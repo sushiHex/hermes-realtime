@@ -1,0 +1,141 @@
+{
+  "codexVersion": "codex-cli 0.145.0",
+  "codexBinarySha256": "83751f15cb6a0a7b97df67752c001e3fe1c20e18ffbfec3ff63567296205eb6c",
+  "serverRequestMethod": "item/tool/call",
+  "schemas": {
+    "DynamicToolSpec": {
+      "type": "object",
+      "required": [
+        "description",
+        "inputSchema",
+        "name",
+        "type"
+      ],
+      "properties": {
+        "deferLoading": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "inputSchema": true,
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "function"
+          ]
+        }
+      }
+    },
+    "DynamicToolCallParams": {
+      "type": "object",
+      "required": [
+        "arguments",
+        "callId",
+        "threadId",
+        "tool",
+        "turnId"
+      ],
+      "properties": {
+        "arguments": true,
+        "callId": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      }
+    },
+    "DynamicToolCallResponse": {
+      "type": "object",
+      "required": [
+        "contentItems",
+        "success"
+      ],
+      "properties": {
+        "contentItems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/schemas/DynamicToolCallOutputContentItem"
+          }
+        },
+        "success": {
+          "type": "boolean"
+        }
+      }
+    },
+    "DynamicToolCallOutputContentItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inputText"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "imageUrl",
+            "type"
+          ],
+          "properties": {
+            "imageUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inputImage"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "audioUrl",
+            "type"
+          ],
+          "properties": {
+            "audioUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inputAudio"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,120 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-realtime"
+version = "0.0.3"
+description = "Realtime LiveKit conversation runtime for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+authors = [{ name = "sushiX" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["hermes-agent", "livekit", "realtime", "voice-assistant"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Typing :: Typed",
+]
+dependencies = [
+  "aiohttp>=3.11,<4",
+  "ddgs>=9.5,<10",
+  "livekit>=1.1.14,<2",
+  "livekit-api>=1.2.0,<2",
+  "pydantic>=2.11,<3",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-realtime = "hermes_realtime.hermes_plugin"
+
+[project.urls]
+Homepage = "https://github.com/sushiHex/hermes-realtime"
+Repository = "https://github.com/sushiHex/hermes-realtime"
+Documentation = "https://github.com/sushiHex/hermes-realtime/tree/main/docs"
+Changelog = "https://github.com/sushiHex/hermes-realtime/blob/main/CHANGELOG.md"
+Security = "https://github.com/sushiHex/hermes-realtime/security/policy"
+Issues = "https://github.com/sushiHex/hermes-realtime/issues"
+
+[project.scripts]
+hermes-realtime-host = "hermes_realtime.host_launcher:main"
+hermes-realtime-local = "hermes_realtime.launcher:main"
+
+[project.optional-dependencies]
+browser-acceptance = [
+    "playwright>=1.50,<2",
+]
+local = [
+    "edge-tts>=7.2.8",
+    "faster-whisper>=1.2.1",
+    "kokoro-onnx==0.5.0; sys_platform == 'win32'",
+    "moonshine-voice==0.1.0",
+    "numpy>=1.26,<3",
+    "onnxruntime>=1.20,<2",
+    "webrtcvad-wheels>=2.0.14",
+]
+speech-verification = [
+    "numpy>=1.26,<3",
+    "onnxruntime>=1.20,<2",
+    "webrtcvad-wheels>=2.0.14",
+]
+
+[dependency-groups]
+dev = [
+  "cryptography>=50,<51",
+  "jsonschema>=4.23,<5",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_realtime"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/CHANGELOG.md",
+  "/CODE_OF_CONDUCT.md",
+  "/CONTRIBUTING.md",
+  "/LICENSE",
+  "/README.md",
+  "/SECURITY.md",
+  "/SUPPORT.md",
+  "/THIRD_PARTY_NOTICES.md",
+  "/pyproject.toml",
+  "/uv.lock",
+  "/docs/**",
+  "/requirements/**",
+  "/scripts/**",
+  "/src/**",
+  "/tests/**",
+  "/web/**",
+]
+exclude = [
+  "/web/coverage/**",
+  "/web/dist/**",
+  "/web/node_modules/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["hermes_realtime"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["livekit", "livekit.*"]
+follow_imports = "skip"
