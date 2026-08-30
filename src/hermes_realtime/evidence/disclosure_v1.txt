@@ -1,0 +1,7 @@
+Evidence capture is optional and off until you consent.
+
+If you consent, Hermes Realtime stores the selected final microphone transcript text, selected final typed input text, generated assistant segment text, transport-confirmed assistant text, and content-free routing, delivery, lifecycle, and settlement metadata. These records can contain sensitive personal information. They are stored locally without encryption at rest.
+
+The configured retention period and bounded storage quota limit capture. Revoking consent closes capture immediately and erases the current consent epoch; older closed epochs remain until their retention deadline or an explicit full purge. Best-effort RAM cleanup cannot prove zeroization, and restart recovery may complete pending privacy work before capture becomes available.
+
+This evidence does not prove physical speaker identity, typed authorship, browser playout, audibility, hearing, comprehension, agreement, or truth. Slice 0 performs capture only; it does not learn from or automatically apply the stored evidence.

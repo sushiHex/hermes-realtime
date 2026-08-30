@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#08090b" />
+    <title>Hermes Realtime</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="ambient" aria-hidden="true"></div>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" role="img">
+              <path d="M7 5.5v13M17 5.5v13M7 12h10" />
+            </svg>
+          </span>
+          <div>
+            <p class="eyebrow">Hermes Realtime</p>
+            <h1>Conversation</h1>
+          </div>
+        </div>
+        <div class="topbar-statuses">
+          <button
+            id="microphone-activity"
+            class="microphone-activity"
+            type="button"
+            data-enabled="false"
+            data-active="false"
+            aria-label="Mute microphone"
+            aria-pressed="false"
+            disabled
+          >
+            <span class="microphone-activity-dot" aria-hidden="true"></span>
+            <span id="microphone-activity-label" aria-live="polite">Mic off</span>
+            <span class="microphone-meter" aria-hidden="true">
+              <i id="microphone-level"></i>
+            </span>
+          </button>
+          <div id="connection-status" class="connection-status" data-state="idle">
+            <span class="status-dot" aria-hidden="true"></span>
+            <output id="connection-state" class="status" aria-live="polite">Idle</output>
+          </div>
+        </div>
+      </header>
+
+      <section class="toolbar" aria-label="Connection controls">
+        <div class="connection-actions">
+          <button id="session-toggle" class="button primary" type="button">Connect</button>
+          <button id="stop-speaking" class="button secondary" type="button" disabled hidden>Stop speaking</button>
+          <output id="speech-renderer-state" class="status" aria-live="polite" hidden>Speech idle</output>
+        </div>
+        <div class="device-controls">
+          <label class="device-control" for="microphone">
+            <span>Microphone</span>
+            <select id="microphone"><option value="">System default</option></select>
+          </label>
+          <label class="device-control" for="voice">
+            <span>Voice</span>
+            <select id="voice" disabled><option value="">Unavailable</option></select>
+          </label>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <article id="conversation-panel" class="panel conversation-panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-kicker">Voice session</p>
+              <h2>Conversation</h2>
+            </div>
+            <span class="feature-badge">
+              <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+              Live transcription
+            </span>
+          </div>
+
+          <div class="conversation-scroll">
+            <div id="transcript-empty" class="empty-state">
+              <span class="empty-orb" aria-hidden="true">
+                <svg viewBox="0 0 24 24" role="img">
+                  <path d="M12 3.5a4 4 0 0 0-4 4v4a4 4 0 1 0 8 0v-4a4 4 0 0 0-4-4Z" />
+                  <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6" />
+                </svg>
+              </span>
+              <h3 id="readiness-headline">Ready when you are</h3>
+              <p id="readiness-detail">Connect, then wait for Listening before speaking.</p>
+            </div>
+            <ol id="transcript" class="timeline" aria-live="polite" aria-label="Conversation transcript"></ol>
+          </div>
+
+          <form id="typed-form" class="composer-shell">
+            <label class="sr-only" for="typed-input">Type a message</label>
+            <div class="composer">
+              <textarea
+                id="typed-input"
+                maxlength="4096"
+                rows="2"
+                disabled
+                placeholder="Type a message if voice is unavailable…"
+              ></textarea>
+              <button id="send" class="send-button" type="submit" disabled aria-label="Send message">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m5 12 14-7-4.5 14-3-6.5L5 12Z" />
+                  <path d="m11.5 12.5 3-3" />
+                </svg>
+              </button>
+            </div>
+            <p class="composer-hint">Voice remains the primary input. Typed messages use the same conversation context.</p>
+          </form>
+        </article>
+
+        <aside class="inspector" aria-label="Session details">
+          <section class="panel inspector-card model-card" aria-labelledby="model-card-title">
+            <div class="card-heading">
+              <span class="card-icon model-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M8 7h8M8 12h8M10 17h4" /><rect x="4" y="3" width="16" height="18" rx="4" /></svg>
+              </span>
+              <div>
+                <p class="section-kicker">Inference</p>
+                <h2 id="model-card-title">Session model</h2>
+              </div>
+            </div>
+            <div class="model-controls" aria-label="Next turn model configuration">
+              <label for="model-select">
+                <span>Model</span>
+                <select id="model-select" disabled><option value="">Unavailable</option></select>
+              </label>
+              <label for="effort-select">
+                <span>Reasoning / mode</span>
+                <select id="effort-select" disabled><option value="">Unavailable</option></select>
+              </label>
+              <p id="model-selection-state" class="model-selection-state" aria-live="polite">
+                Connect to select the next-turn model.
+              </p>
+            </div>
+            <dl class="model-stats">
+              <div class="model-stat"><dt>Provider</dt><dd id="model-provider">Awaiting session</dd></div>
+              <div class="model-stat"><dt>Model</dt><dd id="model-name">—</dd></div>
+              <div class="model-stat"><dt>Access</dt><dd id="model-access">—</dd></div>
+              <div class="model-stat"><dt>Effort</dt><dd id="model-effort">—</dd></div>
+              <div class="model-stat"><dt>Transport</dt><dd id="model-transport">—</dd></div>
+              <div class="model-stat"><dt>Context</dt><dd id="model-context">Not reported</dd></div>
+              <div class="model-stat"><dt>Usage feed</dt><dd id="model-usage-reporting">Awaiting session</dd></div>
+              <div class="model-stat model-stat-section"><dt>Speech runtime</dt><dd></dd></div>
+              <div class="model-stat"><dt>STT provider</dt><dd id="stt-provider">Awaiting session</dd></div>
+              <div class="model-stat"><dt>STT model</dt><dd id="stt-model">—</dd></div>
+              <div class="model-stat"><dt>TTS provider</dt><dd id="tts-provider">Awaiting session</dd></div>
+              <div class="model-stat"><dt>TTS model</dt><dd id="tts-model">—</dd></div>
+              <div class="model-stat"><dt title="Final user transcript to first foreground token">Response last</dt><dd id="latency-last">Waiting for first response</dd></div>
+              <div class="model-stat"><dt title="Arithmetic mean of final user transcript to first foreground token">Response average</dt><dd id="latency-average">Waiting for first response</dd></div>
+              <div class="model-stat model-stat-section"><dt>Knowledge route</dt><dd id="knowledge-route">Waiting for source-backed turn</dd></div>
+              <div class="model-stat"><dt>Lookup last</dt><dd id="knowledge-last">—</dd></div>
+              <div class="model-stat"><dt>Lookup p50</dt><dd id="knowledge-p50">—</dd></div>
+              <div class="model-stat"><dt>Lookup p95</dt><dd id="knowledge-p95">—</dd></div>
+              <div class="model-stat model-stat-total"><dt>Session tokens</dt><dd id="usage-total">—</dd></div>
+              <div class="model-stat"><dt>Input</dt><dd id="usage-input">—</dd></div>
+              <div class="model-stat"><dt>Cached input</dt><dd id="usage-cached">—</dd></div>
+              <div class="model-stat"><dt>Output</dt><dd id="usage-output">—</dd></div>
+              <div class="model-stat"><dt>Reasoning</dt><dd id="usage-reasoning">—</dd></div>
+            </dl>
+          </section>
+
+          <section id="evidence-disclosure" class="panel inspector-card evidence-disclosure" aria-labelledby="evidence-disclosure-title">
+            <p class="section-kicker">Optional local capture</p>
+            <h2 id="evidence-disclosure-title">Evidence capture disclosure</h2>
+            <div class="evidence-disclosure-copy">
+              <p>Evidence capture is optional and off until you consent.</p>
+              <p>If you consent, Hermes Realtime stores the selected final microphone transcript text, selected final typed input text, generated assistant segment text, transport-confirmed assistant text, and content-free routing, delivery, lifecycle, and settlement metadata. These records can contain sensitive personal information. They are stored locally without encryption at rest.</p>
+              <p>The configured retention period and bounded storage quota limit capture. Revoking consent closes capture immediately and erases the current consent epoch; older closed epochs remain until their retention deadline or an explicit full purge. Best-effort RAM cleanup cannot prove zeroization, and restart recovery may complete pending privacy work before capture becomes available.</p>
+              <p>This evidence does not prove physical speaker identity, typed authorship, browser playout, audibility, hearing, comprehension, agreement, or truth. Slice 0 performs capture only; it does not learn from or automatically apply the stored evidence.</p>
+            </div>
+            <div class="evidence-controls" aria-labelledby="evidence-controls-title">
+              <h3 id="evidence-controls-title">Capture controls</h3>
+              <output id="evidence-capture-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Evidence capture is unavailable for this session.</output>
+              <div class="evidence-control-actions">
+                <button id="evidence-consent" class="button" type="button" aria-describedby="evidence-capture-status" disabled>Enable local capture</button>
+                <button id="evidence-revoke" class="button button-danger" type="button" aria-describedby="evidence-capture-status" disabled>Revoke consent and erase</button>
+              </div>
+            </div>
+          </section>
+
+          <section id="search-egress-disclosure" class="panel inspector-card evidence-disclosure" aria-labelledby="search-egress-disclosure-title">
+            <p class="section-kicker">Optional external search</p>
+            <h2 id="search-egress-disclosure-title">Public search disclosure</h2>
+            <div id="search-egress-disclosure-copy" class="evidence-disclosure-copy">
+              <p>Public search is optional. It is unavailable unless the host operator enables it, and it remains off for each browser session until you consent here.</p>
+              <p>If you consent, Hermes Realtime may use a search query derived from stable partial or final speech transcript text, or final typed input text, and send that query over HTTPS to Bing Search RSS and, for outcome-shaped queries, Google News RSS. Raw microphone audio is not sent to those services by this feature.</p>
+              <p>Search results are untrusted external data used only to support source-sensitive answers. The destinations may receive the query, network metadata such as your host's public IP address, and ordinary HTTP metadata under their own terms and privacy policies.</p>
+              <p>Consent applies only to the active browser binding. Rebinding, projection resynchronization, stopping, inactivity expiry, or revocation closes the server gate for new lookups. Revocation cannot cancel a lookup admitted while consent was active or recall a request that was already sent.</p>
+            </div>
+            <div class="evidence-controls" aria-labelledby="search-egress-controls-title">
+              <h3 id="search-egress-controls-title">Search controls</h3>
+              <output id="search-egress-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Public search is unavailable for this session.</output>
+              <div class="evidence-control-actions">
+                <button id="search-egress-consent" class="button" type="button" aria-describedby="search-egress-status" disabled>Allow public search</button>
+                <button id="search-egress-revoke" class="button button-danger" type="button" aria-describedby="search-egress-status" disabled>Revoke public search</button>
+              </div>
+            </div>
+          </section>
+
+
+          <details class="panel inspector-card diagnostics">
+            <summary>
+              <span>
+                <span class="section-kicker">Diagnostics</span>
+                <strong>Latency markers</strong>
+              </span>
+              <span class="disclosure" aria-hidden="true">⌄</span>
+            </summary>
+            <ol id="markers" class="markers"></ol>
+          </details>
+        </aside>
+      </section>
+      <audio id="remote-audio" autoplay></audio>
+    </main>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
