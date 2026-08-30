@@ -19,10 +19,12 @@ NonEmptyString = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=8192),
 ]
+# Identifiers are never normalized. Trimming would let " evt_1 " and "evt_1"
+# alias to one identity across the bridge, so a value that would need
+# normalization is rejected instead; the pattern already forbids whitespace.
 IdentifierString = Annotated[
     str,
     StringConstraints(
-        strip_whitespace=True,
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
@@ -31,9 +33,12 @@ IdentifierString = Annotated[
 
 
 class StrictModel(BaseModel):
-    """Base model that rejects fields unknown to this protocol version."""
+    """Base model that rejects unknown fields and coerced primitives."""
 
-    model_config = ConfigDict(extra="forbid")
+    # strict=True keeps Pydantic's lax mode from converting wire values such as
+    # {"sequence": "1"} into the declared type. The bridge is the trust
+    # boundary, so a malformed event must fail closed rather than be repaired.
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class Durability(StrEnum):
@@ -60,6 +65,14 @@ class WorkTerminalStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+# The wire representation of these enums *is* their string value, so accepting
+# that string is the contract rather than a coercion. They opt out of the strict
+# default explicitly; every other primitive stays strict.
+LenientDurability = Annotated[Durability, Field(strict=False)]
+LenientCancelScope = Annotated[CancelScope, Field(strict=False)]
+LenientTerminalStatus = Annotated[WorkTerminalStatus, Field(strict=False)]
+
+
 class BaseEvent(StrictModel):
     """Fields carried by every protocol event."""
 
@@ -74,7 +87,7 @@ class WorkDispatchRequestedPayload(StrictModel):
     """Description of background work awaiting real Hermes dispatch."""
 
     objective: NonEmptyString
-    durability: Durability = Durability.EPHEMERAL
+    durability: LenientDurability = Durability.EPHEMERAL
     progress_reporting: Literal["none", "material_only", "all"] = "material_only"
     completion_reporting: Literal["proactive", "on_request"] = "proactive"
 
@@ -119,7 +132,7 @@ class WorkDispatchAcknowledgedEvent(BaseEvent):
 class WorkCompletedPayload(StrictModel):
     """Terminal evidence emitted after an acknowledged Hermes run ends."""
 
-    status: WorkTerminalStatus
+    status: LenientTerminalStatus
     summary: NonEmptyString | None = None
     reason: NonEmptyString | None = None
 
@@ -147,7 +160,7 @@ class WorkCompletedEvent(BaseEvent):
 class ControlCancelPayload(StrictModel):
     """Requested cancellation boundary."""
 
-    scope: CancelScope
+    scope: LenientCancelScope
     reason: NonEmptyString | None = None
 
 
@@ -196,7 +209,7 @@ class ControlCancelAcknowledgedEvent(BaseEvent):
 
     type: Literal["control.cancel.acknowledged"]
     request_event_id: IdentifierString
-    scope: CancelScope
+    scope: LenientCancelScope
     task_id: IdentifierString | None = None
     payload: ControlCancelAcknowledgedPayload
 

@@ -18,10 +18,11 @@ from hermes_realtime.providers._text_segmentation import first_speakable_sentenc
 _MAX_MODEL_CHARS = 256
 _MAX_SEGMENT_CHARS = 4096
 _MAX_ACTIVE_STREAMS = 16
+_MAX_RESPONSE_LINE_BYTES = 1_048_576
 
 
 class _LineResponse(Protocol):
-    def readline(self) -> bytes: ...
+    def readline(self, limit: int = -1, /) -> bytes: ...
 
     def close(self) -> None: ...
 
@@ -173,8 +174,16 @@ class OllamaStreamingInference:
                         raise RuntimeError("Ollama stream was cancelled while reading")
                     if self._responses.get(turn_id) is not response:
                         raise RuntimeError("Ollama response ownership was lost")
+                    # Bound the read itself. Checking the length after an
+                    # unbounded readline() lets a newline-free record allocate
+                    # without limit before the bound is ever consulted, so the
+                    # advertised size cap could not actually prevent it. Read at
+                    # most one byte past the cap so overflow stays detectable.
                     read_operation = asyncio.create_task(
-                        asyncio.to_thread(response.readline),
+                        asyncio.to_thread(
+                            response.readline,
+                            _MAX_RESPONSE_LINE_BYTES + 1,
+                        ),
                         name=f"ollama-read:{turn_id}",
                     )
                     self._reads[turn_id] = read_operation
@@ -438,7 +447,10 @@ class OllamaStreamingInference:
     def _payload(raw_line: object) -> dict[str, object]:
         if type(raw_line) is not bytes:
             raise TypeError("Ollama response line must be exact bytes")
-        if len(raw_line) > 1_048_576:
+        # The reader asks for one byte past the cap, so a line at that length is
+        # either an overlong record or one that was truncated mid-record. Reject
+        # both rather than parsing a partial payload.
+        if len(raw_line) > _MAX_RESPONSE_LINE_BYTES:
             raise ValueError("Ollama response line exceeds supported size")
         parsed = json.loads(raw_line)
         if type(parsed) is not dict:

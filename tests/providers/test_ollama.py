@@ -25,7 +25,7 @@ class LineResponse:
         )
         self.closed = False
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = -1, /) -> bytes:
         if self.closed or not self._lines:
             return b""
         return self._lines.popleft()
@@ -216,7 +216,7 @@ async def test_ollama_cancel_waits_for_owned_blocked_reader_thread() -> None:
     allow_read_finish = threading.Event()
 
     class BlockingReadResponse(LineResponse):
-        def readline(self) -> bytes:
+        def readline(self, limit: int = -1, /) -> bytes:
             read_started.set()
             assert close_called.wait(timeout=5)
             assert allow_read_finish.wait(timeout=5)
@@ -259,7 +259,7 @@ async def test_ollama_cancel_ignores_reader_failure_caused_by_response_close() -
     first_segment = asyncio.Event()
 
     class CloseRaceResponse(LineResponse):
-        def readline(self) -> bytes:
+        def readline(self, limit: int = -1, /) -> bytes:
             if self._lines:
                 return self._lines.popleft()
             second_read_started.set()
@@ -322,7 +322,7 @@ async def test_ollama_cleanup_survives_caller_cancellation(
     class BlockingCleanupResponse(LineResponse):
         close_calls = 0
 
-        def readline(self) -> bytes:
+        def readline(self, limit: int = -1, /) -> bytes:
             read_started.set()
             assert release_read.wait(timeout=5)
             return b""
@@ -381,7 +381,7 @@ async def test_ollama_failed_response_close_remains_owned_across_retries() -> No
     class FailingCloseResponse(LineResponse):
         close_calls = 0
 
-        def readline(self) -> bytes:
+        def readline(self, limit: int = -1, /) -> bytes:
             read_started.set()
             assert release_read.wait(timeout=5)
             return b""
