@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "casual_open",
+      "messages": [{"role": "user", "text": "Hey, how's it going?"}],
+      "limits": {"maxWords": 25, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["good", "well", "okay", "doing", "here", "day", "up"], "minMatches": 1}
+    },
+    {
+      "id": "small_win",
+      "messages": [{"role": "user", "text": "I finally fixed that flaky test."}],
+      "limits": {"maxWords": 30, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["test", "flaky", "fix", "nice", "satisfying"], "minMatches": 1}
+    },
+    {
+      "id": "direct_explanation",
+      "messages": [{"role": "user", "text": "Why does coffee sometimes taste sour?"}],
+      "limits": {"maxWords": 70, "maxSentences": 4, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["coffee", "extract", "brew", "grind", "roast", "acid"], "minMatches": 2}
+    },
+    {
+      "id": "vulnerable",
+      "messages": [{"role": "user", "text": "I don't know. I think I want to quit this project."}],
+      "limits": {"maxWords": 50, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["quit", "project", "making", "pause", "pressure", "leave"], "minMatches": 1}
+    },
+    {
+      "id": "tiny_fact",
+      "messages": [{"role": "user", "text": "What's two plus two?"}],
+      "limits": {"maxWords": 12, "maxSentences": 2, "maxQuestions": 0, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["four", "4"], "minMatches": 1}
+    },
+    {
+      "id": "requested_list",
+      "messages": [{"role": "user", "text": "Give me three easy ways to make scrambled eggs better."}],
+      "limits": {"maxWords": 60, "maxSentences": 4, "maxQuestions": 1, "allowStructuredList": true},
+      "requirements": {"requiredAny": ["egg", "butter", "cheese", "cheddar", "herb", "chive", "cream", "sauce", "salt", "heat", "cook", "season", "add"], "minMatches": 1}
+    },
+    {
+      "id": "context_callback",
+      "messages": [
+        {"role": "user", "text": "I've been running more lately."},
+        {"role": "assistant", "text": "Nice. Has anything about it surprised you?"},
+        {"role": "user", "text": "Yeah, mostly hills."}
+      ],
+      "limits": {"maxWords": 40, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["hill", "leg", "breath", "run", "climb"], "minMatches": 1}
+    },
+    {
+      "id": "correction",
+      "messages": [
+        {"role": "user", "text": "The response feels slow after I speak."},
+        {"role": "assistant", "text": "The turn boundary may be taking too long."},
+        {"role": "user", "text": "No, that's not what I meant. I meant latency after the first token."}
+      ],
+      "limits": {"maxWords": 35, "maxSentences": 2, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["latency", "token", "generation", "playback", "streaming"], "minMatches": 1}
+    },
+    {
+      "id": "opinion",
+      "messages": [{"role": "user", "text": "Do you think this architecture is too complicated?"}],
+      "limits": {"maxWords": 35, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["architecture", "diagram", "outline", "seeing", "see"], "minMatches": 1}
+    },
+    {
+      "id": "minimal_followup",
+      "messages": [
+        {"role": "user", "text": "I might take tomorrow off."},
+        {"role": "assistant", "text": "That sounds overdue."},
+        {"role": "user", "text": "Yeah."}
+      ],
+      "limits": {"maxWords": 25, "maxSentences": 2, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["take", "off", "reset", "rest", "rooting"], "minMatches": 1}
+    },
+    {
+      "id": "sit_with_it",
+      "messages": [{"role": "user", "text": "Can you just sit with that for a second?"}],
+      "limits": {"maxWords": 15, "maxSentences": 2, "maxQuestions": 0, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["course", "yeah", "here", "okay", "sure"], "minMatches": 1}
+    },
+    {
+      "id": "easy_dinner",
+      "messages": [{"role": "user", "text": "What should I cook tonight? Something easy."}],
+      "limits": {"maxWords": 40, "maxSentences": 3, "maxQuestions": 1, "allowStructuredList": false},
+      "requirements": {"requiredAny": ["try", "make", "pasta", "taco", "chicken", "meat", "tortilla", "cook", "roast", "noodle", "vegetable", "rice", "meal", "dinner"], "minMatches": 1}
+    }
+  ]
+}

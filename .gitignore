@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.test-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# JavaScript
+node_modules/
+.next/
+coverage/
+web/dist/
+web/tmp/
+
+# Hermetic release-gate output (the gate itself uses a system temporary directory)
+.release-import-env/
+release-artifacts/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local tool downloads
+.tools/
+
+# Runtime artifacts
+*.log
+.runtime/
+artifacts/
+benchmark-results/local/
+
+# Local Hermes artifacts; plans remain intentionally tracked/visible.
+.hermes/*
+!.hermes/plans/
+!.hermes/plans/**
+research/
+spikes/
