@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible Hermes Realtime defect
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, launch fragments, private audio, transcripts, personal data, or private host paths. Report vulnerabilities through the Security tab instead.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I removed secrets and private data.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Hermes Realtime version or commit
+      placeholder: v0.x.y or full commit SHA
+    validations:
+      required: true
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes Agent version
+      placeholder: hermes --version
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Give safe, deterministic steps and configuration with sensitive values replaced by [REDACTED].
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Paste only the smallest redacted error or traceback needed to understand the failure.
+      render: text

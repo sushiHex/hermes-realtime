@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a generic public capability
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals must be useful outside one private deployment and reproducible without a maintainer's named hardware or accounts.
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Public use case
+      description: What user-visible result should become possible?
+    validations:
+      required: true
+  - type: textarea
+    id: existing
+    attributes:
+      label: Existing alternatives
+      description: Which Hermes Agent, LiveKit, browser, or provider surfaces have you considered?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Smallest useful scope
+      description: Describe the narrowest end-to-end slice and what should remain deferred.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security, privacy, and compatibility considerations
+      description: Include authority, cleanup, secret handling, and platform implications.

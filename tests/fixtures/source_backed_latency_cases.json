@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "corpusVersion": "source-backed-v1",
+  "description": "Synthetic, credential-free transcript progressions for source-backed latency characterization.",
+  "cases": [
+    {
+      "id": "sb-001",
+      "category": "current_fact",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 300, "text": "What is the latest stable"},
+        {"atMs": 620, "text": "What is the latest stable Python"},
+        {"atMs": 980, "text": "What is the latest stable Python release"}
+      ],
+      "finalAtMs": 1350,
+      "final": "What is the latest stable Python release"
+    },
+    {
+      "id": "sb-002",
+      "category": "explicit_source",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 250, "text": "Find official sources for LiveKit"},
+        {"atMs": 600, "text": "Find official sources for LiveKit AudioStream"},
+        {"atMs": 940, "text": "Find official sources for LiveKit AudioStream documentation"}
+      ],
+      "finalAtMs": 1280,
+      "final": "Find official sources for LiveKit AudioStream documentation"
+    },
+    {
+      "id": "sb-003",
+      "category": "historical_fact",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 220, "text": "Who designed the flag"},
+        {"atMs": 540, "text": "Who designed the flag of Greenland"},
+        {"atMs": 860, "text": "Who designed the flag of Greenland and when"}
+      ],
+      "finalAtMs": 1210,
+      "final": "Who designed the flag of Greenland and when"
+    },
+    {
+      "id": "sb-004",
+      "category": "partial_correction",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 200, "text": "What is the latest Python release"},
+        {"atMs": 510, "text": "What is the latest Pydantic release"}
+      ],
+      "finalAtMs": 900,
+      "final": "What is the latest Pydantic release"
+    },
+    {
+      "id": "sb-005",
+      "category": "private_credential",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 240, "text": "My password is swordfish"},
+        {"atMs": 600, "text": "My password is swordfish check whether it leaked"}
+      ],
+      "finalAtMs": 950,
+      "final": "My password is swordfish check whether it leaked"
+    },
+    {
+      "id": "sb-006",
+      "category": "private_token",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 300, "text": "Use bearer redacted-token"},
+        {"atMs": 700, "text": "Use bearer redacted-token to look this up"}
+      ],
+      "finalAtMs": 1050,
+      "final": "Use bearer redacted-token to look this up"
+    },
+    {
+      "id": "sb-007",
+      "category": "private_path",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 260, "text": "Find this under C:\\Users\\private"},
+        {"atMs": 650, "text": "Find this under C:\\Users\\private\\secrets.txt"}
+      ],
+      "finalAtMs": 980,
+      "final": "Find this under C:\\Users\\private\\secrets.txt"
+    },
+    {
+      "id": "sb-008",
+      "category": "no_search",
+      "stt": "moonshine",
+      "partials": [
+        {"atMs": 210, "text": "Tell me a joke"},
+        {"atMs": 510, "text": "Tell me a joke about Python"}
+      ],
+      "finalAtMs": 840,
+      "final": "Tell me a joke about Python"
+    },
+    {
+      "id": "sb-009",
+      "category": "final_only_control",
+      "stt": "faster-whisper",
+      "partials": [],
+      "finalAtMs": 1100,
+      "final": "What is the latest stable Python release"
+    }
+  ]
+}
