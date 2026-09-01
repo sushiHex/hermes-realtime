@@ -26,6 +26,13 @@ from typing import NoReturn
 
 MAX_ARTIFACT_BYTES = 15 * 1024 * 1024
 NPM = "npm.cmd" if os.name == "nt" else "npm"
+# Per-test durations on every gate run, passing or failing. A timeout only ever
+# proves that its bound was exceeded; it never records how long the node
+# actually took, so a recurrence cannot be compared against anything unless the
+# healthy runs were already measured. These reach the retained job log, which is
+# where a recurrence is investigated. See issue #13.
+PYTEST_DURATIONS = ("--durations=25",)
+VITEST_DURATIONS = ("--", "--reporter=verbose", "--slowTestThreshold=100")
 REQUIRED_STATIC = {
     "hermes_realtime/client/static/index.html": "web/index.html",
     "hermes_realtime/client/static/assets/app.js": "src/hermes_realtime/client/static/assets/app.js",
@@ -623,6 +630,7 @@ def check_livekit(
         "dev",
         "pytest",
         "-q",
+        *PYTEST_DURATIONS,
         "-W",
         "error::jwt.warnings.InsecureKeyLengthWarning",
         "tests/integration/test_local_livekit.py",
@@ -694,7 +702,18 @@ def gate_materialized_candidate(
         cwd=root,
         env=source_env,
     )
-    run("uv", "run", "--frozen", "--group", "dev", "pytest", "-q", cwd=root, env=environment)
+    run(
+        "uv",
+        "run",
+        "--frozen",
+        "--group",
+        "dev",
+        "pytest",
+        "-q",
+        *PYTEST_DURATIONS,
+        cwd=root,
+        env=environment,
+    )
     speech_verification_env = dict(environment)
     speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"
     run(
@@ -707,6 +726,7 @@ def gate_materialized_candidate(
         "dev",
         "pytest",
         "-q",
+        *PYTEST_DURATIONS,
         "tests/providers/test_speech_presence.py",
         cwd=root,
         env=speech_verification_env,
@@ -726,7 +746,7 @@ def gate_materialized_candidate(
     run("uv", "run", "--frozen", "--group", "dev", "mypy", "src", cwd=root, env=environment)
     run_script_mypy(root, environment)
     run(NPM, "ci", "--ignore-scripts", cwd=root / "web", env=environment)
-    run(NPM, "test", cwd=root / "web", env=environment)
+    run(NPM, "test", *VITEST_DURATIONS, cwd=root / "web", env=environment)
     run(NPM, "run", "build", cwd=root / "web", env=environment)
     check_static_parity(root, packaged_static)
     validate_disclosure_manifest(root / "src")
