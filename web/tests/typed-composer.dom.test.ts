@@ -79,6 +79,48 @@ describe("mounted typed composer", () => {
     unmount();
   });
 
+  it("does not submit when Safari confirms a composition after compositionend", () => {
+    // WebKit fires this Enter keydown *after* compositionend, so isComposing is
+    // already false; keyCode 229 is the only remaining IME signal.
+    const { dom, input, submissions, unmount } = mountedComposer();
+    input.value = "変換";
+
+    const event = new dom.window.KeyboardEvent("keydown", {
+      key: "Enter",
+      isComposing: false,
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(event, "keyCode", { value: 229 });
+    const dispatchResult = input.dispatchEvent(event);
+
+    expect(event.isComposing).toBe(false);
+    expect(event.keyCode).toBe(229);
+    expect(dispatchResult).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(submissions()).toBe(0);
+    unmount();
+  });
+
+  it("leaves Shift+Enter as a newline instead of submitting", () => {
+    const { dom, input, submissions, unmount } = mountedComposer();
+    input.value = "First line";
+
+    const event = new dom.window.KeyboardEvent("keydown", {
+      key: "Enter",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    const dispatchResult = input.dispatchEvent(event);
+
+    // Not prevented, so the browser still inserts the newline.
+    expect(dispatchResult).toBe(true);
+    expect(event.defaultPrevented).toBe(false);
+    expect(submissions()).toBe(0);
+    unmount();
+  });
+
   it("does not submit while the send control is disabled", () => {
     const { button, dom, input, submissions, unmount } = mountedComposer();
     input.value = "Already sending";
