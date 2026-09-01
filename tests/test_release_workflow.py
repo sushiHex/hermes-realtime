@@ -106,6 +106,25 @@ def test_release_gate_runs_real_speech_presence_calibration_extra() -> None:
     assert 'speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"' in script
 
 
+def test_every_gate_suite_records_per_test_durations() -> None:
+    # Issue #13: a five-second timeout only proves the bound was exceeded. The
+    # durations of the runs that *passed* are the baseline a recurrence is
+    # measured against, so they must be captured on every run rather than
+    # switched on after a third failure.
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts" / "release_gate.py").read_text(encoding="utf-8")
+    release_gate = run_path(str(root / "scripts" / "release_gate.py"))
+
+    assert release_gate["PYTEST_DURATIONS"] == ("--durations=25",)
+    assert release_gate["VITEST_DURATIONS"] == ("--", "--reporter=verbose")
+
+    # Every pytest invocation the gate owns, and the browser suite, splat the
+    # shared constants; a new suite added without them fails here.
+    assert script.count('"pytest",\n        "-q",\n        *PYTEST_DURATIONS,') == 3
+    assert script.count("*VITEST_DURATIONS") == 1
+    assert script.count('run(NPM, "test", *VITEST_DURATIONS,') == 1
+
+
 def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
     workflow = _release_workflow()
     node24_pins = (
