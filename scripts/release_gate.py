@@ -26,12 +26,19 @@ from typing import NoReturn
 
 MAX_ARTIFACT_BYTES = 15 * 1024 * 1024
 NPM = "npm.cmd" if os.name == "nt" else "npm"
-# Per-test durations on every gate run, passing or failing. A timeout only ever
-# proves that its bound was exceeded; it never records how long the node
-# actually took, so a recurrence cannot be compared against anything unless the
-# healthy runs were already measured. These reach the retained job log, which is
-# where a recurrence is investigated. See issue #13.
-PYTEST_DURATIONS = ("--durations=25",)
+# Per-test durations on every gate run, passing or failing. Timeout diagnostics
+# are not a consistent source of comparable healthy-run timing: some restate
+# only the configured authority, while others also report the elapsed failure
+# duration. Capturing passing-run timings before a recurrence is the only way
+# to have a baseline to compare against. These reach the retained job log,
+# which is where a recurrence is investigated. See issue #13.
+#
+# The tail is uncapped, with the noise floor pinned explicitly. A fixed
+# slowest-N ranks raw phase duration, and can therefore omit a lower-duration
+# phase that sits behind a narrower internal timeout or other authority
+# boundary. Retaining every phase above the floor keeps a later incident
+# comparable with healthy runs.
+PYTEST_DURATIONS = ("--durations=0", "--durations-min=0.005")
 VITEST_DURATIONS = ("--", "--reporter=verbose", "--slowTestThreshold=100")
 REQUIRED_STATIC = {
     "hermes_realtime/client/static/index.html": "web/index.html",

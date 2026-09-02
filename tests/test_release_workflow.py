@@ -143,15 +143,20 @@ def test_release_gate_runs_real_speech_presence_calibration_extra() -> None:
 
 
 def test_every_gate_suite_records_per_test_durations() -> None:
-    # Issue #13: a five-second timeout only proves the bound was exceeded. The
-    # durations of the runs that *passed* are the baseline a recurrence is
-    # measured against, so they must be captured on every run rather than
-    # switched on after a third failure.
+    # Issue #13: timeout diagnostics are not a consistent source of comparable
+    # healthy-run timing; some restate only the configured authority, others
+    # also report elapsed failure duration. The durations of runs that *passed*
+    # are the baseline a recurrence is measured against, so they are captured
+    # on every run rather than switched on after a third failure.
     root = Path(__file__).resolve().parents[1]
     script = (root / "scripts" / "release_gate.py").read_text(encoding="utf-8")
     release_gate = run_path(str(root / "scripts" / "release_gate.py"))
 
-    assert release_gate["PYTEST_DURATIONS"] == ("--durations=25",)
+    # Uncapped with an explicit floor. A slowest-N tail ranks raw phase
+    # duration and can drop a shorter phase that sits behind a narrower internal
+    # bound; retaining every phase above the floor is what keeps a recurrence
+    # comparable with healthy runs.
+    assert release_gate["PYTEST_DURATIONS"] == ("--durations=0", "--durations-min=0.005")
     assert release_gate["VITEST_DURATIONS"] == (
         "--",
         "--reporter=verbose",
