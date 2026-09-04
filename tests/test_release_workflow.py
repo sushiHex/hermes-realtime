@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 from runpy import run_path
@@ -24,6 +25,41 @@ def _logical_requirements(path: Path) -> list[str]:
             current = ""
     assert not current
     return logical
+
+
+def _gate_test_commands(source: str) -> list[tuple[str, set[str]]]:
+    commands: list[tuple[str, set[str]]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run"
+        ):
+            continue
+        literal_args = {
+            argument.value
+            for argument in node.args
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+        }
+        if "pytest" in literal_args:
+            kind = "pytest"
+        elif "vitest" in literal_args or (
+            len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "NPM"
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "test"
+        ):
+            kind = "vitest"
+        else:
+            continue
+        timing_splats = {
+            argument.value.id
+            for argument in node.args
+            if isinstance(argument, ast.Starred) and isinstance(argument.value, ast.Name)
+        }
+        commands.append((kind, timing_splats))
+    return commands
 
 
 def test_cuda_worker_installation_is_hash_closed() -> None:
@@ -104,6 +140,51 @@ def test_release_gate_runs_real_speech_presence_calibration_extra() -> None:
     assert '"speech-verification"' in script
     assert '"tests/providers/test_speech_presence.py"' in script
     assert 'speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"' in script
+
+
+def test_every_gate_suite_records_per_test_durations() -> None:
+    # Issue #13: timeout diagnostics are not a consistent source of comparable
+    # healthy-run timing; some restate only the configured authority, others
+    # also report elapsed failure duration. The durations of runs that *passed*
+    # are the baseline a recurrence is measured against, so they are captured
+    # on every run rather than switched on after a third failure.
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts" / "release_gate.py").read_text(encoding="utf-8")
+    release_gate = run_path(str(root / "scripts" / "release_gate.py"))
+
+    # Uncapped with an explicit floor. A slowest-N tail ranks raw phase
+    # duration and can drop a shorter phase that sits behind a narrower internal
+    # bound; retaining every phase above the floor is what keeps a recurrence
+    # comparable with healthy runs.
+    assert release_gate["PYTEST_DURATIONS"] == ("--durations=0", "--durations-min=0.005")
+    assert release_gate["VITEST_DURATIONS"] == (
+        "--",
+        "--reporter=verbose",
+        "--slowTestThreshold=100",
+    )
+
+    commands = _gate_test_commands(script)
+
+    # Pin the current suite inventory and timing authority together. A new test
+    # command therefore requires an explicit policy-test update, and a command
+    # without the appropriate shared timing arguments fails independently.
+    assert len(commands) == 4
+    assert sum(kind == "pytest" for kind, _ in commands) == 3
+    assert sum(kind == "vitest" for kind, _ in commands) == 1
+    assert all(
+        ("PYTEST_DURATIONS" if kind == "pytest" else "VITEST_DURATIONS") in splats
+        for kind, splats in commands
+    )
+
+
+def test_gate_timing_inventory_recognizes_direct_vitest_launchers() -> None:
+    commands = _gate_test_commands(
+        'run("npx", "vitest", "run")\n'
+        'run("uv", "run", "pytest", "-q")\n'
+        'run(NPM, "test")\n'
+    )
+
+    assert [kind for kind, _ in commands] == ["vitest", "pytest", "vitest"]
 
 
 def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
