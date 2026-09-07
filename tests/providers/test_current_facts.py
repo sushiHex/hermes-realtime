@@ -182,6 +182,9 @@ class ScriptedRssLookup(current_facts_module.PublicRssCurrentFactLookup):
         self.urls.append(url)
         return _GOOGLE_NEWS_RSS if "news.google.com" in url else _BING_RSS
 
+    async def _run_search(self, query: str) -> list[object]:
+        return self._search(query)
+
 
 class SelectiveOutcomeExtractor:
     def __init__(self) -> None:
@@ -238,6 +241,7 @@ async def test_public_rss_outcome_lookup_merges_concrete_results_from_two_feeds(
     evidence = await lookup.lookup("How did tonight's games go?")
 
     assert evidence.backend == "public-rss"
+    assert evidence.error is None
     assert len(lookup.urls) == 2
     assert any("games+results+August+5+2026" in url for url in lookup.urls)
     assert any("game+recaps+%22August+5+2026%22" in url for url in lookup.urls)

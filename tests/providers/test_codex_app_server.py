@@ -2890,7 +2890,7 @@ async def test_codex_registered_dynamic_call_suspends_ordinary_idle_timeout() ->
         effort="low",
         transport_factory=lambda: transport,
         request_timeout_seconds=0.05,
-        work_tool_timeout_seconds=0.3,
+        work_tool_timeout_seconds=10,
     )
     inference.bind_work_tools(handler)
 
@@ -2905,6 +2905,44 @@ async def test_codex_registered_dynamic_call_suspends_ordinary_idle_timeout() ->
         async for segment in inference.stream(_snapshot(), turn_id="turn_tool_idle_suspension")
     ] == ["I started it."]
     await release_task
+    await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_late_dynamic_registration_wakes_ordinary_idle_wait() -> None:
+    transport = ManualDynamicCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+        request_timeout_seconds=0.05,
+        work_tool_timeout_seconds=10,
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    stream_task = asyncio.create_task(
+        _collect_stream(inference, "turn_late_tool_idle_suspension")
+    )
+    await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
+
+    for _ in range(100):
+        if any(
+            task.get_name() == "codex-app-server-next-event"
+            for task in asyncio.all_tasks()
+        ):
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("ordinary idle wait did not start")
+
+    await transport.start_item()
+    await asyncio.sleep(0.1)
+    assert not stream_task.done()
+
+    await transport.request_tool(request_id=91)
+    response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
+    await transport.complete_item(response)
+    await transport.complete_turn(delta="I started it.")
+    assert await asyncio.wait_for(stream_task, timeout=0.2) == ["I started it."]
     await inference.close()
 
 
