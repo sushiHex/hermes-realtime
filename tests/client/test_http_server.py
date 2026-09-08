@@ -17,6 +17,7 @@ from hermes_realtime.client import (
     TailnetPeerAddress,
     TailnetPeerAuthorizer,
 )
+from hermes_realtime.client import server as server_module
 from hermes_realtime.livekit import LiveKitConnection
 
 
@@ -85,6 +86,7 @@ async def test_server_serves_only_allowlisted_shell_with_security_headers(
     server = BrowserHttpServer(
         application=app,
         static_root=static,
+        livekit_url="wss://livekit.test",
         host="127.0.0.1",
         port=0,
     )
@@ -103,13 +105,98 @@ async def test_server_serves_only_allowlisted_shell_with_security_headers(
 
     headers, body = response.split(b"\r\n\r\n", 1)
     assert headers.startswith(b"HTTP/1.1 200 OK\r\n")
-    assert b"content-security-policy:" in headers.lower()
+    assert (
+        b"content-security-policy: default-src 'none'; script-src 'self'; style-src 'self'; "
+        b"connect-src 'self' ws: wss: https://livekit.test; media-src 'self' blob:; "
+        b"img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        in headers.lower()
+    )
+    assert b" connect-src 'self' ws: wss: http: " not in headers.lower()
+    assert b" connect-src 'self' ws: wss: https: " not in headers.lower()
     assert b"cache-control: no-store" in headers.lower()
     assert b"access-control-allow-origin" not in headers.lower()
     assert body == b"<!doctype html><title>Hermes</title>"
     stylesheet_headers, stylesheet_body = stylesheet_response.split(b"\r\n\r\n", 1)
     assert b"cache-control: no-store" in stylesheet_headers.lower()
     assert stylesheet_body == b":root { color-scheme: dark; }"
+
+
+@pytest.mark.parametrize(
+    ("livekit_url", "diagnostic_origin"),
+    (
+        ("ws://127.0.0.1:7880", "http://127.0.0.1:7880"),
+        ("ws://[::1]:7880", "http://[::1]:7880"),
+        ("ws://livekit.test:80", "http://livekit.test"),
+        ("wss://livekit.example.net", "https://livekit.example.net"),
+        ("wss://livekit.test", "https://livekit.test"),
+        ("wss://livekit.test:443", "https://livekit.test"),
+        ("ws://[0:0:0:0:0:0:0:1]:7880/", "http://[::1]:7880"),
+    ),
+)
+def test_livekit_diagnostic_origin_maps_only_the_configured_websocket_origin(
+    livekit_url: str,
+    diagnostic_origin: str,
+) -> None:
+    assert server_module._livekit_http_origin(livekit_url) == diagnostic_origin
+
+
+@pytest.mark.parametrize(
+    "livekit_url",
+    (
+        "https://livekit.test",
+        "ws://user:password@127.0.0.1:7880",
+        "ws://127.0.0.1:7880/room",
+        "ws://127.0.0.1:7880?access_token=value",
+        "ws://127.0.0.1:7880#fragment",
+        "ws://127.0.0.1:7880?",
+        "ws://127.0.0.1:7880#",
+        "ws://127.0.0.1:7880/?",
+        "ws://127.0.0.1:7880/#",
+        "ws://livekit.test:",
+        "ws://[fe80::1%25eth0]",
+        "ws://127.1:7880",
+        "ws://0177.0.0.1:7880",
+        "ws://0x7f000001:7880",
+        "ws://0x7f.0.0.1:7880",
+        "ws://127.0.0.0x1:7880",
+        "ws://example.0x10:7880",
+        "ws://example.10:7880",
+        "ws://127.0.0.1:7880; img-src *",
+    ),
+)
+def test_server_rejects_non_origin_livekit_urls_before_building_csp(
+    tmp_path: Path,
+    livekit_url: str,
+) -> None:
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("client", encoding="utf-8")
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+
+    async def provision(_identity: str) -> int:
+        return 1
+
+    app = BrowserBootstrapApplication(
+        sessions=BrowserSessionDirector(
+            issuer=BrowserTokenIssuer(connection=connection, room_name="room"),
+            provision=provision,
+            submit=_submit,
+            stop=_stop,
+            approval=_approval,
+            projection=BrowserEventProjection(),
+        ),
+        verifier=BrowserTokenVerifier(connection=connection, room_name="room"),
+        capability=OneTimeBootstrapCapability(token_factory=lambda: "d" * 43),
+        allowed_origin="http://127.0.0.1:8765",
+        worker_identity="worker_hermes_browser",
+    )
+
+    with pytest.raises(ValueError, match="LiveKit URL must be an exact WebSocket origin"):
+        BrowserHttpServer(
+            application=app,
+            static_root=static,
+            livekit_url=livekit_url,
+        )
 
 
 @pytest.mark.asyncio
@@ -146,6 +233,7 @@ async def test_server_accepts_browser_bodyless_bootstrap_request(
     server = BrowserHttpServer(
         application=app,
         static_root=static,
+        livekit_url="wss://livekit.test",
         host="127.0.0.1",
         port=0,
     )
@@ -221,7 +309,12 @@ async def test_server_uses_socket_peer_and_ignores_forwarding_headers(
             allowed_stable_id="allowed-node", resolver=resolve
         ),
     )
-    server = BrowserHttpServer(application=app, static_root=static, port=0)
+    server = BrowserHttpServer(
+        application=app,
+        static_root=static,
+        livekit_url="wss://livekit.test",
+        port=0,
+    )
     await server.start()
     try:
         response = await _raw_request(
@@ -276,6 +369,7 @@ async def test_server_authorizes_stable_loopback_from_the_socket_peer(
     server = BrowserHttpServer(
         application=app,
         static_root=static,
+        livekit_url="wss://livekit.test",
         host="127.0.0.1",
         port=0,
     )

@@ -235,8 +235,6 @@ jobs:
               Start-Sleep -Seconds 1
             }
             if (-not $ready) {
-              Get-Content $stdout -ErrorAction SilentlyContinue
-              Get-Content $stderr -ErrorAction SilentlyContinue
               throw 'LiveKit did not become ready on loopback'
             }
             $listeners = @(Get-NetTCPConnection -LocalPort 7880 -State Listen -ErrorAction Stop)
@@ -255,8 +253,18 @@ jobs:
           $env:HERMES_REALTIME_BROWSER_SELF_ACCEPTANCE = '1'
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER = $env:LIVEKIT_SERVER
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256 = $env:LIVEKIT_SERVER_SHA256
+          $env:HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR = $env:TEMP
           uv run --frozen --group dev --extra browser-acceptance pytest -q tests/integration/test_browser_self_acceptance.py
           if ($LASTEXITCODE -ne 0) { throw "Browser self-acceptance failed with exit code $LASTEXITCODE" }
+      - name: Print sanitized LiveKit failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          python .github/scripts/render_livekit_logs.py `
+            "$env:RUNNER_TEMP/livekit.out" `
+            "$env:RUNNER_TEMP/livekit.err" `
+            "$env:TEMP/browser-livekit.out" `
+            "$env:TEMP/browser-livekit.err"
       - name: Remove owner-only Windows test temp
         if: always()
         shell: pwsh

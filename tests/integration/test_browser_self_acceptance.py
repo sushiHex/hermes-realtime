@@ -13,9 +13,9 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urldefrag
 
 import pytest
@@ -216,23 +216,34 @@ def _owned_livekit() -> Iterator[None]:
     if _livekit_responding():
         pytest.fail("refusing to use a pre-existing LiveKit listener")
     environment = os.environ | {"LIVEKIT_KEYS": "devkey: local-" + "x" * 32 + "\n"}
-    process = subprocess.Popen(
-        [str(executable), "--dev", "--bind", "127.0.0.1"],
-        env=environment,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_livekit(process)
-        yield
-    finally:
-        process.terminate()
+    with ExitStack() as stack:
+        configured_log_dir = os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR")
+        if configured_log_dir is None:
+            standard_output: BinaryIO | int = subprocess.DEVNULL
+            standard_error: BinaryIO | int = subprocess.DEVNULL
+        else:
+            log_dir = Path(configured_log_dir)
+            if not log_dir.is_absolute() or not log_dir.is_dir():
+                pytest.fail("browser LiveKit log directory must be an existing absolute path")
+            standard_output = stack.enter_context((log_dir / "browser-livekit.out").open("wb"))
+            standard_error = stack.enter_context((log_dir / "browser-livekit.err").open("wb"))
+        process = subprocess.Popen(
+            [str(executable), "--dev", "--bind", "127.0.0.1"],
+            env=environment,
+            stdout=standard_output,
+            stderr=standard_error,
+        )
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
-        assert not _livekit_responding()
+            _wait_for_livekit(process)
+            yield
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            assert not _livekit_responding()
 
 
 async def _close_browser(browser: Browser | None) -> None:
