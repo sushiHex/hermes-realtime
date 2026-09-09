@@ -42,7 +42,7 @@ def test_real_windows_job_retains_and_closes_an_exited_root(
         "sys.path.insert(0,sys.argv[3]);"
         "from scripts.equivalence_worker import _redirect_diagnostics;"
         "_redirect_diagnostics() if sys.argv[4]=='redirect' else None;"
-        "sys.stdout.write('synthetic buffered diagnostic');"
+        "sys.stdout.write('synthetic buffered diagnostic');sys.stdout.flush();"
         "os.write(w,b'{}\\n');os.read(r,1)"
     )
     try:

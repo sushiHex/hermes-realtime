@@ -29,6 +29,20 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _require_ack(frame: Any, nonce: str, sequence: int) -> None:
+    _require(
+        type(frame) is dict
+        and set(frame) == {"version", "nonce", "sequence"}
+        and type(frame["version"]) is int
+        and frame["version"] == 1
+        and type(frame["nonce"]) is str
+        and frame["nonce"] == nonce
+        and type(frame["sequence"]) is int
+        and frame["sequence"] == sequence,
+        "child acknowledgment identity differs",
+    )
+
+
 def _require_owned_listener(port: int, pid: int) -> None:
     """Match the selected signaling socket to an already retained Job member."""
     _require(type(port) is int and 1 <= port <= 65535, "invalid signaling port")

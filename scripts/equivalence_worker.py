@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from scripts.deterministic_equivalence import ARMS_V1
-from scripts.equivalence_process import _read_frame, _require, _write_frame
+from scripts.equivalence_process import _read_frame, _require, _require_ack, _write_frame
 from scripts.qualify_evidence_slice_zero import canonical_json_bytes
 
 
@@ -200,10 +200,7 @@ def main() -> None:
             },
         )
         ack = _read_frame(request_fd, time.monotonic() + 10)
-        _require(
-            ack == {"version": 1, "nonce": config["nonce"], "sequence": sequence},
-            "child acknowledgment identity differs",
-        )
+        _require_ack(ack, config["nonce"], sequence)
         sequence += 1
 
     with ExitStack() as probes:

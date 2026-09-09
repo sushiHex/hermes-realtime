@@ -1,4 +1,4 @@
-"""Focused RED→GREEN tests for the Task 12 qualification input verifier."""
+"""Focused REDâ†’GREEN tests for the Task 12 qualification input verifier."""
 
 from __future__ import annotations
 
@@ -368,9 +368,9 @@ def test_unavailable_registry_is_exact_closed_and_returns_nothing() -> None:
     module = _load_runner()
     registry = module.UNAVAILABLE_SCENARIO_REGISTRY_V1
     assert type(registry) is tuple
-    assert tuple(item.scenario_id.value for item in registry) == SCENARIO_IDS_V1
+    assert tuple(item.scenario_id.value for item in registry) == SCENARIO_IDS_V1[1:]
     assert module.validate_unavailable_scenario_registry_v1(registry) is registry
-    for ordinal, registration in enumerate(registry):
+    for ordinal, registration in enumerate(registry, start=1):
         with pytest.raises(module.ProducerUnavailableV1) as raised:
             module.invoke_unavailable_scenario_v1(registration, _attempt(module, ordinal))
         assert raised.value.scenario_id is registration.scenario_id
@@ -425,7 +425,7 @@ def _verify(
 
 def test_strict_canonical_json_accepts_only_exact_compact_sorted_utf8_with_one_lf() -> None:
     runner = _load_runner()
-    document = {"alpha": [1, True, "π"], "zeta": {"value": 2}}
+    document = {"alpha": [1, True, "Ï€"], "zeta": {"value": 2}}
     raw = _canonical(document)
 
     assert runner.load_strict_canonical_json(raw, source="fixture") == document

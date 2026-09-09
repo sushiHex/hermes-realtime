@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,6 +14,20 @@ def _module() -> Any:
     from scripts import deterministic_equivalence
 
     return deterministic_equivalence
+
+
+def test_only_the_canonical_first_registration_can_invoke_the_real_producer() -> None:
+    from scripts import qualify_evidence_slice_zero as core
+
+    registry = core.SCENARIO_REGISTRY_V1
+    assert tuple(item.scenario_id for item in registry) == tuple(core.ScenarioIdV1)
+    assert type(registry[0]) is core.DeterministicEquivalenceRegistrationV1
+    assert registry[1:] == core.UNAVAILABLE_SCENARIO_REGISTRY_V1
+    copied = core.DeterministicEquivalenceRegistrationV1()
+    with pytest.raises(ValueError, match="not canonical"):
+        copied.produce(
+            object(), object(), livekit_executable=Path("unusable.exe"), livekit_sha256="a" * 64
+        )  # type: ignore[arg-type]
 
 
 def _arm(name: str, *, shutdown: bool = False) -> dict[str, Any]:

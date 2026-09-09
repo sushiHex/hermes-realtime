@@ -9,10 +9,12 @@ from pathlib import Path
 from scripts.candidate_e2e_fast_track import _measure_git_pin
 from scripts.candidate_source_archive_oracle import capture_candidate_source_archive
 from scripts.deterministic_equivalence import (
-    produce_deterministic_equivalence_v1,
     validate_deterministic_equivalence_v1,
 )
-from scripts.qualify_evidence_slice_zero import canonical_json_bytes
+from scripts.qualify_evidence_slice_zero import (
+    DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
+    canonical_json_bytes,
+)
 from scripts.task13_artifact_orchestrator import verify_clean_tracked_candidate
 
 
@@ -35,7 +37,7 @@ def main() -> None:
         identity,
         _measure_git_pin(arguments.git_executable),
     )
-    receipt = produce_deterministic_equivalence_v1(
+    receipt = DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1.produce(
         archive,
         identity,
         livekit_executable=arguments.livekit_executable,

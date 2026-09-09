@@ -17,6 +17,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Host, browser, and media composition | [Local LiveKit and full-host setup](local-livekit.md) |
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Foreground lookup, consent, and latency | [Source-backed routing](source-backed-latency.md) |
+| Candidate-bound source conversation comparison | [Deterministic equivalence](deterministic-equivalence.md) |
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |
 | Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |

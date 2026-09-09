@@ -1,6 +1,6 @@
 # Roadmap
 
-[Collaborator guide](README.md) · [Implementation status](implementation-status.md)
+[Collaborator guide](README.md) Â· [Implementation status](implementation-status.md)
 
 The next milestone is a reproducibly qualified, constrained Windows desktop
 evidence-capture path using the existing host. Capture remains disabled by default
@@ -16,18 +16,18 @@ point; the detailed [evidence contract](evidence-capture.md) governs acceptance.
 
 | Order | Deliverable | Prerequisite | Complete when |
 | --- | --- | --- | --- |
-| 1 — next | One complete deterministic-equivalence qualification producer | Review the existing scenario contract, production observations, and integration coverage. | The real producer binds observations to the candidate and owned process lifecycle; independent validation rejects missing observations, false identity, and incomplete cleanup. Other scenarios remain explicitly unavailable. |
-| 2 | Remaining governed scenario producers | Establish the first complete producer without weakening its acceptance contract. | Every required scenario has a real producer with focused positive and failure coverage. A partial run cannot produce an accepted full qualification report. |
+| 1 â€” next | One complete deterministic-equivalence qualification producer | Review the existing scenario contract, production observations, and integration coverage. | The real producer binds observations to the candidate and owned process lifecycle; independent validation rejects missing observations, false identity, and incomplete cleanup. Other scenarios remain explicitly unavailable. |
+| 2 — next | Remaining governed scenario producers | Establish the first complete producer without weakening its acceptance contract. | Every required scenario has a real producer with focused positive and failure coverage. A partial run cannot produce an accepted full qualification report. |
 | 3 | Frozen-candidate Windows desktop qualification | Complete the producer and installed-path prerequisites. | All required scenarios, including human-assisted observations, have valid evidence on the same candidate. Missing prerequisites and failed cases block the corresponding claim. |
 | 4 | Constrained alpha release decision | Complete desktop qualification and review the supported-use matrix. | The release decision identifies exact artifacts, demonstrated support, compatibility limits, and known issues. Publication requires release-owner authorization. |
 
-Start milestone 1 in
-[`qualify_evidence_slice_zero.py`](../scripts/qualify_evidence_slice_zero.py), using
-the existing `deterministic_equivalence` scenario. Reuse the
-[candidate archive](../scripts/candidate_source_archive_oracle.py), owned process
-boundaries, and [production observations](../src/hermes_realtime/production_observation.py).
-The [full-host ingress tests](../tests/integration/test_qualification_full_host_ingress.py)
-provide existing integration coverage to examine before adding another harness.
+The first producer is registered in
+[`qualify_evidence_slice_zero.py`](../scripts/qualify_evidence_slice_zero.py).
+Its [implementation guide](deterministic-equivalence.md) documents the fixed
+comparison arms, archive binding, and acceptance limits. Extend the remaining
+producers through the same candidate and ownership boundaries. Existing
+[full-host ingress tests](../tests/integration/test_qualification_full_host_ingress.py)
+remain integration coverage to examine before adding another harness.
 
 Keep each implementation change independently reviewable. For milestone 2, group
 work by existing ownership boundaries: consent/revocation, bounded admission,

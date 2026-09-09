@@ -1,6 +1,6 @@
 # Implementation status
 
-[Collaborator guide](README.md) · [Roadmap](roadmap.md)
+[Collaborator guide](README.md) Â· [Roadmap](roadmap.md)
 
 Implementation and evidence reviewed on **2026-09-09** at main commit
 [`c7b8975e33f5dac7203845d7aa9207ee3518d453`](https://github.com/sushiHex/hermes-realtime/commit/c7b8975e33f5dac7203845d7aa9207ee3518d453),
@@ -31,17 +31,28 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-Its `UNAVAILABLE_SCENARIO_REGISTRY_V1` currently registers **all 20 governed
-scenarios as unavailable producers**, including `deterministic_equivalence`.
-The [registry tests](../tests/test_qualify_evidence_slice_zero.py) verify this refusal
-contract; passing them does not mean those scenarios have qualified.
+The `SCENARIO_REGISTRY_V1` now registers one real
+[`deterministic_equivalence` producer](deterministic-equivalence.md), with
+**19 governed producers still explicitly unavailable**. The source-only producer
+owns the archived child, collects nine fixed comparison arms, and independently
+validates conversation, settlement, close, and process cleanup observations.
+The native CI job invokes it against the checked-out committed candidate and
+prints its exact source identities on success.
 
-Existing integration tests exercise production composition and supply useful
-starting points. They are not substitutes for complete candidate-bound scenario
-producers or required human observations. The next implementation is one real
-deterministic-equivalence producer, followed by the remaining governed matrix as
-specified in the [roadmap](roadmap.md#ordered-milestones). Keep the authoritative
-scenario list in the qualification module instead of duplicating its 20 entries here.
+The first complete local source-only run used commit
+`7b9cf17501c21feab30c91c6fcce7cf3aaba3234`, tree
+`b8e77aa3a8cf873060479126592b62847ec5e4e3`, and archive SHA-256
+`8d2fa37f7aa3822be9859629168a165448a4182e3e0a2996fffc82523f9611f4`.
+It accepted nine arms and completed cleanup of five owned processes. This is a
+candidate-specific implementation result; subsequent changes require their own
+run. The [producer guide](deterministic-equivalence.md) states its source-only,
+media-selection, and dependency-environment limits.
+
+The [registry tests](../tests/test_qualify_evidence_slice_zero.py) preserve the
+remaining refusal contract. This producer cannot generate an accepted full
+`qualification-report-v1`; the remaining matrix, installed-path prerequisites,
+and required human observations are still outstanding. Follow the ordered
+[roadmap](roadmap.md#ordered-milestones).
 
 ## CI evidence and open investigation
 

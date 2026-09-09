@@ -1,8 +1,8 @@
-"""Fail-closed verification core for immutable Task 12 qualification inputs.
+"""Strict qualification input/report validation and closed scenario registration.
 
-This module deliberately performs no process launch or report emission.  It only
-accepts canonical qualification-input bytes and reopens every direct and
-transitive artifact that a later runner may rely on.
+Input validation reopens direct and transitive artifacts without launching a
+process. The registered source-equivalence producer owns its separate execution
+boundary; the remaining scenarios refuse execution until their producers exist.
 """
 
 from __future__ import annotations
@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn, TypeGuard
+from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
+
+if TYPE_CHECKING:
+    from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchiveV1
+    from scripts.deterministic_equivalence import ObservedEquivalenceV1
+    from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 
 class QualificationInputError(ValueError):
@@ -178,12 +183,52 @@ class UnavailableScenarioRegistrationV1:
             raise ValueError("unavailable producer registration is confused")
 
 
+@dataclass(frozen=True, slots=True)
+class DeterministicEquivalenceRegistrationV1:
+    """The one available producer, with an exact archive rather than supplied facts."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.DETERMINISTIC_EQUIVALENCE
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not DeterministicEquivalenceRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.DETERMINISTIC_EQUIVALENCE
+        ):
+            raise TypeError("deterministic producer registration is not exact")
+
+    def produce(
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
+        *,
+        livekit_executable: Path,
+        livekit_sha256: str,
+    ) -> ObservedEquivalenceV1:
+        if self is not SCENARIO_REGISTRY_V1[0]:
+            raise ValueError("deterministic producer registration is not canonical")
+        from scripts.deterministic_equivalence import produce_deterministic_equivalence_v1
+
+        return produce_deterministic_equivalence_v1(
+            archive,
+            identity,
+            livekit_executable=livekit_executable,
+            livekit_sha256=livekit_sha256,
+        )
+
+
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
     UnavailableScenarioRegistrationV1(
         scenario_id=scenario_id,
         produce=_UnavailableScenarioProducerV1(scenario_id),
     )
-    for scenario_id in _SCENARIO_IDS_V1
+    for scenario_id in _SCENARIO_IDS_V1[1:]
+)
+
+DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistrationV1()
+
+SCENARIO_REGISTRY_V1 = (
+    DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
+    *UNAVAILABLE_SCENARIO_REGISTRY_V1,
 )
 
 
@@ -194,9 +239,9 @@ def validate_unavailable_scenario_registry_v1(
         raise TypeError("unavailable scenario registry must be an exact tuple")
     if registry is not UNAVAILABLE_SCENARIO_REGISTRY_V1:
         raise ValueError("unavailable scenario registry is not canonical")
-    if len(registry) != len(_SCENARIO_IDS_V1):
-        raise ValueError("unavailable scenario registry must contain exactly 20 entries")
-    for ordinal, registration in enumerate(registry):
+    if len(registry) != len(_SCENARIO_IDS_V1) - 1:
+        raise ValueError("unavailable scenario registry must contain exactly 19 entries")
+    for ordinal, registration in enumerate(registry, start=1):
         if type(registration) is not UnavailableScenarioRegistrationV1:
             raise TypeError("unavailable scenario registration must be exact")
         if registration.scenario_id is not _SCENARIO_IDS_V1[ordinal]:
@@ -217,7 +262,7 @@ def invoke_unavailable_scenario_v1(
         raise TypeError("unavailable scenario registration must be exact")
     if type(attempt) is not ScenarioAttemptIdentityV1:
         raise TypeError("scenario attempt identity type is invalid")
-    if registration is not UNAVAILABLE_SCENARIO_REGISTRY_V1[attempt.ordinal]:
+    if registration is not SCENARIO_REGISTRY_V1[attempt.ordinal]:
         raise ValueError("scenario registration is not canonical for attempt ordinal")
     if registration.scenario_id is not attempt.scenario_id:
         raise ValueError("registration and scenario attempt are confused")
@@ -2713,7 +2758,7 @@ class _CtypesWindowsKernelV1:
         ).contents
         assigned = int(header.NumberOfAssignedProcesses)
         count = int(header.NumberOfProcessIdsInList)
-        if count > assigned or assigned > max_active or count > max_active:
+        if count != assigned or assigned > max_active or count > max_active:
             _windows_fail("Job PID-list returned impossible bounded counts")
         process_ids = ctypes.cast(
             ctypes.byref(buffer, ctypes.sizeof(header)), ctypes.POINTER(ctypes.c_size_t)
