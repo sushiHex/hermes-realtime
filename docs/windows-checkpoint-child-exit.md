@@ -145,7 +145,7 @@ Hosted run [34318730626](https://github.com/sushiHex/hermes-realtime/actions/run
 subsequently passed all four jobs on attempt 1 for this initial candidate.
 Those results do not qualify a later revision. Issue #13 remains open.
 
-## Communication ownership follow-up
+## Communication ownership follow-up (`70f9e7e…`)
 
 - RED: a real timeout, cancellation, and repeated cancellation each let the
   `48ce86b…` fixture return while its Windows reader thread was held at the
@@ -157,5 +157,17 @@ Those results do not qualify a later revision. Issue #13 remains open.
 - Full default Python suite: 3,203 passed, 21 skipped in 357.51 seconds.
 - Ruff and mypy pass; the latter checks 76 source files.
 
-The retained 40-sample JSON is unchanged. These checks qualify the local
-follow-up; hosted results must be bound to its eventual exact commit separately.
+## Independent pipe cleanup follow-up
+
+- RED: a controlled communication-settlement failure left two real protocol pipe
+  descriptors open. The regression releases those descriptors even on failure.
+- GREEN: protocol pipes now close in an independent `finally` block, including
+  when communication settlement fails. Such a failure still propagates and does
+  not record `cleanup_returned`; stderr is closed explicitly only after settlement.
+- The interruption regression's teardown also accepts a cleanup `TimeoutError`,
+  so it does not replace an earlier assertion with that secondary failure.
+- All 25 checkpoint cases pass locally in 30.42 seconds. The full-suite result
+  above belongs to `70f9e7e…`; later results must bind their exact revision.
+
+The retained 40-sample JSON is unchanged. Hosted results must be bound to the
+final exact commit separately.

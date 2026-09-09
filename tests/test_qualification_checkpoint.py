@@ -287,7 +287,7 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
         release_reader.set()
         if not run.done():
             run.cancel()
-        with suppress(asyncio.CancelledError, subprocess.TimeoutExpired):
+        with suppress(asyncio.CancelledError, subprocess.TimeoutExpired, TimeoutError):
             await asyncio.wait_for(asyncio.shield(run), timeout=10.0)
         for child in children:
             if child.poll() is None:
@@ -312,6 +312,44 @@ def test_checkpoint_observation_keeps_the_line_for_failure_capture(
     print(line, end="")
     assert _checkpoint_observation(capsys) == {"version": 1}
     assert capsys.readouterr().out == line
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cleanup_failure_still_closes_owned_protocol_pipes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    owned_fds: set[int] = set()
+    original_pipe, original_close = os.pipe, os.close
+
+    def tracked_pipe() -> tuple[int, int]:
+        pair = original_pipe()
+        owned_fds.update(pair)
+        return pair
+
+    def tracked_close(fd: int) -> None:
+        original_close(fd)
+        owned_fds.discard(fd)
+
+    async def failed_settlement(*_args: Any, **_kwargs: Any) -> None:
+        raise TimeoutError("controlled communication cleanup failure")
+
+    monkeypatch.setattr(os, "pipe", tracked_pipe)
+    monkeypatch.setattr(os, "close", tracked_close)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_settle_checkpoint_communication", failed_settlement,
+    )
+    try:
+        with pytest.raises(TimeoutError, match="controlled communication cleanup failure"):
+            await _assert_external_cli_checkpoint_failure("wrong_nonce", tmp_path)
+        assert not owned_fds, "cleanup failure leaked an owned protocol pipe"
+    finally:
+        for fd in tuple(owned_fds):
+            tracked_close(fd)
+    observation = _checkpoint_observation(capsys)
+    assert observation["reaped"] is True
+    assert "cleanup_returned" not in observation["events_ms"]
 
 
 async def _settle_checkpoint_communication(
@@ -493,23 +531,28 @@ async def _assert_external_cli_checkpoint_failure(
         cleanup_deadline = asyncio.get_running_loop().time() + 5.0
         cleanup_interruption: asyncio.CancelledError | None = None
         try:
-            if process is not None:
-                if process.poll() is None:
-                    process.kill()
-                    killed = True
-                if communication is None:
-                    process.wait(
-                        timeout=max(0.0, cleanup_deadline - asyncio.get_running_loop().time()),
-                    )
-                else:
-                    cleanup_interruption = await _settle_checkpoint_communication(
-                        process, communication, deadline=cleanup_deadline,
-                    )
-                if process.stderr is not None:
-                    process.stderr.close()
-            for fd in (checkpoint_read_fd, resume_write_fd, checkpoint_write_fd, resume_read_fd):
-                if fd >= 0:
-                    os.close(fd)
+            try:
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                        killed = True
+                    if communication is None:
+                        process.wait(
+                            timeout=max(0.0, cleanup_deadline - asyncio.get_running_loop().time()),
+                        )
+                    else:
+                        cleanup_interruption = await _settle_checkpoint_communication(
+                            process, communication, deadline=cleanup_deadline,
+                        )
+                    if process.stderr is not None:
+                        process.stderr.close()
+            finally:
+                # Protocol pipes are independent of the communication worker's stderr.
+                for fd in (
+                    checkpoint_read_fd, resume_write_fd, checkpoint_write_fd, resume_read_fd,
+                ):
+                    if fd >= 0:
+                        os.close(fd)
             mark("cleanup_returned")
             if completed and cleanup_interruption is not None:
                 raise cleanup_interruption
