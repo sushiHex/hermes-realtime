@@ -207,7 +207,22 @@ def main() -> None:
         emit("ready", {"port": port})
         asyncio.run(_run_arms(workspace, f"ws://127.0.0.1:{port}", emit))
         emit("done", {})
-    except BaseException:
+    except BaseException as error:
+        failure_kinds: dict[type[BaseException], str] = {
+            AssertionError: "assertion",
+            TimeoutError: "timeout",
+            RuntimeError: "runtime",
+            ValueError: "value",
+            OSError: "os",
+        }
+        failure_kind = failure_kinds.get(type(error), "other")
+        source_line = 0
+        traceback = error.__traceback__
+        candidate = Path(__file__).resolve().parent.parent
+        while traceback is not None:
+            if Path(traceback.tb_frame.f_code.co_filename).resolve().is_relative_to(candidate):
+                source_line = traceback.tb_lineno
+            traceback = traceback.tb_next
         _write_frame(
             response_fd,
             {
@@ -215,7 +230,7 @@ def main() -> None:
                 "nonce": config["nonce"],
                 "sequence": sequence,
                 "stage": "failed",
-                "observation": {},
+                "observation": {"failure": failure_kind, "sourceLine": source_line},
             },
         )
         raise

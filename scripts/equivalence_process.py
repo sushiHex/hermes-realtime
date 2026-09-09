@@ -277,6 +277,21 @@ def run_archived_equivalence(
                 signaling_port = 0
                 for sequence, stage in enumerate(("ready", *ARMS_V1, "done")):
                     frame = _read_frame(response_read, deadline)
+                    if type(frame) is dict and frame.get("stage") == "failed":
+                        failure = frame.get("observation")
+                        if (
+                            type(failure) is dict
+                            and set(failure) == {"failure", "sourceLine"}
+                            and failure["failure"]
+                            in {"assertion", "timeout", "runtime", "value", "os", "other"}
+                            and type(failure["sourceLine"]) is int
+                            and 0 <= failure["sourceLine"] <= 100_000
+                        ):
+                            raise ValueError(
+                                f"archived worker failed during {stage}: {failure['failure']} "
+                                f"at source line {failure['sourceLine']}"
+                            )
+                        raise ValueError("archived worker failed with malformed diagnostics")
                     _require(
                         type(frame) is dict
                         and set(frame) == {"version", "nonce", "sequence", "stage", "observation"},
@@ -355,7 +370,17 @@ def run_archived_equivalence(
         kernel.close_handle(runner_handle)
         # Never remove a running scenario's files. The known, fresh temporary
         # directory is the only recursive cleanup target.
-        if job is None or finalized:
+        completed_cleanup = job.last_finalization if job is not None else None
+        if (
+            job is None
+            or finalized
+            or (
+                completed_cleanup is not None
+                and completed_cleanup.closed
+                and completed_cleanup.zero_active_observed
+                and not completed_cleanup.failures
+            )
+        ):
             _require(
                 workspace.resolve(strict=True).parent == expected_parent
                 and not workspace.is_symlink(),
