@@ -18,7 +18,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Foreground lookup, consent, and latency | [Source-backed routing](source-backed-latency.md) |
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |
-| Packaging, CI, and installed-path qualification | [Release gates](release-gates.md) |
+| Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |
 
 Detailed contracts belong in these guides. The roadmap links to them rather than

@@ -55,6 +55,43 @@ then runs the native local LiveKit, browser LiveKit, and local launcher tests.
 `InsecureKeyLengthWarning` is promoted to an error. This is a required release job rather than an
 ambient local prerequisite.
 
+## Publishing the repository
+
+Publishing experimental alpha source does not establish desktop qualification or
+production readiness. Use this sequence when publishing a private repository:
+
+1. Confirm the target repository and record the reviewed main commit and tree.
+   Complete the [required automated checks](#required-automated-checks), including
+   the resulting main push run, before making the publication decision.
+2. Review every surface that will become public: Git history and refs, issue/PR
+   text and retained edit history, Discussions, workflow logs, and downloadable
+   artifacts. Record coverage and unavailable material. Apply the
+   [public-repository boundary](../CONTRIBUTING.md#public-repository-boundary) to
+   each surface; candidate-archive scans alone do not cover GitHub discussions or
+   historical content. Preserve the evidence while removing private details from
+   both current text and affected revision diffs. GitHub documents
+   [how to remove sensitive revision diffs](https://docs.github.com/en/communities/moderating-comments-and-conversations/tracking-changes-in-a-comment).
+3. Check licenses, third-party notices, artifact provenance, and dependency
+   advisories for the candidate. Ensure the README and
+   [implementation status](implementation-status.md) distinguish implemented
+   behavior, default activation, and completed qualification.
+4. Obtain release-owner authorization for the visibility change. During the
+   transition, enable and verify
+   [private vulnerability reporting](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository)
+   so the route in [SECURITY.md](../SECURITY.md) works. Read back main protection,
+   workflow token permissions, outside-contributor workflow approval settings,
+   and available secret-scanning/push-protection settings; inspect fresh alerts.
+5. Before announcing the public alpha, verify the published documentation,
+   sanitized history, and security-reporting route from an outside-reader
+   perspective. Record the published commit, CI run/attempt, findings resolved,
+   and remaining qualification limits in the release decision.
+
+GitHub's [visibility documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility)
+describes the transition's effects, including public access to Actions history
+and logs. GitHub's [secret-scanning documentation](https://docs.github.com/en/code-security/concepts/secret-security/secret-scanning)
+describes automatic public-repository scanning. Keep sensitive review evidence
+outside the public repository; publish only sanitized findings and decisions.
+
 ## Conversational style characterization
 
 Before changing the realtime Codex instructions, run the versioned synthetic multi-turn corpus
