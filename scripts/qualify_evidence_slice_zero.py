@@ -2390,6 +2390,7 @@ class _CtypesWindowsKernelV1:
         self._kernel32: Any | None = None
         self._job_max_active_processes: dict[int, int] = {}
         self._retryable_handles: set[int] = set()
+        self._retained_process_identities: dict[int, _WindowsKernelProcessV1] = {}
 
     @property
     def retryable_handles(self) -> tuple[int, ...]:
@@ -2404,6 +2405,7 @@ class _CtypesWindowsKernelV1:
             raise
         self._retryable_handles.discard(handle)
         self._job_max_active_processes.pop(handle, None)
+        self._retained_process_identities.pop(handle, None)
 
     def finalize_transient_handles(self) -> None:
         failures: list[BaseException] = []
@@ -2645,6 +2647,16 @@ class _CtypesWindowsKernelV1:
             ctypes.byref(ctypes.c_uint64()),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        pid = int(api.GetProcessId(ctypes.c_void_p(handle)))
+        retained = self._retained_process_identities.get(handle)
+        if retained is not None:
+            if (pid, int(creation.value)) != (retained.pid, retained.creation_filetime):
+                _windows_fail("retained process handle identity changed")
+            if api.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0:
+                # Windows may no longer expose the image name or Toolhelp row
+                # after exit. The still-retained process handle proves which
+                # previously observed process terminated; a bare PID cannot.
+                return retained
         size = ctypes.c_uint32(32768)
         image = ctypes.create_unicode_buffer(size.value)
         if not api.QueryFullProcessImageNameW(
@@ -2653,11 +2665,16 @@ class _CtypesWindowsKernelV1:
             raise ctypes.WinError(ctypes.get_last_error())
         path = Path(image.value)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        pid = int(api.GetProcessId(ctypes.c_void_p(handle)))
-        parent_pid, parent_creation = self._parent_identity(pid)
-        return _WindowsKernelProcessV1(
+        parent_pid, parent_creation = (
+            self._parent_identity(pid)
+            if retained is None
+            else (retained.parent_pid, retained.parent_creation_filetime)
+        )
+        identity = _WindowsKernelProcessV1(
             pid, parent_pid, parent_creation, int(creation.value), path.name, digest
         )
+        self._retained_process_identities[handle] = identity
+        return identity
 
     def query_job_processes(self, job: int) -> tuple[int, ...]:
         api = self._api()
@@ -2668,7 +2685,7 @@ class _CtypesWindowsKernelV1:
         buffer = (ctypes.c_byte * size)()
         returned = ctypes.c_uint32()
         if not api.QueryInformationJobObject(
-            ctypes.c_void_p(job), 8, ctypes.byref(buffer), size, ctypes.byref(returned)
+            ctypes.c_void_p(job), 3, ctypes.byref(buffer), size, ctypes.byref(returned)
         ):
             if ctypes.get_last_error() == 234:
                 _windows_fail("Job PID-list exceeded its retained active-process limit")
