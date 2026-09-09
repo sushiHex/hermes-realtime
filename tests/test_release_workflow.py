@@ -354,6 +354,49 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     assert "tests/integration/test_browser_self_acceptance.py" in browser_step
 
 
+def test_native_failure_prints_only_bounded_sanitized_logs_from_each_owned_server() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = _release_workflow()
+    native_job = workflow.split("  native-livekit:", maxsplit=1)[1]
+    integration_marker = "      - name: Run native LiveKit integration gate"
+    browser_marker = "      - name: Run real-browser self-acceptance gate"
+    diagnostics_marker = "      - name: Print sanitized LiveKit failure diagnostics"
+    cleanup_marker = "      - name: Remove owner-only Windows test temp"
+
+    assert native_job.index(integration_marker) < native_job.index(browser_marker)
+    assert native_job.index(browser_marker) < native_job.index(diagnostics_marker)
+    assert native_job.index(diagnostics_marker) < native_job.index(cleanup_marker)
+    browser_step = native_job.split(browser_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert "$env:HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR = $env:TEMP" in browser_step
+
+    diagnostics = native_job.split(diagnostics_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert "if: failure()" in diagnostics
+    assert diagnostics.count(".github/scripts/render_livekit_logs.py") == 1
+    for path in (
+        "$env:RUNNER_TEMP/livekit.out",
+        "$env:RUNNER_TEMP/livekit.err",
+        "$env:TEMP/browser-livekit.out",
+        "$env:TEMP/browser-livekit.err",
+    ):
+        assert path in diagnostics
+
+    assert "Get-Content $stdout" not in native_job
+    assert "Get-Content $stderr" not in native_job
+
+    browser_source = (
+        root / "tests" / "integration" / "test_browser_self_acceptance.py"
+    ).read_text(encoding="utf-8")
+    assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR")' in browser_source
+    assert '"browser-livekit.out"' in browser_source
+    assert '"browser-livekit.err"' in browser_source
+    assert "stdout=subprocess.DEVNULL" not in browser_source
+    assert "stderr=subprocess.DEVNULL" not in browser_source
+
+
 def test_browser_self_acceptance_accepts_only_explicit_livekit_executable_override() -> None:
     source = (
         Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py"
