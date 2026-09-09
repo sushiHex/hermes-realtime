@@ -27,6 +27,16 @@ def _server_environment(source: Mapping[str, str]) -> dict[str, str]:
     return environment
 
 
+def _redirect_diagnostics() -> None:
+    with open(os.devnull, "wb", buffering=0) as null:
+        os.dup2(null.fileno(), 1)
+        os.dup2(null.fileno(), 2)
+    # WindowsConsoleIO keeps its original console handle across dup2. Replace
+    # Python's streams as well, so interpreter shutdown flushes a valid sink.
+    # The child process owns this stream until interpreter finalization.
+    sys.stdout = sys.stderr = os.fdopen(os.dup(1), "w", encoding="utf-8")
+
+
 def _observation(
     name: str, records: tuple[object, ...], metadata: tuple[object, ...], key: bytes, complete: bool
 ) -> dict[str, Any]:
@@ -152,9 +162,7 @@ def main() -> None:
     request_fd = msvcrt.open_osfhandle(request_handle, os.O_RDONLY | os.O_BINARY)
     response_fd = msvcrt.open_osfhandle(response_handle, os.O_WRONLY | os.O_BINARY)
     # Provider/library diagnostics must not persist conversation or path data.
-    with open(os.devnull, "wb", buffering=0) as null:
-        os.dup2(null.fileno(), 1)
-        os.dup2(null.fileno(), 2)
+    _redirect_diagnostics()
     config = _read_frame(request_fd, time.monotonic() + 10)
     _require(
         type(config) is dict

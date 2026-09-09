@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import sys
@@ -13,7 +14,10 @@ import pytest
 
 @pytest.mark.skipif(os.name != "nt", reason="real retained Windows process lifecycle")
 @pytest.mark.parametrize("hidden", [False, True])
-def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidden: bool) -> None:
+@pytest.mark.parametrize("redirect", [False, True])
+def test_real_windows_job_retains_and_closes_an_exited_root(
+    tmp_path: Path, hidden: bool, redirect: bool
+) -> None:
     import msvcrt
 
     from scripts import qualify_evidence_slice_zero as core
@@ -35,12 +39,24 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
         "import os,sys,msvcrt;"
         "w=msvcrt.open_osfhandle(int(sys.argv[1]),os.O_WRONLY|os.O_BINARY);"
         "r=msvcrt.open_osfhandle(int(sys.argv[2]),os.O_RDONLY|os.O_BINARY);"
+        "sys.path.insert(0,sys.argv[3]);"
+        "from scripts.equivalence_worker import _redirect_diagnostics;"
+        "_redirect_diagnostics() if sys.argv[4]=='redirect' else None;"
+        "sys.stdout.write('synthetic buffered diagnostic');"
         "os.write(w,b'{}\\n');os.read(r,1)"
     )
     try:
         spec = core._WindowsScenarioSpecV1(
             "deterministic_equivalence",
-            (str(python), "-I", "-c", code, *map(str, handles)),
+            (
+                str(python),
+                "-I",
+                "-c",
+                code,
+                *map(str, handles),
+                str(Path(__file__).resolve().parents[1]),
+                "redirect" if redirect else "ordinary",
+            ),
             (("SystemRoot", os.environ["SYSTEMROOT"]),),
             str(tmp_path),
             2000,
@@ -76,6 +92,12 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
             assert root in job.checkpoint("running").members
             os.write(ack_write, b"a")
             kernel.wait(root.process_handle, 2000)
+            code = ctypes.c_uint32()
+            api = kernel._api()
+            api.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            api.GetExitCodeProcess.restype = ctypes.c_int
+            assert api.GetExitCodeProcess(root.process_handle, ctypes.byref(code))
+            assert code.value == 0
             return root
 
         root = core._run_with_windows_scenario_job_finalization_v1(job, exercise)
