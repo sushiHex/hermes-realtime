@@ -11,7 +11,7 @@ import struct
 import sys
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -423,6 +423,9 @@ async def _run_non_mutation_arm(
     consent: bool,
     writer_fault: bool,
     writer_block: bool = False,
+    livekit_url: str = "ws://127.0.0.1:7880",
+    typed_stimulus: str = "paired typed stimulus",
+    observe: Callable[[tuple[object, ...], tuple[object, ...]], None] | None = None,
 ) -> tuple[object, ...]:
     """Run one real host/browser/LiveKit flow with fixed typed and PCM stimuli."""
 
@@ -449,6 +452,7 @@ async def _run_non_mutation_arm(
     registration = composition.compose_full_host(
         lambda: build_local_host_launcher(
             hermes_api_bearer=None,
+            livekit_url=livekit_url,
             browser_port=port,
             room_name=f"qualification-{suffix}",
             worker_identity=f"worker_{suffix}",
@@ -503,7 +507,9 @@ async def _run_non_mutation_arm(
             origin=origin,
             path="/api/v1/input",
             bearer=token,
-            body=b'{"sequence":1,"text":"paired typed stimulus"}',
+            body=json.dumps(
+                {"sequence": 1, "text": typed_stimulus}, separators=(",", ":")
+            ).encode(),
         )
         assert status == 202 and result == {"sequence": 1, "version": 1}
         if writer_block:
@@ -559,6 +565,11 @@ async def _run_non_mutation_arm(
         assert len(block_transports) == 1
         assert block_transports[0].entered.is_set()
         assert block_transports[0].release.is_set()
+    if observe is not None:
+        assert running is not None
+        observations = composition.production_observations(running)  # type: ignore[arg-type]
+        assert observations.status().trace_complete
+        observe(composition.trace.records(), observations.records())
     return composition.trace.records()
 
 
@@ -661,7 +672,7 @@ def _qualification_fact(record: object) -> tuple[str, object]:
 
 
 async def _run_active_response_host_shutdown_arm(
-    *, tmp_path: Path, capture: bool, consent: bool
+    *, tmp_path: Path, capture: bool, consent: bool, livekit_url: str = "ws://127.0.0.1:7880"
 ) -> tuple[tuple[object, ...], tuple[object, ...], Path]:
     suffix, port = uuid.uuid4().hex[:10], _available_port()
     database = tmp_path / suffix / "capture-v1.sqlite3"
@@ -678,6 +689,7 @@ async def _run_active_response_host_shutdown_arm(
     registration = composition.compose_full_host(
         lambda: build_local_host_launcher(
             hermes_api_bearer=None,
+            livekit_url=livekit_url,
             browser_port=port,
             room_name=f"qualification-{suffix}",
             worker_identity=f"worker_{suffix}",
@@ -742,6 +754,7 @@ async def _run_active_response_host_shutdown_arm(
         closed = True
         observations = composition.production_observations(running)  # type: ignore[arg-type]
         assert observations.status().trace_complete
+        assert composition.trace.status().trace_complete
         return composition.trace.records(), observations.records(), database
     finally:
         for checkpoint in checkpoints:
