@@ -1592,6 +1592,7 @@ def validate_release_manifest(
 # no producer, report, publication, CLI, or physical-execution entry point.
 _CREATE_SUSPENDED = 0x00000004
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _SYNCHRONIZE = 0x00100000
@@ -1690,6 +1691,7 @@ class _WindowsScenarioSpecV1:
     timeout_milliseconds: int
     inherited_handles: tuple[int, ...]
     limits: _WindowsJobLimitsV1
+    no_window: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1787,6 +1789,8 @@ def _valid_windows_handle_v1(value: object) -> TypeGuard[int]:
 def _validate_windows_spec_v1(spec: _WindowsScenarioSpecV1) -> None:
     if not isinstance(spec, _WindowsScenarioSpecV1):
         _windows_fail("scenario spec has the wrong closed DTO type")
+    if type(spec.no_window) is not bool:
+        _windows_fail("scenario window policy must be an exact boolean")
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", spec.scenario_id):
         _windows_fail("scenario ID is not a closed safe identifier")
     if (
@@ -1976,7 +1980,9 @@ class _WindowsScenarioJobV1:
             and rule.root == root
         ]
         if len(applicable) != 1:
-            _windows_fail("member image cannot be classified into a closed role")
+            _windows_fail(
+                f"member image cannot be classified into a closed role: {raw.image_basename}"
+            )
         rule = applicable[0]
         if root:
             if (raw.parent_pid, raw.parent_creation_filetime) != (
@@ -2012,6 +2018,7 @@ class _WindowsScenarioJobV1:
             | _CREATE_NEW_PROCESS_GROUP
             | _CREATE_UNICODE_ENVIRONMENT
             | _EXTENDED_STARTUPINFO_PRESENT
+            | (_CREATE_NO_WINDOW if self._spec.no_window else 0)
         )
         try:
             job = self._ensure_job()
@@ -2127,7 +2134,13 @@ class _WindowsScenarioJobV1:
                 and not member.root
                 and member.identity.parent_pid not in current
             ):
-                _windows_fail("observed descendant parent is outside the Job")
+                parent = self._members.get(member.identity.parent_pid)
+                if label != "pre-cleanup" or parent is None:
+                    _windows_fail("observed descendant parent is outside the Job")
+                # A retained exited root can leave a console helper alive for
+                # final Job termination. Require the exact parent handle to be
+                # signaled; missing membership alone never proves parent exit.
+                self._kernel.wait(parent.process_handle, 0)
         return _WindowsMembershipSnapshotV1(
             label, tuple(self._members[pid] for pid in sorted(current))
         )

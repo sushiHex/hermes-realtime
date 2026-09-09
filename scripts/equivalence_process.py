@@ -176,6 +176,8 @@ def run_archived_equivalence(
     base_python = Path(sys._base_executable).resolve(strict=True)  # type: ignore[attr-defined]
     python_hash = hashlib.sha256(python.read_bytes()).hexdigest()
     base_hash = hashlib.sha256(base_python.read_bytes()).hexdigest()
+    console_host = Path(os.environ["SYSTEMROOT"]) / "System32" / "conhost.exe"
+    console_hash = hashlib.sha256(console_host.read_bytes()).hexdigest()
     kernel = core._CtypesWindowsKernelV1()
     runner_handle = kernel.open_process(
         os.getpid(), core._SYNCHRONIZE | core._PROCESS_QUERY_LIMITED_INFORMATION
@@ -236,6 +238,7 @@ def run_archived_equivalence(
                 10_000,
                 handles,
                 core._WindowsJobLimitsV1(8, 2 * 1024**3, 4 * 1024**3),
+                no_window=True,
             )
             rules = (
                 core._WindowsRoleRuleV1("host_root", python.name, python_hash, frozenset(), True),
@@ -247,6 +250,13 @@ def run_archived_equivalence(
                     livekit.name,
                     livekit_sha256,
                     frozenset({"host_root", "host_runtime"}),
+                    False,
+                ),
+                core._WindowsRoleRuleV1(
+                    "console_owned_descendant",
+                    console_host.name,
+                    console_hash,
+                    frozenset({"host_root", "host_runtime", "livekit_owned_descendant"}),
                     False,
                 ),
             )
@@ -359,6 +369,7 @@ def run_archived_equivalence(
         _executable(livekit, livekit_sha256)
         _executable(python, python_hash)
         _executable(base_python, base_hash)
+        _executable(console_host, console_hash)
         return (
             metadata,
             core.canonical_json_bytes(rows),
