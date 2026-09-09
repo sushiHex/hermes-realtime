@@ -4,6 +4,9 @@ Hermes Realtime welcomes focused bug fixes, tests, documentation, provider integ
 
 ## Before opening a pull request
 
+- Start with the [Collaborator guide](docs/README.md), [Roadmap](docs/roadmap.md),
+  and [Implementation status](docs/implementation-status.md) to find current
+  priorities, existing code, and outstanding qualification work.
 - Use GitHub Issues for reproducible bugs and bounded feature proposals.
 - Discuss substantial API, protocol, persistence, or authority changes before implementation.
 - Report vulnerabilities privately through GitHub's private vulnerability reporting; do not open a public security issue.
@@ -77,6 +80,25 @@ A pull request should state:
 - limitations or unverified physical/perceptual claims.
 
 Passing tests are necessary but not sufficient. New acceptance claims must derive from the real production path rather than a test-only façade or caller-supplied success value.
+
+## Documentation maintenance
+
+Keep the [roadmap](docs/roadmap.md) focused on work order and completion criteria.
+Keep the [status page](docs/implementation-status.md) focused on implementation,
+activation/default behavior, and qualification evidence. Detailed contracts and
+procedures belong in the implementation guides linked from the
+[documentation index](docs/README.md).
+
+Update the affected documents in the same PR as a behavior or default change.
+Link the source, relevant tests, and issue/PR; state what remains unverified. New
+qualification claims must identify the exact candidate and run/attempt or the
+permitted qualification artifact. A passing policy test, a skipped integration
+test, and a completed installed-path check establish different things.
+
+Record a new reviewed commit with the affected capability; advance the page-wide
+baseline only after reviewing the whole map. Keep mutable PR state in GitHub and
+private deployment plans and sensitive qualification material outside the public
+documentation.
 
 ## Dependencies and generated assets
 

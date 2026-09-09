@@ -1,16 +1,18 @@
 # Evidence capture boundary
 
-This document freezes the evidence-only Slice 0 policy before production evidence
-code exists. Task 1 adds documentation and executable repository-policy checks only;
-it does not add capture, consent, storage, status, purge, or review behavior.
+This document defines the evidence-only Slice 0 policy. The host now contains
+capture controls and admission, lifecycle, storage, status, and purge implementation.
+Full Slice 0 qualification is incomplete. See [Implementation status](implementation-status.md)
+for source, test coverage, and the outstanding scenario producers, and the
+[Roadmap](roadmap.md) for the implementation sequence.
 
 ## Status and activation
 
 Evidence capture is disabled by default.
 Operator enablement is not consent.
 
-An eventual host flag may make authenticated controls available, but only an exact,
-current disclosure accepted for the current browser/media binding may begin capture.
+The host's `--evidence-capture` flag makes authenticated controls available, but only
+an exact, current disclosure accepted for the current browser/media binding may begin capture.
 The conversation-only local launcher remains capture-disabled. A disable override must
 win over every enablement path.
 

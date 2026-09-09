@@ -1,14 +1,30 @@
 # Release gates
 
-A release candidate is accepted only when the tracked **Release Gates** workflow
-passes both Windows jobs. The gate never packages the active checkout: it uses
-`git archive HEAD` to create a temporary candidate, so ignored `dist/`,
-`web/tmp/`, virtual environments, old archives, local tool downloads, and the
-tracked `.hermes/` planning metadata excluded by `.gitattributes` cannot enter
-a fresh wheel or source distribution. The pre-archive committed-blob secret
-scan still inspects export-ignored paths.
+Automated candidate acceptance requires all four jobs in the tracked
+[Release Gates workflow](../.github/workflows/release-gates.yml). These checks
+qualify their exercised scope; human-assisted and installed-service claims retain
+the separate gates documented below. See [Implementation status](implementation-status.md)
+for the reviewed candidate and remaining qualification.
+
+The Windows release gates build from a verified committed source archive, not
+dirty checkout bytes. Ignored build output, virtual environments, and local tool
+downloads cannot enter that archive. The pre-archive committed-blob secret scan
+still inspects export-ignored paths.
 
 ## Required automated checks
+
+| Job | Responsibility |
+| --- | --- |
+| Pure candidate wheel | Build the candidate wheel and hash-identified offline dependency closure. |
+| Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
+| Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
+| Native LiveKit release integration | Run the Windows gates with the pinned local LiveKit server and the real-browser self-acceptance check. |
+
+Before an authorized merge, require the reviewed candidate's four PR checks to
+pass. After merging, wait for all four jobs in the resulting exact-commit `main`
+push run to complete on attempt 1 before advancing to the next candidate. Preserve
+any failed run and investigate it; an earlier green PR run does not replace the
+main push result. Head or base changes require requalification of the new candidate.
 
 The `release-candidate` job runs, from that fresh candidate:
 
