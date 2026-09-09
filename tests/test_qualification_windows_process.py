@@ -17,6 +17,7 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
     import msvcrt
 
     from scripts import qualify_evidence_slice_zero as core
+    from scripts.equivalence_process import _read_frame
 
     kernel = core._CtypesWindowsKernelV1()
     runner_handle = kernel.open_process(
@@ -24,18 +25,26 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
     )
     raw = kernel.query_process_identity(runner_handle)
     python = Path(sys._base_executable).resolve()
-    image_hash = hashlib.sha256(python.read_bytes()).hexdigest()
     console = Path(os.environ["SYSTEMROOT"]) / "System32" / "conhost.exe"
     read_fd, write_fd = os.pipe()
+    ack_read, ack_write = os.pipe()
     os.set_inheritable(write_fd, True)
+    os.set_inheritable(ack_read, True)
+    handles = (msvcrt.get_osfhandle(write_fd), msvcrt.get_osfhandle(ack_read))
+    code = (
+        "import os,sys,msvcrt;"
+        "w=msvcrt.open_osfhandle(int(sys.argv[1]),os.O_WRONLY|os.O_BINARY);"
+        "r=msvcrt.open_osfhandle(int(sys.argv[2]),os.O_RDONLY|os.O_BINARY);"
+        "os.write(w,b'{}\\n');os.read(r,1)"
+    )
     try:
         spec = core._WindowsScenarioSpecV1(
             "deterministic_equivalence",
-            (str(python), "-I", "-c", "import time; time.sleep(0.2)"),
+            (str(python), "-I", "-c", code, *map(str, handles)),
             (("SystemRoot", os.environ["SYSTEMROOT"]),),
             str(tmp_path),
             2000,
-            (msvcrt.get_osfhandle(write_fd),),
+            handles,
             core._WindowsJobLimitsV1(4, 1024**3, 2 * 1024**3),
             no_window=hidden,
         )
@@ -44,7 +53,13 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
             spec,
             core._WindowsRunnerIdentityV1(raw.pid, raw.creation_filetime),
             (
-                core._WindowsRoleRuleV1("host_root", python.name, image_hash, frozenset(), True),
+                core._WindowsRoleRuleV1(
+                    "host_root",
+                    python.name,
+                    hashlib.sha256(python.read_bytes()).hexdigest(),
+                    frozenset(),
+                    True,
+                ),
                 core._WindowsRoleRuleV1(
                     "console_owned_descendant",
                     console.name,
@@ -54,22 +69,20 @@ def test_real_windows_job_retains_and_closes_an_exited_root(tmp_path: Path, hidd
                 ),
             ),
         )
-        root = job.launch_root()
-        time.sleep(0.05)
-        assert root in job.checkpoint("running").members
-        try:
-            result = core._run_with_windows_scenario_job_finalization_v1(
-                job, lambda: kernel.wait(root.process_handle, 2000)
-            )
-        except core._WindowsFinalizationError as error:
-            raise AssertionError(
-                [(failure.operation, failure.message) for failure in error.result.failures]
-            ) from error
-        assert result is None
+
+        def exercise() -> core._WindowsBoundProcessV1:
+            root = job.launch_root()
+            assert _read_frame(read_fd, time.monotonic() + 5) == {}
+            assert root in job.checkpoint("running").members
+            os.write(ack_write, b"a")
+            kernel.wait(root.process_handle, 2000)
+            return root
+
+        root = core._run_with_windows_scenario_job_finalization_v1(job, exercise)
         assert job.last_finalization is not None
         assert job.last_finalization.closed and job.last_finalization.zero_active_observed
         assert root.process_handle in job.last_finalization.waited_handles
     finally:
-        os.close(read_fd)
-        os.close(write_fd)
+        for fd in (read_fd, write_fd, ack_read, ack_write):
+            os.close(fd)
         kernel.close_handle(runner_handle)

@@ -200,10 +200,12 @@ def _validate_trace_set(rows: Any) -> None:
         "perturbed ingress failed to change committed context",
     )
     for group in (rows[:4], rows[5:8]):
-        expected = [item for item in group[0]["close"] if item["stage"] not in _EVIDENCE_CLOSE]
+        expected_close = [
+            item for item in group[0]["close"] if item["stage"] not in _EVIDENCE_CLOSE
+        ]
         for row in group[1:]:
             actual = [item for item in row["close"] if item["stage"] not in _EVIDENCE_CLOSE]
-            _require(actual == expected, "capture changed ordinary close ordering")
+            _require(actual == expected_close, "capture changed ordinary close ordering")
 
 
 class ObservedEquivalenceV1:

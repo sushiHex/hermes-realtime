@@ -358,7 +358,7 @@ def run_archived_equivalence(
                 api.GetExitCodeProcess.restype = ctypes.c_int
                 if not api.GetExitCodeProcess(root_process.process_handle, ctypes.byref(code)):
                     raise ctypes.WinError(ctypes.get_last_error())
-                _require(code.value == 0, "archived worker exit code is nonzero")
+                _require(code.value == 0, f"archived worker exit code is {code.value}")
                 return int(code.value)
 
             exit_code = core._run_with_windows_scenario_job_finalization_v1(job, execute)
