@@ -425,7 +425,7 @@ async def _run_non_mutation_arm(
     writer_block: bool = False,
     livekit_url: str = "ws://127.0.0.1:7880",
     typed_stimulus: str = "paired typed stimulus",
-    observe: Callable[[tuple[object, ...], tuple[object, ...]], None] | None = None,
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool], None] | None = None,
 ) -> tuple[object, ...]:
     """Run one real host/browser/LiveKit flow with fixed typed and PCM stimuli."""
 
@@ -569,7 +569,11 @@ async def _run_non_mutation_arm(
         assert running is not None
         observations = composition.production_observations(running)  # type: ignore[arg-type]
         assert observations.status().trace_complete
-        observe(composition.trace.records(), observations.records())
+        observe(
+            composition.trace.records(),
+            observations.records(),
+            composition.trace.status().trace_complete and observations.status().trace_complete,
+        )
     return composition.trace.records()
 
 
@@ -672,7 +676,12 @@ def _qualification_fact(record: object) -> tuple[str, object]:
 
 
 async def _run_active_response_host_shutdown_arm(
-    *, tmp_path: Path, capture: bool, consent: bool, livekit_url: str = "ws://127.0.0.1:7880"
+    *,
+    tmp_path: Path,
+    capture: bool,
+    consent: bool,
+    livekit_url: str = "ws://127.0.0.1:7880",
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool], None] | None = None,
 ) -> tuple[tuple[object, ...], tuple[object, ...], Path]:
     suffix, port = uuid.uuid4().hex[:10], _available_port()
     database = tmp_path / suffix / "capture-v1.sqlite3"
@@ -755,6 +764,12 @@ async def _run_active_response_host_shutdown_arm(
         observations = composition.production_observations(running)  # type: ignore[arg-type]
         assert observations.status().trace_complete
         assert composition.trace.status().trace_complete
+        if observe is not None:
+            observe(
+                composition.trace.records(),
+                observations.records(),
+                composition.trace.status().trace_complete and observations.status().trace_complete,
+            )
         return composition.trace.records(), observations.records(), database
     finally:
         for checkpoint in checkpoints:

@@ -18,6 +18,7 @@ def _module() -> Any:
 def _arm(name: str, *, shutdown: bool = False) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     if shutdown:
+        records.append({"kind": "committed_conversation_context_snapshot", "value": "1" * 64})
         records.append({"kind": "cancellation", "value": "host_shutdown"})
     else:
         for _ in range(2):
@@ -31,19 +32,38 @@ def _arm(name: str, *, shutdown: bool = False) -> dict[str, Any]:
                     )
                 )
             )
-    records.extend(
-        (
-            {"kind": "foreground_cleanup", "value": True},
-            {"kind": "host_return", "value": "returned"},
-        )
-    )
+    if shutdown:
+        records.append({"kind": "foreground_cleanup", "value": True})
+    records.append({"kind": "host_return", "value": "returned"})
     return {
         "arm": name,
         "complete": True,
         "records": records,
+        "terminals": (
+            [{"disposition": "cancelled", "reason": "host_shutdown", "contextCommitted": False}]
+            if name == "shutdown_consented"
+            else [
+                {
+                    "disposition": "completed",
+                    "reason": "authoritative_close_completed",
+                    "contextCommitted": True,
+                }
+            ]
+            * 2
+            if name in {"consented", "blocked", "faulted"}
+            else []
+        ),
         "close": [
             {"stage": stage, "result": "succeeded"}
-            for stage in ("browser_client", "foreground_close", "speech_loop", "launcher")
+            for stage in (
+                "browser_client",
+                "foreground_close",
+                "speech_loop",
+                "update_executor",
+                "binding_cleanup",
+                "livekit_worker",
+                "launcher",
+            )
         ],
     }
 
@@ -83,6 +103,8 @@ def test_validator_accepts_only_the_complete_ordered_comparison_with_negative_co
         "failed_cleanup",
         "unproven_close",
         "missing_close_stage",
+        "missing_terminals",
+        "invented_terminal",
         "unknown_field",
         "unkeyed_text",
         "bool_as_version",
@@ -118,13 +140,20 @@ def test_missing_disconnected_or_changed_observations_never_pass(mutation: str) 
         rows[2]["records"][0]["value"] = "5" * 64
     elif mutation == "failed_cleanup":
         for row in rows:
-            row["records"][-2]["value"] = False
+            for record in row["records"]:
+                if record["kind"] == "foreground_cleanup":
+                    record["value"] = False
     elif mutation == "unproven_close":
         for row in rows:
             row["close"] = []
     elif mutation == "missing_close_stage":
         for row in rows:
             row["close"] = [item for item in row["close"] if item["stage"] != "foreground_close"]
+    elif mutation == "missing_terminals":
+        for row in rows:
+            row["terminals"] = []
+    elif mutation == "invented_terminal":
+        rows[2]["terminals"][0]["contextCommitted"] = 1
     elif mutation == "unknown_field":
         rows[0]["passed"] = True
     elif mutation == "unkeyed_text":

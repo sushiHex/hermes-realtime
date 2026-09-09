@@ -85,8 +85,27 @@ def _validate_trace_set(rows: Any) -> None:
     """Independently derive equality; plain observations never mint run authority."""
     _require(type(rows) is list and len(rows) == len(ARMS_V1), "incomplete comparison matrix")
     for name, row in zip(ARMS_V1, rows, strict=True):
-        _keys(row, {"arm", "complete", "records", "close"})
+        _keys(row, {"arm", "complete", "records", "close", "terminals"})
         _require(row["arm"] == name and row["complete"] is True, "wrong or incomplete arm")
+        terminals = row["terminals"]
+        expected_terminals = (
+            [("cancelled", "host_shutdown", False)]
+            if name == "shutdown_consented"
+            else [("completed", "authoritative_close_completed", True)] * 2
+            if name in {"consented", "blocked", "faulted"}
+            else []
+        )
+        _require(
+            type(terminals) is list and len(terminals) == len(expected_terminals),
+            "terminal settlement observations are missing or duplicated",
+        )
+        for item, expected in zip(terminals, expected_terminals, strict=True):
+            _keys(item, {"disposition", "reason", "contextCommitted"})
+            _require(
+                type(item["contextCommitted"]) is bool
+                and (item["disposition"], item["reason"], item["contextCommitted"]) == expected,
+                "terminal settlement differs from the production contract",
+            )
         records = row["records"]
         _require(type(records) is list and 1 <= len(records) <= 257, "trace is empty or oversized")
         for record in records:
@@ -114,15 +133,18 @@ def _validate_trace_set(rows: Any) -> None:
             kinds[-1] == "host_return" and kinds.count("host_return") == 1,
             "host return is not exactly terminal",
         )
-        _require(kinds.count("foreground_cleanup") >= 1, "foreground cleanup is absent")
         if name.startswith("shutdown_"):
             _require(
-                kinds.count("cancellation") == 1 and not _CONTENT_KINDS.intersection(kinds),
+                kinds.count("cancellation") == 1
+                and kinds.count("foreground_cleanup") == 1
+                and kinds.count("committed_conversation_context_snapshot") == 1
+                and not {"generated_text", "transport_confirmed_chunk"}.intersection(kinds),
                 "active-response cancellation is unproven",
             )
         else:
             _require(
-                all(kinds.count(kind) >= 2 for kind in _CONTENT_KINDS),
+                all(kinds.count(kind) == 2 for kind in _CONTENT_KINDS)
+                and "foreground_cleanup" not in kinds,
                 "typed and PCM conversation observations are absent",
             )
             _require("cancellation" not in kinds, "unexpected conversation cancellation")

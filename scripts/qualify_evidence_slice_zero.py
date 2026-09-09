@@ -1773,8 +1773,13 @@ class _WindowsFinalizationResultV1:
 
 
 class _WindowsFinalizationError(_WindowsScenarioJobError):
-    def __init__(self, result: _WindowsFinalizationResultV1) -> None:
+    def __init__(
+        self,
+        result: _WindowsFinalizationResultV1,
+        owner: _WindowsScenarioJobV1 | None = None,
+    ) -> None:
         self.result = result
+        self.owner = owner
         super().__init__("Windows scenario finalization left retryable retained authority")
 
 
@@ -2293,7 +2298,7 @@ class _WindowsScenarioJobV1:
         )
         self._last_finalization = result
         if failures:
-            raise _WindowsFinalizationError(result)
+            raise _WindowsFinalizationError(result, self)
         return result
 
 

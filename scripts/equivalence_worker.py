@@ -28,9 +28,12 @@ def _server_environment(source: Mapping[str, str]) -> dict[str, str]:
 
 
 def _observation(
-    name: str, records: tuple[object, ...], metadata: tuple[object, ...], key: bytes
+    name: str, records: tuple[object, ...], metadata: tuple[object, ...], key: bytes, complete: bool
 ) -> dict[str, Any]:
-    from hermes_realtime.production_observation import CloseStageObservationV1
+    from hermes_realtime.production_observation import (
+        CloseStageObservationV1,
+        TerminalSettledObservationV1,
+    )
     from tests.support import qualification as trace
 
     context_type = trace._CommittedConversationContextSnapshotQualificationObservationV1
@@ -59,8 +62,17 @@ def _observation(
         result.append({"kind": kind, "value": value})
     return {
         "arm": name,
-        "complete": True,
+        "complete": complete,
         "records": result,
+        "terminals": [
+            {
+                "disposition": cast(Any, item).terminal_disposition.value,
+                "reason": cast(Any, item).terminal_reason.value,
+                "contextCommitted": cast(Any, item).context_committed,
+            }
+            for item in metadata
+            if type(item) is TerminalSettledObservationV1
+        ],
         "close": [
             {"stage": cast(Any, item).stage.value, "result": cast(Any, item).result.value}
             for item in metadata
@@ -92,25 +104,26 @@ async def _run_arms(workspace: Path, livekit_url: str, emit: Any) -> None:
     source_root = Path(__file__).resolve().parent.parent
     for name in ARMS_V1:
         observed: list[dict[str, Any]] = []
+
+        def observe(
+            raw: tuple[object, ...],
+            metadata: tuple[object, ...],
+            complete: bool,
+            *,
+            arm_name: str = name,
+            output: list[dict[str, Any]] = observed,
+        ) -> None:
+            output.append(_observation(arm_name, raw, metadata, key, complete))
+
         if name.startswith("shutdown_"):
-            raw, metadata, _database = await _run_active_response_host_shutdown_arm(
+            await _run_active_response_host_shutdown_arm(
                 tmp_path=workspace,
                 capture=name != "shutdown_disabled",
                 consent=name == "shutdown_consented",
                 livekit_url=livekit_url,
+                observe=observe,
             )
-            observed.append(_observation(name, raw, metadata, key))
         else:
-
-            def observe(
-                raw: tuple[object, ...],
-                metadata: tuple[object, ...],
-                *,
-                arm_name: str = name,
-                output: list[dict[str, Any]] = observed,
-            ) -> None:
-                output.append(_observation(arm_name, raw, metadata, key))
-
             await _run_non_mutation_arm(
                 tmp_path=workspace,
                 capture=name not in {"disabled", "perturbed"},
@@ -200,10 +213,7 @@ def main() -> None:
             "rtc": {
                 "tcp_port": rtc_tcp,
                 "udp_port": rtc_udp,
-                "node_ip": "127.0.0.1",
                 "use_external_ip": False,
-                "enable_loopback_candidate": True,
-                "ips": {"includes": ["127.0.0.0/8"]},
                 "stun_servers": [],
             },
         }

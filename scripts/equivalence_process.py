@@ -377,6 +377,20 @@ def run_archived_equivalence(
             finalization,
             exit_code,
         )
+    except BaseException as primary:
+        # Retry cleanup once, never the scenario. Preserve the original failure
+        # even if the retry releases everything. A further failure retains its
+        # Job owner on the exception for explicit subsequent cleanup.
+        failed_cleanup = job.last_finalization if job is not None else None
+        if job is not None and failed_cleanup is not None and not failed_cleanup.closed:
+            try:
+                job.finalize()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "equivalence failed and retained cleanup still needs attention",
+                    [primary, cleanup],
+                ) from None
+        raise
     finally:
         kernel.close_handle(runner_handle)
         # Never remove a running scenario's files. The known, fresh temporary
