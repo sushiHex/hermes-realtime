@@ -32,11 +32,29 @@ checkpoint transport, host lifecycle, and ICU setup are unchanged.
 
 The completion operation drains stderr and waits for exit under one five-second
 timeout. It does not grant separate five-second budgets to reading and waiting.
-An expired completion still fails the test; its existing cleanup kills a live
-child and waits at most five seconds to reap it. The fixture now also closes its
-parent stderr stream explicitly. A regression injects a completion timeout to
-verify propagation, reaping, stream closure, and incomplete timing observations.
-Startup, checkpoint, workflow, and job timeout authorities are unchanged.
+The async fixture retains and shields the communication task. Cancellation stops
+the awaiter without cancelling that task's ownership of the subprocess streams.
+Cleanup kills a live child and waits for the existing communication call to end.
+If that call timed out, a sequential `communicate()` retry finishes the Windows
+reader and reaps the child. Two communication calls never run concurrently.
+
+Settlement and any retry share one five-second cleanup deadline, measured before
+the kill. Repeated cancellation does not restart it or abandon the worker. The
+fixture closes the parent stderr stream only after communication has settled,
+then propagates the original timeout or cancellation. A cleanup deadline failure
+is still fatal: it does not emit `cleanup_returned` or close a stream still owned
+by active communication. Startup, checkpoint, workflow, and job timeout
+authorities are unchanged.
+
+The real-interruption regression runs the actual Windows `communicate()` and
+reader against a child held in its close operation. After EOF, an event barrier
+pauses reader-thread retirement to expose the ordering deterministically. The
+original fixture returned while that thread was still active for a real timeout,
+cancellation, and repeated cancellation. The corrected fixture remains pending
+until the barrier is released. The regression then checks the original exception,
+non-overlapping communication calls, reader retirement, stream closure, and
+process reaping. The test's synchronization watchdogs do not change the fixture's
+completion or cleanup budgets.
 
 ## Local comparison
 
@@ -66,7 +84,9 @@ it is not timeout headroom.
 ## Retained observations and bounded repetition
 
 The fixture emits one `[checkpoint-child]` JSON line after cleanup. Ordinary
-pytest capture retains it on failure; `-s` exposes passing samples. It contains
+pytest capture retains it on failure; `-s` exposes passing samples. Tests that
+parse the line replay the captured output before asserting, preserving the line
+if a later assertion fails. It contains
 only a version, fixed case name, PID, outcome flags, exit code, stderr byte
 count, and monotonic event offsets. It contains no stderr text, command line,
 environment, checkpoint nonce, or filesystem path.
@@ -81,8 +101,10 @@ The event offsets are milliseconds from the parent's process-creation attempt:
 - `cleanup_entered` / `cleanup_returned`: the fixture's cleanup interval.
 
 These are parent observations, not child-side timestamps. Closing the ACK writer
-does not measure when the child processes EOF. A missing event or a null stderr
-count means it was not observed, not that its duration or byte count was zero.
+does not measure when the child processes EOF. A missing event means that boundary
+was not observed. A null stderr count means the normal completion path did not
+return a measurement; it does not mean zero bytes or claim that no output was
+drained during cleanup.
 A killed child's exit code is a cleanup result, not its natural exit status.
 
 From a clean checkout of the candidate, run a bounded Windows comparison:
@@ -106,7 +128,7 @@ test outcome. A new timing sample does not authorize a CI rerun, timeout increas
 or issue closure. Further hosted evidence is required to resolve the historical
 child-exit failure.
 
-## Local validation
+## Initial candidate validation (`48ce86b…`)
 
 - RED: the injected 64 KiB stderr write timed out at the unchanged five-second
   wait before the drain fix.
@@ -119,5 +141,21 @@ child-exit failure.
 - `uv run --frozen ruff check .`: passed.
 - `uv run --frozen mypy src`: passed, 76 source files.
 
-These are local Windows checks. Hosted release gates have not been run for this
-change, and issue #13 remains open.
+Hosted run [34318730626](https://github.com/sushiHex/hermes-realtime/actions/runs/34318730626)
+subsequently passed all four jobs on attempt 1 for this initial candidate.
+Those results do not qualify a later revision. Issue #13 remains open.
+
+## Communication ownership follow-up
+
+- RED: a real timeout, cancellation, and repeated cancellation each let the
+  `48ce86b…` fixture return while its Windows reader thread was held at the
+  retirement barrier. The observation parser also consumed the diagnostic line.
+- GREEN: those cases pass with explicit communication ownership. Cancellation
+  during the timeout-cleanup retry also preserves the original timeout.
+- All 24 checkpoint cases passed locally: the 23-case checkpoint run plus the
+  added retry-cancellation case, then all 24 again within the full default suite.
+- Full default Python suite: 3,203 passed, 21 skipped in 357.51 seconds.
+- Ruff and mypy pass; the latter checks 76 source files.
+
+The retained 40-sample JSON is unchanged. These checks qualify the local
+follow-up; hosted results must be bound to its eventual exact commit separately.
