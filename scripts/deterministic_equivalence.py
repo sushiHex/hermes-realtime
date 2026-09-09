@@ -37,39 +37,48 @@ _CONTENT_KINDS = frozenset(
         "transport_confirmed_chunk",
     }
 )
-_EVIDENCE_CLOSE = frozenset(
-    {
-        "writer_drain",
-        "writer_stop",
-        "transport_close",
-        "evidence_runtime",
-        "retention_cancellation",
-    }
+_CONVERSATION_KINDS = (
+    "committed_conversation_context_snapshot",
+    "generated_text",
+    "transport_confirmed_chunk",
+) * 2 + ("host_return",)
+_SHUTDOWN_KINDS = (
+    "committed_conversation_context_snapshot",
+    "cancellation",
+    "foreground_cleanup",
+    "host_return",
 )
-_CLOSE_STAGES = frozenset(
-    {
-        "binding_cleanup",
-        "browser_client",
-        "consent_settlement",
-        "epoch_retirement",
-        "evidence_runtime",
-        "foreground_close",
-        "host_work",
-        "launcher",
-        "livekit_worker",
-        "retention_cancellation",
-        "revoke_observer_cancellation",
-        "session_worker",
-        "speech_loop",
-        "transport_close",
-        "update_executor",
-        "writer_drain",
-        "writer_stop",
-    }
+_ORDINARY_CLOSE = (
+    "browser_client",
+    "foreground_close",
+    "speech_loop",
+    "update_executor",
+    "binding_cleanup",
+    "livekit_worker",
 )
-_FAULT_PROPAGATION = frozenset(
-    {"writer_drain", "writer_stop", "evidence_runtime", "browser_client", "launcher"}
-)
+
+
+def _expected_close(name: str) -> list[dict[str, str]]:
+    evidence: tuple[str, ...]
+    if name == "faulted":
+        evidence = ("retention_cancellation", "writer_drain", "evidence_runtime")
+    elif name in {"consented", "blocked", "shutdown_consented"}:
+        evidence = (
+            "retention_cancellation",
+            "writer_drain",
+            "writer_stop",
+            "transport_close",
+            "evidence_runtime",
+        )
+    elif name in {"unconsented", "shutdown_unconsented"}:
+        evidence = ("evidence_runtime",)
+    else:
+        evidence = ()
+    failed = {"writer_drain", "evidence_runtime", "launcher"} if name == "faulted" else set()
+    return [
+        {"stage": stage, "result": "failed" if stage in failed else "succeeded"}
+        for stage in (*_ORDINARY_CLOSE, *evidence, "launcher")
+    ]
 
 
 def _require(condition: bool, message: str) -> None:
@@ -128,54 +137,14 @@ def _validate_trace_set(rows: Any) -> None:
                 )
             else:
                 raise ValueError("unknown trace kind")
-        kinds = [record["kind"] for record in records]
+        expected_kinds = _SHUTDOWN_KINDS if name.startswith("shutdown_") else _CONVERSATION_KINDS
         _require(
-            kinds[-1] == "host_return" and kinds.count("host_return") == 1,
-            "host return is not exactly terminal",
-        )
-        if name.startswith("shutdown_"):
-            _require(
-                kinds.count("cancellation") == 1
-                and kinds.count("foreground_cleanup") == 1
-                and kinds.count("committed_conversation_context_snapshot") == 1
-                and not {"generated_text", "transport_confirmed_chunk"}.intersection(kinds),
-                "active-response cancellation is unproven",
-            )
-        else:
-            _require(
-                all(kinds.count(kind) == 2 for kind in _CONTENT_KINDS)
-                and "foreground_cleanup" not in kinds,
-                "typed and PCM conversation observations are absent",
-            )
-            _require("cancellation" not in kinds, "unexpected conversation cancellation")
-        close = row["close"]
-        _require(type(close) is list and 1 <= len(close) <= 256, "close observations are absent")
-        for item in close:
-            _keys(item, {"stage", "result"})
-            _require(
-                type(item["stage"]) is str and item["stage"] in _CLOSE_STAGES, "unknown close stage"
-            )
-            allowed = (
-                {"succeeded", "failed"}
-                if name == "faulted" and item["stage"] in _FAULT_PROPAGATION
-                else {"succeeded"}
-            )
-            _require(
-                item["result"] in allowed, "close failed outside the characterized writer fault"
-            )
-        _require(
-            sum(item["stage"] == "launcher" for item in close) == 1, "launcher close is unproven"
-        )
-        stages = [item["stage"] for item in close]
-        _require(
-            {"browser_client", "foreground_close", "speech_loop"} <= set(stages),
-            "ordinary close stages are absent",
+            tuple(record["kind"] for record in records) == expected_kinds,
+            "conversation lifecycle observations are missing, duplicated, or reordered",
         )
         _require(
-            stages.index("browser_client") < stages.index("foreground_close")
-            and stages.index("browser_client") < stages.index("speech_loop")
-            and stages[-1] == "launcher",
-            "ordinary close stage order is invalid",
+            row["close"] == _expected_close(name),
+            "close lifecycle differs from the complete ordered production contract",
         )
     baseline = rows[0]["records"]
     for row in rows[1:4]:
@@ -199,13 +168,6 @@ def _validate_trace_set(rows: Any) -> None:
         contexts(rows[8]) != contexts(rows[0]),
         "perturbed ingress failed to change committed context",
     )
-    for group in (rows[:4], rows[5:8]):
-        expected_close = [
-            item for item in group[0]["close"] if item["stage"] not in _EVIDENCE_CLOSE
-        ]
-        for row in group[1:]:
-            actual = [item for item in row["close"] if item["stage"] not in _EVIDENCE_CLOSE]
-            _require(actual == expected_close, "capture changed ordinary close ordering")
 
 
 class ObservedEquivalenceV1:

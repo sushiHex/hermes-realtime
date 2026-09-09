@@ -23,7 +23,9 @@ return. The writer-fault arm must preserve the conversation facts and retain its
 failed host return. An unchanged committed context in the changed-input control
 fails validation. Missing, duplicate, incomplete, or unexpected observations fail.
 
-Raw content stays in the child process. A fresh in-memory HMAC key binds each
+Raw comparison records stay in the child process. Capture arms exercise a real
+temporary SQLite store, removed with the owned workspace after process cleanup.
+A fresh in-memory HMAC key binds each
 content observation to its kind; only commitments and closed lifecycle facts cross
 the inherited pipe. The key is discarded with the child. Commitments support
 comparison within one invocation and cannot be compared across invocations.

@@ -86,7 +86,6 @@ def _arm(name: str, *, shutdown: bool = False) -> dict[str, Any]:
 def _observations() -> list[dict[str, Any]]:
     rows = [_arm(name) for name in ("disabled", "unconsented", "consented", "blocked", "faulted")]
     rows[4]["records"][-1]["value"] = "failed"
-    rows[4]["close"][-1]["result"] = "failed"
     rows.extend(
         _arm(name, shutdown=True)
         for name in ("shutdown_disabled", "shutdown_unconsented", "shutdown_consented")
@@ -94,6 +93,28 @@ def _observations() -> list[dict[str, Any]]:
     control = _arm("perturbed")
     control["records"][0]["value"] = "4" * 64
     rows.append(control)
+    for row in rows:
+        name = row["arm"]
+        extra = (
+            ["retention_cancellation", "writer_drain", "evidence_runtime"]
+            if name == "faulted"
+            else [
+                "retention_cancellation",
+                "writer_drain",
+                "writer_stop",
+                "transport_close",
+                "evidence_runtime",
+            ]
+            if name in {"consented", "blocked", "shutdown_consented"}
+            else ["evidence_runtime"]
+            if name in {"unconsented", "shutdown_unconsented"}
+            else []
+        )
+        row["close"][-1:-1] = [{"stage": stage, "result": "succeeded"} for stage in extra]
+        if name == "faulted":
+            for item in row["close"]:
+                if item["stage"] in {"writer_drain", "evidence_runtime", "launcher"}:
+                    item["result"] = "failed"
     return rows
 
 
@@ -226,3 +247,40 @@ def test_server_environment_preserves_windows_system_keys_without_inheriting_hos
     assert result["SystemDrive"] == "drive"
     assert result["TEMP"] == "temporary"
     assert "API_SERVER_KEY" not in result and "PYTHONPATH" not in result
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "update_executor",
+        "binding_cleanup",
+        "livekit_worker",
+        "evidence_runtime",
+        "writer_drain",
+        "writer_stop",
+        "transport_close",
+        "retention_cancellation",
+    ],
+)
+def test_shared_missing_lifecycle_observations_are_rejected(stage: str) -> None:
+    rows = _observations()
+    for row in rows:
+        row["close"] = [item for item in row["close"] if item["stage"] != stage]
+    with pytest.raises(ValueError):
+        _module()._validate_trace_set(rows)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_close", "shared_reorder", "hidden_writer_fault"])
+def test_shared_malformed_lifecycle_is_rejected(mutation: str) -> None:
+    rows = _observations()
+    if mutation == "duplicate_close":
+        for row in rows:
+            row["close"].insert(0, deepcopy(row["close"][0]))
+    elif mutation == "shared_reorder":
+        for row in rows:
+            row["records"][0], row["records"][1] = row["records"][1], row["records"][0]
+    else:
+        for item in rows[4]["close"]:
+            item["result"] = "succeeded"
+    with pytest.raises(ValueError):
+        _module()._validate_trace_set(rows)

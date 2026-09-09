@@ -1,6 +1,6 @@
 # Implementation status
 
-[Collaborator guide](README.md) Â· [Roadmap](roadmap.md)
+[Collaborator guide](README.md) · [Roadmap](roadmap.md)
 
 Implementation and evidence reviewed on **2026-09-09** at main commit
 [`c7b8975e33f5dac7203845d7aa9207ee3518d453`](https://github.com/sushiHex/hermes-realtime/commit/c7b8975e33f5dac7203845d7aa9207ee3518d453),
