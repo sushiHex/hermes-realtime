@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 from typing import Any
 
 import pytest
@@ -52,3 +53,40 @@ def test_successful_but_partial_job_membership_is_rejected() -> None:
     kernel._job_max_active_processes[1] = 4
     with pytest.raises(core._WindowsScenarioJobError):
         kernel.query_job_processes(1)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows exit-race error handling")
+@pytest.mark.parametrize("exit_observed", [True, False])
+def test_image_query_exit_race_requires_the_retained_handle_to_signal(exit_observed: bool) -> None:
+    from scripts import qualify_evidence_slice_zero as core
+
+    class Api:
+        def __init__(self) -> None:
+            self.waits: list[int] = []
+
+        def GetProcessTimes(self, handle: Any, creation: Any, *unused: Any) -> int:
+            creation._obj.value = 420
+            return 1
+
+        def GetProcessId(self, handle: Any) -> int:
+            return 42
+
+        def WaitForSingleObject(self, handle: Any, timeout: int) -> int:
+            self.waits.append(timeout)
+            return 0 if exit_observed and len(self.waits) == 2 else 258
+
+        def QueryFullProcessImageNameW(self, *unused: Any) -> int:
+            ctypes.set_last_error(5)
+            return 0
+
+    api = Api()
+    kernel = core._CtypesWindowsKernelV1(platform="nt")
+    kernel._kernel32 = api
+    retained = core._WindowsKernelProcessV1(42, 7, 70, 420, "python.exe", "a" * 64)
+    kernel._retained_process_identities[201] = retained
+    if exit_observed:
+        assert kernel.query_process_identity(201) is retained
+    else:
+        with pytest.raises(OSError):
+            kernel.query_process_identity(201)
+    assert api.waits == [0, 1000]

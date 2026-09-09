@@ -1529,3 +1529,14 @@ def test_ctypes_post_create_handle_validation_closes_every_valid_process_informa
             ("C:\\candidate\\python.exe",), (("LANG", "C"),), "C:\\candidate", (11,), 4
         )
     assert {event[1] for event in api.events if event[0] == "close"} >= set(expected)
+
+
+def test_finalization_waits_before_rechecking_terminated_process_identity() -> None:
+    runner = _load_runner()
+    kernel = _FakeWindowsKernel(runner)
+    job = _job(runner, kernel)
+    job.launch_root()
+    job.finalize()
+    termination = kernel.events.index(("terminate_job", 101))
+    events = kernel.events[termination:]
+    assert events.index(("wait", 201, 2000)) < events.index(("identity", 201))

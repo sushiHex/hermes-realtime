@@ -2242,6 +2242,15 @@ class _WindowsScenarioJobV1:
                 failures.append(
                     _WindowsOperationFailureV1("terminate_job", self._job_handle, str(error))
                 )
+        for handle, kind in tuple(self._owned_handles.items()):
+            if kind not in {"process", "thread"}:
+                continue
+            try:
+                self._kernel.wait(handle, self._spec.timeout_milliseconds)
+                waited.append(handle)
+            except BaseException as error:
+                deferred_handles.add(handle)
+                failures.append(_WindowsOperationFailureV1("wait", handle, str(error)))
         for member in tuple(self._members.values()):
             if member.process_handle not in self._owned_handles:
                 continue
@@ -2266,15 +2275,6 @@ class _WindowsScenarioJobV1:
                 failures.append(
                     _WindowsOperationFailureV1("identity", member.process_handle, str(error))
                 )
-        for handle, kind in tuple(self._owned_handles.items()):
-            if kind not in {"process", "thread"}:
-                continue
-            try:
-                self._kernel.wait(handle, self._spec.timeout_milliseconds)
-                waited.append(handle)
-            except BaseException as error:
-                deferred_handles.add(handle)
-                failures.append(_WindowsOperationFailureV1("wait", handle, str(error)))
         if self._job_handle is not None and not self._zero_active_observed:
             try:
                 active_count = self._kernel.query_job_active_process_count(self._job_handle)
@@ -2725,7 +2725,14 @@ class _CtypesWindowsKernelV1:
         if not api.QueryFullProcessImageNameW(
             ctypes.c_void_p(handle), 0, image, ctypes.byref(size)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.WinError(ctypes.get_last_error())
+            # Exit may begin between the zero-time wait and image query. Only
+            # a bounded successful wait on this previously identified handle
+            # permits its cached immutable facts; a live inaccessible process
+            # still fails. PID and creation time were rechecked above.
+            if retained is not None and api.WaitForSingleObject(ctypes.c_void_p(handle), 1000) == 0:
+                return retained
+            raise error
         path = Path(image.value)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         parent_pid, parent_creation = (

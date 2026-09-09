@@ -100,7 +100,13 @@ def test_real_windows_job_retains_and_closes_an_exited_root(
             assert code.value == 0
             return root
 
-        root = core._run_with_windows_scenario_job_finalization_v1(job, exercise)
+        try:
+            root = core._run_with_windows_scenario_job_finalization_v1(job, exercise)
+        except core._WindowsFinalizationError as error:
+            try:
+                job.finalize()
+            finally:
+                pytest.fail(repr(error.result.failures))
         assert job.last_finalization is not None
         assert job.last_finalization.closed and job.last_finalization.zero_active_observed
         assert root.process_handle in job.last_finalization.waited_handles
