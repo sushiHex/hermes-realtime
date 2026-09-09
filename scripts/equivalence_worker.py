@@ -10,11 +10,21 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 
 from scripts.deterministic_equivalence import ARMS_V1
 from scripts.equivalence_process import _read_frame, _require, _write_frame
+from scripts.qualify_evidence_slice_zero import canonical_json_bytes
+
+
+def _server_environment(source: Mapping[str, str]) -> dict[str, str]:
+    allowed = {"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP", "PATH"}
+    environment = {name: value for name, value in source.items() if name.upper() in allowed}
+    environment["LIVEKIT_KEYS"] = "dev" + "key: local" + "-" + "x" * 32 + "\n"
+    return environment
 
 
 def _observation(
@@ -175,21 +185,35 @@ def main() -> None:
         )
         sequence += 1
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = int(probe.getsockname()[1])
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name in {"SystemRoot", "SystemDrive", "WINDIR", "TEMP", "TMP", "PATH"}
-    }
-    environment["LIVEKIT_KEYS"] = "dev" + "key: local" + "-" + "x" * 32 + "\n"
+    with ExitStack() as probes:
+        ports = []
+        for kind in (socket.SOCK_STREAM, socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            probe = probes.enter_context(socket.socket(socket.AF_INET, kind))
+            probe.bind(("127.0.0.1", 0))
+            ports.append(int(probe.getsockname()[1]))
+    port, rtc_tcp, rtc_udp = ports
+    server_config = canonical_json_bytes(
+        {
+            "port": port,
+            "bind_addresses": ["127.0.0.1"],
+            "development": True,
+            "rtc": {
+                "tcp_port": rtc_tcp,
+                "udp_port": rtc_udp,
+                "node_ip": "127.0.0.1",
+                "use_external_ip": False,
+                "enable_loopback_candidate": True,
+                "ips": {"includes": ["127.0.0.0/8"]},
+                "stun_servers": [],
+            },
+        }
+    ).decode("utf-8")
     server = subprocess.Popen(
-        (str(livekit), "--dev", "--bind", "127.0.0.1", "--port", str(port)),
+        (str(livekit), "--config-body", server_config),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=environment,
+        env=_server_environment(os.environ),
         cwd=workspace,
         close_fds=True,
         creationflags=subprocess.CREATE_NO_WINDOW,
@@ -220,7 +244,9 @@ def main() -> None:
         traceback = error.__traceback__
         candidate = Path(__file__).resolve().parent.parent
         while traceback is not None:
-            if Path(traceback.tb_frame.f_code.co_filename).resolve().is_relative_to(candidate):
+            if traceback.tb_frame.f_code.co_name != "_require" and Path(
+                traceback.tb_frame.f_code.co_filename
+            ).resolve().is_relative_to(candidate):
                 source_line = traceback.tb_lineno
             traceback = traceback.tb_next
         _write_frame(

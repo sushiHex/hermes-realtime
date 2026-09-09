@@ -163,3 +163,22 @@ def test_live_listener_requires_the_retained_owner_and_exact_loopback_port() -> 
             _require_owned_listener(port, os.getpid() + 1)
     with pytest.raises(ValueError):
         _require_owned_listener(port, os.getpid())
+
+
+def test_server_environment_preserves_windows_system_keys_without_inheriting_host_authority() -> (
+    None
+):
+    from scripts.equivalence_worker import _server_environment
+
+    values = {
+        "SYSTEMROOT": "system",
+        "SystemDrive": "drive",
+        "TEMP": "temporary",
+        "API_SERVER_KEY": "placeholder",
+        "PYTHONPATH": "ambient",
+    }
+    result = _server_environment(values)
+    assert result["SYSTEMROOT"] == "system"
+    assert result["SystemDrive"] == "drive"
+    assert result["TEMP"] == "temporary"
+    assert "API_SERVER_KEY" not in result and "PYTHONPATH" not in result
