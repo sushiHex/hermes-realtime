@@ -185,12 +185,10 @@ def test_package_metadata_states_the_project_is_unofficial() -> None:
 
 def test_evidence_capture_readme_links_the_status_boundary() -> None:
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
-    assert (
-        "Evidence-only Slice 0 is currently a documented boundary, not an "
-        "implemented production capture path."
-    ) in readme
+    assert "Full Slice 0 qualification is incomplete." in readme
     assert "It remains disabled by default; operator enablement is not consent." in readme
     assert "[Evidence capture boundary](docs/evidence-capture.md)" in readme
+    assert "[Implementation status](docs/implementation-status.md)" in readme
 
 
 def test_public_search_is_documented_as_default_off_and_separately_consented() -> None:
