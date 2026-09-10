@@ -40,6 +40,12 @@ def _observations() -> dict:
                 if predecessor
                 else ["0" * 64, "1" * 64] + (["2" * 64, "2" * 64] if sealed else [])
             ),
+            records=[
+                f"{n:064x}"
+                for n in range(
+                    212 if predecessor else 200, (212 if predecessor else 200) + 6 * turns
+                )
+            ],
             opened="8" * 64 if predecessor else "7" * 64,
             expires="9" * 64 if predecessor else "6" * 64,
             retention_lag_us=1000 if predecessor else 0,
@@ -88,6 +94,10 @@ def _observations() -> dict:
             "rollover_ordinal": 15,
             "records": [f"{n:064x}" for n in range(100, 118)],
         },
+        spool_records=[
+            dict(dto=f"{n:064x}", snapshot=f"{n + 100:064x}", result="committed")
+            for n in range(100, 118)
+        ],
         queue=[
             dict(
                 version=1,
@@ -420,6 +430,80 @@ def test_rollover_observer_reads_the_real_transaction_without_exposing_partial_s
         assert committed["sessions"][1]["predecessor"] == committed["sessions"][0]["session"]
     finally:
         owned.close()
+
+
+@pytest.mark.parametrize("substitution", ["none", "transport", "spool"])
+def test_complete_ordinary_record_is_bound_from_dispatch_through_sqlite(
+    tmp_path: Path, substitution: str
+) -> None:
+    from dataclasses import replace
+
+    from hermes_realtime.evidence.models import StoreDisposition
+    from scripts.capacity_rollover import _validate_observations
+    from scripts.capacity_rollover_worker import (
+        _ObserveRolloverSpool,
+        _payload_commitment,
+        _snapshot,
+    )
+    from tests.evidence.test_sqlite_spool import (
+        event_uuid,
+        make_create_epoch,
+        make_spool,
+        ordinary_record,
+        turn_opened_snapshot,
+    )
+
+    key = b"synthetic key"
+    owned = make_spool(tmp_path)
+    sent = ordinary_record(turn_opened_snapshot(3, event_index=3), 3)
+    changed = replace(sent, snapshot=replace(sent.snapshot, event_id=event_uuid(99)))
+
+    class SubstitutingSpool:
+        def __getattr__(self, name):
+            return getattr(owned, name)
+
+        def append_record(self, item):
+            return owned.append_record(changed if substitution == "spool" else item)
+
+    observer = _ObserveRolloverSpool(SubstitutingSpool(), owned.database, key)
+    try:
+        assert observer.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
+        assert (
+            observer.append_record(changed if substitution == "transport" else sent)
+            is StoreDisposition.COMMITTED
+        )
+        stored = _snapshot(owned.database, key)["sessions"][0]
+        row = _observations()
+        row["dispatch"]["records"][0] = _payload_commitment(key, sent)
+        row["queue"][1]["payload"] = row["dispatch"]["records"][0]
+        row["spool_records"][0] = observer.records[0]
+        for snapshot in row["snapshots"]:
+            snapshot["sessions"][0]["records"][0] = stored["records"][0]
+        if substitution == "none":
+            _validate_observations(row)
+        else:
+            with pytest.raises(ValueError):
+                _validate_observations(row)
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "dto", "snapshot", "result", "persisted", "extra"])
+def test_parent_rejects_a_gap_between_dispatch_spool_and_durable_records(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "missing":
+        row["spool_records"].pop()
+    elif mutation == "extra":
+        row["spool_records"][0]["accepted"] = True
+    elif mutation == "persisted":
+        for snapshot in row["snapshots"]:
+            snapshot["sessions"][0]["records"][0] = "f" * 64
+    else:
+        row["spool_records"][0][mutation] = "writer_fault" if mutation == "result" else "f" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
 
 
 @pytest.mark.parametrize("mutation", ["payload", "record_hash", "aggregate", "seal_head"])

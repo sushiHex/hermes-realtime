@@ -51,6 +51,7 @@ def _validate_observations(row: Any) -> None:
             "commands",
             "dispatch",
             "queue",
+            "spool_records",
             "snapshots",
             "transactions",
             "durable_terminals",
@@ -92,6 +93,18 @@ def _validate_observations(row: Any) -> None:
         {"create_dto", "rollover_dto", "request", "ordinals", "rollover_ordinal", "records"},
     )
     _digests(dispatch["records"], 18)
+    spool_records = row["spool_records"]
+    _require(
+        type(spool_records) is list and len(spool_records) == 18,
+        "spool record observations are incomplete",
+    )
+    for index, record in enumerate(spool_records):
+        _keys(record, {"dto", "snapshot", "result"})
+        _digest(record["snapshot"])
+        _require(
+            record["dto"] == dispatch["records"][index] and record["result"] == "committed",
+            "spool received a different or uncommitted ordinary record",
+        )
     queue = row["queue"]
     _require(type(queue) is list and len(queue) == 21, "dequeued queue envelopes are incomplete")
     expected_payloads = [
@@ -159,6 +172,7 @@ def _validate_observations(row: Any) -> None:
                     "consent",
                     "consent_request",
                     "controls",
+                    "records",
                     "opened",
                     "expires",
                     "retention_lag_us",
@@ -180,6 +194,7 @@ def _validate_observations(row: Any) -> None:
                 "stored retention interval differs from consent",
             )
             _digests(session["controls"], 4 if sealed else 2)
+            _digests(session["records"], 6 * turns)
             expected_controls = (
                 commands["create"] + commands["rollover"][:2]
                 if sealed
@@ -218,6 +233,10 @@ def _validate_observations(row: Any) -> None:
     _require(before == committing, "partial rollover became visible before commit")
     old, successor = committed
     _require(
+        old["records"] + continued[1]["records"] == [r["snapshot"] for r in spool_records],
+        "persisted snapshots differ from the complete dispatched records",
+    )
+    _require(
         old["last_event_at"] == successor["last_event_at"], "rollover control timestamps differ"
     )
     _require(old == continued[0], "sealed predecessor changed during successor conversation")
@@ -229,6 +248,7 @@ def _validate_observations(row: Any) -> None:
         "opened",
         "expires",
         "retention_lag_us",
+        "records",
     } | _CONTENT:
         _require(old[name] == before[0][name], "rollover changed predecessor identity or content")
     _require(

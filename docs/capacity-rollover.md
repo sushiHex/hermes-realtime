@@ -58,6 +58,11 @@ complete payload commitment. The create item must use ordinal 2, rollover 15,
 and drain 22 with watermark 21. Ordinary and rollover payload ordinals must
 match their envelopes; payload commitments must also match transport dispatch.
 The queue and dispatcher retain their production implementations.
+The SQLite owner-thread observer also commits every complete ordinary record
+before calling the real spool. Those DTOs must match dequeue and transport;
+their full snapshots must match independently reconstructed durable snapshots,
+including event identity and every payload field. Every append must commit.
+Validly rehashing a substituted event cannot satisfy this comparison.
 
 The observer also commits complete dispatched control snapshots, including event
 identity, binding identity and generation, source availability, and consent lineage. The reader reconstructs

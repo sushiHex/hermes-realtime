@@ -369,6 +369,9 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     "controls": _control_commitments(
                         key, history[:2] + (history[-2:] if state == "sealed" else [])
                     ),
+                    "records": _control_commitments(
+                        key, history[2:-2] if state == "sealed" else history[2:]
+                    ),
                     "opened": _commit(key, "session_time", opened),
                     "expires": _commit(key, "session_time", expires),
                     "retention_lag_us": lag_us,
@@ -426,6 +429,7 @@ class _ObserveRolloverSpool:
         self.durable_terminals: list[str] = []
         self.third_settled = Event()
         self.commands: dict[str, Any] = {}
+        self.records: list[dict[str, str]] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -454,7 +458,11 @@ class _ObserveRolloverSpool:
         return result
 
     def append_record(self, item: Any) -> Any:
+        _require(len(self.records) < 18, "extra ordinary spool record")
+        dto = _payload_commitment(self.key, item)
+        snapshot = _control_commitments(self.key, (item.snapshot,))[0]
         result = self.delegate.append_record(item)
+        self.records.append({"dto": dto, "snapshot": snapshot, "result": result.value})
         if item.snapshot.event_kind.value == "turn_settled":
             _require(len(self.durable_terminals) < 3, "extra durable terminal")
             self.durable_terminals.append(result.value)
@@ -796,6 +804,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "commands": spool.commands,
         "dispatch": dispatches[0].commands,
         "queue": queues[0].records,
+        "spool_records": spool.records,
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "durable_terminals": spool.durable_terminals,
