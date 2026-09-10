@@ -91,6 +91,6 @@ machine assertions. The Native CI job consumes the existing Pure candidate wheel
 artifact and runs this scenario after archived deterministic equivalence.
 
 This is one `packaged_process` scenario, not an accepted full
-`qualification-report-v1`. Seventeen governed producers and the remaining installed
+`qualification-report-v1`. Sixteen governed producers and the remaining installed
 and human-assisted prerequisites are still unavailable or unqualified. Synthetic
 turns do not establish physical audibility, subjective quality, or browser readiness.

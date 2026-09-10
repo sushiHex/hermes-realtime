@@ -277,7 +277,7 @@ jobs:
             --candidate $env:GITHUB_WORKSPACE `
             --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
           if ($LASTEXITCODE -ne 0) { throw "Deterministic equivalence failed with exit code $LASTEXITCODE" }
-      - name: Qualify packaged revocation race and capacity rollover
+      - name: Qualify packaged revocation race, rollover, and admission overflow
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -299,6 +299,11 @@ jobs:
             --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
             --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
           if ($LASTEXITCODE -ne 0) { throw "Capacity rollover qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_over_budget_turn `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Capture overflow qualification failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |

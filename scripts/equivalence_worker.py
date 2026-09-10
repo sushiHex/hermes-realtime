@@ -207,7 +207,9 @@ def main() -> None:
     )
     _require(type(config["version"]) is int and config["version"] == 1, "unsupported child version")
     _require(
-        config["scenario"] in {"deterministic_equivalence", "revoke_race", "capacity_rollover"},
+        config["scenario"] in {
+            "deterministic_equivalence", "revoke_race", "capacity_rollover", "over_budget_turn"
+        },
         "unknown archived scenario",
     )
     livekit = Path(config["livekit"])
@@ -282,10 +284,14 @@ def main() -> None:
                 from scripts.revoke_race_worker import observe_revoke_race
 
                 observe = observe_revoke_race
-            else:
+            elif config["scenario"] == "capacity_rollover":
                 from scripts.capacity_rollover_worker import observe_capacity_rollover
 
                 observe = observe_capacity_rollover
+            else:
+                from scripts.over_budget_turn_worker import observe_over_budget_turn
+
+                observe = observe_over_budget_turn
             observation = asyncio.run(observe(workspace, f"ws://127.0.0.1:{port}"))
             _verify_imports(Path(__file__).resolve().parent.parent, workspace / "wheel-package")
             emit(config["scenario"], observation)

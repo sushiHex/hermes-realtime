@@ -43,7 +43,8 @@ def _digests(values: Any, count: int) -> None:
         _digest(value)
 
 
-def _validate_thread_owners(threads: Any) -> None:
+def _validate_thread_owners(threads: Any, *, scenario: str = "capacity_rollover") -> None:
+    _require(scenario in {"capacity_rollover", "over_budget_turn"}, "owner scenario differs")
     _keys(
         threads,
         {
@@ -64,7 +65,7 @@ def _validate_thread_owners(threads: Any) -> None:
     _require(
         len({threads[name] for name in ("event_loop", "dispatcher", "sqlite")}) == 3
         and type(threads["dequeues"]) is int
-        and threads["dequeues"] == 21
+        and threads["dequeues"] == (21 if scenario == "capacity_rollover" else 61)
         and threads["dispatcher_stopped"] is True
         and threads["sqlite_stopped"] is True
         and threads["dispatcher_clean"] is True
@@ -74,9 +75,11 @@ def _validate_thread_owners(threads: Any) -> None:
     )
     stages = (
         ["factory", "create_epoch", "active_session_expiry"]
-        + ["append_record"] * 12
-        + ["rollover_session"]
-        + ["append_record"] * 6
+        + (
+            ["append_record"] * 12 + ["rollover_session"] + ["append_record"] * 6
+            if scenario == "capacity_rollover"
+            else ["append_record"] * 59
+        )
         + ["drain_and_close", "close"]
     )
     _require(
