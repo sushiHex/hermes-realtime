@@ -190,8 +190,14 @@ def test_independent_reader_revalidates_real_committed_seals(
 
 def _pin_authority_images(row, point):
     from scripts.spool_crash_matrix import FAILPOINTS_V1
-    from scripts.spool_crash_oracle import checkpoint_sentinel_digest_v1, initialization_digest_v1
+    from scripts.spool_crash_oracle import (
+        checkpoint_installation_digest_v1,
+        checkpoint_sentinel_digest_v1,
+        checkpoint_source_digest_v1,
+        initialization_digest_v1,
+    )
 
+    index = FAILPOINTS_V1.index(point)
     for key in ("before", "after"):
         files = row[key]["files"]
         marker = ".hermes-realtime-evidence-root-v1"
@@ -199,7 +205,16 @@ def _pin_authority_images(row, point):
             files[marker] = initialization_digest_v1("root_marker", "full_write")
         if "capture-v1.owner" in files:
             files["capture-v1.owner"] = checkpoint_sentinel_digest_v1(
-                FAILPOINTS_V1.index(point), "caught-up", after=key == "after"
+                index, "caught-up", after=key == "after"
+            )
+        db = row[key]["database"]
+        if db["schema"]:
+            source_index = index
+            if key == "after" and row["disposition"] == "recovered":
+                source_index = 4 if index in {4, 8, 28} else 6
+            db["source_digest"] = checkpoint_source_digest_v1(source_index)
+            db["installation_digest"] = checkpoint_installation_digest_v1(
+                index, after=key == "after"
             )
     return row
 
@@ -617,3 +632,100 @@ def test_final_sentinel_must_preserve_the_exact_transition_authority(key) -> Non
     row[key]["files"]["capture-v1.owner"] = hashlib.sha256(image).hexdigest()
     with pytest.raises(ValueError):
         _validate_recovery("after_full_purge_absence_verify", "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize("binding_close", [False, True])
+def test_checkpoint_cannot_substitute_another_valid_fixture_event(tmp_path, binding_close) -> None:
+    from scripts.storage_observation import _database_state
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+        result = (
+            spool.append_binding_close(driver._binding_close())
+            if binding_close
+            else spool.append_record(driver._ordinary_record())
+        )
+        assert result.value == "committed"
+    finally:
+        spool.close()
+    database = _database_state(tmp_path / "evidence/capture-v1.sqlite3")
+    expected = "before_seal_commit" if binding_close else "after_event_commit"
+    wrong = "after_event_commit" if binding_close else "before_seal_commit"
+    _validate_checkpoint(expected, database)
+    with pytest.raises(ValueError):
+        _validate_checkpoint(wrong, database)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize(
+    "seconds,point,sealed",
+    [
+        (60, "after_seal_commit_before_ack", True),
+        (1, "after_first_epoch_commit", False),
+        (0, "after_recreate_epoch_commit", False),
+    ],
+)
+def test_checkpoint_pins_the_absolute_source_clock(tmp_path, seconds, point, sealed) -> None:
+    from datetime import timedelta
+
+    from scripts.storage_observation import _database_state
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(
+        tmp_path, clock=driver._Clock(driver.START + timedelta(seconds=seconds))
+    )
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+        if sealed:
+            assert spool.append_binding_close(driver._binding_close()).value == "committed"
+            assert spool.seal_epoch(driver._seal_command()).value == "committed"
+    finally:
+        spool.close()
+    observed = _database_state(tmp_path / "evidence/capture-v1.sqlite3")
+    with pytest.raises(ValueError):
+        _validate_checkpoint(point, observed)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize("field", ["created_at_utc", "clock_high_water_utc"])
+def test_checkpoint_pins_installation_clock_authority(tmp_path, field) -> None:
+    import sqlite3
+
+    from scripts.storage_observation import _database_state
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+        assert spool.append_binding_close(driver._binding_close()).value == "committed"
+        assert spool.seal_epoch(driver._seal_command()).value == "committed"
+    finally:
+        spool.close()
+    database = tmp_path / "evidence/capture-v1.sqlite3"
+    _validate_checkpoint("after_seal_commit_before_ack", _database_state(database))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE producer_installation SET {field}=?", ("2026-08-08T00:00:03.000000Z",)
+        )
+    with pytest.raises(ValueError):
+        _validate_checkpoint("after_seal_commit_before_ack", _database_state(database))
+
+
+def test_empty_committed_schema_has_a_closed_wire_observation(tmp_path) -> None:
+    import sqlite3
+
+    from hermes_realtime.evidence.sqlite_spool import SCHEMA_DDL_V1
+    from scripts.qualify_evidence_slice_zero import canonical_json_bytes
+    from scripts.storage_observation import _database_state
+
+    database = tmp_path / "capture-v1.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(SCHEMA_DDL_V1)
+        connection.execute("PRAGMA application_id=0x48524531")
+        connection.execute("PRAGMA user_version=1")
+    observed = _database_state(database)
+    assert observed["schema"] is True and observed["purge_required"] == -1
+    assert canonical_json_bytes({"database": observed}).endswith(b"\n")

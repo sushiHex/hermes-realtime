@@ -8,6 +8,7 @@ requires every field and its exact JSON type, including explicit null values.
 from __future__ import annotations
 
 import hashlib
+import json
 from uuid import UUID
 
 from scripts.evidence_protocol_oracle import canonical_json_bytes
@@ -98,6 +99,68 @@ def validate_spool_snapshot_v1(snapshot: object) -> None:
         raise ValueError("storage event differs from the pinned synthetic source")
 
 
+def checkpoint_source_digest_v1(index: int) -> str:
+    """Bind the ordered input prefix, not just individually valid source events."""
+    events = {event["event_id"]: event for raw in _SOURCE_EVENTS for event in (json.loads(raw),)}
+    opening = [1, 2]
+    sealed = [1, 2, 20, 21]
+    if index in {0, 1, 5, 21, 22, 26, 27}:
+        histories = [opening]
+    elif index == 2:
+        histories = [[1, 2, 10]]
+    elif index == 3:
+        histories = [[1, 2, 20]]
+    elif index in {4, 8}:
+        histories = [sealed]
+    elif 28 <= index <= 31:
+        histories = [[101, 102], sealed]
+    elif index in {6, 7, 20, 25}:
+        histories = []
+    else:
+        raise ValueError("checkpoint has no source history")
+    origin = 1 if index in {26, 27} else 0
+    source = [
+        [
+            {
+                "snapshot": events[f"40000000-0000-4000-8000-{event:012d}"],
+                "recorded_at_utc": f"2026-08-08T00:00:{origin + max(0, ordinal - 1):02d}.000000Z",
+            }
+            for ordinal, event in enumerate(history)
+        ]
+        for history in histories
+    ]
+    return hashlib.sha256(canonical_json_bytes(source)).hexdigest()
+
+
+def checkpoint_installation_digest_v1(index: int, *, after: bool = False) -> str:
+    """Pin all installation columns, including the independent fixture clock."""
+    if index in {20, 25}:
+        return hashlib.sha256(canonical_json_bytes([])).hexdigest()
+    if index < 9:
+        high_water = (0, 0, 1, 1, 2, 1, 1, 1, 2)[index]
+    elif index in {21, 22, 28, 29, 30, 31}:
+        high_water = 0
+    elif index in {26, 27}:
+        high_water = 1
+    else:
+        raise ValueError("checkpoint has no installation authority")
+    created = 1 if index in {26, 27} else 0
+    high = f"2026-08-08T00:00:{high_water:02d}.000000Z"
+    if after and index not in {4, 5, 8}:
+        high = "2026-08-08T02:00:00.000000Z" if index in {6, 7} else "2026-08-08T02:00:01.000000Z"
+    latched = index == 31
+    row = [
+        "10000000-0000-4000-8000-000000000001",
+        int(latched),
+        1,
+        "clock_rollback" if latched else None,
+        "store" if latched else None,
+        f"2026-08-08T00:00:{created:02d}.000000Z",
+        high,
+    ]
+    return hashlib.sha256(canonical_json_bytes(row)).hexdigest()
+
+
 def initialization_digest_v1(owner: str, stage: str) -> str:
     """Commit the exact V1 bytes supplied to each initialization write."""
     if owner == "root_marker":
@@ -106,9 +169,7 @@ def initialization_digest_v1(owner: str, stage: str) -> str:
             b'"rootId":"50000000-0000-4000-8000-000000000001"}\n'
         )
     elif owner == "sentinel":
-        image = _sentinel_image_v1(
-            (1, 3, "50000000-0000-4000-8000-000000000002"), (0, 0, None)
-        )
+        image = _sentinel_image_v1((1, 3, "50000000-0000-4000-8000-000000000002"), (0, 0, None))
     else:
         raise ValueError("initialization owner differs")
     if stage == "create":

@@ -34,7 +34,11 @@ pinned to fixed protocol vectors, checks complete seal lineage and recovery
 erasure receipts, and verifies sentinel states and each full-purge deletion
 prefix. Each stored event must also match one of seven [pinned synthetic source
 events](../scripts/spool_crash_oracle.py), independently of the candidate's
-payload parser. Persisted session and epoch identities, consent version,
+payload parser. Each checkpoint also pins the complete ordered source history,
+so another valid fixture event or session cannot substitute for its input.
+Those commitments include absolute timestamps from the fixed driver clock;
+installation commitments also pin creation time and the clock high-water state.
+Persisted session and epoch identities, consent version,
 retention expiry, and lifecycle timestamps must agree with those source events;
 the fixture permits no conflict rows or orphan epochs. Purge must leave every database artifact absent while preserving the
 root marker and adjacent decoys. Malformed initialization images must be refused

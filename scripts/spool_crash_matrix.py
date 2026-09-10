@@ -15,7 +15,9 @@ from scripts.candidate_wheel import VerifiedCandidateWheelV1
 from scripts.deterministic_equivalence import _keys, _require
 from scripts.packaged_scenario import PackagedScenarioEvidenceV1
 from scripts.spool_crash_oracle import (
+    checkpoint_installation_digest_v1,
     checkpoint_sentinel_digest_v1,
+    checkpoint_source_digest_v1,
     erasure_receipt_digest_v1,
     erasure_request_digest_v1,
     initialization_digest_v1,
@@ -131,6 +133,14 @@ def _validate_checkpoint(point: str, db: Any) -> None:
         and (db.get("events"), db.get("sessions"), db.get("epochs")) == expected,
         "durable checkpoint history differs",
     )
+    _require(
+        db.get("source_digest") == checkpoint_source_digest_v1(index),
+        "checkpoint source history differs",
+    )
+    _require(
+        db.get("installation_digest") == checkpoint_installation_digest_v1(index),
+        "checkpoint installation authority differs",
+    )
 
 
 def _validate_recovery(point: str, clock: str, row: Any) -> None:
@@ -167,6 +177,8 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
                     "sessions",
                     "epochs",
                     "seals",
+                    "source_digest",
+                    "installation_digest",
                     "purge_required",
                     "tombstones",
                     "erasures",
@@ -208,11 +220,16 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
                 type(db["seals"]) is list and len(db["seals"]) == db["sessions"].count("sealed"),
                 "storage seal count differs",
             )
-            for digest in [db["logical_digest"], *db["seals"]]:
+            for digest in [db["logical_digest"], db["source_digest"], *db["seals"]]:
                 _require(
                     type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest) is not None,
                     "storage history digest differs",
                 )
+            _require(
+                type(db["installation_digest"]) is str
+                and re.fullmatch("[0-9a-f]{64}", db["installation_digest"]) is not None,
+                "storage installation digest differs",
+            )
             _require(
                 type(db["tombstones"]) is list and len(db["tombstones"]) <= 2,
                 "storage tombstone count differs",
@@ -367,6 +384,14 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             "recovered database still requires purge",
         )
         sealed = index in {4, 8, 28}
+        _require(
+            db["installation_digest"] == checkpoint_installation_digest_v1(index, after=True),
+            "recovered installation authority differs",
+        )
+        _require(
+            db["source_digest"] == checkpoint_source_digest_v1(4 if sealed else 6),
+            "recovered source history differs",
+        )
         _require(
             (db["events"], db["sessions"], db["epochs"])
             == ((4, ["sealed"], ["closed"]) if sealed else (0, [], [])),

@@ -59,11 +59,20 @@ def _database_state(database: Path) -> dict[str, Any]:
             "storage foreign keys differ",
         )
         installations = connection.execute(
-            "SELECT installation_id,purge_required,singleton,purge_reason,purge_scope "
+            "SELECT installation_id,purge_required,singleton,purge_reason,purge_scope,"
+            "created_at_utc,clock_high_water_utc "
             "FROM producer_installation"
         ).fetchall()
         _require(len(installations) <= 1, "storage installation count differs")
-        for installation, required, singleton, reason, scope in installations:
+        for (
+            installation,
+            required,
+            singleton,
+            reason,
+            scope,
+            _created,
+            _high_water,
+        ) in installations:
             _require(
                 installation == "10000000-0000-4000-8000-000000000001"
                 and singleton == 1
@@ -89,6 +98,7 @@ def _database_state(database: Path) -> dict[str, Any]:
         )
         total = 0
         seals = []
+        source_histories = []
         for session in rows:
             (
                 sid,
@@ -115,6 +125,7 @@ def _database_state(database: Path) -> dict[str, Any]:
             )
             previous = None
             payloads = []
+            source_events = []
             for ordinal, event in enumerate(events, 1):
                 eid, sequence, kind, payload, payload_hash, prior, digest, at, n = event
                 parsed = json.loads(payload)
@@ -139,18 +150,18 @@ def _database_state(database: Path) -> dict[str, Any]:
                     == digest,
                     "storage event chain differs",
                 )
-                validate_spool_snapshot_v1(
-                    {
-                        "schema_version": 1,
-                        "installation_id": installations[0][0],
-                        "producer_instance_id": producer,
-                        "logical_session_id": sid,
-                        "event_id": eid,
-                        "event_sequence": sequence,
-                        "event_kind": kind,
-                        "payload": parsed,
-                    }
-                )
+                snapshot = {
+                    "schema_version": 1,
+                    "installation_id": installations[0][0],
+                    "producer_instance_id": producer,
+                    "logical_session_id": sid,
+                    "event_id": eid,
+                    "event_sequence": sequence,
+                    "event_kind": kind,
+                    "payload": parsed,
+                }
+                validate_spool_snapshot_v1(snapshot)
+                source_events.append({"snapshot": snapshot, "recorded_at_utc": at})
                 previous = digest
                 payloads.append(parsed)
             opening = payloads[0]
@@ -219,6 +230,7 @@ def _database_state(database: Path) -> dict[str, Any]:
                     )
                 )
             total += len(events)
+            source_histories.append(source_events)
         _require(
             connection.execute("SELECT COUNT(*) FROM evidence_events").fetchone() == (total,),
             "storage has orphan events",
@@ -244,6 +256,10 @@ def _database_state(database: Path) -> dict[str, Any]:
             "sessions": [r[3] for r in rows],
             "epochs": [r[2] for r in epochs],
             "seals": seals,
+            "source_digest": _digest(canonical_json_bytes(source_histories)),
+            "installation_digest": _digest(
+                canonical_json_bytes(list(installations[0]) if installations else [])
+            ),
             "purge_required": installations[0][1] if installations else -1,
             "tombstones": [
                 [row[3], row[11], row[12], _digest(canonical_json_bytes(list(row)))]
