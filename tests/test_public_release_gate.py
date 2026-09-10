@@ -184,3 +184,41 @@ def test_public_gate_has_no_private_history_baseline(
             "livekit_pid": None,
         },
     )
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current", "stale"])
+def test_materialized_gate_requires_current_lock_before_build_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stale: bool,
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "lock-freshness-fixture"\n'
+        'version = "0.1.0"\nrequires-python = ">=3.11,<3.12"\n',
+        encoding="utf-8",
+    )
+    _run("uv", "lock", "--offline", "--python", "3.11", cwd=tmp_path)
+    lock = tmp_path / "uv.lock"
+    committed_lock = lock.read_bytes()
+    if stale:
+        project.write_text(
+            project.read_text(encoding="utf-8").replace('"0.1.0"', '"0.2.0"'),
+            encoding="utf-8",
+        )
+    gate = run_path(str(ROOT / "scripts" / "release_gate.py"))["gate_materialized_candidate"]
+    monkeypatch.setenv("UV_OFFLINE", "1")
+
+    class BuildPreparationReached(Exception):
+        pass
+
+    def stop_before_build(root: Path, snapshot: Path) -> None:
+        raise BuildPreparationReached
+
+    monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", stop_before_build)
+    expected_error = subprocess.CalledProcessError if stale else BuildPreparationReached
+    with pytest.raises(expected_error):
+        gate(tmp_path, livekit=False)
+
+    assert lock.read_bytes() == committed_lock
+    assert not (tmp_path / ".venv").exists()

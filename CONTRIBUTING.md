@@ -104,6 +104,7 @@ documentation.
 
 - Keep runtime dependencies narrow and upper-bounded.
 - Commit `uv.lock` changes with dependency metadata changes.
+- Follow the [optional Windows speech dependency procedure](requirements/README.md) when updating the CPU or CUDA worker closure.
 - Pin third-party GitHub Actions to full immutable commit SHAs.
 - Use `npm ci --ignore-scripts` for the browser workspace.
 - Regenerate packaged browser assets through the documented build, then verify release-gate parity.

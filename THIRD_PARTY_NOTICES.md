@@ -72,8 +72,8 @@ without calling it at runtime.
 Optional extras are installed from `uv.lock`; they are not bundled into the Hermes Realtime wheel. Their licenses remain their own. In particular:
 
 - `edge-tts==7.2.8` declares LGPL-3.0;
-- `phonemizer-fork==3.3.2` declares GPL-3.0-or-later;
-- `moonshine-voice==0.1.0` and `kokoro-onnx==0.5.0` ship MIT license files;
+- `phonemizer==3.4.0` declares GPL-3.0-or-later;
+- `moonshine-voice==0.1.0` and `kokoro-onnx==0.6.1` ship MIT license files;
 - the locked npm and Python dependency closures should be re-audited when lockfiles change.
 
 Installing an optional extra creates a combined runtime environment with those dependencies; it does not relicense Hermes Realtime's source.

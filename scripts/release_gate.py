@@ -400,6 +400,8 @@ def required_sdist_paths() -> frozenset[str]:
     return frozenset(
         {
             "THIRD_PARTY_NOTICES.md",
+            "requirements/README.md",
+            "requirements/kokoro-cuda-worker.in",
             "requirements/kokoro-cuda-worker-win-py311.txt",
             "requirements/kokoro-onnx-package-win-py311.txt",
             "scripts/benchmark_evidence_admission.py",
@@ -701,6 +703,7 @@ def gate_materialized_candidate(
     workspace = root.parent
     reject_ambient_paths(root)
     scan_for_secrets(root)
+    run("uv", "lock", "--check", "--python", "3.11", cwd=root, env=environment)
     # Preserve the committed package bytes before any test or build command can
     # rewrite generated static output.
     packaged_static = workspace / "packaged-static-before-web-build"

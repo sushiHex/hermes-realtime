@@ -395,7 +395,7 @@ loopback. The full launcher performs authenticated capability discovery itself.
    a default. Do not treat upstream accuracy tables or one machine's measurements as Hermes
    acceptance evidence.
 
-   On Windows, the full host defaults to local `kokoro-onnx==0.5.0` with the full English
+   On Windows, the full host defaults to local `kokoro-onnx==0.6.1` with the full English
    v1.0 model and British female Isabella voice (`bf_isabella`), upsampled from native
    24 kHz to the existing 48 kHz mono LiveKit transport. Other platforms default to Edge
    because the locked Kokoro dependency is Windows-only. Explicit provider selection never
@@ -428,8 +428,9 @@ loopback. The full launcher performs authenticated capability discovery itself.
    CPU FP32 remains the default when `--kokoro-worker-python` is omitted. When supplied,
    that value must name an existing absolute native Windows Python executable. The opt-in
    CUDA path uses the separately version-pinned environment created by
-   `scripts/setup-kokoro-cuda-worker.sh`, because `kokoro-onnx==0.5.0` otherwise installs CPU
-   ONNX Runtime alongside its mis-marked Windows GPU extra. The host owns one authenticated
+   `scripts/setup-kokoro-cuda-worker.sh`. Its [hashed dependency closure](../requirements/README.md)
+   keeps `onnxruntime-gpu` as the sole owner of the ONNX Runtime import namespace; the CPU
+   distribution stays in the host environment. The host owns one authenticated
    loopback worker process, verifies pinned model and voice hashes, and profiles hidden startup
    synthesis. Startup requires Conv/Gemm/LSTM on `CUDAExecutionProvider`; CPU execution is
    limited to an explicit control/spectral-op allowlist required by this graph. The worker
