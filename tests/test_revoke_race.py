@@ -52,6 +52,8 @@ def _wheel_bytes(change: str = "") -> tuple[bytes, dict[str, tuple[int, str]]]:
             b'Content-Type: multipart/mixed; boundary="synthetic"\n'
             b'\n--synthetic\nContent-Type: text/plain\n\nbody\n--synthetic--\n'
         )
+    elif change == "wheel_whitespace_body":
+        members[info + "WHEEL"] += b"\n \t\r\n"
     elif change == "wheel_body":
         members[info + "WHEEL"] += b"\nunsupported wheel body\n"
     elif change in {"metadata_header_name", "wheel_header_name"}:
@@ -127,6 +129,7 @@ def test_wheel_inspection_binds_every_runtime_blob_and_closed_metadata() -> None
         "metadata_multipart",
         "wheel_multipart",
         "wheel_body",
+        "wheel_whitespace_body",
         "metadata_header_name",
         "wheel_header_name",
         "metadata_requirement",

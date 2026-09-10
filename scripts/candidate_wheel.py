@@ -95,7 +95,7 @@ def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str
     except (ValueError, ExceptionGroup):
         raise ValueError("candidate wheel core metadata is invalid") from None
     _require(
-        not cast(str, wheel_metadata.get_payload()).strip()
+        wheel_metadata.get_payload() == ""
         and wheel_metadata.get_all("Wheel-Version") == ["1.0"]
         and wheel_metadata.get_all("Root-Is-Purelib") == ["true"]
         and wheel_metadata.get_all("Tag") == ["py3-none-any"],
