@@ -206,3 +206,46 @@ def test_tainted_retirement_preserves_another_live_operation_in_the_same_owner(r
         is admission.settled_terminal_outcome(other)
         is None
     )
+
+
+@pytest.mark.parametrize("reason", SETTLEMENT_REASONS)
+def test_retired_capture_refuses_late_terminal_causes(reason):
+    admission, _, lease = _opened()
+    _overflow(admission, lease, "generated")
+    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.SESSION_TAINTED
+    for late in SETTLEMENT_REASONS[1:]:
+        assert (
+            admission.record_terminal_cause(lease.terminal_cause, late)
+            is m.CauseDisposition.INVALID_AUTHORITY
+        )
+    assert admission.settled_terminal_outcome(lease) is None
+
+
+def test_retirement_freezes_a_cause_report_that_already_retained_its_state(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    admission, _, lease = _opened()
+    _overflow(admission, lease, "generated")
+    validated, release = Event(), Event()
+    owner = current_thread()
+    original = a.TerminalCauseCapabilityV1._validate
+
+    def pause_after_validation(capability):
+        original(capability)
+        if capability is lease.terminal_cause and current_thread() is not owner:
+            validated.set()
+            assert release.wait(2.0)
+
+    monkeypatch.setattr(a.TerminalCauseCapabilityV1, "_validate", pause_after_validation)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        report = worker.submit(
+            admission.record_terminal_cause, lease.terminal_cause, m.TerminalReason.PROVIDER_FAILED
+        )
+        try:
+            assert validated.wait(2.0)
+            assert _settle(admission, lease) is m.AppendDisposition.SESSION_TAINTED
+        finally:
+            release.set()
+        assert report.result(timeout=2.0) is m.CauseDisposition.CAUSE_SET_FROZEN
+    assert admission.settled_terminal_outcome(lease) is None

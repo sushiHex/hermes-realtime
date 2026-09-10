@@ -1,6 +1,6 @@
 # Packaged capture admission overflow
 
-[Collaborator guide](README.md) Â· [Qualification status](implementation-status.md#qualification-producer-status)
+[Collaborator guide](README.md) Ã‚Â· [Qualification status](implementation-status.md#qualification-producer-status)
 
 The `over_budget_turn` producer exercises the ordinary capture queue's real
 64-record admission limit during a valid conversation turn. It compares the
@@ -38,7 +38,9 @@ When a one-shot generated or transport-confirmed publication is refused for
 capacity, admission permanently marks that capture session incomplete. Once
 the turn completes, is cancelled, or fails, the exact live evidence lease can
 retire without creating an accepted evidence terminal. It releases unused terminal credits and
-advances any already-durable revocation waiting for that lease. Other live
+advances any already-durable revocation waiting for that lease. Retirement also
+removes its terminal-cause capability and freezes already-retained cause state,
+so late or racing reports cannot revive it. Other live
 operations retain their own leases; healthy delivery-count validation and
 retryable command/terminal queue behavior remain unchanged. The
 [admission implementation](../src/hermes_realtime/evidence/admission.py) and its

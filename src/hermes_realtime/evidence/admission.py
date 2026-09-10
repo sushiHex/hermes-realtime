@@ -3306,6 +3306,11 @@ class EvidenceAdmissionControllerV1:
 
         if not self._session_tainted:
             return False
+        cause_state = self._cause_states.pop(lease.terminal_cause, None)
+        if cause_state is not None:
+            # Reports that already retained this state must also fail closed.
+            with cause_state.lock:
+                cause_state.frozen = True
         state.settlement_attempted = True
         self._leases.pop(lease, None)
         with self._credit_lock:
