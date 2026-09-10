@@ -1,4 +1,4 @@
-"""Bind a bounded pure wheel's runtime bytes to a verified source archive."""
+"""Bind a bounded pure wheel's runtime and metadata to a verified source archive."""
 
 from __future__ import annotations
 
@@ -8,14 +8,19 @@ import csv
 import hashlib
 import io
 import re
+import tarfile
+import tomllib
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
 from weakref import WeakKeyDictionary
 
-from packaging.metadata import Metadata
+from packaging.markers import Marker
+from packaging.metadata import Metadata, RawMetadata, parse_email
+from packaging.requirements import Requirement
 
 from scripts import candidate_source_archive_oracle as archives
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
@@ -142,6 +147,130 @@ def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str
     return members
 
 
+def _normalized_metadata(raw: RawMetadata) -> dict[str, object]:
+    metadata = Metadata.from_raw(raw, validate=True)
+    # Typed requirements/specifiers compare semantically; repeated fields retain
+    # their multiplicity, without imposing an RFC header serialization order.
+    result: dict[str, object] = {}
+    for field in raw:
+        value = getattr(metadata, field)
+        result[field] = Counter(value) if isinstance(value, list) else value
+    return result
+
+
+def _bind_source_metadata(members: dict[str, bytes], project_bytes: bytes, readme: bytes) -> None:
+    """Bind the repository's static PEP 621 profile, without executing a builder."""
+    try:
+        document = tomllib.loads(project_bytes.decode("utf-8"))
+        project = document["project"]
+        _require(
+            set(project) == {
+                "name", "version", "description", "readme", "requires-python", "authors",
+                "license", "license-files", "keywords", "classifiers", "dependencies",
+                "entry-points", "urls", "scripts", "optional-dependencies",
+            }
+            and project["readme"] == "README.md"
+            and project["license-files"] == ["LICENSE"]
+            and document["build-system"] == {
+                "requires": ["hatchling==1.27.0"], "build-backend": "hatchling.build",
+            },
+            "source metadata profile is unsupported",
+        )
+        authors = project["authors"]
+        _require(
+            type(authors) is list and bool(authors)
+            and all(type(author) is dict and set(author) == {"name"}
+                    and type(author["name"]) is str for author in authors),
+            "source author profile is unsupported",
+        )
+        dependencies = project["dependencies"]
+        extras = project["optional-dependencies"]
+        _require(
+            type(dependencies) is list and type(extras) is dict
+            and all(type(value) is list for value in extras.values()),
+            "source dependency profile is unsupported",
+        )
+        requirements = [str(Requirement(value)) for value in dependencies]
+        for extra, values in extras.items():
+            for value in values:
+                requirement = Requirement(value)
+                marker = f"extra == {extra!r}"
+                if requirement.marker is not None:
+                    marker = f"({requirement.marker}) and {marker}"
+                requirement.marker = Marker(marker)
+                requirements.append(str(requirement))
+        expected: RawMetadata = {
+            "metadata_version": "2.4",
+            "name": project["name"],
+            "version": project["version"],
+            "summary": project["description"],
+            "description": readme.decode("utf-8"),
+            "description_content_type": "text/markdown",
+            "requires_python": project["requires-python"],
+            "author": ", ".join(author["name"] for author in authors),
+            "license_expression": project["license"],
+            "license_files": project["license-files"],
+            "keywords": project["keywords"],
+            "classifiers": project["classifiers"],
+            "project_urls": project["urls"],
+            "provides_extra": list(extras),
+            "requires_dist": requirements,
+        }
+        actual, unparsed = parse_email(members[_INFO + "METADATA"])
+        _require(
+            not unparsed and _normalized_metadata(actual) == _normalized_metadata(expected),
+            "candidate wheel core metadata differs from source",
+        )
+        entry_points = _EntryPointParser(interpolation=None)
+        entry_points.read_string(members[_INFO + "entry_points.txt"].decode("utf-8"))
+        expected_entries = dict(project["entry-points"])
+        _require("console_scripts" not in expected_entries, "source entry points are ambiguous")
+        expected_entries["console_scripts"] = project["scripts"]
+        _require(
+            not entry_points.defaults()
+            and {section: dict(entry_points[section]) for section in entry_points.sections()}
+            == expected_entries,
+            "candidate wheel entry points differ from source",
+        )
+        wheel = BytesParser().parsebytes(members[_INFO + "WHEEL"])
+        _require(
+            set(wheel) == {"Wheel-Version", "Generator", "Root-Is-Purelib", "Tag"}
+            and wheel.get_all("Generator") == ["hatchling 1.27.0"],
+            "candidate wheel build metadata differs from source",
+        )
+    except (KeyError, TypeError, ValueError, AttributeError, configparser.Error, ExceptionGroup):
+        # Metadata is untrusted; exceptions must never echo its field values.
+        raise ValueError(
+            "candidate wheel metadata does not match the static source profile"
+        ) from None
+
+
+def _metadata_source_files(
+    payload: bytes, metadata: archives.CandidateSourceArchiveMetadataV1,
+) -> tuple[bytes, bytes]:
+    values = []
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as source:
+        for name in ("pyproject.toml", "README.md"):
+            manifest = [member for member in metadata.manifest if member.path == name]
+            _require(
+                len(manifest) == 1 and manifest[0].kind == "file"
+                and 0 < manifest[0].size <= 1024**2,
+                "source metadata file is missing or outside its bound",
+            )
+            stream = source.extractfile(f"{metadata.prefix}/{name}")
+            _require(stream is not None, "source metadata file is unreadable")
+            assert stream is not None
+            with stream:
+                raw = stream.read(1024**2 + 1)
+            _require(
+                (len(raw), hashlib.sha256(raw).hexdigest())
+                == (manifest[0].size, manifest[0].sha256),
+                "source metadata file differs from its manifest",
+            )
+            values.append(raw)
+    return values[0], values[1]
+
+
 class VerifiedCandidateWheelV1:
     __slots__ = ("__weakref__",)
 
@@ -169,7 +298,7 @@ def verify_candidate_wheel_v1(
 ) -> VerifiedCandidateWheelV1:
     metadata = archives.verified_candidate_source_archive_metadata(archive)
     # Recheck the capability's candidate identity before reading the supplied wheel.
-    archives._archive_bytes_for_consumer(archive, identity)
+    payload = archives._archive_bytes_for_consumer(archive, identity)
     with path.open("rb") as stream:
         raw = stream.read(_MAX_WHEEL + 1)
     _require(
@@ -183,6 +312,7 @@ def verify_candidate_wheel_v1(
     }
     _require(bool(expected), "source archive contains no runtime package")
     members = _inspect_wheel(raw, expected)
+    _bind_source_metadata(members, *_metadata_source_files(payload, metadata))
     licenses = [member for member in metadata.manifest if member.path == "LICENSE"]
     _require(
         len(licenses) == 1

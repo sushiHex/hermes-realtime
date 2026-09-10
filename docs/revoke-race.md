@@ -54,9 +54,14 @@ description body; `WHEEL` may not carry body content.
 The [core metadata fields](https://packaging.python.org/en/latest/specifications/core-metadata/)
 are checked before granting wheel authority. The existing locked development
 `packaging` library [validates their semantics](https://packaging.pypa.io/en/stable/metadata.html),
-including dependency and Python-version declarations. Entry-point names retain
-exact case. Duplicate,
-missing, unexpected, native, or mismatched members fail before launch.
+including dependency and Python-version declarations. A closed projection of the
+verified archive's static `pyproject.toml` profile binds every declared field:
+requirements and extra markers, Python versions, identity, authors, license,
+classifiers, keywords, URLs, and the exact README description. Repeated fields
+compare as multisets of validated values; header order is immaterial. Entry points
+match the source with exact case, and build metadata matches the pinned builder.
+Unsupported source metadata profiles fail closed without executing build code.
+Duplicate, missing, unexpected, native, or mismatched members fail before launch.
 
 The pure wheel is unpacked into a fresh owned directory outside the source tree.
 Only that directory supplies `hermes_realtime`; the archive supplies the runner

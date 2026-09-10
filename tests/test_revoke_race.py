@@ -146,6 +146,153 @@ def test_wheel_inspection_refuses_foreign_incomplete_or_executable_extra_members
         _inspect_wheel(raw, expected)
 
 
+_SOURCE_PROJECT = b'''[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-realtime"
+version = "0.0.3"
+description = "Synthetic package"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+authors = [{name = "Synthetic author"}]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["voice", "realtime"]
+classifiers = ["Typing :: Typed", "Programming Language :: Python :: 3"]
+dependencies = ["aiohttp>=3.11,<4", "pydantic>=2.11,<3"]
+[project.optional-dependencies]
+local = ["numpy>=1.26,<3; sys_platform == 'win32'"]
+[project.urls]
+Homepage = "https://example.org/"
+[project.scripts]
+hermes-realtime-host = "hermes_realtime.host_launcher:main"
+hermes-realtime-local = "hermes_realtime.launcher:main"
+[project.entry-points."hermes_agent.plugins"]
+hermes-realtime = "hermes_realtime.hermes_plugin"
+'''
+_SOURCE_CORE = b'''Metadata-Version: 2.4
+Name: hermes-realtime
+Version: 0.0.3
+Summary: Synthetic package
+Description-Content-Type: text/markdown
+Requires-Python: <3.12,>=3.11
+Author: Synthetic author
+License-Expression: MIT
+License-File: LICENSE
+Keywords: realtime,voice
+Classifier: Programming Language :: Python :: 3
+Classifier: Typing :: Typed
+Project-URL: Homepage, https://example.org/
+Provides-Extra: local
+Requires-Dist: pydantic<3,>=2.11
+Requires-Dist: aiohttp<4,>=3.11
+Requires-Dist: numpy<3,>=1.26; sys_platform == "win32" and extra == "local"
+
+# Synthetic description
+'''
+
+
+def _source_members() -> dict[str, bytes]:
+    from scripts.candidate_wheel import _inspect_wheel
+
+    members = _inspect_wheel(*_wheel_bytes())
+    info = "hermes_realtime-0.0.3.dist-info/"
+    members[info + "METADATA"] = _SOURCE_CORE
+    members[info + "WHEEL"] += b"Generator: hatchling 1.27.0\n"
+    return members
+
+
+def test_wheel_metadata_matches_source_despite_header_and_requirement_order() -> None:
+    from scripts.candidate_wheel import _bind_source_metadata
+
+    members = _source_members()
+    info = "hermes_realtime-0.0.3.dist-info/"
+    for reorder in (False, True):
+        if reorder:
+            headers, body = _SOURCE_CORE.split(b"\n\n", 1)
+            members[info + "METADATA"] = b"\n".join(reversed(headers.splitlines())) + b"\n\n" + body
+            members[info + "METADATA"] = members[info + "METADATA"].replace(
+                b"aiohttp<4,>=3.11", b"AioHTTP>=3.11,<4"
+            )
+        _bind_source_metadata(members, _SOURCE_PROJECT, b"# Synthetic description\n")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b"Requires-Dist: pydantic<3,>=2.11\n", b""),
+        (b"Requires-Dist: pydantic<3,>=2.11", b"Requires-Dist: unexpected>=1"),
+        (
+            b"Requires-Dist: pydantic<3,>=2.11",
+            b"Requires-Dist: pydantic<3,>=2.11\nRequires-Dist: unexpected>=1",
+        ),
+        (
+            b"Requires-Dist: pydantic<3,>=2.11",
+            b"Requires-Dist: pydantic<3,>=2.11\nRequires-Dist: pydantic<3,>=2.11",
+        ),
+        (b"sys_platform == \"win32\" and extra == \"local\"", b"extra == \"local\""),
+        (b"Provides-Extra: local", b"Provides-Extra: other"),
+        (b"Requires-Python: <3.12,>=3.11", b"Requires-Python: >=3.11"),
+        (b"Summary: Synthetic package", b"Summary: Other package"),
+        (b"Author: Synthetic author", b"Author: Other author"),
+        (b"License-Expression: MIT", b"License-Expression: BSD-3-Clause"),
+        (b"License-File: LICENSE", b"License-File: OTHER"),
+        (b"Keywords: realtime,voice", b"Keywords: realtime"),
+        (b"Classifier: Typing :: Typed\n", b""),
+        (b"https://example.org/", b"https://example.net/"),
+        (b"# Synthetic description", b"# Other description"),
+        (b"Description-Content-Type: text/markdown", b"Description-Content-Type: text/plain"),
+        (b"Name: hermes-realtime", b"Name: hermes-realtime\nPlatform: any"),
+    ],
+)
+def test_valid_but_foreign_core_metadata_is_rejected(old: bytes, new: bytes) -> None:
+    from packaging.metadata import Metadata
+
+    from scripts.candidate_wheel import _bind_source_metadata
+
+    members = _source_members()
+    name = "hermes_realtime-0.0.3.dist-info/METADATA"
+    assert old in members[name]
+    members[name] = members[name].replace(old, new)
+    # Each mutant is valid packaging metadata; provenance, not syntax, must reject it.
+    Metadata.from_email(members[name], validate=True)
+    with pytest.raises(ValueError, match="static source profile"):
+        _bind_source_metadata(members, _SOURCE_PROJECT, b"# Synthetic description\n")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (b"aiohttp>=3.11,<4", b"aiohttp>=3.12,<4"),
+        (b"sys_platform == 'win32'", b"sys_platform == 'linux'"),
+        (b"host_launcher:main", b"host_launcher:other"),
+        (b"[project]", b'[project]\ndynamic = ["version"]'),
+        (b"hatchling==1.27.0", b"hatchling==1.28.0"),
+        (b'readme = "README.md"', b'readme = "OTHER.md"'),
+        (b'name = "Synthetic author"', b'name = "Synthetic author", email = "author@example.org"'),
+    ],
+)
+def test_source_changes_require_matching_wheel_metadata(old: bytes, new: bytes) -> None:
+    from scripts.candidate_wheel import _bind_source_metadata
+
+    assert old in _SOURCE_PROJECT
+    with pytest.raises(ValueError, match="static source profile"):
+        _bind_source_metadata(
+            _source_members(), _SOURCE_PROJECT.replace(old, new), b"# Synthetic description\n"
+        )
+
+
+@pytest.mark.parametrize("addition", [b"Build: 1\n", b"Generator: hatchling 1.27.0\n"])
+def test_wheel_build_metadata_is_closed_and_matches_the_source_pin(addition: bytes) -> None:
+    from scripts.candidate_wheel import _bind_source_metadata
+
+    members = _source_members()
+    members["hermes_realtime-0.0.3.dist-info/WHEEL"] += addition
+    with pytest.raises(ValueError, match="static source profile"):
+        _bind_source_metadata(members, _SOURCE_PROJECT, b"# Synthetic description\n")
+
+
 def test_revoke_receipts_cannot_be_constructed_from_caller_assertions() -> None:
     from scripts.revoke_race import ObservedRevokeRaceV1, validate_revoke_race_v1
 
