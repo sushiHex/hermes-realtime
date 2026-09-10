@@ -49,6 +49,7 @@ def _validate_observations(row: Any) -> None:
         {
             "arm",
             "commands",
+            "dispatch",
             "snapshots",
             "transactions",
             "durable_terminals",
@@ -80,7 +81,23 @@ def _validate_observations(row: Any) -> None:
         "rollover lifecycle is incomplete or reordered",
     )
     commands = row["commands"]
-    _keys(commands, {"create", "rollover", "successor_expiry"})
+    _keys(
+        commands,
+        {"create", "rollover", "successor_expiry", "create_dto", "rollover_dto", "request"},
+    )
+    dispatch = row["dispatch"]
+    _keys(dispatch, {"create_dto", "rollover_dto", "request", "ordinals", "rollover_ordinal"})
+    for field in ("create_dto", "rollover_dto", "request"):
+        _digest(commands[field])
+        _require(dispatch[field] == commands[field], "transport changed the complete command")
+    _require(
+        type(dispatch["ordinals"]) is list
+        and all(type(n) is int for n in dispatch["ordinals"])
+        and dispatch["ordinals"] == list(range(3, 22))
+        and type(dispatch["rollover_ordinal"]) is int
+        and dispatch["rollover_ordinal"] == 15,
+        "dispatched rollover lost admission order",
+    )
     _digests(commands["create"], 2)
     _digests(commands["rollover"], 4)
     _digest(commands["successor_expiry"])
@@ -107,6 +124,7 @@ def _validate_observations(row: Any) -> None:
                     "controls",
                     "opened",
                     "expires",
+                    "retention_lag_us",
                 }
                 | _CONTENT,
             )
@@ -116,6 +134,12 @@ def _validate_observations(row: Any) -> None:
             _digest(session["consent_request"])
             _digest(session["opened"])
             _digest(session["expires"])
+            lag = session["retention_lag_us"]
+            _require(
+                type(lag) is int
+                and (0 <= lag <= 5_000_000 if session["predecessor"] else lag == 0),
+                "stored retention interval differs from consent",
+            )
             _digests(session["controls"], 4 if sealed else 2)
             expected_controls = (
                 commands["create"] + commands["rollover"][:2]
@@ -150,7 +174,15 @@ def _validate_observations(row: Any) -> None:
     _require(before == committing, "partial rollover became visible before commit")
     old, successor = committed
     _require(old == continued[0], "sealed predecessor changed during successor conversation")
-    for name in {"session", "epoch", "predecessor", "consent", "opened", "expires"} | _CONTENT:
+    for name in {
+        "session",
+        "epoch",
+        "predecessor",
+        "consent",
+        "opened",
+        "expires",
+        "retention_lag_us",
+    } | _CONTENT:
         _require(old[name] == before[0][name], "rollover changed predecessor identity or content")
     _require(
         before[0]["predecessor"] == "" and old["chain"][:14] == before[0]["chain"],
@@ -163,10 +195,23 @@ def _validate_observations(row: Any) -> None:
         and successor["predecessor"] == old["session"],
         "rollover successor lineage differs",
     )
-    for name in ("session", "epoch", "predecessor", "consent", "opened", "expires"):
+    for name in (
+        "session",
+        "epoch",
+        "predecessor",
+        "consent",
+        "opened",
+        "expires",
+        "retention_lag_us",
+    ):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
-    _keys(row["source"], _CONTENT | {"consent"})
+    _keys(row["source"], _CONTENT | {"consent", "request"})
+    _digest(row["source"]["request"])
+    _require(
+        commands["request"] == row["source"]["request"],
+        "create differs from accepted request identity",
+    )
     _digest(row["source"]["consent"])
     _require(
         all(

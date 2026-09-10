@@ -42,6 +42,7 @@ def _observations() -> dict:
             ),
             opened="8" * 64 if predecessor else "7" * 64,
             expires="9" * 64 if predecessor else "6" * 64,
+            retention_lag_us=1000 if predecessor else 0,
             predecessor=predecessor,
             state="sealed" if sealed else "open",
             events=len(kinds),
@@ -59,6 +60,9 @@ def _observations() -> dict:
             "create": ["0" * 64, "1" * 64],
             "rollover": ["2" * 64, "2" * 64, "3" * 64, "4" * 64],
             "successor_expiry": "9" * 64,
+            "create_dto": "1" * 64,
+            "rollover_dto": "2" * 64,
+            "request": "3" * 64,
         },
         snapshots=[before, copy.deepcopy(before), committed, continued],
         transactions=["BEGIN IMMEDIATE", "COMMIT"],
@@ -70,7 +74,14 @@ def _observations() -> dict:
             }
             for stage in ("claimed", "queued", "durable", "published", "terminal")
         ],
-        source=source | {"consent": "f" * 64},
+        source=source | {"consent": "f" * 64, "request": "3" * 64},
+        dispatch={
+            "create_dto": "1" * 64,
+            "rollover_dto": "2" * 64,
+            "request": "3" * 64,
+            "ordinals": list(range(3, 22)),
+            "rollover_ordinal": 15,
+        },
         terminals=[
             dict(
                 disposition="completed",
@@ -162,8 +173,20 @@ async def test_consent_source_commitment_requires_the_exact_dispatched_request_a
     }
     raw = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
     assert (
-        commitment
+        commitment["consent"]
         == hmac.new(b"synthetic key", b"accepted_consent\0" + raw, hashlib.sha256).hexdigest()
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(sent, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert (
+        commitment["request"]
+        == hmac.new(
+            b"synthetic key",
+            b"accepted_request\0"
+            + json.dumps([sent["sequence"], fingerprint], separators=(",", ":")).encode(),
+            hashlib.sha256,
+        ).hexdigest()
     )
 
 
@@ -589,7 +612,7 @@ def test_rollover_observer_rejects_coordinated_command_substitution(
     try:
         # Both substitutions use real spool writes, valid payloads and HRE1
         # chains. Only the independently captured dispatched command differs.
-        with pytest.raises(ValueError, match="dispatched"):
+        with pytest.raises(ValueError, match="dispatched|retention"):
             observer.create_epoch(make_create_epoch())
             observer.rollover_session(make_rollover_command())
     finally:
@@ -614,3 +637,159 @@ def test_rollover_parent_rejects_coordinated_store_changes_against_dispatched_co
                     session["expires"] = "d" * 64
     with pytest.raises(ValueError):
         _validate_observations(row)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["create_sequence", "create_fingerprint", "rollover_ordinal", "runtime_retention"]
+)
+def test_rollover_rejects_foreign_command_identity_and_consent_deadline(
+    tmp_path: Path, mutation: str
+) -> None:
+    from dataclasses import replace
+    from datetime import datetime, timedelta
+
+    from hermes_realtime.evidence.sqlite_spool import format_canonical_utc
+    from scripts.capacity_rollover_worker import _ObserveRolloverSpool
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    owned = make_spool(tmp_path)
+
+    class SubstitutingSpool:
+        def __getattr__(self, name):
+            return getattr(owned, name)
+
+        def create_epoch(self, command):
+            if mutation == "create_sequence":
+                command = replace(command, control_sequence=command.control_sequence + 1)
+            elif mutation == "create_fingerprint":
+                command = replace(command, control_fingerprint_hash="f" * 64)
+            return owned.create_epoch(command)
+
+        def rollover_session(self, command):
+            if mutation == "rollover_ordinal":
+                command = replace(command, admission_ordinal=command.admission_ordinal + 1)
+            return owned.rollover_session(command)
+
+    observer = _ObserveRolloverSpool(SubstitutingSpool(), owned.database, b"synthetic key")
+    try:
+        command = make_rollover_command()
+        if mutation == "runtime_retention":
+            # The wrong deadline originates before observation and is persisted
+            # unchanged. Command/store equality alone cannot establish policy.
+            command = replace(
+                command,
+                successor_expires_at_utc=format_canonical_utc(
+                    datetime.fromisoformat(command.successor_expires_at_utc) + timedelta(hours=144)
+                ),
+            )
+        with pytest.raises(ValueError):
+            observer.create_epoch(make_create_epoch())
+            observer.rollover_session(command)
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "dto",
+        "transport_dto",
+        "request",
+        "gap",
+        "rollover_order",
+        "bool_ordinal",
+        "negative_lag",
+        "large_lag",
+        "bool_lag",
+    ],
+)
+def test_rollover_parent_rejects_foreign_command_or_retention_authority(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "dto":
+        row["commands"]["create_dto"] = "e" * 64
+    elif mutation == "transport_dto":
+        row["dispatch"]["rollover_dto"] = "e" * 64
+    elif mutation == "request":
+        row["commands"]["request"] = row["dispatch"]["request"] = "e" * 64
+    elif mutation == "gap":
+        row["dispatch"]["ordinals"][2] += 1
+    elif mutation == "rollover_order":
+        row["dispatch"]["rollover_ordinal"] += 1
+    elif mutation == "bool_ordinal":
+        row["dispatch"]["ordinals"][0] = True
+    else:
+        value = {"negative_lag": -1, "large_lag": 5_000_001, "bool_lag": False}[mutation]
+        for snapshot in row["snapshots"][2:]:
+            snapshot["sessions"][1]["retention_lag_us"] = value
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize(
+    "offset_microseconds", [-6_000_000, -5_000_000, 0, 1, 144 * 3600 * 1_000_000]
+)
+def test_rollover_reader_checks_successor_retention_with_bounded_clock_skew(
+    tmp_path: Path, offset_microseconds: int
+) -> None:
+    from datetime import datetime, timedelta
+
+    from hermes_realtime.evidence.sqlite_spool import format_canonical_utc
+    from scripts.capacity_rollover_worker import _snapshot
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    owned = make_spool(tmp_path)
+    try:
+        owned.create_epoch(make_create_epoch())
+        command = make_rollover_command()
+        owned.rollover_session(command)
+        opened = owned.connection.execute(
+            "SELECT opened_at_utc FROM evidence_sessions WHERE logical_session_id=?",
+            (command.successor_logical_session_id,),
+        ).fetchone()[0]
+        expires = format_canonical_utc(
+            datetime.fromisoformat(opened) + timedelta(hours=24, microseconds=offset_microseconds)
+        )
+        owned.connection.execute(
+            "UPDATE evidence_sessions SET expires_at_utc=? WHERE logical_session_id=?",
+            (expires, command.successor_logical_session_id),
+        )
+        owned.connection.commit()
+        if offset_microseconds in (-5_000_000, 0):
+            observed = _snapshot(owned.database, b"synthetic key")
+            assert observed["sessions"][1]["retention_lag_us"] == -offset_microseconds
+        else:
+            with pytest.raises(ValueError, match="retention"):
+                _snapshot(owned.database, b"synthetic key")
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize("ordinals", [(2,), (4,), (True,), (3, 5), (3, 4, 5)])
+def test_dispatch_observer_preserves_fifo_and_rejects_gaps_before_delegation(
+    ordinals: tuple,
+) -> None:
+    from types import SimpleNamespace
+
+    from scripts.capacity_rollover_worker import _ObserveDispatch
+
+    calls = []
+    observer = _ObserveDispatch(SimpleNamespace(append_record=calls.append), b"synthetic key")
+    if ordinals == (3, 4, 5):
+        for ordinal in ordinals:
+            observer.append_record(SimpleNamespace(admission_ordinal=ordinal))
+        assert len(calls) == 3
+    else:
+        with pytest.raises(ValueError, match="ordinal"):
+            for ordinal in ordinals:
+                observer.append_record(SimpleNamespace(admission_ordinal=ordinal))
+        assert len(calls) == (1 if ordinals == (3, 5) else 0)

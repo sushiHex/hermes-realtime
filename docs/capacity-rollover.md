@@ -39,14 +39,26 @@ all store consent fields and recomputing their hashes cannot replace the request
 that was actually accepted. The reader also requires one active epoch and no
 conflicts or pending/completed erasure authority in this fresh scenario.
 
-Before delegating epoch creation and rollover, the observer commits the complete
-dispatched control snapshots, including event identity, binding identity and
-generation, source availability, and consent lineage. The reader reconstructs
+Before transport delegation and again on the SQLite owner thread, observers
+commit the complete create and rollover command DTOs. The accepted DTO retained
+by SQLite must also match. No command field is omitted: request sequence and
+fingerprint, admission ordinal, identities, expiry, and all nested snapshots are
+bound. The create request sequence/fingerprint must match the exact accepted
+browser request. Ordered dispatch must match every actual record ordinal,
+including the two ordinals consumed by atomic epoch creation.
+
+The observer also commits complete dispatched control snapshots, including event
+identity, binding identity and generation, source availability, and consent lineage. The reader reconstructs
 those snapshots from SQLite; both observer and parent compare their commitments
 with the dispatched commands. The successor's stored expiry must match the
 rollover command's exact deadline. Canonical opening and expiry timestamps,
 opening-event timestamp equality, the initial retention interval, and unchanged
-timestamps across subsequent observations are also required. A consistent
+timestamps across subsequent observations are also required. The successor's
+retention interval must match accepted consent, allowing only zero to five
+seconds between the runtime's deadline sample and the writer's opening sample.
+The deadline cannot extend consent; a shorter interval beyond the existing
+five-second observation authority also fails. Command/store agreement alone
+cannot establish retention policy. A consistent
 rewrite within the store cannot substitute different command authority.
 
 Session IDs, timestamps, and raw records stay in the child. An invocation-local HMAC key commits session lineage, chain entries,

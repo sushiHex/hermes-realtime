@@ -10,6 +10,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -43,7 +44,30 @@ def _consent_commitment(key: bytes, fields: dict[str, Any]) -> str:
     return _commit(key, "accepted_consent", raw)
 
 
-async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> str:
+def _request_commitment(key: bytes, sequence: int, fingerprint: str) -> str:
+    return _commit(
+        key, "accepted_request", json.dumps([sequence, fingerprint], separators=(",", ":"))
+    )
+
+
+def _command_commitment(key: bytes, command: Any) -> str:
+    from hermes_realtime.evidence.models import CreateEpochV1, RolloverSessionV1
+
+    _require(type(command) in (CreateEpochV1, RolloverSessionV1), "command type differs")
+    return _commit(
+        key,
+        "dispatched_command",
+        json.dumps(
+            asdict(command),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> dict[str, str]:
     from tests.integration import test_qualification_full_host_ingress as ingress
 
     capture = await ingress._wait_event(
@@ -82,7 +106,7 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     # Anchor the receipt to the bytes actually dispatched through the host API,
     # independently of every subsequently observed SQLite row.
     sent = json.loads(raw)
-    return _consent_commitment(
+    consent = _consent_commitment(
         key,
         {
             "consent_version": sent["consentVersion"],
@@ -92,6 +116,11 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
             "typed_accepted": sent["sources"]["typed"],
         },
     )
+
+    fingerprint = hashlib.sha256(
+        json.dumps(sent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {"consent": consent, "request": _request_commitment(key, sent["sequence"], fingerprint)}
 
 
 def _control_commitments(key: bytes, snapshots: Any) -> list[str]:
@@ -258,12 +287,19 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                 opened == events[0][7] == events[1][7],
                 "session opening timestamps differ",
             )
-            if not sessions:
-                _require(
-                    datetime.fromisoformat(expires) - datetime.fromisoformat(opened)
-                    == timedelta(hours=payloads[0]["retention_hours"]),
-                    "initial session retention deadline differs",
-                )
+            lag = (
+                datetime.fromisoformat(opened)
+                + timedelta(hours=payloads[0]["retention_hours"])
+                - datetime.fromisoformat(expires)
+            )
+            lag_us = (lag.days * 86_400 + lag.seconds) * 1_000_000 + lag.microseconds
+            # Rollover expiry is sampled by the runtime before the writer's
+            # opening clock. Bound that skew by the existing five-second
+            # observation authority; epoch creation uses a single clock sample.
+            _require(
+                (lag_us == 0 if not sessions else 0 <= lag_us <= 5_000_000),
+                "session retention interval differs from accepted consent",
+            )
             consent = {
                 "opening": {
                     name: value
@@ -289,6 +325,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     ),
                     "opened": _commit(key, "session_time", opened),
                     "expires": _commit(key, "session_time", expires),
+                    "retention_lag_us": lag_us,
                     "predecessor": ""
                     if predecessor is None
                     else _commit(key, "session", predecessor),
@@ -333,10 +370,19 @@ class _ObserveRolloverSpool:
 
     def create_epoch(self, command: Any) -> Any:
         _require(not self.commands, "create command was dispatched more than once")
+        self.commands["create_dto"] = _command_commitment(self.key, command)
+        self.commands["request"] = _request_commitment(
+            self.key, command.control_sequence, command.control_fingerprint_hash
+        )
         self.commands["create"] = _control_commitments(
             self.key, (command.session_opened, command.binding_opened)
         )
         result = self.delegate.create_epoch(command)
+        _require(
+            _command_commitment(self.key, self.delegate._accepted_create)
+            == self.commands["create_dto"],
+            "accepted create differs from the complete dispatched command",
+        )
         snapshot = _snapshot(self.database, self.key)
         _require(
             len(snapshot["sessions"]) == 1
@@ -356,7 +402,11 @@ class _ObserveRolloverSpool:
 
     def rollover_session(self, command: Any) -> Any:
         _require(not self.snapshots, "rollover was invoked more than once")
-        _require(set(self.commands) == {"create"}, "dispatched create command is absent")
+        _require(
+            set(self.commands) == {"create", "create_dto", "request"},
+            "dispatched create command is absent",
+        )
+        self.commands["rollover_dto"] = _command_commitment(self.key, command)
         self.commands["rollover"] = _control_commitments(self.key, command.snapshots)
         self.commands["successor_expiry"] = _commit(
             self.key, "session_time", command.successor_expires_at_utc
@@ -384,6 +434,11 @@ class _ObserveRolloverSpool:
         finally:
             self.delegate.connection.set_trace_callback(None)
         _require(not self.failed, "rollover transaction observation failed")
+        _require(
+            _command_commitment(self.key, self.delegate._accepted_rollover)
+            == self.commands["rollover_dto"],
+            "accepted rollover differs from the complete dispatched command",
+        )
         committed = _snapshot(self.database, self.key)
         self.snapshots.append(committed)
         predecessor, successor = committed["sessions"]
@@ -394,6 +449,45 @@ class _ObserveRolloverSpool:
             "stored rollover differs from the dispatched command",
         )
         return result
+
+
+class _ObserveDispatch:
+    """Commit commands before transport delegation and observe the real FIFO."""
+
+    def __init__(self, delegate: Any, key: bytes) -> None:
+        self.delegate, self.key = delegate, key
+        self.commands: dict[str, Any] = {"ordinals": []}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def _ordinal(self, ordinal: int) -> None:
+        # Epoch creation consumes two record ordinals in one physical item.
+        ordinals = self.commands["ordinals"]
+        _require(
+            type(ordinal) is int and len(ordinals) < 19 and ordinal == len(ordinals) + 3,
+            "dispatched admission ordinal is not the next FIFO item",
+        )
+        ordinals.append(ordinal)
+
+    def create_epoch(self, command: Any) -> Any:
+        _require(set(self.commands) == {"ordinals"}, "create dispatch repeated")
+        self.commands["create_dto"] = _command_commitment(self.key, command)
+        self.commands["request"] = _request_commitment(
+            self.key, command.control_sequence, command.control_fingerprint_hash
+        )
+        return self.delegate.create_epoch(command)
+
+    def append_record(self, item: Any) -> Any:
+        self._ordinal(item.admission_ordinal)
+        return self.delegate.append_record(item)
+
+    def rollover_session(self, command: Any) -> Any:
+        _require("rollover_dto" not in self.commands, "rollover dispatch repeated")
+        self._ordinal(command.admission_ordinal)
+        self.commands["rollover_ordinal"] = command.admission_ordinal
+        self.commands["rollover_dto"] = _command_commitment(self.key, command)
+        return self.delegate.rollover_session(command)
 
 
 async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[str, Any]:
@@ -416,6 +510,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     composition = trace.InProcessQualificationComposition()
     transcriber = ingress._Transcriber()
     spools: list[_ObserveRolloverSpool] = []
+    dispatches: list[_ObserveDispatch] = []
 
     def writer_factory(runtime: Any) -> Any:
         transport = runtime.create_sqlite_transport()
@@ -427,7 +522,9 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             return spool
 
         transport._spool_factory = observed_factory
-        return transport
+        dispatch = _ObserveDispatch(transport, key)
+        dispatches.append(dispatch)
+        return dispatch
 
     registration = composition.compose_full_host(
         lambda: build_local_host_launcher(
@@ -530,6 +627,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     return {
         "arm": "capacity_rollover",
         "commands": spool.commands,
+        "dispatch": dispatches[0].commands,
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "durable_terminals": spool.durable_terminals,
@@ -539,7 +637,8 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             if type(item) is RolloverObservationV1
         ],
         "source": {
-            "consent": accepted_consent,
+            "consent": accepted_consent["consent"],
+            "request": accepted_consent["request"],
             "user": users,
             "generated": [
                 _commit(key, "generated", item.generated_text)
