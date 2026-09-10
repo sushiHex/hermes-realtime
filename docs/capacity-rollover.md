@@ -72,7 +72,10 @@ and content without exporting that key or identifiers.
 
 The independent parent validator compares the persisted user, generated, and
 transport-confirmed text commitments with the accepted inputs and actual
-production conversation observations. It requires all five ordered rollover
+production conversation observations. Each user commitment binds source type
+together with text to the accepted typed HTTP input, so a valid, consented
+microphone record containing the same text cannot substitute for that input.
+It requires all five ordered rollover
 stages, three successful settlements and durable writer results, no queue
 rejections, complete traces, all twelve successful close stages, and released
 capacity. It derives exactly `persisted_source_equal` and `rollover_atomic`.

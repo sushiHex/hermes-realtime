@@ -24,6 +24,15 @@ def _commit(key: bytes, domain: str, value: str | bytes) -> str:
     return hmac.new(key, domain.encode("ascii") + b"\0" + raw, hashlib.sha256).hexdigest()
 
 
+def _user_commitment(key: bytes, source: str, text: str) -> str:
+    _require(source in {"typed", "microphone"}, "input source is invalid")
+    return _commit(
+        key,
+        "user",
+        json.dumps([source, text], ensure_ascii=False, allow_nan=False, separators=(",", ":")),
+    )
+
+
 _CONSENT_FIELDS = (
     "consent_version",
     "disclosure_digest",
@@ -357,7 +366,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     "chain": [_commit(key, "chain", e[6]) for e in events],
                     "kinds": [e[2] for e in events],
                     "user": [
-                        _commit(key, "user", p["text"])
+                        _user_commitment(key, p["source"], p["text"])
                         for e, p in zip(events, payloads, strict=True)
                         if e[2] == "user_final_accepted"
                     ],
@@ -606,7 +615,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
                 status == 202 and result == {"sequence": sequence, "version": 1},
                 "rollover conversation input was not accepted",
             )
-            inputs.append(_commit(key, "user", text))
+            inputs.append(_user_commitment(key, "typed", text))
             event = await ingress._wait_event(
                 port=port,
                 origin=origin,
@@ -657,7 +666,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     ]
     _require(bool(contexts), "committed conversation context is absent")
     users = [
-        _commit(key, "user", message[1])
+        _user_commitment(key, "typed", message[1])
         for message in contexts[-1]["messages"]
         if message[0] == "user"
     ]

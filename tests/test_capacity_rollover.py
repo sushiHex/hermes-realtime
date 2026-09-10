@@ -109,6 +109,66 @@ def test_rollover_validator_accepts_a_durable_transition_and_equal_source() -> N
     _validate_observations(_observations())
 
 
+@pytest.mark.parametrize("stored_source", ["typed", "microphone"])
+def test_persisted_source_provenance_must_match_the_accepted_typed_input(
+    tmp_path: Path, stored_source: str
+) -> None:
+    from dataclasses import replace
+
+    from hermes_realtime.evidence.models import InputSource, StoreDisposition
+    from scripts.capacity_rollover import _validate_observations
+    from scripts.capacity_rollover_worker import _snapshot
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_spool,
+        ordinary_record,
+        turn_opened_snapshot,
+        user_final_snapshot,
+    )
+
+    commitments = {}
+    for source in ("typed", "microphone"):
+        owned = make_spool(tmp_path / source)
+        try:
+            command = make_create_epoch()
+            command = replace(
+                command,
+                microphone_accepted=True,
+                session_opened=replace(
+                    command.session_opened,
+                    payload=replace(command.session_opened.payload, microphone_accepted=True),
+                ),
+                binding_opened=replace(
+                    command.binding_opened,
+                    payload=replace(command.binding_opened.payload, microphone_available=True),
+                ),
+            )
+            assert owned.create_epoch(command) is StoreDisposition.COMMITTED
+            opened = turn_opened_snapshot(3, event_index=3)
+            user = user_final_snapshot(4, event_index=4, text="Synthetic accepted typed input.")
+            user = replace(user, payload=replace(user.payload, source=InputSource(source)))
+            for snapshot in (opened, user):
+                assert owned.append_record(
+                    ordinary_record(snapshot, snapshot.event_sequence)
+                ) is StoreDisposition.COMMITTED
+            # Both histories are valid, consented and hashed by the real spool.
+            # Their text is identical; only the persisted provenance differs.
+            observed = _snapshot(owned.database, b"synthetic key")
+            commitments[source] = observed["sessions"][0]["user"][0]
+        finally:
+            owned.close()
+    row = _observations()
+    row["source"]["user"] = [commitments["typed"]] * 3
+    for snapshot in row["snapshots"]:
+        for session in snapshot["sessions"]:
+            session["user"] = [commitments[stored_source]] * len(session["user"])
+    if stored_source == "typed":
+        _validate_observations(row)
+    else:
+        with pytest.raises(ValueError, match="persisted content"):
+            _validate_observations(row)
+
+
 def test_coordinated_store_consent_changes_cannot_replace_the_accepted_request() -> None:
     from scripts.capacity_rollover import _validate_observations
 
