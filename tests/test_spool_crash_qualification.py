@@ -23,7 +23,11 @@ def test_governed_cases_and_existing_driver_have_the_same_closed_matrix() -> Non
     )
     assert FAILPOINTS_V1 == FAILPOINTS
     assert list(case_ids()) == schema["$defs"]["SpoolCrashCaseV1"]["properties"]["caseId"]["enum"]
-    _validate_case_contract(schema)
+    _validate_case_contract(
+        (
+            Path(__file__).parents[1] / "scripts/schemas/qualification-report-v1.schema.json"
+        ).read_bytes()
+    )
     cases = schema["properties"]["scenarios"]["prefixItems"][13]["allOf"][1]["properties"][
         "caseResults"
     ]["prefixItems"]
@@ -49,7 +53,22 @@ def test_producer_rejects_changed_per_case_contract(field) -> None:
     ]["prefixItems"]
     cases[18]["allOf"][1]["properties"][field] = {}
     with pytest.raises(ValueError, match="governed spool case contract"):
-        _validate_case_contract(schema)
+        _validate_case_contract(
+            (json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        )
+
+
+def test_producer_requires_the_exact_canonical_contract_bytes() -> None:
+    from pathlib import Path
+
+    from scripts.spool_crash_matrix import _validate_case_contract
+
+    raw = (
+        Path(__file__).parents[1] / "scripts/schemas/qualification-report-v1.schema.json"
+    ).read_bytes()
+    _validate_case_contract(raw)
+    with pytest.raises(ValueError, match="governed spool case contract"):
+        _validate_case_contract(raw + b"\n")
 
 
 def test_registration_and_receipts_reject_reconstruction() -> None:

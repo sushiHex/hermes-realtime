@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -122,11 +121,12 @@ def _entry_sentinel(index: int) -> str:
     return "clear"
 
 
-def _validate_case_contract(schema: Any) -> None:
+def _validate_case_contract(schema: bytes) -> None:
     # Pin the complete reviewed V1 contract, including every per-case field and
     # transitive definition. A schema change requires an explicit producer review.
     _require(
-        hashlib.sha256(core.canonical_json_bytes(schema)).hexdigest()
+        type(schema) is bytes
+        and hashlib.sha256(schema).hexdigest()
         == "e3c8c509612bba844d9329202beb83bee7cbdf6b7a3d98501e2511be9da3e399",
         "governed spool case contract differs",
     )
@@ -487,12 +487,9 @@ def produce_spool_crash_matrix_v1(
 ) -> ObservedSpoolCrashMatrixV1:
     invocations = []
     with _storage_archive(archive, identity, wheel) as owned:
-        schema = json.loads(
-            (owned.source / "scripts/schemas/qualification-report-v1.schema.json").read_text(
-                encoding="utf-8"
-            )
+        _validate_case_contract(
+            (owned.source / "scripts/schemas/qualification-report-v1.schema.json").read_bytes()
         )
-        _validate_case_contract(schema)
         for point in FAILPOINTS_V1:
             for mode in (197, 198):
                 clocks = (
