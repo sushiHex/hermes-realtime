@@ -14,6 +14,7 @@ from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchi
 from scripts.candidate_wheel import VerifiedCandidateWheelV1
 from scripts.deterministic_equivalence import _keys, _require
 from scripts.packaged_scenario import PackagedScenarioEvidenceV1
+from scripts.spool_crash_oracle import erasure_receipt_digest_v1, initialization_digest_v1
 from scripts.storage_process import (
     _run_storage_worker,
     _storage_archive,
@@ -202,9 +203,11 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             for tombstone in db["tombstones"]:
                 _require(
                     type(tombstone) is list
-                    and len(tombstone) == 3
+                    and len(tombstone) == 4
                     and tombstone[0] in {"revoked", "unclean_epoch", "clock_rollback", "ttl"}
-                    and all(type(n) is int and 0 <= n <= 8 for n in tombstone[1:]),
+                    and all(type(n) is int and 0 <= n <= 8 for n in tombstone[1:3])
+                    and type(tombstone[3]) is str
+                    and re.fullmatch("[0-9a-f]{64}", tombstone[3]) is not None,
                     "storage tombstone values differ",
                 )
     index = FAILPOINTS_V1.index(point)
@@ -279,7 +282,11 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             set(before["files"]) == expected_files, "initialization checkpoint inventory differs"
         )
         _require(
-            (before["files"][temporary] == hashlib.sha256(b"").hexdigest()) == (index in {9, 14}),
+            before["files"][temporary]
+            == initialization_digest_v1(
+                "root_marker" if index <= 12 else "sentinel",
+                point.partition("_init_")[2],
+            ),
             "initialization checkpoint write boundary differs",
         )
     disposition = (
@@ -340,14 +347,23 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             db["seals"] == (before["database"]["seals"] if sealed else []),
             "recovery changed a revalidated seal",
         )
-        tombstones = (
+        tombstones: list[tuple[str, int, int]] = (
             []
             if index in {4, 8}
-            else [["revoked", 1, 2]]
+            else [("revoked", 1, 2)]
             if index in {6, 7}
-            else [["unclean_epoch", 1, 2 if index in {22, 27, 28} else _ORDINARY[index][0]]]
+            else [("unclean_epoch", 1, 2 if index in {22, 27, 28} else _ORDINARY[index][0])]
         )
-        _require(db["tombstones"] == tombstones, "storage erasure receipt differs")
+        expected_receipts = [
+            [
+                reason,
+                sessions,
+                events,
+                erasure_receipt_digest_v1(reason, events, rollback=index == 28),
+            ]
+            for reason, sessions, events in tombstones
+        ]
+        _require(db["tombstones"] == expected_receipts, "storage erasure receipt differs")
     elif disposition == "faulted":
         _require(before == after, "refused recovery mutated durable state")
         if index == 5:

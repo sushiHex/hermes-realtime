@@ -155,7 +155,10 @@ def _database_state(database: Path) -> dict[str, Any]:
             "storage has orphan events",
         )
         tombstones = connection.execute(
-            "SELECT reason_code,erased_session_count,erased_event_count "
+            "SELECT erasure_request_id,scope_kind,scope_key,reason_code,control_sequence,"
+            "control_fingerprint_hash,ttl_consent_epoch_id,ttl_expires_at_utc,"
+            "last_admission_ordinal,final_admission_ordinal,erased_at_utc,"
+            "erased_session_count,erased_event_count "
             "FROM erasure_tombstones ORDER BY rowid"
         ).fetchall()
         _require(len(tombstones) <= 2, "storage tombstone bound differs")
@@ -170,7 +173,10 @@ def _database_state(database: Path) -> dict[str, Any]:
             "epochs": [r[2] for r in epochs],
             "seals": seals,
             "purge_required": installations[0][1] if installations else -1,
-            "tombstones": [list(row) for row in tombstones],
+            "tombstones": [
+                [row[3], row[11], row[12], _digest(canonical_json_bytes(list(row)))]
+                for row in tombstones
+            ],
             "erasures": [row[0] for row in erasures],
             "logical_digest": _digest("\n".join(connection.iterdump()).encode("utf-8")),
         }

@@ -361,10 +361,11 @@ def test_completed_initialization_removes_its_temporary(owner, stage) -> None:
     from copy import deepcopy
 
     from scripts.spool_crash_matrix import _validate_recovery
+    from scripts.spool_crash_oracle import initialization_digest_v1
 
     name = ".hermes-realtime-evidence-root-v1" if owner == "root_marker" else "capture-v1.owner"
     before = {
-        "files": {name + ".init": "a" * 64},
+        "files": {name + ".init": initialization_digest_v1(owner, stage)},
         "sentinel": "no_final_sentinel",
         "database": {"schema": False},
     }
@@ -378,3 +379,87 @@ def test_completed_initialization_removes_its_temporary(owner, stage) -> None:
     after["files"][name + ".init"] = "a" * 64
     with pytest.raises(ValueError):
         _validate_recovery(point, "caught-up", row)
+
+
+@pytest.mark.parametrize("owner", ["root_marker", "sentinel"])
+@pytest.mark.parametrize("stage", ["partial_write", "full_write", "flush"])
+def test_initialization_requires_the_exact_image_at_each_boundary(owner, stage) -> None:
+    import copy
+    import hashlib
+
+    from hermes_realtime.evidence.storage_security import encode_root_marker, initial_sentinel_image
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    marker = ".hermes-realtime-evidence-root-v1"
+    temporary = marker + ".init" if owner == "root_marker" else "capture-v1.owner.init"
+    image = (
+        encode_root_marker("50000000-0000-4000-8000-000000000001")
+        if owner == "root_marker"
+        else initial_sentinel_image("50000000-0000-4000-8000-000000000002")
+    )
+    if stage == "partial_write":
+        image = image[: len(image) // 2]
+    retained = {marker: "a" * 64} if owner == "sentinel" else {}
+    before = {
+        "files": {**retained, temporary: hashlib.sha256(image).hexdigest()},
+        "sentinel": "no_final_sentinel",
+        "database": {"schema": False},
+    }
+    after = copy.deepcopy(before)
+    if stage != "partial_write":
+        after["files"] = retained
+    row = {
+        "before": before,
+        "after": after,
+        "disposition": "faulted" if stage == "partial_write" else "absent",
+        "baseline": {},
+    }
+    point = f"after_{owner}_init_{stage}"
+    _validate_recovery(point, "caught-up", row)
+    before["files"][temporary] = hashlib.sha256(b"malformed-image").hexdigest()
+    if stage == "partial_write":
+        after["files"][temporary] = before["files"][temporary]
+    with pytest.raises(ValueError):
+        _validate_recovery(point, "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize("field", ["scope_key", "erasure_request_id", "last_admission_ordinal"])
+def test_recovery_receipt_cannot_change_its_erased_epoch_or_authority(tmp_path, field) -> None:
+    import sqlite3
+    from datetime import timedelta
+
+    from scripts.spool_crash_matrix import _validate_recovery
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+    finally:
+        spool.close()
+    root = tmp_path / "evidence"
+    before = observe_storage(root)
+    recovered = driver._make_spool(tmp_path, clock=driver._Clock(driver.START + timedelta(hours=2)))
+    try:
+        assert recovered.recover_existing().value == "recovered"
+    finally:
+        recovered.close()
+    row = {
+        "before": before,
+        "after": observe_storage(root),
+        "disposition": "recovered",
+        "baseline": {},
+    }
+    _validate_recovery("before_begin", "caught-up", row)
+    with sqlite3.connect(root / "capture-v1.sqlite3") as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='erasure_tombstones_are_immutable'"
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER erasure_tombstones_are_immutable")
+        value = 3 if field == "last_admission_ordinal" else "90000000-0000-4000-8000-000000000003"
+        connection.execute(f"UPDATE erasure_tombstones SET {field}=?", (value,))
+        connection.execute(trigger)
+    row["after"] = observe_storage(root)
+    with pytest.raises(ValueError):
+        _validate_recovery("before_begin", "caught-up", row)
