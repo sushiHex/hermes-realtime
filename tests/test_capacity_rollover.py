@@ -107,7 +107,20 @@ def _observations() -> dict:
             }
             for stage in ("claimed", "queued", "durable", "published", "terminal")
         ],
-        source=source | {"consent": "f" * 64, "request": "3" * 64, "binding": "5" * 64},
+        source=source
+        | {
+            "consent": "f" * 64,
+            "request": "3" * 64,
+            "binding": [
+                {
+                    "browser_generation": "5" * 64,
+                    "worker_generation": "5" * 64,
+                    "browser_participant": "6" * 64,
+                    "worker_participant": "6" * 64,
+                }
+                for _ in range(2)
+            ],
+        },
         dispatch={
             "create_dto": "1" * 64,
             "rollover_dto": "2" * 64,
@@ -1573,10 +1586,12 @@ async def test_consent_anchor_requires_a_live_browser_generation(
     launcher = object.__new__(LocalBrowserLauncher)
     launcher._runtime = Shutdown()
     if type(generation) is int and generation == 42 and participant == "synthetic participant":
-        assert await _live_browser_binding(launcher, b"synthetic key") == (
-            _commit(b"synthetic key", "browser_generation", "42"),
-            _commit(b"synthetic key", "browser_participant", participant),
-        )
+        assert await _live_browser_binding(launcher, b"synthetic key") == {
+            "browser_generation": _commit(b"synthetic key", "browser_generation", "42"),
+            "worker_generation": _commit(b"synthetic key", "browser_generation", "42"),
+            "browser_participant": _commit(b"synthetic key", "browser_participant", participant),
+            "worker_participant": _commit(b"synthetic key", "browser_participant", participant),
+        }
     else:
         with pytest.raises(ValueError):
             await _live_browser_binding(launcher, b"synthetic key")
@@ -1620,5 +1635,46 @@ def test_parent_requires_closed_connection_audit(mutation: str) -> None:
         row["connections"]["observer_reads"] = 0
     else:
         row["connections"]["observer_reads"] = True
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+def test_parent_refuses_generation_without_independent_participant_observations() -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    row["source"]["binding"] = row["commands"]["binding"]
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("position", [0, 1])
+@pytest.mark.parametrize(
+    "field",
+    ["browser_generation", "worker_generation", "browser_participant", "worker_participant"],
+)
+def test_parent_checks_each_live_binding_fact(position: int, field: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    row["source"]["binding"][position][field] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "malformed", "changed_pair"])
+def test_parent_requires_complete_stable_participant_observations(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    binding = row["source"]["binding"][1]
+    if mutation == "missing":
+        del binding["worker_participant"]
+    elif mutation == "extra":
+        binding["unrecognized"] = "d" * 64
+    elif mutation == "malformed":
+        binding["browser_participant"] = binding["worker_participant"] = True
+    else:
+        binding["browser_participant"] = binding["worker_participant"] = "d" * 64
     with pytest.raises(ValueError):
         _validate_observations(row)

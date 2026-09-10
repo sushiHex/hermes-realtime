@@ -58,9 +58,13 @@ all store consent fields and recomputing their hashes cannot replace the request
 that was actually accepted. The create command also binds to the generation
 read from the existing browser session and LiveKit owners. They must agree
 in both participant identity and generation before and after consent; the
-browser snapshot is read under its real authority lock. The keyed pair must
-also remain unchanged across consent. Both anchors are independently compared in the parent. This establishes the observed live
-activation; it does not qualify reconnect or every stale-binding rejection.
+browser snapshot is read under its real authority lock. Before and after consent,
+the child exports separate keyed browser and worker generations and participant
+identities. The independent parent requires agreement between roles, agreement
+with the create generation, and unchanged observations across consent. Missing,
+malformed, contradictory, or changed participant facts block acceptance. This
+establishes the observed live activation; it does not qualify reconnect or every
+stale-binding rejection.
 The reader also requires one active epoch and no
 conflicts or pending/completed erasure authority in this fresh scenario.
 

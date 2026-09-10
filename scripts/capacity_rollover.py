@@ -85,6 +85,29 @@ def _validate_thread_owners(threads: Any) -> None:
     )
 
 
+def _validate_live_bindings(bindings: Any, generation: str) -> None:
+    _digest(generation)
+    _require(
+        type(bindings) is list and len(bindings) == 2, "live binding observations are incomplete"
+    )
+    fields = {
+        "browser_generation",
+        "worker_generation",
+        "browser_participant",
+        "worker_participant",
+    }
+    for binding in bindings:
+        _keys(binding, fields)
+        for value in binding.values():
+            _digest(value)
+        _require(
+            binding["browser_generation"] == binding["worker_generation"] == generation
+            and binding["browser_participant"] == binding["worker_participant"],
+            "live browser and media binding observations differ",
+        )
+    _require(bindings[0] == bindings[1], "live binding changed across consent")
+
+
 def _validate_observations(row: Any) -> None:
     _keys(
         row,
@@ -351,11 +374,7 @@ def _validate_observations(row: Any) -> None:
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
     _keys(row["source"], _CONTENT | {"consent", "request", "binding"})
-    _digest(commands["binding"])
-    _require(
-        row["source"]["binding"] == commands["binding"],
-        "create differs from the live browser generation",
-    )
+    _validate_live_bindings(row["source"]["binding"], commands["binding"])
     _digest(row["source"]["request"])
     _require(
         commands["request"] == row["source"]["request"],

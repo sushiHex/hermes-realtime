@@ -152,7 +152,7 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     }
 
 
-async def _live_browser_binding(launcher: Any, key: bytes) -> tuple[str, str]:
+async def _live_browser_binding(launcher: Any, key: bytes) -> dict[str, str]:
     from inspect import getclosurevars
 
     from hermes_realtime.client.runtime import BrowserClientRuntime
@@ -176,15 +176,18 @@ async def _live_browser_binding(launcher: Any, key: bytes) -> tuple[str, str]:
         type(binding) is BrowserBindingSnapshot
         and type(generation) is int
         and 1 <= generation < 2**53
+        and type(binding.binding_generation) is int
         and binding.binding_generation == generation
         and type(worker._participant_identity) is str
         and binding.participant_identity == worker._participant_identity,
         "live browser and media generations differ",
     )
-    return (
-        _commit(key, "browser_generation", str(generation)),
-        _commit(key, "browser_participant", binding.participant_identity),
-    )
+    return {
+        "browser_generation": _commit(key, "browser_generation", str(binding.binding_generation)),
+        "worker_generation": _commit(key, "browser_generation", str(generation)),
+        "browser_participant": _commit(key, "browser_participant", binding.participant_identity),
+        "worker_participant": _commit(key, "browser_participant", worker._participant_identity),
+    }
 
 
 def _control_commitments(key: bytes, snapshots: Any) -> list[str]:
@@ -1067,11 +1070,8 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         )
         live_binding = await _live_browser_binding(running._host, key)
         accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
-        _require(
-            live_binding == await _live_browser_binding(running._host, key),
-            "live generation changed during consent",
-        )
-        accepted_consent["binding"] = live_binding[0]
+        live_bindings = [live_binding, await _live_browser_binding(running._host, key)]
+        _require(live_bindings[0] == live_bindings[1], "live binding changed during consent")
         _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
         runtime = reservations[0][0]
         thread_owners[0].bind_dispatcher(
@@ -1176,7 +1176,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "source": {
             "consent": accepted_consent["consent"],
             "request": accepted_consent["request"],
-            "binding": accepted_consent["binding"],
+            "binding": live_bindings,
             "user": users,
             "generated": [
                 _commit(key, "generated", item.generated_text)
