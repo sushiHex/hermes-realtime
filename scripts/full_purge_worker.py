@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +44,13 @@ def _prepare(case: Path) -> None:
     (adjacent / "keep.bin").write_bytes(b"adjacent-decoy")
 
 
-def _run(case: Path, phase: str) -> dict[str, Any]:
+def _run(case: Path, phase: str, prepared: Callable[[], None]) -> dict[str, Any]:
     from hermes_realtime.evidence.models import FullPurgeV1, SentinelState
 
     if phase == "purge":
         _prepare(case)
     before = observe_full_purge(case)
+    prepared()
     owned = _make_spool(case)
     try:
         result = owned.purge_full_store(
@@ -117,8 +119,25 @@ def main() -> None:
         )
         workspace = Path(config["workspace"]).resolve(strict=True)
         _require(workspace == Path.cwd().resolve(strict=True), "full-purge workspace differs")
+
+        def send(observation: dict[str, Any]) -> None:
+            _write_frame(
+                response,
+                {key: config[key] for key in ("version", "nonce", "point", "mode", "action")}
+                | {
+                    "pid": os.getpid(),
+                    "observation": observation,
+                },
+            )
+
+        def prepared() -> None:
+            send({"phase": "prepared"})
+            _require_ack(_read_frame(request, time.monotonic() + 10), config["nonce"], 0)
+
         try:
-            observation = _run(workspace / "full_purge_cleanup-exit0-caught-up", config["action"])
+            observation = _run(
+                workspace / "full_purge_cleanup-exit0-caught-up", config["action"], prepared
+            )
         except Exception as error:
             frames = traceback.extract_tb(error.__traceback__)
             observation = {
@@ -132,15 +151,8 @@ def main() -> None:
             failed = True
         else:
             failed = False
-        _write_frame(
-            response,
-            {key: config[key] for key in ("version", "nonce", "point", "mode", "action")}
-            | {
-                "pid": os.getpid(),
-                "observation": observation,
-            },
-        )
-        _require_ack(_read_frame(request, time.monotonic() + 10), config["nonce"], 0)
+        send(observation)
+        _require_ack(_read_frame(request, time.monotonic() + 10), config["nonce"], 1)
         _require(not failed, "full-purge worker failed")
     finally:
         os.close(request)

@@ -21,10 +21,24 @@ opens the same fixture in a fresh process, calls the command again, and requires
 `already_absent` with an unchanged durable image.
 
 The [process owner](../scripts/storage_process.py) uses explicit normal-exit
-operations for these workers. Their expected exit code is zero. Before allowing
-each worker to exit, the parent independently opens the root and remaining files
-with exclusive sharing while the retained process is still alive. A missing file
-or retained owner refuses acceptance; termination cannot supply release evidence.
+operations for these workers. Their expected exit code is zero. A preparation
+handshake lets the parent record and independently reopen all six initial NTFS
+file IDs before purge. It retains the volume hint across the operation, then
+requires those IDs to be retired before allowing the worker to exit. An unlinked
+file with a retained handle refuses acceptance even if its name has disappeared.
+The preparation and result frames share the existing observation deadline.
+
+The audit uses Microsoft's [OpenFileById contract](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid).
+Each initial descriptor must open the exact observed file. A retired NTFS ID can
+return `ERROR_INVALID_PARAMETER`; only this or `ERROR_FILE_NOT_FOUND` indicates
+absence. Access denied, a successful open, or another error refuses acceptance.
+The live marker must still reopen through the same retained hint before and after
+the deletion checks, so an unavailable identity query cannot imply cleanup.
+File IDs remain private to the parent and are absent from the receipt.
+
+The parent also independently opens the root and remaining files with exclusive
+sharing while the retained process is still alive. A missing file or retained
+owner refuses acceptance; termination cannot supply release evidence.
 Both workers enter their private Windows Jobs before executing, and both must be
 waited, leave empty Jobs, and close all retained process handles.
 
@@ -72,6 +86,9 @@ and the derived assertions `adjacent_decoys_preserved`, `purge_verified`, and
 `purged`. It contains no transcript, host path, or process identifier. Successful
 temporary workspaces are removed; failed workspaces remain private for diagnosis.
 
+The file-ID audit requires NTFS. It qualifies release of the six original fixture
+objects; the repeated purge requires an already-absent store and unchanged durable
+observations. It does not claim a general inventory of the worker's file handles.
 This fixture does not qualify initialization-temporary deletion, an active host's
 consent/revocation orchestration, arbitrary sidecar contents, volume-full behavior,
 installed-host recovery, or physical devices. Those contracts remain separate.

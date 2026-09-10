@@ -28,7 +28,11 @@ from scripts.equivalence_process import (
     _write_frame,
 )
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
-from scripts.windows_storage_oracle import audit_drain_release, audit_storage_release
+from scripts.windows_storage_oracle import (
+    audit_drain_release,
+    audit_purge_deletions,
+    audit_storage_release,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +258,7 @@ def _run_storage_worker(
             nonce = secrets.token_hex(32)
 
             def execute() -> tuple[Any, int, bool]:
+                deadline = time.monotonic() + 10
                 _write_frame(
                     request_write,
                     {
@@ -266,36 +271,49 @@ def _run_storage_worker(
                         "workspace": str(archive.workspace),
                     },
                 )
-                frame = _read_frame(response_read, time.monotonic() + 10)
-                _require(
-                    type(frame) is dict
-                    and set(frame)
-                    == {"version", "nonce", "point", "mode", "action", "pid", "observation"}
-                    and type(frame["version"]) is int
-                    and frame["version"] == 1
-                    and frame["nonce"] == nonce
-                    and frame["point"] == point
-                    and type(frame["mode"]) is int
-                    and frame["mode"] == mode
-                    and frame["action"] == action
-                    and type(frame["pid"]) is int
-                    and frame["pid"] == root.identity.pid,
-                    "storage frame is disconnected from its retained process or checkpoint",
-                )
-                members = job.checkpoint("checkpoint").members
-                _require(members == (root,), "storage worker has unexpected descendants")
-                observation = frame["observation"]
-                if type(observation) is dict and set(observation) == {"failure", "source_line"}:
+
+                def receive() -> Any:
+                    frame = _read_frame(response_read, deadline)
                     _require(
-                        observation["failure"] in {"timeout", "value", "os", "other"}
-                        and type(observation["source_line"]) is int
-                        and 0 <= observation["source_line"] <= 100_000,
-                        "storage failure diagnostics differ",
+                        type(frame) is dict
+                        and set(frame)
+                        == {"version", "nonce", "point", "mode", "action", "pid", "observation"}
+                        and type(frame["version"]) is int
+                        and frame["version"] == 1
+                        and frame["nonce"] == nonce
+                        and frame["point"] == point
+                        and type(frame["mode"]) is int
+                        and frame["mode"] == mode
+                        and frame["action"] == action
+                        and type(frame["pid"]) is int
+                        and frame["pid"] == root.identity.pid,
+                        "storage frame is disconnected from its retained process or checkpoint",
                     )
-                    raise ValueError(
-                        f"storage worker failed: {observation['failure']} "
-                        f"at source line {observation['source_line']}"
-                    )
+                    members = job.checkpoint("checkpoint").members
+                    _require(members == (root,), "storage worker has unexpected descendants")
+                    observation = frame["observation"]
+                    if type(observation) is dict and set(observation) == {"failure", "source_line"}:
+                        _require(
+                            observation["failure"] in {"timeout", "value", "os", "other"}
+                            and type(observation["source_line"]) is int
+                            and 0 <= observation["source_line"] <= 100_000,
+                            "storage failure diagnostics differ",
+                        )
+                        raise ValueError(
+                            f"storage worker failed: {observation['failure']} "
+                            f"at source line {observation['source_line']}"
+                        )
+                    return observation
+
+                observation = receive()
+                if purge:
+                    _require(observation == {"phase": "prepared"}, "purge preparation differs")
+                    with audit_purge_deletions(
+                        archive.workspace / "full_purge_cleanup-exit0-caught-up/evidence",
+                        present=action == "purge",
+                    ):
+                        _write_frame(request_write, {"version": 1, "nonce": nonce, "sequence": 0})
+                        observation = receive()
                 drain_released = action == "crash" and point == "after_drain_ack_before_exit"
                 if drain_released:
                     audit_drain_release(
@@ -321,11 +339,13 @@ def _run_storage_worker(
                     if not api.TerminateProcess(root.process_handle, 198):
                         raise ctypes.WinError(ctypes.get_last_error())
                 else:
-                    _write_frame(request_write, {"version": 1, "nonce": nonce, "sequence": 0})
+                    _write_frame(
+                        request_write, {"version": 1, "nonce": nonce, "sequence": 1 if purge else 0}
+                    )
                 kernel.wait(root.process_handle, 10_000)
                 code = _exit_code(kernel, root.process_handle)
                 _require(code == expected_exit, "storage worker did not reach its prescribed exit")
-                return frame["observation"], code, drain_released or purge
+                return observation, code, drain_released or purge
 
             observation, code, storage_released = (
                 core._run_with_windows_scenario_job_finalization_v1(job, execute)

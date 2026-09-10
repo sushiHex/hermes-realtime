@@ -194,7 +194,11 @@ def test_acceptance_requires_exact_cleanup_and_durable_idempotence(mutation) -> 
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires real Windows storage and process ownership")
-@pytest.mark.parametrize("fault", [None, "no_delete", "repeat_mutation", "unclosed"])
+@pytest.mark.parametrize(
+    "fault",
+    [None, "no_delete", "repeat_mutation", "unclosed"]
+    + ["deleted_handle" + str(index) for index in range(6)],
+)
 def test_owned_workers_observe_real_purge_and_reject_false_completion(tmp_path, fault) -> None:
     import shutil
     from pathlib import Path
@@ -234,7 +238,30 @@ def test_owned_workers_observe_real_purge_and_reject_false_completion(tmp_path, 
                 "SQLiteEvidenceSpool.purge_full_store = _fake_purge\n"
                 "SQLiteEvidenceSpool.close = _fake_close\n"
             ),
-        }[fault]
+        }.get(fault)
+        if fault.startswith("deleted_handle"):
+            index = int(fault.removeprefix("deleted_handle"))
+            suffix = ("", "-journal", "-wal", "-shm", "-vacuum", "-tmp")[index]
+            patch = (
+                "\nimport ctypes as _ctypes\n"
+                "_retained_deleted_handles = []\n"
+                "_purge = SQLiteEvidenceSpool.purge_full_store\n"
+                "def _fake_purge(self, command):\n"
+                "    kernel = _ctypes.WinDLL('kernel32', use_last_error=True)\n"
+                "    kernel.CreateFileW.restype = _ctypes.c_void_p\n"
+                "    kernel.CreateFileW.argtypes = [_ctypes.c_wchar_p, _ctypes.c_uint32,\n"
+                "        _ctypes.c_uint32, _ctypes.c_void_p, _ctypes.c_uint32,\n"
+                "        _ctypes.c_uint32, _ctypes.c_void_p]\n"
+                f"    path = self._database.parent / 'capture-v1.sqlite3{suffix}'\n"
+                "    if not path.exists():\n"
+                "        return _purge(self, command)\n"
+                "    handle = kernel.CreateFileW(str(path), 0x80000000, 7, None, 3, 0, None)\n"
+                "    assert handle not in (None, _ctypes.c_void_p(-1).value)\n"
+                "    _retained_deleted_handles.append(handle)\n"
+                "    return _purge(self, command)\n"
+                "SQLiteEvidenceSpool.purge_full_store = _fake_purge\n"
+            )
+        assert patch is not None
         with (package / "hermes_realtime/evidence/sqlite_spool.py").open(
             "a", encoding="utf-8", newline="\n"
         ) as stream:
@@ -260,9 +287,47 @@ def test_owned_workers_observe_real_purge_and_reject_false_completion(tmp_path, 
         with pytest.raises(
             ValueError,
             match={
-                "no_delete": "full-purge disposition differs",
+                "no_delete": "storage worker retains a deleted file identity",
                 "repeat_mutation": "repeated full purge mutated storage",
                 "unclosed": "storage ownership was not released",
-            }[fault],
+            }.get(
+                fault,
+                "storage worker retains a deleted file identity"
+                "|purge file identity remains pending",
+            ),
         ):
             qualify()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows file identities")
+def test_retired_file_ids_require_a_working_live_control(tmp_path, monkeypatch) -> None:
+    import ctypes
+
+    from scripts import windows_storage_oracle as oracle
+    from scripts.full_purge_worker import _prepare
+
+    case = tmp_path / "case"
+    _prepare(case)
+    kernel, security = oracle._api()
+
+    class FaultedKernel:
+        broken = False
+
+        def __getattr__(self, name):
+            return getattr(kernel, name)
+
+        def OpenFileById(self, *arguments):
+            if self.broken:
+                ctypes.set_last_error(87)
+                return ctypes.c_void_p(-1).value
+            return kernel.OpenFileById(*arguments)
+
+    faulted = FaultedKernel()
+    monkeypatch.setattr(oracle, "_api", lambda: (faulted, security))
+    with (
+        pytest.raises(ValueError, match="purge live file-identity control failed"),
+        oracle.audit_purge_deletions(case / "evidence", present=True),
+    ):
+        for suffix in ("", "-journal", "-wal", "-shm", "-vacuum", "-tmp"):
+            (case / "evidence" / ("capture-v1.sqlite3" + suffix)).unlink()
+        faulted.broken = True
