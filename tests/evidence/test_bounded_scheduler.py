@@ -399,21 +399,39 @@ async def test_real_controller_attributes_attempted_user_batch_to_record_capacit
         )
 
     class BlockFirstOrdinaryAppend:
-        def __init__(self, delegate: object) -> None:
-            self._delegate = delegate
+        def __init__(self) -> None:
             self.entered = Event()
             self.release = Event()
             self._blocked = False
 
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._delegate, name)
+        def create_epoch(self, received: m.CreateEpochV1) -> m.StoreDisposition:
+            assert received is command
+            return m.StoreDisposition.COMMITTED
 
-        def append_record(self, item: object) -> object:
+        def drain_and_close(self, _command: m.DrainAndStopV1) -> m.DrainDisposition:
+            return m.DrainDisposition.STOPPED
+
+        def __getattr__(self, name: str) -> object:
+            if name in {
+                "append_binding_close",
+                "rollover_session",
+                "expire_session",
+                "seal_epoch",
+                "commit_revoke_request",
+                "finalize_revoke",
+            }:
+                def unexpected(_payload: object) -> None:
+                    raise AssertionError(f"unexpected capacity-test transport operation: {name}")
+
+                return unexpected
+            raise AttributeError(name)
+
+        def append_record(self, _item: object) -> m.StoreDisposition:
             if not self._blocked:
                 self._blocked = True
                 self.entered.set()
                 assert self.release.wait(5.0), "ordinary writer completion was not released"
-            return self._delegate.append_record(item)  # type: ignore[union-attr]
+            return m.StoreDisposition.COMMITTED
 
     command = _create_epoch(m, seed=95_000)
     projection = BrowserEventProjection()
@@ -422,91 +440,96 @@ async def test_real_controller_attributes_attempted_user_batch_to_record_capacit
         projection.reserve_capture_status(),
         projection.validate_capture_status_reservation,
     )
-    transport = BlockFirstOrdinaryAppend(runtime.create_sqlite_transport())
-    assert await runtime.activate_consent(
-        consent,
-        transport=transport,
-        binding_is_current=lambda candidate: candidate is command,
-        timeout_seconds=2.0,
-    ) is m.ConsentDisposition.CONSENT_ACTIVATED
-    lifecycle, admission = runtime.resolve_evidence_pair()
-    assert lifecycle is not None and admission is not None
-    assert admission.diagnostics().queue_record_count == 3
+    # Exercise the real admission owner and writer without coupling queue capacity
+    # to filesystem latency. SQLite durability has separate integration coverage.
+    transport = BlockFirstOrdinaryAppend()
+    try:
+        assert await runtime.activate_consent(
+            consent,
+            transport=transport,
+            binding_is_current=lambda candidate: candidate is command,
+            timeout_seconds=2.0,
+        ) is m.ConsentDisposition.CONSENT_ACTIVATED
+        lifecycle, admission = runtime.resolve_evidence_pair()
+        assert lifecycle is not None and admission is not None
+        assert admission.diagnostics().queue_record_count == 3
 
-    operation = runtime.operation_scheduler.try_reserve(m.ConversationOperationKind.RESPONSE)
-    assert operation is not None
-    user_authority = lifecycle.decline_to_user(
-        lifecycle.mint_final_input(
-            source=m.InputSource.TYPED,
-            input_incarnation=1,
-            media_incarnation=None,
-            typed_sequence=1,
-        )
-    )
-    user = admission.try_reserve_user_turn(user_authority, operation)
-    assert user.disposition is m.AppendDisposition.ADMITTED and user.lease is not None
-    assert admission.diagnostics().queue_record_count == 5
-
-    for index in range(58):
-        authority = lifecycle.accept_command(
+        operation = runtime.operation_scheduler.try_reserve(m.ConversationOperationKind.RESPONSE)
+        assert operation is not None
+        user_authority = lifecycle.decline_to_user(
             lifecycle.mint_final_input(
                 source=m.InputSource.TYPED,
-                input_incarnation=index + 2,
+                input_incarnation=1,
                 media_incarnation=None,
-                typed_sequence=index + 2,
+                typed_sequence=1,
             )
         )
-        snapshot = m.EvidenceSnapshotV1(
-            schema_version=1,
-            installation_id=command.installation_id,
-            producer_instance_id=command.producer_instance_id,
-            logical_session_id=command.logical_session_id,
-            event_id=_uuid(95_100 + index),
-            event_sequence=index + 3,
-            event_kind=m.EventKind.COMMAND_ROUTED,
-            payload=m.CommandRoutedPayloadV1(
-                utterance_id=authority.utterance_id,
-                source=authority.source,
-                routing_disposition="command",
-            ),
+        user = admission.try_reserve_user_turn(user_authority, operation)
+        assert user.disposition is m.AppendDisposition.ADMITTED and user.lease is not None
+        assert admission.diagnostics().queue_record_count == 5
+
+        for index in range(58):
+            authority = lifecycle.accept_command(
+                lifecycle.mint_final_input(
+                    source=m.InputSource.TYPED,
+                    input_incarnation=index + 2,
+                    media_incarnation=None,
+                    typed_sequence=index + 2,
+                )
+            )
+            snapshot = m.EvidenceSnapshotV1(
+                schema_version=1,
+                installation_id=command.installation_id,
+                producer_instance_id=command.producer_instance_id,
+                logical_session_id=command.logical_session_id,
+                event_id=_uuid(95_100 + index),
+                event_sequence=index + 3,
+                event_kind=m.EventKind.COMMAND_ROUTED,
+                payload=m.CommandRoutedPayloadV1(
+                    utterance_id=authority.utterance_id,
+                    source=authority.source,
+                    routing_disposition="command",
+                ),
+            )
+            assert admission.try_admit_command(authority, snapshot) is m.CommandDisposition.ADMITTED
+
+        assert await asyncio.to_thread(transport.entered.wait, 2.0)
+        before = admission.diagnostics()
+        controller = runtime._admission
+        assert controller is not None
+        before_ordinal = controller.final_admission_ordinal
+        assert before.queue_record_count == 63
+        observations = dependencies._capacity_probe.observations()
+        assert observations[-1].queue_record_count == 63
+        assert observations[-1].queue_physical_count == 58
+        assert observations[-1].queue_canonical_bytes < 2_097_152
+
+        assert (
+            admission.try_admit_user_final(user.lease, user_authority, "lawful final input")
+            is m.AppendDisposition.DROPPED_CAPACITY
         )
-        assert admission.try_admit_command(authority, snapshot) is m.CommandDisposition.ADMITTED
-
-    assert await asyncio.to_thread(transport.entered.wait, 2.0)
-    before = admission.diagnostics()
-    controller = runtime._admission
-    assert controller is not None
-    before_ordinal = controller.final_admission_ordinal
-    assert before.queue_record_count == 63
-    observations = dependencies._capacity_probe.observations()
-    assert observations[-1].queue_record_count == 63
-    assert observations[-1].queue_physical_count == 58
-    assert observations[-1].queue_canonical_bytes < 2_097_152
-
-    assert (
-        admission.try_admit_user_final(user.lease, user_authority, "lawful final input")
-        is m.AppendDisposition.DROPPED_CAPACITY
-    )
-    rejected = [
-        observation
-        for observation in dependencies._capacity_probe.observations()
-        if observation.kind == "ordinary_rejected"
-    ]
-    assert len(rejected) == 1
-    assert rejected[0].rejection_source == "record_capacity"
-    assert admission.diagnostics() == before
-    assert controller.final_admission_ordinal == before_ordinal
-
-    transport.release.set()
-    async with asyncio.timeout(10.0):
-        while sum(
-            observation.kind == "ordinary_completed"
+        rejected = [
+            observation
             for observation in dependencies._capacity_probe.observations()
-        ) < 58:
-            await asyncio.sleep(0.01)
-    assert admission.discard_unopened_user_turn(user.lease, user_authority) is True
-    runtime.operation_scheduler.release(operation)
-    await runtime.close()
+            if observation.kind == "ordinary_rejected"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0].rejection_source == "record_capacity"
+        assert admission.diagnostics() == before
+        assert controller.final_admission_ordinal == before_ordinal
+
+        transport.release.set()
+        async with asyncio.timeout(10.0):
+            while sum(
+                observation.kind == "ordinary_completed"
+                for observation in dependencies._capacity_probe.observations()
+            ) < 58:
+                await asyncio.sleep(0.01)
+        assert admission.discard_unopened_user_turn(user.lease, user_authority) is True
+        runtime.operation_scheduler.release(operation)
+    finally:
+        transport.release.set()
+        await runtime.close()
     final = admission.diagnostics()
     assert final.queue_record_count == final.queue_canonical_bytes == 0
     assert runtime.operation_scheduler.active_count == 0

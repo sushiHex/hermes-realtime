@@ -1,0 +1,3 @@
+# Shared Kokoro pin and Windows CUDA worker roots. See README.md.
+-r kokoro-onnx-package-win-py311.txt
+onnxruntime-gpu[cuda,cudnn]==1.28.0

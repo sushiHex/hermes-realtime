@@ -184,3 +184,59 @@ def test_public_gate_has_no_private_history_baseline(
             "livekit_pid": None,
         },
     )
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["current", "stale"])
+@pytest.mark.parametrize("override", [None, "UV_PROJECT", "UV_WORKING_DIR", "UV_CONFIG_FILE"])
+def test_materialized_gate_requires_current_lock_before_build_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stale: bool,
+    override: str | None,
+) -> None:
+    for name in ("UV_PROJECT", "UV_WORKING_DIR", "UV_CONFIG_FILE", "UV_PROJECT_ENVIRONMENT"):
+        monkeypatch.delenv(name, raising=False)
+    candidate = tmp_path / "candidate"
+    decoy = tmp_path / "decoy"
+    for root in (candidate, decoy):
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "lock-freshness-fixture"\n'
+            'version = "0.1.0"\nrequires-python = ">=3.11,<3.12"\n',
+            encoding="utf-8",
+        )
+        _run("uv", "lock", "--offline", "--no-config", "--python", "3.11", cwd=root)
+    project = candidate / "pyproject.toml"
+    lock = candidate / "uv.lock"
+    committed_lock = lock.read_bytes()
+    decoy_lock = (decoy / "uv.lock").read_bytes()
+    if stale:
+        project.write_text(
+            project.read_text(encoding="utf-8").replace('"0.1.0"', '"0.2.0"'),
+            encoding="utf-8",
+        )
+    if override == "UV_CONFIG_FILE":
+        config = tmp_path / "ambient-uv.toml"
+        config.write_text("this is not valid TOML", encoding="utf-8")
+        monkeypatch.setenv(override, str(config))
+    elif override is not None:
+        monkeypatch.setenv(override, str(decoy))
+    gate = run_path(str(ROOT / "scripts" / "release_gate.py"))["gate_materialized_candidate"]
+    monkeypatch.setenv("UV_OFFLINE", "1")
+
+    class BuildPreparationReached(Exception):
+        pass
+
+    def stop_before_build(root: Path, snapshot: Path) -> None:
+        assert root == candidate
+        raise BuildPreparationReached
+
+    monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", stop_before_build)
+    expected_error = subprocess.CalledProcessError if stale else BuildPreparationReached
+    with pytest.raises(expected_error):
+        gate(candidate, livekit=False)
+
+    assert lock.read_bytes() == committed_lock
+    assert (decoy / "uv.lock").read_bytes() == decoy_lock
+    assert not (candidate / ".venv").exists()
+    assert not (decoy / ".venv").exists()
