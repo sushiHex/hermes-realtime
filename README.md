@@ -31,7 +31,13 @@ The current baseline includes:
 - opt-in local speech providers and explicit Codex or Ollama inference selection;
 - synthetic browser, LiveKit, packaging, and installed-wheel release gates.
 
-Evidence-only Slice 0 is currently a documented boundary, not an implemented production capture path. It remains disabled by default; operator enablement is not consent. The project does not claim subjective audio quality, physical-room acoustic performance, general iPhone/WebKit readiness, or production security hardening.
+Evidence-only Slice 0 includes host capture controls, storage, and lifecycle code.
+Full Slice 0 qualification is incomplete.
+It remains disabled by default; operator enablement is not consent.
+See [Implementation status](docs/implementation-status.md) for code, tests, and
+outstanding qualification. The project does not claim subjective audio quality,
+physical-room acoustic performance, general iPhone/WebKit readiness, or production
+security hardening.
 
 ## Architecture
 
@@ -152,6 +158,10 @@ already sent. See
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Documentation
+
+Start with the [Collaborator guide](docs/README.md),
+[Roadmap](docs/roadmap.md), and [Implementation status](docs/implementation-status.md)
+for priorities, code and test locations, and remaining qualification work.
 
 - [Local LiveKit setup and automated gates](docs/local-livekit.md)
 - [Hermes bridge and natural-work authority](docs/hermes-bridge.md)

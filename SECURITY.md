@@ -20,7 +20,7 @@ Please include:
 
 Do not include live credentials, bearer material, private audio, transcripts, personal data, or unrelated logs. Replace sensitive values with `[REDACTED]`.
 
-Do not open a public issue for an undisclosed vulnerability. If GitHub private vulnerability reporting is unavailable, contact the repository owner through the private contact method listed on their GitHub profile.
+Do not open a public issue for an undisclosed vulnerability.
 
 ## Response process
 

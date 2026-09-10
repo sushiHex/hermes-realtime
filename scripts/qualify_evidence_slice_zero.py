@@ -1,8 +1,8 @@
-"""Fail-closed verification core for immutable Task 12 qualification inputs.
+"""Strict qualification input/report validation and closed scenario registration.
 
-This module deliberately performs no process launch or report emission.  It only
-accepts canonical qualification-input bytes and reopens every direct and
-transitive artifact that a later runner may rely on.
+Input validation reopens direct and transitive artifacts without launching a
+process. The registered source-equivalence producer owns its separate execution
+boundary; the remaining scenarios refuse execution until their producers exist.
 """
 
 from __future__ import annotations
@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn, TypeGuard
+from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
+
+if TYPE_CHECKING:
+    from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchiveV1
+    from scripts.deterministic_equivalence import ObservedEquivalenceV1
+    from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 
 class QualificationInputError(ValueError):
@@ -178,12 +183,52 @@ class UnavailableScenarioRegistrationV1:
             raise ValueError("unavailable producer registration is confused")
 
 
+@dataclass(frozen=True, slots=True)
+class DeterministicEquivalenceRegistrationV1:
+    """The one available producer, with an exact archive rather than supplied facts."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.DETERMINISTIC_EQUIVALENCE
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not DeterministicEquivalenceRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.DETERMINISTIC_EQUIVALENCE
+        ):
+            raise TypeError("deterministic producer registration is not exact")
+
+    def produce(
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
+        *,
+        livekit_executable: Path,
+        livekit_sha256: str,
+    ) -> ObservedEquivalenceV1:
+        if self is not SCENARIO_REGISTRY_V1[0]:
+            raise ValueError("deterministic producer registration is not canonical")
+        from scripts.deterministic_equivalence import produce_deterministic_equivalence_v1
+
+        return produce_deterministic_equivalence_v1(
+            archive,
+            identity,
+            livekit_executable=livekit_executable,
+            livekit_sha256=livekit_sha256,
+        )
+
+
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
     UnavailableScenarioRegistrationV1(
         scenario_id=scenario_id,
         produce=_UnavailableScenarioProducerV1(scenario_id),
     )
-    for scenario_id in _SCENARIO_IDS_V1
+    for scenario_id in _SCENARIO_IDS_V1[1:]
+)
+
+DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistrationV1()
+
+SCENARIO_REGISTRY_V1 = (
+    DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
+    *UNAVAILABLE_SCENARIO_REGISTRY_V1,
 )
 
 
@@ -194,9 +239,9 @@ def validate_unavailable_scenario_registry_v1(
         raise TypeError("unavailable scenario registry must be an exact tuple")
     if registry is not UNAVAILABLE_SCENARIO_REGISTRY_V1:
         raise ValueError("unavailable scenario registry is not canonical")
-    if len(registry) != len(_SCENARIO_IDS_V1):
-        raise ValueError("unavailable scenario registry must contain exactly 20 entries")
-    for ordinal, registration in enumerate(registry):
+    if len(registry) != len(_SCENARIO_IDS_V1) - 1:
+        raise ValueError("unavailable scenario registry must contain exactly 19 entries")
+    for ordinal, registration in enumerate(registry, start=1):
         if type(registration) is not UnavailableScenarioRegistrationV1:
             raise TypeError("unavailable scenario registration must be exact")
         if registration.scenario_id is not _SCENARIO_IDS_V1[ordinal]:
@@ -217,7 +262,7 @@ def invoke_unavailable_scenario_v1(
         raise TypeError("unavailable scenario registration must be exact")
     if type(attempt) is not ScenarioAttemptIdentityV1:
         raise TypeError("scenario attempt identity type is invalid")
-    if registration is not UNAVAILABLE_SCENARIO_REGISTRY_V1[attempt.ordinal]:
+    if registration is not SCENARIO_REGISTRY_V1[attempt.ordinal]:
         raise ValueError("scenario registration is not canonical for attempt ordinal")
     if registration.scenario_id is not attempt.scenario_id:
         raise ValueError("registration and scenario attempt are confused")
@@ -1592,6 +1637,7 @@ def validate_release_manifest(
 # no producer, report, publication, CLI, or physical-execution entry point.
 _CREATE_SUSPENDED = 0x00000004
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _SYNCHRONIZE = 0x00100000
@@ -1690,6 +1736,7 @@ class _WindowsScenarioSpecV1:
     timeout_milliseconds: int
     inherited_handles: tuple[int, ...]
     limits: _WindowsJobLimitsV1
+    no_window: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1771,8 +1818,13 @@ class _WindowsFinalizationResultV1:
 
 
 class _WindowsFinalizationError(_WindowsScenarioJobError):
-    def __init__(self, result: _WindowsFinalizationResultV1) -> None:
+    def __init__(
+        self,
+        result: _WindowsFinalizationResultV1,
+        owner: _WindowsScenarioJobV1 | None = None,
+    ) -> None:
         self.result = result
+        self.owner = owner
         super().__init__("Windows scenario finalization left retryable retained authority")
 
 
@@ -1787,6 +1839,8 @@ def _valid_windows_handle_v1(value: object) -> TypeGuard[int]:
 def _validate_windows_spec_v1(spec: _WindowsScenarioSpecV1) -> None:
     if not isinstance(spec, _WindowsScenarioSpecV1):
         _windows_fail("scenario spec has the wrong closed DTO type")
+    if type(spec.no_window) is not bool:
+        _windows_fail("scenario window policy must be an exact boolean")
     if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", spec.scenario_id):
         _windows_fail("scenario ID is not a closed safe identifier")
     if (
@@ -1976,7 +2030,9 @@ class _WindowsScenarioJobV1:
             and rule.root == root
         ]
         if len(applicable) != 1:
-            _windows_fail("member image cannot be classified into a closed role")
+            _windows_fail(
+                f"member image cannot be classified into a closed role: {raw.image_basename}"
+            )
         rule = applicable[0]
         if root:
             if (raw.parent_pid, raw.parent_creation_filetime) != (
@@ -2012,6 +2068,7 @@ class _WindowsScenarioJobV1:
             | _CREATE_NEW_PROCESS_GROUP
             | _CREATE_UNICODE_ENVIRONMENT
             | _EXTENDED_STARTUPINFO_PRESENT
+            | (_CREATE_NO_WINDOW if self._spec.no_window else 0)
         )
         try:
             job = self._ensure_job()
@@ -2127,7 +2184,13 @@ class _WindowsScenarioJobV1:
                 and not member.root
                 and member.identity.parent_pid not in current
             ):
-                _windows_fail("observed descendant parent is outside the Job")
+                parent = self._members.get(member.identity.parent_pid)
+                if label != "pre-cleanup" or parent is None:
+                    _windows_fail("observed descendant parent is outside the Job")
+                # A retained exited root can leave a console helper alive for
+                # final Job termination. Require the exact parent handle to be
+                # signaled; missing membership alone never proves parent exit.
+                self._kernel.wait(parent.process_handle, 0)
         return _WindowsMembershipSnapshotV1(
             label, tuple(self._members[pid] for pid in sorted(current))
         )
@@ -2179,6 +2242,15 @@ class _WindowsScenarioJobV1:
                 failures.append(
                     _WindowsOperationFailureV1("terminate_job", self._job_handle, str(error))
                 )
+        for handle, kind in tuple(self._owned_handles.items()):
+            if kind not in {"process", "thread"}:
+                continue
+            try:
+                self._kernel.wait(handle, self._spec.timeout_milliseconds)
+                waited.append(handle)
+            except BaseException as error:
+                deferred_handles.add(handle)
+                failures.append(_WindowsOperationFailureV1("wait", handle, str(error)))
         for member in tuple(self._members.values()):
             if member.process_handle not in self._owned_handles:
                 continue
@@ -2203,15 +2275,6 @@ class _WindowsScenarioJobV1:
                 failures.append(
                     _WindowsOperationFailureV1("identity", member.process_handle, str(error))
                 )
-        for handle, kind in tuple(self._owned_handles.items()):
-            if kind not in {"process", "thread"}:
-                continue
-            try:
-                self._kernel.wait(handle, self._spec.timeout_milliseconds)
-                waited.append(handle)
-            except BaseException as error:
-                deferred_handles.add(handle)
-                failures.append(_WindowsOperationFailureV1("wait", handle, str(error)))
         if self._job_handle is not None and not self._zero_active_observed:
             try:
                 active_count = self._kernel.query_job_active_process_count(self._job_handle)
@@ -2280,7 +2343,7 @@ class _WindowsScenarioJobV1:
         )
         self._last_finalization = result
         if failures:
-            raise _WindowsFinalizationError(result)
+            raise _WindowsFinalizationError(result, self)
         return result
 
 
@@ -2390,6 +2453,7 @@ class _CtypesWindowsKernelV1:
         self._kernel32: Any | None = None
         self._job_max_active_processes: dict[int, int] = {}
         self._retryable_handles: set[int] = set()
+        self._retained_process_identities: dict[int, _WindowsKernelProcessV1] = {}
 
     @property
     def retryable_handles(self) -> tuple[int, ...]:
@@ -2404,6 +2468,7 @@ class _CtypesWindowsKernelV1:
             raise
         self._retryable_handles.discard(handle)
         self._job_max_active_processes.pop(handle, None)
+        self._retained_process_identities.pop(handle, None)
 
     def finalize_transient_handles(self) -> None:
         failures: list[BaseException] = []
@@ -2645,19 +2710,41 @@ class _CtypesWindowsKernelV1:
             ctypes.byref(ctypes.c_uint64()),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        pid = int(api.GetProcessId(ctypes.c_void_p(handle)))
+        retained = self._retained_process_identities.get(handle)
+        if retained is not None:
+            if (pid, int(creation.value)) != (retained.pid, retained.creation_filetime):
+                _windows_fail("retained process handle identity changed")
+            if api.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0:
+                # Windows may no longer expose the image name or Toolhelp row
+                # after exit. The still-retained process handle proves which
+                # previously observed process terminated; a bare PID cannot.
+                return retained
         size = ctypes.c_uint32(32768)
         image = ctypes.create_unicode_buffer(size.value)
         if not api.QueryFullProcessImageNameW(
             ctypes.c_void_p(handle), 0, image, ctypes.byref(size)
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.WinError(ctypes.get_last_error())
+            # Exit may begin between the zero-time wait and image query. Only
+            # a bounded successful wait on this previously identified handle
+            # permits its cached immutable facts; a live inaccessible process
+            # still fails. PID and creation time were rechecked above.
+            if retained is not None and api.WaitForSingleObject(ctypes.c_void_p(handle), 1000) == 0:
+                return retained
+            raise error
         path = Path(image.value)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        pid = int(api.GetProcessId(ctypes.c_void_p(handle)))
-        parent_pid, parent_creation = self._parent_identity(pid)
-        return _WindowsKernelProcessV1(
+        parent_pid, parent_creation = (
+            self._parent_identity(pid)
+            if retained is None
+            else (retained.parent_pid, retained.parent_creation_filetime)
+        )
+        identity = _WindowsKernelProcessV1(
             pid, parent_pid, parent_creation, int(creation.value), path.name, digest
         )
+        self._retained_process_identities[handle] = identity
+        return identity
 
     def query_job_processes(self, job: int) -> tuple[int, ...]:
         api = self._api()
@@ -2668,7 +2755,7 @@ class _CtypesWindowsKernelV1:
         buffer = (ctypes.c_byte * size)()
         returned = ctypes.c_uint32()
         if not api.QueryInformationJobObject(
-            ctypes.c_void_p(job), 8, ctypes.byref(buffer), size, ctypes.byref(returned)
+            ctypes.c_void_p(job), 3, ctypes.byref(buffer), size, ctypes.byref(returned)
         ):
             if ctypes.get_last_error() == 234:
                 _windows_fail("Job PID-list exceeded its retained active-process limit")
@@ -2678,7 +2765,7 @@ class _CtypesWindowsKernelV1:
         ).contents
         assigned = int(header.NumberOfAssignedProcesses)
         count = int(header.NumberOfProcessIdsInList)
-        if count > assigned or assigned > max_active or count > max_active:
+        if count != assigned or assigned > max_active or count > max_active:
             _windows_fail("Job PID-list returned impossible bounded counts")
         process_ids = ctypes.cast(
             ctypes.byref(buffer, ctypes.sizeof(header)), ctypes.POINTER(ctypes.c_size_t)
