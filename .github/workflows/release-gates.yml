@@ -246,6 +246,14 @@ jobs:
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }
+      - name: Qualify archived deterministic equivalence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run --frozen --group dev python -m scripts.qualify_deterministic_equivalence `
+            --candidate $env:GITHUB_WORKSPACE `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Deterministic equivalence failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |

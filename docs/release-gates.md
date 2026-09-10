@@ -18,7 +18,7 @@ still inspects export-ignored paths.
 | Pure candidate wheel | Build the candidate wheel and hash-identified offline dependency closure. |
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
 | Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
-| Native LiveKit release integration | Run the Windows gates with the pinned local LiveKit server and the real-browser self-acceptance check. |
+| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
 
 Before an authorized merge, require the reviewed candidate's four PR checks to
 pass. After merging, wait for all four jobs in the resulting exact-commit `main`

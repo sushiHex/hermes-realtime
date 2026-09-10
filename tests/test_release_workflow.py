@@ -489,6 +489,10 @@ def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None
     required = release_gate["required_sdist_paths"]()
     task12_paths = {
         "scripts/qualify_evidence_slice_zero.py",
+        "scripts/deterministic_equivalence.py",
+        "scripts/equivalence_process.py",
+        "scripts/equivalence_worker.py",
+        "scripts/qualify_deterministic_equivalence.py",
         "scripts/qualify_hermes_v020_pluginmanager.py",
         "scripts/schemas/benchmark-machine-v1.schema.json",
         "scripts/schemas/benchmark-report-v1.schema.json",
@@ -503,6 +507,10 @@ def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None
     typecheck_block = source.split("script_type_env =", 1)[1].split("cwd=root", 1)[0]
     for runner in (
         '"scripts/qualify_evidence_slice_zero.py"',
+        '"scripts/deterministic_equivalence.py"',
+        '"scripts/equivalence_process.py"',
+        '"scripts/equivalence_worker.py"',
+        '"scripts/qualify_deterministic_equivalence.py"',
         '"scripts/qualify_hermes_v020_pluginmanager.py"',
     ):
         assert typecheck_block.count(runner) == 1
