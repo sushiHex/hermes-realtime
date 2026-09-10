@@ -51,6 +51,34 @@ child exit, retained-handle waits, zero active Job members, closed handles, and
 removal of the owned temporary tree. Cleanup may retry after failure, but a cleanup
 retry cannot turn a failed invocation into an accepted result.
 
+## Worker exit observations
+
+[Issue #24](https://github.com/sushiHex/hermes-realtime/issues/24) records an
+abnormal worker exit after the complete scenario exchange. The parent now prints
+one content-free `[archived-worker]` diagnostic after execution and its owned Job
+finalization attempt, including on failure. It records the version, fixed scenario
+name, whether the full exchange was accepted, the exit code observed before Job
+cleanup (or null if unavailable), and fixed child milestones.
+
+A separate inherited pipe carries at most five bytes: `done_acknowledged`,
+`server_stop_entered`, `server_stop_returned`, `protocol_closed`, and
+`atexit_entered`. The parent samples available bytes without an EOF wait, extra
+reader thread, or additional timeout. Unknown, duplicate, or reordered bytes
+produce null; an empty list means no milestone was observed. No provider output,
+paths, credentials, traces, or exception text enter this diagnostic.
+
+The exit callback is registered after scenario imports and runs before their
+previously registered exit callbacks. Reaching it does not prove that library
+callbacks or interpreter finalization completed. The milestones establish only
+the observed shutdown boundaries; they do not identify a failing native library.
+Normal worker exit, complete observations, and owned cleanup remain independent
+requirements for a successful qualification receipt. Diagnostics cannot supply
+missing acceptance evidence or convert an abnormal exit into success.
+
+The LiveKit stop wait retains its existing five-second authority. Both protocol
+pipe endpoints close even if server termination or its wait fails. A diagnostic
+reader disappearing cannot suppress that cleanup.
+
 ## Running the producer
 
 On Windows, install the locked development environment with `uv sync --frozen --dev`.

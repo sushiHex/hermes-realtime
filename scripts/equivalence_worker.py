@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hashlib
 import hmac
 import os
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -151,16 +152,40 @@ async def _run_arms(workspace: Path, livekit_url: str, emit: Any) -> None:
         emit(name, observed[0])
 
 
+def _mark_exit(fd: int, milestone: bytes) -> None:
+    # Five single-byte writes cannot fill the dedicated pipe. A disconnected
+    # diagnostic reader must never replace the worker's cleanup or outcome.
+    with suppress(OSError):
+        os.write(fd, milestone)
+
+
+def _stop_server_and_close_protocol(
+    server: subprocess.Popen[bytes], request_fd: int, response_fd: int, progress_fd: int,
+) -> None:
+    _mark_exit(progress_fd, b"T")
+    try:
+        server.terminate()
+        server.wait(timeout=5)
+        _mark_exit(progress_fd, b"S")
+    finally:
+        try:
+            os.close(request_fd)
+        finally:
+            os.close(response_fd)
+        _mark_exit(progress_fd, b"P")
+
+
 def main() -> None:
-    if os.name != "nt" or len(sys.argv) != 3 or sys.flags.optimize or not sys.flags.isolated:
+    if os.name != "nt" or len(sys.argv) != 4 or sys.flags.optimize or not sys.flags.isolated:
         raise ValueError("equivalence child requires its exact isolated owned launch")
     import msvcrt
 
-    request_handle, response_handle = (int(value) for value in sys.argv[1:])
-    for handle in (request_handle, response_handle):
+    request_handle, response_handle, progress_handle = (int(value) for value in sys.argv[1:])
+    for handle in (request_handle, response_handle, progress_handle):
         os.set_handle_inheritable(handle, False)
     request_fd = msvcrt.open_osfhandle(request_handle, os.O_RDONLY | os.O_BINARY)
     response_fd = msvcrt.open_osfhandle(response_handle, os.O_WRONLY | os.O_BINARY)
+    progress_fd = msvcrt.open_osfhandle(progress_handle, os.O_WRONLY | os.O_BINARY)
     # Provider/library diagnostics must not persist conversation or path data.
     _redirect_diagnostics()
     config = _read_frame(request_fd, time.monotonic() + 10)
@@ -246,6 +271,7 @@ def main() -> None:
         emit("ready", {"port": port})
         asyncio.run(_run_arms(workspace, f"ws://127.0.0.1:{port}", emit))
         emit("done", {})
+        _mark_exit(progress_fd, b"D")
     except BaseException as error:
         failure_kinds: dict[type[BaseException], str] = {
             AssertionError: "assertion",
@@ -276,10 +302,12 @@ def main() -> None:
         )
         raise
     finally:
-        server.terminate()
-        server.wait(timeout=5)
-        os.close(request_fd)
-        os.close(response_fd)
+        # Register after scenario imports so this probe precedes their atexit
+        # callbacks. Reaching it does not prove interpreter finalization finished.
+        atexit.register(_mark_exit, progress_fd, b"A")
+        _stop_server_and_close_protocol(server, request_fd, response_fd, progress_fd)
+        # The process owns progress_fd through its exit callback; the parent
+        # samples it without waiting for EOF, including after abnormal termination.
 
 
 if __name__ == "__main__":
