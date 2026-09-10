@@ -13,7 +13,7 @@ from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread
 from typing import Any, cast
 
 from scripts.equivalence_process import _require
@@ -418,11 +418,109 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
     }
 
 
+class _ObserveThreadOwners:
+    """Retain actual owner objects; export only invocation-local commitments."""
+
+    def __init__(self, transport: Any, key: bytes) -> None:
+        from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
+
+        _require(type(transport) is SQLiteEvidenceWriterDaemonV1, "SQLite transport is not exact")
+        self.transport, self.key = transport, key
+        self.event_loop = current_thread()
+        self.sqlite = transport._thread
+        self.dispatcher: Any = None
+        self.bound_dispatcher: Any = None
+        self.calls: list[dict[str, str]] = []
+        self.dequeues = 0
+        self.failed = False
+
+    def _check(self, condition: bool, message: str) -> None:
+        if not condition:
+            self.failed = True
+        _require(condition, message)
+
+    def _identity(self, thread: Any) -> str:
+        self._check(thread is not None and type(thread.ident) is int, "owner thread never started")
+        return _commit(self.key, "thread", str(thread.ident))
+
+    def dequeued(self) -> None:
+        observed = current_thread()
+        self._check(
+            observed is not self.event_loop
+            and observed is not self.sqlite
+            and (self.dispatcher is None or self.dispatcher is observed),
+            "dequeue did not run on its independent dispatcher thread",
+        )
+        self.dispatcher = observed
+        self.dequeues += 1
+        self._check(self.dequeues <= 21, "dispatcher observation overflow")
+
+    def bind_dispatcher(self, owner: Any) -> None:
+        from hermes_realtime.evidence.runtime import EvidenceWriterRuntimeOwnerV1
+
+        self._check(
+            type(owner) is EvidenceWriterRuntimeOwnerV1
+            and owner._thread is self.dispatcher
+            and owner.is_running,
+            "observed dispatcher is not the retained production owner",
+        )
+        self.bound_dispatcher = owner._thread
+
+    def spool_call(self, stage: str) -> None:
+        self._check(
+            current_thread() is self.sqlite
+            and self.sqlite is not self.event_loop
+            and self.sqlite is not self.dispatcher
+            and self.transport.owner_thread_id == self.sqlite.ident
+            and self.sqlite.is_alive(),
+            "SQLite call did not run on its dedicated owner thread",
+        )
+        self._check(
+            stage
+            in {
+                "factory",
+                "create_epoch",
+                "append_record",
+                "rollover_session",
+                "active_session_expiry",
+                "drain_and_close",
+                "close",
+                "close_owner_marker",
+            }
+            and len(self.calls) < 32,
+            "SQLite owner observation is unknown or oversized",
+        )
+        self.calls.append({"stage": stage, "thread": self._identity(current_thread())})
+
+    def finished(self) -> dict[str, Any]:
+        self._check(
+            not self.failed
+            and self.bound_dispatcher is self.dispatcher
+            and self.dispatcher is not None
+            and not self.dispatcher.is_alive()
+            and not self.sqlite.is_alive()
+            and not self.transport.is_running,
+            "retained writer owners did not both stop",
+        )
+        return {
+            "event_loop": self._identity(self.event_loop),
+            "dispatcher": self._identity(self.dispatcher),
+            "sqlite": self._identity(self.sqlite),
+            "dequeues": self.dequeues,
+            "calls": self.calls,
+            "dispatcher_stopped": not self.dispatcher.is_alive(),
+            "sqlite_stopped": not self.sqlite.is_alive(),
+        }
+
+
 class _ObserveRolloverSpool:
     """Observe on the real SQLite owner thread and always delegate the operation."""
 
-    def __init__(self, delegate: Any, database: Path, key: bytes) -> None:
+    def __init__(
+        self, delegate: Any, database: Path, key: bytes, owners: _ObserveThreadOwners | None = None
+    ) -> None:
         self.delegate, self.database, self.key = delegate, database, key
+        self.owners = owners
         self.snapshots: list[dict[str, Any]] = []
         self.transactions: list[str] = []
         self.failed = False
@@ -432,9 +530,20 @@ class _ObserveRolloverSpool:
         self.records: list[dict[str, str]] = []
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.delegate, name)
+        value = getattr(self.delegate, name)
+        if self.owners is None or not callable(value):
+            return value
+
+        def observed(*arguments: Any, **keywords: Any) -> Any:
+            assert self.owners is not None
+            self.owners.spool_call(name)
+            return value(*arguments, **keywords)
+
+        return observed
 
     def create_epoch(self, command: Any) -> Any:
+        if self.owners is not None:
+            self.owners.spool_call("create_epoch")
         _require(not self.commands, "create command was dispatched more than once")
         self.commands["create_dto"] = _command_commitment(self.key, command)
         self.commands["request"] = _request_commitment(
@@ -458,6 +567,8 @@ class _ObserveRolloverSpool:
         return result
 
     def append_record(self, item: Any) -> Any:
+        if self.owners is not None:
+            self.owners.spool_call("append_record")
         _require(len(self.records) < 18, "extra ordinary spool record")
         dto = _payload_commitment(self.key, item)
         snapshot = _control_commitments(self.key, (item.snapshot,))[0]
@@ -471,6 +582,8 @@ class _ObserveRolloverSpool:
         return result
 
     def rollover_session(self, command: Any) -> Any:
+        if self.owners is not None:
+            self.owners.spool_call("rollover_session")
         _require(not self.snapshots, "rollover was invoked more than once")
         _require(
             set(self.commands) == {"create", "create_dto", "request"},
@@ -524,13 +637,21 @@ class _ObserveRolloverSpool:
 class _ObserveQueue:
     """Delegate the real blocking dequeue and inspect its unstripped envelope."""
 
-    def __init__(self, queue: Any, key: bytes, *, owner_generation: int) -> None:
+    def __init__(
+        self,
+        queue: Any,
+        key: bytes,
+        *,
+        owner_generation: int,
+        owners: _ObserveThreadOwners | None = None,
+    ) -> None:
         from hermes_realtime.evidence.admission import BoundedEvidenceWriterQueueV1
 
         _require(
             type(queue) is BoundedEvidenceWriterQueueV1, "observed queue is not production-owned"
         )
         self.queue, self.key, self.owner_generation = queue, key, owner_generation
+        self.owners = owners
         self.original = queue.get_blocking
         self.records: list[dict[str, Any]] = []
         queue.get_blocking = self.get_blocking
@@ -550,6 +671,8 @@ class _ObserveQueue:
         item = self.original()
         if item is None:
             return None
+        if self.owners is not None:
+            self.owners.dequeued()
         index = len(self.records)
         _require(
             type(item) is EvidenceWriterQueueItemV1
@@ -666,6 +789,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     dispatches: list[_ObserveDispatch] = []
     queues: list[_ObserveQueue] = []
     reservations: list[tuple[Any, Any]] = []
+    thread_owners: list[_ObserveThreadOwners] = []
 
     def writer_factory(runtime: Any) -> Any:
         reserve = runtime.reserve_browser_consent
@@ -674,7 +798,9 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             authority = reserve(**arguments)
             _require(not queues, "queue reservation observation repeated")
             queues.append(
-                _ObserveQueue(runtime._queue, key, owner_generation=runtime._owner_generation)
+                _ObserveQueue(
+                    runtime._queue, key, owner_generation=runtime._owner_generation, owners=owners
+                )
             )
             return authority
 
@@ -683,10 +809,17 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         runtime.reserve_browser_consent = observe_reservation
         reservations.append((runtime, reserve))
         transport = runtime.create_sqlite_transport()
+        owners = _ObserveThreadOwners(transport, key)
+        thread_owners.append(owners)
         factory = transport._spool_factory
 
         def observed_factory() -> _ObserveRolloverSpool:
-            spool = _ObserveRolloverSpool(factory(), database, key)
+            from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
+
+            owners.spool_call("factory")
+            delegate = factory()
+            _require(type(delegate) is SQLiteEvidenceSpool, "SQLite spool is not exact")
+            spool = _ObserveRolloverSpool(delegate, database, key, owners)
             spools.append(spool)
             return spool
 
@@ -723,6 +856,8 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             room=room,
         )
         accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
+        _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
+        thread_owners[0].bind_dispatcher(reservations[0][0]._writer)
         after = 0
         for sequence in range(1, 4):
             text = f"Synthetic capacity turn {sequence}."
@@ -805,6 +940,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "dispatch": dispatches[0].commands,
         "queue": queues[0].records,
         "spool_records": spool.records,
+        "threads": thread_owners[0].finished(),
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "durable_terminals": spool.durable_terminals,

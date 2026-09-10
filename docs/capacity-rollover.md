@@ -63,6 +63,12 @@ before calling the real spool. Those DTOs must match dequeue and transport;
 their full snapshots must match independently reconstructed durable snapshots,
 including event identity and every payload field. Every append must commit.
 Validly rehashing a substituted event cannot satisfy this comparison.
+The transport must be the exact production SQLite daemon. Factory and spool
+calls are checked against its retained thread object, separately from the
+observed dispatcher and event-loop threads. The dispatcher is bound to the real
+runtime owner after activation. After host close, both retained worker threads
+must actually be stopped. Only keyed thread commitments, bounded call stages,
+and observed stop states cross the child boundary; thread IDs and names do not.
 
 The observer also commits complete dispatched control snapshots, including event
 identity, binding identity and generation, source availability, and consent lineage. The reader reconstructs

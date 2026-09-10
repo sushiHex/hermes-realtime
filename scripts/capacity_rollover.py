@@ -43,6 +43,42 @@ def _digests(values: Any, count: int) -> None:
         _digest(value)
 
 
+def _validate_thread_owners(threads: Any) -> None:
+    _keys(
+        threads,
+        {
+            "event_loop",
+            "dispatcher",
+            "sqlite",
+            "dequeues",
+            "calls",
+            "dispatcher_stopped",
+            "sqlite_stopped",
+        },
+    )
+    for name in ("event_loop", "dispatcher", "sqlite"):
+        _digest(threads[name])
+    _require(
+        len({threads[name] for name in ("event_loop", "dispatcher", "sqlite")}) == 3
+        and type(threads["dequeues"]) is int
+        and threads["dequeues"] == 21
+        and threads["dispatcher_stopped"] is True
+        and threads["sqlite_stopped"] is True,
+        "SQLite, dispatcher, and event-loop ownership is not separate or stopped",
+    )
+    stages = (
+        ["factory", "create_epoch", "active_session_expiry"]
+        + ["append_record"] * 12
+        + ["rollover_session"]
+        + ["append_record"] * 6
+        + ["drain_and_close", "close"]
+    )
+    _require(
+        threads["calls"] == [{"stage": stage, "thread": threads["sqlite"]} for stage in stages],
+        "SQLite factory or spool calls escaped their dedicated owner",
+    )
+
+
 def _validate_observations(row: Any) -> None:
     _keys(
         row,
@@ -52,6 +88,7 @@ def _validate_observations(row: Any) -> None:
             "dispatch",
             "queue",
             "spool_records",
+            "threads",
             "snapshots",
             "transactions",
             "durable_terminals",
@@ -66,6 +103,7 @@ def _validate_observations(row: Any) -> None:
         },
     )
     _require(row["arm"] == "capacity_rollover", "rollover scenario differs")
+    _validate_thread_owners(row["threads"])
     _require(
         row["transactions"] == ["BEGIN IMMEDIATE", "COMMIT"],
         "rollover did not use one committed transaction",

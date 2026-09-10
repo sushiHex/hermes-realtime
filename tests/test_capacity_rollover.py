@@ -67,6 +67,22 @@ def _observations() -> dict:
         snapshot.update(clock=snapshot["sessions"][-1]["last_event_at"], authority="4" * 64)
     return dict(
         arm="capacity_rollover",
+        threads=dict(
+            event_loop="a" * 64,
+            dispatcher="b" * 64,
+            sqlite="c" * 64,
+            dequeues=21,
+            calls=[
+                dict(stage=stage, thread="c" * 64)
+                for stage in ["factory", "create_epoch", "active_session_expiry"]
+                + ["append_record"] * 12
+                + ["rollover_session"]
+                + ["append_record"] * 6
+                + ["drain_and_close", "close"]
+            ],
+            dispatcher_stopped=True,
+            sqlite_stopped=True,
+        ),
         commands={
             "create": ["0" * 64, "1" * 64],
             "rollover": ["2" * 64, "2" * 64, "3" * 64, "4" * 64],
@@ -502,6 +518,120 @@ def test_parent_rejects_a_gap_between_dispatch_spool_and_durable_records(mutatio
             snapshot["sessions"][0]["records"][0] = "f" * 64
     else:
         row["spool_records"][0][mutation] = "writer_fault" if mutation == "result" else "f" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("boundary", ["transport", "factory", "spool", "dequeue", "dispatcher"])
+def test_owner_observer_refuses_duck_transport_and_foreground_execution(boundary: str) -> None:
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
+    from scripts.capacity_rollover_worker import _ObserveThreadOwners
+
+    transport = SQLiteEvidenceWriterDaemonV1(lambda: None)
+    with pytest.raises(ValueError):
+        owners = _ObserveThreadOwners(object() if boundary == "transport" else transport, b"key")
+        if boundary in {"factory", "spool"}:
+            owners.spool_call("factory" if boundary == "factory" else "append_record")
+        elif boundary == "dequeue":
+            owners.dequeued()
+        elif boundary == "dispatcher":
+            owners.bind_dispatcher(object())
+    assert not transport._thread.is_alive()
+
+
+@pytest.mark.parametrize("live", ["none", "sqlite", "dispatcher"])
+def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, live: str) -> None:
+    from threading import Event
+
+    from hermes_realtime.evidence import admission as a
+    from hermes_realtime.evidence.models import StoreDisposition
+    from hermes_realtime.evidence.runtime import EvidenceWriterRuntimeOwnerV1
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
+    from scripts.capacity_rollover_worker import _ObserveRolloverSpool, _ObserveThreadOwners
+    from tests.evidence.test_sqlite_spool import make_create_epoch, make_spool
+
+    key = b"synthetic key"
+
+    def factory():
+        owners.spool_call("factory")
+        spool = make_spool(tmp_path)
+        return _ObserveRolloverSpool(spool, spool.database, key, owners)
+
+    transport = SQLiteEvidenceWriterDaemonV1(factory)
+    owners = _ObserveThreadOwners(transport, key)
+    queue = a.BoundedEvidenceWriterQueueV1()
+    completed = Event()
+
+    def dispatch(item):
+        owners.dequeued()
+        assert transport.create_epoch(item.payload) is StoreDisposition.COMMITTED
+        completed.set()
+
+    dispatcher = EvidenceWriterRuntimeOwnerV1(source=queue, dispatch=dispatch)
+    try:
+        queue.put_nowait(
+            a.EvidenceWriterQueueItemV1(
+                protocol_version=1,
+                lane=a.WriterQueueLane.ORDERED,
+                payload=make_create_epoch(),
+                admission_ordinal=2,
+            )
+        )
+        assert completed.wait(5)
+        owners.bind_dispatcher(dispatcher)
+        if live != "sqlite":
+            assert transport.close()
+        if live != "dispatcher":
+            assert dispatcher.close(2)
+        if live == "none":
+            result = owners.finished()
+            assert result["sqlite_stopped"] is result["dispatcher_stopped"] is True
+            assert len({result[k] for k in ("event_loop", "dispatcher", "sqlite")}) == 3
+        else:
+            with pytest.raises(ValueError, match="both stop"):
+                owners.finished()
+    finally:
+        assert transport.close()
+        assert dispatcher.close(2)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "same_thread",
+        "factory_thread",
+        "spool_thread",
+        "missing_call",
+        "extra_call",
+        "sqlite_live",
+        "dispatcher_live",
+        "bool_count",
+    ],
+)
+def test_parent_rejects_missing_or_collapsed_writer_thread_ownership(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    threads = row["threads"]
+    if mutation == "missing":
+        del row["threads"]
+    elif mutation == "same_thread":
+        threads["dispatcher"] = threads["sqlite"]
+    elif mutation == "factory_thread":
+        threads["calls"][0]["thread"] = threads["event_loop"]
+    elif mutation == "spool_thread":
+        threads["calls"][4]["thread"] = threads["dispatcher"]
+    elif mutation == "missing_call":
+        threads["calls"].pop()
+    elif mutation == "extra_call":
+        threads["calls"].append(dict(stage="close", thread=threads["sqlite"]))
+    elif mutation == "sqlite_live":
+        threads["sqlite_stopped"] = False
+    elif mutation == "dispatcher_live":
+        threads["dispatcher_stopped"] = False
+    else:
+        threads["dequeues"] = True
     with pytest.raises(ValueError):
         _validate_observations(row)
 
