@@ -28,6 +28,7 @@ from scripts.equivalence_process import (
     _write_frame,
 )
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
+from scripts.windows_storage_oracle import audit_drain_release
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,7 @@ class _StorageInvocation:
     cleanup: core._WindowsFinalizationResultV1
     exit_code: int
     expected_exit: int
+    drain_released: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +142,20 @@ def _validate_invocation(record: _StorageInvocation) -> Any:
         and record.process.process_handle in cleanup.waited_handles,
         "storage worker retained ownership cleanup is incomplete",
     )
-    return core.load_strict_canonical_json(record.observation, source="storage observation")
+    observation: Any = core.load_strict_canonical_json(
+        record.observation, source="storage observation"
+    )
+    _require(type(observation) is dict, "storage observation is not an object")
+    _require(
+        type(record.drain_released) is bool
+        and record.drain_released
+        is (
+            record.expected_exit in {197, 198}
+            and observation.get("checkpoint") == "after_drain_ack_before_exit"
+        ),
+        "drain release observation differs",
+    )
+    return observation
 
 
 def _run_storage_worker(
@@ -223,7 +238,7 @@ def _run_storage_worker(
             endpoints[response_write].close()
             nonce = secrets.token_hex(32)
 
-            def execute() -> tuple[Any, int]:
+            def execute() -> tuple[Any, int, bool]:
                 _write_frame(
                     request_write,
                     {
@@ -266,6 +281,12 @@ def _run_storage_worker(
                         f"storage worker failed: {observation['failure']} "
                         f"at source line {observation['source_line']}"
                     )
+                drain_released = action == "crash" and point == "after_drain_ack_before_exit"
+                if drain_released:
+                    audit_drain_release(
+                        archive.workspace / f"{point}-exit{mode}-{clock}" / "evidence",
+                        root.process_handle,
+                    )
                 if expected_exit == 198:
                     api = kernel._api()
                     api.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -277,13 +298,20 @@ def _run_storage_worker(
                 kernel.wait(root.process_handle, 10_000)
                 code = _exit_code(kernel, root.process_handle)
                 _require(code == expected_exit, "storage worker did not reach its prescribed exit")
-                return frame["observation"], code
+                return frame["observation"], code, drain_released
 
-            observation, code = core._run_with_windows_scenario_job_finalization_v1(job, execute)
+            observation, code, drain_released = core._run_with_windows_scenario_job_finalization_v1(
+                job, execute
+            )
             cleanup = job.last_finalization
             assert cleanup is not None
             record = _StorageInvocation(
-                core.canonical_json_bytes(observation), root, cleanup, code, expected_exit
+                core.canonical_json_bytes(observation),
+                root,
+                cleanup,
+                code,
+                expected_exit,
+                drain_released,
             )
             _validate_invocation(record)
             _require(

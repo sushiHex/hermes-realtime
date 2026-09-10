@@ -27,6 +27,14 @@ its first instruction. The parent binds its checkpoint to the retained process
 identity, checks the prescribed exit code, waits the process, observes an empty
 Job, and closes owned handles. Recovery requires normal exit zero.
 
+At `after_drain_ack_before_exit`, the parent also opens the existing root, database,
+and sentinel with exclusive sharing while the retained child process is still alive.
+Only then may it acknowledge the child's exit or terminate it. This independently
+refuses a false drain acknowledgement that retains a SQLite connection, sentinel
+lease, or root authority; process termination cannot supply the missing release
+evidence. The probe does not write or create files. Its authority is Microsoft's
+[CreateFileW sharing contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
 The [driver](../scripts/storage_worker.py) uses the production Windows storage
 probe. It delegates the named durable operations to the existing real SQLite
 crash driver. The [observer](../scripts/storage_observation.py) separately reads

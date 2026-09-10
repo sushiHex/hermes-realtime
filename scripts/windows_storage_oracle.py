@@ -58,6 +58,7 @@ def _api() -> tuple[Any, Any]:
         (kernel, "FindFirstStreamW", pointer, [text, c.c_int, pointer, word]),
         (kernel, "FindNextStreamW", c.c_int, [pointer, pointer]),
         (kernel, "FindClose", c.c_int, [pointer]),
+        (kernel, "WaitForSingleObject", word, [pointer, word]),
         (
             security,
             "GetSecurityInfo",
@@ -177,10 +178,14 @@ def _streams(path: Path, *, directory: bool) -> None:
 
 
 @contextmanager
-def _retain(path: Path, *, directory: bool) -> Iterator[_FileInfo]:
+def _retain(path: Path, *, directory: bool, exclusive: bool = False) -> Iterator[_FileInfo]:
     kernel, _ = _api()
-    handle = kernel.CreateFileW(str(path), 0x20080, 3, None, 3, 0x02200000, None)
-    _require(handle not in (None, c.c_void_p(-1).value), "storage path could not be retained")
+    access = 0x80020080 if exclusive else 0x20080
+    handle = kernel.CreateFileW(str(path), access, 0 if exclusive else 3, None, 3, 0x02200000, None)
+    _require(
+        handle not in (None, c.c_void_p(-1).value),
+        "drain retained storage ownership" if exclusive else "storage path could not be retained",
+    )
     try:
         info = _FileInfo()
         _require(
@@ -208,6 +213,28 @@ def _retain(path: Path, *, directory: bool) -> Iterator[_FileInfo]:
         yield info
     finally:
         _require(bool(kernel.CloseHandle(handle)), "storage retained file did not close")
+
+
+def audit_drain_release(root: Path, process_handle: int) -> None:
+    """Prove release before process exit can supply it; never mutate the store."""
+    kernel, _ = _api()
+
+    def require_alive() -> None:
+        _require(
+            kernel.WaitForSingleObject(process_handle, 0) == 258,  # WAIT_TIMEOUT
+            "drain worker exited before live ownership observation",
+        )
+
+    require_alive()
+    with ExitStack() as owned:
+        parent = owned.enter_context(_retain(root, directory=True, exclusive=True))
+        for name in ("capture-v1.owner", "capture-v1.sqlite3"):
+            child = owned.enter_context(_retain(root / name, directory=False, exclusive=True))
+            _require(child.volume == parent.volume, "drain storage changed volume")
+        # Share mode zero excludes every existing read/write/delete handle,
+        # including SQLite's connection and the sentinel's byte-range lease.
+        # The retained worker is still blocked on its private exit handshake.
+        require_alive()
 
 
 @contextmanager

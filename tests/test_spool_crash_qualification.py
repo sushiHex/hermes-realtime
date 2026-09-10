@@ -359,6 +359,28 @@ def test_expected_crash_exit_never_substitutes_for_owned_cleanup(mutation) -> No
             _validate_invocation(record)
 
 
+def test_drain_acknowledgement_without_live_release_observation_is_refused() -> None:
+    from types import SimpleNamespace
+
+    from scripts.storage_process import _StorageInvocation, _validate_invocation
+
+    record = _StorageInvocation(
+        b'{"checkpoint":"after_drain_ack_before_exit","vacuum_returned":false}\n',
+        SimpleNamespace(process_handle=71),
+        SimpleNamespace(
+            closed=True,
+            zero_active_observed=True,
+            failures=(),
+            failed_handles=(),
+            waited_handles=(71,),
+        ),
+        197,
+        197,
+    )
+    with pytest.raises(ValueError, match="drain release observation differs"):
+        _validate_invocation(record)
+
+
 def test_receipts_cannot_be_constructed_from_supplied_claims() -> None:
     with pytest.raises(TypeError, match="producer-minted"):
         ObservedSpoolCrashMatrixV1()
@@ -988,3 +1010,62 @@ def test_storage_observer_rejects_unsafe_files_when_candidate_probe_lies(
     }[unsafe]
     with pytest.raises(ValueError, match=reason):
         observe_storage(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="observes live Windows drain ownership")
+@pytest.mark.parametrize("mode", [197, 198])
+@pytest.mark.parametrize("retained", [None, "_connection", "_sentinel_handle", "_root"])
+def test_drain_checkpoint_proves_release_before_worker_exit(tmp_path, mode, retained) -> None:
+    import hashlib
+    import shutil
+    from pathlib import Path
+
+    from scripts.storage_process import _run_storage_worker, _StorageArchive, _validate_invocation
+
+    source = Path(__file__).resolve().parents[1]
+    package = tmp_path / "package"
+    shutil.copytree(source / "src/hermes_realtime", package / "hermes_realtime")
+    if retained is not None:
+        # A damaged candidate reports the real STOPPED disposition, but hides one
+        # still-owned resource from its ordinary drain. The process keeps it alive.
+        module = package / "hermes_realtime/evidence/sqlite_spool.py"
+        with module.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                "\n_original_drain = SQLiteEvidenceSpool._close_for_drain\n"
+                "def _faulty_drain(self):\n"
+                f"    retained = self.{retained}\n"
+                f"    self.{retained} = None\n"
+                "    try:\n"
+                "        return _original_drain(self)\n"
+                "    finally:\n"
+                f"        self.{retained} = retained\n"
+                "SQLiteEvidenceSpool._close_for_drain = _faulty_drain\n"
+            )
+    archive = _StorageArchive(tmp_path, source, package, None, "0" * 64)
+    point = "after_drain_ack_before_exit"
+
+    def invoke():
+        return _run_storage_worker(archive, point=point, mode=mode, action="crash")
+
+    if retained is not None:
+        with pytest.raises(ValueError, match="drain retained storage ownership"):
+            invoke()
+    else:
+        record = invoke()
+        assert _validate_invocation(record) == {"checkpoint": point, "vacuum_returned": False}
+        assert record.drain_released is True
+    # Both refusal and success must finish the owned worker. Its files are then
+    # readable and removable; a process killed before inspection is not a pass.
+    root = tmp_path / f"{point}-exit{mode}-caught-up/evidence"
+    before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.iterdir()}
+    assert set(before) == {
+        ".hermes-realtime-evidence-root-v1",
+        "capture-v1.owner",
+        "capture-v1.sqlite3",
+    }
+    from scripts.windows_storage_oracle import audit_storage
+
+    with audit_storage(root, frozenset(before)):
+        assert before == {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.iterdir()
+        }

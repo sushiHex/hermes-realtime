@@ -561,7 +561,15 @@ def _validate_matrix(record: _MatrixRun) -> PackagedScenarioEvidenceV1:
         )
         row = _validate_invocation(recovery)
         _validate_recovery(point, clock, row)
-        observations.append({"point": point, "mode": mode, "clock": clock, "recovery": row})
+        observations.append(
+            {
+                "point": point,
+                "mode": mode,
+                "clock": clock,
+                "recovery": row,
+                "drain_released": crash.drain_released,
+            }
+        )
     return PackagedScenarioEvidenceV1(
         record.source_commit,
         record.source_tree,
