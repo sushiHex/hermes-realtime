@@ -54,6 +54,8 @@ def _validate_thread_owners(threads: Any) -> None:
             "calls",
             "dispatcher_stopped",
             "sqlite_stopped",
+            "dispatcher_clean",
+            "sqlite_clean",
         },
     )
     for name in ("event_loop", "dispatcher", "sqlite"):
@@ -63,7 +65,9 @@ def _validate_thread_owners(threads: Any) -> None:
         and type(threads["dequeues"]) is int
         and threads["dequeues"] == 21
         and threads["dispatcher_stopped"] is True
-        and threads["sqlite_stopped"] is True,
+        and threads["sqlite_stopped"] is True
+        and threads["dispatcher_clean"] is True
+        and threads["sqlite_clean"] is True,
         "SQLite, dispatcher, and event-loop ownership is not separate or stopped",
     )
     stages = (

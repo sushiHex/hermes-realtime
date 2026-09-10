@@ -82,6 +82,8 @@ def _observations() -> dict:
             ],
             dispatcher_stopped=True,
             sqlite_stopped=True,
+            dispatcher_clean=True,
+            sqlite_clean=True,
         ),
         commands={
             "create": ["0" * 64, "1" * 64],
@@ -539,7 +541,7 @@ def test_owner_observer_refuses_duck_transport_and_foreground_execution(boundary
     assert not transport._thread.is_alive()
 
 
-@pytest.mark.parametrize("live", ["none", "sqlite", "dispatcher"])
+@pytest.mark.parametrize("live", ["none", "sqlite", "dispatcher", "crashed", "spool_close"])
 def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, live: str) -> None:
     from threading import Event
 
@@ -551,10 +553,19 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
     from tests.evidence.test_sqlite_spool import make_create_epoch, make_spool
 
     key = b"synthetic key"
+    finish_dispatch = Event()
 
     def factory():
         owners.spool_call("factory")
         spool = make_spool(tmp_path)
+        if live == "spool_close":
+            original_close = spool.close
+
+            def failed_close():
+                original_close()
+                raise RuntimeError("synthetic spool close failure")
+
+            spool.close = failed_close
         return _ObserveRolloverSpool(spool, spool.database, key, owners)
 
     transport = SQLiteEvidenceWriterDaemonV1(factory)
@@ -566,6 +577,9 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
         owners.dequeued()
         assert transport.create_epoch(item.payload) is StoreDisposition.COMMITTED
         completed.set()
+        assert finish_dispatch.wait(5)
+        if live == "crashed":
+            raise RuntimeError("synthetic dispatcher failure after completion")
 
     dispatcher = EvidenceWriterRuntimeOwnerV1(source=queue, dispatch=dispatch)
     try:
@@ -579,10 +593,13 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
         )
         assert completed.wait(5)
         owners.bind_dispatcher(dispatcher)
+        finish_dispatch.set()
         if live != "sqlite":
             assert transport.close()
         if live != "dispatcher":
             assert dispatcher.close(2)
+        if live == "crashed":
+            assert type(dispatcher.failure) is RuntimeError
         if live == "none":
             result = owners.finished()
             assert result["sqlite_stopped"] is result["dispatcher_stopped"] is True
@@ -591,6 +608,7 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
             with pytest.raises(ValueError, match="both stop"):
                 owners.finished()
     finally:
+        finish_dispatch.set()
         assert transport.close()
         assert dispatcher.close(2)
 
@@ -606,6 +624,8 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
         "extra_call",
         "sqlite_live",
         "dispatcher_live",
+        "dispatcher_failed",
+        "sqlite_failed",
         "bool_count",
     ],
 )
@@ -628,6 +648,8 @@ def test_parent_rejects_missing_or_collapsed_writer_thread_ownership(mutation: s
         threads["calls"].append(dict(stage="close", thread=threads["sqlite"]))
     elif mutation == "sqlite_live":
         threads["sqlite_stopped"] = False
+    elif mutation in {"dispatcher_failed", "sqlite_failed"}:
+        threads[mutation.replace("failed", "clean")] = False
     elif mutation == "dispatcher_live":
         threads["dispatcher_stopped"] = False
     else:

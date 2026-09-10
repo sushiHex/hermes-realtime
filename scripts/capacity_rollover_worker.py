@@ -464,7 +464,7 @@ class _ObserveThreadOwners:
             and owner.is_running,
             "observed dispatcher is not the retained production owner",
         )
-        self.bound_dispatcher = owner._thread
+        self.bound_dispatcher = owner
 
     def spool_call(self, stage: str) -> None:
         self._check(
@@ -495,12 +495,15 @@ class _ObserveThreadOwners:
     def finished(self) -> dict[str, Any]:
         self._check(
             not self.failed
-            and self.bound_dispatcher is self.dispatcher
+            and self.bound_dispatcher is not None
+            and self.bound_dispatcher._thread is self.dispatcher
+            and self.bound_dispatcher.failure is None
+            and self.transport._sticky_fault is None
             and self.dispatcher is not None
             and not self.dispatcher.is_alive()
             and not self.sqlite.is_alive()
             and not self.transport.is_running,
-            "retained writer owners did not both stop",
+            "retained writer owners did not both stop cleanly",
         )
         return {
             "event_loop": self._identity(self.event_loop),
@@ -510,6 +513,8 @@ class _ObserveThreadOwners:
             "calls": self.calls,
             "dispatcher_stopped": not self.dispatcher.is_alive(),
             "sqlite_stopped": not self.sqlite.is_alive(),
+            "dispatcher_clean": self.bound_dispatcher.failure is None,
+            "sqlite_clean": not self.failed and self.transport._sticky_fault is None,
         }
 
 
@@ -537,7 +542,12 @@ class _ObserveRolloverSpool:
         def observed(*arguments: Any, **keywords: Any) -> Any:
             assert self.owners is not None
             self.owners.spool_call(name)
-            return value(*arguments, **keywords)
+            try:
+                return value(*arguments, **keywords)
+            except BaseException:
+                # The real daemon suppresses close exceptions; retain refusal.
+                self.owners.failed = True
+                raise
 
         return observed
 
