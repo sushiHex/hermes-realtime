@@ -1675,50 +1675,127 @@ async def test_host_retention_owner_cancels_then_expires_real_sqlite_session(
         owner_generation=19,
         retention_hours=24,
     )
-    cancelled: list[str] = []
-    wall = [datetime(2026, 8, 12, tzinfo=UTC)]
+    try:
+        cancelled: list[str] = []
+        wall = [datetime(2026, 8, 12, tzinfo=UTC)]
 
-    async def cancel() -> None:
-        cancelled.append("retention_expired")
+        async def cancel() -> None:
+            cancelled.append("retention_expired")
 
-    async def advance(seconds: float) -> None:
-        wall[0] += timedelta(seconds=seconds)
+        async def advance(seconds: float) -> None:
+            wall[0] += timedelta(seconds=seconds)
 
-    runtime.configure_retention_owner(
-        cancel=cancel,
-        wall_clock=lambda: wall[0],
-        sleep=advance,
-    )
-    request = m.parse_evidence_consent_request(
-        b'{"accepted":true,"consentVersion":"realtime-evidence-consent-v1",'
-        b'"disclosureDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
-        b'"retentionHours":24,"sequence":1,'
-        b'"sources":{"microphone":true,"typed":true}}'
-    )
-    projection = BrowserEventProjection()
-    authority = runtime.reserve_browser_consent(
-        binding_generation=3,
-        request=request,
-        projection_reservation=projection.reserve_capture_status(),
-        validate_projection_reservation=projection.validate_capture_status_reservation,
-        microphone_available=True,
-        typed_available=True,
-    )
-    assert await runtime.activate_consent(
-        authority,
-        transport=runtime.create_sqlite_transport(),
-        binding_is_current=lambda _command: True,
-        timeout_seconds=2.0,
-    ) is m.ConsentDisposition.CONSENT_ACTIVATED
+        runtime.configure_retention_owner(
+            cancel=cancel,
+            wall_clock=lambda: wall[0],
+            sleep=advance,
+        )
+        request = m.parse_evidence_consent_request(
+            b'{"accepted":true,"consentVersion":"realtime-evidence-consent-v1",'
+            b'"disclosureDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"retentionHours":24,"sequence":1,'
+            b'"sources":{"microphone":true,"typed":true}}'
+        )
+        projection = BrowserEventProjection()
+        authority = runtime.reserve_browser_consent(
+            binding_generation=3,
+            request=request,
+            projection_reservation=projection.reserve_capture_status(),
+            validate_projection_reservation=projection.validate_capture_status_reservation,
+            microphone_available=True,
+            typed_available=True,
+        )
+        assert await runtime.activate_consent(
+            authority,
+            transport=runtime.create_sqlite_transport(),
+            binding_is_current=lambda _command: True,
+            timeout_seconds=2.0,
+        ) is m.ConsentDisposition.CONSENT_ACTIVATED
 
-    assert await runtime.wait_retention_terminal(timeout_seconds=2.0) is (
-        m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
-    )
-    assert cancelled == ["retention_expired"]
-    assert runtime.capture_status(disclosure_digest="a" * 64).capture_state is (
-        m.CaptureState.IDLE
-    )
-    await runtime.close()
+        assert await runtime.wait_retention_terminal(timeout_seconds=2.0) is (
+            m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+        )
+        assert cancelled == ["retention_expired"]
+        assert runtime.capture_status(disclosure_digest="a" * 64).capture_state is (
+            m.CaptureState.IDLE
+        )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon,
+        test_host_retention_owner_cancels_then_expires_real_sqlite_session,
+    ],
+    ids=["consent", "retention"],
+)
+@pytest.mark.parametrize("failure", ["timeout_disposition", "exception", "pending_timeout"])
+async def test_consent_scenarios_close_their_real_writer_after_activation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario, failure: str,
+) -> None:
+    import threading
+
+    from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+
+    class InjectedActivationFailure(RuntimeError):
+        pass
+
+    original = HostEvidenceRuntimeV1.activate_consent
+    runtimes: list[HostEvidenceRuntimeV1] = []
+    owned_threads: set[threading.Thread] = set()
+    injected = False
+
+    async def activate(runtime, *args, **kwargs):
+        nonlocal injected
+        runtimes.append(runtime)
+        release = threading.Event()
+        entered = threading.Event()
+        if failure == "pending_timeout":
+            transport = kwargs["transport"]
+            create_epoch = transport.create_epoch
+
+            def hold_create_epoch(command):
+                entered.set()
+                assert release.wait(timeout=5.0)
+                return create_epoch(command)
+
+            monkeypatch.setattr(transport, "create_epoch", hold_create_epoch)
+        try:
+            result = await original(runtime, *args, **kwargs)
+        finally:
+            release.set()
+        expected_result = (
+            m.ConsentDisposition.CONTROL_TIMED_OUT if failure == "pending_timeout"
+            else m.ConsentDisposition.CONSENT_ACTIVATED
+        )
+        assert result is expected_result
+        assert failure != "pending_timeout" or entered.is_set()
+        assert runtime._writer is not None and runtime._transport is not None
+        owned_threads.update((runtime._writer._thread, runtime._transport._thread))
+        assert runtime.writer_running and len(owned_threads) == 2
+        assert kwargs["timeout_seconds"] == 2.0
+        injected = True
+        if failure == "exception":
+            raise InjectedActivationFailure("synthetic activation failure after writer startup")
+        return m.ConsentDisposition.CONTROL_TIMED_OUT
+
+    monkeypatch.setattr(HostEvidenceRuntimeV1, "activate_consent", activate)
+    expected = InjectedActivationFailure if failure == "exception" else AssertionError
+    try:
+        with pytest.raises(expected):
+            await scenario(tmp_path)
+        assert injected and len(runtimes) == 1
+        assert runtimes[0]._closed
+        assert not runtimes[0].writer_running
+        assert all(not thread.is_alive() for thread in owned_threads)
+    finally:
+        # A RED regression must not itself contaminate the remaining test process.
+        for runtime in runtimes:
+            await runtime.close()
 
 
 @pytest.mark.asyncio

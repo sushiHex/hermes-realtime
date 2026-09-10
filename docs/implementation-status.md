@@ -96,6 +96,14 @@ Vitest 5 is a new timing baseline relative to the earlier Vitest 3 and 4 runs.
 Retain the exact lockfile and environment when comparing measurements. Installed
 synthetic speech probes do not establish physical audibility or subjective quality.
 
+The real SQLite consent and retention tests invoke owned runtime close from
+`finally`, including when activation assertions fail. Their failure-path regression
+starts the real dispatcher and SQLite writer, exercises a pending activation
+through its unchanged timeout and injects a failed result or exception after
+startup, then requires both retained thread objects to be stopped. The
+[earlier local activation timeouts and subsequent thread-count failures](https://github.com/sushiHex/hermes-realtime/pull/30#issuecomment-5614964675)
+remain recorded; repairing test cleanup does not establish their timing cause.
+
 [Issue #13](https://github.com/sushiHex/hermes-realtime/issues/13) remains open for
 the historical Windows timing failures. The
 [child-exit regression](windows-checkpoint-child-exit.md) demonstrates the
