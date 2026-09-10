@@ -6,6 +6,7 @@ from test_admission import (
     _owner_drain_authority,
     _revoke_authority,
     _turn_authority,
+    _turn_snapshot,
     _uuid,
 )
 
@@ -17,6 +18,7 @@ SETTLEMENT_REASONS = [
     m.TerminalReason.PROVIDER_FAILED,
     m.TerminalReason.CALLER_CANCELLED,
     m.TerminalReason.TRANSPORT_FAILED,
+    m.TerminalReason.TASK_SPAWN_FAILED,
 ]
 
 
@@ -119,6 +121,8 @@ def _overflow(admission, lease, source):
 
 
 def _settle(admission, lease, count=80, reason=None):
+    if reason is m.TerminalReason.TASK_SPAWN_FAILED:
+        return admission.settle_spawn_failed(lease)
     if reason is not None:
         admission.record_terminal_cause(lease.terminal_cause, reason)
         return admission.settle_terminal(
@@ -197,10 +201,14 @@ def test_tainted_retirement_preserves_another_live_operation_in_the_same_owner(r
     assert admission.try_open_non_user_turn(other) is m.AppendDisposition.ADMITTED
     _overflow(admission, lease, "generated")
     assert admission.diagnostics().active_lease_count == 2
-    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.SESSION_TAINTED
+    while writer.ordered_count:
+        admission.complete_ordered_item(writer.get_nowait())
+    assert _settle(admission, lease) is m.AppendDisposition.SESSION_TAINTED
     assert admission.diagnostics().active_lease_count == 1
+    assert writer.ordered_count == 0
     assert _settle(admission, other, 0, reason=reason) is m.AppendDisposition.SESSION_TAINTED
     assert admission.diagnostics().active_lease_count == 0
+    assert writer.ordered_count == 0
     assert (
         admission.settled_terminal_outcome(lease)
         is admission.settled_terminal_outcome(other)
@@ -249,3 +257,99 @@ def test_retirement_freezes_a_cause_report_that_already_retained_its_state(monke
             release.set()
         assert report.result(timeout=2.0) is m.CauseDisposition.CAUSE_SET_FROZEN
     assert admission.settled_terminal_outcome(lease) is None
+
+
+@pytest.mark.parametrize("snapshot_already_queued", [False, True])
+@pytest.mark.parametrize("revoked", [False, True])
+def test_low_level_terminal_append_cannot_complete_a_tainted_session(
+    snapshot_already_queued, revoked
+):
+    admission, operations, writer, create = _active_admission(a, m, owner_generation=721)
+    response = _turn_authority(m, "UserTurnAuthorityV1", create, owner_generation=721)
+    overflowing = admission.try_reserve_user_turn(
+        response, operations.try_reserve(m.ConversationOperationKind.RESPONSE)
+    ).lease
+    assert (
+        admission.try_admit_user_final(overflowing, response, "Synthetic accepted input.")
+        is m.AppendDisposition.ADMITTED
+    )
+    proactive = _turn_authority(m, "ProactiveTurnAuthorityV1", create, owner_generation=721)
+    lease = admission.try_reserve_proactive_turn(
+        proactive, operations.try_reserve(m.ConversationOperationKind.PROACTIVE)
+    ).lease
+    assert admission.try_open_non_user_turn(lease) is m.AppendDisposition.ADMITTED
+
+    def snapshot():
+        return _turn_snapshot(
+            m,
+            create,
+            lease,
+            admission._next_event_sequence,
+            m.EventKind.TURN_SNAPSHOT,
+            m.TurnSnapshotPayloadV1(
+                evidence_turn_id=lease.evidence_turn_id,
+                turn_kind=m.TurnKind.PROACTIVE_UPDATE,
+                generated_segment_count=0,
+                queued_chunk_count=0,
+                started_chunk_count=0,
+                transport_confirmed_full_count=0,
+                model_context_admitted=False,
+                assistant_delivery_context_recorded=False,
+            ),
+        )
+
+    if snapshot_already_queued:
+        assert admission.try_append_turn(lease, snapshot()) is m.AppendDisposition.ADMITTED
+    _overflow(admission, overflowing, "generated")
+    while writer.ordered_count:
+        admission.complete_ordered_item(writer.get_nowait())
+    assert _settle(admission, overflowing) is m.AppendDisposition.SESSION_TAINTED
+    if revoked:
+        revoke = admission.begin_revoke(_revoke_authority(m, create))
+        admission.complete_revoke_request(
+            writer.get_nowait(), m.RevokeDisposition.REVOKE_DURABLY_SCHEDULED
+        )
+        assert not revoke.terminal_event.is_set()
+    if snapshot_already_queued:
+        assert (
+            admission.record_terminal_cause(lease.terminal_cause, m.TerminalReason.PROVIDER_FAILED)
+            is m.CauseDisposition.RECORDED
+        )
+        admission.freeze_and_resolve_terminal_causes(lease, context_committed=False)
+        terminal = _turn_snapshot(
+            m,
+            create,
+            lease,
+            admission._next_event_sequence,
+            m.EventKind.TURN_SETTLED,
+            m.TurnSettledPayloadV1(
+                evidence_turn_id=lease.evidence_turn_id,
+                terminal_disposition=m.TerminalDisposition.FAILED,
+                terminal_reason=m.TerminalReason.PROVIDER_FAILED,
+                context_committed=False,
+                generated_segment_count=0,
+                transport_confirmed_full_count=0,
+            ),
+        )
+    else:
+        terminal = snapshot()
+    assert admission.try_append_turn(lease, terminal) is m.AppendDisposition.SESSION_TAINTED
+    assert admission.diagnostics().active_lease_count == 0
+    assert admission.settled_terminal_outcome(lease) is None
+    assert (
+        admission.record_terminal_cause(lease.terminal_cause, m.TerminalReason.CALLER_CANCELLED)
+        is m.CauseDisposition.INVALID_AUTHORITY
+    )
+    if revoked:
+        finalizer = writer.get_nowait()
+        assert type(finalizer.payload) is m.RevokeFinalizeV1
+        admission.complete_revoke_finalize(finalizer, m.RevokeDisposition.PURGE_COMPLETED)
+        assert revoke.terminal_event.is_set()
+    assert writer.ordered_count == 0
+    drain = admission.request_drain(
+        _owner_drain_authority(m, create, admission, owner_generation=721)
+    )
+    admission.complete_drain(writer.get_nowait(), m.DrainDisposition.STOPPED)
+    assert drain.terminal_event.is_set()
+    assert admission.diagnostics().queue_record_count == 0
+    assert admission.diagnostics().queue_canonical_bytes == 0

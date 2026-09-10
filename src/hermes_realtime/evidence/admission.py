@@ -3000,6 +3000,7 @@ class EvidenceAdmissionControllerV1:
     def settle_spawn_failed(self, lease: EvidenceTurnLease) -> AppendDisposition:
         """Atomically retire an admitted turn whose response task could not spawn."""
 
+        retired_tainted = False
         try:
             disposition: AppendDisposition
             with self._admission_lock:
@@ -3014,6 +3015,9 @@ class EvidenceAdmissionControllerV1:
                     or not self._lease_lineage_matches_locked(lease)
                 ):
                     return AppendDisposition.INVALID_AUTHORITY
+                if self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
                 cause_disposition = self.record_terminal_cause(
                     lease.terminal_cause,
                     TerminalReason.TASK_SPAWN_FAILED,
@@ -3091,6 +3095,9 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                self._advance_revoke_finalization_if_ready()
 
     def settle_completed(
         self,
@@ -3578,6 +3585,7 @@ class EvidenceAdmissionControllerV1:
     ) -> AppendDisposition:
         """Append one exact turn transition without waiting for its writer."""
 
+        retired_tainted = False
         try:
             with self._admission_lock:
                 if not self._enabled:
@@ -3595,6 +3603,12 @@ class EvidenceAdmissionControllerV1:
                 exact_snapshot = _copy_snapshot(snapshot)
                 if not self._turn_event_is_valid_locked(lease, state, exact_snapshot):
                     return AppendDisposition.INVALID_AUTHORITY
+                if exact_snapshot.event_kind in (
+                    EventKind.TURN_SNAPSHOT,
+                    EventKind.TURN_SETTLED,
+                ) and self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
                 if exact_snapshot.event_kind is EventKind.TURN_SETTLED:
                     terminal_taint = self._terminal_resolution_taint_locked(
                         lease,
@@ -3659,6 +3673,9 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                self._advance_revoke_finalization_if_ready()
 
     def _try_reserve_turn(
         self,
