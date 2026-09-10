@@ -377,7 +377,7 @@ def test_drain_acknowledgement_without_live_release_observation_is_refused() -> 
         197,
         197,
     )
-    with pytest.raises(ValueError, match="drain release observation differs"):
+    with pytest.raises(ValueError, match="storage release observation differs"):
         _validate_invocation(record)
 
 
@@ -1048,12 +1048,12 @@ def test_drain_checkpoint_proves_release_before_worker_exit(tmp_path, mode, reta
         return _run_storage_worker(archive, point=point, mode=mode, action="crash")
 
     if retained is not None:
-        with pytest.raises(ValueError, match="drain retained storage ownership"):
+        with pytest.raises(ValueError, match="storage ownership was not released"):
             invoke()
     else:
         record = invoke()
         assert _validate_invocation(record) == {"checkpoint": point, "vacuum_returned": False}
-        assert record.drain_released is True
+        assert record.storage_released is True
     # Both refusal and success must finish the owned worker. Its files are then
     # readable and removable; a process killed before inspection is not a pass.
     root = tmp_path / f"{point}-exit{mode}-caught-up/evidence"

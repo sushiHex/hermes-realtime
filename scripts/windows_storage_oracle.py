@@ -59,6 +59,13 @@ def _api() -> tuple[Any, Any]:
         (kernel, "FindNextStreamW", c.c_int, [pointer, pointer]),
         (kernel, "FindClose", c.c_int, [pointer]),
         (kernel, "WaitForSingleObject", word, [pointer, word]),
+        (kernel, "OpenFileById", pointer, [pointer, pointer, word, word, pointer, word]),
+        (
+            kernel,
+            "GetVolumeInformationByHandleW",
+            c.c_int,
+            [pointer, text, word, pointer, pointer, pointer, text, word],
+        ),
         (
             security,
             "GetSecurityInfo",
@@ -184,7 +191,7 @@ def _retain(path: Path, *, directory: bool, exclusive: bool = False) -> Iterator
     handle = kernel.CreateFileW(str(path), access, 0 if exclusive else 3, None, 3, 0x02200000, None)
     _require(
         handle not in (None, c.c_void_p(-1).value),
-        "drain retained storage ownership" if exclusive else "storage path could not be retained",
+        "storage ownership was not released" if exclusive else "storage path could not be retained",
     )
     try:
         info = _FileInfo()
@@ -215,26 +222,40 @@ def _retain(path: Path, *, directory: bool, exclusive: bool = False) -> Iterator
         _require(bool(kernel.CloseHandle(handle)), "storage retained file did not close")
 
 
-def audit_drain_release(root: Path, process_handle: int) -> None:
+def audit_storage_release(root: Path, process_handle: int, names: tuple[str, ...]) -> None:
     """Prove release before process exit can supply it; never mutate the store."""
     kernel, _ = _api()
+    _require(
+        type(names) is tuple
+        and 1 <= len(names) <= 13
+        and all(
+            type(name) is str and Path(name).name == name and name not in {".", ".."}
+            for name in names
+        )
+        and len(set(names)) == len(names),
+        "storage release inventory differs",
+    )
 
     def require_alive() -> None:
         _require(
             kernel.WaitForSingleObject(process_handle, 0) == 258,  # WAIT_TIMEOUT
-            "drain worker exited before live ownership observation",
+            "storage worker exited before live ownership observation",
         )
 
     require_alive()
     with ExitStack() as owned:
         parent = owned.enter_context(_retain(root, directory=True, exclusive=True))
-        for name in ("capture-v1.owner", "capture-v1.sqlite3"):
+        for name in names:
             child = owned.enter_context(_retain(root / name, directory=False, exclusive=True))
-            _require(child.volume == parent.volume, "drain storage changed volume")
+            _require(child.volume == parent.volume, "released storage changed volume")
         # Share mode zero excludes every existing read/write/delete handle,
         # including SQLite's connection and the sentinel's byte-range lease.
         # The retained worker is still blocked on its private exit handshake.
         require_alive()
+
+
+def audit_drain_release(root: Path, process_handle: int) -> None:
+    audit_storage_release(root, process_handle, ("capture-v1.owner", "capture-v1.sqlite3"))
 
 
 @contextmanager
@@ -259,3 +280,101 @@ def audit_storage(root: Path, allowed: frozenset[str]) -> Iterator[tuple[Path, .
             child = owned.enter_context(_retain(path, directory=False))
             _require(child.volume == parent.volume, "storage file changed volume")
         yield paths
+
+
+class _FileId(c.Structure):
+    # FILE_ID_DESCRIPTOR's 16-byte union, using its 64-bit NTFS FileId member.
+    _fields_ = (
+        ("size", c.c_uint32),
+        ("kind", c.c_uint32),
+        ("value", c.c_uint64),
+        ("padding", c.c_uint64),
+    )
+
+
+def _identity(info: _FileInfo) -> tuple[int, int]:
+    return info.volume, (info.index_high << 32) | info.index_low
+
+
+@contextmanager
+def audit_purge_deletions(root: Path, *, present: bool) -> Iterator[None]:
+    """Check the six pre-purge file identities, including unlinked open files.
+
+    A live marker is a positive control before and after every deletion audit.
+    NTFS reports a retired file ID as ERROR_INVALID_PARAMETER; an ID must first
+    open successfully through this exact retained volume hint. An open or
+    delete-pending object refuses acceptance regardless of its visible name.
+    """
+    kernel, _ = _api()
+    names = tuple(
+        "capture-v1.sqlite3" + suffix
+        for suffix in ("", "-journal", "-wal", "-shm", "-vacuum", "-tmp")
+    )
+    _require(type(present) is bool, "purge deletion phase differs")
+    with _retain(root, directory=True) as parent:
+        hint = kernel.CreateFileW(str(root), 0x80, 3, None, 3, 0x02200000, None)
+        _require(hint not in (None, c.c_void_p(-1).value), "purge volume hint is unavailable")
+        try:
+            hint_info = _FileInfo()
+            _require(
+                bool(kernel.GetFileInformationByHandle(hint, c.byref(hint_info)))
+                and _identity(hint_info) == _identity(parent),
+                "purge volume hint changed identity",
+            )
+            filesystem = c.create_unicode_buffer(32)
+            _require(
+                bool(
+                    kernel.GetVolumeInformationByHandleW(
+                        hint, None, 0, None, None, None, filesystem, len(filesystem)
+                    )
+                )
+                and filesystem.value == "NTFS",
+                "purge file-identity audit requires NTFS",
+            )
+
+            def exists(identity: tuple[int, int]) -> bool:
+                _require(identity[0] == parent.volume, "purge file changed volume")
+                descriptor = _FileId(c.sizeof(_FileId), 0, identity[1], 0)
+                c.set_last_error(0)
+                handle = kernel.OpenFileById(hint, c.byref(descriptor), 0x80, 7, None, 0)
+                if handle in (None, c.c_void_p(-1).value):
+                    _require(
+                        c.get_last_error() in {2, 87},
+                        "purge file identity remains pending or could not be inspected",
+                    )
+                    return False
+                try:
+                    info = _FileInfo()
+                    _require(
+                        bool(kernel.GetFileInformationByHandle(handle, c.byref(info)))
+                        and _identity(info) == identity,
+                        "purge file-identity observation differs",
+                    )
+                    return True
+                finally:
+                    _require(
+                        bool(kernel.CloseHandle(handle)), "purge identity handle did not close"
+                    )
+
+            with _retain(root / ".hermes-realtime-evidence-root-v1", directory=False) as marker:
+                control = _identity(marker)
+                _require(exists(control), "purge live file-identity control failed")
+            identities = []
+            for name in names:
+                if present:
+                    with _retain(root / name, directory=False) as info:
+                        identity = _identity(info)
+                        _require(exists(identity), "purge initial file identity is unavailable")
+                        identities.append(identity)
+                else:
+                    _require(
+                        not os.path.lexists(root / name), "repeat purge began with an artifact"
+                    )
+            _require(len(set(identities)) == len(identities), "purge file identities are repeated")
+            yield
+            _require(exists(control), "purge live file-identity control failed")
+            for identity in identities:
+                _require(not exists(identity), "storage worker retains a deleted file identity")
+            _require(exists(control), "purge live file-identity control failed")
+        finally:
+            _require(bool(kernel.CloseHandle(hint)), "purge volume hint did not close")

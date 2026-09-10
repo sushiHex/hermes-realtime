@@ -31,11 +31,12 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers five real producers,
+The `SCENARIO_REGISTRY_V1` now registers six real producers,
 [`deterministic_equivalence`](deterministic-equivalence.md),
 [`revoke_race`](revoke-race.md), [`capacity_rollover`](capacity-rollover.md),
-[`over_budget_turn`](over-budget-turn.md), and
-[`spool_crash_matrix`](spool-crash-matrix.md), with **15 governed producers still
+[`over_budget_turn`](over-budget-turn.md),
+[`spool_crash_matrix`](spool-crash-matrix.md), and
+[`full_purge_cleanup`](full-purge-cleanup.md), with **14 governed producers still
 explicitly unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
@@ -88,6 +89,13 @@ cases, including both restart clocks for rollback. Its independent observer
 checks durable history, complete seals, recovery purge, and retained filesystem
 authority. [Issue #38](https://github.com/sushiHex/hermes-realtime/issues/38) records
 exact candidate evidence and the seeded historical-fixture boundary.
+
+The [full-purge cleanup producer](full-purge-cleanup.md) uses two fresh workers to
+verify exact database-artifact deletion, preserved adjacent decoy bytes, and an
+unchanged repeated purge. Parent-side checks establish handle release before each
+worker exits. Its synthetic sidecars qualify deletion only; initialization debris,
+host orchestration, volume-full, and physical behavior remain separate.
+[Issue #41](https://github.com/sushiHex/hermes-realtime/issues/41) records its evidence.
 
 ## CI evidence and open investigation
 
