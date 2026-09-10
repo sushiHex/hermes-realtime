@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from scripts import qualify_evidence_slice_zero as core
 from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchiveV1
-from scripts.candidate_wheel import VerifiedCandidateWheelV1, _wheel_for_consumer
+from scripts.candidate_wheel import VerifiedCandidateWheelV1
 from scripts.deterministic_equivalence import _expected_close
+from scripts.packaged_scenario import (
+    PackagedScenarioEvidenceV1 as RevokeRaceEvidenceV1,
+)
+from scripts.packaged_scenario import (
+    _evidence,
+    _observe_packaged_run,
+    _ObservedRun,
+    _validate_packaged_run,
+)
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 _COUNTS = frozenset(
@@ -153,29 +159,6 @@ class ObservedRevokeRaceV1:
         raise TypeError("revocation receipts are producer-minted only")
 
 
-@dataclass(frozen=True, slots=True)
-class RevokeRaceEvidenceV1:
-    source_commit: str
-    source_tree: str
-    source_archive_sha256: str
-    wheel_sha256: str
-    observation_sha256: str
-    process_count: int
-    machine_assertions: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _ObservedRun:
-    source_commit: str
-    source_tree: str
-    source_archive_sha256: str
-    wheel_sha256: str
-    observations: bytes
-    processes: tuple[core._WindowsBoundProcessV1, ...]
-    cleanup: core._WindowsFinalizationResultV1
-    exit_code: int
-
-
 _RUNS: WeakKeyDictionary[ObservedRevokeRaceV1, _ObservedRun] = WeakKeyDictionary()
 
 
@@ -187,27 +170,16 @@ def produce_revoke_race_v1(
     livekit_executable: Path,
     livekit_sha256: str,
 ) -> ObservedRevokeRaceV1:
-    from scripts.equivalence_process import run_archived_revoke_race
-
-    package = _wheel_for_consumer(wheel, archive, identity)
-    metadata, observations, processes, cleanup, exit_code = run_archived_revoke_race(
+    record = _observe_packaged_run(
         archive,
         identity,
         wheel,
+        scenario="revoke_race",
         livekit_executable=livekit_executable,
         livekit_sha256=livekit_sha256,
     )
     receipt = object.__new__(ObservedRevokeRaceV1)
-    _RUNS[receipt] = _ObservedRun(
-        metadata.candidate_head_oid,
-        metadata.candidate_tree_oid,
-        metadata.archive_sha256,
-        package.wheel_sha256,
-        observations,
-        processes,
-        cleanup,
-        exit_code,
-    )
+    _RUNS[receipt] = record
     return receipt
 
 
@@ -216,33 +188,5 @@ def validate_revoke_race_v1(receipt: ObservedRevokeRaceV1) -> RevokeRaceEvidence
         raise TypeError("revocation receipt type is invalid")
     _require(receipt in _RUNS, "revocation receipt is unregistered")
     record = _RUNS[receipt]
-    _require(
-        type(record.exit_code) is int and record.exit_code == 0,
-        "packaged worker did not exit successfully",
-    )
-    cleanup = record.cleanup
-    _require(
-        cleanup.closed
-        and cleanup.zero_active_observed
-        and not cleanup.failures
-        and not cleanup.failed_handles,
-        "owned revocation cleanup is incomplete",
-    )
-    _require(
-        bool(record.processes)
-        and all(process.process_handle in cleanup.waited_handles for process in record.processes),
-        "retained revocation processes were not all waited",
-    )
-    rows = core.load_strict_canonical_json(record.observations, source="revocation observations")
-    _require(type(rows) is list and len(rows) == 1, "revocation scenario is incomplete")
-    assert type(rows) is list
-    _validate_observations(rows[0])
-    return RevokeRaceEvidenceV1(
-        record.source_commit,
-        record.source_tree,
-        record.source_archive_sha256,
-        record.wheel_sha256,
-        hashlib.sha256(record.observations).hexdigest(),
-        len(record.processes),
-        ("purge_verified", "purged", "revocation_request_durable"),
-    )
+    _validate_observations(_validate_packaged_run(record, scenario="revoke_race"))
+    return _evidence(record, ("purge_verified", "purged", "revocation_request_durable"))

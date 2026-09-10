@@ -231,8 +231,14 @@ def _run_archived_scenario(
     """Launch only verified archive bytes; retain all observed processes to close."""
     if os.name != "nt" or ctypes.sizeof(ctypes.c_void_p) != 8 or sys.flags.optimize:
         raise ValueError("equivalence requires nonoptimized 64-bit Windows Python")
-    _require(scenario in {"deterministic_equivalence", "revoke_race"}, "unknown archived scenario")
-    _require((scenario == "revoke_race") == (wheel is not None), "scenario package binding differs")
+    _require(
+        scenario in {"deterministic_equivalence", "revoke_race", "capacity_rollover"},
+        "unknown archived scenario",
+    )
+    _require(
+        (scenario != "deterministic_equivalence") == (wheel is not None),
+        "scenario package binding differs",
+    )
     package = None
     if wheel is not None:
         from scripts.candidate_wheel import _wheel_for_consumer
@@ -248,6 +254,8 @@ def _run_archived_scenario(
         "scripts/qualify_evidence_slice_zero.py",
         "scripts/candidate_wheel.py",
         "scripts/revoke_race.py",
+        "scripts/packaged_scenario.py",
+        "scripts/capacity_rollover.py",
     ):
         matching = [member for member in metadata.manifest if member.path == name]
         _require(
@@ -391,7 +399,7 @@ def _run_archived_scenario(
                 from scripts.deterministic_equivalence import ARMS_V1
 
                 signaling_port = 0
-                arms = ARMS_V1 if scenario == "deterministic_equivalence" else ("revoke_race",)
+                arms = ARMS_V1 if scenario == "deterministic_equivalence" else (scenario,)
                 for sequence, stage in enumerate(("ready", *arms, "done")):
                     frame = _read_frame(response_read, deadline)
                     if type(frame) is dict and frame.get("stage") == "failed":

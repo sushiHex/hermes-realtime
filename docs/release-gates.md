@@ -18,7 +18,7 @@ still inspects export-ignored paths.
 | Pure candidate wheel | Verify the Linux browser build and committed asset parity, then build the candidate wheel and hash-identified offline dependency closure. |
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
 | Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
-| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), the [packaged revocation race](revoke-race.md), and real-browser self-acceptance. |
+| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), and real-browser self-acceptance. |
 
 Before an authorized merge, require the reviewed candidate's four PR checks to
 pass. After merging, wait for all four jobs in the resulting exact-commit `main`
@@ -62,9 +62,9 @@ The `release-candidate` job runs, from that fresh candidate:
    secret; the second scans the extracted distributable candidate.
 
 The Native job also consumes the existing Pure candidate wheel artifact. Its
-revocation producer verifies the wheel digest and every runtime source blob,
-then executes the unpacked pure wheel in an owned process. This single packaged
-scenario does not establish the full installed dependency or physical matrix.
+packaged producers verify the wheel digest and every runtime source blob,
+then execute the unpacked pure wheel in an owned process. These packaged
+scenarios do not establish the full installed dependency or physical matrix.
 
 The `native-livekit` job downloads the documented Windows LiveKit 1.13.4
 binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and

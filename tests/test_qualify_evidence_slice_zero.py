@@ -369,7 +369,7 @@ def test_unavailable_registry_is_exact_closed_and_returns_nothing() -> None:
     registry = module.UNAVAILABLE_SCENARIO_REGISTRY_V1
     assert type(registry) is tuple
     assert tuple(item.scenario_id.value for item in registry) == (
-        *SCENARIO_IDS_V1[1:10], *SCENARIO_IDS_V1[11:],
+        *SCENARIO_IDS_V1[1:10], *SCENARIO_IDS_V1[12:],
     )
     assert module.validate_unavailable_scenario_registry_v1(registry) is registry
     for registration in registry:

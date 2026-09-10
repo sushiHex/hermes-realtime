@@ -206,8 +206,10 @@ def main() -> None:
         "child configuration is not closed",
     )
     _require(type(config["version"]) is int and config["version"] == 1, "unsupported child version")
-    _require(config["scenario"] in {"deterministic_equivalence", "revoke_race"},
-             "unknown archived scenario")
+    _require(
+        config["scenario"] in {"deterministic_equivalence", "revoke_race", "capacity_rollover"},
+        "unknown archived scenario",
+    )
     livekit = Path(config["livekit"])
     _require(
         hashlib.sha256(livekit.read_bytes()).hexdigest() == config["livekitSha256"],
@@ -276,11 +278,17 @@ def main() -> None:
         if config["scenario"] == "deterministic_equivalence":
             asyncio.run(_run_arms(workspace, f"ws://127.0.0.1:{port}", emit))
         else:
-            from scripts.revoke_race_worker import observe_revoke_race
+            if config["scenario"] == "revoke_race":
+                from scripts.revoke_race_worker import observe_revoke_race
 
-            observation = asyncio.run(observe_revoke_race(workspace, f"ws://127.0.0.1:{port}"))
+                observe = observe_revoke_race
+            else:
+                from scripts.capacity_rollover_worker import observe_capacity_rollover
+
+                observe = observe_capacity_rollover
+            observation = asyncio.run(observe(workspace, f"ws://127.0.0.1:{port}"))
             _verify_imports(Path(__file__).resolve().parent.parent, workspace / "wheel-package")
-            emit("revoke_race", observation)
+            emit(config["scenario"], observation)
         emit("done", {})
         _mark_exit(progress_fd, b"D")
     except BaseException as error:

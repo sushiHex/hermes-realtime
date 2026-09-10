@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 if TYPE_CHECKING:
     from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchiveV1
     from scripts.candidate_wheel import VerifiedCandidateWheelV1
+    from scripts.capacity_rollover import ObservedCapacityRolloverV1
     from scripts.deterministic_equivalence import ObservedEquivalenceV1
     from scripts.revoke_race import ObservedRevokeRaceV1
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
@@ -246,9 +247,41 @@ class RevokeRaceRegistrationV1:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CapacityRolloverRegistrationV1:
+    """The packaged capacity rollover producer at its unchanged canonical ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.CAPACITY_ROLLOVER
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not CapacityRolloverRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.CAPACITY_ROLLOVER
+        ):
+            raise TypeError("capacity rollover registration must be exact")
+
+    def produce(
+        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+        *, livekit_executable: Path, livekit_sha256: str,
+    ) -> ObservedCapacityRolloverV1:
+        if self is not SCENARIO_REGISTRY_V1[11]:
+            raise ValueError("capacity rollover producer registration is not canonical")
+        from scripts.capacity_rollover import produce_capacity_rollover_v1
+
+        return produce_capacity_rollover_v1(
+            archive, identity, wheel,
+            livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+        )
+
+
 _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
     scenario for scenario in _SCENARIO_IDS_V1
-    if scenario not in {ScenarioIdV1.DETERMINISTIC_EQUIVALENCE, ScenarioIdV1.REVOKE_RACE}
+    if scenario not in {
+        ScenarioIdV1.DETERMINISTIC_EQUIVALENCE,
+        ScenarioIdV1.REVOKE_RACE,
+        ScenarioIdV1.CAPACITY_ROLLOVER,
+    }
 )
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
     UnavailableScenarioRegistrationV1(
@@ -260,11 +293,13 @@ UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
 
 DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistrationV1()
 REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
+CAPACITY_ROLLOVER_REGISTRATION_V1 = CapacityRolloverRegistrationV1()
 
 SCENARIO_REGISTRY_V1 = (
     DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
     *UNAVAILABLE_SCENARIO_REGISTRY_V1[:9],
     REVOKE_RACE_REGISTRATION_V1,
+    CAPACITY_ROLLOVER_REGISTRATION_V1,
     *UNAVAILABLE_SCENARIO_REGISTRY_V1[9:],
 )
 
@@ -277,7 +312,7 @@ def validate_unavailable_scenario_registry_v1(
     if registry is not UNAVAILABLE_SCENARIO_REGISTRY_V1:
         raise ValueError("unavailable scenario registry is not canonical")
     if len(registry) != len(_UNAVAILABLE_SCENARIO_IDS_V1):
-        raise ValueError("unavailable scenario registry must contain exactly 18 entries")
+        raise ValueError("unavailable registry does not match its scenario IDs")
     for expected, registration in zip(_UNAVAILABLE_SCENARIO_IDS_V1, registry, strict=True):
         if type(registration) is not UnavailableScenarioRegistrationV1:
             raise TypeError("unavailable scenario registration must be exact")
