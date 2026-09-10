@@ -1,8 +1,8 @@
 """Strict qualification input/report validation and closed scenario registration.
 
 Input validation reopens direct and transitive artifacts without launching a
-process. The registered source-equivalence producer owns its separate execution
-boundary; the remaining scenarios refuse execution until their producers exist.
+process. The registered source-equivalence and packaged-revocation producers own their
+execution boundaries; other scenarios refuse execution until their producers exist.
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 if TYPE_CHECKING:
     from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchiveV1
+    from scripts.candidate_wheel import VerifiedCandidateWheelV1
     from scripts.deterministic_equivalence import ObservedEquivalenceV1
+    from scripts.revoke_race import ObservedRevokeRaceV1
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 
@@ -216,19 +218,54 @@ class DeterministicEquivalenceRegistrationV1:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RevokeRaceRegistrationV1:
+    """The packaged revocation producer at its unchanged canonical ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.REVOKE_RACE
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not RevokeRaceRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.REVOKE_RACE
+        ):
+            raise TypeError("revocation registration must be exact")
+
+    def produce(
+        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+        *, livekit_executable: Path, livekit_sha256: str,
+    ) -> ObservedRevokeRaceV1:
+        if self is not SCENARIO_REGISTRY_V1[10]:
+            raise ValueError("revocation producer registration is not canonical")
+        from scripts.revoke_race import produce_revoke_race_v1
+
+        return produce_revoke_race_v1(
+            archive, identity, wheel,
+            livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+        )
+
+
+_UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
+    scenario for scenario in _SCENARIO_IDS_V1
+    if scenario not in {ScenarioIdV1.DETERMINISTIC_EQUIVALENCE, ScenarioIdV1.REVOKE_RACE}
+)
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
     UnavailableScenarioRegistrationV1(
         scenario_id=scenario_id,
         produce=_UnavailableScenarioProducerV1(scenario_id),
     )
-    for scenario_id in _SCENARIO_IDS_V1[1:]
+    for scenario_id in _UNAVAILABLE_SCENARIO_IDS_V1
 )
 
 DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistrationV1()
+REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
 
 SCENARIO_REGISTRY_V1 = (
     DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
-    *UNAVAILABLE_SCENARIO_REGISTRY_V1,
+    *UNAVAILABLE_SCENARIO_REGISTRY_V1[:9],
+    REVOKE_RACE_REGISTRATION_V1,
+    *UNAVAILABLE_SCENARIO_REGISTRY_V1[9:],
 )
 
 
@@ -239,12 +276,12 @@ def validate_unavailable_scenario_registry_v1(
         raise TypeError("unavailable scenario registry must be an exact tuple")
     if registry is not UNAVAILABLE_SCENARIO_REGISTRY_V1:
         raise ValueError("unavailable scenario registry is not canonical")
-    if len(registry) != len(_SCENARIO_IDS_V1) - 1:
-        raise ValueError("unavailable scenario registry must contain exactly 19 entries")
-    for ordinal, registration in enumerate(registry, start=1):
+    if len(registry) != len(_UNAVAILABLE_SCENARIO_IDS_V1):
+        raise ValueError("unavailable scenario registry must contain exactly 18 entries")
+    for expected, registration in zip(_UNAVAILABLE_SCENARIO_IDS_V1, registry, strict=True):
         if type(registration) is not UnavailableScenarioRegistrationV1:
             raise TypeError("unavailable scenario registration must be exact")
-        if registration.scenario_id is not _SCENARIO_IDS_V1[ordinal]:
+        if registration.scenario_id is not expected:
             raise ValueError("unavailable scenario registry order is invalid")
         if (
             type(registration.produce) is not _UnavailableScenarioProducerV1

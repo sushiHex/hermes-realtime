@@ -368,9 +368,12 @@ def test_unavailable_registry_is_exact_closed_and_returns_nothing() -> None:
     module = _load_runner()
     registry = module.UNAVAILABLE_SCENARIO_REGISTRY_V1
     assert type(registry) is tuple
-    assert tuple(item.scenario_id.value for item in registry) == SCENARIO_IDS_V1[1:]
+    assert tuple(item.scenario_id.value for item in registry) == (
+        *SCENARIO_IDS_V1[1:10], *SCENARIO_IDS_V1[11:],
+    )
     assert module.validate_unavailable_scenario_registry_v1(registry) is registry
-    for ordinal, registration in enumerate(registry, start=1):
+    for registration in registry:
+        ordinal = SCENARIO_IDS_V1.index(registration.scenario_id.value)
         with pytest.raises(module.ProducerUnavailableV1) as raised:
             module.invoke_unavailable_scenario_v1(registration, _attempt(module, ordinal))
         assert raised.value.scenario_id is registration.scenario_id

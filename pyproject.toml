@@ -65,6 +65,7 @@ dev = [
   "cryptography>=50,<51",
   "jsonschema>=4.23,<5",
   "mypy>=1.15",
+  "packaging>=26.3,<27",
   "pytest>=8.3",
   "pytest-asyncio>=0.25",
   "ruff>=0.11",

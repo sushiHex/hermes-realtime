@@ -92,13 +92,14 @@ def _observation(
     }
 
 
-def _verify_imports(root: Path) -> None:
+def _verify_imports(root: Path, package_root: Path | None = None) -> None:
     for name, module in tuple(sys.modules.items()):
         if name.split(".")[0] not in {"hermes_realtime", "scripts", "tests"}:
             continue
         filename = getattr(module, "__file__", None)
+        owner = package_root if name.split(".")[0] == "hermes_realtime" and package_root else root
         _require(
-            type(filename) is str and Path(filename).resolve().is_relative_to(root),
+            type(filename) is str and Path(filename).resolve().is_relative_to(owner),
             "qualification imported source outside the archived candidate",
         )
 
@@ -194,6 +195,7 @@ def main() -> None:
         and set(config)
         == {
             "version",
+            "scenario",
             "nonce",
             "livekit",
             "livekitSha256",
@@ -204,6 +206,8 @@ def main() -> None:
         "child configuration is not closed",
     )
     _require(type(config["version"]) is int and config["version"] == 1, "unsupported child version")
+    _require(config["scenario"] in {"deterministic_equivalence", "revoke_race"},
+             "unknown archived scenario")
     livekit = Path(config["livekit"])
     _require(
         hashlib.sha256(livekit.read_bytes()).hexdigest() == config["livekitSha256"],
@@ -269,7 +273,14 @@ def main() -> None:
                 _require(time.monotonic() < deadline, "owned LiveKit readiness timed out")
                 time.sleep(0.05)
         emit("ready", {"port": port})
-        asyncio.run(_run_arms(workspace, f"ws://127.0.0.1:{port}", emit))
+        if config["scenario"] == "deterministic_equivalence":
+            asyncio.run(_run_arms(workspace, f"ws://127.0.0.1:{port}", emit))
+        else:
+            from scripts.revoke_race_worker import observe_revoke_race
+
+            observation = asyncio.run(observe_revoke_race(workspace, f"ws://127.0.0.1:{port}"))
+            _verify_imports(Path(__file__).resolve().parent.parent, workspace / "wheel-package")
+            emit("revoke_race", observation)
         emit("done", {})
         _mark_exit(progress_fd, b"D")
     except BaseException as error:

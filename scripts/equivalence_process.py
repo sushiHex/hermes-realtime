@@ -14,7 +14,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from scripts import candidate_source_archive_oracle as archives
 from scripts import qualify_evidence_slice_zero as core
@@ -22,7 +22,13 @@ from scripts.candidate_e2e_fast_track import _materialize_archive
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 _MAX_FRAME = 256 * 1024
-_SCENARIO = "deterministic_equivalence"
+if TYPE_CHECKING:
+    from scripts.candidate_wheel import VerifiedCandidateWheelV1
+
+_ArchivedResult = tuple[
+    archives.CandidateSourceArchiveMetadataV1, bytes,
+    tuple[core._WindowsBoundProcessV1, ...], core._WindowsFinalizationResultV1, int,
+]
 
 
 def _require(condition: bool, message: str) -> None:
@@ -186,19 +192,52 @@ def _executable(path: Path, digest: str) -> Path:
 def run_archived_equivalence(
     archive: archives.VerifiedCandidateSourceArchiveV1,
     identity: CandidateIdentityV1,
-    *,
-    livekit_executable: Path,
-    livekit_sha256: str,
-) -> tuple[
-    archives.CandidateSourceArchiveMetadataV1,
-    bytes,
-    tuple[core._WindowsBoundProcessV1, ...],
-    core._WindowsFinalizationResultV1,
-    int,
-]:
+    *, livekit_executable: Path, livekit_sha256: str,
+) -> _ArchivedResult:
+    return _run_archived_scenario(
+        archive, identity, scenario="deterministic_equivalence", wheel=None,
+        livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+    )
+
+
+def run_archived_revoke_race(
+    archive: archives.VerifiedCandidateSourceArchiveV1,
+    identity: CandidateIdentityV1,
+    wheel: VerifiedCandidateWheelV1,
+    *, livekit_executable: Path, livekit_sha256: str,
+) -> _ArchivedResult:
+    return _run_archived_scenario(
+        archive, identity, scenario="revoke_race", wheel=wheel,
+        livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+    )
+
+
+def _verify_wheel_tree(root: Path, members: dict[str, bytes]) -> None:
+    files = {path.relative_to(root).as_posix(): path for path in root.rglob("*") if path.is_file()}
+    _require(set(files) == set(members), "materialized wheel member set changed")
+    for name, path in files.items():
+        _require(not path.is_symlink() and path.resolve().is_relative_to(root)
+                 and not (getattr(path.lstat(), "st_file_attributes", 0) & 0x400),
+                 "materialized wheel contains a reparse point")
+        _require(path.read_bytes() == members[name], "materialized wheel bytes changed")
+
+
+def _run_archived_scenario(
+    archive: archives.VerifiedCandidateSourceArchiveV1,
+    identity: CandidateIdentityV1,
+    *, scenario: str, wheel: VerifiedCandidateWheelV1 | None,
+    livekit_executable: Path, livekit_sha256: str,
+) -> _ArchivedResult:
     """Launch only verified archive bytes; retain all observed processes to close."""
     if os.name != "nt" or ctypes.sizeof(ctypes.c_void_p) != 8 or sys.flags.optimize:
         raise ValueError("equivalence requires nonoptimized 64-bit Windows Python")
+    _require(scenario in {"deterministic_equivalence", "revoke_race"}, "unknown archived scenario")
+    _require((scenario == "revoke_race") == (wheel is not None), "scenario package binding differs")
+    package = None
+    if wheel is not None:
+        from scripts.candidate_wheel import _wheel_for_consumer
+
+        package = _wheel_for_consumer(wheel, archive, identity)
     metadata = archives.verified_candidate_source_archive_metadata(archive)
     payload = archives._archive_bytes_for_consumer(archive, identity)
     # The trusted parent must be the same runner implementation as the candidate.
@@ -207,6 +246,8 @@ def run_archived_equivalence(
         "scripts/equivalence_process.py",
         "scripts/deterministic_equivalence.py",
         "scripts/qualify_evidence_slice_zero.py",
+        "scripts/candidate_wheel.py",
+        "scripts/revoke_race.py",
     ):
         matching = [member for member in metadata.manifest if member.path == name]
         _require(
@@ -236,6 +277,15 @@ def run_archived_equivalence(
     try:
         root = _materialize_archive(workspace, payload, metadata)
         _verify_tree(root, metadata)
+        package_root = root / "src"
+        if package is not None:
+            package_root = workspace / "wheel-package"
+            package_root.mkdir()
+            for name, raw in package.members.items():
+                path = package_root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw)
+            _verify_wheel_tree(package_root, package.members)
         raw_runner = kernel.query_process_identity(runner_handle)
         runner = core._WindowsRunnerIdentityV1(raw_runner.pid, raw_runner.creation_filetime)
         with ExitStack() as pipes:
@@ -272,7 +322,7 @@ def run_archived_equivalence(
                 "-B",
                 "-c",
                 bootstrap,
-                str(root / "src"),
+                str(package_root),
                 str(root),
                 *(str(handle) for handle in handles),
             )
@@ -282,7 +332,7 @@ def run_archived_equivalence(
                 if name in os.environ
             } | {"TEMP": str(workspace), "TMP": str(workspace), "PATH": str(base_python.parent)}
             spec = core._WindowsScenarioSpecV1(
-                _SCENARIO,
+                scenario,
                 command,
                 tuple(sorted(environment.items(), key=lambda item: (item[0].casefold(), item[0]))),
                 str(workspace),
@@ -329,6 +379,7 @@ def run_archived_equivalence(
                     request_write,
                     {
                         "version": 1,
+                        "scenario": scenario,
                         "nonce": nonce,
                         "livekit": str(livekit),
                         "livekitSha256": livekit_sha256,
@@ -340,7 +391,8 @@ def run_archived_equivalence(
                 from scripts.deterministic_equivalence import ARMS_V1
 
                 signaling_port = 0
-                for sequence, stage in enumerate(("ready", *ARMS_V1, "done")):
+                arms = ARMS_V1 if scenario == "deterministic_equivalence" else ("revoke_race",)
+                for sequence, stage in enumerate(("ready", *arms, "done")):
                     frame = _read_frame(response_read, deadline)
                     if type(frame) is dict and frame.get("stage") == "failed":
                         failure = frame.get("observation")
@@ -425,7 +477,7 @@ def run_archived_equivalence(
                 # particular, a complete exchange cannot accept an abnormal exit.
                 print("[archived-worker] " + json.dumps({
                     "version": 1,
-                    "scenario": _SCENARIO,
+                    "scenario": scenario,
                     "exchange_completed": exchange_completed,
                     "exit_code": observed_exit_code,
                     "child_events": _read_worker_exit_events(progress_read),
@@ -434,6 +486,8 @@ def run_archived_equivalence(
             assert finalization is not None
             finalized = finalization.closed and finalization.zero_active_observed
         _verify_tree(root, metadata)
+        if package is not None:
+            _verify_wheel_tree(package_root, package.members)
         _executable(livekit, livekit_sha256)
         _executable(python, python_hash)
         _executable(base_python, base_hash)
