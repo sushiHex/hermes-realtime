@@ -64,7 +64,11 @@ identities. The independent parent requires agreement between roles, agreement
 with the create generation, and unchanged observations across consent. Missing,
 malformed, contradictory, or changed participant facts block acceptance. This
 establishes the observed live activation; it does not qualify reconnect or every
-stale-binding rejection.
+stale-binding rejection. The existing writer factory also reads the actual host
+consent callback frame already invoking it, within a bounded call chain. Its
+participant, generation, request, and consent commitments must match both live
+reads and the accepted HTTP request in the independent parent. The observer
+retains no frame and replaces no callback or consent decision.
 The reader also requires one active epoch and no
 conflicts or pending/completed erasure authority in this fresh scenario.
 

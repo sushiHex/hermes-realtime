@@ -152,6 +152,69 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     }
 
 
+def _consent_callback_observation(runtime: Any, key: bytes) -> dict[str, str]:
+    """Read the actual consent call already invoking the owned writer factory."""
+    from inspect import currentframe
+
+    from hermes_realtime.client.session import BrowserBindingSnapshot
+    from hermes_realtime.evidence.models import EvidenceConsentRequestV1
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+    from hermes_realtime.host_launcher import _reserve_host_evidence_consent
+
+    frame = currentframe()
+    try:
+        for _ in range(4):
+            frame = None if frame is None else frame.f_back
+            if frame is not None and frame.f_code is _reserve_host_evidence_consent.__code__:
+                break
+        else:
+            raise ValueError("writer factory is outside the actual consent callback")
+        assert frame is not None
+        _require(
+            type(runtime) is HostEvidenceRuntimeV1 and frame.f_locals["runtime"] is runtime,
+            "consent callback differs from the actual writer runtime",
+        )
+        binding, request = frame.f_locals["binding"], frame.f_locals["request"]
+        _require(
+            type(binding) is BrowserBindingSnapshot
+            and type(binding.binding_generation) is int
+            and 1 <= binding.binding_generation < 2**53
+            and type(binding.participant_identity) is str
+            and bool(binding.participant_identity)
+            and type(request) is EvidenceConsentRequestV1,
+            "actual consent callback authority is invalid",
+        )
+        fields = {
+            "accepted": request.accepted,
+            "consentVersion": request.consent_version,
+            "disclosureDigest": request.disclosure_digest,
+            "retentionHours": request.retention_hours,
+            "sequence": request.sequence,
+            "sources": {"microphone": request.sources.microphone, "typed": request.sources.typed},
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "generation": _commit(key, "browser_generation", str(binding.binding_generation)),
+            "participant": _commit(key, "browser_participant", binding.participant_identity),
+            "request": _request_commitment(key, request.sequence, fingerprint),
+            "consent": _consent_commitment(
+                key,
+                {
+                    "consent_version": request.consent_version,
+                    "disclosure_digest": request.disclosure_digest,
+                    "retention_hours": request.retention_hours,
+                    "microphone_accepted": request.sources.microphone,
+                    "typed_accepted": request.sources.typed,
+                },
+            ),
+        }
+    finally:
+        # Never retain frames, raw request values, or participant identifiers.
+        del frame
+
+
 async def _live_browser_binding(launcher: Any, key: bytes) -> dict[str, str]:
     from inspect import getclosurevars
 
@@ -1004,7 +1067,11 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     reservations: list[tuple[Any, Any]] = []
     thread_owners: list[_ObserveThreadOwners] = []
 
+    consent_callbacks: list[dict[str, str]] = []
+
     def writer_factory(runtime: Any) -> Any:
+        _require(not consent_callbacks, "consent callback was invoked more than once")
+        consent_callbacks.append(_consent_callback_observation(runtime, key))
         reserve = runtime.reserve_browser_consent
 
         def observe_reservation(**arguments: Any) -> Any:
@@ -1177,6 +1244,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             "consent": accepted_consent["consent"],
             "request": accepted_consent["request"],
             "binding": live_bindings,
+            "consent_callback": consent_callbacks[0],
             "user": users,
             "generated": [
                 _commit(key, "generated", item.generated_text)

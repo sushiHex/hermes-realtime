@@ -111,6 +111,12 @@ def _observations() -> dict:
         | {
             "consent": "f" * 64,
             "request": "3" * 64,
+            "consent_callback": {
+                "generation": "5" * 64,
+                "participant": "6" * 64,
+                "request": "3" * 64,
+                "consent": "f" * 64,
+            },
             "binding": [
                 {
                     "browser_generation": "5" * 64,
@@ -1678,3 +1684,85 @@ def test_parent_requires_complete_stable_participant_observations(mutation: str)
         binding["browser_participant"] = binding["worker_participant"] = "d" * 64
     with pytest.raises(ValueError):
         _validate_observations(row)
+
+
+def test_parent_requires_the_participant_at_the_accepted_consent_callback() -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    row["source"].pop("consent_callback", None)
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("field", ["generation", "participant", "request", "consent"])
+def test_parent_binds_each_accepted_consent_callback_fact(field: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    row["source"]["consent_callback"][field] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("participant", ["synthetic participant", "different participant"])
+@pytest.mark.parametrize("foreign_runtime", [False, True])
+def test_consent_observer_reads_the_actual_host_callback(
+    participant: str, foreign_runtime: bool
+) -> None:
+    from hermes_realtime.client.session import BrowserBindingSnapshot
+    from hermes_realtime.evidence.models import EvidenceConsentRequestV1, EvidenceConsentSourcesV1
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+    from hermes_realtime.host_launcher import (
+        _HostEvidenceConsentDependenciesV1,
+        _reserve_host_evidence_consent,
+    )
+    from scripts.capacity_rollover_worker import _commit, _consent_callback_observation
+
+    runtime = object.__new__(HostEvidenceRuntimeV1)
+    observed = []
+
+    class Observed(Exception):
+        pass
+
+    def factory(actual):
+        observed.append(
+            _consent_callback_observation(
+                object.__new__(HostEvidenceRuntimeV1) if foreign_runtime else actual,
+                b"synthetic key",
+            )
+        )
+        raise Observed
+
+    request = EvidenceConsentRequestV1(
+        sequence=1,
+        accepted=True,
+        consent_version="realtime-evidence-consent-v1",
+        disclosure_digest="d" * 64,
+        retention_hours=24,
+        sources=EvidenceConsentSourcesV1(microphone=True, typed=True),
+    )
+    with pytest.raises(ValueError if foreign_runtime else Observed):
+        _reserve_host_evidence_consent(
+            runtime=runtime,
+            projection=None,
+            live_generation=lambda: 42,
+            binding=BrowserBindingSnapshot(participant_identity=participant, binding_generation=42),
+            request=request,
+            dependencies=_HostEvidenceConsentDependenciesV1(writer_transport_factory=factory),
+        )
+    if foreign_runtime:
+        assert observed == []
+    else:
+        assert observed[0]["participant"] == _commit(
+            b"synthetic key", "browser_participant", participant
+        )
+        assert observed[0]["generation"] == _commit(b"synthetic key", "browser_generation", "42")
+
+
+def test_consent_observer_refuses_a_call_outside_the_real_host_boundary() -> None:
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+    from scripts.capacity_rollover_worker import _consent_callback_observation
+
+    with pytest.raises(ValueError):
+        _consent_callback_observation(object.__new__(HostEvidenceRuntimeV1), b"synthetic key")

@@ -108,6 +108,19 @@ def _validate_live_bindings(bindings: Any, generation: str) -> None:
     _require(bindings[0] == bindings[1], "live binding changed across consent")
 
 
+def _validate_consent_callback(callback: Any, source: Any, generation: str) -> None:
+    _keys(callback, {"generation", "participant", "request", "consent"})
+    for value in callback.values():
+        _digest(value)
+    _require(
+        callback["generation"] == generation
+        and callback["participant"] == source["binding"][0]["browser_participant"]
+        and callback["request"] == source["request"]
+        and callback["consent"] == source["consent"],
+        "accepted consent callback differs from the live binding or dispatched request",
+    )
+
+
 def _validate_observations(row: Any) -> None:
     _keys(
         row,
@@ -373,8 +386,11 @@ def _validate_observations(row: Any) -> None:
     ):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
-    _keys(row["source"], _CONTENT | {"consent", "request", "binding"})
+    _keys(row["source"], _CONTENT | {"consent", "request", "binding", "consent_callback"})
     _validate_live_bindings(row["source"]["binding"], commands["binding"])
+    _validate_consent_callback(
+        row["source"]["consent_callback"], row["source"], commands["binding"]
+    )
     _digest(row["source"]["request"])
     _require(
         commands["request"] == row["source"]["request"],
