@@ -594,6 +594,15 @@ class _ObserveThreadOwners:
         }
 
 
+def _data_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA data_version").fetchone()
+    _require(
+        row is not None and len(row) == 1 and type(row[0]) is int and row[0] >= 1,
+        "rollover connection data version is invalid",
+    )
+    return cast(int, row[0])
+
+
 def _statement_kind(statement: str) -> str:
     remaining = statement.lstrip()
     while remaining.startswith(("--", "/*")):
@@ -675,7 +684,7 @@ class _ObserveRolloverSpool:
         self.snapshots: list[dict[str, Any]] = []
         self.transactions: list[str] = []
         self.transaction_writes: list[str] = []
-        self.connections: dict[str, int] = {}
+        self.connections: dict[str, Any] = {}
         self.failed = False
         self.durable_terminals: list[str] = []
         self.third_settled = Event()
@@ -750,6 +759,9 @@ class _ObserveRolloverSpool:
             set(self.commands) == {"create", "create_dto", "request", "binding"},
             "dispatched create command is absent",
         )
+        connection = self.delegate.connection
+        _require(type(connection) is sqlite3.Connection, "rollover connection is not exact")
+        version_before = _data_version(connection)
         self.commands["rollover_dto"] = _command_commitment(self.key, command)
         self.commands["rollover"] = _control_commitments(self.key, command.snapshots)
         self.commands["successor_expiry"] = _commit(
@@ -763,7 +775,7 @@ class _ObserveRolloverSpool:
             # retain only control names and write verbs, never SQL or values.
             try:
                 kind = _statement_kind(statement)
-                active = self.delegate.connection.in_transaction
+                active = connection.in_transaction
                 if kind == "SELECT" or statement in {"PRAGMA page_count", "PRAGMA max_page_count"}:
                     return
                 if kind in {"INSERT", "UPDATE", "DELETE"}:
@@ -797,14 +809,13 @@ class _ObserveRolloverSpool:
                 self.failed = True
 
         with connection_audit:
-            self.delegate.connection.set_trace_callback(trace)
+            connection.set_trace_callback(trace)
             try:
                 result = self.delegate.rollover_session(command)
             finally:
-                self.delegate.connection.set_trace_callback(None)
-        self.connections = connection_audit.observation()
+                connection.set_trace_callback(None)
         _require(
-            not self.failed and not self.delegate.connection.in_transaction,
+            not self.failed and not connection.in_transaction,
             "rollover transaction observation failed",
         )
         _require(
@@ -814,6 +825,15 @@ class _ObserveRolloverSpool:
         )
         committed = _snapshot(self.database, self.key)
         self.snapshots.append(committed)
+        version_after = _data_version(connection)
+        _require(
+            self.delegate.connection is connection and version_before == version_after,
+            "rollover connection observation found an external commit or replacement",
+        )
+        self.connections = {
+            **connection_audit.observation(),
+            "data_version": [version_before, version_after],
+        }
         predecessor, successor = committed["sessions"]
         _require(
             predecessor["controls"] == self.commands["create"] + self.commands["rollover"][:2]

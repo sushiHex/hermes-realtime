@@ -98,7 +98,7 @@ def _observations() -> dict:
         snapshots=[before, copy.deepcopy(before), committed, continued],
         transactions=["BEGIN IMMEDIATE", "COMMIT"],
         transaction_writes=["INSERT", "UPDATE"],
-        connections={"observer_reads": 1, "unexpected": 0},
+        connections={"observer_reads": 1, "unexpected": 0, "data_version": [1, 1]},
         durable_terminals=["committed"] * 3,
         rollover=[
             {
@@ -1435,6 +1435,7 @@ def test_owner_binding_requires_the_actual_production_dispatcher(substitution: s
         "split",
         "second_connection",
         "second_thread",
+        "retained_connection",
     ],
 )
 def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
@@ -1453,6 +1454,7 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
     original = spool.rollover_session
     original_chain = spool._write_chain
     split_committed = False
+    retained_connection = None
 
     def split_chain(*arguments, **keywords):
         nonlocal split_committed
@@ -1464,6 +1466,19 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
 
     def autocommit():
         assert not spool.connection.in_transaction
+        if outside == "retained_connection":
+            assert retained_connection is not None
+            previous = retained_connection.execute(
+                "SELECT clock_high_water_utc FROM producer_installation"
+            ).fetchone()[0]
+            retained_connection.execute(
+                "UPDATE producer_installation SET clock_high_water_utc=?",
+                ("2099-01-01T00:00:00.000000Z",),
+            )
+            retained_connection.execute(
+                "UPDATE producer_installation SET clock_high_water_utc=?", (previous,)
+            )
+            return
         if outside in {"second_connection", "second_thread"}:
             import sqlite3
             from threading import Thread
@@ -1496,12 +1511,23 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
         if outside == "before":
             autocommit()
         result = original(command)
-        if outside in {"after", "commented", "pragma", "second_connection", "second_thread"}:
+        if outside in {
+            "after",
+            "commented",
+            "pragma",
+            "second_connection",
+            "second_thread",
+            "retained_connection",
+        }:
             autocommit()
         return result
 
     try:
         assert observer.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
+        if outside == "retained_connection":
+            import sqlite3
+
+            retained_connection = sqlite3.connect(spool.database, isolation_level=None)
         spool.rollover_session = split
         if outside == "split":
             spool._write_chain = split_chain
@@ -1511,6 +1537,8 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
             with pytest.raises(ValueError, match="(transaction|connection) observation"):
                 observer.rollover_session(make_rollover_command())
     finally:
+        if retained_connection is not None:
+            retained_connection.close()
         spool.close()
 
 
@@ -1573,7 +1601,9 @@ def test_parent_requires_live_generation_and_bounded_transaction_writes(mutation
         _validate_observations(row)
 
 
-@pytest.mark.parametrize("mutation", ["extra", "unseen", "no_reader", "bool"])
+@pytest.mark.parametrize(
+    "mutation", ["extra", "unseen", "no_reader", "bool", "external_commit", "bool_version"]
+)
 def test_parent_requires_closed_connection_audit(mutation: str) -> None:
     from scripts.capacity_rollover import _validate_observations
 
@@ -1582,6 +1612,10 @@ def test_parent_requires_closed_connection_audit(mutation: str) -> None:
         row["connections"]["uri"] = "synthetic"
     elif mutation == "unseen":
         row["connections"]["unexpected"] = 1
+    elif mutation == "external_commit":
+        row["connections"]["data_version"] = [1, 2]
+    elif mutation == "bool_version":
+        row["connections"]["data_version"] = [True, True]
     elif mutation == "no_reader":
         row["connections"]["observer_reads"] = 0
     else:

@@ -112,11 +112,19 @@ def _validate_observations(row: Any) -> None:
     )
     _require(row["arm"] == "capacity_rollover", "rollover scenario differs")
     _validate_thread_owners(row["threads"])
-    _keys(row["connections"], {"observer_reads", "unexpected"})
+    _keys(row["connections"], {"observer_reads", "unexpected", "data_version"})
+    connections = row["connections"]
+    versions = connections["data_version"]
     _require(
-        all(type(value) is int for value in row["connections"].values())
-        and row["connections"] == {"observer_reads": 1, "unexpected": 0},
-        "rollover opened an unobserved connection or missed its reader",
+        type(connections["observer_reads"]) is int
+        and connections["observer_reads"] == 1
+        and type(connections["unexpected"]) is int
+        and connections["unexpected"] == 0
+        and type(versions) is list
+        and len(versions) == 2
+        and all(type(value) is int and value >= 1 for value in versions)
+        and versions[0] == versions[1],
+        "rollover opened an unobserved connection, saw an external commit, or missed its reader",
     )
     _require(
         row["transactions"] == ["BEGIN IMMEDIATE", "COMMIT"],

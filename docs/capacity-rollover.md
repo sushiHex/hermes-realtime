@@ -23,7 +23,12 @@ quota PRAGMAs remain allowed. A scoped Python audit observes connection opens
 throughout the real rollover call, including aliases and other threads. Only
 the observer's one read-only callback connection is allowed; any other open
 blocks acceptance. The audit does not change SQLite execution or retain paths
-or handles. Callback failure
+or handles. The observer also retains the exact writer connection and compares
+its [SQLite data version](https://www.sqlite.org/pragma.html#pragma_data_version)
+before the first snapshot and after durable rollover readback. That value
+changes for commits by other connections, including ones opened earlier or in
+another process, but stays unchanged for this connection's own commit. An
+external commit or connection replacement blocks acceptance. Callback failure
 blocks acceptance even though SQLite itself suppresses callback exceptions.
 
 After that single transaction returns, another read must see the sealed
