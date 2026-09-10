@@ -1,14 +1,30 @@
 # Release gates
 
-A release candidate is accepted only when the tracked **Release Gates** workflow
-passes both Windows jobs. The gate never packages the active checkout: it uses
-`git archive HEAD` to create a temporary candidate, so ignored `dist/`,
-`web/tmp/`, virtual environments, old archives, local tool downloads, and the
-tracked `.hermes/` planning metadata excluded by `.gitattributes` cannot enter
-a fresh wheel or source distribution. The pre-archive committed-blob secret
-scan still inspects export-ignored paths.
+Automated candidate acceptance requires all four jobs in the tracked
+[Release Gates workflow](../.github/workflows/release-gates.yml). These checks
+qualify their exercised scope; human-assisted and installed-service claims retain
+the separate gates documented below. See [Implementation status](implementation-status.md)
+for the reviewed candidate and remaining qualification.
+
+The Windows release gates build from a verified committed source archive, not
+dirty checkout bytes. Ignored build output, virtual environments, and local tool
+downloads cannot enter that archive. The pre-archive committed-blob secret scan
+still inspects export-ignored paths.
 
 ## Required automated checks
+
+| Job | Responsibility |
+| --- | --- |
+| Pure candidate wheel | Build the candidate wheel and hash-identified offline dependency closure. |
+| Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
+| Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
+| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
+
+Before an authorized merge, require the reviewed candidate's four PR checks to
+pass. After merging, wait for all four jobs in the resulting exact-commit `main`
+push run to complete on attempt 1 before advancing to the next candidate. Preserve
+any failed run and investigate it; an earlier green PR run does not replace the
+main push result. Head or base changes require requalification of the new candidate.
 
 The `release-candidate` job runs, from that fresh candidate:
 
@@ -38,6 +54,43 @@ binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and
 then runs the native local LiveKit, browser LiveKit, and local launcher tests.
 `InsecureKeyLengthWarning` is promoted to an error. This is a required release job rather than an
 ambient local prerequisite.
+
+## Publishing the repository
+
+Publishing experimental alpha source does not establish desktop qualification or
+production readiness. Use this sequence when publishing a private repository:
+
+1. Confirm the target repository and record the reviewed main commit and tree.
+   Complete the [required automated checks](#required-automated-checks), including
+   the resulting main push run, before making the publication decision.
+2. Review every surface that will become public: Git history and refs, issue/PR
+   text and retained edit history, Discussions, workflow logs, and downloadable
+   artifacts. Record coverage and unavailable material. Apply the
+   [public-repository boundary](../CONTRIBUTING.md#public-repository-boundary) to
+   each surface; candidate-archive scans alone do not cover GitHub discussions or
+   historical content. Preserve the evidence while removing private details from
+   both current text and affected revision diffs. GitHub documents
+   [how to remove sensitive revision diffs](https://docs.github.com/en/communities/moderating-comments-and-conversations/tracking-changes-in-a-comment).
+3. Check licenses, third-party notices, artifact provenance, and dependency
+   advisories for the candidate. Ensure the README and
+   [implementation status](implementation-status.md) distinguish implemented
+   behavior, default activation, and completed qualification.
+4. Obtain release-owner authorization for the visibility change. During the
+   transition, enable and verify
+   [private vulnerability reporting](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/configure-vulnerability-reporting/configure-for-a-repository)
+   so the route in [SECURITY.md](../SECURITY.md) works. Read back main protection,
+   workflow token permissions, outside-contributor workflow approval settings,
+   and available secret-scanning/push-protection settings; inspect fresh alerts.
+5. Before announcing the public alpha, verify the published documentation,
+   sanitized history, and security-reporting route from an outside-reader
+   perspective. Record the published commit, CI run/attempt, findings resolved,
+   and remaining qualification limits in the release decision.
+
+GitHub's [visibility documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility)
+describes the transition's effects, including public access to Actions history
+and logs. GitHub's [secret-scanning documentation](https://docs.github.com/en/code-security/concepts/secret-security/secret-scanning)
+describes automatic public-repository scanning. Keep sensitive review evidence
+outside the public repository; publish only sanitized findings and decisions.
 
 ## Conversational style characterization
 
