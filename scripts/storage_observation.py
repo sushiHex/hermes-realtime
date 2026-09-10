@@ -11,6 +11,7 @@ from typing import Any
 
 from scripts.equivalence_process import _require
 from scripts.evidence_protocol_oracle import canonical_json_bytes, hre1_record_hash
+from scripts.spool_crash_oracle import validate_spool_snapshot_v1
 
 
 def _digest(raw: bytes) -> str:
@@ -18,8 +19,6 @@ def _digest(raw: bytes) -> str:
 
 
 def _database_state(database: Path) -> dict[str, Any]:
-    from hermes_realtime.evidence.models import parse_evidence_snapshot_json
-
     # SQLite may roll back its own hot rollback journal on this cold open. No
     # application SQL writes or production recovery methods run in this observer.
     with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as connection:
@@ -106,19 +105,17 @@ def _database_state(database: Path) -> dict[str, Any]:
                     == digest,
                     "storage event chain differs",
                 )
-                parse_evidence_snapshot_json(
-                    canonical_json_bytes(
-                        {
-                            "schema_version": 1,
-                            "installation_id": installations[0][0],
-                            "producer_instance_id": producer,
-                            "logical_session_id": sid,
-                            "event_id": eid,
-                            "event_sequence": sequence,
-                            "event_kind": kind,
-                            "payload": parsed,
-                        }
-                    )
+                validate_spool_snapshot_v1(
+                    {
+                        "schema_version": 1,
+                        "installation_id": installations[0][0],
+                        "producer_instance_id": producer,
+                        "logical_session_id": sid,
+                        "event_id": eid,
+                        "event_sequence": sequence,
+                        "event_kind": kind,
+                        "payload": parsed,
+                    }
                 )
                 previous = digest
                 payloads.append(parsed)

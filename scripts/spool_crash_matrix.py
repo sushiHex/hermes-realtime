@@ -237,10 +237,14 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             before["database"]["purge_required"] == int(index == 31),
             "rollback durable latch differs",
         )
+        if index <= 30:
+            _require(
+                before["database"]["logical_digest"] == row["baseline"]["databaseSha256"],
+                "pre-latch rollback changed the original database",
+            )
         if index == 28:
             _require(
-                before["database"]["logical_digest"] == row["baseline"]["databaseSha256"]
-                and before["files"][_SENTINEL] == row["baseline"]["sentinelSha256"],
+                before["files"][_SENTINEL] == row["baseline"]["sentinelSha256"],
                 "pre-sentinel rollback changed the original durable authority",
             )
     else:
@@ -353,8 +357,10 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             )
     else:
         _require(
-            not set(_DATABASE_NAMES) & after["files"].keys(),
-            "absent recovery retained database artifacts",
+            set(after["files"]) == ({_MARKER} if index >= 13 else set())
+            and after["database"] == {"schema": False}
+            and after["sentinel"] == "no_final_sentinel",
+            "absent recovery retained initialization artifacts",
         )
 
 

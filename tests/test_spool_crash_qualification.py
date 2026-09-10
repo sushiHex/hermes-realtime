@@ -42,6 +42,53 @@ def test_registration_and_receipts_reject_reconstruction() -> None:
         validate_spool_crash_matrix_v1(object.__new__(ObservedSpoolCrashMatrixV1))
 
 
+@pytest.mark.parametrize("event_index", range(7))
+def test_fixture_oracle_requires_every_source_field_and_exact_type(event_index) -> None:
+    import copy
+
+    from hermes_realtime.evidence.models import evidence_snapshot_to_primitive
+    from scripts.spool_crash_oracle import validate_spool_snapshot_v1
+    from tests.evidence import spool_crash_worker as driver
+
+    normal = driver._make_create_epoch()
+    rollback = driver._make_create_epoch(
+        epoch_id="20000000-0000-4000-8000-000000000003",
+        session_id="20000000-0000-4000-8000-000000000004",
+        binding_id="20000000-0000-4000-8000-000000000006",
+        event_offset=100,
+    )
+    snapshot = evidence_snapshot_to_primitive(
+        (
+            normal.session_opened,
+            normal.binding_opened,
+            driver._ordinary_record().snapshot,
+            driver._binding_close().snapshot,
+            driver._seal_command().snapshot,
+            rollback.session_opened,
+            rollback.binding_opened,
+        )[event_index]
+    )
+    validate_spool_snapshot_v1(snapshot)
+    for layer in (None, "payload"):
+        original = snapshot if layer is None else snapshot[layer]
+        for field in original:
+            for mutation in ("remove", "type"):
+                changed = copy.deepcopy(snapshot)
+                target = changed if layer is None else changed[layer]
+                if mutation == "remove":
+                    del target[field]
+                else:
+                    value = target[field]
+                    target[field] = int(value) if type(value) is bool else True
+                with pytest.raises(ValueError, match="pinned synthetic source"):
+                    validate_spool_snapshot_v1(changed)
+        changed = copy.deepcopy(snapshot)
+        target = changed if layer is None else changed[layer]
+        target["unknown"] = None
+        with pytest.raises(ValueError, match="pinned synthetic source"):
+            validate_spool_snapshot_v1(changed)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
 @pytest.mark.parametrize(
     "mutation",
@@ -74,13 +121,14 @@ def test_independent_reader_revalidates_real_committed_seals(
         spool.close()
     database = tmp_path / "evidence/capture-v1.sqlite3"
     if mutation == "candidate_oracle":
-        from hermes_realtime.evidence import sqlite_spool
+        from hermes_realtime.evidence import models, sqlite_spool
 
         def refused(*args, **kwargs):
             raise AssertionError("the candidate cannot supply its own hash oracle")
 
         monkeypatch.setattr(sqlite_spool, "canonical_json_bytes", refused)
         monkeypatch.setattr(sqlite_spool, "hre1_record_hash", refused)
+        monkeypatch.setattr(models, "parse_evidence_snapshot_json", refused)
     if mutation in {None, "candidate_oracle"}:
         observed = _database_state(database)
         assert observed["events"] == 4
@@ -276,5 +324,57 @@ def test_database_create_checkpoint_requires_the_empty_file_digest(point) -> Non
     row["before"]["files"]["capture-v1.sqlite3"] = hashlib.sha256(b"").hexdigest()
     _validate_recovery(point, "caught-up", row)
     row["before"]["files"]["capture-v1.sqlite3"] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_recovery(point, "caught-up", row)
+
+
+@pytest.mark.parametrize("point", ["after_rollback_sentinel_fsync", "before_rollback_db_latch"])
+def test_pre_latch_rollback_requires_the_original_logical_database(point) -> None:
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    row = _purge_observation()
+    for state in (row["before"], row["after"]):
+        state["files"]["rollback-decoy.bin"] = state["files"].pop("purge-decoy.bin")
+    row["before"]["files"]["capture-v1.sqlite3"] = "c" * 64
+    row["before"]["sentinel"] = "clock_rollback_purge_pending"
+    row["before"]["database"] = {
+        "schema": True,
+        "events": 6,
+        "sessions": ["open", "sealed"],
+        "epochs": ["active", "closed"],
+        "seals": ["d" * 64],
+        "purge_required": 0,
+        "tombstones": [],
+        "erasures": [],
+        "logical_digest": "e" * 64,
+    }
+    row["baseline"] = {"databaseSha256": "e" * 64, "sentinelSha256": "f" * 64}
+    _validate_recovery(point, "caught-up", row)
+    row["before"]["database"]["logical_digest"] = "a" * 64
+    with pytest.raises(ValueError):
+        _validate_recovery(point, "caught-up", row)
+
+
+@pytest.mark.parametrize("owner", ["root_marker", "sentinel"])
+@pytest.mark.parametrize("stage", ["full_write", "flush"])
+def test_completed_initialization_removes_its_temporary(owner, stage) -> None:
+    from copy import deepcopy
+
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    name = ".hermes-realtime-evidence-root-v1" if owner == "root_marker" else "capture-v1.owner"
+    before = {
+        "files": {name + ".init": "a" * 64},
+        "sentinel": "no_final_sentinel",
+        "database": {"schema": False},
+    }
+    if owner == "sentinel":
+        before["files"][".hermes-realtime-evidence-root-v1"] = "b" * 64
+    after = deepcopy(before)
+    del after["files"][name + ".init"]
+    row = {"before": before, "after": after, "disposition": "absent", "baseline": {}}
+    point = f"after_{owner}_init_{stage}"
+    _validate_recovery(point, "caught-up", row)
+    after["files"][name + ".init"] = "a" * 64
     with pytest.raises(ValueError):
         _validate_recovery(point, "caught-up", row)

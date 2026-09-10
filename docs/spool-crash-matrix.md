@@ -32,10 +32,13 @@ matrix. It checks the exact precommit event counts and unsealed sessions,
 revalidates committed event hashes using an [independent HRE1 oracle](../scripts/evidence_protocol_oracle.py)
 pinned to fixed protocol vectors, checks complete seal lineage and recovery
 erasure receipts, and verifies sentinel states and each full-purge deletion
-prefix. Purge must leave every database artifact absent while preserving the
+prefix. Each stored event must also match one of seven [pinned synthetic source
+events](../scripts/spool_crash_oracle.py), independently of the candidate's
+payload parser. Purge must leave every database artifact absent while preserving the
 root marker and adjacent decoys. Malformed initialization images must be refused
-without mutation. Before the rollback sentinel write, the original logical
-database and sentinel commitments must remain unchanged.
+without mutation; completed initialization temporaries must be removed. The
+original logical database must remain unchanged through every pre-latch rollback
+checkpoint. The sentinel commitment must remain unchanged before its write.
 
 The rollback fixture deliberately includes an older closed epoch alongside an
 active epoch. The existing driver creates that older epoch through the real
