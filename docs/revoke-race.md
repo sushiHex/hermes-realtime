@@ -45,7 +45,12 @@ when an earlier assertion fails.
 Before execution, the verifier binds the supplied wheel digest to the same clean
 source commit, tree, and verified archive as the runner. Every package file must
 match its archived source blob. The wheel must have the exact bounded pure-Python
-member set, package identity, license, and complete SHA-256 `RECORD`. Duplicate,
+member set, package identity, license, and complete SHA-256 `RECORD`. Its UTF-8
+metadata must parse without defects, declare core `Metadata-Version: 2.4` (the
+format produced by the pinned builder), and declare `Wheel-Version: 1.0`.
+The [core metadata fields](https://packaging.python.org/en/latest/specifications/core-metadata/)
+are checked before granting wheel authority, and entry-point names retain exact
+case. Duplicate,
 missing, unexpected, native, or mismatched members fail before launch.
 
 The pure wheel is unpacked into a fresh owned directory outside the source tree.

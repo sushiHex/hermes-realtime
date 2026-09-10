@@ -37,6 +37,11 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+class _EntryPointParser(configparser.ConfigParser):
+    def optionxform(self, optionstr: str) -> str:
+        return optionstr
+
+
 def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str, bytes]:
     _require(0 < len(raw) <= _MAX_WHEEL, "candidate wheel size is outside its bound")
     try:
@@ -59,21 +64,28 @@ def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str
             (len(value), hashlib.sha256(value).hexdigest()) == (size, digest),
             "candidate wheel runtime blob differs from source",
         )
+    for name in ("METADATA", "WHEEL"):
+        try:
+            members[_INFO + name].decode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("candidate wheel metadata is not UTF-8") from error
     metadata = BytesParser().parsebytes(members[_INFO + "METADATA"])
     _require(
-        metadata.get_all("Name") == ["hermes-realtime"]
+        not metadata.defects
+        and metadata.get_all("Metadata-Version") == ["2.4"]
+        and metadata.get_all("Name") == ["hermes-realtime"]
         and metadata.get_all("Version") == ["0.0.3"],
-        "candidate wheel identity differs",
+        "candidate wheel core metadata differs or is malformed",
     )
     wheel_metadata = BytesParser().parsebytes(members[_INFO + "WHEEL"])
     _require(
-        wheel_metadata.get_all("Wheel-Version") == ["1.0"]
+        not wheel_metadata.defects
+        and wheel_metadata.get_all("Wheel-Version") == ["1.0"]
         and wheel_metadata.get_all("Root-Is-Purelib") == ["true"]
         and wheel_metadata.get_all("Tag") == ["py3-none-any"],
         "candidate wheel is not pure",
     )
-    entry_points = configparser.ConfigParser(interpolation=None)
-    entry_points.optionxform = str
+    entry_points = _EntryPointParser(interpolation=None)
     try:
         entry_points.read_string(members[_INFO + "entry_points.txt"].decode("utf-8"))
     except (UnicodeError, configparser.Error) as error:

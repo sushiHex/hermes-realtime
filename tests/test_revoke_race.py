@@ -31,6 +31,18 @@ def _wheel_bytes(change: str = "") -> tuple[bytes, dict[str, tuple[int, str]]]:
         members[info + "entry_points.txt"] = members[info + "entry_points.txt"].replace(
             b"hermes-realtime-host =", b"Hermes-realtime-host ="
         )
+    elif change == "metadata_missing_version":
+        members[info + "METADATA"] = b"Name: hermes-realtime\nVersion: 0.0.3\n"
+    elif change == "metadata_unsupported_version":
+        members[info + "METADATA"] = members[info + "METADATA"].replace(b"2.4", b"99.0")
+    elif change == "metadata_duplicate_version":
+        members[info + "METADATA"] += b"Metadata-Version: 2.4\n"
+    elif change in {"metadata_defect", "wheel_defect"}:
+        name = "METADATA" if change == "metadata_defect" else "WHEEL"
+        members[info + name] += b"malformed header without a separator\n"
+    elif change in {"metadata_encoding", "wheel_encoding"}:
+        name = "METADATA" if change == "metadata_encoding" else "WHEEL"
+        members[info + name] += b"\n\n\xff"
     elif change == "source":
         members["hermes_realtime/runtime.py"] = b"candidate = 2\n"
     elif change == "extra":
@@ -85,6 +97,13 @@ def test_wheel_inspection_binds_every_runtime_blob_and_closed_metadata() -> None
         "duplicate",
         "entrypoint",
         "entrypoint_case",
+        "metadata_missing_version",
+        "metadata_unsupported_version",
+        "metadata_duplicate_version",
+        "metadata_defect",
+        "wheel_defect",
+        "metadata_encoding",
+        "wheel_encoding",
     ],
 )
 def test_wheel_inspection_refuses_foreign_incomplete_or_executable_extra_members(
