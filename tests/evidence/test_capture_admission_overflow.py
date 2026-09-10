@@ -1,16 +1,16 @@
 """Lost one-shot capture publications cannot become complete evidence."""
 
 import pytest
-
-from hermes_realtime.evidence import admission as a
-from hermes_realtime.evidence import models as m
-from tests.evidence.test_admission import (
+from test_admission import (
     _active_admission,
     _owner_drain_authority,
     _revoke_authority,
     _turn_authority,
     _uuid,
 )
+
+from hermes_realtime.evidence import admission as a
+from hermes_realtime.evidence import models as m
 
 
 @pytest.mark.parametrize("revoked", [False, True])
