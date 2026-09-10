@@ -94,6 +94,9 @@ jobs:
       - name: Prove Linux null capture
         shell: bash
         run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/integration/test_linux_null_capture.py
+      - name: Validate portable qualification oracles
+        shell: bash
+        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py
 
   release-candidate:
     name: Hermetic release candidate

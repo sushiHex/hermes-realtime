@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from scripts.spool_crash_matrix import ObservedSpoolCrashMatrixV1, _validate_checkpoint
@@ -40,8 +42,13 @@ def test_registration_and_receipts_reject_reconstruction() -> None:
         validate_spool_crash_matrix_v1(object.__new__(ObservedSpoolCrashMatrixV1))
 
 
-@pytest.mark.parametrize("mutation", [None, "record", "payload", "seal", "epoch", "delete"])
-def test_independent_reader_revalidates_real_committed_seals(tmp_path, mutation) -> None:
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize(
+    "mutation", [None, "record", "payload", "seal", "epoch", "delete", "candidate_oracle"]
+)
+def test_independent_reader_revalidates_real_committed_seals(
+    tmp_path, mutation, monkeypatch
+) -> None:
     import sqlite3
 
     from scripts.storage_observation import _database_state
@@ -55,7 +62,15 @@ def test_independent_reader_revalidates_real_committed_seals(tmp_path, mutation)
     finally:
         spool.close()
     database = tmp_path / "evidence/capture-v1.sqlite3"
-    if mutation is None:
+    if mutation == "candidate_oracle":
+        from hermes_realtime.evidence import sqlite_spool
+
+        def refused(*args, **kwargs):
+            raise AssertionError("the candidate cannot supply its own hash oracle")
+
+        monkeypatch.setattr(sqlite_spool, "canonical_json_bytes", refused)
+        monkeypatch.setattr(sqlite_spool, "hre1_record_hash", refused)
+    if mutation in {None, "candidate_oracle"}:
         observed = _database_state(database)
         assert observed["events"] == 4
         assert observed["sessions"] == ["sealed"]
@@ -111,7 +126,8 @@ def _purge_observation():
 
 
 @pytest.mark.parametrize(
-    "mutation", [None, "sidecar", "marker", "sentinel", "decoy", "entry", "prefix", "extra"]
+    "mutation",
+    [None, "sidecar", "marker", "sentinel", "decoy", "entry", "prefix", "extra", "activation_temp"],
 )
 def test_purge_acceptance_requires_exact_absence_and_retained_authority(mutation) -> None:
     from scripts.spool_crash_matrix import _validate_recovery
@@ -131,6 +147,8 @@ def test_purge_acceptance_requires_exact_absence_and_retained_authority(mutation
         row["before"]["files"]["capture-v1.sqlite3"] = "d" * 64
     elif mutation == "extra":
         row["after"]["files"]["unexpected"] = "d" * 64
+    elif mutation == "activation_temp":
+        row["after"]["files"]["capture-v1.owner.init"] = "d" * 64
     if mutation is None:
         _validate_recovery("after_full_purge_absence_verify", "caught-up", row)
     else:
@@ -190,3 +208,41 @@ def test_seal_commit_requires_the_complete_closed_epoch() -> None:
             "after_seal_commit_before_ack",
             {"events": 4, "sessions": ["sealed"], "epochs": ["active"]},
         )
+
+
+@pytest.mark.parametrize("point", ["after_first_schema_commit", "after_recreate_schema_commit"])
+def test_schema_commit_checkpoint_cannot_report_an_empty_database(point) -> None:
+    with pytest.raises(ValueError, match="checkpoint"):
+        _validate_checkpoint(point, {"schema": False})
+
+
+@pytest.mark.parametrize("purge_required", [1, -1])
+def test_recovered_seal_requires_a_cleared_purge_latch(purge_required) -> None:
+    from copy import deepcopy
+
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    state = {
+        "files": {
+            ".hermes-realtime-evidence-root-v1": "a" * 64,
+            "capture-v1.owner": "b" * 64,
+            "capture-v1.sqlite3": "c" * 64,
+        },
+        "sentinel": "clear",
+        "database": {
+            "schema": True,
+            "events": 4,
+            "sessions": ["sealed"],
+            "epochs": ["closed"],
+            "seals": ["d" * 64],
+            "purge_required": 0,
+            "tombstones": [],
+            "erasures": [],
+            "logical_digest": "e" * 64,
+        },
+    }
+    row = {"before": state, "after": deepcopy(state), "disposition": "recovered", "baseline": {}}
+    _validate_recovery("after_seal_commit_before_ack", "caught-up", row)
+    row["after"]["database"]["purge_required"] = purge_required
+    with pytest.raises(ValueError):
+        _validate_recovery("after_seal_commit_before_ack", "caught-up", row)

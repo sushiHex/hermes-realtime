@@ -110,7 +110,14 @@ def _validate_checkpoint(point: str, db: Any) -> None:
         expected = (6, ["open", "sealed"], ["active", "closed"])
     elif index in {21, 22, 26, 27}:
         expected = (2, ["open"], ["active"])
+    elif index in {20, 25}:
+        expected = (0, [], [])
+        _require(
+            type(db) is dict and db.get("schema") is True and db.get("purge_required") == -1,
+            "schema checkpoint has no committed empty schema",
+        )
     else:
+        _require(db == {"schema": False}, "checkpoint unexpectedly opened a database")
         return
     _require(
         type(db) is dict
@@ -180,7 +187,8 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
                     "storage state values differ",
                 )
             _require(
-                type(db["seals"]) is list and len(db["seals"]) <= 2, "storage seal count differs"
+                type(db["seals"]) is list and len(db["seals"]) == db["sessions"].count("sealed"),
+                "storage seal count differs",
             )
             for digest in [db["logical_digest"], *db["seals"]]:
                 _require(
@@ -193,7 +201,8 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             )
             for tombstone in db["tombstones"]:
                 _require(
-                    type(tombstone) is list and len(tombstone) == 3
+                    type(tombstone) is list
+                    and len(tombstone) == 3
                     and tombstone[0] in {"revoked", "unclean_epoch", "clock_rollback", "ttl"}
                     and all(type(n) is int and 0 <= n <= 8 for n in tombstone[1:]),
                     "storage tombstone values differ",
@@ -238,6 +247,22 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             == {_MARKER, _SENTINEL, "purge-decoy.bin", *_DATABASE_NAMES[deleted:]},
             "full-purge checkpoint deletion prefix differs",
         )
+    elif index < 9:
+        expected_files = {_MARKER, _SENTINEL, _DATABASE_NAMES[0]}
+        if index in {1, 3}:
+            expected_files.add(_DATABASE_NAMES[1])
+        _require(set(before["files"]) == expected_files, "ordinary checkpoint inventory differs")
+    elif index == 13:
+        _require(set(before["files"]) == {_MARKER}, "marker checkpoint inventory differs")
+    elif index >= 18:
+        expected_files = {_MARKER, _SENTINEL}
+        if index not in {18, 23}:
+            expected_files.add(_DATABASE_NAMES[0])
+        if 23 <= index <= 27:
+            expected_files.add("recreation-decoy.bin")
+        if 28 <= index <= 31:
+            expected_files.add("rollback-decoy.bin")
+        _require(set(before["files"]) == expected_files, "creation checkpoint inventory differs")
     if 9 <= index <= 12 or 14 <= index <= 17:
         temporary = _MARKER + ".init" if index <= 12 else _SENTINEL + ".init"
         expected_files = {temporary} | ({_MARKER} if index >= 14 else set())
@@ -278,8 +303,11 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             "storage recovery changed root identity",
         )
     if disposition == "purge_completed" or index == 40:
+        retained = {_MARKER, _SENTINEL} | {
+            name for name in before["files"] if name.endswith("-decoy.bin")
+        }
         _require(
-            not set(_DATABASE_NAMES) & after["files"].keys()
+            set(after["files"]) == retained
             and after["database"] == {"schema": False}
             and after["sentinel"] == "clear"
             and _MARKER in after["files"]
@@ -289,6 +317,10 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
     elif disposition == "recovered":
         db = after["database"]
         _require(type(db) is dict, "recovered database is absent")
+        _require(
+            db["purge_required"] == 0 and db["erasures"] == [] and after["sentinel"] == "clear",
+            "recovered database still requires purge",
+        )
         sealed = index in {4, 8, 28}
         _require(
             (db["events"], db["sessions"], db["epochs"])

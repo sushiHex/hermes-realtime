@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.equivalence_process import _require
+from scripts.evidence_protocol_oracle import canonical_json_bytes, hre1_record_hash
 
 
 def _digest(raw: bytes) -> str:
@@ -18,7 +19,6 @@ def _digest(raw: bytes) -> str:
 
 def _database_state(database: Path) -> dict[str, Any]:
     from hermes_realtime.evidence.models import parse_evidence_snapshot_json
-    from hermes_realtime.evidence.sqlite_spool import canonical_json_bytes, hre1_record_hash
 
     # SQLite may roll back its own hot rollback journal on this cold open. No
     # application SQL writes or production recovery methods run in this observer.

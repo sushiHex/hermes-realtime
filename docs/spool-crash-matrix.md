@@ -29,7 +29,8 @@ the observer issues no application SQL writes.
 
 The [validator](../scripts/spool_crash_matrix.py) requires the complete ordered
 matrix. It checks the exact precommit event counts and unsealed sessions,
-revalidates committed event hashes and complete seal lineage, checks recovery
+revalidates committed event hashes using an [independent HRE1 oracle](../scripts/evidence_protocol_oracle.py)
+pinned to fixed protocol vectors, checks complete seal lineage and recovery
 erasure receipts, and verifies sentinel states and each full-purge deletion
 prefix. Purge must leave every database artifact absent while preserving the
 root marker and adjacent decoys. Malformed initialization images must be refused
