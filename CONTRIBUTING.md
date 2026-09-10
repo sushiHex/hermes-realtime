@@ -34,7 +34,7 @@ Requirements:
 
 - Python 3.11
 - `uv`
-- Node.js/npm for browser assets
+- Node.js 22.22.2 or newer 22.x, with npm, for browser assets
 
 ```bash
 git clone https://github.com/sushiHex/hermes-realtime.git

@@ -18,6 +18,22 @@ jobs:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Qualify Linux browser build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci --ignore-scripts
+          npm test -- --reporter=verbose --slowTestThreshold=100
+          npm run build
+          cd ..
+          git diff --exit-code -- src/hermes_realtime/client/static src/hermes_realtime/evidence/disclosure_manifest_v1.json
+      # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
@@ -100,7 +116,7 @@ jobs:
       # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Provision owner-only Windows test temp
@@ -166,7 +182,7 @@ jobs:
       # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Provision owner-only Windows test temp

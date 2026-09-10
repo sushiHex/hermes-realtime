@@ -98,6 +98,20 @@ def test_browser_bundle_legal_notices_are_release_gated() -> None:
     assert '"hermes_realtime/client/static/assets/app.js.LEGAL.txt"' in release_gate
 
 
+def test_linux_candidate_wheel_requires_browser_build_and_committed_asset_parity() -> None:
+    workflow = _release_workflow()
+    wheel = workflow.split("  candidate-wheel:\n", maxsplit=1)[1].split(
+        "  linux-null-capture:\n", maxsplit=1,
+    )[0]
+
+    assert 'node-version: "22.22.2"' in wheel
+    assert "npm ci --ignore-scripts" in wheel
+    assert "npm test -- --reporter=verbose --slowTestThreshold=100" in wheel
+    assert "npm run build" in wheel
+    assert "git diff --exit-code -- src/hermes_realtime/client/static" in wheel
+    assert wheel.index("npm run build") < wheel.index("uv build --wheel")
+
+
 def test_native_release_gate_runs_the_synthetic_full_host_audio_tracer() -> None:
     script = (Path(__file__).resolve().parents[1] / "scripts" / "release_gate.py").read_text(
         encoding="utf-8"
@@ -196,7 +210,7 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
         "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",  # v10.0.1
     )
 
-    expected_uses = (4, 4, 2, 3)
+    expected_uses = (4, 4, 3, 3)
     for pin, expected_count in zip(node24_pins, expected_uses, strict=True):
         assert workflow.count(f"uses: {pin}") == expected_count
     assert workflow.count("prune-cache: true") == 3

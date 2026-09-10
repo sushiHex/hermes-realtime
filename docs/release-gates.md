@@ -15,7 +15,7 @@ still inspects export-ignored paths.
 
 | Job | Responsibility |
 | --- | --- |
-| Pure candidate wheel | Build the candidate wheel and hash-identified offline dependency closure. |
+| Pure candidate wheel | Verify the Linux browser build and committed asset parity, then build the candidate wheel and hash-identified offline dependency closure. |
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
 | Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
 | Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
@@ -25,6 +25,12 @@ pass. After merging, wait for all four jobs in the resulting exact-commit `main`
 push run to complete on attempt 1 before advancing to the next candidate. Preserve
 any failed run and investigate it; an earlier green PR run does not replace the
 main push result. Head or base changes require requalification of the new candidate.
+
+Browser checks use Node 22.22.2 on Windows and Linux. The Linux wheel job first
+installs the locked browser dependencies with scripts disabled, runs the browser
+tests and TypeScript build, and rejects any generated change to committed assets
+or their disclosure manifest. This exercises platform-specific compiler packages
+before producing the wheel consumed by the Linux installation check.
 
 The `release-candidate` job runs, from that fresh candidate:
 
