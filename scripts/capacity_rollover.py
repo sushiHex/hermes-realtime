@@ -105,7 +105,9 @@ def _validate_observations(row: Any) -> None:
     _require(type(snapshots) is list and len(snapshots) == 4, "rollover snapshots are incomplete")
     shapes = [[(2, False)], [(2, False)], [(2, True), (0, False)], [(2, True), (1, False)]]
     for snapshot, shape in zip(snapshots, shapes, strict=True):
-        _keys(snapshot, {"sessions"})
+        _keys(snapshot, {"sessions", "clock", "authority"})
+        _digest(snapshot["clock"])
+        _digest(snapshot["authority"])
         sessions = snapshot["sessions"]
         _require(type(sessions) is list and len(sessions) == len(shape), "session count differs")
         for session, (turns, sealed) in zip(sessions, shape, strict=True):
@@ -125,6 +127,7 @@ def _validate_observations(row: Any) -> None:
                     "opened",
                     "expires",
                     "retention_lag_us",
+                    "last_event_at",
                 }
                 | _CONTENT,
             )
@@ -134,6 +137,7 @@ def _validate_observations(row: Any) -> None:
             _digest(session["consent_request"])
             _digest(session["opened"])
             _digest(session["expires"])
+            _digest(session["last_event_at"])
             lag = session["retention_lag_us"]
             _require(
                 type(lag) is int
@@ -170,9 +174,17 @@ def _validate_observations(row: Any) -> None:
             _digests(session["chain"], len(kinds))
             for name in _CONTENT:
                 _digests(session[name], turns)
+        _require(
+            snapshot["clock"] == sessions[-1]["last_event_at"]
+            and snapshot["authority"] == snapshots[0]["authority"],
+            "store clock or installation authority differs",
+        )
     before, committing, committed, continued = [s["sessions"] for s in snapshots]
     _require(before == committing, "partial rollover became visible before commit")
     old, successor = committed
+    _require(
+        old["last_event_at"] == successor["last_event_at"], "rollover control timestamps differ"
+    )
     _require(old == continued[0], "sealed predecessor changed during successor conversation")
     for name in {
         "session",

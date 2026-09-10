@@ -147,6 +147,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
 
     sessions: list[dict[str, Any]] = []
     lineage = []
+    recorded_times: list[str] = []
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
         connection.execute("BEGIN")
         _require(
@@ -157,14 +158,24 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
             not connection.execute("PRAGMA foreign_key_check").fetchall(),
             "rollover store foreign keys failed",
         )
-        installation = connection.execute(
-            "SELECT installation_id FROM producer_installation WHERE singleton=1"
-        ).fetchone()[0]
+        installations = connection.execute(
+            "SELECT installation_id,created_at_utc,clock_high_water_utc,"
+            "purge_required,purge_reason,purge_scope FROM producer_installation"
+        ).fetchall()
+        _require(len(installations) == 1, "rollover installation authority is not unique")
+        installation, created, high_water, purge, reason, scope = installations[0]
+        validate_canonical_utc(created, field_name="created_at_utc")
+        validate_canonical_utc(high_water, field_name="clock_high_water_utc")
+        _require((purge, reason, scope) == (0, None, None), "rollover installation requires purge")
         epochs = connection.execute(
-            "SELECT consent_epoch_id,producer_instance_id,state FROM consent_epochs"
+            "SELECT consent_epoch_id,producer_instance_id,state,opened_at_utc,closed_at_utc "
+            "FROM consent_epochs"
         ).fetchall()
         _require(
-            len(epochs) == 1 and epochs[0][2] == "active",
+            len(epochs) == 1
+            and epochs[0][2] == "active"
+            and epochs[0][3] == created
+            and epochs[0][4] is None,
             "rollover has no unique active consent epoch",
         )
         for table in ("evidence_conflicts", "erasure_requests", "erasure_tombstones"):
@@ -207,11 +218,16 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
             _require(1 <= len(events) <= 32, "rollover event count differs")
             history = []
             previous = None
+            previous_time = created
             payloads = []
             for ordinal, event in enumerate(events, 1):
                 event_id, sequence, kind, payload, payload_hash, stored_previous, digest, at, n = (
                     event
                 )
+                validate_canonical_utc(at, field_name="recorded_at_utc")
+                _require(at >= previous_time, "stored event time moves backward")
+                previous_time = at
+                recorded_times.append(at)
                 parsed = json.loads(payload)
                 raw = canonical_json_bytes(parsed)
                 _require(
@@ -266,6 +282,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
             if state == "sealed":
                 _require(
                     [e[2] for e in events[-2:]] == ["binding_closed", "session_seal_requested"]
+                    and events[-2][7] == events[-1][7]
                     and payloads[-2]["close_reason"] == "capacity_rollover"
                     and payloads[-2]["binding_id"] == payloads[0]["binding_id"]
                     and payloads[-1]["final_event_sequence"] == count
@@ -284,7 +301,12 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                 "session row and opening epoch differ",
             )
             _require(
-                opened == events[0][7] == events[1][7],
+                opened == events[0][7] == events[1][7]
+                and (
+                    opened == created
+                    if not sessions
+                    else _commit(key, "session_time", opened) == sessions[-1]["last_event_at"]
+                ),
                 "session opening timestamps differ",
             )
             lag = (
@@ -326,6 +348,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     "opened": _commit(key, "session_time", opened),
                     "expires": _commit(key, "session_time", expires),
                     "retention_lag_us": lag_us,
+                    "last_event_at": _commit(key, "session_time", events[-1][7]),
                     "predecessor": ""
                     if predecessor is None
                     else _commit(key, "session", predecessor),
@@ -350,7 +373,22 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     ],
                 }
             )
-    return {"sessions": sessions}
+        _require(
+            high_water == max(recorded_times),
+            "installation high-water differs from durable event time",
+        )
+        authority = _commit(
+            key,
+            "store_authority",
+            canonical_json_bytes(
+                [[installation, created, purge, reason, scope], [list(epoch) for epoch in epochs]]
+            ),
+        )
+    return {
+        "sessions": sessions,
+        "clock": _commit(key, "session_time", high_water),
+        "authority": authority,
+    }
 
 
 class _ObserveRolloverSpool:

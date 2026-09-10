@@ -43,6 +43,9 @@ def _observations() -> dict:
             opened="8" * 64 if predecessor else "7" * 64,
             expires="9" * 64 if predecessor else "6" * 64,
             retention_lag_us=1000 if predecessor else 0,
+            last_event_at=("3" if turns else "2") * 64
+            if predecessor
+            else ("2" if sealed else "1") * 64,
             predecessor=predecessor,
             state="sealed" if sealed else "open",
             events=len(kinds),
@@ -54,6 +57,8 @@ def _observations() -> dict:
     before = {"sessions": [session("a" * 64, 2, False)]}
     committed = {"sessions": [session("a" * 64, 2, True), session("b" * 64, 0, False, "a" * 64)]}
     continued = {"sessions": [session("a" * 64, 2, True), session("b" * 64, 1, False, "a" * 64)]}
+    for snapshot in (before, committed, continued):
+        snapshot.update(clock=snapshot["sessions"][-1]["last_event_at"], authority="4" * 64)
     return dict(
         arm="capacity_rollover",
         commands={
@@ -793,3 +798,97 @@ def test_dispatch_observer_preserves_fifo_and_rejects_gaps_before_delegation(
             for ordinal in ordinals:
                 observer.append_record(SimpleNamespace(admission_ordinal=ordinal))
         assert len(calls) == (1 if ordinals == (3, 5) else 0)
+
+
+@pytest.mark.parametrize("mutation", ["omitted", "ahead"])
+def test_rollover_reader_observes_clock_high_water_before_a_later_turn_can_repair_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    from datetime import datetime, timedelta
+
+    from hermes_realtime.evidence.sqlite_spool import format_canonical_utc
+    from scripts.capacity_rollover_worker import _ObserveRolloverSpool
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    owned = make_spool(tmp_path)
+    observer = _ObserveRolloverSpool(owned, owned.database, b"synthetic key")
+    try:
+        observer.create_epoch(make_create_epoch())
+        previous = owned.connection.execute(
+            "SELECT clock_high_water_utc FROM producer_installation"
+        ).fetchone()[0]
+        moment = datetime.fromisoformat(previous) + timedelta(seconds=1)
+        monkeypatch.setattr(owned, "_clock", lambda: moment)
+        advance = owned._advance_high_water
+
+        def defective_advance(recorded_at):
+            if mutation == "ahead":
+                advance(format_canonical_utc(moment + timedelta(seconds=1)))
+
+        monkeypatch.setattr(owned, "_advance_high_water", defective_advance)
+        with pytest.raises(ValueError, match="high.water"):
+            observer.rollover_session(make_rollover_command())
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize("mutation", ["installation_created", "epoch_opened", "purge_required"])
+def test_rollover_reader_rejects_foreign_installation_or_epoch_authority(
+    tmp_path: Path, mutation: str
+) -> None:
+    from datetime import datetime, timedelta
+
+    from hermes_realtime.evidence.sqlite_spool import format_canonical_utc
+    from scripts.capacity_rollover_worker import _snapshot
+    from tests.evidence.test_sqlite_spool import make_create_epoch, make_spool
+
+    owned = make_spool(tmp_path)
+    try:
+        owned.create_epoch(make_create_epoch())
+        if mutation == "purge_required":
+            owned.connection.execute(
+                "UPDATE producer_installation SET purge_required=1,"
+                "purge_reason='clock_rollback',purge_scope='store'"
+            )
+        else:
+            previous = owned.connection.execute(
+                "SELECT created_at_utc FROM producer_installation"
+            ).fetchone()[0]
+            changed = format_canonical_utc(
+                datetime.fromisoformat(previous) + timedelta(microseconds=1)
+            )
+            if mutation == "installation_created":
+                owned.connection.execute(
+                    "UPDATE producer_installation SET created_at_utc=?", (changed,)
+                )
+            else:
+                owned.connection.execute("UPDATE consent_epochs SET opened_at_utc=?", (changed,))
+        owned.connection.commit()
+        with pytest.raises(ValueError):
+            _snapshot(owned.database, b"synthetic key")
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing_clock", "stale_clock", "foreign_authority", "rollover_time"]
+)
+def test_rollover_parent_rejects_clock_and_store_authority_gaps(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    committed = row["snapshots"][2]
+    if mutation == "missing_clock":
+        del committed["clock"]
+    elif mutation == "stale_clock":
+        committed["clock"] = row["snapshots"][0]["clock"]
+    elif mutation == "foreign_authority":
+        committed["authority"] = "e" * 64
+    else:
+        committed["sessions"][0]["last_event_at"] = "e" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
