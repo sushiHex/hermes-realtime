@@ -221,6 +221,11 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
     )
     _require(before["sentinel"] == expected_sentinel, "recovery entry sentinel differs")
     _validate_checkpoint(point, before["database"])
+    if index in {19, 24}:
+        _require(
+            before["files"].get(_DATABASE_NAMES[0]) == hashlib.sha256(b"").hexdigest(),
+            "database-create checkpoint did not retain an empty file",
+        )
     if 28 <= index < 32:
         _keys(row["baseline"], {"databaseSha256", "sentinelSha256"})
         for digest in row["baseline"].values():

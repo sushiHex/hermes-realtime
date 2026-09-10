@@ -36,6 +36,21 @@ def _database_state(database: Path) -> dict[str, Any]:
         if not tables:
             return {"schema": False}
         _require(
+            tables
+            == {
+                "producer_installation",
+                "consent_epochs",
+                "evidence_sessions",
+                "evidence_events",
+                "evidence_conflicts",
+                "erasure_requests",
+                "erasure_tombstones",
+            }
+            and connection.execute("PRAGMA application_id").fetchone() == (0x48524531,)
+            and connection.execute("PRAGMA user_version").fetchone() == (1,),
+            "storage schema version or table inventory differs",
+        )
+        _require(
             not connection.execute("PRAGMA foreign_key_check").fetchall(),
             "storage foreign keys differ",
         )

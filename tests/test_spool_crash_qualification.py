@@ -44,7 +44,18 @@ def test_registration_and_receipts_reject_reconstruction() -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
 @pytest.mark.parametrize(
-    "mutation", [None, "record", "payload", "seal", "epoch", "delete", "candidate_oracle"]
+    "mutation",
+    [
+        None,
+        "record",
+        "payload",
+        "seal",
+        "epoch",
+        "delete",
+        "candidate_oracle",
+        "version",
+        "application",
+    ],
 )
 def test_independent_reader_revalidates_real_committed_seals(
     tmp_path, mutation, monkeypatch
@@ -82,6 +93,8 @@ def test_independent_reader_revalidates_real_committed_seals(
         "seal": "UPDATE evidence_sessions SET head_hash=?",
         "epoch": "UPDATE consent_epochs SET state='active',closed_at_utc=NULL",
         "delete": "DELETE FROM evidence_events WHERE event_sequence=4",
+        "version": "PRAGMA user_version=2",
+        "application": "PRAGMA application_id=0",
     }
     with sqlite3.connect(database) as connection:
         # Model damaged storage while preserving the original schema, so the
@@ -246,3 +259,22 @@ def test_recovered_seal_requires_a_cleared_purge_latch(purge_required) -> None:
     row["after"]["database"]["purge_required"] = purge_required
     with pytest.raises(ValueError):
         _validate_recovery("after_seal_commit_before_ack", "caught-up", row)
+
+
+@pytest.mark.parametrize("point", ["after_first_db_create", "after_recreate_db_create"])
+def test_database_create_checkpoint_requires_the_empty_file_digest(point) -> None:
+    import hashlib
+
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    row = _purge_observation()
+    for state in (row["before"], row["after"]):
+        decoy = state["files"].pop("purge-decoy.bin")
+        if "recreate" in point:
+            state["files"]["recreation-decoy.bin"] = decoy
+    row["before"]["sentinel"] = "first_create_pending"
+    row["before"]["files"]["capture-v1.sqlite3"] = hashlib.sha256(b"").hexdigest()
+    _validate_recovery(point, "caught-up", row)
+    row["before"]["files"]["capture-v1.sqlite3"] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_recovery(point, "caught-up", row)
