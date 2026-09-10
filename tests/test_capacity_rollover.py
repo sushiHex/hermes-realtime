@@ -35,6 +35,13 @@ def _observations() -> dict:
             epoch="e" * 64,
             consent="c" * 64,
             consent_request="f" * 64,
+            controls=(
+                ["3" * 64, "4" * 64]
+                if predecessor
+                else ["0" * 64, "1" * 64] + (["2" * 64, "2" * 64] if sealed else [])
+            ),
+            opened="8" * 64 if predecessor else "7" * 64,
+            expires="9" * 64 if predecessor else "6" * 64,
             predecessor=predecessor,
             state="sealed" if sealed else "open",
             events=len(kinds),
@@ -48,6 +55,11 @@ def _observations() -> dict:
     continued = {"sessions": [session("a" * 64, 2, True), session("b" * 64, 1, False, "a" * 64)]}
     return dict(
         arm="capacity_rollover",
+        commands={
+            "create": ["0" * 64, "1" * 64],
+            "rollover": ["2" * 64, "2" * 64, "3" * 64, "4" * 64],
+            "successor_expiry": "9" * 64,
+        },
         snapshots=[before, copy.deepcopy(before), committed, continued],
         transactions=["BEGIN IMMEDIATE", "COMMIT"],
         durable_terminals=["committed"] * 3,
@@ -269,6 +281,7 @@ def test_rollover_receipts_and_registration_reject_supplied_success() -> None:
 def test_rollover_observer_reads_the_real_transaction_without_exposing_partial_state(
     tmp_path: Path,
 ) -> None:
+
     from hermes_realtime.evidence.models import StoreDisposition
     from scripts.capacity_rollover_worker import _ObserveRolloverSpool
     from tests.evidence.test_sqlite_spool import (
@@ -279,8 +292,8 @@ def test_rollover_observer_reads_the_real_transaction_without_exposing_partial_s
 
     owned = make_spool(tmp_path)
     try:
-        assert owned.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
         observer = _ObserveRolloverSpool(owned, owned.database, b"synthetic key")
+        assert observer.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
         assert observer.rollover_session(make_rollover_command()) is StoreDisposition.COMMITTED
         assert observer.transactions == ["BEGIN IMMEDIATE", "COMMIT"]
         before, committing, committed = observer.snapshots
@@ -502,3 +515,102 @@ def test_rollover_reader_rejects_rehashed_foreign_consent(
             _snapshot(owned.database, b"synthetic key")
     finally:
         owned.close()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["binding_id", "binding_generation", "microphone_available", "successor_expiry"]
+)
+def test_rollover_observer_rejects_coordinated_command_substitution(
+    tmp_path: Path, mutation: str
+) -> None:
+    from dataclasses import replace
+    from datetime import datetime, timedelta
+
+    from hermes_realtime.evidence.sqlite_spool import format_canonical_utc
+    from scripts.capacity_rollover_worker import _ObserveRolloverSpool
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    owned = make_spool(tmp_path)
+
+    def altered_snapshot(snapshot):
+        payload = snapshot.payload
+        field = mutation
+        if field == "successor_expiry" or not hasattr(payload, field):
+            return snapshot
+        value = {
+            "binding_id": "12345678-1234-4234-8234-123456789abc",
+            "binding_generation": 91,
+            "microphone_available": True,
+        }[field]
+        assert getattr(payload, field) != value
+        return replace(snapshot, payload=replace(payload, **{field: value}))
+
+    class SubstitutingSpool:
+        def __getattr__(self, name):
+            return getattr(owned, name)
+
+        def create_epoch(self, command):
+            opened = altered_snapshot(command.session_opened)
+            binding = altered_snapshot(command.binding_opened)
+            return owned.create_epoch(
+                replace(
+                    command,
+                    binding_id=opened.payload.binding_id,
+                    binding_generation=binding.payload.binding_generation,
+                    session_opened=opened,
+                    binding_opened=binding,
+                )
+            )
+
+        def rollover_session(self, command):
+            snapshots = tuple(altered_snapshot(s) for s in command.snapshots)
+            return owned.rollover_session(
+                replace(
+                    command,
+                    binding_id=snapshots[2].payload.binding_id,
+                    binding_generation=snapshots[3].payload.binding_generation,
+                    successor_expires_at_utc=(
+                        format_canonical_utc(
+                            datetime.fromisoformat(command.successor_expires_at_utc)
+                            + timedelta(hours=1)
+                        )
+                        if mutation == "successor_expiry"
+                        else command.successor_expires_at_utc
+                    ),
+                    snapshots=snapshots,
+                )
+            )
+
+    observer = _ObserveRolloverSpool(SubstitutingSpool(), owned.database, b"synthetic key")
+    try:
+        # Both substitutions use real spool writes, valid payloads and HRE1
+        # chains. Only the independently captured dispatched command differs.
+        with pytest.raises(ValueError, match="dispatched"):
+            observer.create_epoch(make_create_epoch())
+            observer.rollover_session(make_rollover_command())
+    finally:
+        owned.close()
+
+
+@pytest.mark.parametrize("mutation", ["controls", "expiry", "missing_commands"])
+def test_rollover_parent_rejects_coordinated_store_changes_against_dispatched_commands(
+    mutation: str,
+) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "missing_commands":
+        del row["commands"]
+    else:
+        for snapshot in row["snapshots"]:
+            for session in snapshot["sessions"]:
+                if mutation == "controls":
+                    session["controls"] = ["d" * 64] * len(session["controls"])
+                elif session["predecessor"]:
+                    session["expires"] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)

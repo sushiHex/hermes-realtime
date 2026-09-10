@@ -37,8 +37,19 @@ through the browser API, only after its accepted acknowledgment. Every stored
 session must match that independent source commitment. Consistently rewriting
 all store consent fields and recomputing their hashes cannot replace the request
 that was actually accepted. The reader also requires one active epoch and no
-conflicts or pending/completed erasure authority in this fresh scenario. Session IDs and raw records stay in
-the child. An invocation-local HMAC key commits session lineage, chain entries,
+conflicts or pending/completed erasure authority in this fresh scenario.
+
+Before delegating epoch creation and rollover, the observer commits the complete
+dispatched control snapshots, including event identity, binding identity and
+generation, source availability, and consent lineage. The reader reconstructs
+those snapshots from SQLite; both observer and parent compare their commitments
+with the dispatched commands. The successor's stored expiry must match the
+rollover command's exact deadline. Canonical opening and expiry timestamps,
+opening-event timestamp equality, the initial retention interval, and unchanged
+timestamps across subsequent observations are also required. A consistent
+rewrite within the store cannot substitute different command authority.
+
+Session IDs, timestamps, and raw records stay in the child. An invocation-local HMAC key commits session lineage, chain entries,
 and content without exporting that key or identifiers.
 
 The independent parent validator compares the persisted user, generated, and

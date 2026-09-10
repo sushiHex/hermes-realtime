@@ -48,6 +48,7 @@ def _validate_observations(row: Any) -> None:
         row,
         {
             "arm",
+            "commands",
             "snapshots",
             "transactions",
             "durable_terminals",
@@ -78,6 +79,11 @@ def _validate_observations(row: Any) -> None:
         ],
         "rollover lifecycle is incomplete or reordered",
     )
+    commands = row["commands"]
+    _keys(commands, {"create", "rollover", "successor_expiry"})
+    _digests(commands["create"], 2)
+    _digests(commands["rollover"], 4)
+    _digest(commands["successor_expiry"])
     snapshots = row["snapshots"]
     _require(type(snapshots) is list and len(snapshots) == 4, "rollover snapshots are incomplete")
     shapes = [[(2, False)], [(2, False)], [(2, True), (0, False)], [(2, True), (1, False)]]
@@ -98,6 +104,9 @@ def _validate_observations(row: Any) -> None:
                     "kinds",
                     "consent",
                     "consent_request",
+                    "controls",
+                    "opened",
+                    "expires",
                 }
                 | _CONTENT,
             )
@@ -105,6 +114,23 @@ def _validate_observations(row: Any) -> None:
             _digest(session["epoch"])
             _digest(session["consent"])
             _digest(session["consent_request"])
+            _digest(session["opened"])
+            _digest(session["expires"])
+            _digests(session["controls"], 4 if sealed else 2)
+            expected_controls = (
+                commands["create"] + commands["rollover"][:2]
+                if sealed
+                else commands["rollover"][2:]
+                if session["predecessor"]
+                else commands["create"]
+            )
+            _require(
+                session["controls"] == expected_controls
+                and (
+                    not session["predecessor"] or session["expires"] == commands["successor_expiry"]
+                ),
+                "stored control or expiry differs from the dispatched command",
+            )
             if session["predecessor"] != "":
                 _digest(session["predecessor"])
             kinds = ["session_opened", "binding_opened"] + _TURN * turns
@@ -124,7 +150,7 @@ def _validate_observations(row: Any) -> None:
     _require(before == committing, "partial rollover became visible before commit")
     old, successor = committed
     _require(old == continued[0], "sealed predecessor changed during successor conversation")
-    for name in {"session", "epoch", "predecessor", "consent"} | _CONTENT:
+    for name in {"session", "epoch", "predecessor", "consent", "opened", "expires"} | _CONTENT:
         _require(old[name] == before[0][name], "rollover changed predecessor identity or content")
     _require(
         before[0]["predecessor"] == "" and old["chain"][:14] == before[0]["chain"],
@@ -137,7 +163,7 @@ def _validate_observations(row: Any) -> None:
         and successor["predecessor"] == old["session"],
         "rollover successor lineage differs",
     )
-    for name in ("session", "epoch", "predecessor", "consent"):
+    for name in ("session", "epoch", "predecessor", "consent", "opened", "expires"):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
     _keys(row["source"], _CONTENT | {"consent"})

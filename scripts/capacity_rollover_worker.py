@@ -10,6 +10,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any, cast
@@ -93,14 +94,29 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     )
 
 
+def _control_commitments(key: bytes, snapshots: Any) -> list[str]:
+    from hermes_realtime.evidence.models import evidence_snapshot_to_primitive
+    from hermes_realtime.evidence.sqlite_spool import canonical_json_bytes
+
+    return [
+        _commit(
+            key,
+            "dispatched_control",
+            canonical_json_bytes(evidence_snapshot_to_primitive(snapshot)),
+        )
+        for snapshot in snapshots
+    ]
+
+
 def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
     from hermes_realtime.evidence.models import (
         parse_evidence_snapshot_json,
+        validate_canonical_utc,
         validate_event_sequence,
     )
     from hermes_realtime.evidence.sqlite_spool import canonical_json_bytes, hre1_record_hash
 
-    sessions = []
+    sessions: list[dict[str, Any]] = []
     lineage = []
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
         connection.execute("BEGIN")
@@ -129,11 +145,29 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
             )
         rows = connection.execute(
             "SELECT logical_session_id,consent_epoch_id,producer_instance_id,state,event_count,"
-            "canonical_bytes,final_event_sequence,head_hash,taint_code,consent_version "
+            "canonical_bytes,final_event_sequence,head_hash,taint_code,consent_version, "
+            "opened_at_utc,expires_at_utc "
             "FROM evidence_sessions ORDER BY rowid"
         ).fetchall()
         _require(1 <= len(rows) <= 2, "rollover session count differs")
-        for session_id, epoch, producer, state, count, size, final, head, taint, version in rows:
+        for row in rows:
+            (
+                session_id,
+                epoch,
+                producer,
+                state,
+                count,
+                size,
+                final,
+                head,
+                taint,
+                version,
+                opened,
+                expires,
+            ) = row
+            validate_canonical_utc(opened, field_name="opened_at_utc")
+            validate_canonical_utc(expires, field_name="expires_at_utc")
+            _require(opened < expires, "rollover session expiry is not after opening")
             _require((epoch, producer) == epochs[0][:2], "session and active epoch lineage differ")
             events = connection.execute(
                 "SELECT event_id,event_sequence,event_kind,canonical_payload,payload_hash,"
@@ -220,6 +254,16 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                 and payloads[0]["consent_version"] == version,
                 "session row and opening epoch differ",
             )
+            _require(
+                opened == events[0][7] == events[1][7],
+                "session opening timestamps differ",
+            )
+            if not sessions:
+                _require(
+                    datetime.fromisoformat(expires) - datetime.fromisoformat(opened)
+                    == timedelta(hours=payloads[0]["retention_hours"]),
+                    "initial session retention deadline differs",
+                )
             consent = {
                 "opening": {
                     name: value
@@ -240,6 +284,11 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     "epoch": _commit(key, "epoch", epoch),
                     "consent": _commit(key, "consent", canonical_json_bytes(consent)),
                     "consent_request": _consent_commitment(key, payloads[0]),
+                    "controls": _control_commitments(
+                        key, history[:2] + (history[-2:] if state == "sealed" else [])
+                    ),
+                    "opened": _commit(key, "session_time", opened),
+                    "expires": _commit(key, "session_time", expires),
                     "predecessor": ""
                     if predecessor is None
                     else _commit(key, "session", predecessor),
@@ -277,9 +326,24 @@ class _ObserveRolloverSpool:
         self.failed = False
         self.durable_terminals: list[str] = []
         self.third_settled = Event()
+        self.commands: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
+
+    def create_epoch(self, command: Any) -> Any:
+        _require(not self.commands, "create command was dispatched more than once")
+        self.commands["create"] = _control_commitments(
+            self.key, (command.session_opened, command.binding_opened)
+        )
+        result = self.delegate.create_epoch(command)
+        snapshot = _snapshot(self.database, self.key)
+        _require(
+            len(snapshot["sessions"]) == 1
+            and snapshot["sessions"][0]["controls"] == self.commands["create"],
+            "stored opening differs from the dispatched create command",
+        )
+        return result
 
     def append_record(self, item: Any) -> Any:
         result = self.delegate.append_record(item)
@@ -292,6 +356,11 @@ class _ObserveRolloverSpool:
 
     def rollover_session(self, command: Any) -> Any:
         _require(not self.snapshots, "rollover was invoked more than once")
+        _require(set(self.commands) == {"create"}, "dispatched create command is absent")
+        self.commands["rollover"] = _control_commitments(self.key, command.snapshots)
+        self.commands["successor_expiry"] = _commit(
+            self.key, "session_time", command.successor_expires_at_utc
+        )
         self.snapshots.append(_snapshot(self.database, self.key))
 
         def trace(statement: str) -> None:
@@ -315,7 +384,15 @@ class _ObserveRolloverSpool:
         finally:
             self.delegate.connection.set_trace_callback(None)
         _require(not self.failed, "rollover transaction observation failed")
-        self.snapshots.append(_snapshot(self.database, self.key))
+        committed = _snapshot(self.database, self.key)
+        self.snapshots.append(committed)
+        predecessor, successor = committed["sessions"]
+        _require(
+            predecessor["controls"] == self.commands["create"] + self.commands["rollover"][:2]
+            and successor["controls"] == self.commands["rollover"][2:]
+            and successor["expires"] == self.commands["successor_expiry"],
+            "stored rollover differs from the dispatched command",
+        )
         return result
 
 
@@ -452,6 +529,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     _require(users == inputs, "committed conversation differs from accepted inputs")
     return {
         "arm": "capacity_rollover",
+        "commands": spool.commands,
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "durable_terminals": spool.durable_terminals,
