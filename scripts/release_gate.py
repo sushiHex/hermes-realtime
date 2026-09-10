@@ -26,6 +26,20 @@ from typing import NoReturn
 
 MAX_ARTIFACT_BYTES = 15 * 1024 * 1024
 NPM = "npm.cmd" if os.name == "nt" else "npm"
+# Per-test durations on every gate run, passing or failing. Timeout diagnostics
+# are not a consistent source of comparable healthy-run timing: some restate
+# only the configured authority, while others also report the elapsed failure
+# duration. Capturing passing-run timings before a recurrence is the only way
+# to have a baseline to compare against. These reach the retained job log,
+# which is where a recurrence is investigated. See issue #13.
+#
+# The tail is uncapped, with the noise floor pinned explicitly. A fixed
+# slowest-N ranks raw phase duration, and can therefore omit a lower-duration
+# phase that sits behind a narrower internal timeout or other authority
+# boundary. Retaining every phase above the floor keeps a later incident
+# comparable with healthy runs.
+PYTEST_DURATIONS = ("--durations=0", "--durations-min=0.005")
+VITEST_DURATIONS = ("--", "--reporter=verbose", "--slowTestThreshold=100")
 REQUIRED_STATIC = {
     "hermes_realtime/client/static/index.html": "web/index.html",
     "hermes_realtime/client/static/assets/app.js": "src/hermes_realtime/client/static/assets/app.js",
@@ -390,6 +404,12 @@ def required_sdist_paths() -> frozenset[str]:
             "requirements/kokoro-onnx-package-win-py311.txt",
             "scripts/benchmark_evidence_admission.py",
             "scripts/qualify_evidence_slice_zero.py",
+            "scripts/deterministic_equivalence.py",
+            "scripts/equivalence_process.py",
+            "scripts/equivalence_worker.py",
+            "scripts/qualify_deterministic_equivalence.py",
+            "tests/support/qualification.py",
+            "tests/integration/test_qualification_full_host_ingress.py",
             "scripts/qualify_hermes_v020_pluginmanager.py",
             "scripts/source_archive_authority.py",
             "scripts/real_gate_support.py",
@@ -623,6 +643,7 @@ def check_livekit(
         "dev",
         "pytest",
         "-q",
+        *PYTEST_DURATIONS,
         "-W",
         "error::jwt.warnings.InsecureKeyLengthWarning",
         "tests/integration/test_local_livekit.py",
@@ -649,6 +670,10 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "--follow-imports=skip",
         "scripts/benchmark_evidence_admission.py",
         "scripts/qualify_evidence_slice_zero.py",
+        "scripts/deterministic_equivalence.py",
+        "scripts/equivalence_process.py",
+        "scripts/equivalence_worker.py",
+        "scripts/qualify_deterministic_equivalence.py",
         "scripts/qualify_hermes_v020_pluginmanager.py",
         "scripts/source_archive_authority.py",
         "scripts/real_natural_work_gate.py",
@@ -694,7 +719,18 @@ def gate_materialized_candidate(
         cwd=root,
         env=source_env,
     )
-    run("uv", "run", "--frozen", "--group", "dev", "pytest", "-q", cwd=root, env=environment)
+    run(
+        "uv",
+        "run",
+        "--frozen",
+        "--group",
+        "dev",
+        "pytest",
+        "-q",
+        *PYTEST_DURATIONS,
+        cwd=root,
+        env=environment,
+    )
     speech_verification_env = dict(environment)
     speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"
     run(
@@ -707,6 +743,7 @@ def gate_materialized_candidate(
         "dev",
         "pytest",
         "-q",
+        *PYTEST_DURATIONS,
         "tests/providers/test_speech_presence.py",
         cwd=root,
         env=speech_verification_env,
@@ -726,7 +763,7 @@ def gate_materialized_candidate(
     run("uv", "run", "--frozen", "--group", "dev", "mypy", "src", cwd=root, env=environment)
     run_script_mypy(root, environment)
     run(NPM, "ci", "--ignore-scripts", cwd=root / "web", env=environment)
-    run(NPM, "test", cwd=root / "web", env=environment)
+    run(NPM, "test", *VITEST_DURATIONS, cwd=root / "web", env=environment)
     run(NPM, "run", "build", cwd=root / "web", env=environment)
     check_static_parity(root, packaged_static)
     validate_disclosure_manifest(root / "src")

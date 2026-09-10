@@ -1,0 +1,432 @@
+{
+  "version": 1,
+  "python_version": "3.11.15",
+  "windows_build": 26200,
+  "method": "direct async test invocation; parent Popen.wait clock; stderr byte count only",
+  "observations": [
+    {
+      "revision": "9ce11c34f2290b775d29f7bbe0d1f4fa7dd4101b",
+      "tree": "423694e72bfd8118aeee9ac59cf6d778875a745c",
+      "source_sha256": {
+        "tests/test_qualification_checkpoint.py": "31d4f5e0ce9c4664a655c41d3eee5559e071a9cca52c739c311e77620de140a2",
+        "src/hermes_realtime/_qualification.py": "0913e57a136d3a51772ba19a8e510dc5efba6f5718a5b26e43d20454ba372089",
+        "src/hermes_realtime/host_launcher.py": "c1d160097bf8dfd918bb23b8aee3294a96d45f46263634c1537ac46bd136ccad",
+        "uv.lock": "5a0e98cd99264edd8ae464f07599a0e64d4c01ae5bc9474e01771341f44c5bad"
+      },
+      "samples": [
+        {
+          "iteration": 1,
+          "case": "ack_eof",
+          "spawn_ms": 11.107,
+          "exit_code": 1,
+          "wait_ms": 118.104,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 2988.76
+        },
+        {
+          "iteration": 1,
+          "case": "wrong_nonce",
+          "spawn_ms": 12.009,
+          "exit_code": 1,
+          "wait_ms": 115.709,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1003.676
+        },
+        {
+          "iteration": 2,
+          "case": "ack_eof",
+          "spawn_ms": 11.843,
+          "exit_code": 1,
+          "wait_ms": 117.284,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1137.218
+        },
+        {
+          "iteration": 2,
+          "case": "wrong_nonce",
+          "spawn_ms": 11.384,
+          "exit_code": 1,
+          "wait_ms": 119.98,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1035.264
+        },
+        {
+          "iteration": 3,
+          "case": "ack_eof",
+          "spawn_ms": 9.956,
+          "exit_code": 1,
+          "wait_ms": 118.37,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 990.379
+        },
+        {
+          "iteration": 3,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.248,
+          "exit_code": 1,
+          "wait_ms": 97.311,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 943.51
+        },
+        {
+          "iteration": 4,
+          "case": "ack_eof",
+          "spawn_ms": 10.3,
+          "exit_code": 1,
+          "wait_ms": 106.151,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1012.795
+        },
+        {
+          "iteration": 4,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.607,
+          "exit_code": 1,
+          "wait_ms": 108.384,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 959.276
+        },
+        {
+          "iteration": 5,
+          "case": "ack_eof",
+          "spawn_ms": 12.747,
+          "exit_code": 1,
+          "wait_ms": 99.131,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1055.259
+        },
+        {
+          "iteration": 5,
+          "case": "wrong_nonce",
+          "spawn_ms": 9.98,
+          "exit_code": 1,
+          "wait_ms": 94.205,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 988.772
+        },
+        {
+          "iteration": 6,
+          "case": "ack_eof",
+          "spawn_ms": 11.017,
+          "exit_code": 1,
+          "wait_ms": 108.414,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 960.17
+        },
+        {
+          "iteration": 6,
+          "case": "wrong_nonce",
+          "spawn_ms": 15.187,
+          "exit_code": 1,
+          "wait_ms": 107.433,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1054.411
+        },
+        {
+          "iteration": 7,
+          "case": "ack_eof",
+          "spawn_ms": 14.256,
+          "exit_code": 1,
+          "wait_ms": 99.613,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 974.638
+        },
+        {
+          "iteration": 7,
+          "case": "wrong_nonce",
+          "spawn_ms": 9.853,
+          "exit_code": 1,
+          "wait_ms": 113.552,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 999.224
+        },
+        {
+          "iteration": 8,
+          "case": "ack_eof",
+          "spawn_ms": 50.039,
+          "exit_code": 1,
+          "wait_ms": 100.615,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1035.798
+        },
+        {
+          "iteration": 8,
+          "case": "wrong_nonce",
+          "spawn_ms": 9.494,
+          "exit_code": 1,
+          "wait_ms": 104.384,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 938.773
+        },
+        {
+          "iteration": 9,
+          "case": "ack_eof",
+          "spawn_ms": 9.873,
+          "exit_code": 1,
+          "wait_ms": 106.81,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1023.747
+        },
+        {
+          "iteration": 9,
+          "case": "wrong_nonce",
+          "spawn_ms": 9.517,
+          "exit_code": 1,
+          "wait_ms": 103.667,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 944.937
+        },
+        {
+          "iteration": 10,
+          "case": "ack_eof",
+          "spawn_ms": 10.083,
+          "exit_code": 1,
+          "wait_ms": 101.372,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 947.228
+        },
+        {
+          "iteration": 10,
+          "case": "wrong_nonce",
+          "spawn_ms": 13.425,
+          "exit_code": 1,
+          "wait_ms": 111.453,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1011.845
+        }
+      ]
+    },
+    {
+      "revision": "08300b2815b6cbcbc5c624a39a2c991d972d9694",
+      "tree": "d555dfdf7c2a5ad9abe506c7b1504204f1395ea6",
+      "source_sha256": {
+        "tests/test_qualification_checkpoint.py": "31d4f5e0ce9c4664a655c41d3eee5559e071a9cca52c739c311e77620de140a2",
+        "src/hermes_realtime/_qualification.py": "0913e57a136d3a51772ba19a8e510dc5efba6f5718a5b26e43d20454ba372089",
+        "src/hermes_realtime/host_launcher.py": "c1d160097bf8dfd918bb23b8aee3294a96d45f46263634c1537ac46bd136ccad",
+        "uv.lock": "5a0e98cd99264edd8ae464f07599a0e64d4c01ae5bc9474e01771341f44c5bad"
+      },
+      "samples": [
+        {
+          "iteration": 1,
+          "case": "ack_eof",
+          "spawn_ms": 10.644,
+          "exit_code": 1,
+          "wait_ms": 116.676,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1117.853
+        },
+        {
+          "iteration": 1,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.202,
+          "exit_code": 1,
+          "wait_ms": 106.613,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1006.671
+        },
+        {
+          "iteration": 2,
+          "case": "ack_eof",
+          "spawn_ms": 10.424,
+          "exit_code": 1,
+          "wait_ms": 105.45,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 994.654
+        },
+        {
+          "iteration": 2,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.582,
+          "exit_code": 1,
+          "wait_ms": 107.213,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 996.916
+        },
+        {
+          "iteration": 3,
+          "case": "ack_eof",
+          "spawn_ms": 11.127,
+          "exit_code": 1,
+          "wait_ms": 119.827,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 993.338
+        },
+        {
+          "iteration": 3,
+          "case": "wrong_nonce",
+          "spawn_ms": 74.776,
+          "exit_code": 1,
+          "wait_ms": 113.365,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1059.647
+        },
+        {
+          "iteration": 4,
+          "case": "ack_eof",
+          "spawn_ms": 10.951,
+          "exit_code": 1,
+          "wait_ms": 117.938,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1029.812
+        },
+        {
+          "iteration": 4,
+          "case": "wrong_nonce",
+          "spawn_ms": 11.95,
+          "exit_code": 1,
+          "wait_ms": 110.716,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1009.767
+        },
+        {
+          "iteration": 5,
+          "case": "ack_eof",
+          "spawn_ms": 11.329,
+          "exit_code": 1,
+          "wait_ms": 122.008,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1000.621
+        },
+        {
+          "iteration": 5,
+          "case": "wrong_nonce",
+          "spawn_ms": 11.593,
+          "exit_code": 1,
+          "wait_ms": 115.543,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 995.401
+        },
+        {
+          "iteration": 6,
+          "case": "ack_eof",
+          "spawn_ms": 13.798,
+          "exit_code": 1,
+          "wait_ms": 120.008,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1100.168
+        },
+        {
+          "iteration": 6,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.04,
+          "exit_code": 1,
+          "wait_ms": 128.515,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1036.432
+        },
+        {
+          "iteration": 7,
+          "case": "ack_eof",
+          "spawn_ms": 11.245,
+          "exit_code": 1,
+          "wait_ms": 130.471,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1042.217
+        },
+        {
+          "iteration": 7,
+          "case": "wrong_nonce",
+          "spawn_ms": 15.456,
+          "exit_code": 1,
+          "wait_ms": 103.033,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 992.496
+        },
+        {
+          "iteration": 8,
+          "case": "ack_eof",
+          "spawn_ms": 11.59,
+          "exit_code": 1,
+          "wait_ms": 109.091,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1085.716
+        },
+        {
+          "iteration": 8,
+          "case": "wrong_nonce",
+          "spawn_ms": 10.376,
+          "exit_code": 1,
+          "wait_ms": 146.171,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1053.737
+        },
+        {
+          "iteration": 9,
+          "case": "ack_eof",
+          "spawn_ms": 10.737,
+          "exit_code": 1,
+          "wait_ms": 115.79,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1005.957
+        },
+        {
+          "iteration": 9,
+          "case": "wrong_nonce",
+          "spawn_ms": 11.668,
+          "exit_code": 1,
+          "wait_ms": 114.365,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1037.59
+        },
+        {
+          "iteration": 10,
+          "case": "ack_eof",
+          "spawn_ms": 11.49,
+          "exit_code": 1,
+          "wait_ms": 129.335,
+          "stderr_bytes": 2035,
+          "outcome": "passed",
+          "total_ms": 1088.142
+        },
+        {
+          "iteration": 10,
+          "case": "wrong_nonce",
+          "spawn_ms": 80.877,
+          "exit_code": 1,
+          "wait_ms": 126.154,
+          "stderr_bytes": 1376,
+          "outcome": "passed",
+          "total_ms": 1090.457
+        }
+      ]
+    }
+  ]
+}

@@ -18,6 +18,22 @@ jobs:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Qualify Linux browser build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci --ignore-scripts
+          npm test -- --reporter=verbose --slowTestThreshold=100
+          npm run build
+          cd ..
+          git diff --exit-code -- src/hermes_realtime/client/static src/hermes_realtime/evidence/disclosure_manifest_v1.json
+      # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
@@ -100,7 +116,7 @@ jobs:
       # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Provision owner-only Windows test temp
@@ -166,7 +182,7 @@ jobs:
       # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Provision owner-only Windows test temp
@@ -235,8 +251,6 @@ jobs:
               Start-Sleep -Seconds 1
             }
             if (-not $ready) {
-              Get-Content $stdout -ErrorAction SilentlyContinue
-              Get-Content $stderr -ErrorAction SilentlyContinue
               throw 'LiveKit did not become ready on loopback'
             }
             $listeners = @(Get-NetTCPConnection -LocalPort 7880 -State Listen -ErrorAction Stop)
@@ -248,6 +262,14 @@ jobs:
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }
+      - name: Qualify archived deterministic equivalence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run --frozen --group dev python -m scripts.qualify_deterministic_equivalence `
+            --candidate $env:GITHUB_WORKSPACE `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Deterministic equivalence failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |
@@ -255,8 +277,18 @@ jobs:
           $env:HERMES_REALTIME_BROWSER_SELF_ACCEPTANCE = '1'
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER = $env:LIVEKIT_SERVER
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256 = $env:LIVEKIT_SERVER_SHA256
+          $env:HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR = $env:TEMP
           uv run --frozen --group dev --extra browser-acceptance pytest -q tests/integration/test_browser_self_acceptance.py
           if ($LASTEXITCODE -ne 0) { throw "Browser self-acceptance failed with exit code $LASTEXITCODE" }
+      - name: Print sanitized LiveKit failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          python .github/scripts/render_livekit_logs.py `
+            "$env:RUNNER_TEMP/livekit.out" `
+            "$env:RUNNER_TEMP/livekit.err" `
+            "$env:TEMP/browser-livekit.out" `
+            "$env:TEMP/browser-livekit.err"
       - name: Remove owner-only Windows test temp
         if: always()
         shell: pwsh

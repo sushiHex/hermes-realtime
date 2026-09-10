@@ -576,6 +576,7 @@ class _DynamicCall:
 @dataclass(slots=True)
 class _TurnRouting:
     failure: asyncio.Event = field(default_factory=asyncio.Event)
+    dynamic_registered: asyncio.Event = field(default_factory=asyncio.Event)
     error: BaseException | None = None
     terminal: bool = False
     accepted_start: bool = False
@@ -1766,6 +1767,8 @@ class CodexAppServerStreamingInference:
             )
             if routing is not None and routing.failure.is_set():
                 raise RuntimeError("Codex app-server reader failed") from routing.error
+            if routing is not None:
+                routing.dynamic_registered.clear()
             now = asyncio.get_running_loop().time()
             live_calls = tuple(
                 call
@@ -1788,12 +1791,20 @@ class CodexAppServerStreamingInference:
                 if routing is not None
                 else None
             )
+            dynamic_registered = (
+                asyncio.create_task(
+                    routing.dynamic_registered.wait(),
+                    name="codex-app-server-dynamic-registered",
+                )
+                if routing is not None
+                else None
+            )
             try:
                 waiters: tuple[asyncio.Future[object] | asyncio.Task[object], ...]
-                if routing_failure is None:
+                if routing_failure is None or dynamic_registered is None:
                     waiters = (event, reader)
                 else:
-                    waiters = (event, reader, routing_failure)
+                    waiters = (event, reader, routing_failure, dynamic_registered)
                 done, _pending = await asyncio.wait(
                     waiters,
                     timeout=max(0.0, timeout),
@@ -1811,6 +1822,8 @@ class CodexAppServerStreamingInference:
                     raise RuntimeError("Codex app-server reader failed") from routing.error
                 if event in done:
                     return event.result()
+                if dynamic_registered is not None and dynamic_registered in done:
+                    continue
                 if not live_calls:
                     raise TimeoutError("Codex app-server event stream timed out")
                 tasks: set[asyncio.Task[None]] = set()
@@ -1836,6 +1849,10 @@ class CodexAppServerStreamingInference:
                     routing_failure.cancel()
                     with suppress(asyncio.CancelledError):
                         await routing_failure
+                if dynamic_registered is not None and not dynamic_registered.done():
+                    dynamic_registered.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await dynamic_registered
 
     async def _send(self, message: Mapping[str, object]) -> None:
         transport = self._transport
@@ -2030,6 +2047,7 @@ class CodexAppServerStreamingInference:
                 )
                 started_call.response_ready.set()
             self._dynamic_calls[identity] = started_call
+            routing.dynamic_registered.set()
             return
 
         call = self._dynamic_calls.get(identity)

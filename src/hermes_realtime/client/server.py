@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
+import re
 import ssl
 from pathlib import Path
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from .http import BrowserBootstrapApplication, BrowserBootstrapResponse
 from .loopback import LoopbackPeerAddress
@@ -24,11 +27,66 @@ _STATIC_PATHS = {
     "/assets/app.js": ("assets/app.js", "text/javascript; charset=utf-8"),
     "/assets/styles.css": ("assets/styles.css", "text/css; charset=utf-8"),
 }
-_CSP = (
-    "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self' ws: wss:; media-src 'self' blob:; img-src 'self'; "
-    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+_DNS_HOSTNAME = re.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\."
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
 )
+_ENDS_IN_NUMBER = re.compile(r"(?:[0-9]+|0[xX][0-9A-Fa-f]*)\Z")
+
+
+def _livekit_http_origin(value: object) -> str:
+    error = "LiveKit URL must be an exact WebSocket origin"
+    if type(value) is not str:
+        raise TypeError(error)
+    try:
+        if (
+            any(ord(character) < 33 or ord(character) > 126 for character in value)
+            or "\\" in value
+            or "?" in value
+            or "#" in value
+        ):
+            raise ValueError
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError(error) from None
+    if (
+        parsed.scheme not in {"ws", "wss"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc.endswith(":")
+        or "%" in hostname
+    ):
+        raise ValueError(error)
+    try:
+        canonical_address = ipaddress.ip_address(hostname).compressed
+    except ValueError:
+        if (
+            _DNS_HOSTNAME.fullmatch(hostname) is None
+            or _ENDS_IN_NUMBER.fullmatch(hostname.rsplit(".", 1)[-1]) is not None
+        ):
+            raise ValueError(error) from None
+        canonical_host = hostname.lower()
+    else:
+        canonical_host = f"[{canonical_address}]" if ":" in canonical_address else canonical_address
+    scheme = "http" if parsed.scheme == "ws" else "https"
+    port_suffix = "" if port in {None, 80 if scheme == "http" else 443} else f":{port}"
+    return f"{scheme}://{canonical_host}{port_suffix}"
+
+
+def _content_security_policy(livekit_url: object) -> str:
+    diagnostic_origin = _livekit_http_origin(livekit_url)
+    return (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        f"connect-src 'self' ws: wss: {diagnostic_origin}; "
+        "media-src 'self' blob:; img-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
 
 
 class BrowserHttpServer:
@@ -39,6 +97,7 @@ class BrowserHttpServer:
         *,
         application: BrowserBootstrapApplication,
         static_root: Path,
+        livekit_url: str,
         host: str = "127.0.0.1",
         port: int = 8765,
         lan_mode: bool = False,
@@ -64,6 +123,7 @@ class BrowserHttpServer:
             raise TypeError("ssl_context must be an exact SSLContext")
 
         root = static_root.resolve(strict=True)
+        csp = _content_security_policy(livekit_url)
         static: dict[str, tuple[bytes, str]] = {}
         for request_path, (relative_path, content_type) in _STATIC_PATHS.items():
             path = root / relative_path
@@ -78,6 +138,7 @@ class BrowserHttpServer:
 
         self._application = application
         self._static = MappingProxyType(static)
+        self._csp = csp
         self._host = host
         self._configured_port = port
         self._ssl_context = ssl_context
@@ -203,7 +264,7 @@ class BrowserHttpServer:
             payload, content_type = self._static[target]
             headers_out = {
                 "cache-control": "no-store",
-                "content-security-policy": _CSP,
+                "content-security-policy": self._csp,
                 "content-type": content_type,
                 "referrer-policy": "no-referrer",
                 "x-content-type-options": "nosniff",

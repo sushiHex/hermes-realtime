@@ -246,6 +246,7 @@ class BrowserClientRuntime:
         self._server = BrowserHttpServer(
             application=application,
             static_root=static_root,
+            livekit_url=connection.url,
             host=host,
             port=port,
             lan_mode=lan_mode,

@@ -86,6 +86,7 @@ import {
   mountEvidenceControls,
 } from "./evidence-controls";
 import { mountSearchEgressControls } from "./search-egress-controls";
+import { mountTypedComposerEnterSubmission } from "./typed-composer";
 import {
   parseBootstrapCredential,
   parseCaptureStatus,
@@ -134,6 +135,7 @@ const readinessHeadline = element<HTMLHeadingElement>("readiness-headline");
 const readinessDetail = element<HTMLParagraphElement>("readiness-detail");
 const markers = element<HTMLOListElement>("markers");
 const remoteAudio = element<HTMLAudioElement>("remote-audio");
+mountTypedComposerEnterSubmission(typedInput, typedForm, sendButton);
 const evidenceControls = mountEvidenceControls(document, {
   submit: submitEvidenceControl,
 });

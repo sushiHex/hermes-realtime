@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 from runpy import run_path
@@ -24,6 +25,41 @@ def _logical_requirements(path: Path) -> list[str]:
             current = ""
     assert not current
     return logical
+
+
+def _gate_test_commands(source: str) -> list[tuple[str, set[str]]]:
+    commands: list[tuple[str, set[str]]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run"
+        ):
+            continue
+        literal_args = {
+            argument.value
+            for argument in node.args
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+        }
+        if "pytest" in literal_args:
+            kind = "pytest"
+        elif "vitest" in literal_args or (
+            len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "NPM"
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "test"
+        ):
+            kind = "vitest"
+        else:
+            continue
+        timing_splats = {
+            argument.value.id
+            for argument in node.args
+            if isinstance(argument, ast.Starred) and isinstance(argument.value, ast.Name)
+        }
+        commands.append((kind, timing_splats))
+    return commands
 
 
 def test_cuda_worker_installation_is_hash_closed() -> None:
@@ -60,6 +96,20 @@ def test_browser_bundle_legal_notices_are_release_gated() -> None:
     assert '"package-lock.json"' in build_script
     assert '"assets/app.js.LEGAL.txt"' in build_script
     assert '"hermes_realtime/client/static/assets/app.js.LEGAL.txt"' in release_gate
+
+
+def test_linux_candidate_wheel_requires_browser_build_and_committed_asset_parity() -> None:
+    workflow = _release_workflow()
+    wheel = workflow.split("  candidate-wheel:\n", maxsplit=1)[1].split(
+        "  linux-null-capture:\n", maxsplit=1,
+    )[0]
+
+    assert 'node-version: "22.22.2"' in wheel
+    assert "npm ci --ignore-scripts" in wheel
+    assert "npm test -- --reporter=verbose --slowTestThreshold=100" in wheel
+    assert "npm run build" in wheel
+    assert "git diff --exit-code -- src/hermes_realtime/client/static" in wheel
+    assert wheel.index("npm run build") < wheel.index("uv build --wheel")
 
 
 def test_native_release_gate_runs_the_synthetic_full_host_audio_tracer() -> None:
@@ -106,6 +156,51 @@ def test_release_gate_runs_real_speech_presence_calibration_extra() -> None:
     assert 'speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"' in script
 
 
+def test_every_gate_suite_records_per_test_durations() -> None:
+    # Issue #13: timeout diagnostics are not a consistent source of comparable
+    # healthy-run timing; some restate only the configured authority, others
+    # also report elapsed failure duration. The durations of runs that *passed*
+    # are the baseline a recurrence is measured against, so they are captured
+    # on every run rather than switched on after a third failure.
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "scripts" / "release_gate.py").read_text(encoding="utf-8")
+    release_gate = run_path(str(root / "scripts" / "release_gate.py"))
+
+    # Uncapped with an explicit floor. A slowest-N tail ranks raw phase
+    # duration and can drop a shorter phase that sits behind a narrower internal
+    # bound; retaining every phase above the floor is what keeps a recurrence
+    # comparable with healthy runs.
+    assert release_gate["PYTEST_DURATIONS"] == ("--durations=0", "--durations-min=0.005")
+    assert release_gate["VITEST_DURATIONS"] == (
+        "--",
+        "--reporter=verbose",
+        "--slowTestThreshold=100",
+    )
+
+    commands = _gate_test_commands(script)
+
+    # Pin the current suite inventory and timing authority together. A new test
+    # command therefore requires an explicit policy-test update, and a command
+    # without the appropriate shared timing arguments fails independently.
+    assert len(commands) == 4
+    assert sum(kind == "pytest" for kind, _ in commands) == 3
+    assert sum(kind == "vitest" for kind, _ in commands) == 1
+    assert all(
+        ("PYTEST_DURATIONS" if kind == "pytest" else "VITEST_DURATIONS") in splats
+        for kind, splats in commands
+    )
+
+
+def test_gate_timing_inventory_recognizes_direct_vitest_launchers() -> None:
+    commands = _gate_test_commands(
+        'run("npx", "vitest", "run")\n'
+        'run("uv", "run", "pytest", "-q")\n'
+        'run(NPM, "test")\n'
+    )
+
+    assert [kind for kind, _ in commands] == ["vitest", "pytest", "vitest"]
+
+
 def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
     workflow = _release_workflow()
     node24_pins = (
@@ -115,7 +210,7 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
         "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",  # v10.0.1
     )
 
-    expected_uses = (4, 4, 2, 3)
+    expected_uses = (4, 4, 3, 3)
     for pin, expected_count in zip(node24_pins, expected_uses, strict=True):
         assert workflow.count(f"uses: {pin}") == expected_count
     assert workflow.count("prune-cache: true") == 3
@@ -273,6 +368,49 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     assert "tests/integration/test_browser_self_acceptance.py" in browser_step
 
 
+def test_native_failure_prints_only_bounded_sanitized_logs_from_each_owned_server() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = _release_workflow()
+    native_job = workflow.split("  native-livekit:", maxsplit=1)[1]
+    integration_marker = "      - name: Run native LiveKit integration gate"
+    browser_marker = "      - name: Run real-browser self-acceptance gate"
+    diagnostics_marker = "      - name: Print sanitized LiveKit failure diagnostics"
+    cleanup_marker = "      - name: Remove owner-only Windows test temp"
+
+    assert native_job.index(integration_marker) < native_job.index(browser_marker)
+    assert native_job.index(browser_marker) < native_job.index(diagnostics_marker)
+    assert native_job.index(diagnostics_marker) < native_job.index(cleanup_marker)
+    browser_step = native_job.split(browser_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert "$env:HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR = $env:TEMP" in browser_step
+
+    diagnostics = native_job.split(diagnostics_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert "if: failure()" in diagnostics
+    assert diagnostics.count(".github/scripts/render_livekit_logs.py") == 1
+    for path in (
+        "$env:RUNNER_TEMP/livekit.out",
+        "$env:RUNNER_TEMP/livekit.err",
+        "$env:TEMP/browser-livekit.out",
+        "$env:TEMP/browser-livekit.err",
+    ):
+        assert path in diagnostics
+
+    assert "Get-Content $stdout" not in native_job
+    assert "Get-Content $stderr" not in native_job
+
+    browser_source = (
+        root / "tests" / "integration" / "test_browser_self_acceptance.py"
+    ).read_text(encoding="utf-8")
+    assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR")' in browser_source
+    assert '"browser-livekit.out"' in browser_source
+    assert '"browser-livekit.err"' in browser_source
+    assert "stdout=subprocess.DEVNULL" not in browser_source
+    assert "stderr=subprocess.DEVNULL" not in browser_source
+
+
 def test_browser_self_acceptance_accepts_only_explicit_livekit_executable_override() -> None:
     source = (
         Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py"
@@ -365,6 +503,10 @@ def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None
     required = release_gate["required_sdist_paths"]()
     task12_paths = {
         "scripts/qualify_evidence_slice_zero.py",
+        "scripts/deterministic_equivalence.py",
+        "scripts/equivalence_process.py",
+        "scripts/equivalence_worker.py",
+        "scripts/qualify_deterministic_equivalence.py",
         "scripts/qualify_hermes_v020_pluginmanager.py",
         "scripts/schemas/benchmark-machine-v1.schema.json",
         "scripts/schemas/benchmark-report-v1.schema.json",
@@ -379,6 +521,10 @@ def test_release_gate_registers_all_task12_schemas_and_runners_exactly() -> None
     typecheck_block = source.split("script_type_env =", 1)[1].split("cwd=root", 1)[0]
     for runner in (
         '"scripts/qualify_evidence_slice_zero.py"',
+        '"scripts/deterministic_equivalence.py"',
+        '"scripts/equivalence_process.py"',
+        '"scripts/equivalence_worker.py"',
+        '"scripts/qualify_deterministic_equivalence.py"',
         '"scripts/qualify_hermes_v020_pluginmanager.py"',
     ):
         assert typecheck_block.count(runner) == 1
