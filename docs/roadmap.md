@@ -31,9 +31,10 @@ remain integration coverage to examine before adding another harness. Revocation
 now has a producer under [issue #29](https://github.com/sushiHex/hermes-realtime/issues/29);
 the [capacity rollover producer](capacity-rollover.md) adds real session-budget
 transition coverage under [issue #33](https://github.com/sushiHex/hermes-realtime/issues/33).
-Seventeen scenarios remain unavailable. Continue with the over-budget turn, then
-crash recovery/purge and owned close, preserving the existing
-scenario IDs and their acceptance contracts.
+The [capture admission overflow producer](over-budget-turn.md) adds durable
+exclusion and rejected-source absence under [issue #35](https://github.com/sushiHex/hermes-realtime/issues/35).
+Sixteen scenarios remain unavailable. Continue with crash recovery/purge and
+owned close, preserving the existing scenario IDs and their acceptance contracts.
 
 Keep each implementation change independently reviewable. For milestone 2, group
 work by existing ownership boundaries: consent/revocation, bounded admission,

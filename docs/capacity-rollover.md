@@ -161,7 +161,7 @@ source equivalence and revocation.
 This qualifies one successful session-capacity transition. Queue saturation,
 cumulative turn-budget overflow, crash recovery, and physical audibility remain
 separate claims. The inherited development dependencies do not establish an
-offline installed dependency closure or native-library provenance. Seventeen
+offline installed dependency closure or native-library provenance. Sixteen
 governed producers and the remaining installed and human-assisted prerequisites
 are still unavailable or unqualified; these partial results cannot establish an
 accepted full `qualification-report-v1`.

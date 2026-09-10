@@ -31,11 +31,11 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers three real producers,
+The `SCENARIO_REGISTRY_V1` now registers four real producers,
 [`deterministic_equivalence`](deterministic-equivalence.md),
-[`revoke_race`](revoke-race.md), and [`capacity_rollover`](capacity-rollover.md),
-with **17 governed producers still explicitly
-unavailable**. The source-only equivalence producer
+[`revoke_race`](revoke-race.md), [`capacity_rollover`](capacity-rollover.md),
+and [`over_budget_turn`](over-budget-turn.md), with **16 governed producers still
+explicitly unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
 The native CI job invokes it against the checked-out committed candidate and
@@ -65,6 +65,16 @@ persisted content equality, continued conversation, and owned cleanup. The
 [implementation issue](https://github.com/sushiHex/hermes-realtime/issues/33)
 records exact candidate and run evidence. This scenario does not qualify queue
 saturation or cumulative turn-budget overflow.
+
+The packaged [capture overflow producer](over-budget-turn.md) exceeds the real
+64-record ordinary queue limit while conversation continues. Its independent
+validator binds the persisted prefix to accepted source, requires incomplete
+evidence to remain excluded, and scans the closed store for rejected source.
+Admission permanently marks a lost one-shot publication as incomplete; completed
+conversation retires only its exact evidence lease and advances pending
+revocation. Capture remains disabled by default. [Issue #35](https://github.com/sushiHex/hermes-realtime/issues/35)
+records exact qualification evidence. Cumulative 16 MiB turn-quota overflow
+remains unqualified.
 
 The [registry tests](../tests/test_qualify_evidence_slice_zero.py) preserve the
 remaining refusal contract. These producers cannot generate an accepted full

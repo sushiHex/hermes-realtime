@@ -3000,6 +3000,7 @@ class EvidenceAdmissionControllerV1:
     def settle_spawn_failed(self, lease: EvidenceTurnLease) -> AppendDisposition:
         """Atomically retire an admitted turn whose response task could not spawn."""
 
+        retired_tainted = False
         try:
             disposition: AppendDisposition
             with self._admission_lock:
@@ -3014,6 +3015,9 @@ class EvidenceAdmissionControllerV1:
                     or not self._lease_lineage_matches_locked(lease)
                 ):
                     return AppendDisposition.INVALID_AUTHORITY
+                if self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
                 cause_disposition = self.record_terminal_cause(
                     lease.terminal_cause,
                     TerminalReason.TASK_SPAWN_FAILED,
@@ -3091,6 +3095,9 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                self._advance_revoke_finalization_if_ready()
 
     def settle_completed(
         self,
@@ -3101,8 +3108,9 @@ class EvidenceAdmissionControllerV1:
         transport_confirmed_full_count: int,
         assistant_delivery_context_recorded: bool,
     ) -> AppendDisposition:
-        """Atomically settle one successfully closed evidence turn."""
+        """Settle completed conversation or retire its incomplete capture lease."""
 
+        retired_tainted = False
         try:
             claimed: _AdmissionRolloverPreparationV1 | None = None
             callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
@@ -3116,8 +3124,12 @@ class EvidenceAdmissionControllerV1:
                     or state.snapshot
                     or state.settlement_attempted
                     or not self._lease_lineage_matches_locked(lease)
-                    or transport_confirmed_full_count != state.transport_confirmed_full_count
                 ):
+                    return AppendDisposition.INVALID_AUTHORITY
+                if self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
+                if transport_confirmed_full_count != state.transport_confirmed_full_count:
                     return AppendDisposition.INVALID_AUTHORITY
                 cause = self.record_terminal_cause(
                     lease.terminal_cause,
@@ -3196,6 +3208,11 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                # A tainted retirement queues no terminal records whose writer
+                # completion could otherwise advance pending revocation.
+                self._advance_revoke_finalization_if_ready()
 
     def settle_terminal(
         self,
@@ -3205,8 +3222,9 @@ class EvidenceAdmissionControllerV1:
         started_chunk_count: int,
         assistant_delivery_context_recorded: bool,
     ) -> AppendDisposition:
-        """Atomically settle one turn from its complete recorded cause set."""
+        """Settle recorded terminal causes or retire incomplete capture."""
 
+        retired_tainted = False
         try:
             claimed: _AdmissionRolloverPreparationV1 | None = None
             callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
@@ -3222,6 +3240,9 @@ class EvidenceAdmissionControllerV1:
                     or not self._lease_lineage_matches_locked(lease)
                 ):
                     return AppendDisposition.INVALID_AUTHORITY
+                if self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
                 context_committed = assistant_delivery_context_recorded
                 resolution = self.freeze_and_resolve_terminal_causes(
                     lease,
@@ -3283,6 +3304,25 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                self._advance_revoke_finalization_if_ready()
+
+    def _retire_tainted_turn_locked(self, lease: EvidenceTurnLease, state: _LeaseState) -> bool:
+        """Release an already-validated live lease without publishing incomplete evidence."""
+
+        if not self._session_tainted:
+            return False
+        cause_state = self._cause_states.pop(lease.terminal_cause, None)
+        if cause_state is not None:
+            # Reports that already retained this state must also fail closed.
+            with cause_state.lock:
+                cause_state.frozen = True
+        state.settlement_attempted = True
+        self._leases.pop(lease, None)
+        with self._credit_lock:
+            self._release_unused_terminal_credits_locked(state.terminal_reservation)
+        return True
 
     def try_admit_generated(
         self,
@@ -3348,6 +3388,8 @@ class EvidenceAdmissionControllerV1:
                     state.event_count += 1
                     state.canonical_bytes += size
                     self._apply_turn_event_locked(state, generated)
+                elif disposition is AppendDisposition.DROPPED_CAPACITY:
+                    self._taint_locked(TaintCode.ADMISSION_GAP)
                 return disposition
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -3500,6 +3542,8 @@ class EvidenceAdmissionControllerV1:
                     state.event_count += 1
                     state.canonical_bytes += size
                     self._apply_turn_event_locked(state, snapshot)
+                elif disposition is AppendDisposition.DROPPED_CAPACITY:
+                    self._taint_locked(TaintCode.ADMISSION_GAP)
                 return disposition
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -3541,6 +3585,7 @@ class EvidenceAdmissionControllerV1:
     ) -> AppendDisposition:
         """Append one exact turn transition without waiting for its writer."""
 
+        retired_tainted = False
         try:
             with self._admission_lock:
                 if not self._enabled:
@@ -3558,6 +3603,12 @@ class EvidenceAdmissionControllerV1:
                 exact_snapshot = _copy_snapshot(snapshot)
                 if not self._turn_event_is_valid_locked(lease, state, exact_snapshot):
                     return AppendDisposition.INVALID_AUTHORITY
+                if exact_snapshot.event_kind in (
+                    EventKind.TURN_SNAPSHOT,
+                    EventKind.TURN_SETTLED,
+                ) and self._retire_tainted_turn_locked(lease, state):
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
                 if exact_snapshot.event_kind is EventKind.TURN_SETTLED:
                     terminal_taint = self._terminal_resolution_taint_locked(
                         lease,
@@ -3622,6 +3673,9 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                self._advance_revoke_finalization_if_ready()
 
     def _try_reserve_turn(
         self,

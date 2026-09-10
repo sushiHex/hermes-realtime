@@ -1,7 +1,7 @@
 """Strict qualification input/report validation and closed scenario registration.
 
 Input validation reopens direct and transitive artifacts without launching a
-process. The registered source-equivalence and packaged-revocation producers own their
+process. The registered source-equivalence and packaged producers own their
 execution boundaries; other scenarios refuse execution until their producers exist.
 """
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from scripts.candidate_wheel import VerifiedCandidateWheelV1
     from scripts.capacity_rollover import ObservedCapacityRolloverV1
     from scripts.deterministic_equivalence import ObservedEquivalenceV1
+    from scripts.over_budget_turn import ObservedOverBudgetTurnV1
     from scripts.revoke_race import ObservedRevokeRaceV1
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
@@ -275,12 +276,48 @@ class CapacityRolloverRegistrationV1:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class OverBudgetTurnRegistrationV1:
+    """The packaged capture admission overflow producer at its unchanged canonical ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.OVER_BUDGET_TURN
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not OverBudgetTurnRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.OVER_BUDGET_TURN
+        ):
+            raise TypeError("capture admission overflow registration must be exact")
+
+    def produce(
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+        *,
+        livekit_executable: Path,
+        livekit_sha256: str,
+    ) -> ObservedOverBudgetTurnV1:
+        if self is not SCENARIO_REGISTRY_V1[12]:
+            raise ValueError("capture admission overflow producer registration is not canonical")
+        from scripts.over_budget_turn import produce_over_budget_turn_v1
+
+        return produce_over_budget_turn_v1(
+            archive,
+            identity,
+            wheel,
+            livekit_executable=livekit_executable,
+            livekit_sha256=livekit_sha256,
+        )
+
+
 _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
     scenario for scenario in _SCENARIO_IDS_V1
     if scenario not in {
         ScenarioIdV1.DETERMINISTIC_EQUIVALENCE,
         ScenarioIdV1.REVOKE_RACE,
         ScenarioIdV1.CAPACITY_ROLLOVER,
+        ScenarioIdV1.OVER_BUDGET_TURN,
     }
 )
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
@@ -294,12 +331,14 @@ UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
 DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistrationV1()
 REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
 CAPACITY_ROLLOVER_REGISTRATION_V1 = CapacityRolloverRegistrationV1()
+OVER_BUDGET_TURN_REGISTRATION_V1 = OverBudgetTurnRegistrationV1()
 
 SCENARIO_REGISTRY_V1 = (
     DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
     *UNAVAILABLE_SCENARIO_REGISTRY_V1[:9],
     REVOKE_RACE_REGISTRATION_V1,
     CAPACITY_ROLLOVER_REGISTRATION_V1,
+    OVER_BUDGET_TURN_REGISTRATION_V1,
     *UNAVAILABLE_SCENARIO_REGISTRY_V1[9:],
 )
 
