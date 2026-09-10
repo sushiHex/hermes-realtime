@@ -14,7 +14,12 @@ from scripts.candidate_source_archive_oracle import VerifiedCandidateSourceArchi
 from scripts.candidate_wheel import VerifiedCandidateWheelV1
 from scripts.deterministic_equivalence import _keys, _require
 from scripts.packaged_scenario import PackagedScenarioEvidenceV1
-from scripts.spool_crash_oracle import erasure_receipt_digest_v1, initialization_digest_v1
+from scripts.spool_crash_oracle import (
+    checkpoint_sentinel_digest_v1,
+    erasure_receipt_digest_v1,
+    erasure_request_digest_v1,
+    initialization_digest_v1,
+)
 from scripts.storage_process import (
     _run_storage_worker,
     _storage_archive,
@@ -179,13 +184,25 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             for name, options in (
                 ("sessions", {"open", "sealed"}),
                 ("epochs", {"active", "closed", "revoked"}),
-                ("erasures", {"pending", "logical_deleted"}),
             ):
                 _require(
                     type(db[name]) is list
                     and len(db[name]) <= 2
                     and all(type(v) is str and v in options for v in db[name]),
                     "storage state values differ",
+                )
+            _require(
+                type(db["erasures"]) is list and len(db["erasures"]) <= 1,
+                "storage erasure request count differs",
+            )
+            for request in db["erasures"]:
+                _require(
+                    type(request) is list
+                    and len(request) == 2
+                    and request[0] in {"pending", "logical_deleted"}
+                    and type(request[1]) is str
+                    and re.fullmatch("[0-9a-f]{64}", request[1]) is not None,
+                    "storage erasure request authority differs",
                 )
             _require(
                 type(db["seals"]) is list and len(db["seals"]) == db["sessions"].count("sealed"),
@@ -224,6 +241,18 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
     )
     _require(before["sentinel"] == expected_sentinel, "recovery entry sentinel differs")
     _validate_checkpoint(point, before["database"])
+    if before["database"]["schema"]:
+        request_state = "pending" if index == 5 else "logical_deleted" if index in {6, 7} else None
+        expected_requests = (
+            []
+            if request_state is None
+            else [[request_state, erasure_request_digest_v1(request_state)]]
+        )
+        _require(
+            before["database"]["erasures"] == expected_requests
+            and before["database"]["tombstones"] == [],
+            "checkpoint erasure authority differs",
+        )
     if index in {19, 24}:
         _require(
             before["files"].get(_DATABASE_NAMES[0]) == hashlib.sha256(b"").hexdigest(),
@@ -366,17 +395,23 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
         _require(db["tombstones"] == expected_receipts, "storage erasure receipt differs")
     elif disposition == "faulted":
         _require(before == after, "refused recovery mutated durable state")
-        if index == 5:
-            _require(
-                after["database"]["erasures"] == ["pending"],
-                "revocation recovery lost pending authority",
-            )
     else:
         _require(
             set(after["files"]) == ({_MARKER} if index >= 13 else set())
             and after["database"] == {"schema": False}
             and after["sentinel"] == "no_final_sentinel",
             "absent recovery retained initialization artifacts",
+        )
+    for state, recovered in ((before, False), (after, True)):
+        if _MARKER in state["files"]:
+            _require(
+                state["files"][_MARKER] == initialization_digest_v1("root_marker", "full_write"),
+                "checkpoint root marker bytes differ",
+            )
+        _require(
+            state["files"].get(_SENTINEL)
+            == checkpoint_sentinel_digest_v1(index, clock, after=recovered),
+            "checkpoint sentinel authority bytes differ",
         )
 
 

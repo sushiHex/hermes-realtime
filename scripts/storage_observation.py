@@ -11,7 +11,11 @@ from typing import Any
 
 from scripts.equivalence_process import _require
 from scripts.evidence_protocol_oracle import canonical_json_bytes, hre1_record_hash
-from scripts.spool_crash_oracle import validate_spool_snapshot_v1
+from scripts.spool_crash_oracle import (
+    initialization_digest_v1,
+    sentinel_state_v1,
+    validate_spool_snapshot_v1,
+)
 
 
 def _digest(raw: bytes) -> str:
@@ -163,7 +167,10 @@ def _database_state(database: Path) -> dict[str, Any]:
         ).fetchall()
         _require(len(tombstones) <= 2, "storage tombstone bound differs")
         erasures = connection.execute(
-            "SELECT state FROM erasure_requests ORDER BY rowid"
+            "SELECT erasure_request_id,scope_kind,scope_key,requested_at_utc,reason_code,"
+            "state,control_sequence,control_fingerprint_hash,ttl_consent_epoch_id,"
+            "ttl_expires_at_utc,last_admission_ordinal,final_admission_ordinal,resume_state,"
+            "erased_session_count,erased_event_count FROM erasure_requests ORDER BY rowid"
         ).fetchall()
         _require(len(erasures) <= 2, "storage erasure request bound differs")
         return {
@@ -177,7 +184,7 @@ def _database_state(database: Path) -> dict[str, Any]:
                 [row[3], row[11], row[12], _digest(canonical_json_bytes(list(row)))]
                 for row in tombstones
             ],
-            "erasures": [row[0] for row in erasures],
+            "erasures": [[row[5], _digest(canonical_json_bytes(list(row)))] for row in erasures],
             "logical_digest": _digest("\n".join(connection.iterdump()).encode("utf-8")),
         }
 
@@ -186,8 +193,6 @@ def observe_storage(root: Path) -> dict[str, Any]:
     from hermes_realtime.evidence.storage_security import (
         EvidenceArtifactManifestV1,
         WindowsStorageProbeV1,
-        decode_sentinel_image,
-        parse_root_marker,
     )
 
     manifest = EvidenceArtifactManifestV1()
@@ -215,14 +220,13 @@ def observe_storage(root: Path) -> dict[str, Any]:
         )
         files[path.name] = _digest(path.read_bytes())
     sentinel = root / manifest.sentinel
-    state = (
-        decode_sentinel_image(sentinel.read_bytes()).active.state.value
-        if sentinel.exists()
-        else "no_final_sentinel"
-    )
+    state = sentinel_state_v1(sentinel.read_bytes()) if sentinel.exists() else "no_final_sentinel"
     marker = root / manifest.root_marker
     if marker.exists():
-        parse_root_marker(marker.read_bytes())
+        _require(
+            _digest(marker.read_bytes()) == initialization_digest_v1("root_marker", "full_write"),
+            "root marker differs from its independent fixture image",
+        )
     database = root / manifest.database
     readable = database.exists() and state not in {"full_purge_pending"}
     db = _database_state(database) if readable else {"schema": False}

@@ -159,10 +159,26 @@ def test_independent_reader_revalidates_real_committed_seals(
         _database_state(database)
 
 
+def _pin_authority_images(row, point):
+    from scripts.spool_crash_matrix import FAILPOINTS_V1
+    from scripts.spool_crash_oracle import checkpoint_sentinel_digest_v1, initialization_digest_v1
+
+    for key in ("before", "after"):
+        files = row[key]["files"]
+        marker = ".hermes-realtime-evidence-root-v1"
+        if marker in files:
+            files[marker] = initialization_digest_v1("root_marker", "full_write")
+        if "capture-v1.owner" in files:
+            files["capture-v1.owner"] = checkpoint_sentinel_digest_v1(
+                FAILPOINTS_V1.index(point), "caught-up", after=key == "after"
+            )
+    return row
+
+
 def _purge_observation():
     import hashlib
 
-    return {
+    row = {
         "before": {
             "files": {
                 ".hermes-realtime-evidence-root-v1": "a" * 64,
@@ -184,6 +200,7 @@ def _purge_observation():
         "disposition": "purge_completed",
         "baseline": {},
     }
+    return _pin_authority_images(row, "after_full_purge_absence_verify")
 
 
 @pytest.mark.parametrize(
@@ -303,6 +320,7 @@ def test_recovered_seal_requires_a_cleared_purge_latch(purge_required) -> None:
         },
     }
     row = {"before": state, "after": deepcopy(state), "disposition": "recovered", "baseline": {}}
+    _pin_authority_images(row, "after_seal_commit_before_ack")
     _validate_recovery("after_seal_commit_before_ack", "caught-up", row)
     row["after"]["database"]["purge_required"] = purge_required
     with pytest.raises(ValueError):
@@ -322,6 +340,7 @@ def test_database_create_checkpoint_requires_the_empty_file_digest(point) -> Non
             state["files"]["recreation-decoy.bin"] = decoy
     row["before"]["sentinel"] = "first_create_pending"
     row["before"]["files"]["capture-v1.sqlite3"] = hashlib.sha256(b"").hexdigest()
+    _pin_authority_images(row, point)
     _validate_recovery(point, "caught-up", row)
     row["before"]["files"]["capture-v1.sqlite3"] = "d" * 64
     with pytest.raises(ValueError):
@@ -349,6 +368,7 @@ def test_pre_latch_rollback_requires_the_original_logical_database(point) -> Non
         "logical_digest": "e" * 64,
     }
     row["baseline"] = {"databaseSha256": "e" * 64, "sentinelSha256": "f" * 64}
+    _pin_authority_images(row, point)
     _validate_recovery(point, "caught-up", row)
     row["before"]["database"]["logical_digest"] = "a" * 64
     with pytest.raises(ValueError):
@@ -375,6 +395,7 @@ def test_completed_initialization_removes_its_temporary(owner, stage) -> None:
     del after["files"][name + ".init"]
     row = {"before": before, "after": after, "disposition": "absent", "baseline": {}}
     point = f"after_{owner}_init_{stage}"
+    _pin_authority_images(row, point)
     _validate_recovery(point, "caught-up", row)
     after["files"][name + ".init"] = "a" * 64
     with pytest.raises(ValueError):
@@ -415,6 +436,7 @@ def test_initialization_requires_the_exact_image_at_each_boundary(owner, stage) 
         "baseline": {},
     }
     point = f"after_{owner}_init_{stage}"
+    _pin_authority_images(row, point)
     _validate_recovery(point, "caught-up", row)
     before["files"][temporary] = hashlib.sha256(b"malformed-image").hexdigest()
     if stage == "partial_write":
@@ -463,3 +485,106 @@ def test_recovery_receipt_cannot_change_its_erased_epoch_or_authority(tmp_path, 
     row["after"] = observe_storage(root)
     with pytest.raises(ValueError):
         _validate_recovery("before_begin", "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize(
+    "field",
+    ["scope_key", "erasure_request_id", "control_fingerprint_hash", "last_admission_ordinal"],
+)
+def test_pending_revocation_preserves_the_complete_accepted_authority(tmp_path, field) -> None:
+    import sqlite3
+
+    from scripts.spool_crash_matrix import _validate_recovery
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+        request, _ = driver._revoke_commands()
+        assert spool.commit_revoke_request(request).value == "revoke_durably_scheduled"
+    finally:
+        spool.close()
+    root = tmp_path / "evidence"
+    state = observe_storage(root)
+    row = {"before": state, "after": state, "disposition": "faulted", "baseline": {}}
+    _validate_recovery("after_revoke_request_commit", "caught-up", row)
+    values = {
+        "scope_key": "90000000-0000-4000-8000-000000000003",
+        "erasure_request_id": "90000000-0000-4000-8000-000000000003",
+        "control_fingerprint_hash": "ef" * 32,
+        "last_admission_ordinal": 3,
+    }
+    with sqlite3.connect(root / "capture-v1.sqlite3") as connection:
+        trigger = connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql LIKE ?",
+            ("%erasure request authority is immutable%",),
+        ).fetchone()
+        connection.execute(f"DROP TRIGGER {trigger[0]}")
+        connection.execute(f"UPDATE erasure_requests SET {field}=?", (values[field],))
+        connection.execute(trigger[1])
+    changed = observe_storage(root)
+    row.update(before=changed, after=changed)
+    with pytest.raises(ValueError):
+        _validate_recovery("after_revoke_request_commit", "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+def test_final_authority_reader_does_not_call_candidate_parsers(tmp_path, monkeypatch) -> None:
+    from hermes_realtime.evidence import storage_security
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+    finally:
+        spool.close()
+
+    def refused(*args, **kwargs):
+        raise AssertionError("the candidate cannot supply its own authority decoder")
+
+    monkeypatch.setattr(storage_security, "decode_sentinel_image", refused)
+    monkeypatch.setattr(storage_security, "parse_root_marker", refused)
+    assert observe_storage(tmp_path / "evidence")["sentinel"] == "clear"
+
+
+@pytest.mark.parametrize("offset", [8, 12, 25, 48, 232, 273, 296, 511])
+def test_independent_sentinel_reader_rejects_corrupt_or_noncanonical_slots(offset) -> None:
+    from hermes_realtime.evidence.storage_security import initial_sentinel_image
+    from scripts.spool_crash_oracle import sentinel_state_v1
+
+    image = initial_sentinel_image("50000000-0000-4000-8000-000000000002")
+    assert sentinel_state_v1(image) == "first_create_pending"
+    changed = bytearray(image)
+    changed[offset] ^= 1
+    with pytest.raises(ValueError):
+        sentinel_state_v1(bytes(changed))
+
+
+@pytest.mark.parametrize("key", ["before", "after"])
+def test_final_sentinel_must_preserve_the_exact_transition_authority(key) -> None:
+    import hashlib
+
+    from hermes_realtime.evidence.models import SentinelState
+    from hermes_realtime.evidence.storage_security import (
+        initial_sentinel_image,
+        next_sentinel_image,
+    )
+    from scripts.spool_crash_matrix import _validate_recovery
+
+    row = _purge_observation()
+    _validate_recovery("after_full_purge_absence_verify", "caught-up", row)
+    image = initial_sentinel_image("50000000-0000-4000-8000-000000000002")
+    image = next_sentinel_image(image, SentinelState.CLEAR)
+    image = next_sentinel_image(
+        image,
+        SentinelState.FULL_PURGE_PENDING,
+        state_generation_id="90000000-0000-4000-8000-000000000096",
+    )
+    if key == "after":
+        image = next_sentinel_image(image, SentinelState.CLEAR)
+    row[key]["files"]["capture-v1.owner"] = hashlib.sha256(image).hexdigest()
+    with pytest.raises(ValueError):
+        _validate_recovery("after_full_purge_absence_verify", "caught-up", row)

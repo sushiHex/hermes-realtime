@@ -40,7 +40,11 @@ without mutation; completed initialization temporaries must be removed. The
 empty, partial, complete, and flushed images are pinned by independent V1 byte
 encoding. Erasure receipt commitments bind every column, including the erased
 epoch, request identity, control fingerprint, admission authority, and timestamp;
-only digests and deletion counts leave the reader. The
+pending requests and logically deleted requests likewise bind their complete
+authority. Receipt identities remain inside the reader; exported receipts carry
+only state/reason, deletion counts, and commitments. Final root-marker bytes
+and both sentinel slots are independently pinned at every boundary, including
+their generations, predecessor slots, and fixture authority IDs. The
 original logical database must remain unchanged through every pre-latch rollback
 checkpoint. The sentinel commitment must remain unchanged before its write.
 
