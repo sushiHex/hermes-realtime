@@ -1,6 +1,6 @@
 # Packaged capture admission overflow
 
-[Collaborator guide](README.md) Ãƒâ€šÃ‚Â· [Qualification status](implementation-status.md#qualification-producer-status)
+[Collaborator guide](README.md) · [Qualification status](implementation-status.md#qualification-producer-status)
 
 The `over_budget_turn` producer exercises the ordinary capture queue's real
 64-record admission limit during a valid conversation turn. It compares the
