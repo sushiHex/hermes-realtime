@@ -88,10 +88,12 @@ def _validate_observations(row: Any) -> None:
         for session, (turns, sealed) in zip(sessions, shape, strict=True):
             _keys(
                 session,
-                {"session", "epoch", "predecessor", "state", "events", "chain", "kinds"} | _CONTENT,
+                {"session", "epoch", "predecessor", "state", "events", "chain", "kinds", "consent"}
+                | _CONTENT,
             )
             _digest(session["session"])
             _digest(session["epoch"])
+            _digest(session["consent"])
             if session["predecessor"] != "":
                 _digest(session["predecessor"])
             kinds = ["session_opened", "binding_opened"] + _TURN * turns
@@ -111,7 +113,7 @@ def _validate_observations(row: Any) -> None:
     _require(before == committing, "partial rollover became visible before commit")
     old, successor = committed
     _require(old == continued[0], "sealed predecessor changed during successor conversation")
-    for name in {"session", "epoch", "predecessor"} | _CONTENT:
+    for name in {"session", "epoch", "predecessor", "consent"} | _CONTENT:
         _require(old[name] == before[0][name], "rollover changed predecessor identity or content")
     _require(
         before[0]["predecessor"] == "" and old["chain"][:14] == before[0]["chain"],
@@ -120,10 +122,11 @@ def _validate_observations(row: Any) -> None:
     _require(
         successor["session"] != old["session"]
         and successor["epoch"] == old["epoch"]
+        and successor["consent"] == old["consent"]
         and successor["predecessor"] == old["session"],
         "rollover successor lineage differs",
     )
-    for name in ("session", "epoch", "predecessor"):
+    for name in ("session", "epoch", "predecessor", "consent"):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
     _keys(row["source"], _CONTENT)

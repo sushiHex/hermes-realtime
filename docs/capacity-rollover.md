@@ -29,7 +29,9 @@ Every store snapshot checks SQLite integrity, foreign keys, exact canonical
 payload bytes, contiguous sequences, recomputed HRE1 hashes, session aggregates,
 and terminal authority. The static event validator checks each session's turn
 history; separate rollover checks bind its close/seal records and the successor
-to the same consent and production binding. Session IDs and raw records stay in
+to the complete consent envelope and production binding: consent version,
+disclosure digest, retention, source acceptance, and source availability. A
+separate commitment preserves that envelope across all four observations. Session IDs and raw records stay in
 the child. An invocation-local HMAC key commits session lineage, chain entries,
 and content without exporting that key or identifiers.
 

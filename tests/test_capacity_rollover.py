@@ -33,6 +33,7 @@ def _observations() -> dict:
         return dict(
             session=identity,
             epoch="e" * 64,
+            consent="c" * 64,
             predecessor=predecessor,
             state="sealed" if sealed else "open",
             events=len(kinds),
@@ -87,6 +88,7 @@ def test_rollover_validator_accepts_a_durable_transition_and_equal_source() -> N
         "separate_commits",
         "wrong_predecessor",
         "wrong_epoch",
+        "wrong_consent",
         "same_session",
         "old_session_changed",
         "old_chain_changed",
@@ -123,6 +125,8 @@ def test_rollover_validator_rejects_incomplete_or_contradictory_facts(mutation: 
         snapshots[2]["sessions"][1]["predecessor"] = "c" * 64
     elif mutation == "wrong_epoch":
         snapshots[2]["sessions"][1]["epoch"] = "c" * 64
+    elif mutation == "wrong_consent":
+        snapshots[2]["sessions"][1]["consent"] = "d" * 64
     elif mutation == "same_session":
         snapshots[2]["sessions"][1]["session"] = "a" * 64
     elif mutation == "old_session_changed":
@@ -298,3 +302,128 @@ def test_shared_packaged_boundary_rejects_failed_ownership_and_scenario_identity
         record = replace(record, observations=canonical_json_bytes([{"arm": "revoke_race"}]))
     with pytest.raises(ValueError):
         _validate_packaged_run(record, scenario="capacity_rollover")
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("seal", "disclosure_digest", "0" * 64),
+        ("successor", "disclosure_digest", "0" * 64),
+        ("successor", "retention_hours", 25),
+        ("successor", "microphone_accepted", False),
+        ("successor", "typed_accepted", False),
+    ],
+)
+def test_rollover_reader_rejects_rehashed_foreign_consent(
+    tmp_path: Path,
+    target: str,
+    field: str,
+    value: object,
+) -> None:
+    import hashlib
+    import json
+    from dataclasses import replace
+
+    from hermes_realtime.evidence.models import StoreDisposition
+    from hermes_realtime.evidence.sqlite_spool import canonical_json_bytes, hre1_record_hash
+    from scripts.capacity_rollover_worker import _snapshot
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    owned = make_spool(tmp_path)
+    try:
+        create = make_create_epoch()
+        create = replace(
+            create,
+            microphone_accepted=True,
+            session_opened=replace(
+                create.session_opened,
+                payload=replace(create.session_opened.payload, microphone_accepted=True),
+            ),
+            binding_opened=replace(
+                create.binding_opened,
+                payload=replace(create.binding_opened.payload, microphone_available=True),
+            ),
+        )
+        command = make_rollover_command()
+        command = replace(
+            command,
+            snapshots=(
+                *command.snapshots[:2],
+                replace(
+                    command.snapshots[2],
+                    payload=replace(command.snapshots[2].payload, microphone_accepted=True),
+                ),
+                replace(
+                    command.snapshots[3],
+                    payload=replace(command.snapshots[3].payload, microphone_available=True),
+                ),
+            ),
+        )
+        assert owned.create_epoch(create) is StoreDisposition.COMMITTED
+        assert owned.rollover_session(command) is StoreDisposition.COMMITTED
+        connection = owned.connection
+        for (name,) in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"
+        ).fetchall():
+            connection.execute('DROP TRIGGER "' + name.replace('"', '""') + '"')
+        installation = connection.execute(
+            "SELECT installation_id FROM producer_installation"
+        ).fetchone()[0]
+        sessions = connection.execute(
+            "SELECT logical_session_id,producer_instance_id,state "
+            "FROM evidence_sessions ORDER BY rowid"
+        ).fetchall()
+        changes = 0
+        for index, (session, producer, state) in enumerate(sessions):
+            previous = None
+            size = 0
+            for event, sequence, kind, at, payload in connection.execute(
+                "SELECT event_id,event_sequence,event_kind,recorded_at_utc,canonical_payload "
+                "FROM evidence_events WHERE logical_session_id=? ORDER BY event_sequence",
+                (session,),
+            ).fetchall():
+                document = json.loads(payload)
+                if (target == "seal" and index == 0 and kind == "session_seal_requested") or (
+                    target == "successor" and index == 1 and kind == "session_opened"
+                ):
+                    assert document[field] != value
+                    document[field] = value
+                    changes += 1
+                raw = canonical_json_bytes(document)
+                payload_hash = hashlib.sha256(raw).hexdigest()
+                digest = hre1_record_hash(
+                    installation_id=installation,
+                    producer_instance_id=producer,
+                    event_id=event,
+                    logical_session_id=session,
+                    event_sequence=sequence,
+                    event_kind=kind,
+                    recorded_at_utc=at,
+                    payload_hash=payload_hash,
+                    previous_hash=previous,
+                )
+                connection.execute(
+                    "UPDATE evidence_events SET canonical_payload=?,canonical_bytes=?,"
+                    "payload_hash=?,"
+                    "previous_hash=?,record_hash=? WHERE event_id=?",
+                    (raw.decode(), len(raw), payload_hash, previous, digest, event),
+                )
+                previous = digest
+                size += len(raw)
+            connection.execute(
+                "UPDATE evidence_sessions SET canonical_bytes=?,head_hash=? "
+                "WHERE logical_session_id=?",
+                (size, previous if state == "sealed" else None, session),
+            )
+        connection.commit()
+        assert changes == 1
+        # Every edited record has a valid recomputed chain. Consent, not a stale
+        # checksum, must make the independent reader refuse this transition.
+        with pytest.raises(ValueError):
+            _snapshot(owned.database, b"synthetic key")
+    finally:
+        owned.close()

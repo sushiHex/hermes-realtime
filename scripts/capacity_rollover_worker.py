@@ -46,11 +46,11 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
         ).fetchone()[0]
         rows = connection.execute(
             "SELECT logical_session_id,consent_epoch_id,producer_instance_id,state,event_count,"
-            "canonical_bytes,final_event_sequence,head_hash,taint_code "
+            "canonical_bytes,final_event_sequence,head_hash,taint_code,consent_version "
             "FROM evidence_sessions ORDER BY rowid"
         ).fetchall()
         _require(1 <= len(rows) <= 2, "rollover session count differs")
-        for session_id, epoch, producer, state, count, size, final, head, taint in rows:
+        for session_id, epoch, producer, state, count, size, final, head, taint, version in rows:
             events = connection.execute(
                 "SELECT event_id,event_sequence,event_kind,canonical_payload,payload_hash,"
                 "previous_hash,record_hash,recorded_at_utc,canonical_bytes "
@@ -122,27 +122,39 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     and payloads[-2]["close_reason"] == "capacity_rollover"
                     and payloads[-2]["binding_id"] == payloads[0]["binding_id"]
                     and payloads[-1]["final_event_sequence"] == count
-                    and payloads[-1]["consent_epoch_id"] == epoch,
+                    and all(
+                        payloads[-1][field] == payloads[0][field]
+                        for field in ("consent_epoch_id", "consent_version", "disclosure_digest")
+                    ),
                     "rollover seal payloads differ",
                 )
                 validate_event_sequence(tuple(history[:-2]))
             else:
                 validate_event_sequence(tuple(history))
             _require(
-                payloads[0]["consent_epoch_id"] == epoch, "session row and opening epoch differ"
+                payloads[0]["consent_epoch_id"] == epoch
+                and payloads[0]["consent_version"] == version,
+                "session row and opening epoch differ",
             )
-            lineage.append(
-                (producer, epoch, payloads[0]["binding_id"], payloads[1]["binding_generation"])
-            )
+            consent = {
+                "opening": {
+                    name: value
+                    for name, value in payloads[0].items()
+                    if name != "predecessor_session_id"
+                },
+                "binding": payloads[1],
+            }
+            lineage.append((producer, consent))
             _require(
                 all(value == lineage[0] for value in lineage),
-                "rollover changed production binding lineage",
+                "rollover changed the complete consent or production binding envelope",
             )
             predecessor = payloads[0]["predecessor_session_id"]
             sessions.append(
                 {
                     "session": _commit(key, "session", session_id),
                     "epoch": _commit(key, "epoch", epoch),
+                    "consent": _commit(key, "consent", canonical_json_bytes(consent)),
                     "predecessor": ""
                     if predecessor is None
                     else _commit(key, "session", predecessor),
