@@ -52,6 +52,12 @@ fingerprint, admission ordinal, identities, expiry, and all nested snapshots are
 bound. The create request sequence/fingerprint must match the exact accepted
 browser request. Ordered dispatch must match every actual record ordinal,
 including the two ordinals consumed by atomic epoch creation.
+The observer delegates the real blocking dequeue and checks its complete queue
+envelope before the dispatcher strips it: protocol, lane, ordinal, and the
+complete payload commitment. The create item must use ordinal 2, rollover 15,
+and drain 22 with watermark 21. Ordinary and rollover payload ordinals must
+match their envelopes; payload commitments must also match transport dispatch.
+The queue and dispatcher retain their production implementations.
 
 The observer also commits complete dispatched control snapshots, including event
 identity, binding identity and generation, source availability, and consent lineage. The reader reconstructs

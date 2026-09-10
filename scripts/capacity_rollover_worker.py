@@ -63,6 +63,21 @@ def _command_commitment(key: bytes, command: Any) -> str:
     from hermes_realtime.evidence.models import CreateEpochV1, RolloverSessionV1
 
     _require(type(command) in (CreateEpochV1, RolloverSessionV1), "command type differs")
+    return _payload_commitment(key, command)
+
+
+def _payload_commitment(key: bytes, command: Any) -> str:
+    from hermes_realtime.evidence.models import (
+        CreateEpochV1,
+        DrainAndStopV1,
+        QueuedEvidenceRecordV1,
+        RolloverSessionV1,
+    )
+
+    _require(
+        type(command) in (CreateEpochV1, DrainAndStopV1, QueuedEvidenceRecordV1, RolloverSessionV1),
+        "queue payload type differs",
+    )
     return _commit(
         key,
         "dispatched_command",
@@ -498,12 +513,94 @@ class _ObserveRolloverSpool:
         return result
 
 
+class _ObserveQueue:
+    """Delegate the real blocking dequeue and inspect its unstripped envelope."""
+
+    def __init__(self, queue: Any, key: bytes, *, owner_generation: int) -> None:
+        from hermes_realtime.evidence.admission import BoundedEvidenceWriterQueueV1
+
+        _require(
+            type(queue) is BoundedEvidenceWriterQueueV1, "observed queue is not production-owned"
+        )
+        self.queue, self.key, self.owner_generation = queue, key, owner_generation
+        self.original = queue.get_blocking
+        self.records: list[dict[str, Any]] = []
+        queue.get_blocking = self.get_blocking
+
+    def restore(self) -> None:
+        self.queue.get_blocking = self.original
+
+    def get_blocking(self) -> Any:
+        from hermes_realtime.evidence.admission import EvidenceWriterQueueItemV1, WriterQueueLane
+        from hermes_realtime.evidence.models import (
+            CreateEpochV1,
+            DrainAndStopV1,
+            QueuedEvidenceRecordV1,
+            RolloverSessionV1,
+        )
+
+        item = self.original()
+        if item is None:
+            return None
+        index = len(self.records)
+        _require(
+            type(item) is EvidenceWriterQueueItemV1
+            and type(item.protocol_version) is int
+            and item.protocol_version == 1
+            and index < 21
+            and type(item.admission_ordinal) is int
+            and item.admission_ordinal == index + 2,
+            "dequeued envelope protocol or admission ordinal differs",
+        )
+        payload = item.payload
+        expected = (
+            CreateEpochV1
+            if index == 0
+            else RolloverSessionV1
+            if index == 13
+            else DrainAndStopV1
+            if index == 20
+            else QueuedEvidenceRecordV1
+        )
+        _require(
+            type(payload) is expected
+            and item.lane is (WriterQueueLane.DRAIN if index == 20 else WriterQueueLane.ORDERED),
+            "dequeued envelope lane or payload differs",
+        )
+        if type(payload) in (QueuedEvidenceRecordV1, RolloverSessionV1):
+            _require(
+                payload.admission_ordinal == item.admission_ordinal,
+                "queue envelope and payload ordinals differ",
+            )
+        elif type(payload) is DrainAndStopV1:
+            _require(
+                payload.final_admission_ordinal == item.admission_ordinal - 1
+                and payload.owner_generation == self.owner_generation,
+                "dequeued drain owner or watermark differs",
+            )
+        self.records.append(
+            {
+                "version": item.protocol_version,
+                "ordinal": item.admission_ordinal,
+                "lane": item.lane.value,
+                "kind": {
+                    CreateEpochV1: "create",
+                    QueuedEvidenceRecordV1: "record",
+                    RolloverSessionV1: "rollover",
+                    DrainAndStopV1: "drain",
+                }[type(payload)],
+                "payload": _payload_commitment(self.key, payload),
+            }
+        )
+        return item
+
+
 class _ObserveDispatch:
     """Commit commands before transport delegation and observe the real FIFO."""
 
     def __init__(self, delegate: Any, key: bytes) -> None:
         self.delegate, self.key = delegate, key
-        self.commands: dict[str, Any] = {"ordinals": []}
+        self.commands: dict[str, Any] = {"ordinals": [], "records": []}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -518,7 +615,7 @@ class _ObserveDispatch:
         ordinals.append(ordinal)
 
     def create_epoch(self, command: Any) -> Any:
-        _require(set(self.commands) == {"ordinals"}, "create dispatch repeated")
+        _require(set(self.commands) == {"ordinals", "records"}, "create dispatch repeated")
         self.commands["create_dto"] = _command_commitment(self.key, command)
         self.commands["request"] = _request_commitment(
             self.key, command.control_sequence, command.control_fingerprint_hash
@@ -527,6 +624,7 @@ class _ObserveDispatch:
 
     def append_record(self, item: Any) -> Any:
         self._ordinal(item.admission_ordinal)
+        self.commands["records"].append(_payload_commitment(self.key, item))
         return self.delegate.append_record(item)
 
     def rollover_session(self, command: Any) -> Any:
@@ -558,8 +656,24 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
     transcriber = ingress._Transcriber()
     spools: list[_ObserveRolloverSpool] = []
     dispatches: list[_ObserveDispatch] = []
+    queues: list[_ObserveQueue] = []
+    reservations: list[tuple[Any, Any]] = []
 
     def writer_factory(runtime: Any) -> Any:
+        reserve = runtime.reserve_browser_consent
+
+        def observe_reservation(**arguments: Any) -> Any:
+            authority = reserve(**arguments)
+            _require(not queues, "queue reservation observation repeated")
+            queues.append(
+                _ObserveQueue(runtime._queue, key, owner_generation=runtime._owner_generation)
+            )
+            return authority
+
+        # The factory runs before the real consent reservation creates its
+        # queue. Attach after that exact call returns, before consumer startup.
+        runtime.reserve_browser_consent = observe_reservation
+        reservations.append((runtime, reserve))
         transport = runtime.create_sqlite_transport()
         factory = transport._spool_factory
 
@@ -648,8 +762,14 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         try:
             await room.disconnect()
         finally:
-            if running is not None:
-                await composition.close_host(running)
+            try:
+                if running is not None:
+                    await composition.close_host(running)
+            finally:
+                for queue in queues:
+                    queue.restore()
+                for runtime, reserve in reservations:
+                    runtime.reserve_browser_consent = reserve
     _require(running is not None, "rollover host was not started")
     observations = composition.production_observations(running)
     records = composition.trace.records()
@@ -675,6 +795,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "arm": "capacity_rollover",
         "commands": spool.commands,
         "dispatch": dispatches[0].commands,
+        "queue": queues[0].records,
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "durable_terminals": spool.durable_terminals,

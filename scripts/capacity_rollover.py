@@ -50,6 +50,7 @@ def _validate_observations(row: Any) -> None:
             "arm",
             "commands",
             "dispatch",
+            "queue",
             "snapshots",
             "transactions",
             "durable_terminals",
@@ -86,7 +87,41 @@ def _validate_observations(row: Any) -> None:
         {"create", "rollover", "successor_expiry", "create_dto", "rollover_dto", "request"},
     )
     dispatch = row["dispatch"]
-    _keys(dispatch, {"create_dto", "rollover_dto", "request", "ordinals", "rollover_ordinal"})
+    _keys(
+        dispatch,
+        {"create_dto", "rollover_dto", "request", "ordinals", "rollover_ordinal", "records"},
+    )
+    _digests(dispatch["records"], 18)
+    queue = row["queue"]
+    _require(type(queue) is list and len(queue) == 21, "dequeued queue envelopes are incomplete")
+    expected_payloads = [
+        commands["create_dto"],
+        *dispatch["records"][:12],
+        commands["rollover_dto"],
+        *dispatch["records"][12:],
+    ]
+    for index, item in enumerate(queue):
+        _keys(item, {"version", "kind", "lane", "ordinal", "payload"})
+        _digest(item["payload"])
+        kind = (
+            "create"
+            if index == 0
+            else "rollover"
+            if index == 13
+            else "drain"
+            if index == 20
+            else "record"
+        )
+        _require(
+            type(item["version"]) is int
+            and item["version"] == 1
+            and type(item["ordinal"]) is int
+            and item["ordinal"] == index + 2
+            and item["kind"] == kind
+            and item["lane"] == ("drain" if index == 20 else "ordered")
+            and (index == 20 or item["payload"] == expected_payloads[index]),
+            "dequeued envelope differs from FIFO transport dispatch",
+        )
     for field in ("create_dto", "rollover_dto", "request"):
         _digest(commands[field])
         _require(dispatch[field] == commands[field], "transport changed the complete command")

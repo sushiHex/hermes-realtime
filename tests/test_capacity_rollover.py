@@ -86,7 +86,32 @@ def _observations() -> dict:
             "request": "3" * 64,
             "ordinals": list(range(3, 22)),
             "rollover_ordinal": 15,
+            "records": [f"{n:064x}" for n in range(100, 118)],
         },
+        queue=[
+            dict(
+                version=1,
+                ordinal=n + 2,
+                lane="drain" if n == 20 else "ordered",
+                kind="create"
+                if n == 0
+                else "rollover"
+                if n == 13
+                else "drain"
+                if n == 20
+                else "record",
+                payload=payload,
+            )
+            for n, payload in enumerate(
+                [
+                    "1" * 64,
+                    *[f"{n:064x}" for n in range(100, 112)],
+                    "2" * 64,
+                    *[f"{n:064x}" for n in range(112, 118)],
+                    "4" * 64,
+                ]
+            )
+        ],
         terminals=[
             dict(
                 disposition="completed",
@@ -148,9 +173,10 @@ def test_persisted_source_provenance_must_match_the_accepted_typed_input(
             user = user_final_snapshot(4, event_index=4, text="Synthetic accepted typed input.")
             user = replace(user, payload=replace(user.payload, source=InputSource(source)))
             for snapshot in (opened, user):
-                assert owned.append_record(
-                    ordinary_record(snapshot, snapshot.event_sequence)
-                ) is StoreDisposition.COMMITTED
+                assert (
+                    owned.append_record(ordinary_record(snapshot, snapshot.event_sequence))
+                    is StoreDisposition.COMMITTED
+                )
             # Both histories are valid, consented and hashed by the real spool.
             # Their text is identical; only the persisted provenance differs.
             observed = _snapshot(owned.database, b"synthetic key")
@@ -846,18 +872,147 @@ def test_dispatch_observer_preserves_fifo_and_rejects_gaps_before_delegation(
     from types import SimpleNamespace
 
     from scripts.capacity_rollover_worker import _ObserveDispatch
+    from tests.evidence.test_sqlite_spool import ordinary_record, turn_opened_snapshot
 
     calls = []
     observer = _ObserveDispatch(SimpleNamespace(append_record=calls.append), b"synthetic key")
+
+    def item(ordinal):
+        record = ordinary_record(turn_opened_snapshot(3, event_index=3), 3)
+        object.__setattr__(record, "admission_ordinal", ordinal)
+        return record
+
     if ordinals == (3, 4, 5):
         for ordinal in ordinals:
-            observer.append_record(SimpleNamespace(admission_ordinal=ordinal))
+            observer.append_record(item(ordinal))
         assert len(calls) == 3
     else:
         with pytest.raises(ValueError, match="ordinal"):
             for ordinal in ordinals:
-                observer.append_record(SimpleNamespace(admission_ordinal=ordinal))
+                observer.append_record(item(ordinal))
         assert len(calls) == (1 if ordinals == (3, 5) else 0)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "create_ordinal",
+        "record_ordinal",
+        "rollover_ordinal",
+        "protocol",
+        "drain_owner",
+        "drain_watermark",
+    ],
+)
+def test_dequeue_observer_binds_queue_envelopes_before_payload_stripping(mutation: str) -> None:
+    from dataclasses import replace
+
+    from hermes_realtime.evidence import admission as a
+    from hermes_realtime.evidence import models as m
+    from scripts.capacity_rollover_worker import _ObserveQueue
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        ordinary_record,
+        turn_opened_snapshot,
+    )
+
+    queue = a.BoundedEvidenceWriterQueueV1()
+    observer = _ObserveQueue(queue, b"synthetic key", owner_generation=41)
+    items = [
+        a.EvidenceWriterQueueItemV1(
+            protocol_version=1,
+            lane=a.WriterQueueLane.ORDERED,
+            payload=make_create_epoch(),
+            admission_ordinal=1 if mutation == "create_ordinal" else 2,
+        )
+    ]
+    for ordinal in range(3, 22):
+        if ordinal == 15:
+            payload = replace(
+                make_rollover_command(),
+                admission_ordinal=16 if mutation == "rollover_ordinal" else 15,
+            )
+        else:
+            payload = ordinary_record(
+                turn_opened_snapshot(3, event_index=3),
+                ordinal + (1 if mutation == "record_ordinal" and ordinal == 3 else 0),
+            )
+        items.append(
+            a.EvidenceWriterQueueItemV1(
+                protocol_version=1,
+                lane=a.WriterQueueLane.ORDERED,
+                payload=payload,
+                admission_ordinal=ordinal,
+            )
+        )
+    items.append(
+        a.EvidenceWriterQueueItemV1(
+            protocol_version=1,
+            lane=a.WriterQueueLane.DRAIN,
+            admission_ordinal=22,
+            payload=m.DrainAndStopV1(
+                protocol_version=1,
+                owner_generation=42 if mutation == "drain_owner" else 41,
+                final_admission_ordinal=20 if mutation == "drain_watermark" else 21,
+            ),
+        )
+    )
+    if mutation == "protocol":
+        object.__setattr__(items[0], "protocol_version", 2)
+
+    def consume():
+        for item in items:
+            queue.put_nowait(item)
+            assert queue.get_blocking() is item
+
+    try:
+        if mutation == "none":
+            consume()
+            assert [r["ordinal"] for r in observer.records] == list(range(2, 23))
+            assert observer.records[0]["kind"] == "create"
+            assert observer.records[13]["kind"] == "rollover"
+            assert observer.records[-1]["kind"] == "drain"
+        else:
+            with pytest.raises(ValueError):
+                consume()
+    finally:
+        observer.restore()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "create_ordinal",
+        "rollover_ordinal",
+        "lane",
+        "payload",
+        "bool_version",
+        "bool_ordinal",
+    ],
+)
+def test_parent_rejects_queue_envelopes_that_disagree_with_transport(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "missing":
+        row["queue"].pop()
+    elif mutation == "create_ordinal":
+        row["queue"][0]["ordinal"] = 1
+    elif mutation == "rollover_ordinal":
+        row["queue"][13]["ordinal"] = 14
+    elif mutation == "lane":
+        row["queue"][13]["lane"] = "revoke"
+    elif mutation == "payload":
+        row["queue"][13]["payload"] = "f" * 64
+    elif mutation == "bool_version":
+        row["queue"][0]["version"] = True
+    else:
+        row["queue"][0]["ordinal"] = True
+    with pytest.raises(ValueError):
+        _validate_observations(row)
 
 
 @pytest.mark.parametrize("mutation", ["omitted", "ahead"])
