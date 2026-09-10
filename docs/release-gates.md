@@ -33,7 +33,10 @@ or their disclosure manifest. This exercises platform-specific compiler packages
 before producing the wheel consumed by the Linux installation check.
 
 Before provisioning the candidate environment, the gate verifies that `uv.lock`
-matches the project metadata. A stale lock fails without being rewritten.
+matches the project metadata. A stale lock fails without being rewritten. The
+check explicitly selects the materialized candidate. Gate commands ignore ambient
+uv project, working-directory, environment-location, and configuration overrides;
+CI cache and interpreter-installation locations remain available.
 
 The `release-candidate` job runs, from that fresh candidate:
 
