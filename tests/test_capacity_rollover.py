@@ -93,9 +93,11 @@ def _observations() -> dict:
             "create_dto": "1" * 64,
             "rollover_dto": "2" * 64,
             "request": "3" * 64,
+            "binding": "5" * 64,
         },
         snapshots=[before, copy.deepcopy(before), committed, continued],
         transactions=["BEGIN IMMEDIATE", "COMMIT"],
+        transaction_writes=["INSERT", "UPDATE"],
         durable_terminals=["committed"] * 3,
         rollover=[
             {
@@ -104,7 +106,7 @@ def _observations() -> dict:
             }
             for stage in ("claimed", "queued", "durable", "published", "terminal")
         ],
-        source=source | {"consent": "f" * 64, "request": "3" * 64},
+        source=source | {"consent": "f" * 64, "request": "3" * 64, "binding": "5" * 64},
         dispatch={
             "create_dto": "1" * 64,
             "rollover_dto": "2" * 64,
@@ -252,8 +254,12 @@ async def test_consent_source_commitment_requires_the_exact_dispatched_request_a
     requests = []
 
     async def event(**kwargs):
-        assert kwargs["kind"] == "capture_status"
-        return {"data": {"disclosureDigest": "b" * 64}}
+        assert kwargs["kind"] in {"voice_ready", "capture_status"}
+        return {
+            "data": {"generation": 42}
+            if kwargs["kind"] == "voice_ready"
+            else {"disclosureDigest": "b" * 64}
+        }
 
     async def request(**kwargs):
         assert kwargs["path"] == "/api/v1/evidence-consent"
@@ -1415,3 +1421,116 @@ def test_owner_binding_requires_the_actual_production_dispatcher(substitution: s
     finally:
         assert owner.close(2)
         assert not daemon._thread.is_alive()
+
+
+@pytest.mark.parametrize("outside", ["none", "before", "after", "commented", "pragma", "split"])
+def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
+    tmp_path: Path, outside: str
+) -> None:
+    from hermes_realtime.evidence.models import StoreDisposition
+    from scripts.capacity_rollover_worker import _ObserveRolloverSpool
+    from tests.evidence.test_sqlite_spool import (
+        make_create_epoch,
+        make_rollover_command,
+        make_spool,
+    )
+
+    spool = make_spool(tmp_path)
+    observer = _ObserveRolloverSpool(spool, spool.database, b"synthetic key")
+    original = spool.rollover_session
+    original_chain = spool._write_chain
+    split_committed = False
+
+    def split_chain(*arguments, **keywords):
+        nonlocal split_committed
+        result = original_chain(*arguments, **keywords)
+        if not split_committed:
+            spool.connection.commit()
+            split_committed = True
+        return result
+
+    def autocommit():
+        assert not spool.connection.in_transaction
+        if outside == "pragma":
+            value = spool.connection.execute("PRAGMA application_id").fetchone()[0]
+            spool.connection.execute(f"PRAGMA application_id={value}")
+            return
+        prefix = "-- synthetic comment\n/* synthetic */ " if outside == "commented" else ""
+        spool.connection.execute(
+            prefix + "UPDATE producer_installation SET clock_high_water_utc=clock_high_water_utc"
+        )
+
+    def split(command):
+        if outside == "before":
+            autocommit()
+        result = original(command)
+        if outside in {"after", "commented", "pragma"}:
+            autocommit()
+        return result
+
+    try:
+        assert observer.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
+        spool.rollover_session = split
+        if outside == "split":
+            spool._write_chain = split_chain
+        if outside == "none":
+            assert observer.rollover_session(make_rollover_command()) is StoreDisposition.COMMITTED
+        else:
+            with pytest.raises(ValueError, match="transaction observation"):
+                observer.rollover_session(make_rollover_command())
+    finally:
+        spool.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation", [42, True, 0, 2**53, 43])
+async def test_consent_anchor_requires_a_live_browser_generation(generation: object) -> None:
+    import asyncio
+
+    from hermes_realtime.client.runtime import BrowserClientRuntime
+    from hermes_realtime.client.session import BrowserSessionDirector
+    from hermes_realtime.launcher import LocalBrowserLauncher
+    from hermes_realtime.livekit.worker import LiveKitConversationWorker
+    from scripts.capacity_rollover_worker import _commit, _live_browser_binding
+
+    sessions = object.__new__(BrowserSessionDirector)
+    sessions._start_lock = asyncio.Lock()
+    sessions._active_identity = "synthetic participant"
+    sessions._active_generation = 42
+    worker = object.__new__(LiveKitConversationWorker)
+    worker._generation = generation
+    runtime = object.__new__(BrowserClientRuntime)
+    runtime._sessions, runtime._worker = sessions, worker
+
+    class Shutdown:
+        async def start(self):
+            return await runtime.start()
+
+    launcher = object.__new__(LocalBrowserLauncher)
+    launcher._runtime = Shutdown()
+    if type(generation) is int and generation == 42:
+        assert await _live_browser_binding(launcher, b"synthetic key") == _commit(
+            b"synthetic key", "browser_generation", "42"
+        )
+    else:
+        with pytest.raises(ValueError):
+            await _live_browser_binding(launcher, b"synthetic key")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["stale_generation", "missing_writes", "unknown_write", "oversized"]
+)
+def test_parent_requires_live_generation_and_bounded_transaction_writes(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "stale_generation":
+        row["commands"]["binding"] = "d" * 64
+    elif mutation == "missing_writes":
+        row["transaction_writes"] = []
+    elif mutation == "unknown_write":
+        row["transaction_writes"] = ["CREATE"]
+    else:
+        row["transaction_writes"] *= 65
+    with pytest.raises(ValueError):
+        _validate_observations(row)

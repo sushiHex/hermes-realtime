@@ -15,7 +15,11 @@ A delegating observer runs on the real SQLite owner thread. It reads the store
 through a separate read-only connection before rollover and at SQLite's trace
 callback immediately before the real `COMMIT`. Both readers must see the same
 open predecessor with 14 events. The callback retains only transaction-control
-names; SQL statements and their values never leave the child. Callback failure
+names and write verbs; SQL statements and their values never leave the child.
+Every mutating statement must run while the real connection is inside the one
+observed transaction. Writes before its begin or after its commit, unknown
+statement kinds, and writable PRAGMAs block acceptance. The two exact read-only
+quota PRAGMAs remain allowed. Callback failure
 blocks acceptance even though SQLite itself suppresses callback exceptions.
 
 After that single transaction returns, another read must see the sealed
@@ -42,7 +46,12 @@ Another commitment is captured from the exact consent request bytes dispatched
 through the browser API, only after its accepted acknowledgment. Every stored
 session must match that independent source commitment. Consistently rewriting
 all store consent fields and recomputing their hashes cannot replace the request
-that was actually accepted. The reader also requires one active epoch and no
+that was actually accepted. The create command also binds to the generation
+read from the existing browser session and LiveKit owners. They must agree
+before and after consent; the browser snapshot is read under its real authority
+lock. Both anchors are independently compared in the parent. This establishes the observed live
+activation; it does not qualify reconnect or every stale-binding rejection.
+The reader also requires one active epoch and no
 conflicts or pending/completed erasure authority in this fresh scenario.
 
 Before transport delegation and again on the SQLite owner thread, observers

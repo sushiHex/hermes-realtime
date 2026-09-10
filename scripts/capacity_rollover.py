@@ -97,6 +97,7 @@ def _validate_observations(row: Any) -> None:
             "threads",
             "snapshots",
             "transactions",
+            "transaction_writes",
             "durable_terminals",
             "rollover",
             "source",
@@ -114,6 +115,15 @@ def _validate_observations(row: Any) -> None:
         row["transactions"] == ["BEGIN IMMEDIATE", "COMMIT"],
         "rollover did not use one committed transaction",
     )
+    _require(
+        type(row["transaction_writes"]) is list
+        and 1 <= len(row["transaction_writes"]) <= 128
+        and all(
+            type(kind) is str and kind in {"INSERT", "UPDATE", "DELETE"}
+            for kind in row["transaction_writes"]
+        ),
+        "rollover write observations are missing or invalid",
+    )
     _require(row["durable_terminals"] == ["committed"] * 3, "durable turn completion differs")
     _require(
         row["rollover"]
@@ -129,7 +139,15 @@ def _validate_observations(row: Any) -> None:
     commands = row["commands"]
     _keys(
         commands,
-        {"create", "rollover", "successor_expiry", "create_dto", "rollover_dto", "request"},
+        {
+            "create",
+            "rollover",
+            "successor_expiry",
+            "create_dto",
+            "rollover_dto",
+            "request",
+            "binding",
+        },
     )
     dispatch = row["dispatch"]
     _keys(
@@ -317,7 +335,12 @@ def _validate_observations(row: Any) -> None:
     ):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
-    _keys(row["source"], _CONTENT | {"consent", "request"})
+    _keys(row["source"], _CONTENT | {"consent", "request", "binding"})
+    _digest(commands["binding"])
+    _require(
+        row["source"]["binding"] == commands["binding"],
+        "create differs from the live browser generation",
+    )
     _digest(row["source"]["request"])
     _require(
         commands["request"] == row["source"]["request"],

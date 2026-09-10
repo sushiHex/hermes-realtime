@@ -144,7 +144,40 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     fingerprint = hashlib.sha256(
         json.dumps(sent, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return {"consent": consent, "request": _request_commitment(key, sent["sequence"], fingerprint)}
+    return {
+        "consent": consent,
+        "request": _request_commitment(key, sent["sequence"], fingerprint),
+    }
+
+
+async def _live_browser_binding(launcher: Any, key: bytes) -> str:
+    from inspect import getclosurevars
+
+    from hermes_realtime.client.runtime import BrowserClientRuntime
+    from hermes_realtime.client.session import BrowserBindingSnapshot, BrowserSessionDirector
+    from hermes_realtime.launcher import LocalBrowserLauncher
+    from hermes_realtime.livekit.worker import LiveKitConversationWorker
+
+    _require(type(launcher) is LocalBrowserLauncher, "live generation launcher is not exact")
+    # The composed shutdown facade retains this same browser runtime in start
+    # and close. Read its actual owners without replacing either authority.
+    runtime = getclosurevars(launcher._runtime.start).nonlocals["runtime"]
+    _require(type(runtime) is BrowserClientRuntime, "live browser runtime is not exact")
+    sessions, worker = runtime._sessions, runtime._worker
+    _require(
+        type(sessions) is BrowserSessionDirector and type(worker) is LiveKitConversationWorker,
+        "live browser and media owners are not exact",
+    )
+    binding = await sessions.current_binding_snapshot(participant_identity=sessions.active_identity)
+    generation = worker.active_generation
+    _require(
+        type(binding) is BrowserBindingSnapshot
+        and type(generation) is int
+        and 1 <= generation < 2**53
+        and binding.binding_generation == generation,
+        "live browser and media generations differ",
+    )
+    return _commit(key, "browser_generation", str(generation))
 
 
 def _control_commitments(key: bytes, snapshots: Any) -> list[str]:
@@ -554,6 +587,21 @@ class _ObserveThreadOwners:
         }
 
 
+def _statement_kind(statement: str) -> str:
+    remaining = statement.lstrip()
+    while remaining.startswith(("--", "/*")):
+        if remaining.startswith("--"):
+            end = remaining.find("\n")
+            _require(end >= 0, "unterminated SQL comment")
+            remaining = remaining[end + 1 :].lstrip()
+        else:
+            end = remaining.find("*/", 2)
+            _require(end >= 0, "unterminated SQL comment")
+            remaining = remaining[end + 2 :].lstrip()
+    _require(bool(remaining), "empty traced SQL statement")
+    return remaining.split(None, 1)[0].upper()
+
+
 class _ObserveRolloverSpool:
     """Observe on the real SQLite owner thread and always delegate the operation."""
 
@@ -564,6 +612,7 @@ class _ObserveRolloverSpool:
         self.owners = owners
         self.snapshots: list[dict[str, Any]] = []
         self.transactions: list[str] = []
+        self.transaction_writes: list[str] = []
         self.failed = False
         self.durable_terminals: list[str] = []
         self.third_settled = Event()
@@ -592,6 +641,9 @@ class _ObserveRolloverSpool:
             self.owners.spool_call("create_epoch")
         _require(not self.commands, "create command was dispatched more than once")
         self.commands["create_dto"] = _command_commitment(self.key, command)
+        self.commands["binding"] = _commit(
+            self.key, "browser_generation", str(command.binding_generation)
+        )
         self.commands["request"] = _request_commitment(
             self.key, command.control_sequence, command.control_fingerprint_hash
         )
@@ -632,7 +684,7 @@ class _ObserveRolloverSpool:
             self.owners.spool_call("rollover_session")
         _require(not self.snapshots, "rollover was invoked more than once")
         _require(
-            set(self.commands) == {"create", "create_dto", "request"},
+            set(self.commands) == {"create", "create_dto", "request", "binding"},
             "dispatched create command is absent",
         )
         self.commands["rollover_dto"] = _command_commitment(self.key, command)
@@ -643,18 +695,40 @@ class _ObserveRolloverSpool:
         self.snapshots.append(_snapshot(self.database, self.key))
 
         def trace(statement: str) -> None:
-            # SQLite invokes this before executing COMMIT. A separate reader must
-            # still see the entire old state. No statement text is retained.
-            if statement not in {"BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"}:
-                return
+            # SQLite suppresses trace callback exceptions. Latch any refusal;
+            # retain only control names and write verbs, never SQL or values.
             try:
-                _require(len(self.transactions) < 3, "rollover transaction trace overflow")
-                self.transactions.append(statement)
-                if statement == "COMMIT":
-                    _require(len(self.snapshots) == 1, "rollover commit repeated")
+                kind = _statement_kind(statement)
+                active = self.delegate.connection.in_transaction
+                if kind == "SELECT" or statement in {"PRAGMA page_count", "PRAGMA max_page_count"}:
+                    return
+                if kind in {"INSERT", "UPDATE", "DELETE"}:
+                    _require(
+                        active
+                        and self.transactions == ["BEGIN IMMEDIATE"]
+                        and len(self.transaction_writes) < 128,
+                        "rollover write escaped its observed transaction",
+                    )
+                    self.transaction_writes.append(kind)
+                    return
+                _require(
+                    statement in {"BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"}
+                    and len(self.transactions) < 3,
+                    "rollover statement or transaction trace differs",
+                )
+                if kind == "BEGIN":
+                    _require(not active and not self.transactions, "rollover transaction repeated")
+                elif kind == "COMMIT":
+                    _require(
+                        active
+                        and self.transactions == ["BEGIN IMMEDIATE"]
+                        and len(self.snapshots) == 1
+                        and bool(self.transaction_writes),
+                        "rollover commit lacks its active write transaction",
+                    )
                     self.snapshots.append(_snapshot(self.database, self.key))
+                self.transactions.append(statement)
             except Exception:
-                # SQLite swallows callback errors; retain a content-free failure.
                 self.failed = True
 
         self.delegate.connection.set_trace_callback(trace)
@@ -662,7 +736,10 @@ class _ObserveRolloverSpool:
             result = self.delegate.rollover_session(command)
         finally:
             self.delegate.connection.set_trace_callback(None)
-        _require(not self.failed, "rollover transaction observation failed")
+        _require(
+            not self.failed and not self.delegate.connection.in_transaction,
+            "rollover transaction observation failed",
+        )
         _require(
             _command_commitment(self.key, self.delegate._accepted_rollover)
             == self.commands["rollover_dto"],
@@ -901,7 +978,13 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             launch_url=running.url,
             room=room,
         )
+        live_binding = await _live_browser_binding(running._host, key)
         accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
+        _require(
+            live_binding == await _live_browser_binding(running._host, key),
+            "live generation changed during consent",
+        )
+        accepted_consent["binding"] = live_binding
         _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
         runtime = reservations[0][0]
         thread_owners[0].bind_dispatcher(
@@ -995,6 +1078,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "threads": thread_owners[0].finished(),
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
+        "transaction_writes": spool.transaction_writes,
         "durable_terminals": spool.durable_terminals,
         "rollover": [
             {"stage": item.stage.value, "result": item.result.value}
@@ -1004,6 +1088,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "source": {
             "consent": accepted_consent["consent"],
             "request": accepted_consent["request"],
+            "binding": accepted_consent["binding"],
             "user": users,
             "generated": [
                 _commit(key, "generated", item.generated_text)
