@@ -1076,6 +1076,20 @@ _SPOOL_FAILPOINTS = [
     "after_full_purge_marker_clear",
 ]
 
+
+def _spool_sentinel_at_entry(point: str) -> str:
+    index = _SPOOL_FAILPOINTS.index(point)
+    if 9 <= index <= 17:
+        return "no_final_sentinel"
+    if 18 <= index <= 21 or 23 <= index <= 26:
+        return "first_create_pending"
+    if 29 <= index <= 31:
+        return "clock_rollback_purge_pending"
+    if 32 <= index <= 39:
+        return "full_purge_pending"
+    return "clear"
+
+
 _SCENARIO_MATRIX = {
     "deterministic_equivalence": ("deterministic_equivalence", ["conversation_trace_equal"]),
     "physical_capture_disabled": (
@@ -1351,7 +1365,7 @@ def _governed_qualification_report() -> dict[str, Any]:
             "caseId": f"{failpoint}@exit{exit_mode}",
             "faultMechanism": failpoint,
             "exitMode": exit_mode,
-            "sentinelStateAtRecoveryEntry": "clear",
+            "sentinelStateAtRecoveryEntry": _spool_sentinel_at_entry(failpoint),
             "outcome": "pass",
             "assertions": ["purge_verified"],
         }

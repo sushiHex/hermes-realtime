@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPOSITORY / "src"))
+if __name__ == "__main__":
+    sys.path.insert(0, str(REPOSITORY / "src"))
 
 EXIT_MODES = (197, 198)
 
@@ -795,6 +796,20 @@ def _run_full_purge(case_root: Path, failpoint: str, exit_mode: int) -> None:
         raise RuntimeError("failed to establish the full-purge predecessor")
     root = case_root / "evidence"
     (root / "purge-decoy.bin").write_bytes(b"not-owned")
+    if failpoint == "after_full_purge_marker_fsync":
+        (case_root / "full-purge-baseline.json").write_text(
+            json.dumps(
+                {
+                    "databaseImageSha256": hashlib.sha256(
+                        (root / "capture-v1.sqlite3").read_bytes()
+                    ).hexdigest()
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     for name in (
         "capture-v1.sqlite3-journal",
         "capture-v1.sqlite3-wal",
