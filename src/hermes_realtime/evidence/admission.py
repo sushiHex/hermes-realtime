@@ -3101,8 +3101,9 @@ class EvidenceAdmissionControllerV1:
         transport_confirmed_full_count: int,
         assistant_delivery_context_recorded: bool,
     ) -> AppendDisposition:
-        """Atomically settle one successfully closed evidence turn."""
+        """Settle completed conversation or retire its incomplete capture lease."""
 
+        retired_tainted = False
         try:
             claimed: _AdmissionRolloverPreparationV1 | None = None
             callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
@@ -3116,8 +3117,16 @@ class EvidenceAdmissionControllerV1:
                     or state.snapshot
                     or state.settlement_attempted
                     or not self._lease_lineage_matches_locked(lease)
-                    or transport_confirmed_full_count != state.transport_confirmed_full_count
                 ):
+                    return AppendDisposition.INVALID_AUTHORITY
+                if self._session_tainted:
+                    state.settlement_attempted = True
+                    self._leases.pop(lease, None)
+                    with self._credit_lock:
+                        self._release_unused_terminal_credits_locked(state.terminal_reservation)
+                    retired_tainted = True
+                    return AppendDisposition.SESSION_TAINTED
+                if transport_confirmed_full_count != state.transport_confirmed_full_count:
                     return AppendDisposition.INVALID_AUTHORITY
                 cause = self.record_terminal_cause(
                     lease.terminal_cause,
@@ -3196,6 +3205,11 @@ class EvidenceAdmissionControllerV1:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
             return AppendDisposition.WRITER_FAULT
+        finally:
+            if retired_tainted:
+                # A tainted retirement queues no terminal records whose writer
+                # completion could otherwise advance pending revocation.
+                self._advance_revoke_finalization_if_ready()
 
     def settle_terminal(
         self,
@@ -3348,6 +3362,8 @@ class EvidenceAdmissionControllerV1:
                     state.event_count += 1
                     state.canonical_bytes += size
                     self._apply_turn_event_locked(state, generated)
+                elif disposition is AppendDisposition.DROPPED_CAPACITY:
+                    self._taint_locked(TaintCode.ADMISSION_GAP)
                 return disposition
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -3500,6 +3516,8 @@ class EvidenceAdmissionControllerV1:
                     state.event_count += 1
                     state.canonical_bytes += size
                     self._apply_turn_event_locked(state, snapshot)
+                elif disposition is AppendDisposition.DROPPED_CAPACITY:
+                    self._taint_locked(TaintCode.ADMISSION_GAP)
                 return disposition
         except (KeyboardInterrupt, SystemExit):
             raise
