@@ -12,9 +12,17 @@ from test_admission import (
 from hermes_realtime.evidence import admission as a
 from hermes_realtime.evidence import models as m
 
+SETTLEMENT_REASONS = [
+    None,
+    m.TerminalReason.PROVIDER_FAILED,
+    m.TerminalReason.CALLER_CANCELLED,
+    m.TerminalReason.TRANSPORT_FAILED,
+]
 
+
+@pytest.mark.parametrize("reason", SETTLEMENT_REASONS)
 @pytest.mark.parametrize("revoked", [False, True])
-def test_capture_overflow_retires_only_the_owned_evidence_turn(revoked):
+def test_capture_overflow_retires_only_the_owned_evidence_turn(revoked, reason):
     admission, operations, writer, create = _active_admission(a, m, owner_generation=721)
     authority = _turn_authority(m, "UserTurnAuthorityV1", create, owner_generation=721)
     operation = operations.try_reserve(m.ConversationOperationKind.RESPONSE)
@@ -47,13 +55,8 @@ def test_capture_overflow_retires_only_the_owned_evidence_turn(revoked):
             writer.get_nowait(), m.RevokeDisposition.REVOKE_DURABLY_SCHEDULED
         )
         assert not revoke.terminal_event.is_set()
-    result = admission.settle_completed(
-        lease,
-        queued_chunk_count=80,
-        started_chunk_count=80,
-        transport_confirmed_full_count=80,
-        assistant_delivery_context_recorded=True,
-    )
+    queued_before = writer.ordered_count
+    result = _settle(admission, lease, reason=reason)
     after = admission.diagnostics()
     assert result is m.AppendDisposition.SESSION_TAINTED
     assert after.active_lease_count == 0
@@ -65,6 +68,8 @@ def test_capture_overflow_retires_only_the_owned_evidence_turn(revoked):
         admission.complete_revoke_finalize(finalizer, m.RevokeDisposition.PURGE_COMPLETED)
         assert revoke.terminal_event.is_set()
     else:
+        assert writer.ordered_count == queued_before
+        assert after.queue_record_count == before.queue_record_count - 2
         assert after.capture_state is m.CaptureState.FAULTED
     while writer.ordered_count:
         admission.complete_ordered_item(writer.get_nowait())
@@ -113,7 +118,15 @@ def _overflow(admission, lease, source):
     raise AssertionError("The real ordinary queue did not reach its bound")
 
 
-def _complete(admission, lease, count=80):
+def _settle(admission, lease, count=80, reason=None):
+    if reason is not None:
+        admission.record_terminal_cause(lease.terminal_cause, reason)
+        return admission.settle_terminal(
+            lease,
+            queued_chunk_count=count,
+            started_chunk_count=count,
+            assistant_delivery_context_recorded=False,
+        )
     return admission.settle_completed(
         lease,
         queued_chunk_count=count,
@@ -123,8 +136,9 @@ def _complete(admission, lease, count=80):
     )
 
 
+@pytest.mark.parametrize("reason", SETTLEMENT_REASONS)
 @pytest.mark.parametrize("source", ["generated", "transport"])
-def test_one_shot_source_refusal_latches_capture_gap(source):
+def test_one_shot_source_refusal_latches_capture_gap(source, reason):
     admission, writer, lease = _opened()
     _overflow(admission, lease, source)
     assert admission.diagnostics().capture_state is m.CaptureState.FAULTED
@@ -135,36 +149,38 @@ def test_one_shot_source_refusal_latches_capture_gap(source):
         admission.try_admit_generated(lease, "Synthetic later segment.")
         is m.AppendDisposition.SESSION_TAINTED
     )
-    assert _complete(admission, lease) is m.AppendDisposition.SESSION_TAINTED
+    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.SESSION_TAINTED
     assert admission.settled_terminal_outcome(lease) is None
     assert admission.diagnostics().active_lease_count == 0
 
 
-def test_tainted_retirement_requires_the_exact_live_owner_lease():
+@pytest.mark.parametrize("reason", SETTLEMENT_REASONS)
+def test_tainted_retirement_requires_the_exact_live_owner_lease(reason):
     admission, writer, lease = _opened()
     other, _, foreign = _opened(722)
     _overflow(admission, lease, "generated")
     before = admission.diagnostics()
-    assert _complete(admission, foreign) is m.AppendDisposition.INVALID_AUTHORITY
+    assert _settle(admission, foreign, reason=reason) is m.AppendDisposition.INVALID_AUTHORITY
     assert admission.diagnostics() == before
     assert other.diagnostics().active_lease_count == 1
-    assert _complete(admission, lease) is m.AppendDisposition.SESSION_TAINTED
+    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.SESSION_TAINTED
     retired = admission.diagnostics()
-    assert _complete(admission, lease) is m.AppendDisposition.INVALID_AUTHORITY
+    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.INVALID_AUTHORITY
     assert admission.diagnostics() == retired
     assert other.diagnostics().active_lease_count == 1
-    assert _complete(other, foreign, 0) is m.AppendDisposition.ADMITTED
+    assert _settle(other, foreign, 0, reason=reason) is m.AppendDisposition.ADMITTED
 
 
 def test_healthy_capture_still_rejects_a_mismatched_delivery_count():
     admission, _, lease = _opened()
     before = admission.diagnostics()
-    assert _complete(admission, lease, 1) is m.AppendDisposition.INVALID_AUTHORITY
+    assert _settle(admission, lease, 1) is m.AppendDisposition.INVALID_AUTHORITY
     assert admission.diagnostics() == before
-    assert _complete(admission, lease, 0) is m.AppendDisposition.ADMITTED
+    assert _settle(admission, lease, 0) is m.AppendDisposition.ADMITTED
 
 
-def test_tainted_retirement_preserves_another_live_operation_in_the_same_owner():
+@pytest.mark.parametrize("reason", SETTLEMENT_REASONS)
+def test_tainted_retirement_preserves_another_live_operation_in_the_same_owner(reason):
     admission, operations, writer, create = _active_admission(a, m, owner_generation=721)
     response = _turn_authority(m, "UserTurnAuthorityV1", create, owner_generation=721)
     lease = admission.try_reserve_user_turn(
@@ -181,9 +197,9 @@ def test_tainted_retirement_preserves_another_live_operation_in_the_same_owner()
     assert admission.try_open_non_user_turn(other) is m.AppendDisposition.ADMITTED
     _overflow(admission, lease, "generated")
     assert admission.diagnostics().active_lease_count == 2
-    assert _complete(admission, lease) is m.AppendDisposition.SESSION_TAINTED
+    assert _settle(admission, lease, reason=reason) is m.AppendDisposition.SESSION_TAINTED
     assert admission.diagnostics().active_lease_count == 1
-    assert _complete(admission, other, 0) is m.AppendDisposition.SESSION_TAINTED
+    assert _settle(admission, other, 0, reason=reason) is m.AppendDisposition.SESSION_TAINTED
     assert admission.diagnostics().active_lease_count == 0
     assert (
         admission.settled_terminal_outcome(lease)
