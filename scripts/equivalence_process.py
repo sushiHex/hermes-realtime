@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import secrets
 import shutil
@@ -13,7 +14,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from scripts import candidate_source_archive_oracle as archives
 from scripts import qualify_evidence_slice_zero as core
@@ -116,6 +117,34 @@ def _read_frame(fd: int, deadline: float) -> Any:
     raise TimeoutError("equivalence frame deadline expired")
 
 
+def _read_worker_exit_events(fd: int) -> list[str] | None:
+    """Sample five content-free milestones without waiting for pipe EOF."""
+    import _winapi
+    import msvcrt
+
+    names = {
+        ord("D"): "done_acknowledged",
+        ord("T"): "server_stop_entered",
+        ord("S"): "server_stop_returned",
+        ord("P"): "protocol_closed",
+        ord("A"): "atexit_entered",
+    }
+    try:
+        peek = cast(tuple[bytes, int, int], _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd), 1))
+        available = peek[1]
+        raw = os.read(fd, min(available, 6)) if available else b""
+    except BrokenPipeError:
+        raw = b""
+    except OSError:
+        return None
+    if any(value not in names for value in raw):
+        return None
+    order = [list(names).index(value) for value in raw]
+    if order != sorted(set(order)):
+        return None
+    return [names[value] for value in raw]
+
+
 def _write_frame(fd: int, document: Any) -> None:
     raw = core.canonical_json_bytes(document)
     _require(len(raw) <= _MAX_FRAME, "equivalence frame exceeds its bound")
@@ -212,19 +241,27 @@ def run_archived_equivalence(
         with ExitStack() as pipes:
             request_read, request_write = os.pipe()
             response_read, response_write = os.pipe()
+            progress_read, progress_write = os.pipe()
             endpoints = {
                 fd: pipes.enter_context(
                     os.fdopen(
-                        fd, "rb" if fd in {request_read, response_read} else "wb", buffering=0
+                        fd, "rb" if fd in {request_read, response_read, progress_read} else "wb",
+                        buffering=0
                     )
                 )
-                for fd in (request_read, request_write, response_read, response_write)
+                for fd in (
+                    request_read, request_write, response_read, response_write,
+                    progress_read, progress_write,
+                )
             }
             os.set_inheritable(request_read, True)
             os.set_inheritable(response_write, True)
+            os.set_inheritable(progress_write, True)
             import msvcrt
 
-            handles = (msvcrt.get_osfhandle(request_read), msvcrt.get_osfhandle(response_write))
+            handles = tuple(
+                msvcrt.get_osfhandle(fd) for fd in (request_read, response_write, progress_write)
+            )
             bootstrap = (
                 "import sys,runpy;sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)];"
                 "runpy.run_module('scripts.equivalence_worker',run_name='__main__')"
@@ -281,9 +318,13 @@ def run_archived_equivalence(
             root_process = job.launch_root()
             endpoints[request_read].close()
             endpoints[response_write].close()
+            endpoints[progress_write].close()
+            observed_exit_code: int | None = None
+            exchange_completed = False
             deadline = time.monotonic() + 600
 
             def execute() -> int:
+                nonlocal observed_exit_code, exchange_completed
                 _write_frame(
                     request_write,
                     {
@@ -365,6 +406,7 @@ def run_archived_equivalence(
                     _write_frame(
                         request_write, {"version": 1, "nonce": nonce, "sequence": sequence}
                     )
+                exchange_completed = True
                 kernel.wait(root_process.process_handle, 10_000)
                 code = ctypes.c_uint32()
                 api = kernel._api()
@@ -372,10 +414,22 @@ def run_archived_equivalence(
                 api.GetExitCodeProcess.restype = ctypes.c_int
                 if not api.GetExitCodeProcess(root_process.process_handle, ctypes.byref(code)):
                     raise ctypes.WinError(ctypes.get_last_error())
+                observed_exit_code = int(code.value)
                 _require(code.value == 0, f"archived worker exit code is {code.value}")
                 return int(code.value)
 
-            exit_code = core._run_with_windows_scenario_job_finalization_v1(job, execute)
+            try:
+                exit_code = core._run_with_windows_scenario_job_finalization_v1(job, execute)
+            finally:
+                # Diagnostic milestones never supply qualification authority. In
+                # particular, a complete exchange cannot accept an abnormal exit.
+                print("[archived-worker] " + json.dumps({
+                    "version": 1,
+                    "scenario": _SCENARIO,
+                    "exchange_completed": exchange_completed,
+                    "exit_code": observed_exit_code,
+                    "child_events": _read_worker_exit_events(progress_read),
+                }))
             finalization = job.last_finalization
             assert finalization is not None
             finalized = finalization.closed and finalization.zero_active_observed

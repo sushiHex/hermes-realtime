@@ -110,8 +110,9 @@ a later run must qualify the new diagnostic candidate separately.
 archived-worker access violation after the complete ready/nine-arm/done exchange
 in run `34431895476`, attempt 1. The worker's abnormal exit was correctly rejected.
 The healthy main run above is an additional observation, not proof of a cause or
-fix. Bounded teardown observations are the next investigation step; normal exit
-and owned-process cleanup remain mandatory for acceptance.
+fix. The [worker exit diagnostic](deterministic-equivalence.md#worker-exit-observations)
+now retains fixed shutdown milestones separately from scenario frames, including
+on failure. Normal exit and owned-process cleanup remain mandatory for acceptance.
 
 ## Maintaining this snapshot
 
@@ -122,3 +123,11 @@ than this page's baseline, record that identity in the row; advance the page-wid
 baseline only after reviewing the whole map. Keep issue discussions and run logs
 as the detailed evidence record, and follow the
 [contribution guidance](../CONTRIBUTING.md#documentation-maintenance).
+
+A separate [browser readiness investigation](https://github.com/sushiHex/hermes-realtime/issues/27)
+tracks main push run `34441271535`, attempt 1, at `e6d1ffb08967055f064c37b15187408cd14d5071`.
+Native's integration gate and archived equivalence passed, then browser
+self-acceptance found typed input still disabled 30 seconds after Connect. The
+other three jobs passed. The exact-tree PR run was green; it does not replace
+this failed main result. Browser and runtime sources were unchanged by that
+checkpoint diagnostic change. The hosted cause remains unproven.
