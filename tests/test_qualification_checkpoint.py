@@ -173,9 +173,12 @@ async def test_external_cli_checkpoint_failure_reaps_with_stderr_backpressure(
     observation = _checkpoint_observation(capsys)
     assert set(observation) == {
         "version", "case", "pid", "completed", "killed", "reaped", "exit_code",
-        "stderr_bytes", "events_ms",
+        "stderr_bytes", "events_ms", "child_events",
     }
-    assert observation["version"] == 1
+    assert observation["version"] == 2
+    assert observation["child_events"] == [
+        "launcher_close_entered", "launcher_close_returned", "host_main_settled", "atexit_entered",
+    ]
     assert observation["completed"] is True
     assert observation["reaped"] is True
     assert observation["killed"] is False
@@ -189,6 +192,24 @@ async def test_external_cli_checkpoint_failure_reaps_with_stderr_backpressure(
     ]
     assert list(events.values()) == sorted(events.values())
     assert events["spawn_started"] == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_diagnostics_distinguish_host_settlement_from_interpreter_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as failure:
+        await _assert_external_cli_checkpoint_failure("ack_eof", tmp_path, hold_atexit=True)
+    assert failure.value.timeout == 5.0
+    observation = _checkpoint_observation(capsys)
+    assert observation["completed"] is False
+    assert observation["killed"] is True
+    assert observation["reaped"] is True
+    assert observation["stderr_bytes"] > 0
+    assert observation["child_events"] == [
+        "launcher_close_entered", "launcher_close_returned", "host_main_settled", "atexit_entered",
+    ]
 
 
 def _checkpoint_observation(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
@@ -225,6 +246,7 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
+            self.drained_stderr: bytes | None = None
             self.timeouts: list[subprocess.TimeoutExpired] = []
             children.append(self)
 
@@ -243,7 +265,9 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
                 self.maximum_communications, self.active_communications,
             )
             try:
-                return super().communicate(input=input, timeout=timeout)
+                result = super().communicate(input=input, timeout=timeout)
+                self.drained_stderr = result[1]
+                return result
             except subprocess.TimeoutExpired as error:
                 self.timeouts.append(error)
                 raise
@@ -253,7 +277,9 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
     monkeypatch.setattr(subprocess, "Popen", ObservedChild)
     expect_timeout = interruption in ("timeout", "timeout_then_cancel")
     run = asyncio.create_task(
-        _assert_external_cli_checkpoint_failure("ack_eof", tmp_path, hold_close=True),
+        _assert_external_cli_checkpoint_failure(
+            "ack_eof", tmp_path, hold_close=True, stderr_bytes=17,
+        ),
     )
     try:
         await asyncio.wait_for(reader_started.wait(), timeout=10.0)
@@ -299,7 +325,15 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
     observation = _checkpoint_observation(capsys)
     assert observation["completed"] is False
     assert observation["reaped"] is True
-    assert observation["stderr_bytes"] is None
+    assert child.drained_stderr is not None
+    assert observation["stderr_bytes"] == len(child.drained_stderr)
+    if expect_timeout:
+        assert observation["stderr_bytes"] == 17
+        assert observation["child_events"] == ["launcher_close_entered"]
+    else:
+        # Cancellation may win before the child enters close or writes anything.
+        assert observation["stderr_bytes"] in {0, 17}
+        assert observation["child_events"] in ([], ["launcher_close_entered"])
     assert "completion_entered" in observation["events_ms"]
     assert "completion_returned" not in observation["events_ms"]
     assert "cleanup_returned" in observation["events_ms"]
@@ -357,7 +391,7 @@ async def _settle_checkpoint_communication(
     communication: asyncio.Task[tuple[bytes | None, bytes | None]],
     *,
     deadline: float,
-) -> asyncio.CancelledError | None:
+) -> tuple[asyncio.CancelledError | None, int | None]:
     """Join the current call before any retry; all cleanup shares one deadline."""
     loop = asyncio.get_running_loop()
     interrupted: asyncio.CancelledError | None = None
@@ -383,7 +417,7 @@ async def _settle_checkpoint_communication(
 
     await settle(communication)
     try:
-        communication.result()
+        _, stderr = communication.result()
     except subprocess.TimeoutExpired:
         # Windows leaves its reader thread active after communicate() times out.
         # The original call has ended, so a sequential retry can join that reader.
@@ -391,8 +425,46 @@ async def _settle_checkpoint_communication(
             asyncio.to_thread(process.communicate, timeout=remaining()),
         )
         await settle(drain)
-        drain.result()
-    return interrupted
+        _, stderr = drain.result()
+    return interrupted, None if stderr is None else len(stderr)
+
+
+@pytest.mark.parametrize("raw", [b"private-output", b"CCCC", b"AC", b"CcHAC"])
+def test_checkpoint_child_events_refuse_unknown_duplicate_or_reordered_bytes(raw: bytes) -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, raw)
+        assert _read_checkpoint_child_events(read_fd) is None
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def _read_checkpoint_child_events(fd: int) -> list[str] | None:
+    """Read at most four fixed milestones; never wait for a writer or retain text."""
+    import _winapi
+    import msvcrt
+
+    names = {
+        ord("C"): "launcher_close_entered",
+        ord("c"): "launcher_close_returned",
+        ord("H"): "host_main_settled",
+        ord("A"): "atexit_entered",
+    }
+    try:
+        _, available, _ = _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd), 1)
+        raw = os.read(fd, min(available, 5)) if available else b""
+    except BrokenPipeError:
+        raw = b""
+    except OSError:
+        return None
+    # A malformed stream is unavailable evidence, never arbitrary child output.
+    if any(value not in names for value in raw):
+        return None
+    ordered = [list(names).index(value) for value in raw]
+    if ordered != sorted(set(ordered)):
+        return None
+    return [names[value] for value in raw]
 
 
 async def _assert_external_cli_checkpoint_failure(
@@ -401,17 +473,21 @@ async def _assert_external_cli_checkpoint_failure(
     *,
     stderr_bytes: int = 0,
     hold_close: bool = False,
+    hold_atexit: bool = False,
 ) -> None:
     import msvcrt
 
     checkpoint_read_fd, checkpoint_write_fd = os.pipe()
     resume_read_fd, resume_write_fd = os.pipe()
+    progress_read_fd, progress_write_fd = os.pipe()
     write_handle = msvcrt.get_osfhandle(checkpoint_write_fd)
     resume_handle = msvcrt.get_osfhandle(resume_read_fd)
+    progress_handle = msvcrt.get_osfhandle(progress_write_fd)
     os.set_handle_inheritable(write_handle, True)
     os.set_handle_inheritable(resume_handle, True)
+    os.set_handle_inheritable(progress_handle, True)
     startup = subprocess.STARTUPINFO()
-    startup.lpAttributeList = {"handle_list": [write_handle, resume_handle]}
+    startup.lpAttributeList = {"handle_list": [write_handle, resume_handle, progress_handle]}
     nonce = "6" * 64
     close_body = (
         f"sys.stderr.buffer.write(b'x' * {stderr_bytes}); sys.stderr.buffer.flush()"
@@ -421,7 +497,9 @@ async def _assert_external_cli_checkpoint_failure(
     if hold_close:
         close_body += "; await asyncio.Event().wait()"
     child = (
-        "import asyncio,sys\n"
+        "import asyncio,sys,os,msvcrt,atexit,threading\n"
+        "os.set_handle_inheritable(int(sys.argv[4]),False)\n"
+        "progress=msvcrt.open_osfhandle(int(sys.argv[4]),os.O_WRONLY|os.O_BINARY)\n"
         "import hermes_realtime.host_launcher as h\n"
         "from hermes_realtime._qualification import _current_qualification_checkpoint_channel\n"
         "class L:\n"
@@ -431,7 +509,7 @@ async def _assert_external_cli_checkpoint_failure(
         "  t.add_done_callback(lambda x:x.exception())\n"
         "  await asyncio.sleep(0)\n"
         "  return 'https://127.0.0.1:8443/'\n"
-        f" async def close(self): {close_body}\n"
+        f" async def close(self): os.write(progress,b'C'); {close_body}; os.write(progress,b'c')\n"
         "def build(**kw):\n"
         " c=_current_qualification_checkpoint_channel(); assert c is not None; return L(c)\n"
         "h.build_local_host_launcher=build\n"
@@ -440,7 +518,12 @@ async def _assert_external_cli_checkpoint_failure(
         "'--qualification-checkpoint-write-handle',sys.argv[1],"
         "'--qualification-checkpoint-resume-handle',sys.argv[2],"
         "'--qualification-checkpoint-nonce',sys.argv[3]]\n"
-        "raise SystemExit(h.main())\n"
+        "def at_exit():\n"
+        " os.write(progress,b'A')\n"
+        + (" threading.Event().wait()\n" if hold_atexit else "")
+        + "atexit.register(at_exit)\n"
+        "try: raise SystemExit(h.main())\n"
+        "finally: os.write(progress,b'H')\n"
     )
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
@@ -456,13 +539,17 @@ async def _assert_external_cli_checkpoint_failure(
     completed = False
     killed = False
     stderr_size: int | None = None
+    child_events: list[str] | None = None
 
     def mark(event: str) -> None:
         events_ms[event] = round((time.perf_counter_ns() - started) / 1_000_000, 3)
 
     try:
         process = subprocess.Popen(
-            [sys.executable, "-c", child, str(write_handle), str(resume_handle), nonce],
+            [
+                sys.executable, "-c", child, str(write_handle), str(resume_handle), nonce,
+                str(progress_handle),
+            ],
             close_fds=True,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             env=environment,
@@ -471,6 +558,8 @@ async def _assert_external_cli_checkpoint_failure(
             stderr=subprocess.PIPE,
         )
         mark("spawn_returned")
+        os.close(progress_write_fd)
+        progress_write_fd = -1
         os.close(checkpoint_write_fd)
         checkpoint_write_fd = -1
         os.close(resume_read_fd)
@@ -541,15 +630,17 @@ async def _assert_external_cli_checkpoint_failure(
                             timeout=max(0.0, cleanup_deadline - asyncio.get_running_loop().time()),
                         )
                     else:
-                        cleanup_interruption = await _settle_checkpoint_communication(
+                        cleanup_interruption, stderr_size = await _settle_checkpoint_communication(
                             process, communication, deadline=cleanup_deadline,
                         )
                     if process.stderr is not None:
                         process.stderr.close()
             finally:
+                child_events = _read_checkpoint_child_events(progress_read_fd)
                 # Protocol pipes are independent of the communication worker's stderr.
                 for fd in (
                     checkpoint_read_fd, resume_write_fd, checkpoint_write_fd, resume_read_fd,
+                    progress_read_fd, progress_write_fd,
                 ):
                     if fd >= 0:
                         os.close(fd)
@@ -558,9 +649,9 @@ async def _assert_external_cli_checkpoint_failure(
                 raise cleanup_interruption
         finally:
             # Pytest retains this on failure; -s also exposes healthy comparison samples.
-            # Only parent-observed timings and scalar process facts leave the fixture.
+            # Only fixed child milestones, parent timings, and scalar process facts leave.
             print("[checkpoint-child] " + json.dumps({
-                "version": 1,
+                "version": 2,
                 "case": failure_case,
                 "pid": None if process is None else process.pid,
                 "completed": completed,
@@ -568,6 +659,7 @@ async def _assert_external_cli_checkpoint_failure(
                 "reaped": process is not None and process.poll() is not None,
                 "exit_code": None if process is None else process.returncode,
                 "stderr_bytes": stderr_size,
+                "child_events": child_events,
                 "events_ms": events_ms,
             }))
 

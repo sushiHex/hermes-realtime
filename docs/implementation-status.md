@@ -100,8 +100,11 @@ measurements.
 A [later Native recurrence](https://github.com/sushiHex/hermes-realtime/issues/13#issuecomment-5611252950)
 exhausted the unchanged `communicate(timeout=5.0)` authority for `ack_eof` and
 `duplicate_key`. Draining alone therefore does not exclude a hosted child-exit
-timeout. The proposed discriminating observations are cleanup stderr byte counts
-and host completion separately from interpreter exit; the cause remains unproven.
+timeout. The [checkpoint fixture](../tests/test_qualification_checkpoint.py) now retains
+cleanup stderr byte counts and fixed child milestones distinguishing launcher
+close, CLI settlement, and entry into an exit callback. These observations keep
+the existing completion and cleanup deadlines. The hosted cause remains unproven;
+a later run must qualify the new diagnostic candidate separately.
 
 [Issue #24](https://github.com/sushiHex/hermes-realtime/issues/24) tracks a separate
 archived-worker access violation after the complete ready/nine-arm/done exchange

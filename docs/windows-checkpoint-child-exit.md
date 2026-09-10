@@ -88,8 +88,8 @@ pytest capture retains it on failure; `-s` exposes passing samples. Tests that
 parse the line replay the captured output before asserting, preserving the line
 if a later assertion fails. It contains
 only a version, fixed case name, PID, outcome flags, exit code, stderr byte
-count, and monotonic event offsets. It contains no stderr text, command line,
-environment, checkpoint nonce, or filesystem path.
+count, parent monotonic event offsets, and fixed child lifecycle names. It contains
+no stderr text, command line, environment, checkpoint nonce, or filesystem path.
 
 The event offsets are milliseconds from the parent's process-creation attempt:
 
@@ -102,10 +102,30 @@ The event offsets are milliseconds from the parent's process-creation attempt:
 
 These are parent observations, not child-side timestamps. Closing the ACK writer
 does not measure when the child processes EOF. A missing event means that boundary
-was not observed. A null stderr count means the normal completion path did not
-return a measurement; it does not mean zero bytes or claim that no output was
-drained during cleanup.
+was not observed. Version 2 retains the byte count returned by either normal
+communication or its sequential cleanup drain. A null count means neither returned a measurement;
+it does not mean zero bytes. The count after a kill describes bytes recovered
+through cleanup, not a naturally completed child.
 A killed child's exit code is a cleanup result, not its natural exit status.
+
+The separate inherited progress pipe carries at most four single-byte milestones:
+`launcher_close_entered`, `launcher_close_returned`, `host_main_settled`, and
+`atexit_entered`. Only those fixed names enter `child_events`; unknown, duplicate,
+or reordered bytes yield null. An empty list means no milestone was observed.
+The parent samples available bytes without waiting for EOF or adding a reader
+thread. The child makes the handle noninheritable before importing the host.
+
+`host_main_settled` observes the test child's `finally` around the real CLI entry
+point, including an exception; it does not mean success. `atexit_entered` observes
+one callback registered after host imports. It does not prove that other exit
+callbacks or interpreter finalization completed. The milestones carry no child
+clock measurements and cannot be subtracted from parent offsets.
+
+A controlled child held inside launcher close and another held inside the exit
+callback distinguish these boundaries under the unchanged five-second deadline.
+Timeout, cancellation, and repeated cancellation tests compare the reported byte
+count with bytes actually returned by the owned communication call. The progress
+pipe remains independent of stderr and closes even if communication cleanup fails.
 
 From a clean checkout of the candidate, run a bounded Windows comparison:
 
