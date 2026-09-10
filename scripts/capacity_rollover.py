@@ -55,6 +55,7 @@ def _validate_thread_owners(threads: Any) -> None:
             "dispatcher_stopped",
             "sqlite_stopped",
             "dispatcher_clean",
+            "dispatcher_bound",
             "sqlite_clean",
         },
     )
@@ -67,6 +68,7 @@ def _validate_thread_owners(threads: Any) -> None:
         and threads["dispatcher_stopped"] is True
         and threads["sqlite_stopped"] is True
         and threads["dispatcher_clean"] is True
+        and threads["dispatcher_bound"] is True
         and threads["sqlite_clean"] is True,
         "SQLite, dispatcher, and event-loop ownership is not separate or stopped",
     )

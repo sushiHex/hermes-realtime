@@ -83,6 +83,7 @@ def _observations() -> dict:
             dispatcher_stopped=True,
             sqlite_stopped=True,
             dispatcher_clean=True,
+            dispatcher_bound=True,
             sqlite_clean=True,
         ),
         commands={
@@ -537,7 +538,7 @@ def test_owner_observer_refuses_duck_transport_and_foreground_execution(boundary
         elif boundary == "dequeue":
             owners.dequeued()
         elif boundary == "dispatcher":
-            owners.bind_dispatcher(object())
+            owners.bind_dispatcher(object(), queue=None, admission=None, transport=None)
     assert not transport._thread.is_alive()
 
 
@@ -547,9 +548,17 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
 
     from hermes_realtime.evidence import admission as a
     from hermes_realtime.evidence.models import StoreDisposition
-    from hermes_realtime.evidence.runtime import EvidenceWriterRuntimeOwnerV1
+    from hermes_realtime.evidence.runtime import (
+        EvidenceWriterDispatcherV1,
+        EvidenceWriterRuntimeOwnerV1,
+    )
     from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
-    from scripts.capacity_rollover_worker import _ObserveRolloverSpool, _ObserveThreadOwners
+    from scripts.capacity_rollover_worker import (
+        _ObserveDispatch,
+        _ObserveQueue,
+        _ObserveRolloverSpool,
+        _ObserveThreadOwners,
+    )
     from tests.evidence.test_sqlite_spool import make_create_epoch, make_spool
 
     key = b"synthetic key"
@@ -571,28 +580,41 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
     transport = SQLiteEvidenceWriterDaemonV1(factory)
     owners = _ObserveThreadOwners(transport, key)
     queue = a.BoundedEvidenceWriterQueueV1()
+    queue_observer = _ObserveQueue(queue, key, owner_generation=41, owners=owners)
+    admission = a.EvidenceAdmissionControllerV1(
+        enabled=True, owner_generation=41, writer_sink=queue
+    )
+    observed_transport = _ObserveDispatch(transport, key)
     completed = Event()
+    complete_create = admission.complete_create_epoch
 
-    def dispatch(item):
-        owners.dequeued()
-        assert transport.create_epoch(item.payload) is StoreDisposition.COMMITTED
+    def complete(item, **arguments):
+        assert arguments["disposition"] is StoreDisposition.COMMITTED
+        result = complete_create(item, **arguments)
         completed.set()
         assert finish_dispatch.wait(5)
         if live == "crashed":
             raise RuntimeError("synthetic dispatcher failure after completion")
+        return result
 
-    dispatcher = EvidenceWriterRuntimeOwnerV1(source=queue, dispatch=dispatch)
+    admission.complete_create_epoch = complete
+    production_dispatcher = EvidenceWriterDispatcherV1(
+        source=queue,
+        admission=admission,
+        transport=observed_transport,
+        binding_is_current=lambda _: True,
+    )
+    reservation = admission.try_reserve_create_epoch(make_create_epoch())
+    assert reservation is not None
+    assert admission.try_enqueue_create_epoch(reservation) is not None
+    dispatcher = EvidenceWriterRuntimeOwnerV1(
+        source=queue, dispatch=production_dispatcher.dispatch_item
+    )
     try:
-        queue.put_nowait(
-            a.EvidenceWriterQueueItemV1(
-                protocol_version=1,
-                lane=a.WriterQueueLane.ORDERED,
-                payload=make_create_epoch(),
-                admission_ordinal=2,
-            )
+        assert completed.wait(5), dispatcher.failure
+        owners.bind_dispatcher(
+            dispatcher, queue=queue, admission=admission, transport=observed_transport
         )
-        assert completed.wait(5)
-        owners.bind_dispatcher(dispatcher)
         finish_dispatch.set()
         if live != "sqlite":
             assert transport.close()
@@ -611,6 +633,7 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
         finish_dispatch.set()
         assert transport.close()
         assert dispatcher.close(2)
+        queue_observer.restore()
 
 
 @pytest.mark.parametrize(
@@ -625,6 +648,7 @@ def test_owner_observer_checks_the_retained_threads_after_close(tmp_path: Path, 
         "sqlite_live",
         "dispatcher_live",
         "dispatcher_failed",
+        "dispatcher_unbound",
         "sqlite_failed",
         "bool_count",
     ],
@@ -648,6 +672,8 @@ def test_parent_rejects_missing_or_collapsed_writer_thread_ownership(mutation: s
         threads["calls"].append(dict(stage="close", thread=threads["sqlite"]))
     elif mutation == "sqlite_live":
         threads["sqlite_stopped"] = False
+    elif mutation == "dispatcher_unbound":
+        threads["dispatcher_bound"] = False
     elif mutation in {"dispatcher_failed", "sqlite_failed"}:
         threads[mutation.replace("failed", "clean")] = False
     elif mutation == "dispatcher_live":
@@ -1343,3 +1369,49 @@ def test_rollover_parent_rejects_clock_and_store_authority_gaps(mutation: str) -
         committed["sessions"][0]["last_event_at"] = "e" * 64
     with pytest.raises(ValueError):
         _validate_observations(row)
+
+
+@pytest.mark.parametrize("substitution", ["none", "callback", "queue", "admission", "transport"])
+def test_owner_binding_requires_the_actual_production_dispatcher(substitution: str) -> None:
+    from hermes_realtime.evidence import admission as a
+    from hermes_realtime.evidence.runtime import (
+        EvidenceWriterDispatcherV1,
+        EvidenceWriterRuntimeOwnerV1,
+    )
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
+    from scripts.capacity_rollover_worker import _ObserveDispatch, _ObserveThreadOwners
+
+    queue = a.BoundedEvidenceWriterQueueV1()
+    admission = a.EvidenceAdmissionControllerV1(
+        enabled=True, owner_generation=41, writer_sink=queue
+    )
+    daemon = SQLiteEvidenceWriterDaemonV1(lambda: None)
+    transport = _ObserveDispatch(daemon, b"synthetic key")
+    owners = _ObserveThreadOwners(daemon, b"synthetic key")
+    dispatcher = EvidenceWriterDispatcherV1(
+        source=queue, admission=admission, transport=transport, binding_is_current=lambda _: True
+    )
+    callable_dispatch = (
+        (lambda item: None) if substitution == "callback" else dispatcher.dispatch_item
+    )
+    owner = EvidenceWriterRuntimeOwnerV1(source=queue, dispatch=callable_dispatch)
+    # Binding validation is independent of the scenario's dequeue test. Retain
+    # the same running thread so only the substituted dispatcher graph differs.
+    owners.dispatcher = owner._thread
+    if substitution == "queue":
+        dispatcher._source = a.BoundedEvidenceWriterQueueV1()
+    elif substitution == "admission":
+        dispatcher._admission = a.EvidenceAdmissionControllerV1(
+            enabled=True, owner_generation=41, writer_sink=a.BoundedEvidenceWriterQueueV1()
+        )
+    elif substitution == "transport":
+        dispatcher._transport = _ObserveDispatch(daemon, b"other key")
+    try:
+        if substitution == "none":
+            owners.bind_dispatcher(owner, queue=queue, admission=admission, transport=transport)
+        else:
+            with pytest.raises(ValueError):
+                owners.bind_dispatcher(owner, queue=queue, admission=admission, transport=transport)
+    finally:
+        assert owner.close(2)
+        assert not daemon._thread.is_alive()

@@ -66,7 +66,11 @@ Validly rehashing a substituted event cannot satisfy this comparison.
 The transport must be the exact production SQLite daemon. Factory and spool
 calls are checked against its retained thread object, separately from the
 observed dispatcher and event-loop threads. The dispatcher is bound to the real
-runtime owner after activation. After host close, both retained worker threads
+runtime owner after activation. Its callable must be the exact production
+dispatcher method, with the observed queue, runtime admission controller, and
+delegating transport. Those bindings must still match after close; arbitrary
+callbacks cannot substitute for typed dispatch and admission completion.
+After host close, both retained worker threads
 must actually be stopped without a recorded dispatcher exception or sticky
 SQLite fault. A suppressed spool-close exception also blocks acceptance; the
 observer records the failure before the daemon can suppress it. Only keyed

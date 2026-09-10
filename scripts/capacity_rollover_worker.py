@@ -430,6 +430,7 @@ class _ObserveThreadOwners:
         self.sqlite = transport._thread
         self.dispatcher: Any = None
         self.bound_dispatcher: Any = None
+        self.dispatcher_binding: tuple[Any, Any, Any] | None = None
         self.calls: list[dict[str, str]] = []
         self.dequeues = 0
         self.failed = False
@@ -455,16 +456,47 @@ class _ObserveThreadOwners:
         self.dequeues += 1
         self._check(self.dequeues <= 21, "dispatcher observation overflow")
 
-    def bind_dispatcher(self, owner: Any) -> None:
-        from hermes_realtime.evidence.runtime import EvidenceWriterRuntimeOwnerV1
+    def _check_dispatcher_binding(
+        self, owner: Any, queue: Any, admission: Any, transport: Any
+    ) -> None:
+        from types import MethodType
 
+        from hermes_realtime.evidence.admission import (
+            BoundedEvidenceWriterQueueV1,
+            EvidenceAdmissionControllerV1,
+        )
+        from hermes_realtime.evidence.runtime import (
+            EvidenceWriterDispatcherV1,
+            EvidenceWriterRuntimeOwnerV1,
+        )
+
+        self._check(type(owner) is EvidenceWriterRuntimeOwnerV1, "dispatcher owner is not exact")
+        method = owner._dispatch
         self._check(
-            type(owner) is EvidenceWriterRuntimeOwnerV1
-            and owner._thread is self.dispatcher
-            and owner.is_running,
+            type(method) is MethodType
+            and method.__func__ is EvidenceWriterDispatcherV1.dispatch_item
+            and type(method.__self__) is EvidenceWriterDispatcherV1,
+            "owner does not call the exact production dispatcher",
+        )
+        dispatcher = method.__self__
+        self._check(
+            type(queue) is BoundedEvidenceWriterQueueV1
+            and owner._source is dispatcher._source is queue
+            and type(admission) is EvidenceAdmissionControllerV1
+            and dispatcher._admission is admission
+            and admission._writer_sink is queue
+            and dispatcher._transport is transport,
+            "production dispatcher does not bind the observed queue, admission, and transport",
+        )
+
+    def bind_dispatcher(self, owner: Any, *, queue: Any, admission: Any, transport: Any) -> None:
+        self._check_dispatcher_binding(owner, queue, admission, transport)
+        self._check(
+            owner._thread is self.dispatcher and owner.is_running,
             "observed dispatcher is not the retained production owner",
         )
         self.bound_dispatcher = owner
+        self.dispatcher_binding = (queue, admission, transport)
 
     def spool_call(self, stage: str) -> None:
         self._check(
@@ -493,6 +525,9 @@ class _ObserveThreadOwners:
         self.calls.append({"stage": stage, "thread": self._identity(current_thread())})
 
     def finished(self) -> dict[str, Any]:
+        self._check(self.dispatcher_binding is not None, "dispatcher was never bound")
+        assert self.dispatcher_binding is not None
+        self._check_dispatcher_binding(self.bound_dispatcher, *self.dispatcher_binding)
         self._check(
             not self.failed
             and self.bound_dispatcher is not None
@@ -514,6 +549,7 @@ class _ObserveThreadOwners:
             "dispatcher_stopped": not self.dispatcher.is_alive(),
             "sqlite_stopped": not self.sqlite.is_alive(),
             "dispatcher_clean": self.bound_dispatcher.failure is None,
+            "dispatcher_bound": True,
             "sqlite_clean": not self.failed and self.transport._sticky_fault is None,
         }
 
@@ -867,7 +903,13 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         )
         accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
         _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
-        thread_owners[0].bind_dispatcher(reservations[0][0]._writer)
+        runtime = reservations[0][0]
+        thread_owners[0].bind_dispatcher(
+            runtime._writer,
+            queue=queues[0].queue,
+            admission=runtime._admission,
+            transport=dispatches[0],
+        )
         after = 0
         for sequence in range(1, 4):
             text = f"Synthetic capacity turn {sequence}."
