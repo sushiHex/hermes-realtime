@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -58,22 +59,51 @@ def _database_state(database: Path) -> dict[str, Any]:
             "storage foreign keys differ",
         )
         installations = connection.execute(
-            "SELECT installation_id,purge_required FROM producer_installation"
+            "SELECT installation_id,purge_required,singleton,purge_reason,purge_scope "
+            "FROM producer_installation"
         ).fetchall()
         _require(len(installations) <= 1, "storage installation count differs")
+        for installation, required, singleton, reason, scope in installations:
+            _require(
+                installation == "10000000-0000-4000-8000-000000000001"
+                and singleton == 1
+                and (required, reason, scope) in {(0, None, None), (1, "clock_rollback", "store")},
+                "storage installation authority differs",
+            )
         epochs = connection.execute(
-            "SELECT consent_epoch_id,producer_instance_id,state FROM consent_epochs ORDER BY rowid"
+            "SELECT consent_epoch_id,producer_instance_id,state,opened_at_utc,closed_at_utc "
+            "FROM consent_epochs ORDER BY rowid"
         ).fetchall()
         rows = connection.execute(
             "SELECT logical_session_id,consent_epoch_id,producer_instance_id,state,event_count,"
-            "canonical_bytes,final_event_sequence,head_hash,taint_code "
+            "canonical_bytes,final_event_sequence,head_hash,taint_code,opened_at_utc,expires_at_utc,"
+            "consent_version "
             "FROM evidence_sessions ORDER BY rowid"
         ).fetchall()
         _require(len(rows) <= 2 and len(epochs) <= 2, "storage history exceeds its bound")
+        _require(
+            len(rows) == len(epochs)
+            and {row[1] for row in rows} == {epoch[0] for epoch in epochs}
+            and connection.execute("SELECT COUNT(*) FROM evidence_conflicts").fetchone() == (0,),
+            "storage has orphan epochs or unexpected conflicts",
+        )
         total = 0
         seals = []
         for session in rows:
-            sid, epoch, producer, state, count, size, final, head, taint = session
+            (
+                sid,
+                epoch,
+                producer,
+                state,
+                count,
+                size,
+                final,
+                head,
+                taint,
+                opened,
+                expires,
+                consent,
+            ) = session
             events = connection.execute(
                 "SELECT event_id,event_sequence,event_kind,canonical_payload,payload_hash,"
                 "previous_hash,record_hash,recorded_at_utc,canonical_bytes FROM evidence_events "
@@ -123,6 +153,37 @@ def _database_state(database: Path) -> dict[str, Any]:
                 )
                 previous = digest
                 payloads.append(parsed)
+            opening = payloads[0]
+            moment = datetime.strptime(events[0][7], "%Y-%m-%dT%H:%M:%S.%fZ")
+            expected_expiry = (moment + timedelta(hours=opening["retention_hours"])).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            epoch_row = next(row for row in epochs if row[0] == epoch)
+            _require(
+                epoch == opening["consent_epoch_id"]
+                and consent == opening["consent_version"]
+                and opened == events[0][7] == epoch_row[3]
+                and expires == expected_expiry
+                and producer == epoch_row[1],
+                "storage persisted consent lineage differs from its source",
+            )
+            for ordinal, event in enumerate(events):
+                expected_at = (moment + timedelta(seconds=max(0, ordinal - 1))).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+                _require(event[7] == expected_at, "storage fixture event chronology differs")
+            _require(
+                (state == "sealed" and epoch_row[2:] == ("closed", opened, events[-1][7]))
+                or (
+                    state == "open"
+                    and epoch_row[2:]
+                    in {
+                        ("active", opened, None),
+                        ("revoked", opened, "2026-08-08T00:00:01.000000Z"),
+                    }
+                ),
+                "storage epoch lifecycle differs from its source",
+            )
             _require(
                 count == len(events) and size == sum(e[8] for e in events),
                 "storage aggregates differ",
@@ -147,11 +208,15 @@ def _database_state(database: Path) -> dict[str, Any]:
                         payloads[-1][k] == payloads[0][k]
                         for k in ("consent_epoch_id", "consent_version", "disclosure_digest")
                     )
-                    and (epoch, producer, "closed") in epochs,
+                    and (epoch, producer, "closed", opened, events[-1][7]) in epochs,
                     "storage complete seal lineage differs",
                 )
                 seals.append(
-                    _digest(canonical_json_bytes([list(session), [list(e) for e in events]]))
+                    _digest(
+                        canonical_json_bytes(
+                            [list(session), list(epoch_row), [list(e) for e in events]]
+                        )
+                    )
                 )
             total += len(events)
         _require(

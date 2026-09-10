@@ -102,6 +102,12 @@ def test_fixture_oracle_requires_every_source_field_and_exact_type(event_index) 
         "candidate_oracle",
         "version",
         "application",
+        "lineage",
+        "conflict",
+        "expiry",
+        "opened",
+        "epoch_opened",
+        "epoch_closed",
     ],
 )
 def test_independent_reader_revalidates_real_committed_seals(
@@ -143,6 +149,10 @@ def test_independent_reader_revalidates_real_committed_seals(
         "delete": "DELETE FROM evidence_events WHERE event_sequence=4",
         "version": "PRAGMA user_version=2",
         "application": "PRAGMA application_id=0",
+        "expiry": "UPDATE evidence_sessions SET expires_at_utc='2026-08-10T00:00:00.000000Z'",
+        "opened": "UPDATE evidence_sessions SET opened_at_utc='2026-08-08T00:00:01.000000Z'",
+        "epoch_opened": "UPDATE consent_epochs SET opened_at_utc='2026-08-08T00:00:01.000000Z'",
+        "epoch_closed": "UPDATE consent_epochs SET closed_at_utc='2026-08-08T00:00:03.000000Z'",
     }
     with sqlite3.connect(database) as connection:
         # Model damaged storage while preserving the original schema, so the
@@ -151,9 +161,28 @@ def test_independent_reader_revalidates_real_committed_seals(
             "SELECT sql FROM sqlite_master WHERE name='evidence_events_are_append_only'"
         ).fetchone()[0]
         connection.execute("DROP TRIGGER evidence_events_are_append_only")
-        connection.execute(
-            statements[mutation], ("f" * 64,) if mutation in {"record", "payload", "seal"} else ()
-        )
+        if mutation == "lineage":
+            for table in ("consent_epochs", "evidence_sessions"):
+                connection.execute(
+                    f"UPDATE {table} SET consent_epoch_id=?",
+                    ("90000000-0000-4000-8000-000000000003",),
+                )
+        elif mutation == "conflict":
+            connection.execute(
+                "INSERT INTO evidence_conflicts VALUES (?,?,?,?,?)",
+                (
+                    "90000000-0000-4000-8000-000000000001",
+                    driver.SESSION_ID,
+                    "40000000-0000-4000-8000-000000000001",
+                    "sealed_session_reuse",
+                    "2026-08-08T00:00:03.000000Z",
+                ),
+            )
+        else:
+            connection.execute(
+                statements[mutation],
+                ("f" * 64,) if mutation in {"record", "payload", "seal"} else (),
+            )
         connection.execute(trigger)
     with pytest.raises(ValueError):
         _database_state(database)

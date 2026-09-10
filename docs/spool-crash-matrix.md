@@ -34,7 +34,9 @@ pinned to fixed protocol vectors, checks complete seal lineage and recovery
 erasure receipts, and verifies sentinel states and each full-purge deletion
 prefix. Each stored event must also match one of seven [pinned synthetic source
 events](../scripts/spool_crash_oracle.py), independently of the candidate's
-payload parser. Purge must leave every database artifact absent while preserving the
+payload parser. Persisted session and epoch identities, consent version,
+retention expiry, and lifecycle timestamps must agree with those source events;
+the fixture permits no conflict rows or orphan epochs. Purge must leave every database artifact absent while preserving the
 root marker and adjacent decoys. Malformed initialization images must be refused
 without mutation; completed initialization temporaries must be removed. The
 empty, partial, complete, and flushed images are pinned by independent V1 byte
