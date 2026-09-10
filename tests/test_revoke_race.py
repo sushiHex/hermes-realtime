@@ -43,6 +43,24 @@ def _wheel_bytes(change: str = "") -> tuple[bytes, dict[str, tuple[int, str]]]:
     elif change in {"metadata_encoding", "wheel_encoding"}:
         name = "METADATA" if change == "metadata_encoding" else "WHEEL"
         members[info + name] += b"\n\n\xff"
+    elif change in {"metadata_unixfrom", "wheel_unixfrom"}:
+        name = "METADATA" if change == "metadata_unixfrom" else "WHEEL"
+        members[info + name] = b"From synthetic envelope\n" + members[info + name]
+    elif change in {"metadata_multipart", "wheel_multipart"}:
+        name = "METADATA" if change == "metadata_multipart" else "WHEEL"
+        members[info + name] += (
+            b'Content-Type: multipart/mixed; boundary="synthetic"\n'
+            b'\n--synthetic\nContent-Type: text/plain\n\nbody\n--synthetic--\n'
+        )
+    elif change == "wheel_body":
+        members[info + "WHEEL"] += b"\nunsupported wheel body\n"
+    elif change in {"metadata_header_name", "wheel_header_name"}:
+        name = "METADATA" if change == "metadata_header_name" else "WHEEL"
+        members[info + name] += b"Invalid\x00Header: value\n"
+    elif change == "metadata_requirement":
+        members[info + "METADATA"] += b"Requires-Dist: !!!invalid!!!\n"
+    elif change == "metadata_python":
+        members[info + "METADATA"] += b"Requires-Python: unsupported-version-syntax\n"
     elif change == "source":
         members["hermes_realtime/runtime.py"] = b"candidate = 2\n"
     elif change == "extra":
@@ -104,6 +122,15 @@ def test_wheel_inspection_binds_every_runtime_blob_and_closed_metadata() -> None
         "wheel_defect",
         "metadata_encoding",
         "wheel_encoding",
+        "metadata_unixfrom",
+        "wheel_unixfrom",
+        "metadata_multipart",
+        "wheel_multipart",
+        "wheel_body",
+        "metadata_header_name",
+        "wheel_header_name",
+        "metadata_requirement",
+        "metadata_python",
     ],
 )
 def test_wheel_inspection_refuses_foreign_incomplete_or_executable_extra_members(

@@ -48,9 +48,14 @@ match its archived source blob. The wheel must have the exact bounded pure-Pytho
 member set, package identity, license, and complete SHA-256 `RECORD`. Its UTF-8
 metadata must parse without defects, declare core `Metadata-Version: 2.4` (the
 format produced by the pinned builder), and declare `Wheel-Version: 1.0`.
+Both files must be plain header documents with valid header names: Unix-from
+envelopes and multipart payloads are rejected. `METADATA` may carry its ordinary
+description body; `WHEEL` may not carry body content.
 The [core metadata fields](https://packaging.python.org/en/latest/specifications/core-metadata/)
-are checked before granting wheel authority, and entry-point names retain exact
-case. Duplicate,
+are checked before granting wheel authority. The existing locked development
+`packaging` library [validates their semantics](https://packaging.pypa.io/en/stable/metadata.html),
+including dependency and Python-version declarations. Entry-point names retain
+exact case. Duplicate,
 missing, unexpected, native, or mismatched members fail before launch.
 
 The pure wheel is unpacked into a fresh owned directory outside the source tree.

@@ -7,12 +7,15 @@ import configparser
 import csv
 import hashlib
 import io
+import re
 import zipfile
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
 from weakref import WeakKeyDictionary
+
+from packaging.metadata import Metadata
 
 from scripts import candidate_source_archive_oracle as archives
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
@@ -69,17 +72,30 @@ def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str
             members[_INFO + name].decode("utf-8")
         except UnicodeError as error:
             raise ValueError("candidate wheel metadata is not UTF-8") from error
-    metadata = BytesParser().parsebytes(members[_INFO + "METADATA"])
+    metadata, wheel_metadata = (
+        BytesParser().parsebytes(members[_INFO + name]) for name in ("METADATA", "WHEEL")
+    )
+    for document in (metadata, wheel_metadata):
+        _require(
+            not document.defects
+            and document.get_unixfrom() is None
+            and not document.is_multipart()
+            and type(document.get_payload()) is str
+            and all(re.fullmatch(r"[!-9;-~]+", name) for name in document),
+            "candidate wheel metadata is not a plain header document",
+        )
     _require(
-        not metadata.defects
-        and metadata.get_all("Metadata-Version") == ["2.4"]
+        metadata.get_all("Metadata-Version") == ["2.4"]
         and metadata.get_all("Name") == ["hermes-realtime"]
         and metadata.get_all("Version") == ["0.0.3"],
         "candidate wheel core metadata differs or is malformed",
     )
-    wheel_metadata = BytesParser().parsebytes(members[_INFO + "WHEEL"])
+    try:
+        Metadata.from_email(members[_INFO + "METADATA"], validate=True)
+    except (ValueError, ExceptionGroup):
+        raise ValueError("candidate wheel core metadata is invalid") from None
     _require(
-        not wheel_metadata.defects
+        not cast(str, wheel_metadata.get_payload()).strip()
         and wheel_metadata.get_all("Wheel-Version") == ["1.0"]
         and wheel_metadata.get_all("Root-Is-Purelib") == ["true"]
         and wheel_metadata.get_all("Tag") == ["py3-none-any"],
