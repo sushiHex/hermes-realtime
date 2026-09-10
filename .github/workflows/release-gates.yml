@@ -162,6 +162,7 @@ jobs:
 
   native-livekit:
     name: Native LiveKit release integration
+    needs: candidate-wheel
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -263,6 +264,11 @@ jobs:
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }
+      # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: hermes-realtime-pure-candidate-wheel
+          path: ${{ runner.temp }}/revoke-candidate-input
       - name: Qualify archived deterministic equivalence
         shell: pwsh
         run: |
@@ -271,6 +277,23 @@ jobs:
             --candidate $env:GITHUB_WORKSPACE `
             --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
           if ($LASTEXITCODE -ne 0) { throw "Deterministic equivalence failed with exit code $LASTEXITCODE" }
+      - name: Qualify packaged revocation race
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wheelRoot = Join-Path $env:RUNNER_TEMP 'revoke-candidate-input/candidate'
+          $wheels = @(Get-ChildItem -LiteralPath $wheelRoot -Filter '*.whl' -File)
+          if ($wheels.Count -ne 1) { throw 'Expected one candidate wheel' }
+          $manifest = (Get-Content -LiteralPath (Join-Path $wheelRoot 'candidate-wheel.sha256') -Raw).Trim()
+          if ($manifest -notmatch '^([0-9a-f]{64})  candidate/hermes_realtime-0\.0\.3-py3-none-any\.whl$') {
+            throw 'Candidate wheel digest manifest is not exact'
+          }
+          $wheelDigest = $Matches[1]
+          uv run --frozen --group dev python -m scripts.qualify_revoke_race `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Revocation qualification failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |

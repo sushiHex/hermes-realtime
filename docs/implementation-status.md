@@ -31,9 +31,10 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers one real
-[`deterministic_equivalence` producer](deterministic-equivalence.md), with
-**19 governed producers still explicitly unavailable**. The source-only producer
+The `SCENARIO_REGISTRY_V1` now registers two real producers,
+[`deterministic_equivalence`](deterministic-equivalence.md) and
+[`revoke_race`](revoke-race.md), with **18 governed producers still explicitly
+unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
 The native CI job invokes it against the checked-out committed candidate and
@@ -48,8 +49,16 @@ candidate-specific implementation result; subsequent changes require their own
 run. The [producer guide](deterministic-equivalence.md) states its source-only,
 media-selection, and dependency-environment limits.
 
+The packaged revocation producer executes the source-bound pure wheel through
+the existing owned Windows process harness. Its independent validator requires
+durable revocation, unchanged evidence admission while ordinary conversation
+continues, verified purge, normal exit, and complete cleanup. The Native job
+consumes the Pure candidate wheel artifact and prints the accepted source, wheel,
+and observation identities. This is a single packaged scenario; dependency-closure
+and physical claims retain the limits in its [implementation guide](revoke-race.md).
+
 The [registry tests](../tests/test_qualify_evidence_slice_zero.py) preserve the
-remaining refusal contract. This producer cannot generate an accepted full
+remaining refusal contract. These producers cannot generate an accepted full
 `qualification-report-v1`; the remaining matrix, installed-path prerequisites,
 and required human observations are still outstanding. Follow the ordered
 [roadmap](roadmap.md#ordered-milestones).

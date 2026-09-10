@@ -17,17 +17,21 @@ point; the detailed [evidence contract](evidence-capture.md) governs acceptance.
 | Order | Deliverable | Prerequisite | Complete when |
 | --- | --- | --- | --- |
 | 1 - implemented | One complete deterministic-equivalence qualification producer | Review the existing scenario contract, production observations, and integration coverage. | The real producer binds observations to the candidate and owned process lifecycle; independent validation rejects missing observations, false identity, and incomplete cleanup. Other scenarios remain explicitly unavailable. |
-| 2 - next | Remaining governed scenario producers | Establish the first complete producer without weakening its acceptance contract. | Every required scenario has a real producer with focused positive and failure coverage. A partial run cannot produce an accepted full qualification report. |
+| 2 - in progress | Remaining governed scenario producers | Establish the first complete producer without weakening its acceptance contract. | Every required scenario has a real producer with focused positive and failure coverage. A partial run cannot produce an accepted full qualification report. |
 | 3 | Frozen-candidate Windows desktop qualification | Complete the producer and installed-path prerequisites. | All required scenarios, including human-assisted observations, have valid evidence on the same candidate. Missing prerequisites and failed cases block the corresponding claim. |
 | 4 | Constrained alpha release decision | Complete desktop qualification and review the supported-use matrix. | The release decision identifies exact artifacts, demonstrated support, compatibility limits, and known issues. Publication requires release-owner authorization. |
 
-The first producer is registered in
+The first producer and the [packaged revocation race](revoke-race.md) are registered in
 [`qualify_evidence_slice_zero.py`](../scripts/qualify_evidence_slice_zero.py).
 Its [implementation guide](deterministic-equivalence.md) documents the fixed
 comparison arms, archive binding, and acceptance limits. Extend the remaining
 producers through the same candidate and ownership boundaries. Existing
 [full-host ingress tests](../tests/integration/test_qualification_full_host_ingress.py)
-remain integration coverage to examine before adding another harness.
+remain integration coverage to examine before adding another harness. Revocation
+now has a producer under [issue #29](https://github.com/sushiHex/hermes-realtime/issues/29);
+eighteen scenarios remain unavailable. Continue with bounded
+admission, then crash recovery/purge and owned close, preserving the existing
+scenario IDs and their acceptance contracts.
 
 Keep each implementation change independently reviewable. For milestone 2, group
 work by existing ownership boundaries: consent/revocation, bounded admission,
@@ -58,6 +62,11 @@ content-free teardown observations before selecting a runtime change. A complete
 scenario exchange followed by an abnormal exit remains a failed qualification.
 Once diagnostics are in place, continue milestone 2 while collecting recurrence
 evidence; an unexplained intermittent failure is not evidence of a fix.
+
+Track the separate browser readiness failure in
+[issue #27](https://github.com/sushiHex/hermes-realtime/issues/27). Preserve its
+readiness assertion and distinguish navigation, connection, and media-activation
+observations before assigning a cause.
 
 Security and demonstrated compatibility needs can take priority. Review dependency
 updates against the current base and affected runtime: generated browser assets
