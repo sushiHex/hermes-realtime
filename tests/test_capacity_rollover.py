@@ -98,6 +98,7 @@ def _observations() -> dict:
         snapshots=[before, copy.deepcopy(before), committed, continued],
         transactions=["BEGIN IMMEDIATE", "COMMIT"],
         transaction_writes=["INSERT", "UPDATE"],
+        connections={"observer_reads": 1, "unexpected": 0},
         durable_terminals=["committed"] * 3,
         rollover=[
             {
@@ -1423,7 +1424,19 @@ def test_owner_binding_requires_the_actual_production_dispatcher(substitution: s
         assert not daemon._thread.is_alive()
 
 
-@pytest.mark.parametrize("outside", ["none", "before", "after", "commented", "pragma", "split"])
+@pytest.mark.parametrize(
+    "outside",
+    [
+        "none",
+        "before",
+        "after",
+        "commented",
+        "pragma",
+        "split",
+        "second_connection",
+        "second_thread",
+    ],
+)
 def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
     tmp_path: Path, outside: str
 ) -> None:
@@ -1451,6 +1464,25 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
 
     def autocommit():
         assert not spool.connection.in_transaction
+        if outside in {"second_connection", "second_thread"}:
+            import sqlite3
+            from threading import Thread
+
+            def write_other():
+                with sqlite3.connect(spool.database, isolation_level=None) as connection:
+                    connection.execute(
+                        "UPDATE producer_installation SET clock_high_water_utc=clock_high_water_utc"
+                    )
+                connection.close()
+
+            if outside == "second_thread":
+                thread = Thread(target=write_other)
+                thread.start()
+                thread.join(5)
+                assert not thread.is_alive()
+            else:
+                write_other()
+            return
         if outside == "pragma":
             value = spool.connection.execute("PRAGMA application_id").fetchone()[0]
             spool.connection.execute(f"PRAGMA application_id={value}")
@@ -1464,7 +1496,7 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
         if outside == "before":
             autocommit()
         result = original(command)
-        if outside in {"after", "commented", "pragma"}:
+        if outside in {"after", "commented", "pragma", "second_connection", "second_thread"}:
             autocommit()
         return result
 
@@ -1476,7 +1508,7 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
         if outside == "none":
             assert observer.rollover_session(make_rollover_command()) is StoreDisposition.COMMITTED
         else:
-            with pytest.raises(ValueError, match="transaction observation"):
+            with pytest.raises(ValueError, match="(transaction|connection) observation"):
                 observer.rollover_session(make_rollover_command())
     finally:
         spool.close()
@@ -1484,7 +1516,10 @@ def test_rollover_observer_rejects_autocommit_writes_outside_its_transaction(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("generation", [42, True, 0, 2**53, 43])
-async def test_consent_anchor_requires_a_live_browser_generation(generation: object) -> None:
+@pytest.mark.parametrize("participant", ["synthetic participant", "different participant"])
+async def test_consent_anchor_requires_a_live_browser_generation(
+    generation: object, participant: str
+) -> None:
     import asyncio
 
     from hermes_realtime.client.runtime import BrowserClientRuntime
@@ -1499,6 +1534,7 @@ async def test_consent_anchor_requires_a_live_browser_generation(generation: obj
     sessions._active_generation = 42
     worker = object.__new__(LiveKitConversationWorker)
     worker._generation = generation
+    worker._participant_identity = participant
     runtime = object.__new__(BrowserClientRuntime)
     runtime._sessions, runtime._worker = sessions, worker
 
@@ -1508,9 +1544,10 @@ async def test_consent_anchor_requires_a_live_browser_generation(generation: obj
 
     launcher = object.__new__(LocalBrowserLauncher)
     launcher._runtime = Shutdown()
-    if type(generation) is int and generation == 42:
-        assert await _live_browser_binding(launcher, b"synthetic key") == _commit(
-            b"synthetic key", "browser_generation", "42"
+    if type(generation) is int and generation == 42 and participant == "synthetic participant":
+        assert await _live_browser_binding(launcher, b"synthetic key") == (
+            _commit(b"synthetic key", "browser_generation", "42"),
+            _commit(b"synthetic key", "browser_participant", participant),
         )
     else:
         with pytest.raises(ValueError):
@@ -1532,5 +1569,22 @@ def test_parent_requires_live_generation_and_bounded_transaction_writes(mutation
         row["transaction_writes"] = ["CREATE"]
     else:
         row["transaction_writes"] *= 65
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.parametrize("mutation", ["extra", "unseen", "no_reader", "bool"])
+def test_parent_requires_closed_connection_audit(mutation: str) -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    if mutation == "extra":
+        row["connections"]["uri"] = "synthetic"
+    elif mutation == "unseen":
+        row["connections"]["unexpected"] = 1
+    elif mutation == "no_reader":
+        row["connections"]["observer_reads"] = 0
+    else:
+        row["connections"]["observer_reads"] = True
     with pytest.raises(ValueError):
         _validate_observations(row)

@@ -8,8 +8,10 @@ import hmac
 import json
 import os
 import sqlite3
+import sys
 import uuid
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -150,7 +152,7 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     }
 
 
-async def _live_browser_binding(launcher: Any, key: bytes) -> str:
+async def _live_browser_binding(launcher: Any, key: bytes) -> tuple[str, str]:
     from inspect import getclosurevars
 
     from hermes_realtime.client.runtime import BrowserClientRuntime
@@ -174,10 +176,15 @@ async def _live_browser_binding(launcher: Any, key: bytes) -> str:
         type(binding) is BrowserBindingSnapshot
         and type(generation) is int
         and 1 <= generation < 2**53
-        and binding.binding_generation == generation,
+        and binding.binding_generation == generation
+        and type(worker._participant_identity) is str
+        and binding.participant_identity == worker._participant_identity,
         "live browser and media generations differ",
     )
-    return _commit(key, "browser_generation", str(generation))
+    return (
+        _commit(key, "browser_generation", str(generation)),
+        _commit(key, "browser_participant", binding.participant_identity),
+    )
 
 
 def _control_commitments(key: bytes, snapshots: Any) -> list[str]:
@@ -602,6 +609,61 @@ def _statement_kind(statement: str) -> str:
     return remaining.split(None, 1)[0].upper()
 
 
+_ACTIVE_CONNECTION_AUDIT: _ObserveConnectionAudit | None = None
+_CONNECTION_AUDIT_INSTALLED = False
+
+
+def _observe_connection_open(event: str, arguments: tuple[Any, ...]) -> None:
+    audit = _ACTIVE_CONNECTION_AUDIT
+    if audit is None or event != "sqlite3.connect":
+        return
+    # Python audits aliases and opens on other threads too. Never retain the
+    # event's database argument, handles, stack, or connection identifiers.
+    if (
+        audit.reader_thread is current_thread()
+        and len(arguments) == 1
+        and arguments[0] == audit.readonly_uri
+    ):
+        audit.reads = min(audit.reads + 1, 128)
+    else:
+        audit.unexpected = min(audit.unexpected + 1, 128)
+
+
+class _ObserveConnectionAudit:
+    """Latch unexpected connection opens without changing SQLite execution."""
+
+    def __init__(self, database: Path) -> None:
+        self.readonly_uri = database.as_uri() + "?mode=ro"
+        self.reader_thread: Any = None
+        self.reads = self.unexpected = 0
+
+    def __enter__(self) -> _ObserveConnectionAudit:
+        global _ACTIVE_CONNECTION_AUDIT, _CONNECTION_AUDIT_INSTALLED
+        _require(_ACTIVE_CONNECTION_AUDIT is None, "rollover connection audit overlapped")
+        if not _CONNECTION_AUDIT_INSTALLED:
+            sys.addaudithook(_observe_connection_open)
+            _CONNECTION_AUDIT_INSTALLED = True
+        _ACTIVE_CONNECTION_AUDIT = self
+        return self
+
+    def __exit__(self, *ignored: Any) -> None:
+        global _ACTIVE_CONNECTION_AUDIT
+        _ACTIVE_CONNECTION_AUDIT = None
+
+    @contextmanager
+    def readonly_snapshot(self) -> Iterator[None]:
+        _require(self.reader_thread is None, "rollover reader scope overlapped")
+        self.reader_thread = current_thread()
+        try:
+            yield
+        finally:
+            self.reader_thread = None
+
+    def observation(self) -> dict[str, int]:
+        _require(self.reads == 1 and self.unexpected == 0, "rollover connection observation failed")
+        return {"observer_reads": self.reads, "unexpected": self.unexpected}
+
+
 class _ObserveRolloverSpool:
     """Observe on the real SQLite owner thread and always delegate the operation."""
 
@@ -613,6 +675,7 @@ class _ObserveRolloverSpool:
         self.snapshots: list[dict[str, Any]] = []
         self.transactions: list[str] = []
         self.transaction_writes: list[str] = []
+        self.connections: dict[str, int] = {}
         self.failed = False
         self.durable_terminals: list[str] = []
         self.third_settled = Event()
@@ -693,6 +756,7 @@ class _ObserveRolloverSpool:
             self.key, "session_time", command.successor_expires_at_utc
         )
         self.snapshots.append(_snapshot(self.database, self.key))
+        connection_audit = _ObserveConnectionAudit(self.database)
 
         def trace(statement: str) -> None:
             # SQLite suppresses trace callback exceptions. Latch any refusal;
@@ -726,16 +790,19 @@ class _ObserveRolloverSpool:
                         and bool(self.transaction_writes),
                         "rollover commit lacks its active write transaction",
                     )
-                    self.snapshots.append(_snapshot(self.database, self.key))
+                    with connection_audit.readonly_snapshot():
+                        self.snapshots.append(_snapshot(self.database, self.key))
                 self.transactions.append(statement)
             except Exception:
                 self.failed = True
 
-        self.delegate.connection.set_trace_callback(trace)
-        try:
-            result = self.delegate.rollover_session(command)
-        finally:
-            self.delegate.connection.set_trace_callback(None)
+        with connection_audit:
+            self.delegate.connection.set_trace_callback(trace)
+            try:
+                result = self.delegate.rollover_session(command)
+            finally:
+                self.delegate.connection.set_trace_callback(None)
+        self.connections = connection_audit.observation()
         _require(
             not self.failed and not self.delegate.connection.in_transaction,
             "rollover transaction observation failed",
@@ -984,7 +1051,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             live_binding == await _live_browser_binding(running._host, key),
             "live generation changed during consent",
         )
-        accepted_consent["binding"] = live_binding
+        accepted_consent["binding"] = live_binding[0]
         _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
         runtime = reservations[0][0]
         thread_owners[0].bind_dispatcher(
@@ -1079,6 +1146,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         "snapshots": [*spool.snapshots, continued],
         "transactions": spool.transactions,
         "transaction_writes": spool.transaction_writes,
+        "connections": spool.connections,
         "durable_terminals": spool.durable_terminals,
         "rollover": [
             {"stage": item.stage.value, "result": item.result.value}

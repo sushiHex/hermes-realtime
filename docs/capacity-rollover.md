@@ -19,7 +19,11 @@ names and write verbs; SQL statements and their values never leave the child.
 Every mutating statement must run while the real connection is inside the one
 observed transaction. Writes before its begin or after its commit, unknown
 statement kinds, and writable PRAGMAs block acceptance. The two exact read-only
-quota PRAGMAs remain allowed. Callback failure
+quota PRAGMAs remain allowed. A scoped Python audit observes connection opens
+throughout the real rollover call, including aliases and other threads. Only
+the observer's one read-only callback connection is allowed; any other open
+blocks acceptance. The audit does not change SQLite execution or retain paths
+or handles. Callback failure
 blocks acceptance even though SQLite itself suppresses callback exceptions.
 
 After that single transaction returns, another read must see the sealed
@@ -48,8 +52,9 @@ session must match that independent source commitment. Consistently rewriting
 all store consent fields and recomputing their hashes cannot replace the request
 that was actually accepted. The create command also binds to the generation
 read from the existing browser session and LiveKit owners. They must agree
-before and after consent; the browser snapshot is read under its real authority
-lock. Both anchors are independently compared in the parent. This establishes the observed live
+in both participant identity and generation before and after consent; the
+browser snapshot is read under its real authority lock. The keyed pair must
+also remain unchanged across consent. Both anchors are independently compared in the parent. This establishes the observed live
 activation; it does not qualify reconnect or every stale-binding rejection.
 The reader also requires one active epoch and no
 conflicts or pending/completed erasure authority in this fresh scenario.
