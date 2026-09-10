@@ -34,7 +34,7 @@ Requirements:
 
 - Python 3.11
 - `uv`
-- Node.js/npm for browser assets
+- Node.js 22.22.2 or newer 22.x, with npm, for browser assets
 
 ```bash
 git clone https://github.com/sushiHex/hermes-realtime.git
@@ -107,6 +107,8 @@ documentation.
 - Pin third-party GitHub Actions to full immutable commit SHAs.
 - Use `npm ci --ignore-scripts` for the browser workspace.
 - Regenerate packaged browser assets through the documented build, then verify release-gate parity.
+  The build refreshes asset hashes in the disclosure manifest; consent text, its
+  version, and disclosure digests still require explicit review.
 
 ## Licensing
 

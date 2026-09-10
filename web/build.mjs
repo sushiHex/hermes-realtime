@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,3 +113,19 @@ await writeFile(
 );
 await cp(resolve(root, "index.html"), resolve(output, "index.html"));
 await cp(resolve(root, "src/styles.css"), resolve(output, "assets/styles.css"));
+
+// Asset bytes follow the build; consent text and its digests require explicit review.
+const disclosureManifestPath = resolve(
+  root, "../src/hermes_realtime/evidence/disclosure_manifest_v1.json",
+);
+const disclosureManifest = JSON.parse(await readFile(disclosureManifestPath, "utf8"));
+for (const [name, relative] of Object.entries({
+  "app.js": "assets/app.js",
+  "index.html": "index.html",
+  "styles.css": "assets/styles.css",
+})) {
+  disclosureManifest.assets[name] = createHash("sha256")
+    .update(await readFile(resolve(output, relative)))
+    .digest("hex");
+}
+await writeFile(disclosureManifestPath, `${JSON.stringify(disclosureManifest)}\n`, "utf8");
