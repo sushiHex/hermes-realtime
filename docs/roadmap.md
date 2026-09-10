@@ -52,6 +52,13 @@ and same-run comparator before selecting a discriminating experiment. The
 the remaining evidence limits. Do not raise global timeouts, weaken assertions,
 or use a routine rerun as the sole response.
 
+Track the separate archived-worker abnormal exit in
+[issue #24](https://github.com/sushiHex/hermes-realtime/issues/24). Add bounded,
+content-free teardown observations before selecting a runtime change. A complete
+scenario exchange followed by an abnormal exit remains a failed qualification.
+Once diagnostics are in place, continue milestone 2 while collecting recurrence
+evidence; an unexplained intermittent failure is not evidence of a fix.
+
 Security and demonstrated compatibility needs can take priority. Review dependency
 updates against the current base and affected runtime: generated browser assets
 and notices must accompany changes that alter them; Node types must match the

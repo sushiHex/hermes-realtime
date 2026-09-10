@@ -56,7 +56,11 @@ and required human observations are still outstanding. Follow the ordered
 
 ## CI evidence and open investigation
 
-[Main push run `34398885362`](https://github.com/sushiHex/hermes-realtime/actions/runs/34398885362)
+The capability map retains its reviewed baseline above. The following dependency
+and automated-qualification update is bound separately to main commit
+[`8676b114696dd47a75f0ff58df0fc1eaf6b9846c`](https://github.com/sushiHex/hermes-realtime/commit/8676b114696dd47a75f0ff58df0fc1eaf6b9846c),
+tree `714ebdbafba4ad47a00fdf23cc197b9248d092b2`.
+[Main push run `34435214901`](https://github.com/sushiHex/hermes-realtime/actions/runs/34435214901)
 completed on **attempt 1** with all four jobs successful:
 
 | Job | Conclusion |
@@ -66,13 +70,22 @@ completed on **attempt 1** with all four jobs successful:
 | Hermetic release candidate | success |
 | Native LiveKit release integration | success |
 
-This is automated evidence for the reviewed baseline. It does not establish the
-full human-assisted Slice 0 matrix or production readiness. Packaging and
-installed-boundary details live in [Release gates](release-gates.md).
+That run accepted nine archived deterministic-equivalence arms and cleaned up
+five owned processes, using source archive SHA-256
+`b43cc8b34bfcd791b5c8279b337255efd190b6af88c12174c39b0b66ee6ce4e3`.
+It does not establish the full human-assisted Slice 0 matrix or production
+readiness. Packaging and installed-boundary details live in
+[Release gates](release-gates.md).
 
-[PR #21](https://github.com/sushiHex/hermes-realtime/pull/21) upgraded Vitest to
-4.1.11. Treat its timing as a separate test-runner baseline from Vitest 3; retain
-the lockfile and actual environment alongside comparisons.
+| Qualified migration | Candidate dependency boundary |
+| --- | --- |
+| [TypeScript](https://github.com/sushiHex/hermes-realtime/pull/10), [jsdom](https://github.com/sushiHex/hermes-realtime/pull/11), and [Vitest](https://github.com/sushiHex/hermes-realtime/pull/8) | TypeScript 7.0.2, jsdom 30.0.1, `@types/jsdom` 30.0.0, and Vitest 5.0.0; browser CI uses Node 22.22.2 on Windows and Linux. |
+| [LiveKit browser client](https://github.com/sushiHex/hermes-realtime/pull/5) | `livekit-client` 2.22.2 with regenerated assets and disclosure hashes; Linux validates the disclosure manifest before wheel construction. |
+| [Optional speech closure](https://github.com/sushiHex/hermes-realtime/pull/4) | Kokoro 0.6.1 and phonemizer 3.4.0; packaging 26.3 and protobuf 7.36.0 in the CPU and CUDA closures. Source-archive and installed-wheel probes exercised synthetic synthesis and owned cleanup on both providers. |
+
+Vitest 5 is a new timing baseline relative to the earlier Vitest 3 and 4 runs.
+Retain the exact lockfile and environment when comparing measurements. Installed
+synthetic speech probes do not establish physical audibility or subjective quality.
 
 [Issue #13](https://github.com/sushiHex/hermes-realtime/issues/13) remains open for
 the historical Windows timing failures. The
@@ -83,6 +96,19 @@ bytes. Its hosted cause remains unproven. The earlier
 is a sub-threshold observation, not a timeout recurrence. Total pytest-node
 duration is not child-exit timeout headroom, and missing diagnostics are not zero
 measurements.
+
+A [later Native recurrence](https://github.com/sushiHex/hermes-realtime/issues/13#issuecomment-5611252950)
+exhausted the unchanged `communicate(timeout=5.0)` authority for `ack_eof` and
+`duplicate_key`. Draining alone therefore does not exclude a hosted child-exit
+timeout. The proposed discriminating observations are cleanup stderr byte counts
+and host completion separately from interpreter exit; the cause remains unproven.
+
+[Issue #24](https://github.com/sushiHex/hermes-realtime/issues/24) tracks a separate
+archived-worker access violation after the complete ready/nine-arm/done exchange
+in run `34431895476`, attempt 1. The worker's abnormal exit was correctly rejected.
+The healthy main run above is an additional observation, not proof of a cause or
+fix. Bounded teardown observations are the next investigation step; normal exit
+and owned-process cleanup remain mandatory for acceptance.
 
 ## Maintaining this snapshot
 
