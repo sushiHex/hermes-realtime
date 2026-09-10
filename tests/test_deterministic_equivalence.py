@@ -22,7 +22,9 @@ def test_only_the_canonical_first_registration_can_invoke_the_real_producer() ->
     registry = core.SCENARIO_REGISTRY_V1
     assert tuple(item.scenario_id for item in registry) == tuple(core.ScenarioIdV1)
     assert type(registry[0]) is core.DeterministicEquivalenceRegistrationV1
-    assert (*registry[1:10], *registry[14:]) == core.UNAVAILABLE_SCENARIO_REGISTRY_V1
+    assert tuple(r for r in registry if type(r) is core.UnavailableScenarioRegistrationV1) == (
+        core.UNAVAILABLE_SCENARIO_REGISTRY_V1
+    )
     copied = core.DeterministicEquivalenceRegistrationV1()
     with pytest.raises(ValueError, match="not canonical"):
         copied.produce(

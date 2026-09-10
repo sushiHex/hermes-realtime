@@ -34,9 +34,13 @@ transition coverage under [issue #33](https://github.com/sushiHex/hermes-realtim
 The [capture admission overflow producer](over-budget-turn.md) adds durable
 exclusion and rejected-source absence under [issue #35](https://github.com/sushiHex/hermes-realtime/issues/35).
 The [packaged spool crash matrix](spool-crash-matrix.md) adds recovery coverage
-under [issue #38](https://github.com/sushiHex/hermes-realtime/issues/38). Fifteen
-scenarios remain unavailable. Continue with full-purge cleanup and owned close,
-preserving the existing scenario IDs and their acceptance contracts.
+under [issue #38](https://github.com/sushiHex/hermes-realtime/issues/38).
+[Full-purge cleanup](full-purge-cleanup.md) adds exact deletion and fresh-process
+idempotence under [issue #41](https://github.com/sushiHex/hermes-realtime/issues/41).
+Fourteen scenarios remain unavailable. Continue with owned-close faults, including
+the completed consent-settlement and public retry defect tracked in
+[issue #40](https://github.com/sushiHex/hermes-realtime/issues/40), preserving the
+existing scenario IDs and acceptance contracts.
 
 Keep each implementation change independently reviewable. For milestone 2, group
 work by existing ownership boundaries: consent/revocation, bounded admission,

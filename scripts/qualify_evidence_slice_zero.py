@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from scripts.candidate_wheel import VerifiedCandidateWheelV1
     from scripts.capacity_rollover import ObservedCapacityRolloverV1
     from scripts.deterministic_equivalence import ObservedEquivalenceV1
+    from scripts.full_purge_cleanup import ObservedFullPurgeV1
     from scripts.over_budget_turn import ObservedOverBudgetTurnV1
     from scripts.revoke_race import ObservedRevokeRaceV1
     from scripts.spool_crash_matrix import ObservedSpoolCrashMatrixV1
@@ -337,6 +338,28 @@ class SpoolCrashMatrixRegistrationV1:
         return produce_spool_crash_matrix_v1(archive, identity, wheel)
 
 
+@dataclass(frozen=True, slots=True)
+class FullPurgeRegistrationV1:
+    """The real-filesystem full-purge producer at its governed ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.FULL_PURGE_CLEANUP
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not FullPurgeRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.FULL_PURGE_CLEANUP
+        ):
+            raise TypeError("full-purge registration must be exact")
+
+    def produce(self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+                wheel: VerifiedCandidateWheelV1) -> ObservedFullPurgeV1:
+        if self is not SCENARIO_REGISTRY_V1[18]:
+            raise ValueError("full-purge producer registration is not canonical")
+        from scripts.full_purge_cleanup import produce_full_purge_v1
+
+        return produce_full_purge_v1(archive, identity, wheel)
+
+
 _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
     scenario for scenario in _SCENARIO_IDS_V1
     if scenario not in {
@@ -345,6 +368,7 @@ _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
         ScenarioIdV1.CAPACITY_ROLLOVER,
         ScenarioIdV1.OVER_BUDGET_TURN,
         ScenarioIdV1.SPOOL_CRASH_MATRIX,
+        ScenarioIdV1.FULL_PURGE_CLEANUP,
     }
 )
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
@@ -360,15 +384,27 @@ REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
 CAPACITY_ROLLOVER_REGISTRATION_V1 = CapacityRolloverRegistrationV1()
 OVER_BUDGET_TURN_REGISTRATION_V1 = OverBudgetTurnRegistrationV1()
 SPOOL_CRASH_MATRIX_REGISTRATION_V1 = SpoolCrashMatrixRegistrationV1()
+FULL_PURGE_REGISTRATION_V1 = FullPurgeRegistrationV1()
 
-SCENARIO_REGISTRY_V1 = (
+_ScenarioRegistrationV1 = (
+    UnavailableScenarioRegistrationV1 | DeterministicEquivalenceRegistrationV1
+    | RevokeRaceRegistrationV1 | CapacityRolloverRegistrationV1
+    | OverBudgetTurnRegistrationV1 | SpoolCrashMatrixRegistrationV1 | FullPurgeRegistrationV1
+)
+_REGISTRATIONS_V1: tuple[_ScenarioRegistrationV1, ...] = (
+    *UNAVAILABLE_SCENARIO_REGISTRY_V1,
     DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
-    *UNAVAILABLE_SCENARIO_REGISTRY_V1[:9],
     REVOKE_RACE_REGISTRATION_V1,
     CAPACITY_ROLLOVER_REGISTRATION_V1,
     OVER_BUDGET_TURN_REGISTRATION_V1,
     SPOOL_CRASH_MATRIX_REGISTRATION_V1,
-    *UNAVAILABLE_SCENARIO_REGISTRY_V1[9:],
+    FULL_PURGE_REGISTRATION_V1,
+)
+_REGISTRATIONS_BY_ID_V1 = {
+    registration.scenario_id: registration for registration in _REGISTRATIONS_V1
+}
+SCENARIO_REGISTRY_V1 = tuple(
+    _REGISTRATIONS_BY_ID_V1[scenario_id] for scenario_id in _SCENARIO_IDS_V1
 )
 
 

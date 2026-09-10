@@ -28,7 +28,7 @@ from scripts.equivalence_process import (
     _write_frame,
 )
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
-from scripts.windows_storage_oracle import audit_drain_release
+from scripts.windows_storage_oracle import audit_drain_release, audit_storage_release
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +38,7 @@ class _StorageInvocation:
     cleanup: core._WindowsFinalizationResultV1
     exit_code: int
     expected_exit: int
-    drain_released: bool = False
+    storage_released: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +71,9 @@ def _storage_archive(
         "scripts/windows_storage_oracle.py",
         "scripts/spool_crash_oracle.py",
         "scripts/spool_crash_matrix.py",
+        "scripts/full_purge_cleanup.py",
+        "scripts/full_purge_observation.py",
+        "scripts/full_purge_worker.py",
         "scripts/qualify_evidence_slice_zero.py",
         "scripts/equivalence_process.py",
         "tests/evidence/spool_crash_worker.py",
@@ -147,13 +150,16 @@ def _validate_invocation(record: _StorageInvocation) -> Any:
     )
     _require(type(observation) is dict, "storage observation is not an object")
     _require(
-        type(record.drain_released) is bool
-        and record.drain_released
+        type(record.storage_released) is bool
+        and record.storage_released
         is (
-            record.expected_exit in {197, 198}
-            and observation.get("checkpoint") == "after_drain_ack_before_exit"
+            (
+                record.expected_exit in {197, 198}
+                and observation.get("checkpoint") == "after_drain_ack_before_exit"
+            )
+            or (record.expected_exit == 0 and observation.get("phase") in {"purge", "repeat_purge"})
         ),
-        "drain release observation differs",
+        "storage release observation differs",
     )
     return observation
 
@@ -162,9 +168,17 @@ def _run_storage_worker(
     archive: _StorageArchive, *, point: str, mode: int, action: str, clock: str = "caught-up"
 ) -> _StorageInvocation:
     """Crash codes are accepted only for a bound crash checkpoint, never recovery."""
-    _require(action in {"crash", "recover"}, "storage action differs")
-    _require(type(mode) is int and mode in {197, 198}, "storage exit mode differs")
+    purge = action in {"purge", "repeat_purge"}
+    _require(action in {"crash", "recover", "purge", "repeat_purge"}, "storage action differs")
+    _require(
+        type(mode) is int and (mode == 0 if purge else mode in {197, 198}),
+        "storage exit mode differs",
+    )
     _require(clock in {"caught-up", "regressed"}, "storage recovery clock differs")
+    _require(
+        not purge or (point == "full_purge_cleanup" and clock == "caught-up"),
+        "full-purge worker configuration differs",
+    )
     expected_exit = mode if action == "crash" else 0
     # The GUI interpreter uses the same runtime without creating a console host.
     # All protocol I/O travels over the two explicitly inherited pipe handles.
@@ -194,9 +208,10 @@ def _run_storage_worker(
             for fd in (request_read, response_write):
                 os.set_inheritable(fd, True)
             handles = tuple(msvcrt.get_osfhandle(fd) for fd in (request_read, response_write))
+            module = "scripts.full_purge_worker" if purge else "scripts.storage_worker"
             bootstrap = (
                 "import sys,runpy;sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)];"
-                "runpy.run_module('scripts.storage_worker',run_name='__main__')"
+                f"runpy.run_module('{module}',run_name='__main__')"
             )
             command = (
                 str(python),
@@ -218,7 +233,7 @@ def _run_storage_worker(
                 "PATH": str(python.parent),
             }
             spec = core._WindowsScenarioSpecV1(
-                "spool_crash_matrix",
+                "full_purge_cleanup" if purge else "spool_crash_matrix",
                 command,
                 tuple(sorted(environment.items(), key=lambda item: (item[0].casefold(), item[0]))),
                 str(archive.workspace),
@@ -287,6 +302,18 @@ def _run_storage_worker(
                         archive.workspace / f"{point}-exit{mode}-{clock}" / "evidence",
                         root.process_handle,
                     )
+                if purge:
+                    audit_storage_release(
+                        archive.workspace / "full_purge_cleanup-exit0-caught-up/evidence",
+                        root.process_handle,
+                        (
+                            ".hermes-realtime-evidence-root-v1",
+                            "capture-v1.owner",
+                            "purge-decoy.bin",
+                            "capture-v1.sqlite3.backup",
+                            "capture-v1.sqlite3-wal.backup",
+                        ),
+                    )
                 if expected_exit == 198:
                     api = kernel._api()
                     api.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -298,10 +325,10 @@ def _run_storage_worker(
                 kernel.wait(root.process_handle, 10_000)
                 code = _exit_code(kernel, root.process_handle)
                 _require(code == expected_exit, "storage worker did not reach its prescribed exit")
-                return frame["observation"], code, drain_released
+                return frame["observation"], code, drain_released or purge
 
-            observation, code, drain_released = core._run_with_windows_scenario_job_finalization_v1(
-                job, execute
+            observation, code, storage_released = (
+                core._run_with_windows_scenario_job_finalization_v1(job, execute)
             )
             cleanup = job.last_finalization
             assert cleanup is not None
@@ -311,7 +338,7 @@ def _run_storage_worker(
                 cleanup,
                 code,
                 expected_exit,
-                drain_released,
+                storage_released,
             )
             _validate_invocation(record)
             _require(

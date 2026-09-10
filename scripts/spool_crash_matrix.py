@@ -567,7 +567,7 @@ def _validate_matrix(record: _MatrixRun) -> PackagedScenarioEvidenceV1:
                 "mode": mode,
                 "clock": clock,
                 "recovery": row,
-                "drain_released": crash.drain_released,
+                "drain_released": crash.storage_released,
             }
         )
     return PackagedScenarioEvidenceV1(

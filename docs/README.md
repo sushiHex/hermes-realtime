@@ -22,6 +22,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Session budgets, durable rollover, and successor conversation | [Packaged capacity rollover](capacity-rollover.md) |
 | Capture queue overflow, durable exclusion, and rejected-source absence | [Packaged admission overflow](over-budget-turn.md) |
 | Spool crash boundaries, durable seals, and recovery purge | [Packaged spool crash matrix](spool-crash-matrix.md) |
+| Exact artifact deletion, preserved decoys, and idempotent purge | [Full-purge cleanup](full-purge-cleanup.md) |
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |
 | Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |
