@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from scripts.deterministic_equivalence import ObservedEquivalenceV1
     from scripts.over_budget_turn import ObservedOverBudgetTurnV1
     from scripts.revoke_race import ObservedRevokeRaceV1
+    from scripts.spool_crash_matrix import ObservedSpoolCrashMatrixV1
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 
@@ -311,6 +312,31 @@ class OverBudgetTurnRegistrationV1:
         )
 
 
+
+@dataclass(frozen=True, slots=True)
+class SpoolCrashMatrixRegistrationV1:
+    """The packaged spool crash producer at its governed ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.SPOOL_CRASH_MATRIX
+
+    def __post_init__(self) -> None:
+        if (
+            type(self) is not SpoolCrashMatrixRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.SPOOL_CRASH_MATRIX
+        ):
+            raise TypeError("spool crash registration must be exact")
+
+    def produce(
+        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+    ) -> ObservedSpoolCrashMatrixV1:
+        if self is not SCENARIO_REGISTRY_V1[13]:
+            raise ValueError("spool crash producer registration is not canonical")
+        from scripts.spool_crash_matrix import produce_spool_crash_matrix_v1
+
+        return produce_spool_crash_matrix_v1(archive, identity, wheel)
+
+
 _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
     scenario for scenario in _SCENARIO_IDS_V1
     if scenario not in {
@@ -318,6 +344,7 @@ _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
         ScenarioIdV1.REVOKE_RACE,
         ScenarioIdV1.CAPACITY_ROLLOVER,
         ScenarioIdV1.OVER_BUDGET_TURN,
+        ScenarioIdV1.SPOOL_CRASH_MATRIX,
     }
 )
 UNAVAILABLE_SCENARIO_REGISTRY_V1 = tuple(
@@ -332,6 +359,7 @@ DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1 = DeterministicEquivalenceRegistration
 REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
 CAPACITY_ROLLOVER_REGISTRATION_V1 = CapacityRolloverRegistrationV1()
 OVER_BUDGET_TURN_REGISTRATION_V1 = OverBudgetTurnRegistrationV1()
+SPOOL_CRASH_MATRIX_REGISTRATION_V1 = SpoolCrashMatrixRegistrationV1()
 
 SCENARIO_REGISTRY_V1 = (
     DETERMINISTIC_EQUIVALENCE_REGISTRATION_V1,
@@ -339,6 +367,7 @@ SCENARIO_REGISTRY_V1 = (
     REVOKE_RACE_REGISTRATION_V1,
     CAPACITY_ROLLOVER_REGISTRATION_V1,
     OVER_BUDGET_TURN_REGISTRATION_V1,
+    SPOOL_CRASH_MATRIX_REGISTRATION_V1,
     *UNAVAILABLE_SCENARIO_REGISTRY_V1[9:],
 )
 

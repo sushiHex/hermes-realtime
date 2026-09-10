@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPOSITORY / "src"))
+if __name__ == "__main__":
+    sys.path.insert(0, str(REPOSITORY / "src"))
 
 EXIT_MODES = (197, 198)
 

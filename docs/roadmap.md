@@ -33,8 +33,10 @@ the [capacity rollover producer](capacity-rollover.md) adds real session-budget
 transition coverage under [issue #33](https://github.com/sushiHex/hermes-realtime/issues/33).
 The [capture admission overflow producer](over-budget-turn.md) adds durable
 exclusion and rejected-source absence under [issue #35](https://github.com/sushiHex/hermes-realtime/issues/35).
-Sixteen scenarios remain unavailable. Continue with crash recovery/purge and
-owned close, preserving the existing scenario IDs and their acceptance contracts.
+The [packaged spool crash matrix](spool-crash-matrix.md) adds recovery coverage
+under [issue #38](https://github.com/sushiHex/hermes-realtime/issues/38). Fifteen
+scenarios remain unavailable. Continue with full-purge cleanup and owned close,
+preserving the existing scenario IDs and their acceptance contracts.
 
 Keep each implementation change independently reviewable. For milestone 2, group
 work by existing ownership boundaries: consent/revocation, bounded admission,

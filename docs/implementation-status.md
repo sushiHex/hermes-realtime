@@ -31,10 +31,11 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers four real producers,
+The `SCENARIO_REGISTRY_V1` now registers five real producers,
 [`deterministic_equivalence`](deterministic-equivalence.md),
 [`revoke_race`](revoke-race.md), [`capacity_rollover`](capacity-rollover.md),
-and [`over_budget_turn`](over-budget-turn.md), with **16 governed producers still
+[`over_budget_turn`](over-budget-turn.md), and
+[`spool_crash_matrix`](spool-crash-matrix.md), with **15 governed producers still
 explicitly unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
@@ -81,6 +82,12 @@ remaining refusal contract. These producers cannot generate an accepted full
 `qualification-report-v1`; the remaining matrix, installed-path prerequisites,
 and required human observations are still outstanding. Follow the ordered
 [roadmap](roadmap.md#ordered-milestones).
+
+The [packaged spool crash producer](spool-crash-matrix.md) covers all 82 governed
+cases, including both restart clocks for rollback. Its independent observer
+checks durable history, complete seals, recovery purge, and retained filesystem
+authority. [Issue #38](https://github.com/sushiHex/hermes-realtime/issues/38) records
+exact candidate evidence and the seeded historical-fixture boundary.
 
 ## CI evidence and open investigation
 
