@@ -31,9 +31,10 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers two real producers,
-[`deterministic_equivalence`](deterministic-equivalence.md) and
-[`revoke_race`](revoke-race.md), with **18 governed producers still explicitly
+The `SCENARIO_REGISTRY_V1` now registers three real producers,
+[`deterministic_equivalence`](deterministic-equivalence.md),
+[`revoke_race`](revoke-race.md), and [`capacity_rollover`](capacity-rollover.md),
+with **17 governed producers still explicitly
 unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
@@ -56,6 +57,14 @@ continues, verified purge, normal exit, and complete cleanup. The Native job
 consumes the Pure candidate wheel artifact and prints the accepted source, wheel,
 and observation identities. This is a single packaged scenario; dependency-closure
 and physical claims retain the limits in its [implementation guide](revoke-race.md).
+
+The packaged [capacity rollover producer](capacity-rollover.md) drives three
+ordinary turns through the real session budget and writer transaction. It binds
+before-commit reader isolation, durable predecessor/successor lineage, source and
+persisted content equality, continued conversation, and owned cleanup. The
+[implementation issue](https://github.com/sushiHex/hermes-realtime/issues/33)
+records exact candidate and run evidence. This scenario does not qualify queue
+saturation or cumulative turn-budget overflow.
 
 The [registry tests](../tests/test_qualify_evidence_slice_zero.py) preserve the
 remaining refusal contract. These producers cannot generate an accepted full
