@@ -910,3 +910,81 @@ def test_full_purge_latch_preserves_the_pre_operation_database_image(tmp_path, c
             _validate_recovery(point, "caught-up", row)
     else:
         _validate_recovery(point, "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="observes real Windows filesystem security")
+def test_storage_observer_does_not_consult_the_candidate_security_probe(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_realtime.evidence.storage_security import WindowsStorageProbeV1
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+    finally:
+        spool.close()
+
+    def forbidden(*args):
+        raise AssertionError("candidate security probe consulted")
+
+    for name in (
+        "platform_is_supported",
+        "volume_is_fixed_local",
+        "path_has_reparse_point",
+        "path_has_alternate_data_streams",
+        "path_grants_only_owner",
+    ):
+        monkeypatch.setattr(WindowsStorageProbeV1, name, forbidden)
+    assert observe_storage(tmp_path / "evidence")["database"]["events"] == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="observes real Windows filesystem security")
+@pytest.mark.parametrize("unsafe", ["root_stream", "file_stream", "dacl", "junction", "hardlink"])
+def test_storage_observer_rejects_unsafe_files_when_candidate_probe_lies(
+    tmp_path, monkeypatch, unsafe
+) -> None:
+    import subprocess
+
+    from hermes_realtime.evidence.storage_security import WindowsStorageProbeV1
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+    finally:
+        spool.close()
+    root = tmp_path / "evidence"
+    database = root / "capture-v1.sqlite3"
+    if unsafe in {"root_stream", "file_stream"}:
+        with open(
+            str(root if unsafe == "root_stream" else database) + ":fixture-stream", "wb"
+        ) as f:
+            f.write(b"synthetic stream")
+    elif unsafe == "dacl":
+        subprocess.run(
+            ["icacls", str(root), "/grant", "*S-1-1-0:(R)"], check=True, capture_output=True
+        )
+    elif unsafe == "junction":
+        import _winapi
+
+        link = tmp_path / "redirected"
+        _winapi.CreateJunction(str(root), str(link))
+        root = link
+    else:
+        os.link(database, tmp_path / "outside.sqlite3")
+    for name in ("platform_is_supported", "volume_is_fixed_local", "path_grants_only_owner"):
+        monkeypatch.setattr(WindowsStorageProbeV1, name, lambda *args: True)
+    for name in ("path_has_reparse_point", "path_has_alternate_data_streams"):
+        monkeypatch.setattr(WindowsStorageProbeV1, name, lambda *args: False)
+    reason = {
+        "root_stream": "alternate stream",
+        "file_stream": "extra or unreadable streams",
+        "dacl": "DACL grants another principal",
+        "junction": "redirected",
+        "hardlink": "link or size bound",
+    }[unsafe]
+    with pytest.raises(ValueError, match=reason):
+        observe_storage(root)

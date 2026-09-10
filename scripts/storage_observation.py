@@ -20,6 +20,7 @@ from scripts.spool_crash_oracle import (
     sentinel_state_v1,
     validate_spool_snapshot_v1,
 )
+from scripts.windows_storage_oracle import audit_storage
 
 
 def _digest(raw: bytes) -> str:
@@ -318,49 +319,43 @@ def _read_database_snapshot(database: Path) -> dict[str, Any]:
 
 
 def observe_storage(root: Path) -> dict[str, Any]:
-    from hermes_realtime.evidence.storage_security import (
-        EvidenceArtifactManifestV1,
-        WindowsStorageProbeV1,
+    marker_name = ".hermes-realtime-evidence-root-v1"
+    sentinel_name = "capture-v1.owner"
+    database_name = "capture-v1.sqlite3"
+    allowed = frozenset(
+        {
+            marker_name,
+            marker_name + ".init",
+            sentinel_name,
+            sentinel_name + ".init",
+            *(
+                database_name + suffix
+                for suffix in ("", "-journal", "-wal", "-shm", "-vacuum", "-tmp")
+            ),
+            "recreation-decoy.bin",
+            "rollback-decoy.bin",
+            "purge-decoy.bin",
+        }
     )
-
-    manifest = EvidenceArtifactManifestV1()
-    probe = WindowsStorageProbeV1()
-    _require(
-        probe.platform_is_supported() and probe.volume_is_fixed_local(root),
-        "storage is not fixed local Windows",
-    )
-    _require(probe.path_grants_only_owner(root), "storage root DACL differs")
-    files = {}
-    allowed = set(manifest.all_names) | {
-        "recreation-decoy.bin",
-        "rollback-decoy.bin",
-        "purge-decoy.bin",
-    }
-    for path in root.iterdir():
-        _require(
-            path.name in allowed
-            and path.is_file()
-            and not probe.path_has_reparse_point(path)
-            and not probe.path_has_alternate_data_streams(path)
-            and probe.path_grants_only_owner(path)
-            and path.stat().st_size <= 4 * 1024 * 1024,
-            "storage artifact is outside the bounded safe inventory",
+    with audit_storage(root, allowed) as paths:
+        files = {path.name: _digest(path.read_bytes()) for path in paths}
+        sentinel = root / sentinel_name
+        state = (
+            sentinel_state_v1(sentinel.read_bytes()) if sentinel.exists() else "no_final_sentinel"
         )
-        files[path.name] = _digest(path.read_bytes())
-    sentinel = root / manifest.sentinel
-    state = sentinel_state_v1(sentinel.read_bytes()) if sentinel.exists() else "no_final_sentinel"
-    marker = root / manifest.root_marker
-    if marker.exists():
-        _require(
-            _digest(marker.read_bytes()) == initialization_digest_v1("root_marker", "full_write"),
-            "root marker differs from its independent fixture image",
+        marker = root / marker_name
+        if marker.exists():
+            _require(
+                _digest(marker.read_bytes())
+                == initialization_digest_v1("root_marker", "full_write"),
+                "root marker differs from its independent fixture image",
+            )
+        database = root / database_name
+        # Full-purge fixtures deliberately seed non-SQLite sidecar bytes. Their
+        # committed database is inspected alone, before production deletes it.
+        db = (
+            _database_state(database, include_journal=state != "full_purge_pending")
+            if database.exists()
+            else {"schema": False}
         )
-    database = root / manifest.database
-    # Full-purge fixtures deliberately seed non-SQLite sidecar bytes. Their
-    # committed database is inspected alone, before production deletes it.
-    db = (
-        _database_state(database, include_journal=state != "full_purge_pending")
-        if database.exists()
-        else {"schema": False}
-    )
-    return {"files": files, "sentinel": state, "database": db}
+        return {"files": files, "sentinel": state, "database": db}

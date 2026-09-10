@@ -66,6 +66,7 @@ def _storage_archive(
         "scripts/storage_process.py",
         "scripts/storage_worker.py",
         "scripts/storage_observation.py",
+        "scripts/windows_storage_oracle.py",
         "scripts/spool_crash_oracle.py",
         "scripts/spool_crash_matrix.py",
         "scripts/qualify_evidence_slice_zero.py",

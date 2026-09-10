@@ -34,6 +34,18 @@ the filesystem and database before and after production recovery. SQLite opens
 only a disposable copy of the database and rollback journal, outside the evidence
 root. The original crash image remains untouched for production recovery.
 
+Filesystem acceptance uses an [independent Windows observer](../scripts/windows_storage_oracle.py),
+with no candidate probe or artifact-manifest imports. It retains the root and
+each leaf without delete sharing while checking the exact paths, fixed local
+volume, reparse attributes, single file links, bounded sizes, streams, and DACLs.
+The bounded fixture profile permits ordinary allow ACEs for the current user,
+SYSTEM, Administrators, and Windows owner identities; other ACE forms or trustees
+refuse qualification. Owner identities must resolve to the permitted owner set.
+This is a fixture security check, not a general Windows permission evaluator.
+The API authorities are Microsoft's [handle security descriptor](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo),
+[stream enumeration](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirststreamw),
+and [owner identity](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-special-identities-groups) contracts.
+
 The [validator](../scripts/spool_crash_matrix.py) requires the complete ordered
 matrix. It checks the exact precommit event counts and unsealed sessions,
 revalidates committed event hashes using an [independent HRE1 oracle](../scripts/evidence_protocol_oracle.py)
