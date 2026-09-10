@@ -134,6 +134,10 @@ def main() -> None:
             baseline = json.loads(
                 (case_root / "rollback-baseline.json").read_text(encoding="utf-8")
             )
+        elif point == "after_full_purge_marker_fsync":
+            baseline = json.loads(
+                (case_root / "full-purge-baseline.json").read_text(encoding="utf-8")
+            )
         recovered = _make_spool(
             case_root,
             clock=driver._Clock(

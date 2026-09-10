@@ -116,7 +116,7 @@ def _validate_checkpoint(point: str, db: Any) -> None:
         expected = _ORDINARY[index]
     elif 28 <= index < 32:
         expected = (6, ["open", "sealed"], ["active", "closed"])
-    elif index in {21, 22, 26, 27}:
+    elif index in {21, 22, 26, 27, 32}:
         expected = (2, ["open"], ["active"])
     elif index in {20, 25}:
         expected = (0, [], [])
@@ -296,8 +296,14 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
                 before["files"][_SENTINEL] == row["baseline"]["sentinelSha256"],
                 "pre-sentinel rollback changed the original durable authority",
             )
+    elif index == 32:
+        _keys(row["baseline"], {"databaseImageSha256"})
+        _require(
+            before["files"].get(_DATABASE_NAMES[0]) == row["baseline"]["databaseImageSha256"],
+            "full-purge latch changed the original database image",
+        )
     else:
-        _require(row["baseline"] == {}, "unexpected rollback baseline")
+        _require(row["baseline"] == {}, "unexpected storage baseline")
     if index >= 32:
         deleted = min(index - 32, 6)
         _require(
@@ -377,6 +383,10 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
             "storage purge absence was not independently verified",
         )
     elif disposition == "recovered":
+        retained = {_MARKER, _SENTINEL, _DATABASE_NAMES[0]} | {
+            name for name in before["files"] if name.endswith("-decoy.bin")
+        }
+        _require(set(after["files"]) == retained, "recovered store retained temporary artifacts")
         db = after["database"]
         _require(type(db) is dict, "recovered database is absent")
         _require(

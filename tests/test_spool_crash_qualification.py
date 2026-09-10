@@ -729,3 +729,138 @@ def test_empty_committed_schema_has_a_closed_wire_observation(tmp_path) -> None:
     observed = _database_state(database)
     assert observed["schema"] is True and observed["purge_required"] == -1
     assert canonical_json_bytes({"database": observed}).endswith(b"\n")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="creates a real Windows evidence store")
+@pytest.mark.parametrize(
+    "artifact", ["capture-v1.sqlite3-tmp", "capture-v1.sqlite3-vacuum", "capture-v1.owner.init"]
+)
+def test_recovered_store_rejects_remaining_owned_temporaries(tmp_path, artifact) -> None:
+    from scripts.spool_crash_matrix import _validate_recovery
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+
+    spool = driver._make_spool(tmp_path)
+    try:
+        assert spool.create_epoch(driver._make_create_epoch()).value == "committed"
+        assert spool.append_binding_close(driver._binding_close()).value == "committed"
+        assert spool.seal_epoch(driver._seal_command()).value == "committed"
+    finally:
+        spool.close()
+    root = tmp_path / "evidence"
+    before = observe_storage(root)
+    row = {"before": before, "after": before, "disposition": "recovered", "baseline": {}}
+    _validate_recovery("after_seal_commit_before_ack", "caught-up", row)
+    (root / artifact).write_bytes(b"fixture residue")
+    row["after"] = observe_storage(root)
+    with pytest.raises(ValueError):
+        _validate_recovery("after_seal_commit_before_ack", "caught-up", row)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="uses the real Windows crash driver")
+@pytest.mark.parametrize("point", ["after_event_insert_before_commit", "before_seal_commit"])
+@pytest.mark.parametrize("hot", [False, True])
+def test_observer_preserves_the_original_crash_image_and_journal(tmp_path, point, hot) -> None:
+    from scripts.storage_observation import _database_state
+    from tests.evidence.test_sqlite_spool import run_task_5d_worker
+
+    case = tmp_path / "crash"
+    run_task_5d_worker(case, point, 197)
+    root = case / "evidence"
+    if hot:
+        # These small transactions can leave an unflushed journal header. Mark
+        # its complete, checksummed original-page records as a hot journal so
+        # the observer must preserve a crash image SQLite would otherwise undo.
+        journal = root / "capture-v1.sqlite3-journal"
+        raw = journal.read_bytes()
+        sector = int.from_bytes(raw[20:24], "big")
+        page_size = int.from_bytes(raw[24:28], "big")
+        assert sector > 0 and page_size == 4096
+        count, remainder = divmod(len(raw) - sector, page_size + 8)
+        assert count > 0 and remainder == 0
+        journal.write_bytes(
+            b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" + count.to_bytes(4, "big") + raw[12:]
+        )
+    original = {p.name: p.read_bytes() for p in root.iterdir()}
+    assert "capture-v1.sqlite3-journal" in original
+    _validate_checkpoint(point, _database_state(root / "capture-v1.sqlite3"))
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == original
+
+
+@pytest.mark.parametrize("mutation", ["trigger", "constraint", "unique", "page_size"])
+def test_schema_commit_requires_the_fixed_complete_v1_schema(tmp_path, mutation) -> None:
+    import sqlite3
+
+    from hermes_realtime.evidence.sqlite_spool import SCHEMA_DDL_V1
+    from scripts.storage_observation import _database_state
+
+    database = tmp_path / "capture-v1.sqlite3"
+    schema = SCHEMA_DDL_V1
+    if mutation == "constraint":
+        schema = schema.replace("CHECK (singleton = 1)", "CHECK (singleton >= 1)")
+    elif mutation == "unique":
+        schema = schema.replace(",\n    UNIQUE (logical_session_id, event_sequence)", "")
+    with sqlite3.connect(database) as connection:
+        if mutation == "page_size":
+            connection.execute("PRAGMA page_size=8192")
+        connection.executescript(schema)
+        connection.execute("PRAGMA application_id=0x48524531")
+        connection.execute("PRAGMA user_version=1")
+        if mutation == "trigger":
+            connection.execute("DROP TRIGGER evidence_events_are_append_only")
+    with pytest.raises(ValueError):
+        _database_state(database)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="uses the real Windows crash driver")
+def test_full_purge_latch_observes_the_intact_pre_deletion_database(tmp_path) -> None:
+    from scripts.storage_observation import observe_storage
+    from tests.evidence.test_sqlite_spool import run_task_5d_worker
+
+    case = tmp_path / "crash"
+    run_task_5d_worker(case, "after_full_purge_marker_fsync", 197)
+    state = observe_storage(case / "evidence")
+    assert state["database"]["schema"] is True
+    assert state["database"]["events"] == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="uses the real Windows crash driver")
+@pytest.mark.parametrize("changed", [False, True])
+def test_full_purge_latch_preserves_the_pre_operation_database_image(tmp_path, changed) -> None:
+    import json
+
+    from scripts.spool_crash_matrix import _validate_recovery
+    from scripts.storage_observation import observe_storage
+    from tests.evidence import spool_crash_worker as driver
+    from tests.evidence.test_sqlite_spool import run_task_5d_worker
+
+    case = tmp_path / "crash"
+    point = "after_full_purge_marker_fsync"
+    run_task_5d_worker(case, point, 197)
+    root = case / "evidence"
+    if changed:
+        database = root / "capture-v1.sqlite3"
+        image = bytearray(database.read_bytes())
+        # Change only the SQLite file-change counter, retaining a valid image
+        # with exactly the same schema and logical source history.
+        counter = (int.from_bytes(image[24:28], "big") + 1).to_bytes(4, "big")
+        image[24:28] = image[92:96] = counter
+        database.write_bytes(image)
+    before = observe_storage(root)
+    _validate_checkpoint(point, before["database"])
+    spool = driver._make_spool(case)
+    try:
+        disposition = spool.recover_existing().value
+    finally:
+        spool.close()
+    row = {
+        "before": before,
+        "after": observe_storage(root),
+        "disposition": disposition,
+        "baseline": json.loads((case / "full-purge-baseline.json").read_text(encoding="utf-8")),
+    }
+    if changed:
+        with pytest.raises(ValueError, match="full-purge latch changed"):
+            _validate_recovery(point, "caught-up", row)
+    else:
+        _validate_recovery(point, "caught-up", row)

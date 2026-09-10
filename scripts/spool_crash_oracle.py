@@ -13,6 +13,11 @@ from uuid import UUID
 
 from scripts.evidence_protocol_oracle import canonical_json_bytes
 
+# Exact sqlite_master (type, name, tbl_name, sql), ordered by type/name, encoded
+# with this independent JSON codec. Includes all 25 tables, indexes and triggers.
+# Pinned from V1 at 05e0955197574c92cb8bdc40d650e6c8d9e3c25c, never from candidate DDL.
+SCHEMA_DIGEST_V1 = "fdee6149b23aa8ceb9faad402f7f068162513bcefae4ef4b3c491ba3c1389604"
+
 
 def _source_events() -> frozenset[bytes]:
     events = []
@@ -104,7 +109,7 @@ def checkpoint_source_digest_v1(index: int) -> str:
     events = {event["event_id"]: event for raw in _SOURCE_EVENTS for event in (json.loads(raw),)}
     opening = [1, 2]
     sealed = [1, 2, 20, 21]
-    if index in {0, 1, 5, 21, 22, 26, 27}:
+    if index in {0, 1, 5, 21, 22, 26, 27, 32}:
         histories = [opening]
     elif index == 2:
         histories = [[1, 2, 10]]
@@ -138,7 +143,7 @@ def checkpoint_installation_digest_v1(index: int, *, after: bool = False) -> str
         return hashlib.sha256(canonical_json_bytes([])).hexdigest()
     if index < 9:
         high_water = (0, 0, 1, 1, 2, 1, 1, 1, 2)[index]
-    elif index in {21, 22, 28, 29, 30, 31}:
+    elif index in {21, 22, 28, 29, 30, 31, 32}:
         high_water = 0
     elif index in {26, 27}:
         high_water = 1

@@ -23,9 +23,9 @@ Job, and closes owned handles. Recovery requires normal exit zero.
 The [driver](../scripts/storage_worker.py) uses the production Windows storage
 probe. It delegates the named durable operations to the existing real SQLite
 crash driver. The [observer](../scripts/storage_observation.py) separately reads
-the filesystem and database before and after production recovery. SQLite itself
-may recover a hot rollback journal during the observer's cold database open;
-the observer issues no application SQL writes.
+the filesystem and database before and after production recovery. SQLite opens
+only a disposable copy of the database and rollback journal, outside the evidence
+root. The original crash image remains untouched for production recovery.
 
 The [validator](../scripts/spool_crash_matrix.py) requires the complete ordered
 matrix. It checks the exact precommit event counts and unsealed sessions,
@@ -43,6 +43,8 @@ retention expiry, and lifecycle timestamps must agree with those source events;
 the fixture permits no conflict rows or orphan epochs. Purge must leave every database artifact absent while preserving the
 root marker and adjacent decoys. Malformed initialization images must be refused
 without mutation; completed initialization temporaries must be removed. The
+ordinary recovered store must retain exactly its database, final authority
+files, and original decoys, with no journal, vacuum, or initialization residue. The
 empty, partial, complete, and flushed images are pinned by independent V1 byte
 encoding. Erasure receipt commitments bind every column, including the erased
 epoch, request identity, control fingerprint, admission authority, and timestamp;
@@ -53,6 +55,13 @@ and both sentinel slots are independently pinned at every boundary, including
 their generations, predecessor slots, and fixture authority IDs. The
 original logical database must remain unchanged through every pre-latch rollback
 checkpoint. The sentinel commitment must remain unchanged before its write.
+The full-purge latch checkpoint retains the complete two-event source history
+and installation authority, and its database bytes must match a commitment
+recorded before latching. Its deliberately synthetic sidecars are deletion
+fixtures; this checkpoint inspects a database-only copy. Every committed schema,
+including empty creation checkpoints, must match an independent V1 commitment
+covering all 25 `sqlite_master` entries, their exact SQL, and persisted page size,
+encoding, auto-vacuum, journal mode, application ID, and user version.
 
 The rollback fixture deliberately includes an older closed epoch alongside an
 active epoch. The existing driver creates that older epoch through the real

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +15,7 @@ from typing import Any
 from scripts.equivalence_process import _require
 from scripts.evidence_protocol_oracle import canonical_json_bytes, hre1_record_hash
 from scripts.spool_crash_oracle import (
+    SCHEMA_DIGEST_V1,
     initialization_digest_v1,
     sentinel_state_v1,
     validate_spool_snapshot_v1,
@@ -23,9 +26,39 @@ def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _database_state(database: Path) -> dict[str, Any]:
-    # SQLite may roll back its own hot rollback journal on this cold open. No
-    # application SQL writes or production recovery methods run in this observer.
+def _database_state(database: Path, *, include_journal: bool = True) -> dict[str, Any]:
+    """Read a disposable image; only production recovery opens the crash files."""
+    sources = [database]
+    journal = database.with_name(database.name + "-journal")
+    if include_journal and journal.exists():
+        sources.append(journal)
+    images = {}
+    for source in sources:
+        _require(source.stat().st_size <= 4 * 1024 * 1024, "database image exceeds its bound")
+        images[source.name] = source.read_bytes()
+    parent = database.parent.parent.resolve(strict=True)
+    snapshot = Path(tempfile.mkdtemp(prefix="hermes-storage-observer-", dir=parent))
+    try:
+        for name, raw in images.items():
+            (snapshot / name).write_bytes(raw)
+        return _read_database_snapshot(snapshot / database.name)
+    finally:
+        _require(
+            snapshot.resolve(strict=True).parent == parent and not snapshot.is_symlink(),
+            "database snapshot cleanup escaped its owner",
+        )
+        shutil.rmtree(snapshot)
+        _require(
+            all(
+                source.is_file() and source.read_bytes() == images[source.name]
+                for source in sources
+            ),
+            "database observation changed the original crash image",
+        )
+
+
+def _read_database_snapshot(database: Path) -> dict[str, Any]:
+    # SQLite may recover a hot journal here, inside the disposable copy only.
     with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as connection:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
@@ -53,6 +86,20 @@ def _database_state(database: Path) -> dict[str, Any]:
             and connection.execute("PRAGMA application_id").fetchone() == (0x48524531,)
             and connection.execute("PRAGMA user_version").fetchone() == (1,),
             "storage schema version or table inventory differs",
+        )
+        schema = [
+            list(row)
+            for row in connection.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+            )
+        ]
+        _require(
+            _digest(canonical_json_bytes(schema)) == SCHEMA_DIGEST_V1
+            and connection.execute("PRAGMA page_size").fetchone() == (4096,)
+            and connection.execute("PRAGMA encoding").fetchone() == ("UTF-8",)
+            and connection.execute("PRAGMA auto_vacuum").fetchone() == (0,)
+            and connection.execute("PRAGMA journal_mode").fetchone() == ("delete",),
+            "storage committed schema differs from the independent V1 image",
         )
         _require(
             not connection.execute("PRAGMA foreign_key_check").fetchall(),
@@ -309,6 +356,11 @@ def observe_storage(root: Path) -> dict[str, Any]:
             "root marker differs from its independent fixture image",
         )
     database = root / manifest.database
-    readable = database.exists() and state not in {"full_purge_pending"}
-    db = _database_state(database) if readable else {"schema": False}
+    # Full-purge fixtures deliberately seed non-SQLite sidecar bytes. Their
+    # committed database is inspected alone, before production deletes it.
+    db = (
+        _database_state(database, include_journal=state != "full_purge_pending")
+        if database.exists()
+        else {"schema": False}
+    )
     return {"files": files, "sentinel": state, "database": db}
