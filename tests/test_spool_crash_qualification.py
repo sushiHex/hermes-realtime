@@ -13,7 +13,7 @@ def test_governed_cases_and_existing_driver_have_the_same_closed_matrix() -> Non
     import json
     from pathlib import Path
 
-    from scripts.spool_crash_matrix import FAILPOINTS_V1
+    from scripts.spool_crash_matrix import FAILPOINTS_V1, _entry_sentinel, _validate_case_contract
     from tests.evidence.spool_crash_worker import FAILPOINTS, case_ids
 
     schema = json.loads(
@@ -23,6 +23,33 @@ def test_governed_cases_and_existing_driver_have_the_same_closed_matrix() -> Non
     )
     assert FAILPOINTS_V1 == FAILPOINTS
     assert list(case_ids()) == schema["$defs"]["SpoolCrashCaseV1"]["properties"]["caseId"]["enum"]
+    _validate_case_contract(schema)
+    cases = schema["properties"]["scenarios"]["prefixItems"][13]["allOf"][1]["properties"][
+        "caseResults"
+    ]["prefixItems"]
+    for index, case in enumerate(cases):
+        fields = case["allOf"][1]["properties"]
+        assert fields["sentinelStateAtRecoveryEntry"]["const"] == _entry_sentinel(index // 2)
+
+
+@pytest.mark.parametrize("field", ["exitMode", "sentinelStateAtRecoveryEntry", "assertions"])
+def test_producer_rejects_changed_per_case_contract(field) -> None:
+    import json
+    from pathlib import Path
+
+    from scripts.spool_crash_matrix import _validate_case_contract
+
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "scripts/schemas/qualification-report-v1.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    cases = schema["properties"]["scenarios"]["prefixItems"][13]["allOf"][1]["properties"][
+        "caseResults"
+    ]["prefixItems"]
+    cases[18]["allOf"][1]["properties"][field] = {}
+    with pytest.raises(ValueError, match="governed spool case contract"):
+        _validate_case_contract(schema)
 
 
 def test_registration_and_receipts_reject_reconstruction() -> None:

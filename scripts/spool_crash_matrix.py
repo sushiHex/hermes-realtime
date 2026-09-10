@@ -110,6 +110,28 @@ _MARKER = ".hermes-realtime-evidence-root-v1"
 _SENTINEL = "capture-v1.owner"
 
 
+def _entry_sentinel(index: int) -> str:
+    if 9 <= index <= 17:
+        return "no_final_sentinel"
+    if 18 <= index <= 21 or 23 <= index <= 26:
+        return "first_create_pending"
+    if 29 <= index <= 31:
+        return "clock_rollback_purge_pending"
+    if 32 <= index <= 39:
+        return "full_purge_pending"
+    return "clear"
+
+
+def _validate_case_contract(schema: Any) -> None:
+    # Pin the complete reviewed V1 contract, including every per-case field and
+    # transitive definition. A schema change requires an explicit producer review.
+    _require(
+        hashlib.sha256(core.canonical_json_bytes(schema)).hexdigest()
+        == "e3c8c509612bba844d9329202beb83bee7cbdf6b7a3d98501e2511be9da3e399",
+        "governed spool case contract differs",
+    )
+
+
 def _validate_checkpoint(point: str, db: Any) -> None:
     index = FAILPOINTS_V1.index(point)
     if index < 9:
@@ -245,18 +267,7 @@ def _validate_recovery(point: str, clock: str, row: Any) -> None:
                     "storage tombstone values differ",
                 )
     index = FAILPOINTS_V1.index(point)
-    expected_sentinel = (
-        "no_final_sentinel"
-        if 9 <= index <= 17
-        else "first_create_pending"
-        if index in {*range(18, 22), *range(23, 27)}
-        else "clock_rollback_purge_pending"
-        if 29 <= index <= 31
-        else "full_purge_pending"
-        if 32 <= index <= 39
-        else "clear"
-    )
-    _require(before["sentinel"] == expected_sentinel, "recovery entry sentinel differs")
+    _require(before["sentinel"] == _entry_sentinel(index), "recovery entry sentinel differs")
     _validate_checkpoint(point, before["database"])
     if before["database"]["schema"]:
         request_state = "pending" if index == 5 else "logical_deleted" if index in {6, 7} else None
@@ -481,11 +492,7 @@ def produce_spool_crash_matrix_v1(
                 encoding="utf-8"
             )
         )
-        cases = schema["$defs"]["SpoolCrashCaseV1"]["properties"]["caseId"]["enum"]
-        _require(
-            cases == [f"{p}@exit{m}" for p in FAILPOINTS_V1 for m in (197, 198)],
-            "governed spool crash matrix differs",
-        )
+        _validate_case_contract(schema)
         for point in FAILPOINTS_V1:
             for mode in (197, 198):
                 clocks = (

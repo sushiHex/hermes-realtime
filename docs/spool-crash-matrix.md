@@ -9,6 +9,13 @@ process. The four rollback checkpoints additionally use both caught-up and
 regressed restart clocks: 82 governed cases, 90 recovery attempts, and 180
 separately retained processes.
 
+The V1 report contract pins the actual sentinel state at each recovery-entry
+checkpoint: clear, absent final sentinel, first-create pending, clock-rollback
+pending, or full-purge pending. This corrects the earlier placeholder that
+required `clear` for every case. Case identities and order are unchanged. The
+producer pins the complete reviewed report-schema commitment, so changing any
+case field or transitive constraint requires an explicit producer review.
+
 ## Execution and acceptance
 
 The [process owner](../scripts/storage_process.py) verifies the executing scripts
