@@ -108,6 +108,8 @@ documentation.
 - Pin third-party GitHub Actions to full immutable commit SHAs.
 - Use `npm ci --ignore-scripts` for the browser workspace.
 - Regenerate packaged browser assets through the documented build, then verify release-gate parity.
+  The build refreshes asset hashes in the disclosure manifest; consent text, its
+  version, and disclosure digests still require explicit review.
 
 ## Licensing
 

@@ -108,8 +108,16 @@ def test_linux_candidate_wheel_requires_browser_build_and_committed_asset_parity
     assert "npm ci --ignore-scripts" in wheel
     assert "npm test -- --reporter=verbose --slowTestThreshold=100" in wheel
     assert "npm run build" in wheel
-    assert "git diff --exit-code -- src/hermes_realtime/client/static" in wheel
-    assert wheel.index("npm run build") < wheel.index("uv build --wheel")
+    parity = (
+        "git diff --exit-code -- src/hermes_realtime/client/static "
+        "src/hermes_realtime/evidence/disclosure_manifest_v1.json"
+    )
+    validation = "validate_disclosure_manifest(Path('src'))"
+    assert parity in wheel
+    assert "from scripts.release_gate import validate_disclosure_manifest" in wheel
+    assert wheel.index("npm run build") < wheel.index(parity) < wheel.index(validation)
+    assert wheel.index('python-version: "3.11"') < wheel.index(validation)
+    assert wheel.index(validation) < wheel.index("uv build --wheel")
 
 
 def test_native_release_gate_runs_the_synthetic_full_host_audio_tracer() -> None:

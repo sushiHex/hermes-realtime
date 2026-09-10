@@ -47,6 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -c "from pathlib import Path; from scripts.release_gate import validate_disclosure_manifest; validate_disclosure_manifest(Path('src'))"
           mkdir -p candidate wheelhouse requirements
           uv build --wheel --out-dir candidate
           uv export --frozen --group dev --no-emit-project --output-file requirements/linux-null-capture.txt
