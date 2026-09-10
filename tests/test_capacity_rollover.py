@@ -34,6 +34,7 @@ def _observations() -> dict:
             session=identity,
             epoch="e" * 64,
             consent="c" * 64,
+            consent_request="f" * 64,
             predecessor=predecessor,
             state="sealed" if sealed else "open",
             events=len(kinds),
@@ -57,7 +58,7 @@ def _observations() -> dict:
             }
             for stage in ("claimed", "queued", "durable", "published", "terminal")
         ],
-        source=source,
+        source=source | {"consent": "f" * 64},
         terminals=[
             dict(
                 disposition="completed",
@@ -78,6 +79,80 @@ def test_rollover_validator_accepts_a_durable_transition_and_equal_source() -> N
     from scripts.capacity_rollover import _validate_observations
 
     _validate_observations(_observations())
+
+
+def test_coordinated_store_consent_changes_cannot_replace_the_accepted_request() -> None:
+    from scripts.capacity_rollover import _validate_observations
+
+    row = _observations()
+    for snapshot in row["snapshots"]:
+        for session in snapshot["sessions"]:
+            session["consent"] = "d" * 64
+            session["consent_request"] = "d" * 64
+    with pytest.raises(ValueError):
+        _validate_observations(row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledgment", ["accepted", "pending", "bool_sequence"])
+async def test_consent_source_commitment_requires_the_exact_dispatched_request_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    acknowledgment: str,
+) -> None:
+    import hashlib
+    import hmac
+    import json
+
+    from scripts.capacity_rollover_worker import _accept_consent
+    from tests.integration import test_qualification_full_host_ingress as ingress
+
+    requests = []
+
+    async def event(**kwargs):
+        assert kwargs["kind"] == "capture_status"
+        return {"data": {"disclosureDigest": "b" * 64}}
+
+    async def request(**kwargs):
+        assert kwargs["path"] == "/api/v1/evidence-consent"
+        requests.append(json.loads(kwargs["body"]))
+        return (202 if acknowledgment == "pending" else 200), {
+            "captureState": "active",
+            "result": "consent_activated",
+            "sequence": True if acknowledgment == "bool_sequence" else 1,
+        }
+
+    monkeypatch.setattr(ingress, "_wait_event", event)
+    monkeypatch.setattr(ingress, "_request", request)
+    arguments = dict(
+        port=1, origin="https://example.invalid", token="synthetic", key=b"synthetic key"
+    )
+    if acknowledgment != "accepted":
+        with pytest.raises(ValueError, match="not accepted"):
+            await _accept_consent(**arguments)
+        return
+    commitment = await _accept_consent(**arguments)
+    assert len(requests) == 1
+    sent = requests[0]
+    assert sent == {
+        "accepted": True,
+        "sequence": 1,
+        "consentVersion": "realtime-evidence-consent-v1",
+        "disclosureDigest": "b" * 64,
+        "retentionHours": 24,
+        "sources": {"microphone": True, "typed": True},
+    }
+    normalized = {
+        "consent_version": sent["consentVersion"],
+        "disclosure_digest": sent["disclosureDigest"],
+        "retention_hours": sent["retentionHours"],
+        "microphone_accepted": sent["sources"]["microphone"],
+        "typed_accepted": sent["sources"]["typed"],
+    }
+    raw = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    assert (
+        commitment
+        == hmac.new(b"synthetic key", b"accepted_consent\0" + raw, hashlib.sha256).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(

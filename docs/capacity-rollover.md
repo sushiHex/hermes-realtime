@@ -31,7 +31,13 @@ and terminal authority. The static event validator checks each session's turn
 history; separate rollover checks bind its close/seal records and the successor
 to the complete consent envelope and production binding: consent version,
 disclosure digest, retention, source acceptance, and source availability. A
-separate commitment preserves that envelope across all four observations. Session IDs and raw records stay in
+separate commitment preserves that envelope across all four observations.
+Another commitment is captured from the exact consent request bytes dispatched
+through the browser API, only after its accepted acknowledgment. Every stored
+session must match that independent source commitment. Consistently rewriting
+all store consent fields and recomputing their hashes cannot replace the request
+that was actually accepted. The reader also requires one active epoch and no
+conflicts or pending/completed erasure authority in this fresh scenario. Session IDs and raw records stay in
 the child. An invocation-local HMAC key commits session lineage, chain entries,
 and content without exporting that key or identifiers.
 

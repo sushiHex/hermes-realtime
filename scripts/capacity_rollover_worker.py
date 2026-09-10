@@ -22,6 +22,77 @@ def _commit(key: bytes, domain: str, value: str | bytes) -> str:
     return hmac.new(key, domain.encode("ascii") + b"\0" + raw, hashlib.sha256).hexdigest()
 
 
+_CONSENT_FIELDS = (
+    "consent_version",
+    "disclosure_digest",
+    "retention_hours",
+    "microphone_accepted",
+    "typed_accepted",
+)
+
+
+def _consent_commitment(key: bytes, fields: dict[str, Any]) -> str:
+    raw = json.dumps(
+        {name: fields[name] for name in _CONSENT_FIELDS},
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _commit(key, "accepted_consent", raw)
+
+
+async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> str:
+    from tests.integration import test_qualification_full_host_ingress as ingress
+
+    capture = await ingress._wait_event(
+        port=port, origin=origin, token=token, kind="capture_status"
+    )
+    data = capture["data"]
+    _require(type(data) is dict, "capture status is malformed")
+    assert type(data) is dict
+    request = {
+        "sequence": 1,
+        "accepted": True,
+        "consentVersion": "realtime-evidence-consent-v1",
+        "disclosureDigest": data["disclosureDigest"],
+        "retentionHours": 24,
+        "sources": {"microphone": True, "typed": True},
+    }
+    raw = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    status, result = await ingress._request(
+        port=port,
+        origin=origin,
+        path="/api/v1/evidence-consent",
+        bearer=token,
+        body=raw,
+    )
+    _require(
+        status == 200
+        and type(result.get("sequence")) is int
+        and result
+        == {
+            "captureState": "active",
+            "result": "consent_activated",
+            "sequence": 1,
+        },
+        "consent request was not accepted",
+    )
+    # Anchor the receipt to the bytes actually dispatched through the host API,
+    # independently of every subsequently observed SQLite row.
+    sent = json.loads(raw)
+    return _consent_commitment(
+        key,
+        {
+            "consent_version": sent["consentVersion"],
+            "disclosure_digest": sent["disclosureDigest"],
+            "retention_hours": sent["retentionHours"],
+            "microphone_accepted": sent["sources"]["microphone"],
+            "typed_accepted": sent["sources"]["typed"],
+        },
+    )
+
+
 def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
     from hermes_realtime.evidence.models import (
         parse_evidence_snapshot_json,
@@ -44,6 +115,18 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
         installation = connection.execute(
             "SELECT installation_id FROM producer_installation WHERE singleton=1"
         ).fetchone()[0]
+        epochs = connection.execute(
+            "SELECT consent_epoch_id,producer_instance_id,state FROM consent_epochs"
+        ).fetchall()
+        _require(
+            len(epochs) == 1 and epochs[0][2] == "active",
+            "rollover has no unique active consent epoch",
+        )
+        for table in ("evidence_conflicts", "erasure_requests", "erasure_tombstones"):
+            _require(
+                connection.execute("SELECT COUNT(*) FROM " + table).fetchone() == (0,),
+                "fresh rollover carries conflicts or erasure authority",
+            )
         rows = connection.execute(
             "SELECT logical_session_id,consent_epoch_id,producer_instance_id,state,event_count,"
             "canonical_bytes,final_event_sequence,head_hash,taint_code,consent_version "
@@ -51,6 +134,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
         ).fetchall()
         _require(1 <= len(rows) <= 2, "rollover session count differs")
         for session_id, epoch, producer, state, count, size, final, head, taint, version in rows:
+            _require((epoch, producer) == epochs[0][:2], "session and active epoch lineage differ")
             events = connection.execute(
                 "SELECT event_id,event_sequence,event_kind,canonical_payload,payload_hash,"
                 "previous_hash,record_hash,recorded_at_utc,canonical_bytes "
@@ -155,6 +239,7 @@ def _snapshot(database: Path, key: bytes) -> dict[str, Any]:
                     "session": _commit(key, "session", session_id),
                     "epoch": _commit(key, "epoch", epoch),
                     "consent": _commit(key, "consent", canonical_json_bytes(consent)),
+                    "consent_request": _consent_commitment(key, payloads[0]),
                     "predecessor": ""
                     if predecessor is None
                     else _commit(key, "session", predecessor),
@@ -294,7 +379,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             launch_url=running.url,
             room=room,
         )
-        await ingress._consent_capture(port=port, origin=origin, token=token)
+        accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
         after = 0
         for sequence in range(1, 4):
             text = f"Synthetic capacity turn {sequence}."
@@ -376,6 +461,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             if type(item) is RolloverObservationV1
         ],
         "source": {
+            "consent": accepted_consent,
             "user": users,
             "generated": [
                 _commit(key, "generated", item.generated_text)

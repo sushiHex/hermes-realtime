@@ -88,12 +88,23 @@ def _validate_observations(row: Any) -> None:
         for session, (turns, sealed) in zip(sessions, shape, strict=True):
             _keys(
                 session,
-                {"session", "epoch", "predecessor", "state", "events", "chain", "kinds", "consent"}
+                {
+                    "session",
+                    "epoch",
+                    "predecessor",
+                    "state",
+                    "events",
+                    "chain",
+                    "kinds",
+                    "consent",
+                    "consent_request",
+                }
                 | _CONTENT,
             )
             _digest(session["session"])
             _digest(session["epoch"])
             _digest(session["consent"])
+            _digest(session["consent_request"])
             if session["predecessor"] != "":
                 _digest(session["predecessor"])
             kinds = ["session_opened", "binding_opened"] + _TURN * turns
@@ -129,7 +140,16 @@ def _validate_observations(row: Any) -> None:
     for name in ("session", "epoch", "predecessor", "consent"):
         _require(continued[1][name] == successor[name], "conversation changed successor lineage")
     _require(continued[1]["chain"][:2] == successor["chain"], "successor opening changed")
-    _keys(row["source"], _CONTENT)
+    _keys(row["source"], _CONTENT | {"consent"})
+    _digest(row["source"]["consent"])
+    _require(
+        all(
+            session["consent_request"] == row["source"]["consent"]
+            for snapshot in snapshots
+            for session in snapshot["sessions"]
+        ),
+        "stored consent differs from the accepted source request",
+    )
     for name in _CONTENT:
         _digests(row["source"][name], 3)
         _require(
