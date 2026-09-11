@@ -11,7 +11,7 @@ import struct
 import sys
 import urllib.parse
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -425,6 +425,8 @@ async def _run_non_mutation_arm(
     writer_block: bool = False,
     livekit_url: str = "ws://127.0.0.1:7880",
     typed_stimulus: str = "paired typed stimulus",
+    synthesizer_factory: Callable[[], Any] = _Synthesizer,
+    close_driver: Callable[[Any, Any], Awaitable[None]] | None = None,
     observe: Callable[[tuple[object, ...], tuple[object, ...], bool], None] | None = None,
 ) -> tuple[object, ...]:
     """Run one real host/browser/LiveKit flow with fixed typed and PCM stimuli."""
@@ -461,7 +463,7 @@ async def _run_non_mutation_arm(
         ),
         inference_factory=_Inference,
         speech_presence_factory=_Presence,
-        synthesizer_factory=_Synthesizer,
+        synthesizer_factory=synthesizer_factory,
         transcriber_factory=lambda: transcriber,
         vad_factory=lambda: _Vad(transcriber),
         identity_factory=lambda: f"verifier_{suffix}",
@@ -549,7 +551,9 @@ async def _run_non_mutation_arm(
             transport.release.set()
         await room.disconnect()
         if running is not None:
-            if writer_fault:
+            if close_driver is not None:
+                await close_driver(composition, running)
+            elif writer_fault:
                 with pytest.raises(
                     RuntimeError,
                     match="evidence drain did not reach terminal stopped state",

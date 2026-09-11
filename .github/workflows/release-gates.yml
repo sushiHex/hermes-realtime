@@ -96,7 +96,7 @@ jobs:
         run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/integration/test_linux_null_capture.py
       - name: Validate portable qualification oracles
         shell: bash
-        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py
+        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py tests/test_owned_close_faults.py
 
   release-candidate:
     name: Hermetic release candidate
@@ -315,6 +315,11 @@ jobs:
             --candidate $env:GITHUB_WORKSPACE `
             --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
           if ($LASTEXITCODE -ne 0) { throw "Full-purge qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_owned_close_faults `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Owned-close qualification failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |

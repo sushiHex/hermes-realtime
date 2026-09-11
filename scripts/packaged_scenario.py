@@ -47,7 +47,9 @@ def _observe_packaged_run(
 ) -> _ObservedRun:
     from scripts.equivalence_process import _run_archived_scenario
 
-    if scenario not in {"revoke_race", "capacity_rollover", "over_budget_turn"}:
+    if scenario not in {
+        "revoke_race", "capacity_rollover", "over_budget_turn", "owned_close_faults",
+    }:
         raise ValueError("packaged scenario is unavailable")
     package = _wheel_for_consumer(wheel, archive, identity)
     metadata, observations, processes, cleanup, exit_code = _run_archived_scenario(

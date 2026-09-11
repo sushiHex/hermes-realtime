@@ -92,7 +92,7 @@ observations. It does not claim a general inventory of the worker's file handles
 This fixture does not qualify initialization-temporary deletion, an active host's
 consent/revocation orchestration, arbitrary sidecar contents, volume-full behavior,
 installed-host recovery, or physical devices. Those contracts remain separate.
-Capture remains disabled by default. Fourteen producers remain unavailable and
+Capture remains disabled by default. The remaining producers are listed in [implementation status](implementation-status.md), and
 full Slice 0 acceptance remains pending.
 
 [Issue #41](https://github.com/sushiHex/hermes-realtime/issues/41) tracks exact

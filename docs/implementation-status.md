@@ -31,12 +31,13 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
-The `SCENARIO_REGISTRY_V1` now registers six real producers,
+The `SCENARIO_REGISTRY_V1` now registers seven real producers,
 [`deterministic_equivalence`](deterministic-equivalence.md),
 [`revoke_race`](revoke-race.md), [`capacity_rollover`](capacity-rollover.md),
 [`over_budget_turn`](over-budget-turn.md),
-[`spool_crash_matrix`](spool-crash-matrix.md), and
-[`full_purge_cleanup`](full-purge-cleanup.md), with **14 governed producers still
+[`spool_crash_matrix`](spool-crash-matrix.md),
+[`full_purge_cleanup`](full-purge-cleanup.md), and
+[`owned_close_faults`](owned-close-faults.md), with **13 governed producers still
 explicitly unavailable**. The source-only equivalence producer
 owns the archived child, collects nine fixed comparison arms, and independently
 validates conversation, settlement, close, and process cleanup observations.
