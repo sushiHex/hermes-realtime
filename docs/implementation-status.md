@@ -100,7 +100,9 @@ worker exits. Its synthetic sidecars qualify deletion only; initialization debri
 host orchestration, volume-full, and physical behavior remain separate.
 [Issue #41](https://github.com/sushiHex/hermes-realtime/issues/41) records its evidence.
 
-## CI evidence and open investigation
+<a name="ci-evidence-and-open-investigation"></a>
+
+## CI evidence and investigation limits
 
 The capability map retains its reviewed baseline above. The following dependency
 and automated-qualification update is bound separately to main commit
