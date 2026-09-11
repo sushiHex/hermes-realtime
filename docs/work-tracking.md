@@ -98,6 +98,7 @@ gh issue view <number> --repo sushiHex/hermes-realtime --json number,url,state,t
 gh api graphql -F number=<number> -f query='query($number:Int!) { repository(owner:"sushiHex", name:"hermes-realtime") { issue(number:$number) { parent { number url } } } }'
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/timeline
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/dependencies/blocked_by
+gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/dependencies/blocking
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/sub_issues
 gh api --paginate 'repos/sushiHex/hermes-realtime/milestones?state=all'
 gh pr list --repo sushiHex/hermes-realtime --state all --limit 100
