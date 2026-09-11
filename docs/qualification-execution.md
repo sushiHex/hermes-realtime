@@ -209,8 +209,23 @@ Preserve the real provider and host paths being qualified. The pinned Codex role
 needs an explicitly authorized subscription and remote inference access; use a
 qualification-specific credential context with an owner-approved attempt/usage
 budget. The trusted controller admits only the governed scenarios and retains
-their dispatch and observation evidence under the existing runtime bounds. Do
-not replace real inference with a local/mock provider, claim that local size or
+their dispatch and observation evidence under the existing runtime bounds.
+Before any credential or prompt dispatch, independently verify the actual Codex
+client's service authority, endpoint configuration, hostname-checked TLS and
+approved trust roots. Bind its effective DNS, proxy and TLS configuration to the
+admitted environment; remote reachability and a service-reported model name are
+insufficient. Remove ambient `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides from fresh
+host environments unless their exact authority and bytes were independently
+authenticated and frozen. The current provider forwards those variables, so
+ordinary environment sanitization alone does not establish this check. Refuse
+unverified system or environment proxies, endpoint/trust overrides, DNS policy,
+or redirects outside the approved service authorities. Retain content-free
+service-authentication evidence for the actual client connections and preserve
+the policy across redirects and reconnects. A separate probe connection does not
+prove where the credential-bearing client connected. Missing client evidence or
+an unverifiable route/trust configuration refuses before sensitive dispatch;
+implement this admission in #62 without substituting a credential broker or mock
+provider. Do not claim that local size or
 timeout bounds impose a service-side spending cap, or continue when authorization
 or the applicable usage limit is unavailable. The reviewed host uses the existing
 `livekit_local_v1` development profile. Its key and secret are fixed public,
