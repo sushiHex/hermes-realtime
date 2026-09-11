@@ -18,7 +18,9 @@ in both Markdown and GitHub would give contributors competing records.
 | Pull requests and implementation records | Changes, review, and completion evidence |
 | Optional GitHub Project | A view of the same issues |
 
-One work item has one issue; one decision has one authoritative document.
+One substantive work item has one issue; one decision has one authoritative
+document. Small incidental corrections can use their PR as the work and handoff
+record, following the tracking guide.
 Use native issue dependencies and sub-issues. Keep implementation work,
 investigations, and owner decisions distinct. Tracking a proposal never approves
 its design, and closing an investigation does not imply that a feature qualified.

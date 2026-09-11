@@ -3,7 +3,8 @@
 <!-- What problem does this solve? Link the owning issue and design authority.
 Use Refs #<number> for partial work. Use closing keywords only when merge completes
 the entire issue; if acceptance includes main CI, close after that run is verified.
-Small incidental corrections can use this PR as their work record. -->
+Small incidental corrections can use this PR as their work record. Leave paused-work
+handoffs in the owning issue, or here when this PR is the work record. -->
 
 ## Public behavior
 
