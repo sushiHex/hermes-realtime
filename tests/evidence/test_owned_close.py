@@ -8,11 +8,11 @@ import threading
 from pathlib import Path
 
 import pytest
+from test_task11b_real_chain import _activate, _create_epoch
 
 from hermes_realtime.evidence import models as m
 from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
 from hermes_realtime.production_observation import CloseResultV1, CloseStageV1
-from tests.evidence.test_task11b_real_chain import _activate, _create_epoch
 
 
 def _runtime(path: Path) -> HostEvidenceRuntimeV1:
