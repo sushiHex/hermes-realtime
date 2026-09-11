@@ -249,8 +249,9 @@ Before admitting microphone or typed input, the operator must read and explicitl
 accept this v1 remote-inference disclosure: the Codex path sends conversation text
 to OpenAI, including final microphone transcriptions, typed user text, retained
 conversation messages and supplied context. The data is processed remotely.
-Withdrawing consent cannot retract text already submitted. Use synthetic scenario
-content and admit no uninformed participant's speech or text.
+Withdrawing consent cannot retract text already handed to the owned Codex client;
+that includes work queued by the client and text already submitted to the service.
+Use synthetic scenario content and admit no uninformed participant's speech or text.
 
 The trusted qualification controller must collect that explicit consent through
 its own contemporaneous operator prompt before input admission and bind it
@@ -258,10 +259,15 @@ privately to the exact disclosure/policy blob,
 candidate, final input digest and run. Keep an explicit controller-owned
 withdrawal/abort control available throughout the attempt. Its event permanently
 latches consent as withdrawn for that attempt; a fresh acceptance needs a new
-attempt. Serialize that latch with the consent check immediately before every
-input admission and remote dispatch. An absent or failed withdrawal control
-refuses admission. Refusal, missing evidence or withdrawal blocks further input
-and dispatch, cancels owned outstanding work and refuses the attempt while
+attempt. Serialize withdrawal with the actual input-admission commitment and
+with each handoff of conversation text to the owned Codex client for remote
+processing. Checking consent and later handing off text are not separate
+permissions: the check and commitment share one controller-owned decision.
+Withdrawal that wins that decision prevents the handoff; a handoff committed
+first is outstanding work subject to cancellation, with the disclosure's explicit
+non-retraction limit. An absent or failed withdrawal control refuses admission.
+Refusal, missing evidence or withdrawal blocks further input and handoffs,
+cancels owned outstanding work and refuses the attempt while
 preserving cleanup obligations. Account usage permission, proposal approval,
 stored defaults and prior runs cannot supply consent. This admission record is
 separate from the twelve scenario attestations, adds no report field or claim of
