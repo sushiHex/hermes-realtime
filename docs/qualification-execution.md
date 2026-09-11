@@ -184,6 +184,22 @@ from the bound inputs and scenario; it must not forward arbitrary caller-supplie
 CLI arguments or configuration overrides. Unspecified optional features retain
 the exact source-bound defaults rather than acquiring authority from the operator.
 
+Full-host execution must explicitly select `inference_provider="codex"`,
+`stt_provider="moonshine"`, `tts_provider="kokoro"`, and
+`moonshine_model_tier="medium"`. Select `codex_model="gpt-5.6-terra"`,
+`codex_effort="low"`, and `kokoro_voice="bf_isabella"`, matching the governed
+report's `ProviderV1` constants. These mandatory selections override ordinary
+launcher defaults, including Ollama, the tiny Moonshine tier and automatic TTS
+selection. Before resource creation, independently verify the merged effective
+selectors against this profile, the input's expected values and its admitted
+distribution/model resources. Freeze them in the invocation binding. After
+construction and before admitting scenario input or dispatch, independently
+verify the actual provider identities, selected medium backend and resource
+bindings; a configured string is not evidence of the selected implementation.
+Missing providers or selection/resource mismatch refuse qualification, with no
+provider fallback. This full-host profile does not turn a synthetic producer's
+declared proof class into physical or remote-inference evidence.
+
 Public search and knowledge speculation/recovery are disabled for every v1
 qualification scenario. Before creating any qualification resource or launching
 any consumer, the independent controller must complete both checks: reject
@@ -246,6 +262,31 @@ needs an explicitly authorized subscription and remote inference access; use a
 qualification-specific credential context with an owner-approved attempt/usage
 budget. The trusted controller admits only the governed scenarios and retains
 their dispatch and observation evidence under the existing runtime bounds.
+
+Before admitting microphone or typed input, require the operator to read and
+explicitly accept this separate v1 remote-inference disclosure: the Codex path
+sends conversation text to OpenAI, including final microphone transcriptions,
+typed user text, retained conversation messages and the supplied conversation
+context. This is remote processing; local evidence-storage consent and account
+usage authorization do not authorize it. Do not claim that remote submissions
+remain on the qualification machine or that withdrawing consent retracts text
+already submitted. Use synthetic scenario content and admit no uninformed
+participant's speech or text.
+
+The independently controlled input station must observe the operator's explicit
+consent before input admission, bind it to the exact disclosure/policy blob,
+candidate, final input digest and owned run, and retain the protected admission
+record. The #62 controller must gate input and every remote dispatch on that live
+consent. Refusal, missing evidence or withdrawal blocks further input/dispatch,
+cancels owned outstanding work and refuses the attempt while preserving its
+cleanup obligations. Consent is specific to this run; proposal approval, a
+stored default or a prior run cannot supply it. This admission prerequisite is
+separate from the twelve scenario attestations and does not add a v1 report
+field or a human-identity/truth claim. Full acceptance independently validates
+its retained timing and binding. Current storage disclosure and provider
+composition supply no such remote-consent capability; missing integration
+refuses physical execution.
+
 Adopt the closed `codex-openai-service-v1` admission policy below. Its authority
 comes from this reviewed source document, not an operator-supplied hostname or CA
 approval. Bind its exact source blob to the candidate archive and governing-plan
