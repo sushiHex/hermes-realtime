@@ -227,9 +227,14 @@ the Codex executable digest and the final input digest.
   complete connection behavior.
 - Use only server-authentication roots admitted by the Microsoft Trusted Root
   Program, excluding its Disallowed set. Independently authenticate the published
-  AuthRoot/Disallowed material and compare the client's effective trust roots
-  against it; accepting the machine's current store without that comparison is
-  insufficient. Before each run, the independent trusted controller must obtain
+  AuthRoot/Disallowed material. Require every effective trust root to belong to
+  AuthRoot and be absent from Disallowed. Require every member of each actual
+  service connection chain, including leaf and intermediate certificates, to be
+  absent from Disallowed before sensitive application bytes. Client admission
+  must establish that the native same-connection verifier enforces this rule
+  against the initial admitted catalogs; a root-only comparison, machine store
+  inspection or later rejection cannot supply that pre-dispatch guard. Before
+  each run, the independent trusted controller must obtain
   the latest published catalogs from an authenticated Microsoft distribution
   source; a supplied snapshot, filesystem timestamp or successful verification
   of an old Microsoft signature does not establish freshness. The policy permits
@@ -243,8 +248,11 @@ the Codex executable digest and the final input digest.
   publication, never from the admitted host's cache. Recheck the publication
   before final acceptance; changed catalogs require reevaluation of every
   effective root and retained connection chain against both refreshed catalogs.
-  Missing evidence, a root no longer admitted by AuthRoot, or any chain member
-  newly present in Disallowed refuses acceptance. This is a bounded
+  Final acceptance applies the same predicate to every effective root and every
+  retained connection chain under both the initial and refreshed catalogs:
+  roots must be admitted by AuthRoot and all chain members must be absent from
+  Disallowed. Missing evidence or any violation refuses acceptance, regardless
+  of when a certificate became disallowed. This is a bounded
   freshness policy, not instantaneous notice of later root-program changes.
   Freeze catalog identities, sequence/update times, retrieval/expiry evidence,
   effective-root digests and final recheck in the private tool environment
