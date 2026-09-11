@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from scripts.owned_close_faults import ObservedOwnedCloseFaultsV1
     from scripts.revoke_race import ObservedRevokeRaceV1
     from scripts.spool_crash_matrix import ObservedSpoolCrashMatrixV1
+    from scripts.synthetic_fault_matrix import ObservedSyntheticFaultV1
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 
 
@@ -340,6 +341,26 @@ class SpoolCrashMatrixRegistrationV1:
 
 
 @dataclass(frozen=True, slots=True)
+class SyntheticFaultRegistrationV1:
+    """The five-case synthetic producer at its governed ordinal."""
+
+    scenario_id: ScenarioIdV1 = ScenarioIdV1.SYNTHETIC_FAULT_MATRIX
+
+    def __post_init__(self) -> None:
+        if (type(self) is not SyntheticFaultRegistrationV1
+                or self.scenario_id is not ScenarioIdV1.SYNTHETIC_FAULT_MATRIX):
+            raise TypeError("synthetic fault registration must be exact")
+
+    def produce(self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+                wheel: VerifiedCandidateWheelV1) -> ObservedSyntheticFaultV1:
+        if self is not SCENARIO_REGISTRY_V1[15]:
+            raise ValueError("synthetic fault producer registration is not canonical")
+        from scripts.synthetic_fault_matrix import produce_synthetic_fault_v1
+
+        return produce_synthetic_fault_v1(archive, identity, wheel)
+
+
+@dataclass(frozen=True, slots=True)
 class FullPurgeRegistrationV1:
     """The real-filesystem full-purge producer at its governed ordinal."""
 
@@ -405,6 +426,7 @@ _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
         ScenarioIdV1.CAPACITY_ROLLOVER,
         ScenarioIdV1.OVER_BUDGET_TURN,
         ScenarioIdV1.SPOOL_CRASH_MATRIX,
+        ScenarioIdV1.SYNTHETIC_FAULT_MATRIX,
         ScenarioIdV1.FULL_PURGE_CLEANUP,
         ScenarioIdV1.OWNED_CLOSE_FAULTS,
     }
@@ -422,6 +444,7 @@ REVOKE_RACE_REGISTRATION_V1 = RevokeRaceRegistrationV1()
 CAPACITY_ROLLOVER_REGISTRATION_V1 = CapacityRolloverRegistrationV1()
 OVER_BUDGET_TURN_REGISTRATION_V1 = OverBudgetTurnRegistrationV1()
 SPOOL_CRASH_MATRIX_REGISTRATION_V1 = SpoolCrashMatrixRegistrationV1()
+SYNTHETIC_FAULT_REGISTRATION_V1 = SyntheticFaultRegistrationV1()
 FULL_PURGE_REGISTRATION_V1 = FullPurgeRegistrationV1()
 OWNED_CLOSE_FAULTS_REGISTRATION_V1 = OwnedCloseFaultsRegistrationV1()
 
@@ -429,7 +452,7 @@ _ScenarioRegistrationV1 = (
     UnavailableScenarioRegistrationV1 | DeterministicEquivalenceRegistrationV1
     | RevokeRaceRegistrationV1 | CapacityRolloverRegistrationV1
     | OverBudgetTurnRegistrationV1 | SpoolCrashMatrixRegistrationV1 | FullPurgeRegistrationV1
-    | OwnedCloseFaultsRegistrationV1
+    | OwnedCloseFaultsRegistrationV1 | SyntheticFaultRegistrationV1
 )
 _REGISTRATIONS_V1: tuple[_ScenarioRegistrationV1, ...] = (
     *UNAVAILABLE_SCENARIO_REGISTRY_V1,
@@ -438,6 +461,7 @@ _REGISTRATIONS_V1: tuple[_ScenarioRegistrationV1, ...] = (
     CAPACITY_ROLLOVER_REGISTRATION_V1,
     OVER_BUDGET_TURN_REGISTRATION_V1,
     SPOOL_CRASH_MATRIX_REGISTRATION_V1,
+    SYNTHETIC_FAULT_REGISTRATION_V1,
     FULL_PURGE_REGISTRATION_V1,
     OWNED_CLOSE_FAULTS_REGISTRATION_V1,
 )

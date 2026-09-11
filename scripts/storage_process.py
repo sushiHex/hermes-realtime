@@ -27,6 +27,7 @@ from scripts.equivalence_process import (
     _verify_wheel_tree,
     _write_frame,
 )
+from scripts.synthetic_fault_oracle import CASES_V1
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 from scripts.windows_storage_oracle import (
     audit_drain_release,
@@ -78,6 +79,9 @@ def _storage_archive(
         "scripts/full_purge_cleanup.py",
         "scripts/full_purge_observation.py",
         "scripts/full_purge_worker.py",
+        "scripts/synthetic_fault_matrix.py",
+        "scripts/synthetic_fault_oracle.py",
+        "scripts/synthetic_fault_worker.py",
         "scripts/qualify_evidence_slice_zero.py",
         "scripts/equivalence_process.py",
         "tests/evidence/spool_crash_worker.py",
@@ -162,6 +166,7 @@ def _validate_invocation(record: _StorageInvocation) -> Any:
                 and observation.get("checkpoint") == "after_drain_ack_before_exit"
             )
             or (record.expected_exit == 0 and observation.get("phase") in {"purge", "repeat_purge"})
+            or (record.expected_exit == 0 and observation.get("caseId") in CASES_V1)
         ),
         "storage release observation differs",
     )
@@ -173,9 +178,14 @@ def _run_storage_worker(
 ) -> _StorageInvocation:
     """Crash codes are accepted only for a bound crash checkpoint, never recovery."""
     purge = action in {"purge", "repeat_purge"}
-    _require(action in {"crash", "recover", "purge", "repeat_purge"}, "storage action differs")
+    synthetic = action == "synthetic"
+    normal = purge or synthetic
     _require(
-        type(mode) is int and (mode == 0 if purge else mode in {197, 198}),
+        action in {"crash", "recover", "purge", "repeat_purge", "synthetic"},
+        "storage action differs",
+    )
+    _require(
+        type(mode) is int and (mode == 0 if normal else mode in {197, 198}),
         "storage exit mode differs",
     )
     _require(clock in {"caught-up", "regressed"}, "storage recovery clock differs")
@@ -183,6 +193,11 @@ def _run_storage_worker(
         not purge or (point == "full_purge_cleanup" and clock == "caught-up"),
         "full-purge worker configuration differs",
     )
+    _require(
+        not synthetic or (point in CASES_V1 and clock == "caught-up"),
+        "synthetic worker configuration differs",
+    )
+    case_root = archive.workspace / f"{point}-exit{mode}-{clock}"
     expected_exit = mode if action == "crash" else 0
     # The GUI interpreter uses the same runtime without creating a console host.
     # All protocol I/O travels over the two explicitly inherited pipe handles.
@@ -212,7 +227,13 @@ def _run_storage_worker(
             for fd in (request_read, response_write):
                 os.set_inheritable(fd, True)
             handles = tuple(msvcrt.get_osfhandle(fd) for fd in (request_read, response_write))
-            module = "scripts.full_purge_worker" if purge else "scripts.storage_worker"
+            module = (
+                "scripts.synthetic_fault_worker"
+                if synthetic
+                else "scripts.full_purge_worker"
+                if purge
+                else "scripts.storage_worker"
+            )
             bootstrap = (
                 "import sys,runpy;sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)];"
                 f"runpy.run_module('{module}',run_name='__main__')"
@@ -237,7 +258,11 @@ def _run_storage_worker(
                 "PATH": str(python.parent),
             }
             spec = core._WindowsScenarioSpecV1(
-                "full_purge_cleanup" if purge else "spool_crash_matrix",
+                "synthetic_fault_matrix"
+                if synthetic
+                else "full_purge_cleanup"
+                if purge
+                else "spool_crash_matrix",
                 command,
                 tuple(sorted(environment.items(), key=lambda item: (item[0].casefold(), item[0]))),
                 str(archive.workspace),
@@ -306,11 +331,11 @@ def _run_storage_worker(
                     return observation
 
                 observation = receive()
-                if purge:
+                if normal:
                     _require(observation == {"phase": "prepared"}, "purge preparation differs")
                     with audit_purge_deletions(
-                        archive.workspace / "full_purge_cleanup-exit0-caught-up/evidence",
-                        present=action == "purge",
+                        case_root / "evidence",
+                        present=action != "repeat_purge",
                     ):
                         _write_frame(request_write, {"version": 1, "nonce": nonce, "sequence": 0})
                         observation = receive()
@@ -320,9 +345,9 @@ def _run_storage_worker(
                         archive.workspace / f"{point}-exit{mode}-{clock}" / "evidence",
                         root.process_handle,
                     )
-                if purge:
+                if normal:
                     audit_storage_release(
-                        archive.workspace / "full_purge_cleanup-exit0-caught-up/evidence",
+                        case_root / "evidence",
                         root.process_handle,
                         (
                             ".hermes-realtime-evidence-root-v1",
@@ -340,12 +365,13 @@ def _run_storage_worker(
                         raise ctypes.WinError(ctypes.get_last_error())
                 else:
                     _write_frame(
-                        request_write, {"version": 1, "nonce": nonce, "sequence": 1 if purge else 0}
+                        request_write,
+                        {"version": 1, "nonce": nonce, "sequence": 1 if normal else 0},
                     )
                 kernel.wait(root.process_handle, 10_000)
                 code = _exit_code(kernel, root.process_handle)
                 _require(code == expected_exit, "storage worker did not reach its prescribed exit")
-                return observation, code, drain_released or purge
+                return observation, code, drain_released or normal
 
             observation, code, storage_released = (
                 core._run_with_windows_scenario_job_finalization_v1(job, execute)
