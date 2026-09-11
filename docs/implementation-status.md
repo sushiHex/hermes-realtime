@@ -1,6 +1,6 @@
 # Implementation status
 
-[Collaborator guide](README.md) · [Roadmap](roadmap.md)
+[Collaborator guide](README.md) · [Work tracking](work-tracking.md)
 
 Implementation and evidence reviewed on **2026-09-09** at main commit
 [`c7b8975e33f5dac7203845d7aa9207ee3518d453`](https://github.com/sushiHex/hermes-realtime/commit/c7b8975e33f5dac7203845d7aa9207ee3518d453),
@@ -82,8 +82,10 @@ remains unqualified.
 The [registry tests](../tests/test_qualify_evidence_slice_zero.py) preserve the
 remaining refusal contract. These producers cannot generate an accepted full
 `qualification-report-v1`; the remaining matrix, installed-path prerequisites,
-and required human observations are still outstanding. Follow the ordered
-[roadmap](roadmap.md#ordered-milestones).
+and required human observations are still outstanding. Use
+[GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues?q=is%3Aissue%20is%3Aopen%20label%3Aqualification)
+for current ownership, prerequisites, and acceptance criteria; this page records
+implementation and evidence rather than work status.
 
 The [packaged spool crash producer](spool-crash-matrix.md) covers all 82 governed
 cases, including both restart clocks for rollback. Its independent observer
@@ -98,7 +100,9 @@ worker exits. Its synthetic sidecars qualify deletion only; initialization debri
 host orchestration, volume-full, and physical behavior remain separate.
 [Issue #41](https://github.com/sushiHex/hermes-realtime/issues/41) records its evidence.
 
-## CI evidence and open investigation
+<a name="ci-evidence-and-open-investigation"></a>
+
+## CI evidence and investigation limits
 
 The capability map retains its reviewed baseline above. The following dependency
 and automated-qualification update is bound separately to main commit
@@ -139,7 +143,7 @@ startup, then requires both retained thread objects to be stopped. The
 [earlier local activation timeouts and subsequent thread-count failures](https://github.com/sushiHex/hermes-realtime/pull/30#issuecomment-5614964675)
 remain recorded; repairing test cleanup does not establish their timing cause.
 
-[Issue #13](https://github.com/sushiHex/hermes-realtime/issues/13) remains open for
+[Issue #13](https://github.com/sushiHex/hermes-realtime/issues/13) tracks
 the historical Windows timing failures. The
 [child-exit regression](windows-checkpoint-child-exit.md) demonstrates the
 pipe-deadlock class with 64 KiB, while the historical `ack_eof` child wrote 2,035

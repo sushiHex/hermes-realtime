@@ -160,8 +160,10 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 ## Documentation
 
 Start with the [Collaborator guide](docs/README.md),
-[Roadmap](docs/roadmap.md), and [Implementation status](docs/implementation-status.md)
-for priorities, code and test locations, and remaining qualification work.
+[Work tracking](docs/work-tracking.md), and [Implementation status](docs/implementation-status.md)
+for contributor workflow, code, and evidence. Find substantive work and outcome
+groups in [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) and
+[Milestones](https://github.com/sushiHex/hermes-realtime/milestones).
 
 - [Local LiveKit setup and automated gates](docs/local-livekit.md)
 - [Hermes bridge and natural-work authority](docs/hermes-bridge.md)

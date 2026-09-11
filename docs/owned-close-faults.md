@@ -66,8 +66,8 @@ assertions `conversation_trace_equal_to_revised_close_baseline` and
 qualification remains incomplete. Capture remains disabled by default.
 
 [Issue #43](https://github.com/sushiHex/hermes-realtime/issues/43) records exact
-candidate, review, and run evidence. Historical investigations
+candidate, review, and run evidence. These results do not establish the historical
+causes investigated in
 [#13](https://github.com/sushiHex/hermes-realtime/issues/13),
 [#24](https://github.com/sushiHex/hermes-realtime/issues/24), and
-[#27](https://github.com/sushiHex/hermes-realtime/issues/27) remain open; their
-historical causes remain unproven.
+[#27](https://github.com/sushiHex/hermes-realtime/issues/27).

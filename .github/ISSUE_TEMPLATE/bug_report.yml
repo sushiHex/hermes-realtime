@@ -6,17 +6,19 @@ body:
   - type: markdown
     attributes:
       value: |
-        Do not include credentials, launch fragments, private audio, transcripts, personal data, or private host paths. Report vulnerabilities through the Security tab instead.
+        Follow the [public-repository boundary](https://github.com/sushiHex/hermes-realtime/blob/main/CONTRIBUTING.md#public-repository-boundary).
+        Do not include credentials, launch fragments, private endpoints or paths, device/account identities, raw audio, transcripts, screenshots, traces, private reports, or user data. Share only minimal, sanitized log or error excerpts.
+        Report vulnerabilities through [private vulnerability reporting](https://github.com/sushiHex/hermes-realtime/security/advisories/new) instead of a public issue.
   - type: checkboxes
     id: checks
     attributes:
       label: Preflight
       options:
-        - label: I searched existing issues.
+        - label: I searched existing issues and PRs, including closed records.
           required: true
         - label: This is not a security vulnerability.
           required: true
-        - label: I removed secrets and private data.
+        - label: I removed secrets and private data from all text and attachments.
           required: true
   - type: input
     id: version
@@ -28,10 +30,8 @@ body:
   - type: input
     id: hermes
     attributes:
-      label: Hermes Agent version
-      placeholder: hermes --version
-    validations:
-      required: true
+      label: Hermes Agent version, if involved
+      placeholder: Version or not involved
   - type: dropdown
     id: os
     attributes:

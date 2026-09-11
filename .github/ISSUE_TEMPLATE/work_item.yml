@@ -1,12 +1,11 @@
-name: Proposal or decision
-description: Propose a public capability or request an explicit design decision
-labels: ["enhancement", "decision", "needs-triage"]
+name: Work item
+description: Scope one implementation or investigation outcome
+labels: ["needs-triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Proposals must be useful outside one private deployment and reproducible without a maintainer's named hardware or accounts.
-        Creating an issue does not approve a design. Accepted decisions belong in a reviewed repository plan or ADR.
+        Search existing issues and PRs first. Tracking work does not approve a design.
         Follow the [public-repository boundary](https://github.com/sushiHex/hermes-realtime/blob/main/CONTRIBUTING.md#public-repository-boundary).
         Do not include credentials, launch fragments, private endpoints or paths, device/account identities, raw audio, transcripts, screenshots, traces, private reports, or user data. Share only minimal, sanitized log or error excerpts.
         Report vulnerabilities through [private vulnerability reporting](https://github.com/sushiHex/hermes-realtime/security/advisories/new) instead of a public issue.
@@ -21,36 +20,40 @@ body:
           required: true
         - label: I removed secrets and private data from all text and attachments.
           required: true
-  - type: textarea
-    id: use_case
+  - type: dropdown
+    id: kind
     attributes:
-      label: Public use case
-      description: What user-visible result should become possible?
+      label: Work kind
+      options:
+        - Implementation
+        - Investigation
     validations:
       required: true
   - type: textarea
-    id: existing
+    id: problem
     attributes:
-      label: Existing alternatives
-      description: Which Hermes Agent, LiveKit, browser, or provider surfaces have you considered?
+      label: Problem and intended outcome
+      description: What changes or becomes known? Explain why it matters.
     validations:
       required: true
   - type: textarea
     id: scope
     attributes:
-      label: Smallest useful scope
-      description: Describe the narrowest end-to-end slice, non-goals, and affected contracts or plan/ADR links.
+      label: Scope and non-goals
+      description: Bound one outcome; independently assignable work can become sub-issues.
     validations:
       required: true
   - type: textarea
-    id: risks
+    id: authority
     attributes:
-      label: Security, privacy, and compatibility considerations
-      description: Include authority, cleanup, secret handling, and platform implications.
+      label: Authority and prerequisites
+      description: Link reviewed plans, contracts, ADRs, and prerequisite issues. Mark proposals or unknowns explicitly; maintainers add native dependency links.
+    validations:
+      required: true
   - type: textarea
-    id: decision
+    id: acceptance
     attributes:
-      label: Decision requested and supporting evidence
-      description: State the exact choice, prerequisites, and evidence needed to accept or decline it. Separate observations from hypotheses.
+      label: Observable completion criteria
+      description: Name the required evidence. Investigations need a stopping condition and may reach a negative result.
     validations:
       required: true

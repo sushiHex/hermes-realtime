@@ -5,7 +5,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 
 | Question | Start here |
 | --- | --- |
-| What should we work on next? | [Roadmap](roadmap.md): ordered milestones, dependencies, and completion criteria |
+| What should we work on next? | [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) and [Milestones](https://github.com/sushiHex/hermes-realtime/milestones); follow the [tracking guide](work-tracking.md) |
 | What exists, and what has been verified? | [Implementation status](implementation-status.md): source, tests, defaults, and outstanding qualification |
 | How do I contribute a change? | [Contributing](../CONTRIBUTING.md): setup, public-repository boundaries, and PR expectations |
 | Which engineering rules apply? | [Development guide](../AGENTS.md): protocol, ownership, cancellation, and change discipline |
@@ -28,18 +28,20 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |
 
-Detailed contracts belong in these guides. The roadmap links to them rather than
-repeating timeout values, schemas, or operational procedures.
+Detailed contracts belong in these guides. Reviewed plans and accepted
+[architectural decisions](adr/0001-github-work-tracking.md) hold design authority;
+issues link to them rather than repeating their contracts.
 
 ## Working together
 
-Choose the earliest unblocked roadmap item and check its implementation status
-before proposing new code. Use a [bounded issue](https://github.com/sushiHex/hermes-realtime/issues)
-to discuss substantial changes and link the implementation PR to that issue.
+Read the owning issue, or PR for an incidental correction, along with its
+prerequisites, ownership, and linked design before proposing a change.
+Use one bounded issue per substantive outcome and link its PR.
 Check [open PRs](https://github.com/sushiHex/hermes-realtime/pulls) for overlapping
-work; a roadmap entry does not reserve work or authorize a merge.
+work. The [tracking guide](work-tracking.md) explains triage and handoffs; an issue
+or milestone does not approve a design or reserve work.
 
-Update status with the change that affects it. Link the relevant source and tests,
+Update implementation evidence with the change that affects it. Link the relevant source and tests,
 record the candidate and run supporting any new qualification claim, and state
 what remains unverified. Follow the [documentation maintenance rules](../CONTRIBUTING.md#documentation-maintenance)
 to keep plans, implementation, and evidence aligned.

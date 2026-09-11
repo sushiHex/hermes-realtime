@@ -4,10 +4,13 @@ Hermes Realtime welcomes focused bug fixes, tests, documentation, provider integ
 
 ## Before opening a pull request
 
-- Start with the [Collaborator guide](docs/README.md), [Roadmap](docs/roadmap.md),
-  and [Implementation status](docs/implementation-status.md) to find current
-  priorities, existing code, and outstanding qualification work.
-- Use GitHub Issues for reproducible bugs and bounded feature proposals.
+- Start with [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues)
+  and [Milestones](https://github.com/sushiHex/hermes-realtime/milestones) for current
+  work. Follow the [tracking guide](docs/work-tracking.md) for scope, ownership,
+  dependencies, handoffs, and closure.
+- Read the [Collaborator guide](docs/README.md) and
+  [Implementation status](docs/implementation-status.md) for code, contracts, and
+  qualification evidence. A tracked proposal is not an approved design.
 - Discuss substantial API, protocol, persistence, or authority changes before implementation.
 - Report vulnerabilities privately through GitHub's private vulnerability reporting; do not open a public security issue.
 - Read and follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
@@ -83,8 +86,12 @@ Passing tests are necessary but not sufficient. New acceptance claims must deriv
 
 ## Documentation maintenance
 
-Keep the [roadmap](docs/roadmap.md) focused on work order and completion criteria.
-Keep the [status page](docs/implementation-status.md) focused on implementation,
+Keep substantive work and mutable status in GitHub Issues and Milestones. Small
+incidental corrections can keep their scope, ownership, and pause handoff in the
+PR used as their work record. The
+[tracking guide](docs/work-tracking.md) describes the workflow without duplicating
+the backlog. Reviewed plans and accepted ADRs hold design intent and decisions;
+the [status page](docs/implementation-status.md) records implementation,
 activation/default behavior, and qualification evidence. Detailed contracts and
 procedures belong in the implementation guides linked from the
 [documentation index](docs/README.md).
