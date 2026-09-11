@@ -207,10 +207,16 @@ budget. The trusted controller admits only the governed scenarios and retains
 their dispatch and observation evidence under the existing runtime bounds. Do
 not replace real inference with a local/mock provider, claim that local size or
 timeout bounds impose a service-side spending cap, or continue when authorization
-or the applicable usage limit is unavailable. The reviewed host receives the
-disposable loopback LiveKit service's required credentials through its existing
-production configuration. Keep those values private, restrict them to that owned
-service, and retire them with it. They are not credentials for a shared deployment.
+or the applicable usage limit is unavailable. The reviewed host uses the existing
+`livekit_local_v1` development profile. Its key and secret are fixed public,
+predictable values; they cannot be made private or revoked per run. Their bounded
+use relies on the dedicated environment, loopback signaling, effective firewall
+policy and independently verified participant/media topology. The profile is not
+an authentication boundary against untrusted local peers and cannot qualify a
+shared or externally accessible deployment. Stop and remove the owned service and
+its temporary state during cleanup; this retires that service instance, not the
+public constants or their potential use by another instance. Real subscription
+credentials and operational grants remain private.
 
 Decline extending v1 into an adversarial-code execution architecture. Separate
 credential brokers, per-request hostile-client capabilities and isolation from a
@@ -359,9 +365,15 @@ Attempt cleanup after success, failure, cancellation, or unavailable prerequisit
 Stop admission, finalize consent/revocation and owned processes, purge raw capture
 artifacts, restore fixture permissions and mixer changes, dismount the owned VHDX,
 and remove only owned temporary environments, profiles, extraction, and backing
-files after verifying their absolute paths and ownership. Preserve adjacent
-decoys, stable ownership markers as required by the purge contract, the browser
-image, and firewall state. Verify each applicable cleanup assertion from the
+files after verifying their absolute paths and ownership. Preserve fixture decoys
+and stable ownership markers through the independent purge/recovery observation,
+as required by that scenario's contract. After every consumer has exited and the
+accepted observation receipt is retained, final cleanup may remove the enclosing
+qualification-owned workspace, including its fixture markers and decoys. This is
+how successful storage producers satisfy `evidenceRootsRemoved`; it does not
+retroactively claim that purge deleted the protected fixtures. Adjacent files
+outside the owned workspace, the browser installation image and firewall state
+remain outside cleanup authority. Verify each applicable cleanup assertion from the
 responsible owner. An unknown or incomplete cleanup result prevents acceptance.
 Do not claim forensic SSD erasure or secure clearing of Python process memory.
 
