@@ -88,8 +88,8 @@ wheelhouse, with dependency hashes enforced and ambient configuration excluded.
 Build inputs and runtime inputs retain separate roles. Installed checks must
 execute the installed candidate and bound dependency environment with no editable
 installation, source-checkout fallback, user-site imports, or unbound downloads.
-Before the first installed import, independently manifest the complete executable
-environment: interpreter and native libraries, standard library, installed
+Before any tool invocation or installed import, independently manifest the complete
+executable environment: interpreter and native libraries, standard library, installed
 packages, generated entry points, and every allowed import/resource location.
 Bind that manifest and its owned installation receipt to the sealed input closure
 and candidate. Retain immutable file and ancestor seals, or an equivalent owned
@@ -100,6 +100,13 @@ alone does not bind imported modules. These generated-tree receipts belong to th
 input authority; do not invent additional v1 report fields to imply that the
 current `verifiedArtifacts` array covers them. Current archived producers extract
 into writable workspaces and do not yet supply this installed-tree authority.
+Apply this requirement to the build-tool environment before the first source
+capture, build, repeated build or installation invocation, including Git/uv
+helpers and the build interpreter's DLL, standard-library and import closure.
+The existing single-executable pins do not establish that complete tool closure.
+Build outputs must be written outside sealed executable/import locations and
+independently verified and sealed before consumption. Equal repeated outputs do
+not excuse an unsealed build environment.
 Source-only producer success and the Pure wheel job do not establish this full
 closure. Missing provider, Hermes, browser, benchmark, or platform prerequisites
 must remain unavailable; do not fabricate placeholders to satisfy the schema.
@@ -119,14 +126,29 @@ the candidate execution boundary. Before any candidate code runs, #62 must
 establish a dedicated low-privilege execution identity or equivalent OS sandbox
 with explicit filesystem, handle, credential and network access restrictions.
 The candidate may read sealed runtime inputs, write only owned scenario data, and
-use the explicitly permitted loopback/media resources. It must not inherit the
+use the explicitly permitted loopback/media resources and bounded inference path
+below. It must not inherit the
 operator's access token, credentials, home-directory access, arbitrary handles,
-or outbound network access, nor be able to modify the controller, input authority,
+or unrestricted outbound network access, nor be able to modify the controller, input authority,
 installed seals or recovery journal. A separate ordinary account alone is not
 sufficient without those verified restrictions. Provisioning requires the
 separate environment authorization; capability discovery cannot silently create
 accounts, grant permissions or change firewall policy. Refuse before dispatch if
 the required boundary or desktop/media capability cannot be established.
+
+Real subscription-backed Codex inference requires remote service access. Give
+only the pinned Codex execution role a separately isolated credential/network
+authority with an explicit destination allowlist for its authenticated service
+path. Keep that role under retained process/Job ownership while separating its
+token, credential access and writable state from candidate code. Candidate code
+may use only the existing bounded request/response protocol; it cannot obtain
+credentials, select network destinations, supply a proxy or change the allowlist.
+The trusted controller must verify endpoint policy, TLS validation, redirect and
+proxy restrictions and credential confinement before dispatch, and bind those
+observations to the same run/input identity. Keep policy details and credentials
+private; this subordinate authority does not add invented v1 report fields.
+Missing service authorization or enforceable isolation refuses the applicable
+physical run. Local or mocked inference cannot substitute for this provider path.
 
 The existing Windows Job owner provides lifecycle and resource limits, not this
 security boundary. The current archived producers execute candidate code under
