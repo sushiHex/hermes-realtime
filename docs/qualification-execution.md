@@ -60,9 +60,25 @@ LiveKit and Codex executables, Hermes source/harness, benchmark report and machi
 manifest, and the exact governed schemas. The schema is the exhaustive role list.
 
 Reopen and verify actual files through `verify_qualification_input_closure` before
-launch and before accepting output. Reject missing, changed, aliased, indirect,
-out-of-root, noncanonical, duplicate, or mismatched inputs. Claimed hashes and
-version strings alone do not prove installed identity or source provenance.
+launch and before accepting output. Those calls are point-in-time byte checks;
+they do not retain file handles, compare file identities, detect hard-link
+aliases, or prevent a file from changing between verification and use. The input
+authority in #47 must seal the complete input closure through every consumer:
+retain validated file and ancestor identities with handles that deny writes,
+replacement and deletion, or use an equivalently immutable owned snapshot.
+Verify bytes through those seals and preserve the seals across build, install,
+launch, observation and final acceptance. If sealing cannot be established,
+refuse before executing a consumer. A final matching hash does not excuse a
+transient replacement during execution.
+
+Reject missing, changed, aliased, indirect, out-of-root, noncanonical, duplicate,
+or mismatched inputs. Require distinct file identities and a single hard link for
+each declared artifact role, including direct/repeated build outputs. Separate
+files with equal hashes still do not prove separate builds: reproducibility
+requires independently owned build invocations and their bound output receipts.
+Claimed hashes and version strings alone do not prove installed identity, build
+execution, or source provenance. These filesystem seals do not isolate a hostile
+process that already controls the runner's interpreter or execution authority.
 Reuse the existing archive and wheel validators for runtime blob parity. Verify
 build reproducibility, dependency closure, installed import origins, and required
 environment identities independently before they support an installed claim.
@@ -204,13 +220,31 @@ Do not claim forensic SSD erasure or secure clearing of Python process memory.
 
 Existing storage producers deliberately retain a failed private workspace when
 successful cleanup cannot be established; see [full-purge cleanup](full-purge-cleanup.md).
-This can include a database and diagnostic material. Treat it as private
-quarantine, never as completed purge or publishable failure evidence. Keep
-ownership and privacy maintenance pending, establish that every retained process
-has exited before touching its files, and then perform owned cleanup and verify
-the result. Do not delete beneath a possibly live writer merely to satisfy this
-plan. The complete runner must report that refusal and retain the outstanding
-cleanup obligation; no automatic safe cleanup of such a workspace is claimed here.
+This can include a database and diagnostic material. The existing context manager
+does not persist a recovery record or return a surviving cleanup capability after
+failure. Therefore its retained directory alone is not a recoverable quarantine
+authority, and this plan does not claim that existing failed workspaces will be
+automatically discovered or purged.
+
+Before creating sensitive files or dispatching workers, the complete runner in
+#62 must durably record private workspace ownership and cleanup obligations.
+Bind the record to the run/candidate, exact workspace and parent file/volume
+identities, an owned marker, allowed artifacts, and retained process creation and
+image identities. Keep the record in an access-controlled private recovery root
+outside the disposable workspace, update it durably before each new owned
+resource, and preserve it across exceptions and runner restart. If recording
+fails, refuse dispatch. The journal itself contains private paths and identifiers;
+it cannot enter Git, public reports, logs, comments, or attachments.
+
+Recovery must reopen and match the recorded ownership before touching files,
+establish that every recorded process has exited without confusing reused PIDs,
+perform only the recorded owned cleanup, and independently verify completion
+before retiring the recovery record. Unknown ownership or incomplete cleanup
+remains a visible private obligation and prevents acceptance. Never scan a name
+prefix and adopt arbitrary directories, retroactively claim an unrecorded
+workspace, or delete beneath a possibly live writer. Existing partial producers
+retain their documented limits until integrated with this authority; a complete
+qualification entry point must refuse until that integration is available.
 
 The composition authority must accept only genuine producer-minted capabilities,
 revalidate their independent observations, and bind each to the same candidate,
