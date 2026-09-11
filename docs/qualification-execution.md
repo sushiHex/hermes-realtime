@@ -255,8 +255,12 @@ content and admit no uninformed participant's speech or text.
 The trusted qualification controller must collect that explicit consent through
 its own contemporaneous operator prompt before input admission and bind it
 privately to the exact disclosure/policy blob,
-candidate, final input digest and run. Gate input and every remote dispatch on
-the live consent. Refusal, missing evidence or withdrawal blocks further input
+candidate, final input digest and run. Keep an explicit controller-owned
+withdrawal/abort control available throughout the attempt. Its event permanently
+latches consent as withdrawn for that attempt; a fresh acceptance needs a new
+attempt. Serialize that latch with the consent check immediately before every
+input admission and remote dispatch. An absent or failed withdrawal control
+refuses admission. Refusal, missing evidence or withdrawal blocks further input
 and dispatch, cancels owned outstanding work and refuses the attempt while
 preserving cleanup obligations. Account usage permission, proposal approval,
 stored defaults and prior runs cannot supply consent. This admission record is
@@ -473,6 +477,17 @@ outside the disposable workspace, update it durably before each new owned
 resource, and preserve it across exceptions and runner restart. If recording
 fails, refuse dispatch. The journal itself contains private paths and identifiers;
 it cannot enter Git, public reports, logs, comments, or attachments.
+
+Make process acquisition recoverable: durably record a launch intent before
+creation, then create the child suspended with its noninherited kill-on-close Job
+already associated through Windows' [at-creation Job list](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+Persist the actual process creation/image identity while it remains suspended;
+resume only after that update is durable. A controller death before the identity
+update therefore leaves an unresumed child owned by the closing Job, never an
+unassigned running worker. Recovery must resolve pending intents conservatively;
+unknown exit or ownership still prevents cleanup acceptance. The current
+create-then-assign launcher has a crash interval before Job assignment and does
+not satisfy this requirement. #62 owns the change and termination-boundary tests.
 
 Include a dedicated private host-temporary root in this journal before launching
 any full-host process. The actual Codex provider creates random temporary
