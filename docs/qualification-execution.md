@@ -186,9 +186,14 @@ qualification controller and validator, authenticated tools/providers/services,
 and operating system. Admit only an exact candidate with clear code and security
 reviews and the required automated gates. Run it in an explicitly provisioned
 qualification account/session containing no unrelated operator files, browser
-profiles or credentials. Keep fixtures synthetic except for the separately
-authorized physical observations. Missing candidate admission or a dedicated
-environment refuses full execution. This does not authorize account provisioning,
+profiles or credentials, on a host under exclusive qualification control for the
+entire run. Exclude other user sessions and untrusted local workloads; trusted OS
+services remain part of the computing base. A dedicated account alone is
+insufficient for the public LiveKit profile. Verify host admission before launch
+and retain that exclusive control until every owned process has stopped. Keep
+fixtures synthetic except for the separately authorized physical observations.
+Missing candidate admission or exclusive host control refuses full execution.
+This does not authorize account provisioning,
 credential installation, firewall changes or physical execution by this PR.
 
 This is qualification of reviewed code, not a malware sandbox. Job membership,
@@ -246,7 +251,13 @@ bindings. Owned browser/host media clients may use OS-assigned UDP endpoints
 bound to loopback, wildcard or verified addresses of the same qualification
 machine. Independently retain process, interface and selected ICE-pair evidence;
 require both media peers to be on that same machine, the expected room and
-participant identities, and no external TURN/media peer. Reject unowned endpoints,
+participant identities, and no external TURN/media peer. Independently collect
+participant admission, identity and departure events continuously from service
+startup through shutdown, with no observation gap; an unexpected or impersonated
+peer refuses the run even if it leaves before the final inventory. Combine that
+evidence with exclusive host control: the public credentials and inbound firewall
+do not authenticate or exclude same-host loopback clients. Missing continuous
+observation refuses qualification. Reject unowned endpoints,
 unexpected server ports, remote media peers or unclassified sockets. Collapse
 only genuinely observed duplicate `(protocol, port, addressClass)` rows for the
 v1 inventory; preserve their process/interface bindings in the private topology
@@ -394,6 +405,27 @@ outside the disposable workspace, update it durably before each new owned
 resource, and preserve it across exceptions and runner restart. If recording
 fails, refuse dispatch. The journal itself contains private paths and identifiers;
 it cannot enter Git, public reports, logs, comments, or attachments.
+
+Include a dedicated private host-temporary root in this journal before launching
+any full-host process. The actual Codex provider creates random temporary
+credential homes and inference workspaces; forced process termination bypasses
+their normal Python cleanup. Launch fresh host processes with `TEMP`, `TMP` and
+`TMPDIR` all bound to that pre-owned root in their actual process environment,
+before Python can cache a temporary directory. Supplying a mapping only to the
+Codex child launcher does not redirect the parent provider's `tempfile` calls.
+Verify containment of both the copied credential home and inference workspace,
+including descendant tool temporary files, before accepting their use. An
+ambient fallback or unowned temporary path refuses full qualification.
+
+Record this root as an owned private subtree cleanup obligation, so recovery
+covers randomly named descendants without needing their names before creation.
+Require its protected access, exact parent/root identities and marker; reject
+links, reparse points or unexpected ownership during recovery. After all recorded
+writers have exited, verify and remove only this recorded subtree, including any
+credential copies left by termination. Never discover it by scanning a temporary
+directory prefix. The complete runner must demonstrate this path under forced
+termination and restart; the current provider's `TemporaryDirectory` cleanup
+alone does not satisfy it. Credential content and these paths remain private.
 
 Recovery must reopen and match the recorded ownership before touching files,
 establish that every recorded process has exited without confusing reused PIDs,
