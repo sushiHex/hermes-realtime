@@ -84,7 +84,7 @@ chat history:
 
 ```bash
 gh issue list --repo sushiHex/hermes-realtime --state all --limit 100
-gh issue view <number> --repo sushiHex/hermes-realtime --comments
+gh issue view <number> --repo sushiHex/hermes-realtime --json number,url,state,title,body,assignees,labels,milestone,comments
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/timeline
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/dependencies/blocked_by
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/sub_issues
@@ -94,7 +94,7 @@ gh pr view <pr-number> --repo sushiHex/hermes-realtime --json number,url,state,h
 ```
 
 The [issue timeline](https://docs.github.com/en/rest/issues/timeline#list-timeline-events-for-an-issue)
-includes PR cross-references that `--comments` omits. Read each relevant PR's
+includes PR cross-references that issue comments omit. Read each relevant PR's
 current state, body, and head before claiming work; closed PRs can also carry
 handoffs or completion evidence.
 
