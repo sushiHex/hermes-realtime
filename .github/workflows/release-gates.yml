@@ -96,7 +96,7 @@ jobs:
         run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/integration/test_linux_null_capture.py
       - name: Validate portable qualification oracles
         shell: bash
-        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py tests/test_owned_close_faults.py
+        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py tests/test_owned_close_faults.py tests/test_synthetic_fault_matrix.py
 
   release-candidate:
     name: Hermetic release candidate
@@ -311,6 +311,10 @@ jobs:
             --candidate $env:GITHUB_WORKSPACE `
             --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
           if ($LASTEXITCODE -ne 0) { throw "Spool crash qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_synthetic_fault_matrix `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
+          if ($LASTEXITCODE -ne 0) { throw "Synthetic fault qualification failed with exit code $LASTEXITCODE" }
           uv run --frozen --group dev python -m scripts.qualify_full_purge_cleanup `
             --candidate $env:GITHUB_WORKSPACE `
             --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest

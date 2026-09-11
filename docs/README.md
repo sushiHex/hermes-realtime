@@ -22,6 +22,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Session budgets, durable rollover, and successor conversation | [Packaged capacity rollover](capacity-rollover.md) |
 | Capture queue overflow, durable exclusion, and rejected-source absence | [Packaged admission overflow](over-budget-turn.md) |
 | Spool crash boundaries, durable seals, and recovery purge | [Packaged spool crash matrix](spool-crash-matrix.md) |
+| Synthetic capacity, filtering, rollback, SQLite faults, and blocked drain | [Synthetic fault matrix](synthetic-fault-matrix.md) |
 | Exact artifact deletion, preserved decoys, and idempotent purge | [Full-purge cleanup](full-purge-cleanup.md) |
 | Close retries, caller cancellation, and paired conversation facts | [Owned-close faults](owned-close-faults.md) |
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |

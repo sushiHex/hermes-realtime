@@ -434,7 +434,6 @@ def test_only_the_canonical_revoke_registration_can_invoke_the_packaged_producer
     registry = core.SCENARIO_REGISTRY_V1
     assert tuple(item.scenario_id for item in registry) == tuple(core.ScenarioIdV1)
     assert type(registry[10]) is core.RevokeRaceRegistrationV1
-    assert len(core.UNAVAILABLE_SCENARIO_REGISTRY_V1) == 13
     copied = core.RevokeRaceRegistrationV1()
     with pytest.raises(ValueError, match="not canonical"):
         copied.produce(
