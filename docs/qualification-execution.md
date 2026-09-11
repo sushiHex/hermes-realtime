@@ -554,7 +554,7 @@ alone does not satisfy it. Credential content and these paths remain private.
 
 Before introducing reusable authentication, independently establish an emergency
 credential disposition for the qualification-specific grant. Require either a
-provider-enforced hard expiry no later than its authorized run deadline, which
+provider-enforced hard expiry no later than its bounded credential deadline, which
 refresh or derived tokens cannot extend, or independently operable authority to
 invalidate all copied access/refresh material and its derived grant family
 upstream. That authority must remain usable outside the failed worker and
@@ -562,6 +562,21 @@ disposable credential home; if runner interruption can also disable revocation,
 require independent supervision or the verified hard expiry. Missing support or
 unverifiable grant scope refuses credential copying and launch. The current
 temporary-home copy/normal-close path supplies no such capability.
+
+The v1 maximum credential lifetime is **3,600 seconds**. Before the first copy,
+durably record a conservative admission-budget epoch using the independently
+trusted UTC and monotonic clock; the effective credential deadline is the earlier
+of that epoch plus 3,600 seconds and the owner's authorized run deadline. A
+provider-enforced hard expiry must be no later than this effective deadline.
+Recopying, refreshing, retrying or rotating within the same grant family cannot
+reset or extend it. In the revocation branch, upstream invalidation must be
+confirmed by this same bounded deadline; quarantine still triggers it immediately.
+Bind the epoch, both clock observations, effective deadline and grant disposition
+capability to the exact governing-policy blob, candidate, final input digest and
+owned run in the private recovery record. Full acceptance must independently
+verify this binding and arithmetic; an owner-supplied deadline or a schema-valid
+report alone is insufficient. The v1 report schema need not expose these private
+grant details: its genuine execution authority must retain and validate them.
 
 Entering unresolved credential-bearing cleanup or quarantine must immediately
 invoke that upstream invalidation/rotation authority, unless the verified hard
