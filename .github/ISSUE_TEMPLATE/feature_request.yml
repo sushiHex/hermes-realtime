@@ -1,6 +1,6 @@
 name: Proposal or decision
 description: Propose a public capability or request an explicit design decision
-labels: ["decision", "needs-triage"]
+labels: ["enhancement", "decision", "needs-triage"]
 body:
   - type: markdown
     attributes:
