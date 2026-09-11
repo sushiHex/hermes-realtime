@@ -552,44 +552,46 @@ directory prefix. The complete runner must demonstrate this path under forced
 termination and restart; the current provider's `TemporaryDirectory` cleanup
 alone does not satisfy it. Credential content and these paths remain private.
 
-Before introducing reusable authentication, independently establish an emergency
-credential disposition for the qualification-specific grant. Require either a
-provider-enforced hard expiry no later than its bounded credential deadline, which
-refresh or derived tokens cannot extend, or independently operable authority to
-invalidate all copied access/refresh material and its derived grant family
-upstream. That authority must remain usable outside the failed worker and
-disposable credential home; if runner interruption can also disable revocation,
-require independent supervision or the verified hard expiry. Missing support or
-unverifiable grant scope refuses credential copying and launch. The current
-temporary-home copy/normal-close path supplies no such capability.
+Before introducing reusable authentication, independently verify a
+provider-enforced, nonextendable cutoff for the qualification-specific grant.
+The cutoff must cover all copied access/refresh material and its usable derived
+grant family, and be established before the first copy. A hard expiry or an
+irrevocable provider-scheduled invalidation may supply this authority; a later
+best-effort revocation action cannot. The cutoff must remain effective if the
+worker, controller or credential custodian becomes unavailable. Missing provider
+support or unverifiable grant scope refuses credential copying and launch. The
+current temporary-home copy/normal-close path supplies no such capability.
 
 The v1 maximum credential lifetime is **3,600 seconds**. Before the first copy,
 durably record a conservative admission-budget epoch using the independently
 trusted UTC and monotonic clock; the effective credential deadline is the earlier
 of that epoch plus 3,600 seconds and the owner's authorized run deadline. A
-provider-enforced hard expiry must be no later than this effective deadline.
+provider-enforced cutoff must be no later than this effective deadline.
 Recopying, refreshing, retrying or rotating within the same grant family cannot
-reset or extend it. In the revocation branch, upstream invalidation must be
-confirmed by this same bounded deadline; quarantine still triggers it immediately.
+reset or extend it, or cancel the established cutoff.
 Bind the epoch, both clock observations, effective deadline and grant disposition
-capability to the exact governing-policy blob, candidate, final input digest and
+capability and independently verified cutoff evidence to the exact
+governing-policy blob, candidate, final input digest and
 owned run in the private recovery record. Full acceptance must independently
 verify this binding and arithmetic; an owner-supplied deadline or a schema-valid
 report alone is insufficient. The v1 report schema need not expose these private
 grant details: its genuine execution authority must retain and validate them.
 
 Entering unresolved credential-bearing cleanup or quarantine must immediately
-invoke that upstream invalidation/rotation authority, unless the verified hard
-expiry already bounds the grant. Rotation counts only when the provider has
-invalidated the old material and its usable descendants; deleting local files or
-receiving a local logout acknowledgment does not prove this. Retain the grant
-binding, trigger, attempted action, independently confirmed upstream outcome or
-verified expiry, and any failure/unknown disposition in the protected private
-recovery record. An unresolved revocation outcome must remain escalated to its
-responsible credential custodian and cannot be presented as successful cleanup.
-Revocation does not authorize deletion without verified filesystem/process
-ownership, nor does it prove that raw files were removed. Preserve those separate
-cleanup obligations, and continue refusing qualification while either is unresolved.
+invoke any independently available upstream invalidation authority to shorten
+the established lifetime. If that additional action is unavailable, rejected or
+unconfirmed, the previously established provider cutoff still bounds the grant;
+the attempted action is never the maximum-lifetime authority. Rotation counts as
+invalidation only when the provider invalidates the old material and its usable
+descendants. Deleting local files or receiving a local logout acknowledgment
+does not prove this. Retain the grant binding, trigger, cutoff evidence, attempted
+emergency action and independently confirmed outcome or failure/unknown state in
+the protected private recovery record. Keep an unresolved outcome with the
+responsible credential custodian and never present it as successful cleanup.
+Invalidation or expiry does not authorize deletion without verified
+filesystem/process ownership, nor prove that raw files were removed. Preserve
+those separate cleanup obligations, and continue refusing qualification while
+cleanup remains unresolved.
 
 Recovery must reopen and match the recorded ownership before touching files,
 establish that every recorded process has exited without confusing reused PIDs,
