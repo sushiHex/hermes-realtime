@@ -26,7 +26,9 @@ Use the [issue forms](https://github.com/sushiHex/hermes-realtime/issues/new/cho
   complete it without qualifying a feature or establishing a historical cause.
 
 Small steps can be checkboxes inside their issue. Independently assignable work
-can become native sub-issues. Use native **blocked by / blocking** relationships
+can become native sub-issues. Before claiming a sub-issue, follow its parent links
+and read the owning scope, prerequisites, and design authority too.
+Use native **blocked by / blocking** relationships
 for unconditional issue prerequisites. Explain conditional choices and external
 prerequisites in the body. A closed blocker may have been declined or superseded;
 read its outcome before assuming its required proof exists.
@@ -93,6 +95,7 @@ chat history:
 ```bash
 gh issue list --repo sushiHex/hermes-realtime --state all --limit 100
 gh issue view <number> --repo sushiHex/hermes-realtime --json number,url,state,title,body,assignees,labels,milestone,comments
+gh api graphql -F number=<number> -f query='query($number:Int!) { repository(owner:"sushiHex", name:"hermes-realtime") { issue(number:$number) { parent { number url } } } }'
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/timeline
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/dependencies/blocked_by
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/sub_issues
