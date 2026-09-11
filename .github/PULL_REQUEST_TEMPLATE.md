@@ -22,7 +22,12 @@ Small incidental corrections can use this PR as their work record. -->
 
 ## Public-repository checklist
 
-- [ ] No credentials, private endpoints, launch fragments, personal paths, private audio, transcripts, or user data
+The [public-repository boundary](https://github.com/sushiHex/hermes-realtime/blob/main/CONTRIBUTING.md#public-repository-boundary)
+applies to the PR body, comments, and attachments, including PR-only work records.
+Review each addition before posting. Report vulnerabilities through
+[private vulnerability reporting](https://github.com/sushiHex/hermes-realtime/security/advisories/new).
+
+- [ ] I reviewed all shared PR text and attachments against that boundary and removed prohibited or private material
 - [ ] No named private hardware or deployment-specific assumptions
 - [ ] Dependencies and GitHub Actions are appropriately bounded/pinned
 - [ ] Documentation reflects behavior and limitations
