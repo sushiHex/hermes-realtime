@@ -252,8 +252,9 @@ conversation messages and supplied context. The data is processed remotely.
 Withdrawing consent cannot retract text already submitted. Use synthetic scenario
 content and admit no uninformed participant's speech or text.
 
-An independently controlled input station must observe that explicit consent
-before input admission and bind it privately to the exact disclosure/policy blob,
+The trusted qualification controller must collect that explicit consent through
+its own contemporaneous operator prompt before input admission and bind it
+privately to the exact disclosure/policy blob,
 candidate, final input digest and run. Gate input and every remote dispatch on
 the live consent. Refusal, missing evidence or withdrawal blocks further input
 and dispatch, cancels owned outstanding work and refuses the attempt while
@@ -395,15 +396,16 @@ codes, extra rows, reused attestations, or automatic confirmations.
 
 The composition authority in #62 must enforce this exact scenario/code mapping,
 one occurrence of every code, fresh unique IDs, and observation times inside both
-the run and corresponding scenario observation windows. It must collect operator
-input through an owned contemporaneous interaction on a separately secured
-desktop/input station or an out-of-band trusted attestation device. Verify that
-candidate processes cannot observe or inject input into that collector; do not
-collect confirmations in candidate-controlled browser UI. The operator may view
-the qualified UI while confirming through the independent channel. A supplied JSON confirmation
-is not that capability. Missing collector separation, declined, stale, misassigned, or out-of-window
-observations refuse acceptance. The current byte validator does not enforce these
-requirements and must not be used as their substitute.
+the run and corresponding scenario observation windows. The trusted controller
+must collect each response through its own contemporaneous operator prompt while
+the operator observes the qualified UI. Bind that interaction to the current
+scenario; neither a supplied JSON confirmation nor the candidate's observation
+record can substitute for it. The controller and reviewed candidate share the
+stated trusted-host boundary: a separate device, secured desktop or proof of
+isolation from a malicious candidate is not required or claimed. Declined,
+missing, stale, misassigned or out-of-window observations refuse acceptance.
+The current byte validator does not enforce these requirements and must not be
+used as their substitute.
 
 ## Coverage dispositions
 
