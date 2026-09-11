@@ -54,7 +54,10 @@ execute a dirty checkout or replace a bound artifact during a run.
 Establish the closure in three stages so no invocation depends on its own output:
 
 1. Seal the independently selected tool environments and pre-existing build
-   resources first. Under those seals, use the existing Git/archive authority to
+   resources first. Authenticate every trusted tool/runtime against a governed
+   digest allowlist or independently verified publisher/distribution provenance
+   before executing it. A caller-chosen digest or locally generated manifest
+   cannot establish that trust. Under those authenticated seals, use the existing Git/archive authority to
    verify the selected candidate and capture its source. Bind the verified source,
    governing plan, runner, schemas and tool/resource manifests into a sealed
    pre-build closure. No final qualification-input digest exists at this stage.
@@ -163,53 +166,51 @@ must remain unavailable; do not fabricate placeholders to satisfy the schema.
 
 ## Own the execution environment
 
-Full storage qualification targets an interactive Windows desktop with an
-operator present. Use capability discovery and explicit opt-in fixture paths;
+Full storage qualification targets a dedicated interactive Windows qualification
+desktop with an operator present. Use capability discovery and explicit opt-in fixture paths;
 require no named machine, device, room, account, or private network. Credentials
 and deployment-specific provisioning remain outside the repository and reports.
 Keep capture disabled by default and require fresh browser-binding consent for
 each applicable scenario. Search and Hermes task authority remain separate;
 qualification uses the governed disabled Hermes task mode.
 
-Keep the trusted qualification controller and its private recovery state outside
-the candidate execution boundary. Before any candidate code runs, #62 must
-establish a dedicated low-privilege execution identity or equivalent OS sandbox
-with explicit filesystem, handle, credential and network access restrictions.
-The candidate may read sealed runtime inputs, write only owned scenario data, and
-use the explicitly permitted loopback/media resources and bounded inference path
-below. It must not inherit the
-operator's access token, credentials, home-directory access, arbitrary handles,
-or unrestricted outbound network access, nor be able to modify the controller, input authority,
-installed seals or recovery journal. A separate ordinary account alone is not
-sufficient without those verified restrictions. Provisioning requires the
-separate environment authorization; capability discovery cannot silently create
-accounts, grant permissions or change firewall policy. Refuse before dispatch if
-the required boundary or desktop/media capability cannot be established.
+The trusted computing base includes the independently reviewed candidate host,
+qualification controller and validator, authenticated tools/providers/services,
+and operating system. Admit only an exact candidate with clear code and security
+reviews and the required automated gates. Run it in an explicitly provisioned
+qualification account/session containing no unrelated operator files, browser
+profiles or credentials. Keep fixtures synthetic except for the separately
+authorized physical observations. Missing candidate admission or a dedicated
+environment refuses full execution. This does not authorize account provisioning,
+credential installation, firewall changes or physical execution by this PR.
 
-Real subscription-backed Codex inference requires remote service access. Give
-only the pinned Codex execution role a separately isolated credential/network
-authority with an explicit destination allowlist for its authenticated service
-path. Keep that role under retained process/Job ownership while separating its
-token, credential access and writable state from candidate code. Candidate code
-may use only the existing bounded request/response protocol; it cannot obtain
-credentials, select network destinations, supply a proxy or change the allowlist.
-The trusted controller must verify endpoint policy, TLS validation, redirect and
-proxy restrictions and credential confinement before dispatch, and bind those
-observations to the same run/input identity. Keep policy details and credentials
-private; this subordinate authority does not add invented v1 report fields.
-Missing service authorization or enforceable isolation refuses the applicable
-physical run. Local or mocked inference cannot substitute for this provider path.
-
-The existing Windows Job owner provides lifecycle and resource limits, not this
-security boundary. The current archived producers execute candidate code under
-the invoking identity; they do not qualify execution of an adversarial candidate
-on an operator's ordinary desktop. Full execution must verify its isolation
-before those producers are integrated. Windows documents
-[Job security limits](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+This is qualification of reviewed code, not a malware sandbox. Job membership,
+Python-private receipts, independent observer implementations and file seals do
+not protect against malicious candidate code or a compromised trusted controller,
+toolchain, validator or OS. The current archived producers execute under the
+invoking identity. They must not be presented as safe execution of an unreviewed
+or adversarial candidate on an operator's ordinary desktop. Windows documents
+[Job limits](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
 separately from [AppContainer access restrictions](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer).
-The controller, OS isolation implementation and independently reviewed validator
-are trusted authorities; this protocol does not claim to withstand compromise of
-those authorities or the operating system.
+
+Preserve the real provider and host paths being qualified. The pinned Codex role
+needs an explicitly authorized subscription and remote inference access; use a
+qualification-specific credential context with an owner-approved attempt/usage
+budget. The trusted controller admits only the governed scenarios and retains
+their dispatch and observation evidence under the existing runtime bounds. Do
+not replace real inference with a local/mock provider, claim that local size or
+timeout bounds impose a service-side spending cap, or continue when authorization
+or the applicable usage limit is unavailable. The reviewed host receives the
+disposable loopback LiveKit service's required credentials through its existing
+production configuration. Keep those values private, restrict them to that owned
+service, and retire them with it. They are not credentials for a shared deployment.
+
+Decline extending v1 into an adversarial-code execution architecture. Separate
+credential brokers, per-request hostile-client capabilities and isolation from a
+malicious host would require reviewed runtime changes and a new qualification
+decision. Replacing the host's existing credential/provider path with those
+components would qualify a different composition. These limits do not relax
+strict validation of untrusted input data, protocol messages or observations.
 
 Bind the actual Python, browser version directory, provider/model resources,
 LiveKit binary, benchmark machine context, and report environment to the frozen
@@ -279,8 +280,12 @@ codes, extra rows, reused attestations, or automatic confirmations.
 The composition authority in #62 must enforce this exact scenario/code mapping,
 one occurrence of every code, fresh unique IDs, and observation times inside both
 the run and corresponding scenario observation windows. It must collect operator
-input through an owned contemporaneous interaction; a supplied JSON confirmation
-is not that capability. Missing, declined, stale, misassigned, or out-of-window
+input through an owned contemporaneous interaction on a separately secured
+desktop/input station or an out-of-band trusted attestation device. Verify that
+candidate processes cannot observe or inject input into that collector; do not
+collect confirmations in candidate-controlled browser UI. The operator may view
+the qualified UI while confirming through the independent channel. A supplied JSON confirmation
+is not that capability. Missing collector separation, declined, stale, misassigned, or out-of-window
 observations refuse acceptance. The current byte validator does not enforce these
 requirements and must not be used as their substitute.
 
