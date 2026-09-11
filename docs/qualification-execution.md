@@ -242,8 +242,9 @@ the Codex executable digest and the final input digest.
   identity. Bootstrap those records from the same authenticated current
   publication, never from the admitted host's cache. Recheck the publication
   before final acceptance; changed catalogs require reevaluation of every
-  effective root and connection against the new Disallowed set, with missing
-  evidence or a newly disallowed root refusing acceptance. This is a bounded
+  effective root and retained connection chain against both refreshed catalogs.
+  Missing evidence, a root no longer admitted by AuthRoot, or any chain member
+  newly present in Disallowed refuses acceptance. This is a bounded
   freshness policy, not instantaneous notice of later root-program changes.
   Freeze catalog identities, sequence/update times, retrieval/expiry evidence,
   effective-root digests and final recheck in the private tool environment
