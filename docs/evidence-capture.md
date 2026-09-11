@@ -5,6 +5,8 @@ capture controls and admission, lifecycle, storage, status, and purge implementa
 Full Slice 0 qualification is incomplete. See [Implementation status](implementation-status.md)
 for source, test coverage, and the outstanding scenario producers, and the
 [work-tracking guide](work-tracking.md) for current issues and milestones.
+The [execution protocol](qualification-execution.md) defines frozen inputs,
+scenario and operator authority, cleanup, and acceptance for a complete run.
 
 ## Status and activation
 
