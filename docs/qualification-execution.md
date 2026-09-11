@@ -51,6 +51,27 @@ diff digest, and deterministic archive identity. Materialize only that archive.
 Freeze the governing plan and qualification runner with the candidate; never
 execute a dirty checkout or replace a bound artifact during a run.
 
+Establish the closure in three stages so no invocation depends on its own output:
+
+1. Seal the independently selected tool environments and pre-existing build
+   resources first. Under those seals, use the existing Git/archive authority to
+   verify the selected candidate and capture its source. Bind the verified source,
+   governing plan, runner, schemas and tool/resource manifests into a sealed
+   pre-build closure. No final qualification-input digest exists at this stage.
+2. Execute each build and repeated build independently against that pre-build
+   closure, writing into separate owned output locations outside executable/import
+   paths. Retain each invocation's actual ownership, input identity and output
+   receipt; independently verify and seal outputs before later consumers use them.
+   Obtain the Linux prerequisite receipt described below against the same source
+   and applicable output/resource digests. Preserve the original seals and receipts.
+3. Once all required outputs and prerequisites exist, construct the final canonical
+   `qualification-input-v1` document and seal its complete direct/transitive
+   closure. The input authority must match every final role to its pre-build input
+   or genuinely produced output and verify that the original seals remain live.
+   It then binds those retained capabilities to the final input digest. This later
+   binding must not rewrite an invocation's original input identity or substitute
+   a final-file hash for evidence that the invocation occurred.
+
 Prepare one owned input root matching every direct and transitive role in
 `qualification-input-v1`. It contains the direct and repeated wheels, sdist and
 repeated sdist, wheels rebuilt from each sdist, all five purpose-specific
@@ -83,16 +104,39 @@ Reuse the existing archive and wheel validators for runtime blob parity. Verify
 build reproducibility, dependency closure, installed import origins, and required
 environment identities independently before they support an installed claim.
 
-Install each runtime purpose offline in its own fresh environment from the bound
-wheelhouse, with dependency hashes enforced and ambient configuration excluded.
+Install each runtime purpose offline on its matching OS in its own fresh
+environment from the bound wheelhouse, with dependency hashes enforced and ambient
+configuration excluded. The Windows direct, sdist-built and Hermes environments
+are local prerequisites for the desktop run. The `realtime_linux_runtime`
+wheelhouse requires a separate Linux execution authority; never install it into
+a Windows environment or silently change its platform tag.
+
+The #47 input authority must retain a genuine Linux installation/null-capture
+receipt binding the same verified candidate source, direct wheel, Linux
+wheelhouse, requirements, dependencies, tool environment and actual Linux
+execution. Accept only a receipt authenticated by the independently owned Linux
+executor, with its exact source/workflow identity, attempt, artifact digests and
+cleanup outcome. For GitHub Actions, verify the exact repository, workflow source,
+head, run/attempt, job result and transferred artifact digests through the trusted
+GitHub service; a supplied JSON result or log string cannot mint that authority.
+Before freezing the final input document, match its applicable roles to that
+receipt's retained input/output identities. This is an input prerequisite, not a
+twenty-first scenario or physical proof. Missing or mismatched Linux execution
+refuses complete input acceptance. The existing Linux CI job proves its exercised
+scope but does not yet supply this complete qualification receipt.
+Its Linux tool/runtime manifest is a separate retained prerequisite capability;
+the v1 Windows `build_python_executable` role is not a claim that both operating
+systems execute the same interpreter file.
+
 Build inputs and runtime inputs retain separate roles. Installed checks must
 execute the installed candidate and bound dependency environment with no editable
 installation, source-checkout fallback, user-site imports, or unbound downloads.
 Before any tool invocation or installed import, independently manifest the complete
 executable environment: interpreter and native libraries, standard library, installed
 packages, generated entry points, and every allowed import/resource location.
-Bind that manifest and its owned installation receipt to the sealed input closure
-and candidate. Retain immutable file and ancestor seals, or an equivalent owned
+Bind each manifest and owned invocation receipt to the pre-build closure or,
+after it exists, the final input closure and candidate. Retain immutable file and
+ancestor seals, or an equivalent owned
 immutable snapshot, over those generated bytes through every scenario and final
 acceptance. Disable bytecode writes and keep writable data in separately owned
 locations excluded from import and executable search paths. A Python image hash
