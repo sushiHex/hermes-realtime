@@ -83,13 +83,13 @@ Query current GitHub state instead of reconstructing a backlog from Markdown or
 chat history:
 
 ```bash
-gh issue list --repo sushiHex/hermes-realtime --state open --limit 100
+gh issue list --repo sushiHex/hermes-realtime --state all --limit 100
 gh issue view <number> --repo sushiHex/hermes-realtime --comments
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/timeline
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/dependencies/blocked_by
 gh api --paginate repos/sushiHex/hermes-realtime/issues/<number>/sub_issues
-gh api --paginate repos/sushiHex/hermes-realtime/milestones
-gh pr list --repo sushiHex/hermes-realtime --state open --limit 100
+gh api --paginate 'repos/sushiHex/hermes-realtime/milestones?state=all'
+gh pr list --repo sushiHex/hermes-realtime --state all --limit 100
 gh pr view <pr-number> --repo sushiHex/hermes-realtime --json number,url,state,headRefName,headRefOid,body
 ```
 
