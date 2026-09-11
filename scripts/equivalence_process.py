@@ -233,7 +233,8 @@ def _run_archived_scenario(
         raise ValueError("equivalence requires nonoptimized 64-bit Windows Python")
     _require(
         scenario in {
-            "deterministic_equivalence", "revoke_race", "capacity_rollover", "over_budget_turn"
+            "deterministic_equivalence", "revoke_race", "capacity_rollover", "over_budget_turn",
+            "owned_close_faults",
         },
         "unknown archived scenario",
     )
@@ -259,6 +260,8 @@ def _run_archived_scenario(
         "scripts/packaged_scenario.py",
         "scripts/capacity_rollover.py",
         "scripts/over_budget_turn.py",
+        "scripts/owned_close_faults.py",
+        "scripts/owned_close_faults_worker.py",
         "scripts/evidence_observation.py",
     ):
         matching = [member for member in metadata.manifest if member.path == name]

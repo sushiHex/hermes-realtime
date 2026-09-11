@@ -37,9 +37,13 @@ The [packaged spool crash matrix](spool-crash-matrix.md) adds recovery coverage
 under [issue #38](https://github.com/sushiHex/hermes-realtime/issues/38).
 [Full-purge cleanup](full-purge-cleanup.md) adds exact deletion and fresh-process
 idempotence under [issue #41](https://github.com/sushiHex/hermes-realtime/issues/41).
-Fourteen scenarios remain unavailable. Continue with owned-close faults, including
-the completed consent-settlement and public retry defect tracked in
-[issue #40](https://github.com/sushiHex/hermes-realtime/issues/40), preserving the
+[Owned-close faults](owned-close-faults.md) adds paired conversation comparisons
+across ordinary close, failed-provider retry, and caller cancellation under
+[issue #43](https://github.com/sushiHex/hermes-realtime/issues/43), with narrow
+consent-settlement and binding-ownership regressions for
+[issue #40](https://github.com/sushiHex/hermes-realtime/issues/40).
+Thirteen scenarios remain unavailable. Continue with installed-host crash and
+filesystem fault prerequisites before physical qualification, preserving the
 existing scenario IDs and acceptance contracts.
 
 Keep each implementation change independently reviewable. For milestone 2, group
