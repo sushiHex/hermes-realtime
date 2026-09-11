@@ -552,6 +552,30 @@ directory prefix. The complete runner must demonstrate this path under forced
 termination and restart; the current provider's `TemporaryDirectory` cleanup
 alone does not satisfy it. Credential content and these paths remain private.
 
+Before introducing reusable authentication, independently establish an emergency
+credential disposition for the qualification-specific grant. Require either a
+provider-enforced hard expiry no later than its authorized run deadline, which
+refresh or derived tokens cannot extend, or independently operable authority to
+invalidate all copied access/refresh material and its derived grant family
+upstream. That authority must remain usable outside the failed worker and
+disposable credential home; if runner interruption can also disable revocation,
+require independent supervision or the verified hard expiry. Missing support or
+unverifiable grant scope refuses credential copying and launch. The current
+temporary-home copy/normal-close path supplies no such capability.
+
+Entering unresolved credential-bearing cleanup or quarantine must immediately
+invoke that upstream invalidation/rotation authority, unless the verified hard
+expiry already bounds the grant. Rotation counts only when the provider has
+invalidated the old material and its usable descendants; deleting local files or
+receiving a local logout acknowledgment does not prove this. Retain the grant
+binding, trigger, attempted action, independently confirmed upstream outcome or
+verified expiry, and any failure/unknown disposition in the protected private
+recovery record. An unresolved revocation outcome must remain escalated to its
+responsible credential custodian and cannot be presented as successful cleanup.
+Revocation does not authorize deletion without verified filesystem/process
+ownership, nor does it prove that raw files were removed. Preserve those separate
+cleanup obligations, and continue refusing qualification while either is unresolved.
+
 Recovery must reopen and match the recorded ownership before touching files,
 establish that every recorded process has exited without confusing reused PIDs,
 perform only the recorded owned cleanup, and independently verify completion
