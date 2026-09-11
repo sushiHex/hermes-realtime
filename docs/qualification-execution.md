@@ -269,7 +269,18 @@ the Codex executable digest and the final input digest.
   unknown, missing, expired or unverifiable status without soft-failing. Check
   status validity with the trusted UTC and elapsed-time authority above, including
   resumed sessions and reconnects, and retain the status-to-connection bindings
-  for final acceptance. Ordinary path validation, certificate validity, usage and
+  for final acceptance. For each connection, bind a monotonic stop deadline to
+  the earliest applicable status/certificate validity end, catalog admission
+  expiry or owned run deadline. The admitted native client must forbid every
+  sensitive application write at or after that deadline, including writes on
+  an already-open HTTPS/WSS connection and automatic credential refresh. #62 must
+  block further dispatch and terminate its owned client by that deadline; native
+  write admission must also cover queued/background work so a controller timer
+  or handshake-only check cannot substitute for the guard. Refuse a client whose
+  deadline enforcement cannot be established before launch. Test a persistent
+  connection crossing the earliest status expiry with queued application traffic
+  and background refresh, and require absence of post-deadline application writes.
+  Ordinary path validation, certificate validity, usage and
   constraints remain required in addition to both catalog and revocation checks.
   Microsoft's [chain validation API](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain)
   distinguishes offline/unknown revocation errors from successful validation.
