@@ -44,6 +44,15 @@ their implementation is tracked in [#47](https://github.com/sushiHex/hermes-real
 and [#62](https://github.com/sushiHex/hermes-realtime/issues/62). A validator return
 value alone is never an accepted qualification result.
 
+Accept qualification of the governed evidence behavior on a trusted host.
+Decline turning v1 into a new adversarial execution or infrastructure-security
+certification architecture. In particular, this report does not prove a maximum
+upstream credential lifetime, global certificate-revocation freshness, or complete
+browser/OS network isolation. Those properties are outside the existing contract
+and cannot be inferred from a passing report. They remain distinct from the
+required native TLS use, explicit remote-input consent, verified local media
+topology, immutable execution inputs and independently verified owned cleanup.
+
 ## Freeze and verify inputs
 
 Use a clean committed source candidate with its baseline, commit, tree, canonical
@@ -173,254 +182,109 @@ must remain unavailable; do not fabricate placeholders to satisfy the schema.
 
 ## Own the execution environment
 
-Full storage qualification targets a dedicated interactive Windows qualification
-desktop with an operator present. Use capability discovery and explicit opt-in fixture paths;
-require no named machine, device, room, account, or private network. Credentials
-and deployment-specific provisioning remain outside the repository and reports.
-Keep capture disabled by default and require fresh browser-binding consent for
-each applicable scenario. Qualification uses the governed disabled Hermes task
-mode and a closed host launch profile. The controller constructs that profile
-from the bound inputs and scenario; it must not forward arbitrary caller-supplied
-CLI arguments or configuration overrides. Unspecified optional features retain
-the exact source-bound defaults rather than acquiring authority from the operator.
+Use a dedicated interactive Windows qualification account/session on a host
+under exclusive qualification control, with an operator present. Exclude
+unrelated user sessions, files, profiles, credentials and untrusted workloads
+until every owned consumer has stopped. Trusted OS services remain part of the
+environment. A dedicated account alone does not protect the public LiveKit
+development profile from other local users. Missing admission or exclusive
+control refuses physical execution. Capability discovery and explicit fixture
+paths must work without a named machine, device, account, room or private network.
+This decision does not authorize account, credential, firewall or browser
+provisioning, physical execution, or capture enablement outside its scenarios.
 
-Full-host execution must explicitly select `inference_provider="codex"`,
-`stt_provider="moonshine"`, `tts_provider="kokoro"`, and
-`moonshine_model_tier="medium"`. Select `codex_model="gpt-5.6-terra"`,
-`codex_effort="low"`, and `kokoro_voice="bf_isabella"`, matching the governed
-report's `ProviderV1` constants. These mandatory selections override ordinary
-launcher defaults, including Ollama, the tiny Moonshine tier and automatic TTS
-selection. Before resource creation, independently verify the merged effective
-selectors against this profile, the input's expected values and its admitted
-distribution/model resources. Freeze them in the invocation binding. After
-construction and before admitting scenario input or dispatch, independently
-verify the actual provider identities, selected medium backend and resource
-bindings; a configured string is not evidence of the selected implementation.
-Missing providers or selection/resource mismatch refuse qualification, with no
-provider fallback. This full-host profile does not turn a synthetic producer's
-declared proof class into physical or remote-inference evidence.
+The trusted computing base consists of the independently reviewed controller and
+validator, exact reviewed candidate host, admitted tool/provider/browser software,
+and OS. Native client TLS and its admitted trust material are part of that base.
+Qualification does not reimplement certificate validation or certify that base
+against compromise. Windows Jobs, private Python capabilities and file seals
+establish their documented process/data properties; they are not a malware
+sandbox. Untrusted input data, messages and observations still require strict
+validation. A malicious candidate, controller, admitted tool or OS is outside this
+claim and must not be qualified on an operator's ordinary desktop. A different
+threat model requires a separate reviewed runtime/design decision.
 
-Public search and knowledge speculation/recovery are disabled for every v1
-qualification scenario. Before creating any qualification resource or launching
-any consumer, the independent controller must complete both checks: reject
-`--enable-public-search`, `--knowledge-speculation`, `--knowledge-recovery` and
-`--knowledge-budget-seconds`, including equivalent API/configuration overrides;
-and verify the merged effective configuration has `public_search`,
-`knowledge_speculation` and `knowledge_recovery` all false, with no search lookup
-or knowledge coordinator admitted. Freeze that verified profile and bind it to
-the owned invocation before resource creation. Subsequent construction must
-consume that same profile; any configuration change invalidates admission.
-Browser search consent cannot enable an
-operator-disabled feature. Preserve this configuration binding in the private
-invocation authority through final acceptance; a supplied report flag is not
-evidence of it. The current no-Hermes-task mode does not enforce this additional
-qualification restriction. The #62 controller must establish it. Neither v1
-schema records search/knowledge mode, so accepting these features would require
-a separately reviewed profile and contract extension, not extra destinations
-silently added to the service policy below.
+Construct a closed full-host launch profile from bound inputs and the scenario;
+never forward arbitrary caller CLI arguments or configuration overrides. Before
+resource creation, independently verify and freeze the merged effective profile:
 
-The fixed provider selections must remain fixed during execution. The #62
-qualification host must refuse model/effort and voice changes at the native
-selection boundary before mutation, including authenticated browser requests to
-`/api/v1/model` and `/api/v1/voice` and any equivalent internal control path.
-Disable selection callbacks for the qualification composition; hiding browser
-controls alone is insufficient. Before resource creation, independently verify
-that this refusal is part of the admitted host configuration, then verify the
-effective model, effort and voice against the bound input before each inference
-or synthesis dispatch and final acceptance. A mismatch refuses dispatch and
-qualification. Retain those observations privately. The current host installs
-both selection callbacks in qualification mode; its behavior does not yet
-satisfy this requirement. The controller must demonstrate refusal with
-authenticated adverse requests while preserving the governed selections.
+- Explicitly select `inference_provider="codex"`, `stt_provider="moonshine"`,
+  `tts_provider="kokoro"`, and `moonshine_model_tier="medium"`.
+- Require the report's `ProviderV1` constants: Codex `gpt-5.6-terra` with `low`
+  effort, Moonshine distribution `0.1.0` with the medium backend, and Kokoro voice
+  `bf_isabella`. Match all expected versions and admitted distribution/model
+  resources to the input. Ordinary Ollama/tiny/automatic-TTS defaults cannot
+  substitute; missing or mismatched providers refuse without fallback.
+- Use the governed disabled Hermes-task mode. Reject task-enabling overrides.
+  Require `public_search`, `knowledge_speculation` and `knowledge_recovery` false,
+  with no search lookup or knowledge coordinator admitted. Reject all public-search
+  and knowledge flags, including `--knowledge-budget-seconds`, and equivalent
+  API/configuration overrides. Other optional features retain source-bound defaults.
+- Disable model/effort/voice mutation at the native selection boundary, including
+  authenticated `/api/v1/model` and `/api/v1/voice` requests and equivalent internal
+  controls. Hiding UI controls alone is insufficient. Authenticated adverse
+  requests must demonstrate refusal without changing the selected configuration.
 
-The trusted computing base includes the independently reviewed candidate host,
-qualification controller and validator, authenticated tools/providers/services,
-and operating system. Admit only an exact candidate with clear code and security
-reviews and the required automated gates. Run it in an explicitly provisioned
-qualification account/session containing no unrelated operator files, browser
-profiles or credentials, on a host under exclusive qualification control for the
-entire run. Exclude other user sessions and untrusted local workloads; trusted OS
-services remain part of the computing base. A dedicated account alone is
-insufficient for the public LiveKit profile. Verify host admission before launch
-and retain that exclusive control until every owned process has stopped. Keep
-fixtures synthetic except for the separately authorized physical observations.
-Missing candidate admission or exclusive host control refuses full execution.
-This does not authorize account provisioning,
-credential installation, firewall changes or physical execution by this PR.
+Construction must consume that same frozen profile. Before invoking any provider
+constructor, resolve its complete model/resource selection through the input
+authority and retain the admitted paths, identities and sealed bytes. In
+particular, the Moonshine constructor imports its package, resolves the model
+and opens it natively: its selected medium model must already match the sealed
+manifest before that native load. Constrain lookup to the admitted resource
+namespace; refuse ambient fallback, downloads, changed selection or unavailable
+pre-load verification. A post-construction mismatch cannot undo an unbound load.
+Verify actual provider, backend and resource identities again after construction
+and before input admission;
+verify effective selections before each inference/synthesis dispatch and final
+acceptance. Any configuration change invalidates admission. This profile applies
+to full-host execution and does not broaden a synthetic producer's proof class.
+The current no-task composition still admits public-search and selection controls;
+#62 owns enforcement. Its present behavior is not evidence of compliance.
 
-This is qualification of reviewed code, not a malware sandbox. Job membership,
-Python-private receipts, independent observer implementations and file seals do
-not protect against malicious candidate code or a compromised trusted controller,
-toolchain, validator or OS. The current archived producers execute under the
-invoking identity. They must not be presented as safe execution of an unreviewed
-or adversarial candidate on an operator's ordinary desktop. Windows documents
-[Job limits](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
-separately from [AppContainer access restrictions](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer).
+Keep evidence capture disabled by default and collect fresh browser-binding
+storage consent for every applicable scenario. That local-storage consent is
+separate from permission to send conversation text to the remote inference service.
 
-Preserve the real provider and host paths being qualified. The pinned Codex role
-needs an explicitly authorized subscription and remote inference access; use a
-qualification-specific credential context with an owner-approved attempt/usage
-budget. The trusted controller admits only the governed scenarios and retains
-their dispatch and observation evidence under the existing runtime bounds.
+Before admitting microphone or typed input, the operator must read and explicitly
+accept this v1 remote-inference disclosure: the Codex path sends conversation text
+to OpenAI, including final microphone transcriptions, typed user text, retained
+conversation messages and supplied context. The data is processed remotely.
+Withdrawing consent cannot retract text already submitted. Use synthetic scenario
+content and admit no uninformed participant's speech or text.
 
-Before admitting microphone or typed input, require the operator to read and
-explicitly accept this separate v1 remote-inference disclosure: the Codex path
-sends conversation text to OpenAI, including final microphone transcriptions,
-typed user text, retained conversation messages and the supplied conversation
-context. This is remote processing; local evidence-storage consent and account
-usage authorization do not authorize it. Do not claim that remote submissions
-remain on the qualification machine or that withdrawing consent retracts text
-already submitted. Use synthetic scenario content and admit no uninformed
-participant's speech or text.
+An independently controlled input station must observe that explicit consent
+before input admission and bind it privately to the exact disclosure/policy blob,
+candidate, final input digest and run. Gate input and every remote dispatch on
+the live consent. Refusal, missing evidence or withdrawal blocks further input
+and dispatch, cancels owned outstanding work and refuses the attempt while
+preserving cleanup obligations. Account usage permission, proposal approval,
+stored defaults and prior runs cannot supply consent. This admission record is
+separate from the twelve scenario attestations, adds no report field or claim of
+human identity/truth, and must remain independently verifiable at final acceptance.
+The current storage disclosure/provider composition does not supply this
+capability; #62 must integrate it before physical execution.
 
-The independently controlled input station must observe the operator's explicit
-consent before input admission, bind it to the exact disclosure/policy blob,
-candidate, final input digest and owned run, and retain the protected admission
-record. The #62 controller must gate input and every remote dispatch on that live
-consent. Refusal, missing evidence or withdrawal blocks further input/dispatch,
-cancels owned outstanding work and refuses the attempt while preserving its
-cleanup obligations. Consent is specific to this run; proposal approval, a
-stored default or a prior run cannot supply it. This admission prerequisite is
-separate from the twelve scenario attestations and does not add a v1 report
-field or a human-identity/truth claim. Full acceptance independently validates
-its retained timing and binding. Current storage disclosure and provider
-composition supply no such remote-consent capability; missing integration
-refuses physical execution.
+The `codex-openai-service-v1` profile preserves the real published subscription
+client and existing host/provider path. Require a separately authorized account
+and bounded attempt/usage budget. Bind the complete admitted client/configuration
+and its native TLS/trust material to the candidate/input authority. Use the
+documented first-party ChatGPT service configuration with normal server-name and
+certificate validation; reject alternate providers, API-key routes and unbound
+endpoint, proxy or custom-CA overrides before launching the client. The official
+[sample configuration](https://learn.chatgpt.com/docs/config-file/config-sample)
+identifies the ChatGPT service base. Review every effective configuration layer,
+including the temporary home and environment. The wrapper currently forwards
+custom-CA variables, so its environment mapping alone does not establish admission.
+Preserve the admitted configuration through reconnects. Do not substitute a broker
+or mock provider, or infer a service-side spending cap from a local timeout.
 
-Adopt the closed `codex-openai-service-v1` admission policy below. Its authority
-comes from this reviewed source document, not an operator-supplied hostname or CA
-approval. Bind its exact source blob to the candidate archive and governing-plan
-closure, and bind the admitted client/configuration/trust evidence to that policy,
-the Codex executable digest and the final input digest.
-
-- Permit subscription service HTTPS/WSS only at `chatgpt.com:443`, using the
-  first-party `/backend-api/` service base, and HTTPS token refresh only at
-  `auth.openai.com:443`. No wildcard hosts, IP-literal service authorities,
-  alternate providers, API-key routes or cross-origin redirects are admitted.
-  A required destination outside this set needs a new reviewed policy version;
-  the environment being checked cannot approve it for itself. The official
-  [sample configuration](https://learn.chatgpt.com/docs/config-file/config-sample)
-  identifies the ChatGPT service base; it does not prove a particular binary's
-  complete connection behavior.
-- Use only server-authentication roots admitted by the Microsoft Trusted Root
-  Program, excluding its Disallowed set. Independently authenticate the published
-  AuthRoot/Disallowed material. Require every effective trust root to belong to
-  AuthRoot and be absent from Disallowed. Require every member of each actual
-  service connection chain, including leaf and intermediate certificates, to be
-  absent from Disallowed before sensitive application bytes. Client admission
-  must establish that the native same-connection verifier enforces this rule
-  against the initial admitted catalogs; a root-only comparison, machine store
-  inspection or later rejection cannot supply that pre-dispatch guard. Before
-  each run, the independent trusted controller must obtain
-  the latest published catalogs from an authenticated Microsoft distribution
-  source; a supplied snapshot, filesystem timestamp or successful verification
-  of an old Microsoft signature does not establish freshness. The policy permits
-  at most 24 hours from that authenticated retrieval through the last service
-  connection. Use independently trusted UTC and a monotonic elapsed-time bound;
-  unavailable time/source authentication or expiry refuses admission or further
-  dispatch. Validate the catalogs' signed update times and any specified validity
-  end, and reject future update times, expired material, or sequence/update-time
-  rollback against controller-retained high-water records for each catalog
-  identity. Bootstrap those records from the same authenticated current
-  publication, never from the admitted host's cache. Recheck the publication
-  before final acceptance; changed catalogs require reevaluation of every
-  effective root and retained connection chain against both refreshed catalogs.
-  Final acceptance applies the same predicate to every effective root and every
-  retained connection chain under both the initial and refreshed catalogs:
-  roots must be admitted by AuthRoot and all chain members must be absent from
-  Disallowed. Missing evidence or any violation refuses acceptance, regardless
-  of when a certificate became disallowed. This is a bounded
-  freshness policy, not instantaneous notice of later root-program changes.
-  Freeze catalog identities, sequence/update times, retrieval/expiry evidence,
-  effective-root digests and final recheck in the private tool environment
-  receipt. No client admission occurs without the initial evidence. See Microsoft's
-  [CTL verification procedure](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/configure-trusted-roots-disallowed-certificates#verify-trusted-and-untrusted-ctls).
-  Private, enterprise-interception and locally added roots are excluded. This
-  retains the ordinary public-CA trust assumption, not protection against a
-  compromised admitted CA or OS.
-- The Disallowed catalogs do not replace issuing-CA revocation checks. Native
-  same-connection validation must establish authenticated, fresh non-revoked
-  status for every non-root service-chain certificate before sensitive
-  application bytes. Require correctly signed, certificate/issuer-bound CRL or
-  OCSP evidence with an applicable signed validity interval; reject revoked,
-  unknown, missing, expired or unverifiable status without soft-failing. Check
-  status validity with the trusted UTC and elapsed-time authority above, including
-  resumed sessions and reconnects, and retain the status-to-connection bindings
-  for final acceptance. For each connection, bind a monotonic stop deadline to
-  the earliest applicable status/certificate validity end, catalog admission
-  expiry or owned run deadline. The admitted native client must forbid every
-  sensitive application write at or after that deadline, including writes on
-  an already-open HTTPS/WSS connection and automatic credential refresh. #62 must
-  block further dispatch and terminate its owned client by that deadline; native
-  write admission must also cover queued/background work so a controller timer
-  or handshake-only check cannot substitute for the guard. Refuse a client whose
-  deadline enforcement cannot be established before launch. Test a persistent
-  connection crossing the earliest status expiry with queued application traffic
-  and background refresh, and require absence of post-deadline application writes.
-  Ordinary path validation, certificate validity, usage and
-  constraints remain required in addition to both catalog and revocation checks.
-  Microsoft's [chain validation API](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain)
-  distinguishes offline/unknown revocation errors from successful validation.
-  Under this closed endpoint policy, status must arrive as authenticated stapled
-  evidence or as independently authenticated, fresh status material prepared by
-  the trusted controller and sealed into the admitted client trust environment.
-  Its provenance, certificate/issuer scope and expiry bind to that environment's
-  receipt; stale host caches or supplied success flags cannot establish it.
-  The client receives no general permission to contact certificate-supplied
-  responder URLs. A native client that needs additional responder destinations
-  requires a reviewed policy version defining those authorities and strictly
-  credential-free status requests; missing native support for the current
-  stapled/sealed-status policy refuses admission. Adverse client-admission tests
-  must include a revoked non-root certificate absent from Disallowed, and
-  missing, stale, wrong-certificate and unverifiable status. This policy supplies
-  no claim of instantaneous knowledge of later CA revocations.
-- Require direct service connections with authenticated hostname/chain checks;
-  reject system/environment proxies, unverified DNS policy, endpoint overrides
-  and ambient `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE` or `SSL_CERT_DIR` values.
-  Inspect every effective configuration layer before launch. OpenAI documents
-  [custom CA overrides](https://learn.chatgpt.com/docs/auth#custom-ca-bundles);
-  the current provider forwards the two SSL variables, so its allowlist alone
-  does not implement this qualification restriction.
-
-Enforce the first-request boundary inside the admitted native client's transport.
-Before placing real credentials in its temporary home or launching it, #62 must
-have independently verified that the exact authenticated client/configuration
-natively rejects a wrong hostname, untrusted certificate, prohibited endpoint or
-cross-origin redirect before writing credentials or prompt bytes. No sensitive
-TLS early data is allowed. Bind this admission evidence to exact client/tool bytes
-and credential-free adverse-transport tests using synthetic data. Missing native
-enforcement or an unverifiable configuration refuses that client before launch;
-an executable hash by itself supplies no such capability.
-
-The safe sequence is configuration/client admission, then the real client's
-authenticated TLS handshake, then application data on that same connection.
-The TLS implementation performs the in-path authentication before application
-data; this does not require a nonexistent external pause in the stdio wrapper.
-Independently collect content-free connection evidence during the run and require
-it for final acceptance, preserving the admitted policy across reconnects. A
-separate probe, a model string or after-the-fact detection cannot establish the
-pre-dispatch guard. The existing wrapper and the cited user documentation do not
-yet provide the required client-admission capability; full execution stays
-unavailable until #62 establishes it. Do not substitute a broker or mock provider,
-or claim that local size or
-timeout bounds impose a service-side spending cap, or continue when authorization
-or the applicable usage limit is unavailable. The reviewed host uses the existing
-`livekit_local_v1` development profile. Its key and secret are fixed public,
-predictable values; they cannot be made private or revoked per run. Their bounded
-use relies on the dedicated environment, loopback signaling, effective firewall
-policy and independently verified participant/media topology. The profile is not
-an authentication boundary against untrusted local peers and cannot qualify a
-shared or externally accessible deployment. Stop and remove the owned service and
-its temporary state during cleanup; this retires that service instance, not the
-public constants or their potential use by another instance. Real subscription
-credentials and operational grants remain private.
-
-Decline extending v1 into an adversarial-code execution architecture. Separate
-credential brokers, per-request hostile-client capabilities and isolation from a
-malicious host would require reviewed runtime changes and a new qualification
-decision. Replacing the host's existing credential/provider path with those
-components would qualify a different composition. These limits do not relax
-strict validation of untrusted input data, protocol messages or observations.
+Use the existing `livekit_local_v1` development profile. Its public predictable
+constants are not private credentials and cannot be revoked per run. Its bounded
+use relies on exclusive host control, loopback signaling, the effective inbound
+firewall policy and the independently verified participant/media topology below.
+It cannot authenticate against untrusted local peers or qualify a shared/external
+deployment. Cleanup retires the owned service instance and temporary state; it
+does not revoke the public constants or their use by another instance.
 
 Bind the actual Python, browser version directory, provider/model resources,
 LiveKit binary, benchmark machine context, and report environment to the frozen
@@ -468,24 +332,15 @@ accepted full report. Do not infer RTC routing from the signaling address.
 Use an owned disposable browser profile;
 do not modify or clean an operator's ordinary profile or browser installation.
 
-Before launching the qualification browser, independently establish an effective
-outbound policy for the exact admitted browser image, its owned process tree and
-networking helpers. Permit only the owned local application/signaling endpoints
-and verified same-host media endpoints described above. Reject public Internet
-egress, unbound name resolution, remote navigation and browser background traffic,
-including update, Safe Browsing, sync and telemetry requests. The Codex service
-policy applies to its separately owned client and does not grant browser egress.
-The browser policy must cover startup through verified exit of every consumer;
-new descendants or helper paths cannot escape it. Independently verify the
-effective enforcement and credential-free adverse cases before admitting the
-browser to any scenario, and retain the policy, image/process bindings and
-observations through final acceptance. A list of launch switches, sampled
-sockets or browser-supplied success values alone cannot establish enforcement.
-Use an already provisioned control or an independently verified hardened browser
-configuration that enforces the same boundary; missing capability refuses the
-physical run. This decision does not authorize firewall, account or browser
-installation changes. #62 must integrate the admission check; the current
-disposable-profile mechanism alone supplies no outbound-policy capability.
+Use an admitted browser image with an owned fresh profile, no operator sign-in,
+extensions or restored sessions. Keep the qualification UI and actions on the
+owned application and media topology; unexpected navigation, participants or
+scenario input refuses the run. Bind the browser configuration and observations
+to the input authority. The browser and its native networking remain admitted
+software in the trusted base. This is not a claim that every browser/OS background
+connection was blocked or inventoried; neither disposable profiles nor the RTC
+inventory establish whole-host egress isolation. Stronger browser/network
+certification is a separate scope, not a new prerequisite silently imposed on v1.
 
 Filesystem faults require an owned fixture root, exact allowed artifact names,
 adjacent decoys, and verified restoration of any changed DACL or file attributes.
@@ -648,46 +503,26 @@ directory prefix. The complete runner must demonstrate this path under forced
 termination and restart; the current provider's `TemporaryDirectory` cleanup
 alone does not satisfy it. Credential content and these paths remain private.
 
-Before introducing reusable authentication, independently verify a
-provider-enforced, nonextendable cutoff for the qualification-specific grant.
-The cutoff must cover all copied access/refresh material and its usable derived
-grant family, and be established before the first copy. A hard expiry or an
-irrevocable provider-scheduled invalidation may supply this authority; a later
-best-effort revocation action cannot. The cutoff must remain effective if the
-worker, controller or credential custodian becomes unavailable. Missing provider
-support or unverifiable grant scope refuses credential copying and launch. The
-current temporary-home copy/normal-close path supplies no such capability.
+Reusable subscription credentials remain an explicitly authorized prerequisite
+on this trusted host. Before copying them, bind the credential context and
+responsible custodian to the run and its private recovery record; preserve the
+original credential source outside disposable cleanup authority. Verify protected
+access and containment of every owned copy, and stop all consumers before safe
+removal. Missing authorization, containment or ownership refuses introduction.
 
-The v1 maximum credential lifetime is **3,600 seconds**. Before the first copy,
-durably record a conservative admission-budget epoch using the independently
-trusted UTC and monotonic clock; the effective credential deadline is the earlier
-of that epoch plus 3,600 seconds and the owner's authorized run deadline. A
-provider-enforced cutoff must be no later than this effective deadline.
-Recopying, refreshing, retrying or rotating within the same grant family cannot
-reset or extend it, or cancel the established cutoff.
-Bind the epoch, both clock observations, effective deadline and grant disposition
-capability and independently verified cutoff evidence to the exact
-governing-policy blob, candidate, final input digest and
-owned run in the private recovery record. Full acceptance must independently
-verify this binding and arithmetic; an owner-supplied deadline or a schema-valid
-report alone is insufficient. The v1 report schema need not expose these private
-grant details: its genuine execution authority must retain and validate them.
-
-Entering unresolved credential-bearing cleanup or quarantine must immediately
-invoke any independently available upstream invalidation authority to shorten
-the established lifetime. If that additional action is unavailable, rejected or
-unconfirmed, the previously established provider cutoff still bounds the grant;
-the attempted action is never the maximum-lifetime authority. Rotation counts as
-invalidation only when the provider invalidates the old material and its usable
-descendants. Deleting local files or receiving a local logout acknowledgment
-does not prove this. Retain the grant binding, trigger, cutoff evidence, attempted
-emergency action and independently confirmed outcome or failure/unknown state in
-the protected private recovery record. Keep an unresolved outcome with the
-responsible credential custodian and never present it as successful cleanup.
-Invalidation or expiry does not authorize deletion without verified
-filesystem/process ownership, nor prove that raw files were removed. Preserve
-those separate cleanup obligations, and continue refusing qualification while
-cleanup remains unresolved.
+If cleanup cannot be proved, retain a private recovery obligation with the
+custodian, keep the workspace access-controlled, stop further dispatch and refuse
+qualification. Resolve it through verified owned cleanup and, when required by
+the incident, the provider's supported credential-invalidation procedure. Record
+an invalidation as successful only with independently confirmed evidence. A
+failed or unavailable action remains unresolved; local logout or deletion is not
+proof of upstream invalidation. Never claim a bounded upstream grant lifetime
+from this runner, or require a new scheduled-expiry/revocation service as part of
+this design. This accepts the existing credential path under the stated trusted
+host model, not an assertion that a copied refresh grant becomes harmless after
+a local deadline. Invalidation does not prove file removal or authorize deletion
+without verified filesystem/process ownership. Cleanup and credential disposition
+remain distinct private obligations; no unresolved cleanup can yield acceptance.
 
 Recovery must reopen and match the recorded ownership before touching files,
 establish that every recorded process has exited without confusing reused PIDs,
