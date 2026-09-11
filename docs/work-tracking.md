@@ -61,8 +61,9 @@ before starting. A review or status request alone does not authorize mutations.
    prerequisites, the relevant contract, and accepted decisions.
    Discuss substantial API, persistence, or authority changes before implementation.
 2. Record the agreed scope and branch in that record. Link the implementation PR
-   from the issue when one exists. Small incidental corrections can use their PR
-   as the work record without manufacturing an issue.
+   from the issue when one exists. Small incidental corrections, such as a typo or
+   broken documentation link, can use their PR as the work record without
+   manufacturing an issue.
 3. Follow the [change and review rules](../CONTRIBUTING.md#change-discipline) and
    [release gates](release-gates.md#required-automated-checks). Keep in-scope review
    corrections on the PR. Exact candidate/run evidence belongs with the change;

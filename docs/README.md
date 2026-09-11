@@ -34,8 +34,9 @@ issues link to them rather than repeating their contracts.
 
 ## Working together
 
-Read the current issue, native dependencies, ownership, and linked design before
-proposing code. Use one bounded issue per substantive outcome and link its PR.
+Read the owning issue, or PR for an incidental correction, along with its
+prerequisites, ownership, and linked design before proposing a change.
+Use one bounded issue per substantive outcome and link its PR.
 Check [open PRs](https://github.com/sushiHex/hermes-realtime/pulls) for overlapping
 work. The [tracking guide](work-tracking.md) explains triage and handoffs; an issue
 or milestone does not approve a design or reserve work.

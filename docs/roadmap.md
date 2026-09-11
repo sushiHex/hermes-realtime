@@ -1,6 +1,6 @@
 # Roadmap
 
-Current work, ownership, dependencies, and acceptance criteria live in
+Substantive work, ownership, dependencies, and acceptance criteria live in
 [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues).
 Read the [work-tracking guide](work-tracking.md) for contributor workflow.
 

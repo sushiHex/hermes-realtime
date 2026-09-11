@@ -12,7 +12,7 @@ in both Markdown and GitHub would give contributors competing records.
 
 | Artifact | Responsibility |
 | --- | --- |
-| GitHub Issues | Actionable work, discussion, ownership, dependencies, and acceptance criteria |
+| GitHub Issues | Substantive work, discussion, ownership, dependencies, and acceptance criteria |
 | GitHub Milestones | Groups of issues that deliver an observable outcome |
 | Reviewed repository plans and accepted ADRs | Design intent and accepted decisions |
 | Pull requests and implementation records | Changes, review, and completion evidence |

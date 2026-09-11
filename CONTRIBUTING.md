@@ -86,7 +86,9 @@ Passing tests are necessary but not sufficient. New acceptance claims must deriv
 
 ## Documentation maintenance
 
-Keep actionable work and mutable status in GitHub Issues and Milestones. The
+Keep substantive work and mutable status in GitHub Issues and Milestones. Small
+incidental corrections can keep their scope, ownership, and pause handoff in the
+PR used as their work record. The
 [tracking guide](docs/work-tracking.md) describes the workflow without duplicating
 the backlog. Reviewed plans and accepted ADRs hold design intent and decisions;
 the [status page](docs/implementation-status.md) records implementation,

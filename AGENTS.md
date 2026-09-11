@@ -18,7 +18,7 @@ This repository is an independently authored realtime conversation runtime for u
 
 ## Work tracking
 
-Follow [the tracking guide](docs/work-tracking.md). GitHub Issues owns actionable
+Follow [the tracking guide](docs/work-tracking.md). GitHub Issues owns substantive
 work, dependencies, ownership, and acceptance criteria; milestones group outcomes.
 Query current issues and linked PRs before starting. Repository plans and accepted
 ADRs own design authority; implementation records and PRs carry evidence. Do not
