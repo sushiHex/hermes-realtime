@@ -185,12 +185,16 @@ CLI arguments or configuration overrides. Unspecified optional features retain
 the exact source-bound defaults rather than acquiring authority from the operator.
 
 Public search and knowledge speculation/recovery are disabled for every v1
-qualification scenario. Reject `--enable-public-search`, `--knowledge-speculation`,
-`--knowledge-recovery` and `--knowledge-budget-seconds`, and equivalent API or
-configuration overrides, before creating resources or launching consumers.
-Independently verify that the effective `public_search`, `knowledge_speculation`
-and `knowledge_recovery` values are all false and that no search lookup or
-knowledge coordinator is admitted. Browser search consent cannot enable an
+qualification scenario. Before creating any qualification resource or launching
+any consumer, the independent controller must complete both checks: reject
+`--enable-public-search`, `--knowledge-speculation`, `--knowledge-recovery` and
+`--knowledge-budget-seconds`, including equivalent API/configuration overrides;
+and verify the merged effective configuration has `public_search`,
+`knowledge_speculation` and `knowledge_recovery` all false, with no search lookup
+or knowledge coordinator admitted. Freeze that verified profile and bind it to
+the owned invocation before resource creation. Subsequent construction must
+consume that same profile; any configuration change invalidates admission.
+Browser search consent cannot enable an
 operator-disabled feature. Preserve this configuration binding in the private
 invocation authority through final acceptance; a supplied report flag is not
 evidence of it. The current no-Hermes-task mode does not enforce this additional
