@@ -6,7 +6,20 @@ body:
     attributes:
       value: |
         Search existing issues and PRs first. Tracking work does not approve a design.
-        Keep credentials, private URLs, paths, transcripts, audio, and device identities out of public issues.
+        Follow the [public-repository boundary](https://github.com/sushiHex/hermes-realtime/blob/main/CONTRIBUTING.md#public-repository-boundary).
+        Do not include credentials, launch fragments, private endpoints or paths, device/account identities, raw audio, transcripts, screenshots, traces, private reports, or user data. Share only minimal, sanitized log or error excerpts.
+        Report vulnerabilities through [private vulnerability reporting](https://github.com/sushiHex/hermes-realtime/security/advisories/new) instead of a public issue.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and PRs, including closed records.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I removed secrets and private data from all text and attachments.
+          required: true
   - type: dropdown
     id: kind
     attributes:

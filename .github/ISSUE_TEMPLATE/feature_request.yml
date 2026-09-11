@@ -7,7 +7,20 @@ body:
       value: |
         Proposals must be useful outside one private deployment and reproducible without a maintainer's named hardware or accounts.
         Creating an issue does not approve a design. Accepted decisions belong in a reviewed repository plan or ADR.
-        Do not include credentials, private URLs, paths, transcripts, audio, or device identities.
+        Follow the [public-repository boundary](https://github.com/sushiHex/hermes-realtime/blob/main/CONTRIBUTING.md#public-repository-boundary).
+        Do not include credentials, launch fragments, private endpoints or paths, device/account identities, raw audio, transcripts, screenshots, traces, private reports, or user data. Share only minimal, sanitized log or error excerpts.
+        Report vulnerabilities through [private vulnerability reporting](https://github.com/sushiHex/hermes-realtime/security/advisories/new) instead of a public issue.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and PRs, including closed records.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I removed secrets and private data from all text and attachments.
+          required: true
   - type: textarea
     id: use_case
     attributes:
