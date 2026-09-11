@@ -203,6 +203,20 @@ schema records search/knowledge mode, so accepting these features would require
 a separately reviewed profile and contract extension, not extra destinations
 silently added to the service policy below.
 
+The fixed provider selections must remain fixed during execution. The #62
+qualification host must refuse model/effort and voice changes at the native
+selection boundary before mutation, including authenticated browser requests to
+`/api/v1/model` and `/api/v1/voice` and any equivalent internal control path.
+Disable selection callbacks for the qualification composition; hiding browser
+controls alone is insufficient. Before resource creation, independently verify
+that this refusal is part of the admitted host configuration, then verify the
+effective model, effort and voice against the bound input before each inference
+or synthesis dispatch and final acceptance. A mismatch refuses dispatch and
+qualification. Retain those observations privately. The current host installs
+both selection callbacks in qualification mode; its behavior does not yet
+satisfy this requirement. The controller must demonstrate refusal with
+authenticated adverse requests while preserving the governed selections.
+
 The trusted computing base includes the independently reviewed candidate host,
 qualification controller and validator, authenticated tools/providers/services,
 and operating system. Admit only an exact candidate with clear code and security
@@ -412,6 +426,25 @@ insufficient. Until that implementation exists, this profile cannot produce an
 accepted full report. Do not infer RTC routing from the signaling address.
 Use an owned disposable browser profile;
 do not modify or clean an operator's ordinary profile or browser installation.
+
+Before launching the qualification browser, independently establish an effective
+outbound policy for the exact admitted browser image, its owned process tree and
+networking helpers. Permit only the owned local application/signaling endpoints
+and verified same-host media endpoints described above. Reject public Internet
+egress, unbound name resolution, remote navigation and browser background traffic,
+including update, Safe Browsing, sync and telemetry requests. The Codex service
+policy applies to its separately owned client and does not grant browser egress.
+The browser policy must cover startup through verified exit of every consumer;
+new descendants or helper paths cannot escape it. Independently verify the
+effective enforcement and credential-free adverse cases before admitting the
+browser to any scenario, and retain the policy, image/process bindings and
+observations through final acceptance. A list of launch switches, sampled
+sockets or browser-supplied success values alone cannot establish enforcement.
+Use an already provisioned control or an independently verified hardened browser
+configuration that enforces the same boundary; missing capability refuses the
+physical run. This decision does not authorize firewall, account or browser
+installation changes. #62 must integrate the admission check; the current
+disposable-profile mechanism alone supplies no outbound-policy capability.
 
 Filesystem faults require an owned fixture root, exact allowed artifact names,
 adjacent decoys, and verified restoration of any changed DACL or file attributes.
