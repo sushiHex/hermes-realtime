@@ -229,8 +229,25 @@ the Codex executable digest and the final input digest.
   Program, excluding its Disallowed set. Independently authenticate the published
   AuthRoot/Disallowed material and compare the client's effective trust roots
   against it; accepting the machine's current store without that comparison is
-  insufficient. Freeze catalog and effective-root digests in the private tool
-  environment receipt before client admission. See Microsoft's
+  insufficient. Before each run, the independent trusted controller must obtain
+  the latest published catalogs from an authenticated Microsoft distribution
+  source; a supplied snapshot, filesystem timestamp or successful verification
+  of an old Microsoft signature does not establish freshness. The policy permits
+  at most 24 hours from that authenticated retrieval through the last service
+  connection. Use independently trusted UTC and a monotonic elapsed-time bound;
+  unavailable time/source authentication or expiry refuses admission or further
+  dispatch. Validate the catalogs' signed update times and any specified validity
+  end, and reject future update times, expired material, or sequence/update-time
+  rollback against controller-retained high-water records for each catalog
+  identity. Bootstrap those records from the same authenticated current
+  publication, never from the admitted host's cache. Recheck the publication
+  before final acceptance; changed catalogs require reevaluation of every
+  effective root and connection against the new Disallowed set, with missing
+  evidence or a newly disallowed root refusing acceptance. This is a bounded
+  freshness policy, not instantaneous notice of later root-program changes.
+  Freeze catalog identities, sequence/update times, retrieval/expiry evidence,
+  effective-root digests and final recheck in the private tool environment
+  receipt. No client admission occurs without the initial evidence. See Microsoft's
   [CTL verification procedure](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/configure-trusted-roots-disallowed-certificates#verify-trusted-and-untrusted-ctls).
   Private, enterprise-interception and locally added roots are excluded. This
   retains the ordinary public-CA trust assumption, not protection against a
