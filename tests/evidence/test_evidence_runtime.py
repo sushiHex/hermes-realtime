@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
+from functools import wraps
 from pathlib import Path
+from threading import Lock
+from time import monotonic_ns
 
 import pytest
 
@@ -1481,7 +1485,87 @@ async def test_host_evidence_close_retains_owned_drain_after_writer_join_failure
     assert runtime._closed is True
 
 
+def _observe_sqlite_consent(scenario):
+    """Observe the real methods without retaining arguments, errors or identities."""
+    @wraps(scenario)
+    async def observed(*args, **kwargs):
+        from hermes_realtime.evidence import models as m
+        from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+        from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
+
+        start = monotonic_ns()
+        lock = Lock()
+        offsets: dict[str, int] = {}
+        activation = None
+        store = None
+        closed = False
+
+        def mark(stage):
+            with lock:
+                offsets.setdefault(stage, (monotonic_ns() - start) // 1_000_000)
+
+        activate = HostEvidenceRuntimeV1.activate_consent
+        close = HostEvidenceRuntimeV1.close
+        create = SQLiteEvidenceSpool.create_epoch
+        open_store = SQLiteEvidenceSpool._open_owned_store
+
+        async def observe_activation(runtime, *values, **options):
+            nonlocal activation
+            mark("activation_enter")
+            try:
+                result = await activate(runtime, *values, **options)
+                if type(result) is m.ConsentDisposition:
+                    activation = result.value
+                return result
+            finally:
+                mark("activation_exit")
+
+        async def observe_close(runtime, *values, **options):
+            nonlocal closed
+            mark("close_enter")
+            try:
+                result = await close(runtime, *values, **options)
+                closed = True
+                return result
+            finally:
+                mark("close_exit")
+
+        def observe_create(spool, *values, **options):
+            nonlocal store
+            mark("create_enter")
+            try:
+                result = create(spool, *values, **options)
+                if type(result) is m.StoreDisposition:
+                    store = result.value
+                return result
+            finally:
+                mark("create_exit")
+
+        def observe_open(spool, *values, **options):
+            mark("open_enter")
+            try:
+                return open_store(spool, *values, **options)
+            finally:
+                mark("open_exit")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(HostEvidenceRuntimeV1, "activate_consent", observe_activation)
+            patch.setattr(HostEvidenceRuntimeV1, "close", observe_close)
+            patch.setattr(SQLiteEvidenceSpool, "create_epoch", observe_create)
+            patch.setattr(SQLiteEvidenceSpool, "_open_owned_store", observe_open)
+            try:
+                return await scenario(*args, **kwargs)
+            finally:
+                with lock:
+                    observation = {"version": 1, "offset_ms": dict(offsets),
+                                   "activation": activation, "store": store, "closed": closed}
+                print("[sqlite-consent] " + json.dumps(observation, sort_keys=True), flush=True)
+
+    return observed
+
+
 @pytest.mark.asyncio
+@_observe_sqlite_consent
 async def test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(
     tmp_path: Path,
 ) -> None:
@@ -1734,7 +1818,7 @@ async def test_host_retention_owner_cancels_then_expires_real_sqlite_session(
 )
 @pytest.mark.parametrize("failure", ["timeout_disposition", "exception", "pending_timeout"])
 async def test_consent_scenarios_close_their_real_writer_after_activation_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario, failure: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, scenario, failure: str,
 ) -> None:
     import threading
 
@@ -1792,10 +1876,77 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
         assert runtimes[0]._closed
         assert not runtimes[0].writer_running
         assert all(not thread.is_alive() for thread in owned_threads)
+        if scenario is test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon:
+            output = capsys.readouterr().out
+            lines = [line for line in output.splitlines() if line.startswith("[sqlite-consent] ")]
+            assert len(lines) == 1
+            observation = json.loads(lines[0].removeprefix("[sqlite-consent] "))
+            assert observation["version"] == 1
+            assert observation["closed"] is True
+            offsets = observation["offset_ms"]
+            assert all(type(value) is int and value >= 0 for value in offsets.values())
+            assert offsets["activation_enter"] <= offsets["create_enter"]
+            assert offsets["create_enter"] <= offsets["open_enter"] <= offsets["open_exit"]
+            assert offsets["open_exit"] <= offsets["create_exit"] <= offsets["close_exit"]
+            assert offsets["activation_exit"] <= offsets["close_enter"] <= offsets["close_exit"]
+            assert observation["store"] == "committed"
+            assert observation["activation"] == (
+                None if failure == "exception" else "control_timed_out"
+            )
+            assert "synthetic activation failure" not in lines[0]
+            assert str(tmp_path) not in lines[0]
     finally:
         # A RED regression must not itself contaminate the remaining test process.
         for runtime in runtimes:
             await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "store", "close"])
+async def test_sqlite_consent_observation_preserves_outcomes_without_private_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, failure,
+) -> None:
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
+
+    marker = "synthetic-private-diagnostic-payload"
+    if failure == "store":
+        original_create = SQLiteEvidenceSpool.create_epoch
+
+        def fail_after_create(self, command):
+            original_create(self, command)
+            raise RuntimeError(marker)
+
+        monkeypatch.setattr(SQLiteEvidenceSpool, "create_epoch", fail_after_create)
+    if failure == "close":
+        original_close = HostEvidenceRuntimeV1.close
+
+        async def fail_after_close(self):
+            await original_close(self)
+            raise RuntimeError(marker)
+
+        monkeypatch.setattr(HostEvidenceRuntimeV1, "close", fail_after_close)
+    if failure:
+        with pytest.raises(AssertionError if failure == "store" else RuntimeError):
+            await test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(tmp_path)
+    else:
+        await test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(tmp_path)
+    output = capsys.readouterr().out
+    assert output.startswith("[sqlite-consent] ") and len(output.splitlines()) == 1
+    assert marker not in output and str(tmp_path) not in output
+    observation = json.loads(output.removeprefix("[sqlite-consent] "))
+    assert set(observation) == {"version", "offset_ms", "activation", "store", "closed"}
+    assert observation["version"] == 1
+    assert observation["closed"] is (failure != "close")
+    assert observation["activation"] == (
+        "create_failed" if failure == "store" else "consent_activated"
+    )
+    assert observation["store"] == (None if failure == "store" else "committed")
+    assert set(observation["offset_ms"]) == {
+        "activation_enter", "activation_exit", "create_enter", "create_exit",
+        "open_enter", "open_exit", "close_enter", "close_exit",
+    }
+    assert all(type(value) is int and value >= 0 for value in observation["offset_ms"].values())
 
 
 @pytest.mark.asyncio
