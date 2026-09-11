@@ -2087,12 +2087,13 @@ class HostEvidenceRuntimeV1:
             if not settled:
                 raise RuntimeError("capacity rollover did not settle before close timeout")
         async with self._state_lock:
-            if self._published:
+            operation = self._close_operation
+            if operation is None and self._published:
                 # Ordinary host close has no browser replacement authority to
                 # append, but it must still revoke the active lifecycle bearer
-                # before the drain makes writer teardown definitive.
+                # before the first close owner drains. Joins and retries retain
+                # that revocation instead of attempting to consume it again.
                 self._lifecycle_owner.close_binding(BindingCloseReason.CLIENT_CLOSED)
-            operation = self._close_operation
             if operation is None or (
                 operation.done() and (operation.cancelled() or operation.exception() is not None)
             ):
@@ -2346,9 +2347,17 @@ class HostEvidenceRuntimeV1:
             operation = self._consent_settlement_operation
         if operation is None or operation is asyncio.current_task():
             return None, None
-        if not operation.done():
+        result: ConsentDisposition | BaseException
+        if operation.done():
+            # A terminal task can outlive its loop. Reading its outcome needs
+            # no new future or callback scheduled on that stopped loop.
+            try:
+                result = operation.result()
+            except BaseException as error:
+                result = error
+        else:
             operation.cancel()
-        result = (await asyncio.gather(operation, return_exceptions=True))[0]
+            result = (await asyncio.gather(operation, return_exceptions=True))[0]
         if isinstance(result, asyncio.CancelledError):
             return CloseResultV1.CANCELLED, None
         if isinstance(result, BaseException):
