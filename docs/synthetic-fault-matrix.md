@@ -15,7 +15,7 @@ by default; this fixture creates synthetic consent and source records privately.
 | `queue_capacity_coupled` | The production scheduler reaches 64 record credits and 64 physical items, refuses the next source as `record_capacity`, persists all 64 accepted records, and releases every credit. |
 | `deny_filter` | A generated credential-shaped synthetic input is refused by the real filter. The session is durably tainted, the rejected source is absent, and full purge completes. |
 | `clock_rollback` | An injected clock regression latches durable purge authority. Recovery with a later fixture clock completes physical purge before any new capture. The OS clock is unchanged. |
-| `sqlite_injected_fault` | One event insertion raises an injected SQLite error inside an observed active transaction. The real rollback is observed while that transaction is active, the transaction ends, the writer latches its fault, the rejected source is absent, and full purge completes. |
+| `sqlite_injected_fault` | One event insertion raises an injected SQLite error inside an observed active transaction. SQLite's ordered transaction trace must be begin, injection, rollback, with no intervening commit or second transaction. The transaction ends, the writer latches its fault, the rejected source is absent, and full purge completes. |
 | `writer_drain_blocked` | A bounded gate holds the real daemon's drain while its owned caller remains pending. Release delegates to the production drain; both threads finish before purge and process completion. |
 
 The capacity fixture first commits the two opening records, a turn, and one

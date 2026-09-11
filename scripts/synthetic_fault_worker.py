@@ -31,20 +31,38 @@ from scripts.synthetic_fault_oracle import (
 class _InjectedConnection(sqlite3.Connection):
     inject = False
     injections = 0
-    injection_transactions: tuple[bool, ...] = ()
-    rollback_transactions: tuple[bool, ...] = ()
+    transaction_events: tuple[tuple[str, bool], ...] = ()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.set_trace_callback(self._observe_transaction)
+
+    def _observe_transaction(self, sql: str) -> None:
+        if not self.inject:
+            return
+        # SQLite reports executed transaction statements for both SQL and its
+        # commit/rollback methods. Keep only closed event codes, never SQL text.
+        # SQLite also ignores leading empty statements and UTF-8 byte-order marks.
+        prefix = "\ufeff; \t\r\n\f\v"
+        statement = sql.lstrip(prefix)
+        while statement.startswith(("--", "/*")):
+            line = statement.startswith("--")
+            end = statement.find("\n" if line else "*/", 2)
+            if end < 0:
+                return
+            statement = statement[end + (1 if line else 2):].lstrip(prefix)
+        token = re.match(r"[A-Za-z]+", statement)
+        command = token.group().lower() if token else ""
+        command = "commit" if command == "end" else command
+        if command in {"begin", "commit", "rollback", "savepoint", "release"}:
+            self.transaction_events += ((command, self.in_transaction),)
 
     def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
         if self.inject and sql.startswith("INSERT INTO evidence_events"):
             self.injections += 1
-            self.injection_transactions += (self.in_transaction,)
+            self.transaction_events += (("injection", self.in_transaction),)
             raise sqlite3.OperationalError("synthetic event insertion failure")
         return super().execute(sql, *args, **kwargs)
-
-    def rollback(self) -> None:
-        self.rollback_transactions += (self.in_transaction,)
-        super().rollback()
-
 
 def _spool(case: Path, clock: Any, cls: Any = None) -> Any:
     from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
@@ -274,8 +292,9 @@ def _run(case: Path, case_id: str, prepared: Callable[[], None]) -> dict[str, An
                     ),
                     "sticky_fault": getattr(owned.diagnostics().sticky_fault, "value", "none"),
                     "injections": owned.connection.injections,
-                    "injection_transactions": list(owned.connection.injection_transactions),
-                    "rollback_transactions": list(owned.connection.rollback_transactions),
+                    "transaction_events": [
+                        list(event) for event in owned.connection.transaction_events
+                    ],
                     "in_transaction": owned.connection.in_transaction,
                 }
         finally:

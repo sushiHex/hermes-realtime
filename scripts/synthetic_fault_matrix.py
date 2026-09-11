@@ -168,8 +168,10 @@ def _validate_observations(rows: Any) -> dict[str, int]:
                 if case == "clock_rollback"
                 else "sqlite_fault",
                 "injections": 1 if case == "sqlite_injected_fault" else 0,
-                "injection_transactions": [True] if case == "sqlite_injected_fault" else [],
-                "rollback_transactions": [True] if case == "sqlite_injected_fault" else [],
+                "transaction_events": (
+                    [["begin", False], ["injection", True], ["rollback", True]]
+                    if case == "sqlite_injected_fault" else []
+                ),
                 "in_transaction": False,
             }
         _same(row["fault"], expected_fault, "synthetic injection or capacity observation differs")
