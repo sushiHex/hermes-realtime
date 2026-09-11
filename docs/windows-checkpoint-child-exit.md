@@ -163,7 +163,8 @@ child-exit failure.
 
 Hosted run [34318730626](https://github.com/sushiHex/hermes-realtime/actions/runs/34318730626)
 subsequently passed all four jobs on attempt 1 for this initial candidate.
-Those results do not qualify a later revision. Issue #13 remains open.
+Those results do not qualify a later revision or establish the historical hosted
+cause tracked in [issue #13](https://github.com/sushiHex/hermes-realtime/issues/13).
 
 ## Communication ownership follow-up (`70f9e7e…`)
 
