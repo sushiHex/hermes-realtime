@@ -29,11 +29,20 @@ runner, and source archive. Changing any bound input requires a new input digest
 and run. A plan/schema disagreement stops acceptance for explicit review; neither
 a permissive schema nor an issue description can silently extend a proof.
 
-Accept the existing twenty-scenario v1 contract with the coverage limits below.
+Accept the existing twenty-scenario v1 shape with the coverage limits below.
 Do not add another runner authority, a caller-supplied success switch, or a second
 report format for full qualification. This decision approves the implementation
 design. It supplies no physical observations, installed environment, release
 decision, deployment permission, or public disclosure of private evidence.
+
+This is an implementation protocol, not a claim that its complete acceptance path
+exists. The current `validate_qualification_report` checks supplied bytes and
+their semantic consistency. It does not authenticate observations, establish
+operator presence, or prove that any producer ran. Full qualification is refused
+until the input authority and capability-based composition described here exist;
+their implementation is tracked in [#47](https://github.com/sushiHex/hermes-realtime/issues/47)
+and [#62](https://github.com/sushiHex/hermes-realtime/issues/62). A validator return
+value alone is never an accepted qualification result.
 
 ## Freeze and verify inputs
 
@@ -114,29 +123,41 @@ filesystem scenarios retain their OS and storage boundary. Synthetic injection
 remains `synthetic_injected`. Deterministic equivalence establishes its bounded
 comparison and does not replace any physical observation.
 
-Collect only contemporaneous operator confirmations from the schema's closed
-observation codes. Bind each fresh attestation to this attempt, UTC observation
-time, and exactly one referencing scenario; do not reuse attestations across
-scenarios or candidates. An absent, declined, stale, or out-of-window observation
-blocks acceptance. These are operator observations, not identity, authorship,
-hearing, comprehension, or truth verification.
+The v1 full report permits twelve attestations total. Use exactly the twelve
+observations in the table, each once at its designated scenario. Bind each to the
+current attempt, its UTC observation time, and exactly one referencing scenario;
+do not reuse an attestation across scenarios or candidates. These are operator
+observations, not identity, authorship, hearing, comprehension, or truth
+verification.
 
-| Physical observation | Required use of existing codes |
+| Scenario | Required codes, each observed once |
 | --- | --- |
-| Consent controls | `disclosure_visible_controls_accessible` where capture is available and for fresh consent after a binding replacement |
-| Microphone response | `chrome_microphone_permission_allowed`, `physical_input_selected`, and `physical_phrase_spoken`; machine evidence separately compares the synthetic fixture and STT result |
-| Unmuted transport | `physical_output_selected` and `unmuted_output_audible` |
-| Muted transport | `physical_output_selected`, `chrome_mixer_zero`, `muted_output_not_audible`, and subsequent `mixer_restored` |
-| Interruption matrix | `barge_in_performed` and `stop_performed` for the corresponding actions; machine evidence covers each governed case |
-| Reconnect | `reconnect_performed`, followed by a fresh disclosure observation and machine verification that previous consent is not inherited |
-| Media replacement | A new `physical_input_selected` or `physical_output_selected` observation for the actual changed medium, fresh disclosure observation, and machine verification of media-incarnation and consent isolation |
+| `physical_available_unconsented` | `disclosure_visible_controls_accessible` |
+| `physical_microphone_response` | `chrome_microphone_permission_allowed`, `physical_input_selected`, `physical_phrase_spoken` |
+| `physical_unmuted_transport` | `physical_output_selected`, `unmuted_output_audible` |
+| `physical_muted_transport` | `chrome_mixer_zero`, `muted_output_not_audible`, `mixer_restored` |
+| `physical_interruption_matrix` | `barge_in_performed`, `stop_performed` |
+| `physical_reconnect` | `reconnect_performed` |
 
 Capture-disabled and unconsented noncreation require real absence observations;
 an unavailable consent control cannot be attested as visible. Typed-response
 equality derives from the accepted input and persisted source, not an operator
-authorship claim. The codes do not encode every interruption case or a generic
-media-replacement action; case-specific machine observations supply that binding.
-Do not invent additional v1 codes or automatically confirm an operator action.
+authorship claim. Other scenarios have no report attestations. The muted scenario
+must independently verify continuity of the output selected in the unmuted
+scenario; a changed device blocks that comparison. Reconnect and media replacement
+require machine evidence of fresh consent and binding isolation. The v1 report
+does not attest repeated disclosure viewing, repeated device selection, every
+interruption action, or a human-confirmed media-replacement action. Accept those
+limits; stronger human claims require a reviewed format extension, not invented
+codes, extra rows, reused attestations, or automatic confirmations.
+
+The composition authority in #62 must enforce this exact scenario/code mapping,
+one occurrence of every code, fresh unique IDs, and observation times inside both
+the run and corresponding scenario observation windows. It must collect operator
+input through an owned contemporaneous interaction; a supplied JSON confirmation
+is not that capability. Missing, declined, stale, misassigned, or out-of-window
+observations refuse acceptance. The current byte validator does not enforce these
+requirements and must not be used as their substitute.
 
 ## Coverage dispositions
 
@@ -181,11 +202,28 @@ image, and firewall state. Verify each applicable cleanup assertion from the
 responsible owner. An unknown or incomplete cleanup result prevents acceptance.
 Do not claim forensic SSD erasure or secure clearing of Python process memory.
 
-Compose a complete report only from genuine independently accepted scenario
-capabilities, verified installed inputs, actual environment/topology observations,
-and the fresh operator attestations. Reopen the complete input closure, serialize
-canonical JSON, and run `validate_qualification_report` on the resulting bytes.
-The producer must derive `passed`; the semantic validator checks that derivation.
+Existing storage producers deliberately retain a failed private workspace when
+successful cleanup cannot be established; see [full-purge cleanup](full-purge-cleanup.md).
+This can include a database and diagnostic material. Treat it as private
+quarantine, never as completed purge or publishable failure evidence. Keep
+ownership and privacy maintenance pending, establish that every retained process
+has exited before touching its files, and then perform owned cleanup and verify
+the result. Do not delete beneath a possibly live writer merely to satisfy this
+plan. The complete runner must report that refusal and retain the outstanding
+cleanup obligation; no automatic safe cleanup of such a workspace is claimed here.
+
+The composition authority must accept only genuine producer-minted capabilities,
+revalidate their independent observations, and bind each to the same candidate,
+artifact closure, scenario and invocation. It must verify actual installed input,
+environment, topology, cleanup, and operator capabilities before deriving report
+rows; a dictionary of supplied outcomes or a serialized receipt is insufficient.
+Only this authority may issue a full acceptance result. Missing registration or
+evidence refuses before an acceptance result can exist.
+
+After this authority verifies the complete run, reopen the input closure,
+serialize canonical JSON, and use `validate_qualification_report` as a final
+consistency check on the derived bytes. The composer derives `passed`; the byte
+validator checks internal consistency but supplies no execution or human proof.
 Schema-valid failure records are not accepted qualification. Missing or
 unexecuted producers must cause explicit refusal, never invented pass rows or a
 partial report presented as the complete v1 report. Benchmark acceptance and
@@ -195,8 +233,10 @@ Keep failed attempts and their bounded, sanitized conclusions associated with
 the exact source/input identities. Do not overwrite them with a later success,
 cancel hosted runs, rerun a failed workflow, relax a timeout, or combine different
 candidates' successful rows into one run. Raw audio, transcripts, screenshots,
-databases, credentials, and private diagnostic output are purged under the
-contract; preserving failure evidence does not authorize retaining those bytes.
+databases, credentials, and private diagnostic output cannot enter public failure
+records. Purge owned raw artifacts when cleanup is safe; unresolved ownership
+uses the private quarantine disposition above. Preserving a sanitized failure
+conclusion is separate from claiming raw-data cleanup.
 
 A schema-valid input or report is not automatically safe to publish: it can
 contain relative paths, process identities, hardware context, and attestation
