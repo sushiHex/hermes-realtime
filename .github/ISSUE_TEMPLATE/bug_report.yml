@@ -28,10 +28,8 @@ body:
   - type: input
     id: hermes
     attributes:
-      label: Hermes Agent version
-      placeholder: hermes --version
-    validations:
-      required: true
+      label: Hermes Agent version, if involved
+      placeholder: Version or not involved
   - type: dropdown
     id: os
     attributes:

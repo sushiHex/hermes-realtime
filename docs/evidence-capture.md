@@ -4,7 +4,7 @@ This document defines the evidence-only Slice 0 policy. The host now contains
 capture controls and admission, lifecycle, storage, status, and purge implementation.
 Full Slice 0 qualification is incomplete. See [Implementation status](implementation-status.md)
 for source, test coverage, and the outstanding scenario producers, and the
-[Roadmap](roadmap.md) for the implementation sequence.
+[work-tracking guide](work-tracking.md) for current issues and milestones.
 
 ## Status and activation
 

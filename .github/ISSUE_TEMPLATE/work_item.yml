@@ -1,0 +1,46 @@
+name: Work item
+description: Scope one implementation or investigation outcome
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and PRs first. Tracking work does not approve a design.
+        Keep credentials, private URLs, paths, transcripts, audio, and device identities out of public issues.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Work kind
+      options:
+        - Implementation
+        - Investigation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and intended outcome
+      description: What changes or becomes known? Explain why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Bound one outcome; independently assignable work can become sub-issues.
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority and prerequisites
+      description: Link reviewed plans, contracts, ADRs, and prerequisite issues. Mark proposals or unknowns explicitly; maintainers add native dependency links.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Observable completion criteria
+      description: Name the required evidence. Investigations need a stopping condition and may reach a negative result.
+    validations:
+      required: true

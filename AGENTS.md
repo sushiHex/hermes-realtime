@@ -16,6 +16,15 @@ This repository is an independently authored realtime conversation runtime for u
 - Support Windows development and Linux CI/deployment.
 - Prefer deterministic state machines and policies over model-controlled lifecycle state.
 
+## Work tracking
+
+Follow [the tracking guide](docs/work-tracking.md). GitHub Issues owns actionable
+work, dependencies, ownership, and acceptance criteria; milestones group outcomes.
+Query current issues and linked PRs before starting. Repository plans and accepted
+ADRs own design authority; implementation records and PRs carry evidence. Do not
+maintain a second Markdown TODO or infer design approval from issue metadata.
+Leave a branch/head and evidence handoff in the owning issue when work pauses.
+
 ## Commands
 
 ```bash

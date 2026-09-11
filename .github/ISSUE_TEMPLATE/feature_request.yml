@@ -1,12 +1,13 @@
-name: Feature request
-description: Propose a generic public capability
-title: "feat: "
-labels: ["enhancement", "needs-triage"]
+name: Proposal or decision
+description: Propose a public capability or request an explicit design decision
+labels: ["decision", "needs-triage"]
 body:
   - type: markdown
     attributes:
       value: |
         Proposals must be useful outside one private deployment and reproducible without a maintainer's named hardware or accounts.
+        Creating an issue does not approve a design. Accepted decisions belong in a reviewed repository plan or ADR.
+        Do not include credentials, private URLs, paths, transcripts, audio, or device identities.
   - type: textarea
     id: use_case
     attributes:
@@ -25,7 +26,7 @@ body:
     id: scope
     attributes:
       label: Smallest useful scope
-      description: Describe the narrowest end-to-end slice and what should remain deferred.
+      description: Describe the narrowest end-to-end slice, non-goals, and affected contracts or plan/ADR links.
     validations:
       required: true
   - type: textarea
@@ -33,3 +34,10 @@ body:
     attributes:
       label: Security, privacy, and compatibility considerations
       description: Include authority, cleanup, secret handling, and platform implications.
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision requested and supporting evidence
+      description: State the exact choice, prerequisites, and evidence needed to accept or decline it. Separate observations from hypotheses.
+    validations:
+      required: true
