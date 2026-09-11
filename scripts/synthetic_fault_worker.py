@@ -31,12 +31,19 @@ from scripts.synthetic_fault_oracle import (
 class _InjectedConnection(sqlite3.Connection):
     inject = False
     injections = 0
+    injection_transactions: tuple[bool, ...] = ()
+    rollback_transactions: tuple[bool, ...] = ()
 
     def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
         if self.inject and sql.startswith("INSERT INTO evidence_events"):
             self.injections += 1
+            self.injection_transactions += (self.in_transaction,)
             raise sqlite3.OperationalError("synthetic event insertion failure")
         return super().execute(sql, *args, **kwargs)
+
+    def rollback(self) -> None:
+        self.rollback_transactions += (self.in_transaction,)
+        super().rollback()
 
 
 def _spool(case: Path, clock: Any, cls: Any = None) -> Any:
@@ -267,6 +274,8 @@ def _run(case: Path, case_id: str, prepared: Callable[[], None]) -> dict[str, An
                     ),
                     "sticky_fault": getattr(owned.diagnostics().sticky_fault, "value", "none"),
                     "injections": owned.connection.injections,
+                    "injection_transactions": list(owned.connection.injection_transactions),
+                    "rollback_transactions": list(owned.connection.rollback_transactions),
                     "in_transaction": owned.connection.in_transaction,
                 }
         finally:

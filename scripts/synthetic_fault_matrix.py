@@ -31,6 +31,7 @@ from scripts.synthetic_fault_oracle import (
     SENTINEL,
     digest,
     expected_history,
+    expected_sentinel_digest,
     rejected_snapshot,
 )
 from scripts.task13_artifact_orchestrator import CandidateIdentityV1
@@ -88,7 +89,7 @@ def _validate_cleanup(value: Any, case: str) -> None:
         )
         expected = {
             MARKER: initialization_digest_v1("root_marker", "full_write"),
-            SENTINEL: state["files"].get(SENTINEL),
+            SENTINEL: expected_sentinel_digest(case, after=phase == "after"),
             **{name: digest(raw) for name, raw in DECOYS.items()},
         }
         if phase == "before":
@@ -167,6 +168,8 @@ def _validate_observations(rows: Any) -> dict[str, int]:
                 if case == "clock_rollback"
                 else "sqlite_fault",
                 "injections": 1 if case == "sqlite_injected_fault" else 0,
+                "injection_transactions": [True] if case == "sqlite_injected_fault" else [],
+                "rollback_transactions": [True] if case == "sqlite_injected_fault" else [],
                 "in_transaction": False,
             }
         _same(row["fault"], expected_fault, "synthetic injection or capacity observation differs")

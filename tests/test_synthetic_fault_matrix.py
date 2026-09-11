@@ -100,6 +100,8 @@ def test_assertions_and_case_order_match_the_governed_schema():
         (4, ("fault", "outcomes"), ["already_queued"]),
         (4, ("cleanup", "after", "sentinel"), "full_purge_pending"),
         (4, ("cleanup", "after", "adjacent", "keep.bin"), "0" * 64),
+        (0, ("cleanup", "before", "files", "capture-v1.owner"), "0" * 64),
+        (0, ("cleanup", "after", "files", "capture-v1.owner"), "0" * 64),
     ],
 )
 def test_changed_fault_source_capacity_or_cleanup_is_rejected(
@@ -217,7 +219,13 @@ def test_synthetic_launch_cannot_borrow_crash_or_recovery_authority(point, mode,
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires retained Windows process/storage identities")
-@pytest.mark.parametrize("fault", [None, "no_delete", "unclosed", "ignore_sqlite"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None, "no_delete", "unclosed", "ignore_sqlite", "no_transaction",
+        "commit_instead_of_rollback", "wrong_purge_authority", "wrong_initial_authority",
+    ],
+)
 def test_owned_processes_refuse_false_purge_release_and_transaction_success(tmp_path, fault):
     import shutil
     from pathlib import Path
@@ -260,6 +268,39 @@ def test_owned_processes_refuse_false_purge_release_and_transaction_success(tmp_
             "    return result\n"
             "SQLiteEvidenceSpool.append_record = _fake_append\n"
         ),
+        "no_transaction": (
+            "\n_append = SQLiteEvidenceSpool.append_record\n"
+            "def _fake_append(self, record):\n"
+            "    if self.connection.inject:\n"
+            "        try:\n"
+            "            self.connection.execute('INSERT INTO evidence_events')\n"
+            "        except sqlite3.Error:\n"
+            "            self._rollback()\n"
+            "            self._latch(WriterFault.SQLITE_FAULT)\n"
+            "            return StoreDisposition.FAULTED\n"
+            "    return _append(self, record)\n"
+            "SQLiteEvidenceSpool.append_record = _fake_append\n"
+        ),
+        "commit_instead_of_rollback": (
+            "\ndef _fake_rollback(self):\n"
+            "    if self._connection is not None:\n"
+            "        self._connection.commit()\n"
+            "SQLiteEvidenceSpool._rollback = _fake_rollback\n"
+        ),
+        "wrong_purge_authority": (
+            "\nfrom dataclasses import replace as _replace\n"
+            "_purge = SQLiteEvidenceSpool.purge_full_store\n"
+            "def _fake_purge(self, command):\n"
+            "    return _purge(self, _replace(command, full_purge_generation_id="
+            "'40000000-0000-4000-8000-000000000097'))\n"
+            "SQLiteEvidenceSpool.purge_full_store = _fake_purge\n"
+        ),
+        "wrong_initial_authority": (
+            "\n_initial = initial_sentinel_image\n"
+            "def _fake_initial(identifier):\n"
+            "    return _initial('50000000-0000-4000-8000-000000000099')\n"
+            "initial_sentinel_image = _fake_initial\n"
+        ),
     }
     if fault is not None:
         with (package / "hermes_realtime/evidence/sqlite_spool.py").open(
@@ -285,6 +326,10 @@ def test_owned_processes_refuse_false_purge_release_and_transaction_success(tmp_
                 "no_delete": "storage worker retains a deleted file identity",
                 "unclosed": "storage ownership was not released",
                 "ignore_sqlite": "synthetic injection or capacity observation differs",
+                "no_transaction": "synthetic injection or capacity observation differs",
+                "commit_instead_of_rollback": "synthetic injection or capacity observation differs",
+                "wrong_purge_authority": "synthetic purge inventory differs",
+                "wrong_initial_authority": "synthetic purge inventory differs",
             }[fault],
         ):
             qualify()

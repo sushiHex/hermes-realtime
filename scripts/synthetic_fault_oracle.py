@@ -12,7 +12,12 @@ from typing import Any
 
 from scripts.equivalence_process import _require
 from scripts.evidence_protocol_oracle import canonical_json_bytes, hre1_record_hash
-from scripts.spool_crash_oracle import SCHEMA_DIGEST_V1, _source_events, sentinel_state_v1
+from scripts.spool_crash_oracle import (
+    SCHEMA_DIGEST_V1,
+    _sentinel_image_v1,
+    _source_events,
+    sentinel_state_v1,
+)
 from scripts.windows_storage_oracle import audit_storage
 
 CASES_V1 = (
@@ -38,6 +43,21 @@ ALLOWED = frozenset((MARKER, SENTINEL, *DATABASE_NAMES, *DECOYS))
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def expected_sentinel_digest(case: str, *, after: bool) -> str:
+    """Pin both fixture slots, including the predecessor's exact authority."""
+    _require(case in CASES_V1 and type(after) is bool, "synthetic sentinel phase differs")
+    if case == "clock_rollback":
+        active = (3, 2, "50000000-0000-4000-8000-000000000003")
+        clear_generation = 4 if after else 2
+    elif after:
+        active = (3, 1, "40000000-0000-4000-8000-000000000096")
+        clear_generation = 4
+    else:
+        active = (1, 3, "50000000-0000-4000-8000-000000000002")
+        clear_generation = 2
+    return digest(_sentinel_image_v1(active, (clear_generation, 0, None)))
 
 
 def expected_history(count: int) -> list[dict[str, Any]]:
