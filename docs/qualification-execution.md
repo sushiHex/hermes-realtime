@@ -80,15 +80,21 @@ identities, provider distributions and model manifests, browser image manifest,
 LiveKit and Codex executables, Hermes source/harness, benchmark report and machine
 manifest, and the exact governed schemas. The schema is the exhaustive role list.
 
-Reopen and verify actual files through `verify_qualification_input_closure` before
-launch and before accepting output. Those calls are point-in-time byte checks;
+After stage 3, reopen and verify actual files through
+`verify_qualification_input_closure` before scenario launch and final acceptance.
+Those calls are point-in-time byte checks;
 they do not retain file handles, compare file identities, detect hard-link
 aliases, or prevent a file from changing between verification and use. The input
-authority in #47 must seal the complete input closure through every consumer:
+authority in #47 must retain the pre-build and intermediate-output seals for
+stage 1/2 consumers. Only after stage 3 can it seal the complete final input
+closure, whose seals must remain live for every subsequent consumer:
 retain validated file and ancestor identities with handles that deny writes,
 replacement and deletion, or use an equivalently immutable owned snapshot.
-Verify bytes through those seals and preserve the seals across build, install,
-launch, observation and final acceptance. If sealing cannot be established,
+Verify bytes through each stage's applicable seals. Builds use only pre-build
+and independently produced intermediate capabilities; they never require their
+own future outputs or the final closure as inputs. After stage 3, preserve the
+final closure seals across subsequent installation, launch, observation and
+final acceptance. If the applicable seals cannot be established,
 refuse before executing a consumer. A final matching hash does not excuse a
 transient replacement during execution.
 
