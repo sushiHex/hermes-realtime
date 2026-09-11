@@ -413,7 +413,17 @@ their normal Python cleanup. Launch fresh host processes with `TEMP`, `TMP` and
 `TMPDIR` all bound to that pre-owned root in their actual process environment,
 before Python can cache a temporary directory. Supplying a mapping only to the
 Codex child launcher does not redirect the parent provider's `tempfile` calls.
-Verify containment of both the copied credential home and inference workspace,
+Before constructing any provider or copying credentials, a trusted bootstrap in
+that fresh host must call `tempfile.gettempdir()` and prove its selected, cached
+directory matches the retained private root's path and file/volume identities.
+Python may otherwise skip an unavailable environment directory and choose an
+ambient fallback. Missing, unwritable or different selection refuses before any
+sensitive creation. Retain the root and its ancestry against replacement for the
+entire consumer lifetime; after selection, a failed creation must fail in that
+same cached root, without resetting it or selecting another directory. Prove the
+pre-provider refusal with missing and unwritable-root tests, including termination
+at the credential-copy boundary. Post-creation detection alone is insufficient.
+Also verify containment of both the copied credential home and inference workspace,
 including descendant tool temporary files, before accepting their use. An
 ambient fallback or unowned temporary path refuses full qualification.
 
