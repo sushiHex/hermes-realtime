@@ -261,6 +261,31 @@ the Codex executable digest and the final input digest.
   Private, enterprise-interception and locally added roots are excluded. This
   retains the ordinary public-CA trust assumption, not protection against a
   compromised admitted CA or OS.
+- The Disallowed catalogs do not replace issuing-CA revocation checks. Native
+  same-connection validation must establish authenticated, fresh non-revoked
+  status for every non-root service-chain certificate before sensitive
+  application bytes. Require correctly signed, certificate/issuer-bound CRL or
+  OCSP evidence with an applicable signed validity interval; reject revoked,
+  unknown, missing, expired or unverifiable status without soft-failing. Check
+  status validity with the trusted UTC and elapsed-time authority above, including
+  resumed sessions and reconnects, and retain the status-to-connection bindings
+  for final acceptance. Ordinary path validation, certificate validity, usage and
+  constraints remain required in addition to both catalog and revocation checks.
+  Microsoft's [chain validation API](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain)
+  distinguishes offline/unknown revocation errors from successful validation.
+  Under this closed endpoint policy, status must arrive as authenticated stapled
+  evidence or as independently authenticated, fresh status material prepared by
+  the trusted controller and sealed into the admitted client trust environment.
+  Its provenance, certificate/issuer scope and expiry bind to that environment's
+  receipt; stale host caches or supplied success flags cannot establish it.
+  The client receives no general permission to contact certificate-supplied
+  responder URLs. A native client that needs additional responder destinations
+  requires a reviewed policy version defining those authorities and strictly
+  credential-free status requests; missing native support for the current
+  stapled/sealed-status policy refuses admission. Adverse client-admission tests
+  must include a revoked non-root certificate absent from Disallowed, and
+  missing, stale, wrong-certificate and unverifiable status. This policy supplies
+  no claim of instantaneous knowledge of later CA revocations.
 - Require direct service connections with authenticated hostname/chain checks;
   reject system/environment proxies, unverified DNS policy, endpoint overrides
   and ambient `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE` or `SSL_CERT_DIR` values.
