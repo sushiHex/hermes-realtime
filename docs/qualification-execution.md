@@ -178,8 +178,26 @@ desktop with an operator present. Use capability discovery and explicit opt-in f
 require no named machine, device, room, account, or private network. Credentials
 and deployment-specific provisioning remain outside the repository and reports.
 Keep capture disabled by default and require fresh browser-binding consent for
-each applicable scenario. Search and Hermes task authority remain separate;
-qualification uses the governed disabled Hermes task mode.
+each applicable scenario. Qualification uses the governed disabled Hermes task
+mode and a closed host launch profile. The controller constructs that profile
+from the bound inputs and scenario; it must not forward arbitrary caller-supplied
+CLI arguments or configuration overrides. Unspecified optional features retain
+the exact source-bound defaults rather than acquiring authority from the operator.
+
+Public search and knowledge speculation/recovery are disabled for every v1
+qualification scenario. Reject `--enable-public-search`, `--knowledge-speculation`,
+`--knowledge-recovery` and `--knowledge-budget-seconds`, and equivalent API or
+configuration overrides, before creating resources or launching consumers.
+Independently verify that the effective `public_search`, `knowledge_speculation`
+and `knowledge_recovery` values are all false and that no search lookup or
+knowledge coordinator is admitted. Browser search consent cannot enable an
+operator-disabled feature. Preserve this configuration binding in the private
+invocation authority through final acceptance; a supplied report flag is not
+evidence of it. The current no-Hermes-task mode does not enforce this additional
+qualification restriction. The #62 controller must establish it. Neither v1
+schema records search/knowledge mode, so accepting these features would require
+a separately reviewed profile and contract extension, not extra destinations
+silently added to the service policy below.
 
 The trusted computing base includes the independently reviewed candidate host,
 qualification controller and validator, authenticated tools/providers/services,
