@@ -210,22 +210,60 @@ needs an explicitly authorized subscription and remote inference access; use a
 qualification-specific credential context with an owner-approved attempt/usage
 budget. The trusted controller admits only the governed scenarios and retains
 their dispatch and observation evidence under the existing runtime bounds.
-Before any credential or prompt dispatch, independently verify the actual Codex
-client's service authority, endpoint configuration, hostname-checked TLS and
-approved trust roots. Bind its effective DNS, proxy and TLS configuration to the
-admitted environment; remote reachability and a service-reported model name are
-insufficient. Remove ambient `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides from fresh
-host environments unless their exact authority and bytes were independently
-authenticated and frozen. The current provider forwards those variables, so
-ordinary environment sanitization alone does not establish this check. Refuse
-unverified system or environment proxies, endpoint/trust overrides, DNS policy,
-or redirects outside the approved service authorities. Retain content-free
-service-authentication evidence for the actual client connections and preserve
-the policy across redirects and reconnects. A separate probe connection does not
-prove where the credential-bearing client connected. Missing client evidence or
-an unverifiable route/trust configuration refuses before sensitive dispatch;
-implement this admission in #62 without substituting a credential broker or mock
-provider. Do not claim that local size or
+Adopt the closed `codex-openai-service-v1` admission policy below. Its authority
+comes from this reviewed source document, not an operator-supplied hostname or CA
+approval. Bind its exact source blob to the candidate archive and governing-plan
+closure, and bind the admitted client/configuration/trust evidence to that policy,
+the Codex executable digest and the final input digest.
+
+- Permit subscription service HTTPS/WSS only at `chatgpt.com:443`, using the
+  first-party `/backend-api/` service base, and HTTPS token refresh only at
+  `auth.openai.com:443`. No wildcard hosts, IP-literal service authorities,
+  alternate providers, API-key routes or cross-origin redirects are admitted.
+  A required destination outside this set needs a new reviewed policy version;
+  the environment being checked cannot approve it for itself. The official
+  [sample configuration](https://learn.chatgpt.com/docs/config-file/config-sample)
+  identifies the ChatGPT service base; it does not prove a particular binary's
+  complete connection behavior.
+- Use only server-authentication roots admitted by the Microsoft Trusted Root
+  Program, excluding its Disallowed set. Independently authenticate the published
+  AuthRoot/Disallowed material and compare the client's effective trust roots
+  against it; accepting the machine's current store without that comparison is
+  insufficient. Freeze catalog and effective-root digests in the private tool
+  environment receipt before client admission. See Microsoft's
+  [CTL verification procedure](https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/configure-trusted-roots-disallowed-certificates#verify-trusted-and-untrusted-ctls).
+  Private, enterprise-interception and locally added roots are excluded. This
+  retains the ordinary public-CA trust assumption, not protection against a
+  compromised admitted CA or OS.
+- Require direct service connections with authenticated hostname/chain checks;
+  reject system/environment proxies, unverified DNS policy, endpoint overrides
+  and ambient `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE` or `SSL_CERT_DIR` values.
+  Inspect every effective configuration layer before launch. OpenAI documents
+  [custom CA overrides](https://learn.chatgpt.com/docs/auth#custom-ca-bundles);
+  the current provider forwards the two SSL variables, so its allowlist alone
+  does not implement this qualification restriction.
+
+Enforce the first-request boundary inside the admitted native client's transport.
+Before placing real credentials in its temporary home or launching it, #62 must
+have independently verified that the exact authenticated client/configuration
+natively rejects a wrong hostname, untrusted certificate, prohibited endpoint or
+cross-origin redirect before writing credentials or prompt bytes. No sensitive
+TLS early data is allowed. Bind this admission evidence to exact client/tool bytes
+and credential-free adverse-transport tests using synthetic data. Missing native
+enforcement or an unverifiable configuration refuses that client before launch;
+an executable hash by itself supplies no such capability.
+
+The safe sequence is configuration/client admission, then the real client's
+authenticated TLS handshake, then application data on that same connection.
+The TLS implementation performs the in-path authentication before application
+data; this does not require a nonexistent external pause in the stdio wrapper.
+Independently collect content-free connection evidence during the run and require
+it for final acceptance, preserving the admitted policy across reconnects. A
+separate probe, a model string or after-the-fact detection cannot establish the
+pre-dispatch guard. The existing wrapper and the cited user documentation do not
+yet provide the required client-admission capability; full execution stays
+unavailable until #62 establishes it. Do not substitute a broker or mock provider,
+or claim that local size or
 timeout bounds impose a service-side spending cap, or continue when authorization
 or the applicable usage limit is unavailable. The reviewed host uses the existing
 `livekit_local_v1` development profile. Its key and secret are fixed public,
