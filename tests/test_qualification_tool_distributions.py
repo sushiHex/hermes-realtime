@@ -103,6 +103,21 @@ def test_distribution_member_bound_is_enforced(monkeypatch):
         admit_fixture(monkeypatch, raw, "zip")
 
 
+@pytest.mark.parametrize("format", ["zip", "tar.gz"])
+def test_private_archive_consumer_can_select_a_narrow_larger_member_bound(monkeypatch, format):
+    from scripts import qualification_tool_distributions as tools
+
+    monkeypatch.setattr(tools, "_MAX_MEMBER", 4)
+    raw = fixture_archive(format, [("tool.exe", b"image bytes")])
+    with pytest.raises(ValueError, match="bounded ordinary file"):
+        tools._inspect_archive_members(raw, format)
+    assert tools._inspect_archive_members(raw, format, max_member_bytes=11) == (
+        ("tool.exe", b"image bytes"),
+    )
+    with pytest.raises(ValueError, match="bounded ordinary file"):
+        tools._inspect_archive_members(raw, format, max_member_bytes=10)
+
+
 def test_distribution_capability_cannot_be_constructed_or_replaced_with_metadata():
     from scripts.qualification_tool_distributions import (
         AdmittedToolDistributionV1,
@@ -121,7 +136,11 @@ def test_distribution_capability_cannot_be_constructed_or_replaced_with_metadata
 def test_distribution_keeps_ordinary_windows_resource_names(monkeypatch, format):
     from scripts.qualification_tool_distributions import _tool_distribution_files
 
-    members = [("tool.exe", b"image"), ("Lib/launcher manifest.xml", b"manifest"),
-               ("tcl/Etc/GMT+0", b"timezone"), ("Lib/script (dev).tmpl", b"template")]
+    members = [
+        ("tool.exe", b"image"),
+        ("Lib/launcher manifest.xml", b"manifest"),
+        ("tcl/Etc/GMT+0", b"timezone"),
+        ("Lib/script (dev).tmpl", b"template"),
+    ]
     receipt = admit_fixture(monkeypatch, fixture_archive(format, members), format)
     assert dict(_tool_distribution_files(receipt)) == dict(members)

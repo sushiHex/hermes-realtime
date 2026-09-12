@@ -469,7 +469,7 @@ def test_input_closure_revalidates_direct_and_transitive_artifacts_before_execut
     assert "tool:git" in logical_ids
     assert "wheelhouse:build:wheel:build-1.0.whl" in logical_ids
     assert "provider:moonshine:resource:model.bin" in logical_ids
-    assert "chrome:file:chrome.exe" in logical_ids
+    assert "chrome:file:" + hashlib.sha256(b"chrome.exe").hexdigest() in logical_ids
 
 
 def test_input_closure_rejects_schema_invalid_empty_requested_scenarios(tmp_path: Path) -> None:

@@ -736,6 +736,20 @@ def _safe_posix_path(value: object, *, label: str) -> str:
     return path
 
 
+def _chrome_resource_name(value: object) -> str:
+    """Keep ordinary publisher names; direct artifact references stay strict."""
+    from scripts.qualification_file_seals import _relative_windows_member
+
+    name = _expect_string(value, label="Chrome resource name")
+    if len(name) > 512:
+        _fail("Chrome resource name exceeds its bound")
+    try:
+        _relative_windows_member(name)
+    except ValueError as error:
+        raise QualificationInputError("Chrome resource name is unsafe") from error
+    return name
+
+
 def _is_reparse_or_link(path: Path) -> bool:
     try:
         metadata = path.lstat()
@@ -1080,7 +1094,7 @@ def _verify_chrome_manifest(
         file = _expect_exact_object(
             item, frozenset({"name", "bytes", "sha256"}), label=f"Chrome manifest.files[{index}]"
         )
-        name = _safe_posix_path(file["name"], label=f"Chrome manifest.files[{index}].name")
+        name = _chrome_resource_name(file["name"])
         if name <= previous_name or name in manifest_paths:
             _fail("Chrome version-directory manifest: files are not sorted unique")
         previous_name = name
@@ -1107,7 +1121,10 @@ def _verify_chrome_manifest(
             executable_name = name
         _append_artifact(
             artifacts,
-            logical_id=f"chrome:file:{name}",
+            # Publisher names can contain spaces and directory separators. A
+            # digest identifies every name under the existing public ID grammar;
+            # the sealed version manifest retains the exact relative spelling.
+            logical_id="chrome:file:" + hashlib.sha256(name.encode("utf-8")).hexdigest(),
             reference={"sha256": claimed_sha, "bytes": claimed_bytes},
         )
     if executable_name is None:

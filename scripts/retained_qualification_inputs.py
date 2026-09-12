@@ -57,11 +57,17 @@ def _read(seals: RetainedFileSealsV1, member: str) -> dict[str, Any]:
 
 
 def _relative(value: object) -> str:
-    return cast(str, core._safe_posix_path(value, label="sealed input member"))
+    core._safe_posix_path(value, label="sealed input member")
+    assert isinstance(value, str)
+    return value
 
 
 def _nested(parent: str, name: object) -> str:
     return str(PurePosixPath(parent).parent / _relative(name))
+
+
+def _nested_chrome(parent: str, name: object) -> str:
+    return str(PurePosixPath(parent).parent / core._chrome_resource_name(name))
 
 
 def _members(
@@ -73,7 +79,7 @@ def _members(
     members = {manifest}
 
     def add(name: object, *, chrome: bool = False) -> None:
-        relative = _relative(name)
+        relative = core._chrome_resource_name(name) if chrome else _relative(name)
         _require(
             relative not in members or (chrome and relative == files["chrome_executable"]),
             "sealed input roles alias a path",
@@ -99,7 +105,7 @@ def _members(
             add(_nested(path, reference["name"]))
     path = files["chrome_version_directory_manifest"]
     for reference in _read(direct, path)["files"]:
-        add(_nested(path, reference["name"]), chrome=True)
+        add(_nested_chrome(path, reference["name"]), chrome=True)
     return tuple(sorted(members))
 
 

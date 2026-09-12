@@ -290,6 +290,41 @@ def test_controlled_fixture_is_schema_valid_and_semantically_closed(tmp_path: Pa
     assert release["passed"] is True
 
 
+def test_ordinary_chrome_publisher_name_survives_report_and_release_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _make_input_root
+
+    def with_publisher_resource(parent: Path):
+        result = original(parent)
+        root, manifest, _, _, _ = result
+        document = json.loads(manifest.read_bytes())
+        reference = _file(document, "chrome_version_directory_manifest")
+        chrome_manifest = root / reference["relativePath"]
+        chrome = json.loads(chrome_manifest.read_bytes())
+        raw = b"synthetic publisher first-run metadata"
+        (chrome_manifest.parent / "First Run").write_bytes(raw)
+        chrome["files"].append({"name": "First Run", "bytes": len(raw), "sha256": _sha(raw)})
+        chrome["files"].sort(key=lambda row: row["name"])
+        _write_json(chrome_manifest, chrome)
+        reference.update(_ref(root, chrome_manifest, "chrome_version_directory_manifest"))
+        _write_json(manifest, document)
+        return result
+
+    monkeypatch.setitem(_context.__globals__, "_make_input_root", with_publisher_resource)
+    context = _context(tmp_path)
+    report = _report_validate(context)
+    release = _release_validate(context)
+    assert report["verifiedArtifacts"] == release["artifacts"]
+    chrome_ids = [
+        row["logicalId"]
+        for row in release["artifacts"]
+        if row["logicalId"].startswith("chrome:file:")
+    ]
+    assert "chrome:file:" + _sha(b"First Run") in chrome_ids
+    assert all("First Run" not in value for value in chrome_ids)
+
+
 @pytest.mark.parametrize(
     "field", ("qualificationInputSha256", "governingPlanSha256", "benchmarkReportSha256")
 )

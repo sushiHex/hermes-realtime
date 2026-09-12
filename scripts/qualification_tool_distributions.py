@@ -97,8 +97,15 @@ class _Distribution:
 _ADMITTED: WeakKeyDictionary[AdmittedToolDistributionV1, _Distribution] = WeakKeyDictionary()
 
 
-def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes], ...]:
+def _inspect_archive_members(
+    raw: bytes, format: str, *, max_member_bytes: int | None = None
+) -> tuple[tuple[str, bytes], ...]:
     """Read one bounded ordinary-file archive namespace without selecting a tool."""
+    member_limit = _MAX_MEMBER if max_member_bytes is None else max_member_bytes
+    _require(
+        type(member_limit) is int and 0 < member_limit <= _MAX_EXPANDED,
+        "archive member policy exceeds its bound",
+    )
     files: dict[str, bytes] = {}
     directories: set[str] = set()
     explicit: set[str] = set()
@@ -127,7 +134,7 @@ def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes]
             directories.add(name)
         else:
             _require(
-                name not in directories and len(payload) <= _MAX_MEMBER,
+                name not in directories and len(payload) <= member_limit,
                 "tool distribution file differs or exceeds its bound",
             )
             expanded += len(payload)
@@ -144,7 +151,7 @@ def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes]
                     not member.flag_bits & 1
                     and member.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
                     and kind in ({0, stat.S_IFDIR} if directory else {0, stat.S_IFREG})
-                    and 0 <= member.file_size <= _MAX_MEMBER,
+                    and 0 <= member.file_size <= member_limit,
                     "tool ZIP member is not a bounded ordinary file",
                 )
                 if directory:
@@ -152,7 +159,7 @@ def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes]
                     add(member.filename.removesuffix("/"), None)
                 else:
                     with archive.open(member) as stream:
-                        payload = stream.read(_MAX_MEMBER + 1)
+                        payload = stream.read(member_limit + 1)
                     _require(len(payload) == member.file_size, "tool ZIP member size differs")
                     add(member.filename, payload)
     else:
@@ -166,7 +173,7 @@ def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes]
                     (tar_member.isfile() or tar_member.isdir())
                     and not tar_member.sparse
                     and not tar_member.mode & 0o7000
-                    and 0 <= tar_member.size <= _MAX_MEMBER,
+                    and 0 <= tar_member.size <= member_limit,
                     "tool tar member is not a bounded ordinary file",
                 )
                 if tar_member.isdir():
@@ -177,7 +184,7 @@ def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes]
                     _require(tar_stream is not None, "tool tar member is unreadable")
                     assert tar_stream is not None
                     with tar_stream:
-                        payload = tar_stream.read(_MAX_MEMBER + 1)
+                        payload = tar_stream.read(member_limit + 1)
                     _require(len(payload) == tar_member.size, "tool tar member size differs")
                     add(tar_member.name, payload)
     return tuple(sorted(files.items()))
