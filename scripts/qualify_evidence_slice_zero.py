@@ -238,17 +238,24 @@ class RevokeRaceRegistrationV1:
             raise TypeError("revocation registration must be exact")
 
     def produce(
-        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
         wheel: VerifiedCandidateWheelV1,
-        *, livekit_executable: Path, livekit_sha256: str,
+        *,
+        livekit_executable: Path,
+        livekit_sha256: str,
     ) -> ObservedRevokeRaceV1:
         if self is not SCENARIO_REGISTRY_V1[10]:
             raise ValueError("revocation producer registration is not canonical")
         from scripts.revoke_race import produce_revoke_race_v1
 
         return produce_revoke_race_v1(
-            archive, identity, wheel,
-            livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+            archive,
+            identity,
+            wheel,
+            livekit_executable=livekit_executable,
+            livekit_sha256=livekit_sha256,
         )
 
 
@@ -266,17 +273,24 @@ class CapacityRolloverRegistrationV1:
             raise TypeError("capacity rollover registration must be exact")
 
     def produce(
-        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
         wheel: VerifiedCandidateWheelV1,
-        *, livekit_executable: Path, livekit_sha256: str,
+        *,
+        livekit_executable: Path,
+        livekit_sha256: str,
     ) -> ObservedCapacityRolloverV1:
         if self is not SCENARIO_REGISTRY_V1[11]:
             raise ValueError("capacity rollover producer registration is not canonical")
         from scripts.capacity_rollover import produce_capacity_rollover_v1
 
         return produce_capacity_rollover_v1(
-            archive, identity, wheel,
-            livekit_executable=livekit_executable, livekit_sha256=livekit_sha256,
+            archive,
+            identity,
+            wheel,
+            livekit_executable=livekit_executable,
+            livekit_sha256=livekit_sha256,
         )
 
 
@@ -315,7 +329,6 @@ class OverBudgetTurnRegistrationV1:
         )
 
 
-
 @dataclass(frozen=True, slots=True)
 class SpoolCrashMatrixRegistrationV1:
     """The packaged spool crash producer at its governed ordinal."""
@@ -330,7 +343,9 @@ class SpoolCrashMatrixRegistrationV1:
             raise TypeError("spool crash registration must be exact")
 
     def produce(
-        self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
         wheel: VerifiedCandidateWheelV1,
     ) -> ObservedSpoolCrashMatrixV1:
         if self is not SCENARIO_REGISTRY_V1[13]:
@@ -347,12 +362,18 @@ class SyntheticFaultRegistrationV1:
     scenario_id: ScenarioIdV1 = ScenarioIdV1.SYNTHETIC_FAULT_MATRIX
 
     def __post_init__(self) -> None:
-        if (type(self) is not SyntheticFaultRegistrationV1
-                or self.scenario_id is not ScenarioIdV1.SYNTHETIC_FAULT_MATRIX):
+        if (
+            type(self) is not SyntheticFaultRegistrationV1
+            or self.scenario_id is not ScenarioIdV1.SYNTHETIC_FAULT_MATRIX
+        ):
             raise TypeError("synthetic fault registration must be exact")
 
-    def produce(self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
-                wheel: VerifiedCandidateWheelV1) -> ObservedSyntheticFaultV1:
+    def produce(
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+    ) -> ObservedSyntheticFaultV1:
         if self is not SCENARIO_REGISTRY_V1[15]:
             raise ValueError("synthetic fault producer registration is not canonical")
         from scripts.synthetic_fault_matrix import produce_synthetic_fault_v1
@@ -373,8 +394,12 @@ class FullPurgeRegistrationV1:
         ):
             raise TypeError("full-purge registration must be exact")
 
-    def produce(self, archive: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
-                wheel: VerifiedCandidateWheelV1) -> ObservedFullPurgeV1:
+    def produce(
+        self,
+        archive: VerifiedCandidateSourceArchiveV1,
+        identity: CandidateIdentityV1,
+        wheel: VerifiedCandidateWheelV1,
+    ) -> ObservedFullPurgeV1:
         if self is not SCENARIO_REGISTRY_V1[18]:
             raise ValueError("full-purge producer registration is not canonical")
         from scripts.full_purge_cleanup import produce_full_purge_v1
@@ -417,10 +442,11 @@ class OwnedCloseFaultsRegistrationV1:
         )
 
 
-
 _UNAVAILABLE_SCENARIO_IDS_V1 = tuple(
-    scenario for scenario in _SCENARIO_IDS_V1
-    if scenario not in {
+    scenario
+    for scenario in _SCENARIO_IDS_V1
+    if scenario
+    not in {
         ScenarioIdV1.DETERMINISTIC_EQUIVALENCE,
         ScenarioIdV1.REVOKE_RACE,
         ScenarioIdV1.CAPACITY_ROLLOVER,
@@ -449,10 +475,15 @@ FULL_PURGE_REGISTRATION_V1 = FullPurgeRegistrationV1()
 OWNED_CLOSE_FAULTS_REGISTRATION_V1 = OwnedCloseFaultsRegistrationV1()
 
 _ScenarioRegistrationV1 = (
-    UnavailableScenarioRegistrationV1 | DeterministicEquivalenceRegistrationV1
-    | RevokeRaceRegistrationV1 | CapacityRolloverRegistrationV1
-    | OverBudgetTurnRegistrationV1 | SpoolCrashMatrixRegistrationV1 | FullPurgeRegistrationV1
-    | OwnedCloseFaultsRegistrationV1 | SyntheticFaultRegistrationV1
+    UnavailableScenarioRegistrationV1
+    | DeterministicEquivalenceRegistrationV1
+    | RevokeRaceRegistrationV1
+    | CapacityRolloverRegistrationV1
+    | OverBudgetTurnRegistrationV1
+    | SpoolCrashMatrixRegistrationV1
+    | FullPurgeRegistrationV1
+    | OwnedCloseFaultsRegistrationV1
+    | SyntheticFaultRegistrationV1
 )
 _REGISTRATIONS_V1: tuple[_ScenarioRegistrationV1, ...] = (
     *UNAVAILABLE_SCENARIO_REGISTRY_V1,
@@ -1053,7 +1084,8 @@ def _verify_provider_manifest(
         resource_map[name] = claimed_sha
         _append_artifact(
             artifacts,
-            logical_id=f"provider:{provider}:resource:{name}",
+            logical_id=f"provider:{provider}:resource:"
+            + hashlib.sha256(name.encode("utf-8")).hexdigest(),
             reference={"sha256": claimed_sha, "bytes": claimed_bytes},
         )
     if (
