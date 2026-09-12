@@ -369,7 +369,9 @@ def test_unavailable_registry_is_exact_closed_and_returns_nothing() -> None:
     registry = module.UNAVAILABLE_SCENARIO_REGISTRY_V1
     assert type(registry) is tuple
     assert tuple(item.scenario_id.value for item in registry) == (
-        *SCENARIO_IDS_V1[1:10], SCENARIO_IDS_V1[14], *SCENARIO_IDS_V1[16:18],
+        *SCENARIO_IDS_V1[1:10],
+        SCENARIO_IDS_V1[14],
+        *SCENARIO_IDS_V1[16:18],
     )
     assert module.validate_unavailable_scenario_registry_v1(registry) is registry
     for registration in registry:
@@ -468,8 +470,8 @@ def test_input_closure_revalidates_direct_and_transitive_artifacts_before_execut
     assert "file:governing_plan" in logical_ids
     assert "tool:git" in logical_ids
     assert "wheelhouse:build:wheel:build-1.0.whl" in logical_ids
-    assert "provider:moonshine:resource:model.bin" in logical_ids
-    assert "chrome:file:chrome.exe" in logical_ids
+    assert "provider:moonshine:resource:" + hashlib.sha256(b"model.bin").hexdigest() in logical_ids
+    assert "chrome:file:" + hashlib.sha256(b"chrome.exe").hexdigest() in logical_ids
 
 
 def test_input_closure_rejects_schema_invalid_empty_requested_scenarios(tmp_path: Path) -> None:
@@ -917,6 +919,30 @@ def test_windows_membership_resolves_child_first_kernel_order() -> None:
         (43, "descendant"),
         (44, "descendant"),
     ]
+
+
+def test_windows_membership_captures_new_child_before_rechecking_a_retained_parent() -> None:
+    runner = _load_runner()
+    kernel = _FakeWindowsKernel(runner)
+    job = _job(runner, kernel)
+    job.launch_root()
+    kernel.members = [42, 43]
+    original = kernel.query_process_identity
+    child_captured = False
+
+    def short_lived_child(handle):
+        nonlocal child_captured
+        if handle == 201 and not child_captured:
+            # Reopening a large known parent image can outlive a short child.
+            kernel.fail.add("identity:203")
+        identity = original(handle)
+        if handle == 203:
+            child_captured = True
+        return identity
+
+    kernel.query_process_identity = short_lived_child
+    snapshot = job.checkpoint("short-child")
+    assert child_captured and len(snapshot.members) == 2
 
 
 def test_windows_membership_identity_failure_retains_handle_for_job_cleanup() -> None:

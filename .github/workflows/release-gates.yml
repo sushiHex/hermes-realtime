@@ -17,6 +17,9 @@ jobs:
     steps:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -48,14 +51,25 @@ jobs:
         run: |
           set -euo pipefail
           python -c "from pathlib import Path; from scripts.release_gate import validate_disclosure_manifest; validate_disclosure_manifest(Path('src'))"
-          mkdir -p candidate wheelhouse requirements
+          mkdir -p candidate wheelhouse requirements linux-runtime/wheels
           uv build --wheel --out-dir candidate
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.qualification_build_worker import canonicalize_wheel_file
+
+          wheel = Path("candidate/hermes_realtime-0.0.3-py3-none-any.whl")
+          canonicalize_wheel_file(wheel)
+          PY
           uv export --frozen --group dev --no-emit-project --output-file requirements/linux-null-capture.txt
           python -m pip download --dest wheelhouse --require-hashes -r requirements/linux-null-capture.txt
+          uv export --frozen --no-dev --no-emit-project --output-file "$RUNNER_TEMP/linux-runtime-export.txt"
+          python -m pip download --dest linux-runtime/wheels --require-hashes -r "$RUNNER_TEMP/linux-runtime-export.txt"
+          printf '# No additional constraints\n' > linux-runtime/constraints.txt
           wheel=$(find candidate -maxdepth 1 -name '*.whl' -print -quit)
           test -n "$wheel"
           sha256sum "$wheel" | tee candidate/candidate-wheel.sha256
           printf 'hermes-realtime==0.0.3 --hash=sha256:%s\n' "$(sha256sum "$wheel" | awk '{print $1}')" > candidate/candidate-requirements.txt
+          python -m scripts.qualification_linux_producer --prepare-inputs --input-root . --source-root .
       # v7.0.1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -64,6 +78,8 @@ jobs:
             candidate/
             requirements/linux-null-capture.txt
             wheelhouse/
+            linux-runtime/
+            source/
           retention-days: 7
 
   linux-null-capture:
@@ -74,29 +90,48 @@ jobs:
     steps:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # v7.0.0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.11"
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       # v8.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: hermes-realtime-pure-candidate-wheel
           path: candidate-input
-      - name: Verify and install the candidate wheel offline
+      - name: Produce owned Linux installation and null-capture receipt
+        shell: bash
+        env:
+          HERMES_CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p linux-receipt
+          python3 -m scripts.qualification_linux_producer \
+            --input-root candidate-input --source-root . \
+            --output linux-receipt/linux-null-capture-receipt-v1.json
+      # v7.0.0; this environment is for portable tests, not the qualified proof.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      - name: Install the separate portable-check environment
         shell: bash
         run: |
           set -euo pipefail
           cd candidate-input
           sha256sum --check candidate/candidate-wheel.sha256
-          python -m venv runtime
-          runtime/bin/python -m pip install --no-index --find-links candidate --find-links wheelhouse --require-hashes -r requirements/linux-null-capture.txt -r candidate/candidate-requirements.txt
+          python -m venv portable-runtime
+          portable-runtime/bin/python -m pip install --no-index --find-links candidate --find-links wheelhouse --require-hashes -r requirements/linux-null-capture.txt -r candidate/candidate-requirements.txt
       - name: Prove Linux null capture
         shell: bash
-        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/integration/test_linux_null_capture.py
+        run: PATH="$PWD/candidate-input/portable-runtime/bin:$PATH" candidate-input/portable-runtime/bin/python -m pytest -q tests/integration/test_linux_null_capture.py
       - name: Validate portable qualification oracles
         shell: bash
-        run: PATH="$PWD/candidate-input/runtime/bin:$PATH" candidate-input/runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py tests/test_owned_close_faults.py tests/test_synthetic_fault_matrix.py
+        run: PATH="$PWD/candidate-input/portable-runtime/bin:$PATH" candidate-input/portable-runtime/bin/python -m pytest -q tests/test_evidence_protocol_oracle.py tests/test_spool_crash_qualification.py tests/test_full_purge_cleanup.py tests/test_owned_close_faults.py tests/test_synthetic_fault_matrix.py
+      # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: hermes-realtime-linux-null-capture-receipt-v1
+          path: linux-receipt/linux-null-capture-receipt-v1.json
+          retention-days: 7
 
   release-candidate:
     name: Hermetic release candidate
@@ -106,6 +141,7 @@ jobs:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -172,6 +208,7 @@ jobs:
       # v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
       # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97

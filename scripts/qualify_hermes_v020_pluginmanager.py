@@ -139,6 +139,7 @@ _RAW_IDENTIFIER_FRAGMENTS = ("/", "\\", ":", "users", "profile", "evidence", "cw
 _MAX_SNAPSHOT_FILE_BYTES = 16 * 1024 * 1024
 _MAX_SNAPSHOT_TREE_BYTES = 256 * 1024 * 1024
 _MAX_SOURCE_ARCHIVE_MEMBERS = 100_000
+_MAX_HERMES_SOURCE_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
@@ -373,12 +374,18 @@ def snapshot_protected_path(root: Path) -> dict[str, tuple[object, ...]]:
     }
 
 
-def _snapshot_single_file(path: Path) -> tuple[object, ...]:
+def _snapshot_single_file(
+    path: Path, *, maximum_bytes: int = _MAX_SNAPSHOT_FILE_BYTES
+) -> tuple[object, ...]:
+    if type(maximum_bytes) is not int or maximum_bytes <= 0:
+        raise ValueError("single file snapshot bound is invalid")
     with path.open("rb") as stream:
         digest = hashlib.sha256()
         size = 0
         while chunk := stream.read(1024 * 1024):
             size += len(chunk)
+            if size > maximum_bytes:
+                raise ValueError("single file snapshot exceeds its bound")
             digest.update(chunk)
         if os.name == "nt":
             volume, file_id, final, attributes, native_size = _native_handle_info(
@@ -589,7 +596,14 @@ def _verify_bound_wheelhouse_closure(
         raise ValueError("wheelhouse manifest schemaVersion is invalid")
     if manifest["purpose"] != "hermes_v020_pluginmanager_runtime":
         raise ValueError("wheelhouse manifest purpose is invalid")
-    if manifest["pythonVersion"] != "3.11":
+    # The standalone v1 harness historically used the minor version. Complete
+    # input binding additionally requires the admitted interpreter's full patch
+    # version; accept that canonical spelling here without weakening its check.
+    python_version = manifest["pythonVersion"]
+    if (
+        type(python_version) is not str
+        or re.fullmatch(r"3\.11(?:\.(?:0|[1-9][0-9]*))?", python_version) is None
+    ):
         raise ValueError("wheelhouse manifest Python pin is invalid")
     if manifest["platform"] != "windows_amd64":
         raise ValueError("wheelhouse manifest platform pin is invalid")
@@ -672,7 +686,7 @@ def _verify_bound_source_archive(request: ParentRequest, payload: bytes) -> None
     if (
         type(payload) is not bytes
         or not payload
-        or len(payload) > _MAX_SNAPSHOT_FILE_BYTES
+        or len(payload) > _MAX_HERMES_SOURCE_ARCHIVE_BYTES
         or type(expected) is not str
         or len(expected) != 64
         or any(character not in "0123456789abcdef" for character in expected)
@@ -842,7 +856,9 @@ class WindowsRetainedImmutableInputs:
         self._retained[path] = (handle, seal)
         return handle
 
-    def read_retained_bytes(self, path: Path) -> bytes:
+    def read_retained_bytes(
+        self, path: Path, *, maximum_bytes: int = _MAX_SNAPSHOT_FILE_BYTES
+    ) -> bytes:
         """Read and digest the exact bytes consumed through the retained file handle."""
         if self._closed:
             raise RuntimeError("retained immutable inputs are closed")
@@ -853,7 +869,12 @@ class WindowsRetainedImmutableInputs:
         handle, seal = retained
         expected_size = _exact_int(seal[3])
         expected_digest = seal[4]
-        if type(expected_digest) is not str or expected_size > _MAX_SNAPSHOT_FILE_BYTES:
+        if (
+            type(maximum_bytes) is not int
+            or maximum_bytes <= 0
+            or type(expected_digest) is not str
+            or expected_size > maximum_bytes
+        ):
             raise ValueError("retained file seal is invalid")
         self._validate_handle(resolved, handle, seal)
         position = ctypes.c_longlong()
@@ -938,7 +959,14 @@ class WindowsRetainedImmutableInputs:
                 )
                 consumed_seal: tuple[object, ...] | None
                 if owner is None:
-                    consumed_seal = _snapshot_single_file(resolved)
+                    consumed_seal = _snapshot_single_file(
+                        resolved,
+                        maximum_bytes=(
+                            _MAX_HERMES_SOURCE_ARCHIVE_BYTES
+                            if path == self._request.hermes_source_archive
+                            else _MAX_SNAPSHOT_FILE_BYTES
+                        ),
+                    )
                 else:
                     relative = resolved.relative_to(owner).as_posix()
                     consumed_seal = self._inventories[owner].get(relative)
@@ -1389,7 +1417,9 @@ def validate_parent_request(value: ParentRequest) -> ParentRequest:
     return value
 
 
-def _new_source_workspace_watcher(kernel: object, root_handle: int) -> WindowsRetainedImmutableInputs:
+def _new_source_workspace_watcher(
+    kernel: object, root_handle: int
+) -> WindowsRetainedImmutableInputs:
     """Adapt the harness's retained journal to the generic owned-tree authority."""
 
     watcher = WindowsRetainedImmutableInputs.__new__(WindowsRetainedImmutableInputs)
@@ -1411,7 +1441,7 @@ def _extract_official_source_archive(
     request: ParentRequest, payload: bytes
 ) -> _WindowsSourceWorkspaceAuthorityV1:
     """Parse exact retained bytes, then create and retain a private native source root."""
-    if type(payload) is not bytes or not payload or len(payload) > _MAX_SNAPSHOT_FILE_BYTES:
+    if type(payload) is not bytes or not payload or len(payload) > _MAX_HERMES_SOURCE_ARCHIVE_BYTES:
         raise ValueError("Hermes source archive payload is invalid")
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
         members = _validated_archive_members(archive)
@@ -1446,7 +1476,12 @@ def _extract_official_source_archive(
 
 
 def build_child_environment(
-    *, base: Mapping[str, str], scripts: Path, profile: Path, temporary: Path
+    *,
+    base: Mapping[str, str],
+    scripts: Path,
+    profile: Path,
+    temporary: Path,
+    home_proxy: Path,
 ) -> dict[str, str]:
     if type(base) is not dict or any(
         type(k) is not str or type(v) is not str for k, v in base.items()
@@ -1457,19 +1492,25 @@ def build_child_environment(
         "WINDIR",
         "COMSPEC",
         "USERNAME",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
     )
     if any(not base.get(key) for key in required):
         raise ValueError("child environment lacks Windows identity")
-    if not temporary.is_absolute() or not temporary.is_dir():
-        raise ValueError("child temporary directory is invalid")
+    if (
+        not temporary.is_absolute()
+        or not temporary.is_dir()
+        or not home_proxy.is_absolute()
+        or not home_proxy.is_dir()
+        or home_proxy in {profile, temporary}
+    ):
+        raise ValueError("child disposable directory is invalid")
     keep = {key: base[key] for key in required}
     keep.update(
         {
             "PATH": str(scripts) + os.pathsep + str(Path(base["SYSTEMROOT"]) / "System32"),
             "HERMES_HOME": str(profile.resolve(strict=True)),
+            "HOME": str(home_proxy.resolve(strict=True)),
+            "LOCALAPPDATA": str(home_proxy.resolve(strict=True)),
+            "USERPROFILE": str(home_proxy.resolve(strict=True)),
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
@@ -1501,10 +1542,11 @@ def _canonical_stage(payload: bytes, keys: set[str]) -> dict[str, object]:
 
 
 _DISABLED_CHILD = r"""import hashlib,importlib.metadata,json,pathlib,sys
-source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True)
+source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True); packages=pathlib.Path(sys.argv[3]).resolve(strict=True)
 if any(n=="hermes_cli" or n.startswith("hermes_cli.") for n in sys.modules): raise RuntimeError("preloaded hermes_cli")
-if sys.stdin is None or sys.stdin.isatty() or sys.stdin.read(1)!="": raise RuntimeError("stdin not EOF")
-sys.path.insert(0,str(source))
+stdin_closed=sys.stdin is None or sys.stdin.read(1)==""
+if not stdin_closed: raise RuntimeError("stdin not EOF")
+sys.path.insert(0,str(packages)); sys.path.insert(0,str(source))
 if sys.path.count(str(source))!=1: raise RuntimeError("source insertion")
 from hermes_cli import plugins as hp
 from hermes_cli.config import get_config_path
@@ -1524,12 +1566,13 @@ finally: sys.setprofile(None)
 loaded=m._plugins.get("hermes-realtime")
 ok=loaded is not None and loaded.manifest.source=="entrypoint" and loaded.enabled is False and loaded.module is None and isinstance(loaded.error,str) and bool(loaded.error)
 side=any(n=="hermes_realtime" or n.startswith("hermes_realtime.") for n in sys.modules) or bool(calls)
-print(json.dumps({"discovered":bool(ok),"importOrRegistration":bool(side),"sourceOriginSha256":hashlib.sha256(str(source).encode()).hexdigest()},sort_keys=True,separators=(",",":")))"""
+sys.stdout.buffer.write(json.dumps({"discovered":bool(ok),"importOrRegistration":bool(side),"sourceOriginSha256":hashlib.sha256(str(source).encode()).hexdigest()},sort_keys=True,separators=(",",":")).encode()+b"\n")"""
 
-_ENABLE_CHILD = r"""import copy,hashlib,json,os,pathlib,sys,yaml
-source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True); config=profile/"config.yaml"
+_ENABLE_CHILD = r"""import contextlib,copy,hashlib,json,os,pathlib,sys
+source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True); packages=pathlib.Path(sys.argv[3]).resolve(strict=True); config=profile/"config.yaml"
 if any(n=="hermes_cli" or n.startswith("hermes_cli.") for n in sys.modules): raise RuntimeError("preloaded hermes_cli")
-if sys.stdin is None or sys.stdin.isatty() or sys.stdin.read(1)!="": raise RuntimeError("stdin not EOF")
+stdin_closed=sys.stdin is None or sys.stdin.read(1)==""
+if not stdin_closed: raise RuntimeError("stdin not EOF")
 def tree():
  result={}; seen=set()
  for base,dirs,files in os.walk(profile,followlinks=False):
@@ -1545,7 +1588,7 @@ def tree():
    if folded in seen: raise RuntimeError("profile case collision")
    seen.add(folded); s=p.stat(); result[rel]=["directory",s.st_dev,s.st_ino]
  return result
-tree_before=tree(); sys.path.insert(0,str(source))
+tree_before=tree(); sys.path.insert(0,str(packages)); sys.path.insert(0,str(source)); import yaml
 if sys.path.count(str(source))!=1: raise RuntimeError("source insertion")
 before=yaml.safe_load(config.read_text(encoding="utf-8")) if config.exists() else {}
 if type(before) is not dict or type(before.get("plugins",{})) is not dict: raise RuntimeError("plugins shape")
@@ -1562,19 +1605,21 @@ for obj in (hm,hp,pathlib.Path(sys.modules[hp.PluginContext.__module__].__file__
  p=pathlib.Path(obj.__file__) if hasattr(obj,"__file__") else obj
  if not p.resolve(strict=True).is_relative_to(source): raise RuntimeError("official enable origin")
 if pathlib.Path(get_hermes_home()).resolve()!=profile or pathlib.Path(get_config_path()).resolve()!=config: raise RuntimeError("profile resolution")
-try: result=hm.main()
+try:
+ with contextlib.redirect_stdout(sys.stderr): result=hm.main()
 except SystemExit as exc: result=exc.code
 if result not in (None,0): raise RuntimeError("enable exit")
-after=yaml.safe_load(config.read_text(encoding="utf-8")) or {}; expected=copy.deepcopy(frozen); plugins=expected.setdefault("plugins",{}); old=list(plugins.get("enabled",[])); plugins["enabled"]=old+["hermes-realtime"]; plugins.setdefault("entries",{}).setdefault("hermes-realtime",{})["allow_tool_override"]=False
+after=yaml.safe_load(config.read_text(encoding="utf-8")) or {}; expected=copy.deepcopy(frozen); expected["_config_version"]=33; plugins=expected.setdefault("plugins",{}); old=list(plugins.get("enabled",[])); plugins["enabled"]=old+["hermes-realtime"]; plugins["disabled"]=[]; plugins.setdefault("entries",{}).setdefault("hermes-realtime",{})["allow_tool_override"]=False
 tree_after=tree(); changed={name for name in set(tree_before)|set(tree_after) if tree_before.get(name)!=tree_after.get(name)}
-print(json.dumps({"argvExact":sys.argv==["hermes","plugins","enable","hermes-realtime","--no-allow-tool-override"],"exactConfigDelta":after==expected and old.count("hermes-realtime")==0 and changed=={"config.yaml"},"stdinClosed":sys.stdin is not None and not sys.stdin.isatty()},sort_keys=True,separators=(",",":")))"""
+sys.stdout.buffer.write(json.dumps({"argvExact":sys.argv==["hermes","plugins","enable","hermes-realtime","--no-allow-tool-override"],"exactConfigDelta":after==expected and old.count("hermes-realtime")==0 and changed=={"config.yaml"},"stdinClosed":stdin_closed},sort_keys=True,separators=(",",":")).encode()+b"\n")"""
 
 _ENABLED_CHILD = r"""import hashlib,importlib.metadata,json,pathlib,sys
-source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True); venv=pathlib.Path(sys.argv[3]).resolve(strict=True)
+source=pathlib.Path(sys.argv[1]).resolve(strict=True); profile=pathlib.Path(sys.argv[2]).resolve(strict=True); packages=pathlib.Path(sys.argv[3]).resolve(strict=True)
 expected_dist_info=json.loads(sys.argv[4])
 if any(n=="hermes_cli" or n.startswith("hermes_cli.") for n in sys.modules): raise RuntimeError("preloaded hermes_cli")
-if sys.stdin is None or sys.stdin.isatty() or sys.stdin.read(1)!="": raise RuntimeError("stdin not EOF")
-sys.path.insert(0,str(source))
+stdin_closed=sys.stdin is None or sys.stdin.read(1)==""
+if not stdin_closed: raise RuntimeError("stdin not EOF")
+sys.path.insert(0,str(packages)); sys.path.insert(0,str(source))
 if sys.path.count(str(source))!=1: raise RuntimeError("source insertion")
 from hermes_cli import plugins as hp
 from hermes_cli.config import get_config_path
@@ -1589,7 +1634,7 @@ dist=importlib.metadata.distribution("hermes-realtime"); calls=[]
 dist_module=pathlib.Path(dist.locate_file("hermes_realtime/hermes_plugin.py")).resolve(strict=True)
 dist_metadata=pathlib.Path(dist.locate_file("hermes_realtime-0.0.3.dist-info/METADATA")).resolve(strict=True)
 dist_entrypoints=pathlib.Path(dist.locate_file("hermes_realtime-0.0.3.dist-info/entry_points.txt")).resolve(strict=True)
-if not all(p.is_relative_to(venv) for p in (dist_module,dist_metadata,dist_entrypoints)): raise RuntimeError("distribution origin")
+if not all(p.is_relative_to(packages) for p in (dist_module,dist_metadata,dist_entrypoints)): raise RuntimeError("distribution origin")
 if dist.version!="0.0.3" or len(points)!=1 or points[0] not in dist.entry_points: raise RuntimeError("distribution ownership")
 dist_info_files=sorted(str(item).replace("\\","/") for item in (dist.files or ()))
 if not expected_dist_info or len(expected_dist_info)!=len(set(expected_dist_info)): raise RuntimeError("expected dist-info inventory")
@@ -1605,7 +1650,7 @@ finally: sys.setprofile(None)
 loaded=m._plugins.get("hermes-realtime"); module=loaded.module if loaded else None; origin=pathlib.Path(module.__file__).resolve(strict=True) if module else pathlib.Path("missing")
 ok=loaded is not None and type(loaded).__module__==hp.__name__ and loaded.enabled is True and loaded.error is None and loaded.module is module and origin==dist_module
 registered=ok and len(calls)==1 and calls[0][0] is module.register.__code__ and type(calls[0][1]) is hp.PluginContext and calls[0][3] is m and pathlib.Path(calls[0][2].co_filename).resolve(strict=True).is_relative_to(source) and module.get_dispatcher() is not None and module.get_runtime() is not None
-print(json.dumps({"contextObserved":bool(registered),"discovered":bool(ok),"distributionVersion":dist.version,"distEntryPointsContentSha256":hashlib.sha256(dist_entrypoints.read_bytes()).hexdigest(),"distInfoInventorySha256":hashlib.sha256(json.dumps(dist_inventory,sort_keys=True,separators=(",",":")).encode()).hexdigest(),"distMetadataContentSha256":hashlib.sha256(dist_metadata.read_bytes()).hexdigest(),"distOriginSha256":hashlib.sha256(str(dist_metadata.parent).encode()).hexdigest(),"moduleContentSha256":hashlib.sha256(origin.read_bytes()).hexdigest(),"moduleOriginSha256":hashlib.sha256(str(origin).encode()).hexdigest()},sort_keys=True,separators=(",",":")))"""
+sys.stdout.buffer.write(json.dumps({"contextObserved":bool(registered),"discovered":bool(ok),"distributionVersion":dist.version,"distEntryPointsContentSha256":hashlib.sha256(dist_entrypoints.read_bytes()).hexdigest(),"distInfoInventorySha256":hashlib.sha256(json.dumps(dist_inventory,sort_keys=True,separators=(",",":")).encode()).hexdigest(),"distMetadataContentSha256":hashlib.sha256(dist_metadata.read_bytes()).hexdigest(),"distOriginSha256":hashlib.sha256(str(dist_metadata.parent).encode()).hexdigest(),"moduleContentSha256":hashlib.sha256(origin.read_bytes()).hexdigest(),"moduleOriginSha256":hashlib.sha256(str(origin).encode()).hexdigest()},sort_keys=True,separators=(",",":")).encode()+b"\n")"""
 
 
 def _qualify_governed_request_body(
@@ -1642,12 +1687,19 @@ def _qualify_governed_request_body(
     venv = request.workspace / (venv_name or ("pluginmanager-venv-" + secrets.token_hex(16)))
     cwd = request.workspace / "child-cwd"
     temporary = request.workspace / "temp"
+    home_proxy = request.workspace / "home-proxy"
     cwd.mkdir(exist_ok=False)
     temporary.mkdir(exist_ok=False)
+    home_proxy.mkdir(exist_ok=False)
+    home_proxy_before = snapshot_protected_path(home_proxy)
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     base = dict(os.environ if base_environment is None else base_environment)
     environment = build_child_environment(
-        base=base, scripts=python.parent, profile=request.profile, temporary=temporary
+        base=base,
+        scripts=python.parent,
+        profile=request.profile,
+        temporary=temporary,
+        home_proxy=home_proxy,
     )
     command_hash = hashlib.sha256()
 
@@ -1661,6 +1713,7 @@ def _qualify_governed_request_body(
                 ("evidence", request.evidence_root),
             )
         }
+        stage_home_before = snapshot_protected_path(home_proxy)
         failures: list[BaseException] = []
         output = b""
         try:
@@ -1682,7 +1735,13 @@ def _qualify_governed_request_body(
                     ("evidence", request.evidence_root),
                 )
             }
-            if stage_before != stage_after or stage_after != before:
+            stage_home_after = snapshot_protected_path(home_proxy)
+            if (
+                stage_before != stage_after
+                or stage_after != before
+                or stage_home_before != stage_home_after
+                or stage_home_after != home_proxy_before
+            ):
                 raise RuntimeError("protected root changed during PluginManager child")
         except BaseException as error:
             failures.append(error)
@@ -1754,7 +1813,7 @@ def _qualify_governed_request_body(
                     _DISABLED_CHILD,
                     str(hermes_source),
                     str(request.profile),
-                    str(venv),
+                    str(venv / "Lib" / "site-packages"),
                 )
             ),
             {"discovered", "importOrRegistration", "sourceOriginSha256"},
@@ -1768,7 +1827,7 @@ def _qualify_governed_request_body(
                     _ENABLE_CHILD,
                     str(hermes_source),
                     str(request.profile),
-                    str(venv),
+                    str(venv / "Lib" / "site-packages"),
                 )
             ),
             {"argvExact", "exactConfigDelta", "stdinClosed"},
@@ -1782,7 +1841,7 @@ def _qualify_governed_request_body(
                     _ENABLED_CHILD,
                     str(hermes_source),
                     str(request.profile),
-                    str(venv),
+                    str(venv / "Lib" / "site-packages"),
                     json.dumps(expected_immutable_dist_info, separators=(",", ":")),
                 )
             ),
@@ -1803,9 +1862,8 @@ def _qualify_governed_request_body(
         expected_source_origin = hashlib.sha256(
             str(hermes_source.resolve(strict=True)).encode()
         ).hexdigest()
-        expected_module = (
-            venv / "Lib" / "site-packages" / "hermes_realtime" / "hermes_plugin.py"
-        ).resolve(strict=False)
+        packages = (venv / "Lib" / "site-packages").resolve(strict=False)
+        expected_module = (packages / "hermes_realtime" / "hermes_plugin.py").resolve(strict=False)
         expected_module_origin = hashlib.sha256(str(expected_module).encode()).hexdigest()
         with zipfile.ZipFile(request.candidate_wheel) as candidate_archive:
             expected_module_content = hashlib.sha256(
@@ -1830,9 +1888,7 @@ def _qualify_governed_request_body(
                 candidate_archive.read(entrypoint_names[0])
             ).hexdigest()
             dist_info_name = metadata_names[0].split("/", 1)[0]
-            expected_dist_info = (venv / "Lib" / "site-packages" / dist_info_name).resolve(
-                strict=False
-            )
+            expected_dist_info = (packages / dist_info_name).resolve(strict=False)
             expected_dist_origin = hashlib.sha256(str(expected_dist_info).encode()).hexdigest()
             dist_info_inventory = {
                 name: hashlib.sha256(candidate_archive.read(name)).hexdigest()
@@ -1951,7 +2007,10 @@ def _qualify_governed_request(
                 revalidate_inputs()
                 retained.assert_unchanged()
 
-            source_archive_payload = retained.read_retained_bytes(request.hermes_source_archive)
+            source_archive_payload = retained.read_retained_bytes(
+                request.hermes_source_archive,
+                maximum_bytes=_MAX_HERMES_SOURCE_ARCHIVE_BYTES,
+            )
             wheelhouse_manifest_payload = retained.read_retained_bytes(request.wheelhouse_manifest)
             facts = _qualify_governed_request_unretained(
                 request,

@@ -1,12 +1,13 @@
 # ruff: noqa: E501
 """Candidate-bound, in-memory Git source archive authority.
 
-The retained seal attests the selected ``git.exe`` file object only, under the
-protected Program Files runtime and a fixed sanitized environment.  It does not
-attest dependent/dynamic DLL or helper closure, broader Git runtime provenance,
-or isolation from a hostile process with the same Windows SID/interpreter
-authority.  This Python-private capability boundary also prevents ordinary
-callers from receiving archive bytes or reusable checkout-path authority.
+Ordinary pins attest the selected ``git.exe`` file object under the protected
+Program Files runtime; they do not attest dependent DLL/helper closure or broader
+runtime provenance. The owned-tool entry point instead requires the live owner of
+its complete admitted distribution tree. Both use the existing native Git child
+owner and fixed sanitized environment. Neither isolates a hostile controller or
+OS, proves an independent build, or supplies durable-journal recovery. The opaque
+archive prevents ordinary callers from substituting bytes or checkout authority.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
 try:
@@ -34,6 +35,11 @@ except ModuleNotFoundError as error:
     if error.name != "task13_artifact_orchestrator":
         raise
     from scripts.task13_artifact_orchestrator import CandidateIdentityV1
+
+if TYPE_CHECKING:
+    from scripts.qualification_tool_distributions import ToolDistributionMetadataV1
+    from scripts.qualification_tool_environment import ImmutableToolEnvironmentV1
+
 
 _MAX_ARCHIVE_BYTES = 15 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
@@ -138,6 +144,9 @@ class VerifiedCandidateSourceArchiveV1:
 _RECORDS: WeakKeyDictionary[VerifiedCandidateSourceArchiveV1, _VerifiedArchiveRecord] = (
     WeakKeyDictionary()
 )
+_TOOL_CAPTURES: WeakKeyDictionary[
+    VerifiedCandidateSourceArchiveV1, tuple[ToolDistributionMetadataV1, ...]
+] = WeakKeyDictionary()
 
 
 def verified_candidate_source_archive_metadata(
@@ -167,6 +176,16 @@ def _archive_bytes_for_consumer(
     if record.identity != identity:
         raise CandidateSourceArchiveError("archive token candidate identity differs")
     return record.archive
+
+
+def _archive_tool_capture_for_consumer(
+    token: VerifiedCandidateSourceArchiveV1, identity: CandidateIdentityV1,
+) -> tuple[ToolDistributionMetadataV1, ...]:
+    """Completed capture provenance; does not keep removed tool trees executable."""
+    _archive_bytes_for_consumer(token, identity)
+    if token not in _TOOL_CAPTURES:
+        raise CandidateSourceArchiveError("archive has no complete tool capture provenance")
+    return _TOOL_CAPTURES[token]
 
 
 class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
@@ -1076,9 +1095,32 @@ class _RetainedFileV1:
             self._handle = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _OwnedGitFileBindingV1:
+    path: Path
+    sha256: str
+    version: str
+    link_count: int = 1
+    max_bytes: int = _MAX_EXECUTABLE_BYTES
+
+
 class _RetainedGitExecutableV1(_RetainedFileV1):
     def __init__(self, pin: GitExecutablePinV1) -> None:
         _validate_public_git_location(pin.path)
+        self._owned_tools: ImmutableToolEnvironmentV1 | None = None
+        self._initialize_pin(pin)
+
+    @classmethod
+    def from_owned_tools(cls, tools: ImmutableToolEnvironmentV1) -> _RetainedGitExecutableV1:
+        from scripts.qualification_tool_environment import _tool_image_for_consumer
+
+        path, digest, version = _tool_image_for_consumer(tools, "git")
+        retained = object.__new__(cls)
+        retained._owned_tools = tools
+        retained._initialize_pin(_OwnedGitFileBindingV1(path, digest, "git version " + version))
+        return retained
+
+    def _initialize_pin(self, pin: GitExecutablePinV1 | _OwnedGitFileBindingV1) -> None:
         self.executable = str(pin.path)
         self._pin = pin
         self._max_seal_bytes = pin.max_bytes
@@ -1128,6 +1170,12 @@ class _RetainedGitExecutableV1(_RetainedFileV1):
             raise CandidateSourceArchiveError(f"{label} Git executable handle seal changed")
 
     def assert_sealed(self) -> None:
+        if self._owned_tools is not None:
+            from scripts.qualification_tool_environment import _tool_image_for_consumer
+
+            path, digest, version = _tool_image_for_consumer(self._owned_tools, "git")
+            if (path, digest, "git version " + version) != (self._pin.path, self._pin.sha256, self._pin.version):
+                raise CandidateSourceArchiveError("owned Git distribution binding changed")
         self._assert_complete_seal(self._seal_from_handle(self._handle), "retained")
         fresh = _RetainedFileV1(self._pin.path)
         failure: BaseException | None = None
@@ -1152,6 +1200,7 @@ def _retained_git_executable_for_test(path: Path) -> _RetainedGitExecutableV1:
     if path.name.casefold() != "git.exe":
         raise CandidateSourceArchiveError("disposable retained file must be git.exe")
     retained = object.__new__(_RetainedGitExecutableV1)
+    retained._owned_tools = None
     _RetainedFileV1.__init__(retained, path)
     try:
         info = retained._file_information(retained._handle)
@@ -1229,10 +1278,16 @@ def _clean_git_environment(executable: str) -> dict[str, str]:
 
 
 class _GitExecutor:
-    def __init__(self, retained: _RetainedGitExecutableV1, root: Path) -> None:
+    def __init__(
+        self,
+        retained: _RetainedGitExecutableV1,
+        root: Path,
+        attribute_source: str | None = None,
+    ) -> None:
         self._retained = retained
         self._root = root
         self._root_text = str(root)
+        self._attribute_source = attribute_source
 
     def run(self, *arguments: str, stdout_limit: int = _MAX_ARCHIVE_BYTES) -> bytes:
         self._retained.assert_sealed()
@@ -1256,6 +1311,9 @@ class _GitExecutor:
             self._root_text,
         )
         command = (self._retained.executable, *fixed, *arguments)
+        environment = _clean_git_environment(self._retained.executable)
+        if self._attribute_source is not None:
+            environment["GIT_ATTR_SOURCE"] = self._attribute_source
         primary: BaseException | None = None
         result: bytes | None = None
         try:
@@ -1263,7 +1321,7 @@ class _GitExecutor:
                 _NativeWin32GitKernel(),
                 self._retained.executable,
                 self._root,
-                _clean_git_environment(self._retained.executable),
+                environment,
             ).run(command, stdout_limit=stdout_limit)
         except BaseException as error:
             primary = error
@@ -1343,11 +1401,6 @@ def _require_root_and_identity(
         _text(top[:-1], "checkout root")
     ) != _normal_final_path(str(root)):
         raise CandidateSourceArchiveError("candidate must be the exact checkout root")
-    status = executor.run(
-        "status", "--porcelain=v1", "-z", "--untracked-files=no", stdout_limit=1024
-    )
-    if status:
-        raise CandidateSourceArchiveError(f"candidate has tracked index/worktree drift: {status!r}")
     head = _git_line(executor, "rev-parse", "--verify", "HEAD^{commit}", label="candidate head")
     tree = _git_line(executor, "rev-parse", "--verify", "HEAD^{tree}", label="candidate tree")
     base = _git_line(
@@ -1363,11 +1416,20 @@ def _require_root_and_identity(
         "--full-index",
         "--no-renames",
         "--no-ext-diff",
+        "--no-textconv",
         f"{base}..{head}",
     )
     captured = CandidateIdentityV1(head, tree, base, hashlib.sha256(diff).hexdigest())
     if captured != supplied:
         raise CandidateSourceArchiveError("candidate identity drifted")
+
+
+def _require_clean_checkout(executor: _GitExecutor) -> None:
+    status = executor.run(
+        "status", "--porcelain=v1", "-z", "--untracked-files=no", stdout_limit=1024
+    )
+    if status:
+        raise CandidateSourceArchiveError(f"candidate has tracked index/worktree drift: {status!r}")
 
 
 def _git_object(
@@ -1471,27 +1533,33 @@ def _walk_tree(
     return files, directories
 
 
-def _attribute(executor: _GitExecutor, path: str) -> tuple[str, str]:
+def _attribute(executor: _GitExecutor, tree: str, path: str) -> tuple[str, str]:
     answer = executor.run(
         "check-attr",
-        "--cached",
+        f"--source={tree}",
         "-z",
         "export-ignore",
         "export-subst",
+        "filter",
         "--",
         path,
         stdout_limit=8192,
     )
     fields = answer.split(b"\0")
-    if len(fields) != 7 or fields[-1] != b"":
+    if len(fields) != 10 or fields[-1] != b"":
         raise CandidateSourceArchiveError("committed attribute output is malformed")
     if (
         _text(fields[0], "attribute path") != path
         or _text(fields[1], "attribute name") != "export-ignore"
         or _text(fields[3], "attribute path") != path
         or _text(fields[4], "attribute name") != "export-subst"
+        or _text(fields[6], "attribute path") != path
+        or _text(fields[7], "attribute name") != "filter"
     ):
         raise CandidateSourceArchiveError("committed attribute output is unexpected")
+    clean_filter = _text(fields[8], "attribute value")
+    if clean_filter not in {"unset", "unspecified"}:
+        raise CandidateSourceArchiveError("committed clean/process filter is forbidden")
     return _text(fields[2], "attribute value"), _text(fields[5], "attribute value")
 
 
@@ -1501,7 +1569,7 @@ def _visible_manifest(
     files, directories = _walk_tree(executor, tree)
     ignored: set[str] = set()
     for path in sorted({*files, *(item for item in directories if item)}):
-        export_ignore, export_subst = _attribute(executor, path)
+        export_ignore, export_subst = _attribute(executor, tree, path)
         if export_ignore not in {"set", "unset", "unspecified"} or export_subst not in {
             "set",
             "unset",
@@ -1925,7 +1993,7 @@ def _verify_reachable_objects(executor: _GitExecutor, head: str) -> None:
         )
 
 
-def _verify_retained_version(executor: _GitExecutor, pin: GitExecutablePinV1) -> None:
+def _verify_retained_version(executor: _GitExecutor, pin: GitExecutablePinV1 | _OwnedGitFileBindingV1) -> None:
     observed = executor.run("--version", stdout_limit=4096)
     expected = pin.version.encode("ascii", "strict") + b"\n"
     if observed != expected:
@@ -1951,10 +2019,39 @@ def capture_candidate_source_archive(
         raise TypeError("candidate archive inputs require exact V1 types")
     _validate_supplied_identity(identity)
     retained = _RetainedGitExecutableV1(git_pin)
+    return _capture_retained_source_archive(checkout_root, identity, git_pin, retained)
+
+
+def capture_candidate_source_archive_from_tools(
+    checkout_root: Path,
+    identity: CandidateIdentityV1,
+    tools: ImmutableToolEnvironmentV1,
+) -> VerifiedCandidateSourceArchiveV1:
+    """Capture through the existing Git owner while its complete tool tree is sealed."""
+    if type(checkout_root) is not _PATH_TYPE or type(identity) is not CandidateIdentityV1:
+        raise TypeError("owned-tool archive inputs require exact V1 types")
+    _validate_supplied_identity(identity)
+    from scripts.qualification_tool_environment import tool_environment_metadata
+
+    distributions = tool_environment_metadata(tools)
+    retained = _RetainedGitExecutableV1.from_owned_tools(tools)
+    captured = _capture_retained_source_archive(checkout_root, identity, retained._pin, retained)
+    if tool_environment_metadata(tools) != distributions:
+        raise CandidateSourceArchiveError("archive tool capture environment changed")
+    _TOOL_CAPTURES[captured] = distributions
+    return captured
+
+
+def _capture_retained_source_archive(
+    checkout_root: Path,
+    identity: CandidateIdentityV1,
+    git_pin: GitExecutablePinV1 | _OwnedGitFileBindingV1,
+    retained: _RetainedGitExecutableV1,
+) -> VerifiedCandidateSourceArchiveV1:
     minted: VerifiedCandidateSourceArchiveV1 | None = None
     failure: BaseException | None = None
     try:
-        executor = _GitExecutor(retained, checkout_root)
+        executor = _GitExecutor(retained, checkout_root, identity.candidate_head_oid)
         _verify_retained_version(executor, git_pin)
         _require_root_and_identity(executor, checkout_root, identity)
         metadata_authority = _GitMetadataAuthority(executor, checkout_root)
@@ -1968,6 +2065,7 @@ def capture_candidate_source_archive(
             metadata_authority.revalidate()
             _require_root_and_identity(executor, checkout_root, identity)
             _refuse_info_attributes(executor, metadata_authority)
+            _require_clean_checkout(executor)
             archive = executor.run(
                 "archive", "--format=tar", f"--prefix={_PREFIX}/", identity.candidate_head_oid
             )
@@ -1978,10 +2076,12 @@ def capture_candidate_source_archive(
             metadata_authority.revalidate()
             _require_root_and_identity(executor, checkout_root, identity)
             _refuse_info_attributes(executor, metadata_authority)
+            _require_clean_checkout(executor)
         archive = _require_equal_repeated_archives(archives[0], archives[1])
         metadata_authority.revalidate()
         _require_root_and_identity(executor, checkout_root, identity)
         _refuse_info_attributes(executor, metadata_authority)
+        _require_clean_checkout(executor)
         metadata = CandidateSourceArchiveMetadataV1(
             identity.candidate_head_oid,
             identity.candidate_tree_oid,

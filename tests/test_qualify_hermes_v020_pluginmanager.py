@@ -9,6 +9,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import threading
@@ -75,14 +76,18 @@ def test_source_archive_authority_is_shared_without_pluginmanager_policy_couplin
     module = runner()
 
     assert authority.SourceArchivePolicyV1.__module__ == "scripts.source_archive_authority"
-    assert authority.WindowsSourceWorkspaceAuthorityV1.__module__ == "scripts.source_archive_authority"
+    assert (
+        authority.WindowsSourceWorkspaceAuthorityV1.__module__ == "scripts.source_archive_authority"
+    )
     assert "ParentRequest" not in vars(authority)
     assert "PluginManager" not in vars(authority)
     assert module._validated_archive_members.__module__ == "scripts.source_archive_authority"
     assert module._ExtractedSourceV1 is authority.WindowsSourceWorkspaceAuthorityV1
-    assert tuple(
-        inspect.signature(authority.WindowsSourceWorkspaceAuthorityV1).parameters
-    ) == ("workspace", "policy", "watcher_factory")
+    assert tuple(inspect.signature(authority.WindowsSourceWorkspaceAuthorityV1).parameters) == (
+        "workspace",
+        "policy",
+        "watcher_factory",
+    )
     expected_policy = authority.SourceArchivePolicyV1(
         prefix="hermes-agent-v0.20.0",
         workspace_child=".pluginmanager-hermes-v020-source",
@@ -93,6 +98,27 @@ def test_source_archive_authority_is_shared_without_pluginmanager_policy_couplin
         error_label="Hermes source archive",
     )
     assert expected_policy == module._SOURCE_ARCHIVE_POLICY
+
+
+def test_hermes_source_archive_container_has_a_separate_bound(tmp_path: Path, monkeypatch) -> None:
+    module = runner()
+    request, files = write_request_inputs(module, tmp_path)
+    payload = files["archive"].read_bytes()
+    assert len(payload) > 4
+    request = request._replace(hermes_source_archive_sha256=hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(module, "_MAX_SNAPSHOT_FILE_BYTES", 4)
+    monkeypatch.setattr(module, "_MAX_HERMES_SOURCE_ARCHIVE_BYTES", len(payload))
+
+    module._verify_bound_source_archive(request, payload)
+    extracted = module._extract_official_source_archive(request, payload)
+    extracted.close(cleanup=True)
+    with pytest.raises(ValueError, match="digest is invalid"):
+        module._verify_bound_source_archive(request, payload + b"x")
+
+    archive = files["archive"]
+    with pytest.raises(ValueError, match="exceeds its bound"):
+        module._snapshot_single_file(archive, maximum_bytes=4)
+    assert module._snapshot_single_file(archive, maximum_bytes=len(payload))[0] == "file"
 
 
 def valid_result() -> dict[str, object]:
@@ -320,15 +346,21 @@ def test_allowlisted_environment_scrubs_all_ambient_hermes_python_and_profile_se
         "HERMES_BUNDLED_PLUGINS": "hostile",
     }
     temporary = (tmp_path / "workspace" / "temp").resolve()
+    home_proxy = (tmp_path / "workspace" / "home-proxy").resolve()
     temporary.mkdir()
+    home_proxy.mkdir()
     environment = module.build_child_environment(
-        base=base, scripts=scripts, profile=profile, temporary=temporary
+        base=base,
+        scripts=scripts,
+        profile=profile,
+        temporary=temporary,
+        home_proxy=home_proxy,
     )
     assert set(environment) == {
         "COMSPEC",
-        "HOMEDRIVE",
-        "HOMEPATH",
         "HERMES_HOME",
+        "HOME",
+        "LOCALAPPDATA",
         "PATH",
         "PIP_DISABLE_PIP_VERSION_CHECK",
         "PIP_NO_COLOR",
@@ -343,6 +375,8 @@ def test_allowlisted_environment_scrubs_all_ambient_hermes_python_and_profile_se
         "WINDIR",
     }
     assert environment["HERMES_HOME"] == str(profile)
+    assert environment["HOME"] == environment["LOCALAPPDATA"] == str(home_proxy)
+    assert environment["USERPROFILE"] == str(home_proxy)
     assert environment["PATH"].split(__import__("os").pathsep)[0] == str(scripts)
     assert environment["TEMP"] == environment["TMP"] == str(temporary)
 
@@ -357,8 +391,177 @@ def test_child_programs_use_nonmutating_profile_observation_and_exact_eof_checks
     assert "sys.setprofile" in module._ENABLED_CHILD
     assert "PluginContext.__init__=" not in programs
     assert "setattr(hp.PluginContext" not in programs
-    assert 'sys.stdin.read(1)!=""' in programs
+    assert 'sys.stdin.read(1)==""' in programs
+    assert 'stdin_closed=sys.stdin is None or sys.stdin.read(1)==""' in programs
     assert "get_hermes_home" in programs and "get_config_path" in programs
+
+
+def test_disabled_child_accepts_owned_devnull_as_closed_stdin(tmp_path: Path) -> None:
+    module = runner()
+    source = tmp_path / "source"
+    package = source / "hermes_cli"
+    packages = tmp_path / "packages"
+    profile = tmp_path / "profile"
+    dist_info = packages / "hermes_realtime-0.0.3.dist-info"
+    package.mkdir(parents=True)
+    profile.mkdir()
+    dist_info.mkdir(parents=True)
+    (package / "__init__.py").write_bytes(b"")
+    (package / "config.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "def get_config_path(): return Path(os.environ['HERMES_HOME'])/'config.yaml'\n",
+        encoding="utf-8",
+    )
+    (package / "plugins.py").write_text(
+        "from types import SimpleNamespace\n"
+        "class PluginContext: pass\n"
+        "class PluginManager:\n"
+        " def __init__(self): self._plugins={}\n"
+        " def discover_and_load(self, force=False):\n"
+        "  self._plugins['hermes-realtime']=SimpleNamespace("
+        "manifest=SimpleNamespace(source='entrypoint'),enabled=False,module=None,error='disabled')\n",
+        encoding="utf-8",
+    )
+    (source / "hermes_constants.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "def get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n",
+        encoding="utf-8",
+    )
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hermes-realtime\nVersion: 0.0.3\n",
+        encoding="utf-8",
+    )
+    (dist_info / "entry_points.txt").write_text(
+        "[hermes_agent.plugins]\n"
+        "hermes-realtime = hermes_realtime.hermes_plugin\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["HERMES_HOME"] = str(profile)
+    child = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            module._DISABLED_CHILD,
+            str(source),
+            str(profile),
+            str(packages),
+        ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=environment,
+        cwd=tmp_path,
+        check=False,
+        timeout=30,
+    )
+    assert child.returncode == 0, child.stderr.decode(errors="replace")
+    assert json.loads(child.stdout)["discovered"] is True
+
+
+def test_enable_child_finds_yaml_only_after_sealed_packages_insertion(tmp_path: Path) -> None:
+    module = runner()
+    source = tmp_path / "source"
+    packages = tmp_path / "packages"
+    profile = tmp_path / "profile"
+    for directory in (source, packages, profile):
+        directory.mkdir()
+    (packages / "yaml.py").write_text(
+        "raise RuntimeError('sealed yaml marker')\n", encoding="utf-8"
+    )
+    environment = os.environ.copy()
+    environment["HERMES_HOME"] = str(profile)
+    child = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            module._ENABLE_CHILD,
+            str(source),
+            str(profile),
+            str(packages),
+        ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=environment,
+        cwd=tmp_path,
+        check=False,
+        timeout=30,
+    )
+    assert child.returncode != 0
+    assert b"sealed yaml marker" in child.stderr
+    assert b"No module named 'yaml'" not in child.stderr
+
+
+def test_enable_child_keeps_cli_text_out_of_canonical_stdout(tmp_path: Path) -> None:
+    module = runner()
+    source = tmp_path / "source"
+    package = source / "hermes_cli"
+    packages = tmp_path / "packages"
+    profile = tmp_path / "profile"
+    package.mkdir(parents=True)
+    packages.mkdir()
+    profile.mkdir()
+    (package / "__init__.py").write_bytes(b"")
+    (package / "plugins.py").write_text(
+        "class PluginContext: pass\nclass PluginManager: pass\n", encoding="utf-8"
+    )
+    (package / "config.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "def get_config_path(): return Path(os.environ['HERMES_HOME'])/'config.yaml'\n",
+        encoding="utf-8",
+    )
+    (package / "main.py").write_text(
+        "import json,os\nfrom pathlib import Path\n"
+        "def main():\n"
+        " print('official cli output')\n"
+        " value={'_config_version':33,'plugins':{'enabled':['hermes-realtime'],"
+        "'disabled':[],'entries':{'hermes-realtime':{'allow_tool_override':False}}}}\n"
+        " (Path(os.environ['HERMES_HOME'])/'config.yaml').write_text(json.dumps(value))\n"
+        " return 0\n",
+        encoding="utf-8",
+    )
+    (source / "hermes_constants.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "def get_hermes_home(): return Path(os.environ['HERMES_HOME'])\n",
+        encoding="utf-8",
+    )
+    (packages / "yaml.py").write_text(
+        "import json\ndef safe_load(value): return json.loads(value) if value.strip() else {}\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["HERMES_HOME"] = str(profile)
+    child = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            module._ENABLE_CHILD,
+            str(source),
+            str(profile),
+            str(packages),
+        ),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=environment,
+        cwd=tmp_path,
+        check=False,
+        timeout=30,
+    )
+    assert child.returncode == 0, child.stderr.decode(errors="replace")
+    assert child.stderr == b"official cli output\r\n" if os.name == "nt" else b"official cli output\n"
+    assert json.loads(child.stdout) == {
+        "argvExact": True,
+        "exactConfigDelta": True,
+        "stdinClosed": True,
+    }
 
 
 def test_harness_has_no_bare_process_launcher_or_direct_config_write_fallback() -> None:
@@ -521,17 +724,41 @@ def test_parent_request_requires_distinct_external_owned_roots_and_initially_abs
         module.validate_parent_request(request._replace(active_profile=roots["evidence"]))
 
 
+@pytest.mark.parametrize("python_version", ["3.11", "3.11.16"])
 def test_parent_supplied_manifest_binds_the_exact_closed_wheelhouse_before_any_child(
     tmp_path: Path,
+    python_version: str,
 ) -> None:
     module = runner()
     request, files = write_request_inputs(module, tmp_path)
+    manifest = json.loads(files["manifest"].read_bytes())
+    manifest["pythonVersion"] = python_version
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    files["manifest"].write_bytes(raw)
+    request = request._replace(wheelhouse_manifest_sha256=hashlib.sha256(raw).hexdigest())
     closure = module._verify_bound_wheelhouse_closure(request)
     assert closure["candidate"] == files["candidate"]
     assert closure["requirements"] == files["requirements"]
     assert closure["constraints"] == files["constraints"]
     assert closure["wheels"] == (files["candidate"],)
     assert module.validate_parent_request(request) is request
+
+
+@pytest.mark.parametrize(
+    "python_version", ["3.12.0", "3.11.16rc1", "3.11.016", "3.11.16+local", "3.11.16\n", 3.11, True]
+)
+def test_pluginmanager_rejects_unsupported_or_ambiguous_python_manifest_versions(
+    tmp_path, python_version
+):
+    module = runner()
+    request, files = write_request_inputs(module, tmp_path)
+    manifest = json.loads(files["manifest"].read_bytes())
+    manifest["pythonVersion"] = python_version
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    files["manifest"].write_bytes(raw)
+    request = request._replace(wheelhouse_manifest_sha256=hashlib.sha256(raw).hexdigest())
+    with pytest.raises(ValueError, match="Python pin"):
+        module._verify_bound_wheelhouse_closure(request)
 
 
 @pytest.mark.parametrize(
@@ -1587,7 +1814,9 @@ def test_governed_aggregation_requires_disabled_false_and_publishes_reopened_out
     enabled = job.commands[4]
     assert install[-1] == "--no-deps"
     assert str(files["candidate.whl"]) not in install
-    assert disabled[-1] == str(request.workspace / "pluginmanager-venv-fixed")
+    assert disabled[-1] == str(
+        request.workspace / "pluginmanager-venv-fixed" / "Lib" / "site-packages"
+    )
     assert json.loads(enabled[-1]) == [
         "hermes_realtime-0.0.3.dist-info/METADATA",
         "hermes_realtime-0.0.3.dist-info/WHEEL",

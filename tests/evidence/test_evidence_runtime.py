@@ -7,7 +7,7 @@ import subprocess
 import sys
 from functools import wraps
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from time import monotonic_ns
 
 import pytest
@@ -1485,29 +1485,116 @@ async def test_host_evidence_close_retains_owned_drain_after_writer_join_failure
     assert runtime._closed is True
 
 
+_SQLITE_CONSENT_OPEN_PHASES = (
+    "root_validation",
+    "root_occupancy",
+    "root_marker",
+    "sentinel_ensure",
+    "sentinel_read",
+    "sentinel_decode",
+    "maintenance_headroom",
+    "sentinel_transition",
+    "database_create",
+)
+
+
+def _expected_fresh_sqlite_open_phase_counts() -> dict[str, int]:
+    counts = {phase: 1 for phase in _SQLITE_CONSENT_OPEN_PHASES}
+    # A newly created sentinel already carries FIRST_CREATE_PENDING.
+    counts["sentinel_transition"] = 0
+    return counts
+
+
 def _observe_sqlite_consent(scenario):
     """Observe the real methods without retaining arguments, errors or identities."""
     @wraps(scenario)
     async def observed(*args, **kwargs):
         from hermes_realtime.evidence import models as m
+        from hermes_realtime.evidence import sqlite_spool
         from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
         from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
 
-        start = monotonic_ns()
+        try:
+            start = monotonic_ns()
+        except Exception:
+            start = None
         lock = Lock()
         offsets: dict[str, int] = {}
+        open_phase_counts = {phase: 0 for phase in _SQLITE_CONSENT_OPEN_PHASES}
+        open_scope = local()
         activation = None
         store = None
         closed = False
 
         def mark(stage):
-            with lock:
-                offsets.setdefault(stage, (monotonic_ns() - start) // 1_000_000)
+            try:
+                if start is not None:
+                    offset = (monotonic_ns() - start) // 1_000_000
+                    with lock:
+                        offsets.setdefault(stage, offset)
+            except Exception:
+                pass
+
+        def begin_phase(phase):
+            try:
+                with lock:
+                    # Two is a fixed "repeated" bucket, not an unbounded call count.
+                    open_phase_counts[phase] = min(open_phase_counts[phase] + 1, 2)
+            except Exception:
+                pass
+            mark(f"{phase}_enter")
+
+        def observe_method_phase(phase, method):
+            def phase_method(spool, *values, **options):
+                record = getattr(open_scope, "spool", None) is spool
+                if record:
+                    begin_phase(phase)
+                try:
+                    return method(spool, *values, **options)
+                finally:
+                    if record:
+                        mark(f"{phase}_exit")
+
+            return phase_method
+
+        def observe_global_phase(phase, function):
+            def phase_function(*values, **options):
+                record = getattr(open_scope, "spool", None) is not None
+                if record:
+                    begin_phase(phase)
+                try:
+                    return function(*values, **options)
+                finally:
+                    if record:
+                        mark(f"{phase}_exit")
+
+            return phase_function
 
         activate = HostEvidenceRuntimeV1.activate_consent
         close = HostEvidenceRuntimeV1.close
         create = SQLiteEvidenceSpool.create_epoch
         open_store = SQLiteEvidenceSpool._open_owned_store
+        method_phases = (
+            ("root_validation", "_ensure_root", SQLiteEvidenceSpool._ensure_root),
+            ("root_marker", "_ensure_root_marker", SQLiteEvidenceSpool._ensure_root_marker),
+            ("sentinel_ensure", "_ensure_sentinel", SQLiteEvidenceSpool._ensure_sentinel),
+            ("sentinel_read", "_read_sentinel", SQLiteEvidenceSpool._read_sentinel),
+            (
+                "sentinel_transition",
+                "_transition_sentinel",
+                SQLiteEvidenceSpool._transition_sentinel,
+            ),
+        )
+        global_phases = (
+            ("root_occupancy", "audit_root_occupancy", sqlite_spool.audit_root_occupancy),
+            ("sentinel_decode", "decode_sentinel_image", sqlite_spool.decode_sentinel_image),
+            (
+                "maintenance_headroom",
+                "check_maintenance_headroom",
+                sqlite_spool.check_maintenance_headroom,
+            ),
+            ("database_create", "create_store_database", sqlite_spool.create_store_database),
+        )
 
         async def observe_activation(runtime, *values, **options):
             nonlocal activation
@@ -1542,24 +1629,54 @@ def _observe_sqlite_consent(scenario):
                 mark("create_exit")
 
         def observe_open(spool, *values, **options):
+            previous = getattr(open_scope, "spool", None)
+            open_scope.spool = spool
             mark("open_enter")
             try:
                 return open_store(spool, *values, **options)
             finally:
                 mark("open_exit")
+                if previous is None:
+                    del open_scope.spool
+                else:
+                    open_scope.spool = previous
 
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(HostEvidenceRuntimeV1, "activate_consent", observe_activation)
             patch.setattr(HostEvidenceRuntimeV1, "close", observe_close)
             patch.setattr(SQLiteEvidenceSpool, "create_epoch", observe_create)
             patch.setattr(SQLiteEvidenceSpool, "_open_owned_store", observe_open)
+            for phase, name, method in method_phases:
+                patch.setattr(
+                    SQLiteEvidenceSpool,
+                    name,
+                    observe_method_phase(phase, method),
+                )
+            for phase, name, function in global_phases:
+                patch.setattr(
+                    sqlite_spool,
+                    name,
+                    observe_global_phase(phase, function),
+                )
             try:
                 return await scenario(*args, **kwargs)
             finally:
-                with lock:
-                    observation = {"version": 1, "offset_ms": dict(offsets),
-                                   "activation": activation, "store": store, "closed": closed}
-                print("[sqlite-consent] " + json.dumps(observation, sort_keys=True), flush=True)
+                try:
+                    with lock:
+                        observation = {
+                            "version": 2,
+                            "offset_ms": dict(offsets),
+                            "open_phase_counts": dict(open_phase_counts),
+                            "activation": activation,
+                            "store": store,
+                            "closed": closed,
+                        }
+                    print(
+                        "[sqlite-consent] " + json.dumps(observation, sort_keys=True),
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
     return observed
 
@@ -1881,7 +1998,7 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
             lines = [line for line in output.splitlines() if line.startswith("[sqlite-consent] ")]
             assert len(lines) == 1
             observation = json.loads(lines[0].removeprefix("[sqlite-consent] "))
-            assert observation["version"] == 1
+            assert observation["version"] == 2
             assert observation["closed"] is True
             offsets = observation["offset_ms"]
             assert all(type(value) is int and value >= 0 for value in offsets.values())
@@ -1889,6 +2006,9 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
             assert offsets["create_enter"] <= offsets["open_enter"] <= offsets["open_exit"]
             assert offsets["open_exit"] <= offsets["create_exit"] <= offsets["close_exit"]
             assert offsets["activation_exit"] <= offsets["close_enter"] <= offsets["close_exit"]
+            assert observation["open_phase_counts"] == (
+                _expected_fresh_sqlite_open_phase_counts()
+            )
             assert observation["store"] == "committed"
             assert observation["activation"] == (
                 None if failure == "exception" else "control_timed_out"
@@ -1935,18 +2055,187 @@ async def test_sqlite_consent_observation_preserves_outcomes_without_private_con
     assert output.startswith("[sqlite-consent] ") and len(output.splitlines()) == 1
     assert marker not in output and str(tmp_path) not in output
     observation = json.loads(output.removeprefix("[sqlite-consent] "))
-    assert set(observation) == {"version", "offset_ms", "activation", "store", "closed"}
-    assert observation["version"] == 1
+    assert set(observation) == {
+        "version", "offset_ms", "open_phase_counts", "activation", "store", "closed",
+    }
+    assert observation["version"] == 2
     assert observation["closed"] is (failure != "close")
     assert observation["activation"] == (
         "create_failed" if failure == "store" else "consent_activated"
     )
     assert observation["store"] == (None if failure == "store" else "committed")
-    assert set(observation["offset_ms"]) == {
+    expected_offsets = {
         "activation_enter", "activation_exit", "create_enter", "create_exit",
         "open_enter", "open_exit", "close_enter", "close_exit",
     }
+    phase_counts = _expected_fresh_sqlite_open_phase_counts()
+    expected_offsets.update(
+        f"{phase}_{edge}"
+        for phase in _SQLITE_CONSENT_OPEN_PHASES
+        if phase_counts[phase]
+        for edge in ("enter", "exit")
+    )
+    assert set(observation["offset_ms"]) == expected_offsets
+    assert observation["open_phase_counts"] == phase_counts
     assert all(type(value) is int and value >= 0 for value in observation["offset_ms"].values())
+    phase_edges = ["open_enter"]
+    phase_edges.extend(
+        f"{phase}_{edge}"
+        for phase in _SQLITE_CONSENT_OPEN_PHASES
+        if phase_counts[phase]
+        for edge in ("enter", "exit")
+    )
+    phase_edges.append("open_exit")
+    assert [observation["offset_ms"][edge] for edge in phase_edges] == sorted(
+        observation["offset_ms"][edge] for edge in phase_edges
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_consent_open_phases_exclude_foreign_thread_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from threading import Thread
+
+    from hermes_realtime.evidence import sqlite_spool
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
+
+    calls: list[str] = []
+
+    def create_store_database(_path):
+        calls.append("database")
+
+    def open_store(_spool, *, for_create):
+        assert for_create is True
+        foreign = Thread(
+            target=lambda: sqlite_spool.create_store_database(Path("private-foreign"))
+        )
+        foreign.start()
+        foreign.join()
+        sqlite_spool.create_store_database(Path("private-owner"))
+
+    monkeypatch.setattr(sqlite_spool, "create_store_database", create_store_database)
+    monkeypatch.setattr(SQLiteEvidenceSpool, "_open_owned_store", open_store)
+
+    async def scenario():
+        SQLiteEvidenceSpool._open_owned_store(object(), for_create=True)
+
+    await _observe_sqlite_consent(scenario)()
+
+    output = capsys.readouterr().out
+    assert "private-owner" not in output and "private-foreign" not in output
+    observation = json.loads(output.removeprefix("[sqlite-consent] "))
+    assert calls == ["database", "database"]
+    assert observation["open_phase_counts"] == {
+        phase: int(phase == "database_create") for phase in _SQLITE_CONSENT_OPEN_PHASES
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario_raises", [False, True])
+async def test_sqlite_consent_observer_bookkeeping_cannot_replace_scenario_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    scenario_raises: bool,
+) -> None:
+    marker = object()
+    error = RuntimeError("private original scenario error")
+
+    def fail_clock():
+        raise RuntimeError("private observer bookkeeping error")
+
+    async def scenario():
+        if scenario_raises:
+            raise error
+        return marker
+
+    monkeypatch.setattr(sys.modules[__name__], "monotonic_ns", fail_clock)
+    if scenario_raises:
+        with pytest.raises(RuntimeError) as raised:
+            await _observe_sqlite_consent(scenario)()
+        assert raised.value is error
+    else:
+        assert await _observe_sqlite_consent(scenario)() is marker
+
+    output = capsys.readouterr().out
+    assert "private original" not in output and "private observer" not in output
+    observation = json.loads(output.removeprefix("[sqlite-consent] "))
+    assert observation["version"] == 2
+    assert observation["offset_ms"] == {}
+    assert observation["open_phase_counts"] == {
+        phase: 0 for phase in _SQLITE_CONSENT_OPEN_PHASES
+    }
+
+
+@pytest.mark.asyncio
+async def test_sqlite_consent_diagnostic_write_failure_preserves_scenario_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    marker = RuntimeError("private original scenario error")
+
+    async def scenario():
+        raise marker
+
+    def fail_write(*_values, **_options):
+        raise OSError("private diagnostic write error")
+
+    monkeypatch.setattr(builtins, "print", fail_write)
+    with pytest.raises(RuntimeError) as raised:
+        await _observe_sqlite_consent(scenario)()
+    assert raised.value is marker
+
+
+@pytest.mark.asyncio
+async def test_sqlite_consent_observer_locates_an_injected_root_validation_delay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from threading import Event
+
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceSpool
+
+    entered = Event()
+    release = Event()
+    ensure_root = SQLiteEvidenceSpool._ensure_root
+
+    def delayed_ensure_root(spool):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return ensure_root(spool)
+
+    async def release_after_control_timeout() -> None:
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while not entered.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(2.1)
+        release.set()
+
+    monkeypatch.setattr(SQLiteEvidenceSpool, "_ensure_root", delayed_ensure_root)
+    releaser = asyncio.create_task(release_after_control_timeout())
+    try:
+        with pytest.raises(AssertionError):
+            await test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(
+                tmp_path
+            )
+    finally:
+        release.set()
+        await releaser
+
+    output = capsys.readouterr().out
+    observation = json.loads(output.removeprefix("[sqlite-consent] "))
+    assert observation["activation"] == "control_timed_out"
+    assert observation["store"] == "committed"
+    assert observation["closed"] is True
+    assert observation["open_phase_counts"] == _expected_fresh_sqlite_open_phase_counts()
+    offsets = observation["offset_ms"]
+    assert offsets["root_validation_exit"] - offsets["root_validation_enter"] >= 2_000
+    assert offsets["activation_exit"] <= offsets["root_validation_exit"]
+    assert offsets["root_validation_exit"] <= offsets["root_occupancy_enter"]
 
 
 @pytest.mark.asyncio

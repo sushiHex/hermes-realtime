@@ -8,6 +8,7 @@ import gc
 import hashlib
 import json
 import os
+import platform
 import re
 import sys
 import threading
@@ -313,12 +314,42 @@ def collect_live_machine_manifest() -> dict[str, object]:
     result = {
         "schemaVersion": 1,
         **values,
-        "pythonFullVersion": sys.version,
+        "pythonFullVersion": platform.python_version(),
         "pythonArchitecture": "64bit" if sys.maxsize > 2**32 else "32bit",
         "powerScheme": "high_performance",
         "benchmarkScriptSha256": sha256_bytes(script.read_bytes()),
     }
     return validate_machine_manifest(result)
+
+
+def _write_atomic_bytes(path: Path, payload: bytes) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / (path.name + ".tmp-" + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    reopened = path.read_bytes()
+    if reopened != payload:
+        raise ValueError("atomic output reopen mismatch")
+    return reopened
+
+
+def write_machine_manifest_atomic(path: Path, manifest: object) -> str:
+    validated = validate_machine_manifest(manifest)
+    script_digest = sha256_bytes(Path(__file__).resolve().read_bytes())
+    if validated["benchmarkScriptSha256"] != script_digest:
+        raise ValueError("machine manifest script binding is invalid")
+    reopened = _write_atomic_bytes(path, canonical_json_bytes(validated))
+    if validate_machine_manifest(parse_canonical_json_bytes(reopened)) != validated:
+        raise ValueError("reopened machine manifest differs")
+    return sha256_bytes(reopened)
 
 
 def load_machine_manifest(path: Path, *, require_live: bool) -> dict[str, object]:
@@ -1216,21 +1247,7 @@ def write_report_atomic(
     payload_sha256: str,
 ) -> str:
     payload = canonical_json_bytes(validate_report(report))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / (path.name + ".tmp-" + uuid.uuid4().hex)
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    reopened = path.read_bytes()
-    if reopened != payload:
-        raise ValueError("atomic report reopen mismatch")
+    reopened = _write_atomic_bytes(path, payload)
     reopened_report = validate_report(parse_canonical_json_bytes(reopened))
     reopened_method = reopened_report["method"]
     if not isinstance(reopened_method, dict):
