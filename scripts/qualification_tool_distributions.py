@@ -97,7 +97,8 @@ class _Distribution:
 _ADMITTED: WeakKeyDictionary[AdmittedToolDistributionV1, _Distribution] = WeakKeyDictionary()
 
 
-def _inspect(raw: bytes, policy: _ToolPolicy) -> tuple[tuple[str, bytes], ...]:
+def _inspect_archive_members(raw: bytes, format: str) -> tuple[tuple[str, bytes], ...]:
+    """Read one bounded ordinary-file archive namespace without selecting a tool."""
     files: dict[str, bytes] = {}
     directories: set[str] = set()
     explicit: set[str] = set()
@@ -133,7 +134,7 @@ def _inspect(raw: bytes, policy: _ToolPolicy) -> tuple[tuple[str, bytes], ...]:
             _require(expanded <= _MAX_EXPANDED, "tool distribution expanded bound exceeded")
             files[name] = payload
 
-    if policy.format == "zip":
+    if format == "zip":
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             _require(len(archive.infolist()) <= _MAX_MEMBERS, "tool member bound exceeded")
             for member in archive.infolist():
@@ -155,7 +156,7 @@ def _inspect(raw: bytes, policy: _ToolPolicy) -> tuple[tuple[str, bytes], ...]:
                     _require(len(payload) == member.file_size, "tool ZIP member size differs")
                     add(member.filename, payload)
     else:
-        _require(policy.format == "tar.gz", "tool distribution format differs")
+        _require(format == "tar.gz", "tool distribution format differs")
         with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
             expanded_tar = compressed.read(_MAX_EXPANDED + 1)
         _require(len(expanded_tar) <= _MAX_EXPANDED, "tool tar stream exceeds its bound")
@@ -179,8 +180,13 @@ def _inspect(raw: bytes, policy: _ToolPolicy) -> tuple[tuple[str, bytes], ...]:
                         payload = tar_stream.read(_MAX_MEMBER + 1)
                     _require(len(payload) == tar_member.size, "tool tar member size differs")
                     add(tar_member.name, payload)
-    _require(policy.executable in files, "selected tool image is absent")
     return tuple(sorted(files.items()))
+
+
+def _inspect(raw: bytes, policy: _ToolPolicy) -> tuple[tuple[str, bytes], ...]:
+    files = _inspect_archive_members(raw, policy.format)
+    _require(policy.executable in dict(files), "selected tool image is absent")
+    return files
 
 
 def admit_tool_distribution(role: str, raw: bytes) -> AdmittedToolDistributionV1:
