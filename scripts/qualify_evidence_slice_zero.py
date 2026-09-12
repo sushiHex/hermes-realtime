@@ -2272,11 +2272,10 @@ class _WindowsScenarioJobV1:
         self._identities: dict[int, _WindowsProcessIdentityV1] = {}
         self._pending_process_handles: dict[int, int] = {}
         self._owned_handles: dict[int, str] = {}
-        self._directly_terminated_handles: set[int] = set()
-        self._unassigned_process_handles: set[int] = set()
-        self._job_assigned = False
         self._zero_active_observed = False
         self._last_finalization: _WindowsFinalizationResultV1 | None = None
+        self._root_launch_attempted = False
+        self._suspended_root: _WindowsBoundProcessV1 | None = None
 
     @property
     def last_finalization(self) -> _WindowsFinalizationResultV1 | None:
@@ -2352,7 +2351,11 @@ class _WindowsScenarioJobV1:
             self._owned_handles.setdefault(thread_handle, "thread")
         return bound
 
-    def launch_root(self) -> _WindowsBoundProcessV1:
+    def launch_root_suspended(self) -> _WindowsBoundProcessV1:
+        """Retain one never-resumed root for the controller's durable identity step."""
+        if self._root_launch_attempted or self._last_finalization is not None:
+            _windows_fail("this Job has already attempted root creation or finalization")
+        self._root_launch_attempted = True
         flags = (
             _CREATE_SUSPENDED
             | _CREATE_NEW_PROCESS_GROUP
@@ -2368,6 +2371,7 @@ class _WindowsScenarioJobV1:
                 self._spec.working_directory,
                 self._spec.inherited_handles,
                 flags,
+                job=job,
             )
             process_handle = getattr(launch, "process_handle", None)
             thread_handle = getattr(launch, "thread_handle", None)
@@ -2377,7 +2381,6 @@ class _WindowsScenarioJobV1:
                 and process_handle not in self._owned_handles
             ):
                 self._owned_handles[process_handle] = "process"
-                self._unassigned_process_handles.add(process_handle)
             if _valid_windows_handle_v1(thread_handle) and thread_handle not in self._owned_handles:
                 self._owned_handles[thread_handle] = "thread"
             if (
@@ -2396,10 +2399,9 @@ class _WindowsScenarioJobV1:
             if raw.pid != launch.pid:
                 _windows_fail("CreateProcess PID does not match retained process handle")
             root = self._bind(raw, launch.process_handle, launch.thread_handle, True)
-            self._kernel.assign_process_to_job(job, launch.process_handle)
-            self._job_assigned = True
             self._pending_process_handles.pop(launch.pid, None)
-            self._unassigned_process_handles.discard(launch.process_handle)
+            self._suspended_root = root
+            return root
         except BaseException as primary:
             try:
                 self.finalize()
@@ -2409,17 +2411,68 @@ class _WindowsScenarioJobV1:
                     [primary, cleanup],
                 ) from None
             raise
+
+    def launch_root(self) -> _WindowsBoundProcessV1:
+        """Preserve immediate resume for existing bounded producer owners."""
+        if self._root_launch_attempted or self._last_finalization is not None:
+            _windows_fail("this Job has already attempted root creation or finalization")
         try:
-            self._kernel.resume_thread(launch.thread_handle)
+            root = self.launch_root_suspended()
+            self.resume_root(root)
+            return root
+        except BaseException as primary:
+            if self._last_finalization is not None:
+                raise
+            try:
+                self.finalize()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "root launch handoff and finalization both failed", [primary, cleanup]
+                ) from None
+            raise
+
+    def resume_root(self, root: _WindowsBoundProcessV1) -> None:
+        """Consume this owner's exact suspended root after caller prerequisites.
+
+        This primitive supplies no durable journal, consent, or dispatch authority.
+        """
+        if (
+            type(root) is not _WindowsBoundProcessV1
+            or self._suspended_root is not root
+            or self._last_finalization is not None
+            or self._job_handle is None
+            or self._owned_handles.get(root.process_handle) != "process"
+            or root.thread_handle is None
+            or self._owned_handles.get(root.thread_handle) != "thread"
+        ):
+            _windows_fail("suspended root is foreign, consumed or closed")
+        try:
+            self._suspended_root = None
+            raw = self._kernel.query_process_identity(root.process_handle)
+            _validate_kernel_identity_v1(raw)
+            observed = _WindowsProcessIdentityV1(
+                self._spec.scenario_id,
+                raw.pid,
+                raw.parent_pid,
+                raw.parent_creation_filetime,
+                raw.creation_filetime,
+                raw.image_basename,
+                raw.image_sha256,
+            )
+            if observed != root.identity:
+                _windows_fail("suspended root identity changed before resume")
+            if self._bind(raw, root.process_handle, root.thread_handle, True) is not root:
+                _windows_fail("suspended root binding changed before resume")
+            self._kernel.resume_thread(root.thread_handle)
+            return None
         except BaseException as primary:
             try:
                 self.finalize()
-            except _WindowsFinalizationError as cleanup:
+            except BaseException as cleanup:
                 raise BaseExceptionGroup(
                     "root resume and finalization both failed", [primary, cleanup]
                 ) from None
             raise
-        return root
 
     def checkpoint(self, label: str) -> _WindowsMembershipSnapshotV1:
         if not isinstance(label, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", label):
@@ -2458,6 +2511,8 @@ class _WindowsScenarioJobV1:
                 pending[pid] = (raw, handle)
             else:
                 raw = self._kernel.query_process_identity(existing.process_handle)
+                if raw.pid != pid:
+                    _windows_fail("Job member PID does not match its retained process handle")
                 self._bind(raw, existing.process_handle, existing.thread_handle, existing.root)
         while pending:
             progressed = False
@@ -2497,6 +2552,7 @@ class _WindowsScenarioJobV1:
         self._owned_handles[handle] = kind
 
     def finalize(self) -> _WindowsFinalizationResultV1:
+        self._suspended_root = None
         failures: list[_WindowsOperationFailureV1] = []
         deferred_handles: set[int] = set()
         defer_job_close = False
@@ -2512,19 +2568,6 @@ class _WindowsScenarioJobV1:
                 failures.append(
                     _WindowsOperationFailureV1("pre_cleanup_snapshot", self._job_handle, str(error))
                 )
-        if self._job_handle is not None and self._unassigned_process_handles:
-            for handle in tuple(sorted(self._unassigned_process_handles)):
-                if handle in self._directly_terminated_handles:
-                    continue
-                try:
-                    self._kernel.terminate_process(handle)
-                    self._directly_terminated_handles.add(handle)
-                except BaseException as error:
-                    defer_job_close = True
-                    deferred_handles.add(handle)
-                    failures.append(
-                        _WindowsOperationFailureV1("terminate_process", handle, str(error))
-                    )
         if self._job_handle is not None:
             try:
                 self._kernel.terminate_job(self._job_handle)
@@ -2590,8 +2633,6 @@ class _WindowsScenarioJobV1:
                 self._kernel.close_handle(handle)
                 closed_handles.append(handle)
                 self._owned_handles.pop(handle, None)
-                self._directly_terminated_handles.discard(handle)
-                self._unassigned_process_handles.discard(handle)
                 for pid, pending_handle in tuple(self._pending_process_handles.items()):
                     if pending_handle == handle:
                         self._pending_process_handles.pop(pid, None)
@@ -2823,6 +2864,8 @@ class _CtypesWindowsKernelV1:
         cwd: str,
         handles: tuple[int, ...],
         flags: int,
+        *,
+        job: int,
     ) -> _WindowsKernelLaunchV1:
         if (
             type(handles) is not tuple
@@ -2831,6 +2874,8 @@ class _CtypesWindowsKernelV1:
             or len(set(handles)) != len(handles)
         ):
             _windows_fail("concrete inherited handles are not an exact valid allowlist")
+        if not _valid_windows_handle_v1(job) or job in handles:
+            _windows_fail("creation Job must be valid and excluded from inheritance")
         api = self._api()
 
         class _STARTUPINFO(ctypes.Structure):
@@ -2859,10 +2904,10 @@ class _CtypesWindowsKernelV1:
             _fields_ = [("StartupInfo", _STARTUPINFO), ("lpAttributeList", ctypes.c_void_p)]
 
         size = ctypes.c_size_t()
-        api.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        api.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
         attributes = (ctypes.c_byte * size.value)()
         if not api.InitializeProcThreadAttributeList(
-            ctypes.byref(attributes), 1, 0, ctypes.byref(size)
+            ctypes.byref(attributes), 2, 0, ctypes.byref(size)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
         inherited = (ctypes.c_void_p * len(handles))(*handles)
@@ -2873,6 +2918,17 @@ class _CtypesWindowsKernelV1:
                 0x00020002,
                 ctypes.byref(inherited),
                 ctypes.sizeof(inherited),
+                None,
+                None,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            jobs = (ctypes.c_void_p * 1)(job)
+            if not api.UpdateProcThreadAttribute(
+                ctypes.byref(attributes),
+                0,
+                0x0002000D,
+                ctypes.byref(jobs),
+                ctypes.sizeof(jobs),
                 None,
                 None,
             ):

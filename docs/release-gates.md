@@ -44,7 +44,8 @@ The `release-candidate` job runs, from that fresh candidate:
 
 1. a forced import from `src/`, then default `pytest -q`, `ruff check .`, and
    `mypy src` with the lockfile and development group, plus a `speech-verification`-extra run of
-   `tests/providers/test_speech_presence.py` and a typed pass over the three real-gate scripts;
+   `tests/providers/test_speech_presence.py` and a typed pass over the governed
+   qualification and real-gate scripts, including the private run journal;
 2. `npm ci --ignore-scripts`, browser unit tests, and the production browser
    build;
 3. source/static parity after CRLF-to-LF normalization for package files captured from the archived
