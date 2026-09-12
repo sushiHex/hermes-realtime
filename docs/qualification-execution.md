@@ -491,9 +491,38 @@ Persist the actual process creation/image identity while it remains suspended;
 resume only after that update is durable. A controller death before the identity
 update therefore leaves an unresumed child owned by the closing Job, never an
 unassigned running worker. Recovery must resolve pending intents conservatively;
-unknown exit or ownership still prevents cleanup acceptance. The current
-create-then-assign launcher has a crash interval before Job assignment and does
-not satisfy this requirement. #62 owns the change and termination-boundary tests.
+unknown exit or ownership still prevents cleanup acceptance.
+
+The [Windows process owner](../scripts/qualify_evidence_slice_zero.py) now assigns
+the Job at creation. Its `launch_root_suspended()` returns the retained root
+identity; `resume_root()` accepts only that exact, unchanged root, once. Starting
+finalization permanently revokes resume, including when cleanup needs a retry.
+Existing producers use `launch_root()`, which immediately composes those two
+operations. They do not yet record durable launch intent or identity. The
+[atomic Job tests](../tests/test_qualification_atomic_job.py) exercise ownership
+before resume and termination on the last Job-handle close; they do not establish
+controller restart or durable recovery.
+
+The private [journal primitive](../scripts/qualification_run_journal.py) records
+typed filesystem and process observations in a bounded, append-only sequence.
+It borrows an already owned, noninherited regular-file handle and checks the
+file identity, location and append extent. Each transition requires a complete
+`WriteFile` followed by
+[`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers);
+a failed I/O or handle check poisons that writer.
+Frames bind canonical JSON, sequence and prior digest, with limits of 64 KiB per
+frame, 2,048 frames and 8 MiB in total. Inspection refuses to treat a torn,
+corrupt, changing or unfinished sequence as recorded complete.
+
+Journal facts are private observations, including paths and process identities.
+`recorded_complete` describes the recorded sequence; it does not verify that a
+process exited or a file was removed. The primitive does not create a recovery
+root, establish custody, launch a child or perform cleanup. Its
+[tests](../tests/test_qualification_run_journal.py) cover transition ordering,
+failed durability and a native Windows write/flush/reopen round trip. Connecting
+these primitives to independently verified run ownership and recovery remains
+part of [#62](https://github.com/sushiHex/hermes-realtime/issues/62); existing
+producer execution does not gain that authority from these additions.
 
 Include a dedicated private host-temporary root in this journal before launching
 any full-host process. The actual Codex provider creates random temporary

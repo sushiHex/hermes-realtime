@@ -673,10 +673,18 @@ class _FakeWindowsKernel:
         return self.job_handle
 
     def create_process_suspended(
-        self, command: Any, environment: Any, cwd: str, handles: Any, flags: int
+        self,
+        command: Any,
+        environment: Any,
+        cwd: str,
+        handles: Any,
+        flags: int,
+        *,
+        job: int,
     ) -> Any:
-        self.events.append(("create_process", command, environment, cwd, handles, flags))
+        self.events.append(("create_process", command, environment, cwd, handles, flags, job))
         if "create_process" in self.fail:
+            self.members = []
             raise OSError("create_process")
         if self.launch_value is not None:
             return self.launch_value
@@ -808,7 +816,7 @@ def test_windows_job_validates_every_input_before_native_action(changes: dict[st
     assert kernel.events == []
 
 
-def test_windows_job_launches_suspended_with_exact_allowlist_assigns_then_resumes() -> None:
+def test_windows_job_launches_suspended_in_its_job_before_identity_and_resume() -> None:
     runner = _load_runner()
     kernel = _FakeWindowsKernel(runner)
     root = _job(runner, kernel).launch_root()
@@ -816,11 +824,12 @@ def test_windows_job_launches_suspended_with_exact_allowlist_assigns_then_resume
         "create_job",
         "create_process",
         "identity",
-        "assign",
+        "identity",
         "resume",
     ]
     create = kernel.events[1]
     assert create[4] == (11, 12)
+    assert create[6] == kernel.job_handle
     assert (
         create[5]
         == runner._CREATE_SUSPENDED
@@ -829,47 +838,6 @@ def test_windows_job_launches_suspended_with_exact_allowlist_assigns_then_resume
         | runner._EXTENDED_STARTUPINFO_PRESENT
     )
     assert root.identity.pid == 42
-
-
-def test_windows_assignment_failure_preserves_cleanup_failure_and_retry_authority() -> None:
-    runner = _load_runner()
-    kernel = _FakeWindowsKernel(runner)
-    kernel.fail.update({"assign", "wait:201"})
-    job = _job(runner, kernel)
-    with pytest.raises(BaseExceptionGroup) as raised:
-        job.launch_root()
-    assert any("assign" in str(error) for error in raised.value.exceptions)
-    assert any(
-        isinstance(error, runner._WindowsFinalizationError) for error in raised.value.exceptions
-    )
-    assert ("terminate_process", 201) in kernel.events
-    assert ("close", 201) not in kernel.events
-    kernel.fail.remove("wait:201")
-    result = job.finalize()
-    assert result.closed is True
-    assert ("close", 201) in kernel.events
-
-
-def test_windows_job_assignment_failure_directly_terminates_waits_and_closes_unassigned_root() -> (
-    None
-):
-    runner = _load_runner()
-    kernel = _FakeWindowsKernel(runner)
-    kernel.fail.add("assign")
-    with pytest.raises(OSError, match="assign"):
-        _job(runner, kernel).launch_root()
-    names = [event[0] for event in kernel.events]
-    assert "terminate_job" in names
-    assert names.index("terminate_process") < names.index("wait")
-    assert ("terminate_process", 201) in kernel.events
-    assert ("wait", 201, 2_000) in kernel.events
-    assert ("wait", 202, 2_000) in kernel.events
-    assert ("active", 101) in kernel.events
-    assert {event for event in kernel.events if event[0] == "close"} >= {
-        ("close", 101),
-        ("close", 201),
-        ("close", 202),
-    }
 
 
 def test_windows_job_resume_failure_finalizes_assigned_root_without_bare_pid_termination() -> None:
@@ -1191,43 +1159,10 @@ def test_windows_launch_creation_or_malformed_dto_finalizes_all_plausible_author
         job.launch_root()
     assert ("close", 101) in kernel.events
     if launch in {"bad-pid", "bad-thread", "duplicate-handles"}:
-        assert ("terminate_process", 201) in kernel.events
+        assert ("terminate_job", 101) in kernel.events
         assert ("close", 201) in kernel.events
     if launch in {"bad-pid", "bad-process"}:
         assert ("close", 202) in kernel.events
-
-
-def test_windows_assignment_fallback_failure_remains_retryable() -> None:
-    runner = _load_runner()
-    kernel = _FakeWindowsKernel(runner)
-    kernel.fail.update({"assign", "terminate_job"})
-    job = _job(runner, kernel)
-    with pytest.raises(BaseExceptionGroup) as raised:
-        job.launch_root()
-    assert any(
-        isinstance(error, runner._WindowsFinalizationError) for error in raised.value.exceptions
-    )
-    assert ("terminate_process", 201) in kernel.events
-    assert ("terminate_job", 101) in kernel.events
-    assert ("close", 101) not in kernel.events
-    kernel.fail.remove("terminate_job")
-    assert job.finalize().closed is True
-
-
-def test_windows_assignment_direct_termination_failure_retains_job_for_retry() -> None:
-    runner = _load_runner()
-    kernel = _FakeWindowsKernel(runner)
-    kernel.fail.update({"assign", "terminate_process"})
-    job = _job(runner, kernel)
-    with pytest.raises(BaseExceptionGroup):
-        job.launch_root()
-    assert ("close", 101) not in kernel.events
-    kernel.fail.remove("terminate_process")
-    assert job.finalize().closed is True
-    assert [event for event in kernel.events if event == ("terminate_process", 201)] == [
-        ("terminate_process", 201),
-        ("terminate_process", 201),
-    ]
 
 
 def test_windows_unsigned_invalid_handle_is_rejected_before_native_action() -> None:
@@ -1383,7 +1318,7 @@ class _ConcreteApiShim:
         self._initialize_calls += 1
         size = _[-1]
         ctypes.cast(size, ctypes.POINTER(ctypes.c_size_t)).contents.value = 64
-        self.events.append(("initialize", bool(attributes)))
+        self.events.append(("initialize", bool(attributes), int(_[0])))
         return int(self.failure != "initialize" or self._initialize_calls == 1)
 
     def _UpdateProcThreadAttribute(
@@ -1512,7 +1447,12 @@ def test_ctypes_invalid_allowlist_is_rejected_before_any_api_event(
     api = _ConcreteApiShim()
     with pytest.raises(runner._WindowsScenarioJobError):
         _concrete_kernel(runner, api).create_process_suspended(
-            ("C:\\candidate\\python.exe",), (("LANG", "C"),), "C:\\candidate", handles, 4
+            ("C:\\candidate\\python.exe",),
+            (("LANG", "C"),),
+            "C:\\candidate",
+            handles,
+            4,
+            job=101,
         )
     assert api.events == []
 
@@ -1529,7 +1469,12 @@ def test_ctypes_attribute_setup_failures_delete_initialized_list(failure: str) -
     api = _ConcreteApiShim(failure=failure)
     with pytest.raises(OSError):
         _concrete_kernel(runner, api).create_process_suspended(
-            ("C:\\candidate\\python.exe", "-I"), (("LANG", "C"),), "C:\\candidate", (11, 12), 0xA55
+            ("C:\\candidate\\python.exe", "-I"),
+            (("LANG", "C"),),
+            "C:\\candidate",
+            (11, 12),
+            0xA55,
+            job=101,
         )
     if failure != "initialize":
         assert ("delete",) in api.events
@@ -1539,10 +1484,16 @@ def test_ctypes_attribute_list_uses_exact_allowlist_inheritance_and_required_fla
     runner = _load_runner()
     api = _ConcreteApiShim()
     launch = _concrete_kernel(runner, api).create_process_suspended(
-        ("C:\\candidate\\python.exe", "-I"), (("LANG", "C"),), "C:\\candidate", (11, 12), 0xA55
+        ("C:\\candidate\\python.exe", "-I"),
+        (("LANG", "C"),),
+        "C:\\candidate",
+        (11, 12),
+        0xA55,
+        job=101,
     )
     assert launch == runner._WindowsKernelLaunchV1(42, 501, 502)
     assert ("update", 0x00020002, 2 * ctypes.sizeof(ctypes.c_void_p), (11, 12)) in api.events
+    assert ("update", 0x0002000D, ctypes.sizeof(ctypes.c_void_p), (101,)) in api.events
     assert ("create_process", True, 0xA55) in api.events
     assert ("delete",) in api.events
 
@@ -1555,7 +1506,12 @@ def test_ctypes_post_create_handle_validation_closes_every_valid_process_informa
     api = _ConcreteApiShim(process=process, thread=thread)
     with pytest.raises(OSError):
         _concrete_kernel(runner, api).create_process_suspended(
-            ("C:\\candidate\\python.exe",), (("LANG", "C"),), "C:\\candidate", (11,), 4
+            ("C:\\candidate\\python.exe",),
+            (("LANG", "C"),),
+            "C:\\candidate",
+            (11,),
+            4,
+            job=101,
         )
     assert {event[1] for event in api.events if event[0] == "close"} >= set(expected)
 

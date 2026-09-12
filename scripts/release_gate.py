@@ -714,6 +714,7 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "--follow-imports=skip",
         "scripts/benchmark_evidence_admission.py",
         "scripts/qualify_evidence_slice_zero.py",
+        "scripts/qualification_run_journal.py",
         "scripts/deterministic_equivalence.py",
         "scripts/equivalence_process.py",
         "scripts/equivalence_worker.py",
