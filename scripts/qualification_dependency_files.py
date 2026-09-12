@@ -48,11 +48,34 @@ def _include_candidate_wheel(
     digest: str,
 ) -> bytes:
     if not any(parse_wheel_filename(name)[0] == "hermes-realtime" for name in wheels):
-        wheels["hermes_realtime-0.0.3-py3-none-any.whl"] = sealed_file_bytes(
-            seals, path, 16 * 1024**2
+        raw = sealed_file_bytes(seals, path, 16 * 1024**2)
+        return _include_candidate_wheel_bytes(
+            wheels, requirements, "hermes_realtime-0.0.3-py3-none-any.whl", raw, digest
         )
-        requirements += ("\nhermes-realtime==0.0.3 --hash=sha256:" + digest + "\n").encode("ascii")
     return requirements
+
+
+def _include_candidate_wheel_bytes(
+    wheels: dict[str, bytes],
+    requirements: bytes,
+    basename: str,
+    raw: bytes,
+    digest: str,
+) -> bytes:
+    """Add the genuine candidate to a verified runtime recipe when it is separate."""
+    if any(parse_wheel_filename(name)[0] == "hermes-realtime" for name in wheels):
+        return requirements
+    name, version, _, _ = parse_wheel_filename(basename)
+    _require(
+        name == "hermes-realtime"
+        and hashlib.sha256(raw).hexdigest() == digest
+        and digest == digest.lower(),
+        "dependency candidate wheel differs from its genuine source binding",
+    )
+    wheels[basename] = raw
+    return requirements + (
+        f"\n{name}=={version} --hash=sha256:{digest}\n"
+    ).encode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
