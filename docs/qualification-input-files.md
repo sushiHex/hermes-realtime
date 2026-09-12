@@ -109,6 +109,16 @@ metadata, RECORD contents, pins and dependency edges. The three realtime runtime
 closures and the Hermes plugin runtime also include the genuine candidate wheel
 in that check. The Windows direct and sdist-built runtime purposes activate its
 `local` extra; optional and transitive extras must have their required packages.
+Build traversal starts at Hatchling; runtime traversal starts at the candidate.
+Every supplied distribution must be reachable from that purpose's root, including
+its activated extras. Presence in the source lock alone does not admit an
+unrelated package into the installed namespace.
+
+Windows manifests must name the full admitted interpreter version. The standalone
+Hermes PluginManager consumer accepts that canonical `3.11.x` spelling as well as
+its legacy `3.11` spelling; complete input binding still requires the exact patch
+version. This format compatibility supplies no interpreter or installed-host
+execution evidence by itself.
 
 The Moonshine and Kokoro distribution roles must also match the exact versions
 and wheel bytes admitted in both Windows runtime purposes. A separately hashed
@@ -185,6 +195,38 @@ metadata, not installation or entry-point execution authority; an installed
 receipt still requires the actual owned installer, live runtime/package seals,
 observed imports and cleanup.
 
+## Bind provider resources before loading
+
+`bind_kokoro_resources` reads the existing `_MODEL_ASSET` and `_VOICES_ASSET`
+literal selections from the candidate's source-verified wheel. It does not import
+the provider or maintain a second model pin list. It requires the same live input,
+candidate and Windows dependency-purpose authorities, including the admitted
+Kokoro distribution, before comparing the complete resource manifest and reopening
+each sealed model file. Rehashing a replacement manifest cannot authorize different
+model bytes, names, missing resources or additional resources.
+
+The resulting capability covers only the selected direct or sdist-built Windows
+purpose and expires with the input seals. Its metadata contains digests, counts
+and the closed purpose value; resource paths and bytes remain private to the
+consumer. This establishes model provenance before loading. It does not construct
+Kokoro, select an execution namespace, prove provider behavior, or admit Moonshine
+resources. The full host still needs the execution protocol's sealed pre-load
+namespace and fixed provider profile.
+
+## Admit the Linux runtime descriptor
+
+The [Linux image admission](../scripts/qualification_linux_image.py) selects the
+official Python 3.11.16 slim-bookworm image's exact `linux/amd64` manifest. It
+authenticates that descriptor before following its configuration reference and
+retains the complete compressed-layer and root-filesystem digest graph. Caller
+tags or replacement digests cannot change the reviewed selection. The Windows
+build interpreter retains its separate role.
+
+Descriptor admission does not establish downloaded image layers, an immutable
+container, observed Linux ABI compatibility, installed execution, cleanup, or
+an authenticated GitHub Actions receipt. The Linux executor must establish those
+before this prerequisite can support complete input acceptance.
+
 ## Own immutable execution files
 
 File handles alone do not prevent new import files from appearing in a directory.
@@ -204,8 +246,26 @@ import-origin evidence, and independent cleanup observations.
 `qualification_tool_process` invokes an admitted tool through the existing
 Windows Job owner. Root exit and zero active Job accounting share one bounded
 wait; a nonzero exit or incomplete finalization produces no completed invocation.
-Its receipt retains the actual command, closed environment, root identity and
-cleanup observation privately. That proves an invocation, not a governed build
+It observes live descendants and retains their classified process identities.
+Before completion, the Job's cumulative process count must equal the complete
+retained inventory, with zero active processes and no limit-terminated processes.
+An unobserved short-lived child therefore refuses completion. Every retained
+process must signal and exit normally within the same budget; the invocation
+also bounds total process lifetimes to 128. See Microsoft's
+[Job lifetime accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information).
+
+System directories come from native Windows APIs, with fixed-drive and nonreparse
+validation. The Windows console host, which can accompany a windowless tool, and
+the command shell have explicit OS roles bound to native System32 image digests
+and retained parent identities. The shell is needed by
+[CPython 3.11.16's Windows version query](https://github.com/python/cpython/blob/v3.11.16/Lib/platform.py),
+which the admitted uv interpreter probe invokes. Ambient `SystemRoot`,
+`SystemDrive` and `WINDIR` values cannot select those inputs. The accepted OS
+trust boundary remains unchanged.
+
+Its receipt retains the actual command, closed environment, process identities and
+cleanup observation privately. Counts and OS image digests carry no paths or
+process identifiers. That proves an invocation, not a governed build
 recipe, independent repeat, installed import closure or full qualification.
 
 `OwnedQualificationWorkV1` composes those existing owners with their file
