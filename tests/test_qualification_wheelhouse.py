@@ -7,6 +7,7 @@ import io
 import zipfile
 
 import pytest
+from packaging.tags import compatible_tags, cpython_tags
 
 
 def wheel(
@@ -162,6 +163,33 @@ def test_target_and_artifact_binding_refuse_mismatch(option):
             requirements=requirements,
             constraints=b"synthetic-base==2.0\n" if option == "constraint" else b"",
         )
+
+
+def test_private_target_core_accepts_manylinux_only_from_derived_tags():
+    from scripts.qualification_wheelhouse import (
+        _inspect_wheelhouse_for_target,
+        _target,
+    )
+
+    artifact = wheel("synthetic_base", tag="cp311-cp311-manylinux_2_17_x86_64")
+    wheels = dict([artifact])
+    environment, _ = _target("3.11.16", "linux_x86_64")
+    platforms = ["manylinux_2_36_x86_64", "manylinux_2_17_x86_64", "linux_x86_64"]
+    tags = set(cpython_tags((3, 11), abis=["cp311"], platforms=platforms))
+    tags.update(compatible_tags((3, 11), interpreter="cp311", platforms=platforms))
+
+    assert (
+        len(
+            _inspect_wheelhouse_for_target(
+                requirements=pins(wheels),
+                constraints=b"",
+                wheels=wheels,
+                environment=environment,
+                tags=tags,
+            )
+        )
+        == 1
+    )
 
 
 @pytest.mark.parametrize(

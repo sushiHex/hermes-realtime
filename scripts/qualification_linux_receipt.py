@@ -15,6 +15,12 @@ _OID = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _PLATFORM = "linux_x86_64"
+_REPOSITORY_ID = 1351392603
+_WORKFLOW_ID = 345893071
+_ATTEMPT = 1
+_JOB = "Linux null capture"
+_ARTIFACT = "hermes-realtime-linux-null-capture-receipt-v1"
+_MEMBER = "linux-null-capture-receipt-v1.json"
 
 
 def _require(condition: bool, message: str) -> None:

@@ -18,6 +18,8 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass
 from email.parser import BytesParser
+from typing import cast
+from weakref import WeakKeyDictionary
 
 from packaging.markers import Environment
 from packaging.metadata import Metadata, parse_email
@@ -53,6 +55,79 @@ class WheelDistributionV1:
     requires: tuple[str, ...]
     members: tuple[tuple[str, str, int], ...]
     extras: tuple[str, ...]
+
+
+class AuthenticatedLinuxWheelTargetV1:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("Linux wheel targets are verifier-minted only")
+
+
+@dataclass(frozen=True, slots=True)
+class _LinuxWheelRecipeBinding:
+    candidate_commit: str
+    candidate_tree: str
+    source_archive_sha256: str
+    direct_wheel: tuple[str, str, int]
+    manifest_sha256: str
+    source_lock_sha256: str
+    requirements_sha256: str
+    constraints_sha256: str
+    wheels: tuple[tuple[str, str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LinuxTarget:
+    environment: Environment
+    tags: frozenset[Tag]
+    recipe: _LinuxWheelRecipeBinding
+    image: tuple[str, str, tuple[str, ...], tuple[str, ...]]
+
+
+_LINUX_TARGETS: WeakKeyDictionary[AuthenticatedLinuxWheelTargetV1, _LinuxTarget] = (
+    WeakKeyDictionary()
+)
+
+
+def _mint_authenticated_linux_target(
+    environment: Environment,
+    tags: set[Tag],
+    recipe: _LinuxWheelRecipeBinding,
+    image: tuple[str, str, tuple[str, ...], tuple[str, ...]],
+) -> AuthenticatedLinuxWheelTargetV1:
+    _require(
+        environment["sys_platform"] == "linux"
+        and environment["platform_machine"] == "x86_64"
+        and bool(tags),
+        "authenticated Linux wheel target differs",
+    )
+    receipt = object.__new__(AuthenticatedLinuxWheelTargetV1)
+    _LINUX_TARGETS[receipt] = _LinuxTarget(
+        cast(Environment, dict(environment)),
+        frozenset(tags),
+        recipe,
+        image,
+    )
+    return receipt
+
+
+def _authenticated_linux_target_for_consumer(
+    receipt: AuthenticatedLinuxWheelTargetV1,
+) -> tuple[Environment, set[Tag]]:
+    if type(receipt) is not AuthenticatedLinuxWheelTargetV1:
+        raise TypeError("authenticated Linux wheel target type differs")
+    _require(receipt in _LINUX_TARGETS, "authenticated Linux wheel target is unregistered")
+    value = _LINUX_TARGETS[receipt]
+    return cast(Environment, dict(value.environment)), set(value.tags)
+
+
+def _authenticated_linux_binding_for_consumer(
+    receipt: AuthenticatedLinuxWheelTargetV1,
+) -> tuple[_LinuxWheelRecipeBinding, tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
+    _authenticated_linux_target_for_consumer(receipt)
+    value = _LINUX_TARGETS[receipt]
+    return value.recipe, value.image
 
 
 def _pins(raw: bytes, *, hashed: bool) -> dict[str, tuple[Version, str | None]]:
@@ -298,22 +373,22 @@ def _verify_installation_namespace(distributions: list[WheelDistributionV1]) -> 
             directories.update(parents)
 
 
-def inspect_wheelhouse_files(
+def _inspect_wheelhouse_for_target(
     *,
     requirements: bytes,
     constraints: bytes,
     wheels: dict[str, bytes],
-    python_version: str,
-    platform: str,
+    environment: Environment,
+    tags: set[Tag],
     root_extras: dict[str, tuple[str, ...]] | None = None,
     roots: tuple[str, ...] | None = None,
     site_processing: bool = True,
 ) -> tuple[WheelDistributionV1, ...]:
-    """Derive a closed wheel inventory; no supplied data can mint install evidence."""
+    """Inspect with a target derived by an owning verifier, never mint authority."""
     _require(type(site_processing) is bool, "wheel site processing profile differs")
     _require(type(wheels) is dict and 0 < len(wheels) <= 2048, "wheel set exceeds its bound")
+    _require(type(environment) is dict and type(tags) is set and bool(tags), "wheel target differs")
     pins, restrictions = _pins(requirements, hashed=True), _pins(constraints, hashed=False)
-    environment, tags = _target(python_version, platform)
     inspected = [
         _inspect(name, raw, environment, tags, site_processing=site_processing)
         for name, raw in wheels.items()
@@ -407,3 +482,28 @@ def inspect_wheelhouse_files(
                     pending.add(dependency.name)
     _require(reachable == set(by_name), "wheel set contains an unrelated distribution")
     return tuple(by_name[name] for name in sorted(by_name))
+
+
+def inspect_wheelhouse_files(
+    *,
+    requirements: bytes,
+    constraints: bytes,
+    wheels: dict[str, bytes],
+    python_version: str,
+    platform: str,
+    root_extras: dict[str, tuple[str, ...]] | None = None,
+    roots: tuple[str, ...] | None = None,
+    site_processing: bool = True,
+) -> tuple[WheelDistributionV1, ...]:
+    """Derive a closed wheel inventory; no supplied data can mint install evidence."""
+    environment, tags = _target(python_version, platform)
+    return _inspect_wheelhouse_for_target(
+        requirements=requirements,
+        constraints=constraints,
+        wheels=wheels,
+        environment=environment,
+        tags=tags,
+        root_extras=root_extras,
+        roots=roots,
+        site_processing=site_processing,
+    )

@@ -49,13 +49,13 @@ from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 _API = "https://api.github.com"
 _OWNER = "sushiHex"
 _REPOSITORY = "hermes-realtime"
-_REPOSITORY_ID = 1351392603
 _WORKFLOW = ".github/workflows/release-gates.yml"
-_WORKFLOW_ID = 345893071
-_ATTEMPT = 1
-_JOB = "Linux null capture"
-_ARTIFACT = "hermes-realtime-linux-null-capture-receipt-v1"
-_MEMBER = "linux-null-capture-receipt-v1.json"
+_REPOSITORY_ID = payloads._REPOSITORY_ID
+_WORKFLOW_ID = payloads._WORKFLOW_ID
+_ATTEMPT = payloads._ATTEMPT
+_JOB = payloads._JOB
+_ARTIFACT = payloads._ARTIFACT
+_MEMBER = payloads._MEMBER
 
 
 def _require(condition: bool, message: str) -> None:

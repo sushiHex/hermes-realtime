@@ -26,7 +26,15 @@ from scripts.qualification_candidate_files import (
     candidate_file_metadata,
 )
 from scripts.qualification_file_seals import RetainedFileSealsV1, sealed_file_bytes
-from scripts.qualification_wheelhouse import WheelDistributionV1, inspect_wheelhouse_files
+from scripts.qualification_wheelhouse import (
+    AuthenticatedLinuxWheelTargetV1,
+    WheelDistributionV1,
+    _authenticated_linux_binding_for_consumer,
+    _authenticated_linux_target_for_consumer,
+    _inspect_wheelhouse_for_target,
+    _LinuxWheelRecipeBinding,
+    inspect_wheelhouse_files,
+)
 from scripts.retained_qualification_inputs import (
     RetainedQualificationInputFilesV1,
     _retained_input_files_for_consumer,
@@ -73,9 +81,7 @@ def _include_candidate_wheel_bytes(
         "dependency candidate wheel differs from its genuine source binding",
     )
     wheels[basename] = raw
-    return requirements + (
-        f"\n{name}=={version} --hash=sha256:{digest}\n"
-    ).encode("ascii")
+    return requirements + (f"\n{name}=={version} --hash=sha256:{digest}\n").encode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +118,7 @@ class _Binding:
     files: RetainedQualificationInputFilesV1
     candidate: BoundCandidateFilesV1
     metadata: DependencyFileMetadataV1
+    linux_target: AuthenticatedLinuxWheelTargetV1 | None = None
 
 
 _BINDINGS: WeakKeyDictionary[BoundDependencyFilesV1, _Binding] = WeakKeyDictionary()
@@ -213,6 +220,7 @@ def _inspect_dependency_files(
     files: RetainedQualificationInputFilesV1,
     candidate: BoundCandidateFilesV1,
     purposes: tuple[str, ...],
+    linux_target: AuthenticatedLinuxWheelTargetV1 | None = None,
 ) -> _Binding:
     """Read actual retained wheel bytes, including the candidate's dependency edges."""
     source = candidate_file_metadata(candidate)
@@ -229,13 +237,12 @@ def _inspect_dependency_files(
     observed = []
     for purpose in purposes:
         role = core._WHEELHOUSE_ROLES[purpose]
-        manifest = json.loads(
-            sealed_file_bytes(
-                selected.seals,
-                references[role]["relativePath"],
-                4 * 1024**2,
-            )
+        manifest_raw = sealed_file_bytes(
+            selected.seals,
+            references[role]["relativePath"],
+            4 * 1024**2,
         )
+        manifest = json.loads(manifest_raw)
         platform = "linux_x86_64" if purpose == "realtime_linux_runtime" else "windows_amd64"
         _require(manifest["platform"] == platform, "dependency purpose platform differs")
         if platform == "windows_amd64":
@@ -286,19 +293,49 @@ def _inspect_dependency_files(
                 reference["relativePath"],
                 reference["sha256"],
             )
-        inventory = inspect_wheelhouse_files(
-            requirements=requirements,
-            constraints=constraints,
-            wheels=wheels,
-            python_version=manifest["pythonVersion"],
-            platform=platform,
-            site_processing=False,
-            roots=("hatchling",) if purpose == "build" else ("hermes-realtime",),
-            root_extras={"hermes-realtime": ("local",)}
+        options = {
+            "requirements": requirements,
+            "constraints": constraints,
+            "wheels": wheels,
+            "site_processing": False,
+            "roots": ("hatchling",) if purpose == "build" else ("hermes-realtime",),
+            "root_extras": {"hermes-realtime": ("local",)}
             if purpose
             in {"realtime_windows_direct_runtime", "realtime_windows_sdist_built_runtime"}
             else None,
-        )
+        }
+        if purpose == "realtime_linux_runtime" and linux_target is not None:
+            environment, tags = _authenticated_linux_target_for_consumer(linux_target)
+            expected_recipe, _ = _authenticated_linux_binding_for_consumer(linux_target)
+            direct = references["direct_wheel"]
+            current_recipe = _LinuxWheelRecipeBinding(
+                source.source_commit,
+                source.source_tree,
+                source.source_archive_sha256,
+                (direct["basename"], direct["sha256"], direct["bytes"]),
+                hashlib.sha256(manifest_raw).hexdigest(),
+                lock_digest,
+                hashlib.sha256(requirements).hexdigest(),
+                hashlib.sha256(constraints).hexdigest(),
+                tuple(
+                    sorted(
+                        (name, hashlib.sha256(raw).hexdigest(), len(raw))
+                        for name, raw in wheels.items()
+                    )
+                ),
+            )
+            _require(
+                environment["python_full_version"] == manifest["pythonVersion"]
+                and current_recipe == expected_recipe,
+                "authenticated Linux target recipe differs",
+            )
+            inventory = _inspect_wheelhouse_for_target(
+                **options, environment=environment, tags=tags
+            )
+        else:
+            inventory = inspect_wheelhouse_files(
+                **options, python_version=manifest["pythonVersion"], platform=platform
+            )
         if purpose == "build":
             hatchling = [item for item in inventory if item.name == "hatchling"]
             _require(
@@ -336,15 +373,27 @@ def _inspect_dependency_files(
             lock_digest,
             tuple(observed),
         ),
+        linux_target,
     )
 
 
 def bind_dependency_files(
     files: RetainedQualificationInputFilesV1,
     candidate: BoundCandidateFilesV1,
+    *,
+    linux_target: AuthenticatedLinuxWheelTargetV1 | None = None,
 ) -> BoundDependencyFilesV1:
     """Bind all five purposes; a partial purpose cannot mint this capability."""
-    binding = _inspect_dependency_files(files, candidate, tuple(sorted(core._WHEELHOUSE_ROLES)))
+    _require(
+        linux_target is None or type(linux_target) is AuthenticatedLinuxWheelTargetV1,
+        "authenticated Linux target type differs",
+    )
+    binding = _inspect_dependency_files(
+        files,
+        candidate,
+        tuple(sorted(core._WHEELHOUSE_ROLES)),
+        linux_target=linux_target,
+    )
     receipt = object.__new__(BoundDependencyFilesV1)
     _BINDINGS[receipt] = binding
     return receipt
@@ -355,13 +404,22 @@ def bind_dependency_purpose(
     candidate: BoundCandidateFilesV1,
     *,
     purpose: str,
+    linux_target: AuthenticatedLinuxWheelTargetV1 | None = None,
 ) -> BoundDependencyPurposeV1:
     """Verify one installation's inputs without accepting the complete closure."""
     _require(
         type(purpose) is str and purpose in core._WHEELHOUSE_ROLES,
         "dependency purpose is unavailable",
     )
-    binding = _inspect_dependency_files(files, candidate, (purpose,))
+    _require(
+        (linux_target is None)
+        or (
+            purpose == "realtime_linux_runtime"
+            and type(linux_target) is AuthenticatedLinuxWheelTargetV1
+        ),
+        "authenticated Linux target is unavailable for this purpose",
+    )
+    binding = _inspect_dependency_files(files, candidate, (purpose,), linux_target=linux_target)
     receipt = object.__new__(BoundDependencyPurposeV1)
     _PURPOSE_BINDINGS[receipt] = binding
     return receipt

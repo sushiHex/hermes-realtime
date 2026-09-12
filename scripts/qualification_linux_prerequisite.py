@@ -8,10 +8,13 @@ this module does not widen the preliminary wheel inspector's platform authority.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, cast
 from weakref import WeakKeyDictionary
 
+from packaging.markers import Environment
+from packaging.tags import Tag, compatible_tags, cpython_tags
 from packaging.utils import parse_wheel_filename
 
 from scripts import github_actions_linux_receipt as service
@@ -46,7 +49,14 @@ from scripts.qualification_linux_image import (
 )
 from scripts.qualification_linux_receipt import LinuxReceiptPayloadV1
 from scripts.qualification_owned_work import OwnedQualificationWorkV1
-from scripts.qualification_wheelhouse import inspect_wheelhouse_files
+from scripts.qualification_wheelhouse import (
+    AuthenticatedLinuxWheelTargetV1,
+    _authenticated_linux_binding_for_consumer,
+    _inspect_wheelhouse_for_target,
+    _LinuxWheelRecipeBinding,
+    _mint_authenticated_linux_target,
+    _target,
+)
 from scripts.retained_qualification_inputs import RetainedQualificationInputFilesV1
 
 
@@ -86,6 +96,9 @@ class _Prepared:
     files: ImmutableExecutionFilesV1
     contents: tuple[tuple[str, bytes], ...]
     direct_wheel: bytes
+    wheels: tuple[tuple[str, bytes], ...]
+    requirements: bytes
+    constraints: bytes
     expected: service._LinuxReceiptFacts
     metadata: LinuxPrerequisiteMetadataV1
 
@@ -137,7 +150,7 @@ def _expected_facts(
     manifest: bytes,
     contents: dict[str, bytes],
     document: dict[str, Any],
-) -> tuple[service._LinuxReceiptFacts, bytes, str]:
+) -> tuple[service._LinuxReceiptFacts, bytes, str, dict[str, bytes], bytes, bytes]:
     bound = _build_inputs_for_consumer(inputs)
     input_metadata = build_input_metadata(inputs)
     build_metadata = candidate_build_metadata(builds)
@@ -175,15 +188,6 @@ def _expected_facts(
     requirements = _include_candidate_wheel_bytes(
         wheels, requirements, direct_name, direct, direct_digest
     )
-    inspect_wheelhouse_files(
-        requirements=requirements,
-        constraints=constraints,
-        wheels=wheels,
-        python_version=image_metadata.python_version,
-        platform="linux_x86_64",
-        roots=("hermes-realtime",),
-        site_processing=False,
-    )
     source = input_metadata
     expected = service._LinuxReceiptFacts(
         source.source_commit,
@@ -204,7 +208,7 @@ def _expected_facts(
         image_metadata.layer_diff_sha256s,
         image_metadata.python_version,
     )
-    return expected, direct, lock_digest
+    return expected, direct, lock_digest, wheels, requirements, constraints
 
 
 def prepare_linux_receipt_inputs(
@@ -223,7 +227,7 @@ def prepare_linux_receipt_inputs(
     work._accepting()
     try:
         snapshot, contents, document = _owned_recipe(work, manifest_path, manifest, closure)
-        expected, direct, lock_digest = _expected_facts(
+        expected, direct, lock_digest, wheels, requirements, constraints = _expected_facts(
             inputs, builds, image, manifest, contents, document
         )
         image_metadata = linux_image_metadata(image)
@@ -236,6 +240,9 @@ def prepare_linux_receipt_inputs(
             snapshot,
             tuple(sorted(contents.items())),
             direct,
+            tuple(sorted(wheels.items())),
+            requirements,
+            constraints,
             expected,
             LinuxPrerequisiteMetadataV1(
                 expected.candidate_commit,
@@ -292,12 +299,82 @@ class AuthenticatedPrefinalLinuxReceiptV1:
 class _PrefinalReceipt:
     prepared: PreparedLinuxReceiptInputsV1
     observation: service._AuthenticatedObservation
+    target: AuthenticatedLinuxWheelTargetV1
 
 
 _PREFINAL: WeakKeyDictionary[AuthenticatedPrefinalLinuxReceiptV1, _PrefinalReceipt] = (
     WeakKeyDictionary()
 )
 _TRANSFERRED: WeakKeyDictionary[AuthenticatedPrefinalLinuxReceiptV1, str] = WeakKeyDictionary()
+
+
+def _authenticated_linux_target(
+    payload: LinuxReceiptPayloadV1,
+) -> tuple[Environment, set[Tag]]:
+    """Derive compatible tags only from service-authenticated native facts."""
+    _require(
+        payload.soabi == "cpython-311-x86_64-linux-gnu"
+        and payload.ext_suffix == ".cpython-311-x86_64-linux-gnu.so"
+        and payload.multiarch == "x86_64-linux-gnu",
+        "authenticated Linux ABI differs",
+    )
+    match = re.fullmatch(r"2\.([0-9]{1,2})", payload.glibc)
+    _require(match is not None and 5 <= int(match.group(1)) <= 99, "authenticated glibc differs")
+    assert match is not None
+    minor = int(match.group(1))
+    platforms = [f"manylinux_2_{value}_x86_64" for value in range(minor, 4, -1)]
+    if minor >= 17:
+        platforms.append("manylinux2014_x86_64")
+    if minor >= 12:
+        platforms.append("manylinux2010_x86_64")
+    if minor >= 5:
+        platforms.append("manylinux1_x86_64")
+    platforms.append("linux_x86_64")
+    tags = set(cpython_tags((3, 11), abis=["cp311"], platforms=platforms))
+    tags.update(compatible_tags((3, 11), interpreter="cp311", platforms=platforms))
+    environment, _ = _target(payload.python_version, "linux_x86_64")
+    return environment, tags
+
+
+def _verify_authenticated_recipe(
+    prepared: _Prepared, payload: LinuxReceiptPayloadV1
+) -> AuthenticatedLinuxWheelTargetV1:
+    environment, tags = _authenticated_linux_target(payload)
+    _inspect_wheelhouse_for_target(
+        requirements=prepared.requirements,
+        constraints=prepared.constraints,
+        wheels=dict(prepared.wheels),
+        environment=environment,
+        tags=tags,
+        roots=("hermes-realtime",),
+        site_processing=False,
+    )
+    expected = prepared.expected
+    return _mint_authenticated_linux_target(
+        environment,
+        tags,
+        _LinuxWheelRecipeBinding(
+            expected.candidate_commit,
+            expected.candidate_tree,
+            expected.source_archive_sha256,
+            (
+                expected.direct_wheel_basename,
+                expected.direct_wheel_sha256,
+                expected.direct_wheel_bytes,
+            ),
+            expected.wheelhouse_manifest_sha256,
+            expected.source_lock_sha256,
+            expected.requirements_sha256,
+            expected.constraints_sha256,
+            expected.wheels,
+        ),
+        (
+            expected.image_reference,
+            expected.image_config_sha256,
+            expected.image_layers,
+            expected.image_diff_ids,
+        ),
+    )
 
 
 def authenticate_prefinal_linux_receipt(
@@ -310,9 +387,10 @@ def authenticate_prefinal_linux_receipt(
     observation = service._authenticate_observation(
         run_id, value.expected, github_api_bearer=github_api_bearer
     )
+    target = _verify_authenticated_recipe(value, observation.payload)
     _require(_prepared(prepared).expected == observation.facts, "prefinal Linux inputs changed")
     receipt = object.__new__(AuthenticatedPrefinalLinuxReceiptV1)
-    _PREFINAL[receipt] = _PrefinalReceipt(prepared, observation)
+    _PREFINAL[receipt] = _PrefinalReceipt(prepared, observation, target)
     return receipt
 
 
@@ -328,6 +406,13 @@ def prefinal_linux_receipt_metadata(
         "prefinal Linux receipt inputs differ",
     )
     return value.observation.metadata
+
+
+def authenticated_linux_wheel_target(
+    receipt: AuthenticatedPrefinalLinuxReceiptV1,
+) -> AuthenticatedLinuxWheelTargetV1:
+    prefinal_linux_receipt_metadata(receipt)
+    return _PREFINAL[receipt].target
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,10 +457,24 @@ def bind_prefinal_linux_receipt(
         "authenticated prefinal Linux facts differ",
     )
     final_facts = service._facts_from_capabilities(linux_runtime, image)
+    _, target_image = _authenticated_linux_binding_for_consumer(prefinal.target)
     _require(final_facts == prepared.expected, "final Linux inputs differ from prefinal receipt")
+    _require(
+        target_image
+        == (
+            final_facts.image_reference,
+            final_facts.image_config_sha256,
+            final_facts.image_layers,
+            final_facts.image_diff_ids,
+        ),
+        "final Linux image differs from authenticated target",
+    )
     _require(_prepared(prefinal.prepared).expected == final_facts, "prefinal Linux seals changed")
     binding = _dependency_binding_for_consumer(linux_runtime)
-    _require(binding.files is files, "final Linux receipt lease differs")
+    _require(
+        binding.files is files and binding.linux_target is prefinal.target,
+        "final Linux receipt lease or target differs",
+    )
     result = object.__new__(BoundPrefinalLinuxReceiptV1)
     metadata = BoundPrefinalLinuxReceiptMetadataV1(
         binding.metadata.qualification_input_sha256, prefinal.observation.metadata

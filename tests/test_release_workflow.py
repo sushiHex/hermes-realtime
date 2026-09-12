@@ -31,9 +31,7 @@ def _gate_test_commands(source: str) -> list[tuple[str, set[str]]]:
     commands: list[tuple[str, set[str]]] = []
     for node in ast.walk(ast.parse(source)):
         if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "run"
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "run"
         ):
             continue
         literal_args = {
@@ -101,7 +99,8 @@ def test_browser_bundle_legal_notices_are_release_gated() -> None:
 def test_linux_candidate_wheel_requires_browser_build_and_committed_asset_parity() -> None:
     workflow = _release_workflow()
     wheel = workflow.split("  candidate-wheel:\n", maxsplit=1)[1].split(
-        "  linux-null-capture:\n", maxsplit=1,
+        "  linux-null-capture:\n",
+        maxsplit=1,
     )[0]
 
     assert 'node-version: "22.22.2"' in wheel
@@ -128,9 +127,10 @@ def test_native_release_gate_runs_the_synthetic_full_host_audio_tracer() -> None
         "def run_script_mypy(", maxsplit=1
     )[0]
 
-    assert livekit_block.count(
-        '"tests/integration/test_qualification_full_host_synthetic_audio.py"'
-    ) == 1
+    assert (
+        livekit_block.count('"tests/integration/test_qualification_full_host_synthetic_audio.py"')
+        == 1
+    )
 
 
 def test_browser_owned_livekit_verifies_the_listener_process_id() -> None:
@@ -201,9 +201,7 @@ def test_every_gate_suite_records_per_test_durations() -> None:
 
 def test_gate_timing_inventory_recognizes_direct_vitest_launchers() -> None:
     commands = _gate_test_commands(
-        'run("npx", "vitest", "run")\n'
-        'run("uv", "run", "pytest", "-q")\n'
-        'run(NPM, "test")\n'
+        'run("npx", "vitest", "run")\nrun("uv", "run", "pytest", "-q")\nrun(NPM, "test")\n'
     )
 
     assert [kind for kind, _ in commands] == ["vitest", "pytest", "vitest"]
@@ -227,7 +225,7 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
     setup_uv = "      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d\n"
     hermetic_setup_uv = setup_uv + (
         "        with:\n"
-        "          version: \"0.11.28\"\n"
+        '          version: "0.11.28"\n'
         "          enable-cache: true\n"
         "          prune-cache: true\n"
     )
@@ -257,9 +255,9 @@ def test_windows_release_jobs_provision_owner_only_temp_roots() -> None:
         assert job.count(provision_marker) == 1
         assert job.count(cleanup_marker) == 1
 
-        provision = job.split(provision_marker, maxsplit=1)[1].split(
-            "\n      - name:", maxsplit=1
-        )[0]
+        provision = job.split(provision_marker, maxsplit=1)[1].split("\n      - name:", maxsplit=1)[
+            0
+        ]
         assert "$env:RUNNER_TEMP" in provision
         assert "[Security.Principal.WindowsPrincipal]" in provision
         assert "[Security.Principal.WindowsBuiltInRole]::Administrator" in provision
@@ -286,13 +284,10 @@ def test_windows_release_jobs_provision_owner_only_temp_roots() -> None:
         assert '"TMP=$testTemp"' in provision
         assert "HERMES_OWNER_ONLY_TEST_TEMP" not in provision
 
-        cleanup = job.split(cleanup_marker, maxsplit=1)[1].split(
-            "\n      - name:", maxsplit=1
-        )[0]
+        cleanup = job.split(cleanup_marker, maxsplit=1)[1].split("\n      - name:", maxsplit=1)[0]
         assert "if: always()" in cleanup
         assert (
-            '$testTemp = Join-Path $env:RUNNER_TEMP '
-            '"hermes-realtime-owner-only-$env:GITHUB_JOB"'
+            '$testTemp = Join-Path $env:RUNNER_TEMP "hermes-realtime-owner-only-$env:GITHUB_JOB"'
         ) in cleanup
         assert "Remove-Item -LiteralPath $testTemp" in cleanup
         assert "HERMES_OWNER_ONLY_TEST_TEMP" not in cleanup
@@ -360,8 +355,10 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     cleanup_marker = "      - name: Remove owner-only Windows test temp"
 
     assert native_job.count(browser_marker) == 1
-    assert native_job.index(native_marker) < native_job.index(browser_marker) < native_job.index(
-        cleanup_marker
+    assert (
+        native_job.index(native_marker)
+        < native_job.index(browser_marker)
+        < native_job.index(cleanup_marker)
     )
     browser_step = native_job.split(browser_marker, maxsplit=1)[1].split(
         "\n      - name:", maxsplit=1
@@ -369,8 +366,7 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     assert "$env:HERMES_REALTIME_BROWSER_SELF_ACCEPTANCE = '1'" in browser_step
     assert "$env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER = $env:LIVEKIT_SERVER" in browser_step
     assert (
-        "$env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256 = "
-        "$env:LIVEKIT_SERVER_SHA256"
+        "$env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256 = $env:LIVEKIT_SERVER_SHA256"
     ) in browser_step
     assert "uv run --frozen --group dev --extra browser-acceptance pytest -q" in browser_step
     assert "tests/integration/test_browser_self_acceptance.py" in browser_step
@@ -409,9 +405,9 @@ def test_native_failure_prints_only_bounded_sanitized_logs_from_each_owned_serve
     assert "Get-Content $stdout" not in native_job
     assert "Get-Content $stderr" not in native_job
 
-    browser_source = (
-        root / "tests" / "integration" / "test_browser_self_acceptance.py"
-    ).read_text(encoding="utf-8")
+    browser_source = (root / "tests" / "integration" / "test_browser_self_acceptance.py").read_text(
+        encoding="utf-8"
+    )
     assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR")' in browser_source
     assert '"browser-livekit.out"' in browser_source
     assert '"browser-livekit.err"' in browser_source
@@ -426,7 +422,7 @@ def test_browser_self_acceptance_accepts_only_explicit_livekit_executable_overri
 
     assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_SERVER")' in source
     assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256", "")' in source
-    assert "Path(__file__).parents[2] / \".tools/livekit/livekit-server.exe\"" in source
+    assert 'Path(__file__).parents[2] / ".tools/livekit/livekit-server.exe"' in source
 
 
 def test_native_livekit_gate_binds_the_verified_executable_and_owned_listener() -> None:
@@ -462,12 +458,28 @@ def test_linux_null_capture_consumes_the_single_hash_identified_candidate_wheel(
     assert "requirements/linux-null-capture.txt" in candidate
     assert "--group dev" in candidate
     assert "wheelhouse/" in candidate
+    assert "uv export --frozen --no-dev --no-emit-project" in candidate
+    assert "$RUNNER_TEMP/linux-runtime-export.txt" in candidate
+    assert "linux-runtime/wheels" in candidate
+    assert "--prepare-inputs" in candidate
+    assert "source/" in candidate
     assert "needs: candidate-wheel" in linux
     assert "sha256sum --check candidate/candidate-wheel.sha256" in linux
     assert "--no-index" in linux
     assert "--require-hashes" in linux
-    assert 'PATH="$PWD/candidate-input/runtime/bin:$PATH"' in linux
+    assert "scripts.qualification_linux_producer" in linux
+    assert 'PATH="$PWD/candidate-input/portable-runtime/bin:$PATH"' in linux
     assert "tests/integration/test_linux_null_capture.py" in linux
+    assert linux.index("scripts.qualification_linux_producer") < linux.index("actions/setup-python")
+    assert linux.index("Validate portable qualification oracles") < linux.index(
+        "hermes-realtime-linux-null-capture-receipt-v1"
+    )
+    assert "linux-null-capture-receipt-v1.json" in linux
+
+
+def test_release_jobs_checkout_the_exact_event_head() -> None:
+    workflow = _release_workflow()
+    assert workflow.count("ref: ${{ github.event.pull_request.head.sha || github.sha }}") == 4
 
 
 def test_committed_test_source_contains_no_credential_shaped_literals() -> None:

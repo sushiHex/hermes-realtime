@@ -10,6 +10,16 @@ def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _runtime_observation() -> SimpleNamespace:
+    return SimpleNamespace(
+        python_version="3.11.16",
+        soabi="cpython-311-x86_64-linux-gnu",
+        ext_suffix=".cpython-311-x86_64-linux-gnu.so",
+        multiarch="x86_64-linux-gnu",
+        glibc="2.36",
+    )
+
+
 def _ref(role: str, path: str, raw: bytes) -> dict[str, object]:
     return {
         "role": role,
@@ -31,16 +41,12 @@ def _prepare(work, tmp_path, monkeypatch, *, dependency_tag="py3-none-any", lock
     )
 
     wheel_helpers = run_path(str(Path.cwd() / "tests/test_qualification_wheelhouse.py"))
-    dependency_name, dependency = wheel_helpers["wheel"](
-        "aiohttp", "1.0", tag=dependency_tag
-    )
+    dependency_name, dependency = wheel_helpers["wheel"]("aiohttp", "1.0", tag=dependency_tag)
     direct_name, direct = wheel_helpers["wheel"](
         "hermes_realtime", "0.0.3", requires=("aiohttp==1.0",)
     )
     assert direct_name == "hermes_realtime-0.0.3-py3-none-any.whl"
-    requirements = (
-        f"aiohttp==1.0 --hash=sha256:{_sha(dependency)}\n"
-    ).encode("ascii")
+    requirements = (f"aiohttp==1.0 --hash=sha256:{_sha(dependency)}\n").encode("ascii")
     constraints = b"# No additional constraints\n"
     paths = {
         "requirements": "inputs/linux/requirements.txt",
@@ -152,7 +158,7 @@ def test_authenticated_prefinal_transfers_once_then_retains_only_final_authority
             LinuxReceiptMetadataV1(
                 42, 1, "5" * 64, expected.candidate_commit, expected.direct_wheel_sha256, True
             ),
-            object(),
+            _runtime_observation(),
         )
         monkeypatch.setattr(
             linux.service, "_authenticate_observation", lambda *args, **kwargs: observation
@@ -163,10 +169,23 @@ def test_authenticated_prefinal_transfers_once_then_retains_only_final_authority
         final_binding = SimpleNamespace(
             files=final_files,
             metadata=SimpleNamespace(qualification_input_sha256="6" * 64),
+            linux_target=linux.authenticated_linux_wheel_target(prefinal),
+        )
+        wrong_runtime = object.__new__(BoundDependencyPurposeV1)
+        wrong_binding = SimpleNamespace(
+            files=final_files,
+            metadata=SimpleNamespace(qualification_input_sha256="6" * 64),
+            linux_target=object(),
         )
         monkeypatch.setattr(linux.service, "_facts_from_capabilities", lambda *args: expected)
         monkeypatch.setattr(linux.service, "_match_payload", lambda *args: None)
-        monkeypatch.setattr(linux, "_dependency_binding_for_consumer", lambda value: final_binding)
+        monkeypatch.setattr(
+            linux,
+            "_dependency_binding_for_consumer",
+            lambda value: wrong_binding if value is wrong_runtime else final_binding,
+        )
+        with pytest.raises(ValueError, match="target differs"):
+            linux.bind_prefinal_linux_receipt(prefinal, final_files, wrong_runtime, image)
         bound = linux.bind_prefinal_linux_receipt(prefinal, final_files, runtime, image)
         with pytest.raises(ValueError, match="already transferred"):
             linux.bind_prefinal_linux_receipt(prefinal, final_files, runtime, image)
@@ -188,13 +207,32 @@ def test_capabilities_are_opaque_and_wrong_final_lease_refuses(monkeypatch):
     ):
         with pytest.raises(TypeError):
             capability()
-    expected = object()
+    expected = SimpleNamespace(
+        image_reference="image",
+        image_config_sha256="config",
+        image_layers=("layer",),
+        image_diff_ids=("diff",),
+    )
     prefinal = object.__new__(linux.AuthenticatedPrefinalLinuxReceiptV1)
+    target = object()
     linux._PREFINAL[prefinal] = SimpleNamespace(
-        prepared=object(), observation=SimpleNamespace(facts=expected)
+        prepared=object(), observation=SimpleNamespace(facts=expected), target=target
     )
     monkeypatch.setattr(linux, "_prepared", lambda value: SimpleNamespace(expected=expected))
     monkeypatch.setattr(linux.service, "_facts_from_capabilities", lambda *args: expected)
+    monkeypatch.setattr(
+        linux,
+        "_authenticated_linux_binding_for_consumer",
+        lambda value: (
+            object(),
+            (
+                expected.image_reference,
+                expected.image_config_sha256,
+                expected.image_layers,
+                expected.image_diff_ids,
+            ),
+        ),
+    )
     runtime = object.__new__(BoundDependencyPurposeV1)
     expected_files = object.__new__(RetainedQualificationInputFilesV1)
     supplied_files = object.__new__(RetainedQualificationInputFilesV1)
@@ -202,10 +240,12 @@ def test_capabilities_are_opaque_and_wrong_final_lease_refuses(monkeypatch):
         linux,
         "_dependency_binding_for_consumer",
         lambda value: SimpleNamespace(
-            files=expected_files, metadata=SimpleNamespace(qualification_input_sha256="7" * 64)
+            files=expected_files,
+            metadata=SimpleNamespace(qualification_input_sha256="7" * 64),
+            linux_target=target,
         ),
     )
-    with pytest.raises(ValueError, match="lease differs"):
+    with pytest.raises(ValueError, match="lease or target differs"):
         linux.bind_prefinal_linux_receipt(
             prefinal,
             supplied_files,
@@ -215,17 +255,42 @@ def test_capabilities_are_opaque_and_wrong_final_lease_refuses(monkeypatch):
 
 
 @pytest.mark.skipif(__import__("os").name != "nt", reason="immutable snapshot owner needs Windows")
-@pytest.mark.parametrize(
-    ("options", "message"),
-    [
-        ({"locked": False}, "source lock"),
-        ({"dependency_tag": "cp311-cp311-manylinux_2_17_x86_64"}, "compatible"),
-    ],
-)
-def test_preparation_refuses_unlocked_and_unobserved_manylinux_wheels(
-    tmp_path, monkeypatch, options, message
-):
+def test_preparation_refuses_unlocked_wheel(tmp_path, monkeypatch):
     from scripts.qualification_owned_work import OwnedQualificationWorkV1
 
-    with pytest.raises(ValueError, match=message), OwnedQualificationWorkV1() as work:
-        _prepare(work, tmp_path, monkeypatch, **options)
+    with pytest.raises(ValueError, match="source lock"), OwnedQualificationWorkV1() as work:
+        _prepare(work, tmp_path, monkeypatch, locked=False)
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="immutable snapshot owner needs Windows")
+def test_manylinux_compatibility_comes_only_from_authenticated_runtime(monkeypatch, tmp_path):
+    from scripts.github_actions_linux_receipt import (
+        LinuxReceiptMetadataV1,
+        _AuthenticatedObservation,
+    )
+    from scripts.qualification_owned_work import OwnedQualificationWorkV1
+
+    with OwnedQualificationWorkV1() as work:
+        linux, prepared, _, _ = _prepare(
+            work,
+            tmp_path,
+            monkeypatch,
+            dependency_tag="cp311-cp311-manylinux_2_17_x86_64",
+        )
+        expected = linux._prepared(prepared).expected
+        observation = _AuthenticatedObservation(
+            expected,
+            LinuxReceiptMetadataV1(
+                42, 1, "5" * 64, expected.candidate_commit, expected.direct_wheel_sha256, True
+            ),
+            _runtime_observation(),
+        )
+        monkeypatch.setattr(
+            linux.service, "_authenticate_observation", lambda *args, **kwargs: observation
+        )
+        assert (
+            linux.prefinal_linux_receipt_metadata(
+                linux.authenticate_prefinal_linux_receipt(42, prepared)
+            ).run_id
+            == 42
+        )

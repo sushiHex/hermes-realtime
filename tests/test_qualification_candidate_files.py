@@ -628,3 +628,108 @@ def test_source_locked_but_unrelated_package_cannot_join_a_purpose(dependency_gr
         candidate = bind_candidate_files(files, archive, identity)
         with pytest.raises(ValueError, match="unrelated"):
             bind_dependency_purpose(files, candidate, purpose=purpose)
+
+
+def test_authenticated_linux_target_cannot_authorize_a_different_recipe(dependency_graph):
+    from scripts.qualification_candidate_files import bind_candidate_files
+    from scripts.qualification_dependency_files import bind_dependency_purpose
+    from scripts.qualification_wheelhouse import (
+        _LinuxWheelRecipeBinding,
+        _mint_authenticated_linux_target,
+        _target,
+    )
+
+    environment, tags = _target("3.11.16", "linux_x86_64")
+    foreign = _LinuxWheelRecipeBinding(
+        "0" * 40,
+        "1" * 40,
+        "2" * 64,
+        ("foreign.whl", "3" * 64, 1),
+        "4" * 64,
+        "5" * 64,
+        "6" * 64,
+        "7" * 64,
+        (("foreign.whl", "3" * 64, 1),),
+    )
+    target = _mint_authenticated_linux_target(
+        environment,
+        tags,
+        foreign,
+        ("foreign-image", "8" * 64, ("9" * 64,), ("a" * 64,)),
+    )
+    root, _, _, archive, identity = dependency_graph
+    with freeze(dependency_graph) as files:
+        candidate = bind_candidate_files(files, archive, identity)
+        with pytest.raises(ValueError, match="target recipe differs"):
+            bind_dependency_purpose(
+                files,
+                candidate,
+                purpose="realtime_linux_runtime",
+                linux_target=target,
+            )
+
+
+def test_complete_dependency_binding_accepts_its_authenticated_linux_target(dependency_graph):
+    from scripts.qualification_candidate_files import (
+        bind_candidate_files,
+        candidate_file_metadata,
+    )
+    from scripts.qualification_dependency_files import (
+        _source_locked_wheels,
+        bind_dependency_files,
+        dependency_file_metadata,
+    )
+    from scripts.qualification_wheelhouse import (
+        _LinuxWheelRecipeBinding,
+        _mint_authenticated_linux_target,
+        _target,
+    )
+
+    root, _, document, archive, identity = dependency_graph
+    linux_reference = next(
+        item for item in document["files"] if item["role"] == "linux_runtime_wheelhouse_manifest"
+    )
+    manifest_raw = (root / linux_reference["relativePath"]).read_bytes()
+    manifest = json.loads(manifest_raw)
+    requirements = (root / manifest["requirements"]["relativePath"]).read_bytes()
+    constraints = (root / manifest["constraints"]["relativePath"]).read_bytes()
+    direct_reference = next(item for item in document["files"] if item["role"] == "direct_wheel")
+    direct_raw = (root / direct_reference["relativePath"]).read_bytes()
+    direct = (
+        direct_reference["basename"],
+        hashlib.sha256(direct_raw).hexdigest(),
+        len(direct_raw),
+    )
+    requirements += (f"\nhermes-realtime==0.0.3 --hash=sha256:{direct[1]}\n").encode("ascii")
+    wheels = [
+        (
+            item["basename"],
+            hashlib.sha256((root / item["relativePath"]).read_bytes()).hexdigest(),
+            len((root / item["relativePath"]).read_bytes()),
+        )
+        for item in manifest["wheels"]
+    ]
+    wheels.append(("hermes_realtime-0.0.3-py3-none-any.whl", direct[1], direct[2]))
+    with freeze(dependency_graph) as files:
+        candidate = bind_candidate_files(files, archive, identity)
+        source = candidate_file_metadata(candidate)
+        source_lock_sha256, _ = _source_locked_wheels(candidate)
+        environment, tags = _target(manifest["pythonVersion"], "linux_x86_64")
+        target = _mint_authenticated_linux_target(
+            environment,
+            tags,
+            _LinuxWheelRecipeBinding(
+                source.source_commit,
+                source.source_tree,
+                source.source_archive_sha256,
+                direct,
+                hashlib.sha256(manifest_raw).hexdigest(),
+                source_lock_sha256,
+                hashlib.sha256(requirements).hexdigest(),
+                hashlib.sha256(constraints).hexdigest(),
+                tuple(sorted(wheels)),
+            ),
+            ("image", "1" * 64, ("2" * 64,), ("3" * 64,)),
+        )
+        receipt = bind_dependency_files(files, candidate, linux_target=target)
+        assert len(dependency_file_metadata(receipt).wheelhouses) == 5
