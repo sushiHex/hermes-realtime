@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import zipfile
+from contextlib import contextmanager
 
 import pytest
 
@@ -96,3 +97,60 @@ def test_tool_environment_capability_is_not_caller_constructible():
         ImmutableToolEnvironmentV1()
     with pytest.raises(ValueError):
         tool_environment_metadata(object.__new__(ImmutableToolEnvironmentV1))
+
+
+def test_completed_environment_is_historical_only_after_successful_snapshot_cleanup(monkeypatch):
+    from scripts.qualification_tool_environment import (
+        _completed_tool_environment_for_consumer,
+        complete_tool_environment,
+        completed_tool_environment_metadata,
+        owned_tool_environment,
+        tool_environment_metadata,
+    )
+
+    selected = distributions(monkeypatch)
+    with owned_tool_environment(selected) as environment:
+        with pytest.raises(ValueError, match="cleanup is incomplete"):
+            complete_tool_environment(environment)
+        active = tool_environment_metadata(environment)
+    completed = complete_tool_environment(environment)
+    assert completed_tool_environment_metadata(completed) == active
+    assert _completed_tool_environment_for_consumer(completed).tools is environment
+    with pytest.raises(ValueError, match="closed"):
+        tool_environment_metadata(environment)
+
+
+def test_failed_snapshot_cleanup_cannot_mint_a_completed_environment(monkeypatch):
+    from scripts import qualification_tool_environment as owner
+
+    selected = distributions(monkeypatch)
+    original = owner.owned_execution_files
+
+    @contextmanager
+    def cleanup_failure(contents):
+        with original(contents) as files:
+            yield files
+        raise RuntimeError("synthetic cleanup failure")
+
+    monkeypatch.setattr(owner, "owned_execution_files", cleanup_failure)
+    with (
+        pytest.raises(RuntimeError, match="cleanup failure"),
+        owner.owned_tool_environment(selected) as environment,
+    ):
+        captured = environment
+    with pytest.raises(ValueError, match="cleanup is incomplete"):
+        owner.complete_tool_environment(captured)
+
+
+def test_completed_environment_capability_cannot_be_constructed_or_forged():
+    from scripts.qualification_tool_environment import (
+        CompletedToolEnvironmentV1,
+        completed_tool_environment_metadata,
+    )
+
+    with pytest.raises(TypeError):
+        CompletedToolEnvironmentV1()
+    with pytest.raises(TypeError):
+        completed_tool_environment_metadata({"completed": True})
+    with pytest.raises(ValueError, match="unregistered"):
+        completed_tool_environment_metadata(object.__new__(CompletedToolEnvironmentV1))

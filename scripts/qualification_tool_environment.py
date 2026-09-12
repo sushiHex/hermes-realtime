@@ -42,6 +42,15 @@ class ImmutableToolEnvironmentV1:
         raise TypeError("tool environments are created by their owner only")
 
 
+class CompletedToolEnvironmentV1:
+    """Historical cleanup receipt; it does not reopen a released tool tree."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("completed tool environments are owner-minted only")
+
+
 @dataclass(frozen=True, slots=True)
 class _Environment:
     files: ImmutableExecutionFilesV1
@@ -49,6 +58,26 @@ class _Environment:
 
 
 _LIVE: WeakKeyDictionary[ImmutableToolEnvironmentV1, _Environment] = WeakKeyDictionary()
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalEnvironment:
+    distributions: tuple[AdmittedToolDistributionV1, ...]
+    metadata: tuple[ToolDistributionMetadataV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedEnvironment:
+    tools: ImmutableToolEnvironmentV1
+    historical: _HistoricalEnvironment
+
+
+_CLEANED: WeakKeyDictionary[ImmutableToolEnvironmentV1, _HistoricalEnvironment] = (
+    WeakKeyDictionary()
+)
+_COMPLETED: WeakKeyDictionary[CompletedToolEnvironmentV1, _CompletedEnvironment] = (
+    WeakKeyDictionary()
+)
 
 
 def _environment(receipt: ImmutableToolEnvironmentV1) -> _Environment:
@@ -88,12 +117,62 @@ def owned_tool_environment(
             yield receipt
         finally:
             del _LIVE[receipt]
+    # owned_execution_files returned only after it released the seals, removed
+    # the owned snapshot, and independently verified removal.
+    _CLEANED[receipt] = _HistoricalEnvironment(
+        selected, tuple(tool_distribution_metadata(item) for item in selected)
+    )
 
 
 def tool_environment_metadata(
     receipt: ImmutableToolEnvironmentV1,
 ) -> tuple[ToolDistributionMetadataV1, ...]:
     return tuple(tool_distribution_metadata(item) for item in _environment(receipt).distributions)
+
+
+def complete_tool_environment(
+    receipt: ImmutableToolEnvironmentV1,
+) -> CompletedToolEnvironmentV1:
+    """Mint a historical receipt only after successful owned-tree cleanup."""
+    if type(receipt) is not ImmutableToolEnvironmentV1:
+        raise TypeError("tool environment capability type differs")
+    _require(receipt not in _LIVE, "tool environment cleanup is incomplete")
+    _require(receipt in _CLEANED, "tool environment cleanup is incomplete")
+    completed = object.__new__(CompletedToolEnvironmentV1)
+    _COMPLETED[completed] = _CompletedEnvironment(receipt, _CLEANED[receipt])
+    return completed
+
+
+def _completed_environment(
+    receipt: CompletedToolEnvironmentV1,
+) -> _CompletedEnvironment:
+    if type(receipt) is not CompletedToolEnvironmentV1:
+        raise TypeError("completed tool environment capability type differs")
+    _require(receipt in _COMPLETED, "completed tool environment capability is unregistered")
+    value = _COMPLETED[receipt]
+    _require(
+        value.tools not in _LIVE and value.tools in _CLEANED,
+        "completed tool environment cleanup is incomplete",
+    )
+    _require(
+        tuple(tool_distribution_metadata(item) for item in value.historical.distributions)
+        == value.historical.metadata,
+        "completed tool environment distribution facts differ",
+    )
+    return value
+
+
+def completed_tool_environment_metadata(
+    receipt: CompletedToolEnvironmentV1,
+) -> tuple[ToolDistributionMetadataV1, ...]:
+    return _completed_environment(receipt).historical.metadata
+
+
+def _completed_tool_environment_for_consumer(
+    receipt: CompletedToolEnvironmentV1,
+) -> _CompletedEnvironment:
+    """Private aggregate seam retaining identity and historical distribution facts."""
+    return _completed_environment(receipt)
 
 
 def _tool_image_for_consumer(
