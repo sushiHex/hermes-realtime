@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,9 +22,17 @@ def layout(tmp_path):
         (package / "__init__.py").write_text("# synthetic worker fixture\n")
     (packages / "hatchling/build.py").write_text(
         "from pathlib import Path\n"
+        "import zipfile\n"
         "def build_wheel(output):\n"
         "    name='hermes_realtime-0.0.3-py3-none-any.whl'\n"
-        "    Path(output,name).write_bytes(b'synthetic wheel, not qualification')\n"
+        "    with zipfile.ZipFile(Path(output,name), 'w') as wheel:\n"
+        "        info=zipfile.ZipInfo('payload.txt', (2024,1,2,3,4,6))\n"
+        "        info.create_system=0\n"
+        "        info.comment=b'variant'\n"
+        "        wheel.writestr(info,b'synthetic wheel, not qualification',"
+        "compress_type=zipfile.ZIP_DEFLATED)\n"
+        "        wheel.writestr('hermes_realtime-0.0.3.dist-info/RECORD',"
+        "b'exact record payload\\n')\n"
         "    return name\n"
         "def build_sdist(output):\n"
         "    name='hermes_realtime-0.0.3.tar.gz'\n"
@@ -82,6 +91,17 @@ def test_worker_uses_installed_namespace_and_reports_only_closed_metadata(layout
         "source_fallback",
         "artifact",
     }
+    if kind == "wheel":
+        with zipfile.ZipFile(layout[2] / expected) as wheel:
+            assert wheel.comment == b""
+            assert wheel.namelist() == sorted(wheel.namelist())
+            assert wheel.read("hermes_realtime-0.0.3.dist-info/RECORD") == b"exact record payload\n"
+            assert all(
+                item.create_system == 3
+                and item.compress_type == zipfile.ZIP_STORED
+                and item.date_time == (2020, 2, 2, 0, 0, 0)
+                for item in wheel.infolist()
+            )
     assert not list(layout[0].rglob("*.pyc"))
 
 

@@ -31,6 +31,8 @@ installs the locked browser dependencies with scripts disabled, runs the browser
 tests and TypeScript build, and rejects any generated change to committed assets
 or their disclosure manifest. This exercises platform-specific compiler packages
 before producing the wheel consumed by the Linux installation check.
+The Pure job applies the same [canonical wheel serialization](qualification-input-files.md#produce-independent-artifacts)
+as the native qualification builds before creating any wheel hash or receipt.
 
 Before provisioning the candidate environment, the gate verifies that `uv.lock`
 matches the project metadata. A stale lock fails without being rewritten. The

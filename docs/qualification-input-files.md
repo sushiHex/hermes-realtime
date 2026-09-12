@@ -480,6 +480,17 @@ and separate output workspace. The source tree comes from the genuine archive;
 sdist-built wheels instead use the exact files admitted by the existing sdist
 comparison. The worker pins the admitted Hatchling reproducibility timestamp.
 
+The worker and the Pure CI job pass each newly built wheel through the same
+`canonicalize_wheel_file` function in the archived
+[build worker](../scripts/qualification_build_worker.py). It limits input reads
+and replaces the output only after serialization succeeds. It fixes ZIP member
+order and metadata and stores member bytes without compression, removing host
+platform and compressor differences from the artifact identity. Member contents,
+including RECORD, remain byte-identical. The existing wheel size limit and
+source/metadata/RECORD validation still apply. Linux receipt authentication
+requires the exact resulting direct wheel; compatible package contents alone
+cannot satisfy that comparison.
+
 The recipe requires normal process exit and complete Job cleanup before reading
 outputs. It independently compares every wheel with the source/wheel authority
 and every sdist with the source-selected files and package metadata. It seals an

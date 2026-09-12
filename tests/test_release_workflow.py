@@ -454,6 +454,17 @@ def test_linux_null_capture_consumes_the_single_hash_identified_candidate_wheel(
 
     assert "runs-on: ubuntu-24.04" in candidate
     assert "uv build --wheel --out-dir candidate" in candidate
+    assert "from scripts.qualification_build_worker import canonicalize_wheel_file" in candidate
+    canonical_write = "canonicalize_wheel_file(wheel)"
+    assert canonical_write in candidate
+    assert (
+        candidate.index("uv build --wheel --out-dir candidate")
+        < candidate.index(canonical_write)
+        < min(
+            candidate.index("--prepare-inputs"),
+            candidate.index("candidate/candidate-wheel.sha256"),
+        )
+    )
     assert "candidate/candidate-wheel.sha256" in candidate
     assert "requirements/linux-null-capture.txt" in candidate
     assert "--group dev" in candidate

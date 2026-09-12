@@ -53,6 +53,13 @@ jobs:
           python -c "from pathlib import Path; from scripts.release_gate import validate_disclosure_manifest; validate_disclosure_manifest(Path('src'))"
           mkdir -p candidate wheelhouse requirements linux-runtime/wheels
           uv build --wheel --out-dir candidate
+          python - <<'PY'
+          from pathlib import Path
+          from scripts.qualification_build_worker import canonicalize_wheel_file
+
+          wheel = Path("candidate/hermes_realtime-0.0.3-py3-none-any.whl")
+          canonicalize_wheel_file(wheel)
+          PY
           uv export --frozen --group dev --no-emit-project --output-file requirements/linux-null-capture.txt
           python -m pip download --dest wheelhouse --require-hashes -r requirements/linux-null-capture.txt
           uv export --frozen --no-dev --no-emit-project --output-file "$RUNNER_TEMP/linux-runtime-export.txt"
