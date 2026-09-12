@@ -35,6 +35,7 @@ from scripts.qualification_owned_work import OwnedQualificationWorkV1
 from scripts.qualification_runtime_environment import (
     InstalledRuntimeEnvironmentV1,
     _installed_runtime_for_consumer,
+    _Runtime,
 )
 from scripts.qualification_tool_process import (
     CompletedToolInvocationV1,
@@ -96,6 +97,7 @@ class BoundMoonshineCatalogV1:
 @dataclass(frozen=True, slots=True)
 class _Binding:
     work: OwnedQualificationWorkV1
+    runtime: _Runtime
     dependencies: BoundDependencyFilesV1 | BoundDependencyPurposeV1
     outputs: BoundBuildOutputsV1
     candidate: BoundCandidateFilesV1
@@ -378,6 +380,7 @@ def observe_moonshine_catalog(
         receipt = object.__new__(BoundMoonshineCatalogV1)
         _BINDINGS[receipt] = _Binding(
             work,
+            value,
             value.dependencies,
             value.outputs,
             closure.candidate,

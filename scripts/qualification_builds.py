@@ -127,9 +127,11 @@ class CandidateBuildsV1:
 
 @dataclass(frozen=True, slots=True)
 class _Builds:
+    inputs: BoundBuildInputsV1
     archive: archives.VerifiedCandidateSourceArchiveV1
     identity: CandidateIdentityV1
     produced: tuple[_Produced, ...]
+    output_owner: OwnedQualificationWorkV1
     metadata: CandidateBuildMetadataV1
 
 
@@ -291,9 +293,11 @@ def build_candidate_artifacts(
         _require(build_input_metadata(inputs) == metadata, "build input closure changed")
         receipt = object.__new__(CandidateBuildsV1)
         _BUILDS[receipt] = _Builds(
+            inputs,
             bound.archive,
             bound.identity,
             outputs,
+            work,
             CandidateBuildMetadataV1(metadata, tuple(item.metadata for item in outputs), 18),
         )
         return receipt
@@ -315,6 +319,10 @@ def _completed_builds(receipt: CandidateBuildsV1) -> _Builds:
 def candidate_build_metadata(receipt: CandidateBuildsV1) -> CandidateBuildMetadataV1:
     """Completed facts remain readable after the disposable build trees are removed."""
     return _completed_builds(receipt).metadata
+
+
+def _candidate_builds_for_consumer(receipt: CandidateBuildsV1) -> _Builds:
+    return _completed_builds(receipt)
 
 
 def _candidate_build_bytes(receipt: CandidateBuildsV1) -> dict[str, bytes]:
@@ -401,3 +409,8 @@ def build_output_metadata(receipt: BoundBuildOutputsV1) -> BuildOutputMetadataV1
         "final build input seals differ",
     )
     return value.metadata
+
+
+def _build_outputs_for_consumer(receipt: BoundBuildOutputsV1) -> _BoundOutputs:
+    build_output_metadata(receipt)
+    return _OUTPUTS[receipt]

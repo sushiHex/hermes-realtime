@@ -273,3 +273,8 @@ def completed_runtime_metadata(
         raise TypeError("completed runtime capability type differs")
     _require(receipt in _COMPLETED, "completed runtime capability is unregistered")
     return _retained_facts(_COMPLETED[receipt])
+
+
+def _completed_runtime_for_consumer(receipt: CompletedRuntimeEnvironmentV1) -> _Runtime:
+    completed_runtime_metadata(receipt)
+    return _COMPLETED[receipt]

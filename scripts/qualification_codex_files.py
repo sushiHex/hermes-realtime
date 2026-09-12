@@ -411,3 +411,8 @@ def codex_file_metadata(receipt: BoundCodexFilesV1) -> CodexFileMetadataV1:
         "Codex final seals differ",
     )
     return value.metadata
+
+
+def _codex_files_for_consumer(receipt: BoundCodexFilesV1) -> _Binding:
+    codex_file_metadata(receipt)
+    return _BOUND[receipt]

@@ -219,3 +219,8 @@ def chrome_file_metadata(receipt: BoundChromeFilesV1) -> ChromeFileMetadataV1:
         "Chrome final input seals differ",
     )
     return bound.metadata
+
+
+def _chrome_files_for_consumer(receipt: BoundChromeFilesV1) -> _Binding:
+    chrome_file_metadata(receipt)
+    return _BOUND[receipt]

@@ -121,6 +121,7 @@ class BoundLiveKitFilesV1:
 class _FinalBinding:
     inputs: BoundBuildInputsV1
     files: RetainedQualificationInputFilesV1
+    preparation_owner: OwnedQualificationWorkV1
     metadata: LiveKitFileMetadataV1
 
 
@@ -294,6 +295,7 @@ def bind_livekit_files(
     _FINAL[receipt] = _FinalBinding(
         admitted.inputs,
         files,
+        admitted.work,
         LiveKitFileMetadataV1(
             retained_input_metadata(files).qualification_input_sha256,
             metadata.source_commit,
@@ -334,3 +336,8 @@ def livekit_file_metadata(receipt: BoundLiveKitFilesV1) -> LiveKitFileMetadataV1
         "LiveKit final seals differ",
     )
     return value.metadata
+
+
+def _livekit_files_for_consumer(receipt: BoundLiveKitFilesV1) -> _FinalBinding:
+    livekit_file_metadata(receipt)
+    return _FINAL[receipt]

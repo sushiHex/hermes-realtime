@@ -92,6 +92,7 @@ class _Prepared:
     inputs: BoundBuildInputsV1
     builds: CandidateBuildsV1
     image: AdmittedLinuxRuntimeImageV1
+    work: OwnedQualificationWorkV1
     image_metadata: LinuxRuntimeImageMetadataV1
     files: ImmutableExecutionFilesV1
     contents: tuple[tuple[str, bytes], ...]
@@ -236,6 +237,7 @@ def prepare_linux_receipt_inputs(
             inputs,
             builds,
             image,
+            work,
             image_metadata,
             snapshot,
             tuple(sorted(contents.items())),
@@ -432,6 +434,7 @@ class BoundPrefinalLinuxReceiptV1:
 class _BoundReceipt:
     linux_runtime: BoundDependencyPurposeV1
     image: AdmittedLinuxRuntimeImageV1
+    preparation_owner: OwnedQualificationWorkV1
     expected: service._LinuxReceiptFacts
     observation: service._AuthenticatedObservation
     metadata: BoundPrefinalLinuxReceiptMetadataV1
@@ -480,7 +483,7 @@ def bind_prefinal_linux_receipt(
         binding.metadata.qualification_input_sha256, prefinal.observation.metadata
     )
     _BOUND[result] = _BoundReceipt(
-        linux_runtime, image, final_facts, prefinal.observation, metadata
+        linux_runtime, image, prepared.work, final_facts, prefinal.observation, metadata
     )
     _TRANSFERRED[receipt] = metadata.qualification_input_sha256
     return result
@@ -510,3 +513,10 @@ def _bound_linux_receipt_payload_for_consumer(
 ) -> LinuxReceiptPayloadV1:
     bound_prefinal_linux_receipt_metadata(receipt)
     return _BOUND[receipt].observation.payload
+
+
+def _bound_linux_receipt_for_consumer(
+    receipt: BoundPrefinalLinuxReceiptV1,
+) -> _BoundReceipt:
+    bound_prefinal_linux_receipt_metadata(receipt)
+    return _BOUND[receipt]

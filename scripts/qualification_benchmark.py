@@ -93,6 +93,7 @@ class _Produced:
     files: ImmutableExecutionFilesV1
     contents: tuple[tuple[str, bytes], ...]
     invocation: CompletedToolInvocationV1
+    output_owner: OwnedQualificationWorkV1
     execution_work: OwnedQualificationWorkV1
     metadata: BenchmarkProductionMetadataV1
 
@@ -255,6 +256,7 @@ def produce_benchmark_artifacts(
             retained,
             tuple(contents.items()),
             invocation,
+            work,
             execution,
             BenchmarkProductionMetadataV1(
                 input_metadata.source_commit,
@@ -401,3 +403,8 @@ def benchmark_file_metadata(receipt: BoundBenchmarkFilesV1) -> BenchmarkFileMeta
         "final benchmark input seals or facts differ",
     )
     return value.metadata
+
+
+def _benchmark_files_for_consumer(receipt: BoundBenchmarkFilesV1) -> _BoundFiles:
+    benchmark_file_metadata(receipt)
+    return _BOUND[receipt]

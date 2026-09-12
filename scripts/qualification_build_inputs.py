@@ -312,3 +312,8 @@ def build_file_metadata(receipt: BoundBuildFilesV1) -> BuildFileMetadataV1:
         "build file binding differs",
     )
     return bound.metadata
+
+
+def _build_files_for_consumer(receipt: BoundBuildFilesV1) -> _BuildFiles:
+    build_file_metadata(receipt)
+    return _FILES[receipt]
