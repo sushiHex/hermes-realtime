@@ -2,9 +2,11 @@
 
 [Execution protocol](qualification-execution.md) · [Evidence contract](evidence-capture.md)
 
-The input-file layer verifies selected bytes and preserves their identities for
-later consumers. It does not by itself authenticate a tool publisher, establish
-an independent build, prove installation, or accept a full qualification report.
+Qualification inputs have separate file, source, build, installation and publisher
+authorities. Their final acceptance boundary requires matching lineage and
+completed preparation cleanup while the final input files remain sealed. The
+result supplies prerequisites for scenario execution; it does not accept a full
+qualification report.
 [Issue #47](https://github.com/sushiHex/hermes-realtime/issues/47) owns the complete
 input authority; [#62](https://github.com/sushiHex/hermes-realtime/issues/62) owns
 its composition with execution and cleanup evidence.
@@ -38,6 +40,12 @@ or prove an independent build. Every consumer still needs its governed command,
 environment, process ownership, durable recovery and final-exit observations.
 Those observations must precede release of the tool tree's seals and cleanup.
 
+After verified tool-tree removal, `complete_tool_environment` can retain a
+historical cleanup receipt tied to the exact original owner and admitted
+distribution facts. Active or failed cleanup cannot mint that receipt. The
+receipt neither reopens removed paths nor restores executable access; it lets
+final acceptance check cleanup after normal tool use has ended.
+
 `capture_candidate_source_archive_from_tools` passes the live tool owner to the
 existing native Git child and source-archive authority. It derives the selected
 image and expected version from the admitted distribution and revalidates the
@@ -51,6 +59,57 @@ that provenance to match its admitted tools; a legacy image-pin archive cannot b
 upgraded by attaching unrelated tool metadata afterward. Completed capture facts
 remain readable after disposable tool trees are removed, without retaining
 execution authority over them.
+
+Canonical source comparison disables external diff and text conversion helpers.
+Attribute inspection reads the exact candidate tree and refuses clean/process
+filters before comparing the worktree. Every Git child uses that same committed
+attribute source, so changed index or worktree attributes cannot select a local
+helper. Hook, fsmonitor and ambient configuration exclusions remain in force.
+
+## Bind complete browser and LiveKit files
+
+The [Chrome distribution admission](../scripts/qualification_chrome_files.py)
+authenticates the complete reviewed Chrome for Testing archive before parsing it.
+It preserves every ordinary publisher file and derives the canonical version
+manifest from those bytes. The final binding requires that exact manifest, every
+sealed member, the selected executable and version, and the same final candidate
+authority. An updated manifest hash cannot authorize a missing or changed file.
+
+Chrome resource names use the shared ordinary Windows path rules, including
+publisher names such as `First Run`. Direct qualification artifact references
+retain their stricter grammar. Public Chrome artifact IDs use the SHA-256 of each
+relative resource name; the sealed version manifest retains its exact spelling.
+This keeps both report schemas unchanged and covers nested resource directories.
+
+The [LiveKit admission](../scripts/qualification_livekit_files.py) derives its
+archive and executable selections from the candidate's existing workflow and
+browser integration test. It owns the archive and its complete publisher file
+set under separate namespace prefixes, then compares the final archive and
+executable while both sets of seals remain live. Completed source facts and final
+seals preserve that binding after the preparation workspace closes.
+
+Both use the existing bounded archive parser. The Chrome policy permits its
+reviewed large native library without widening the default tool-member limit.
+These bindings do not execute a browser or server, establish version output or
+readiness, create an operator profile, or authorize changes to an installation.
+Execution requires the separately owned immutable namespace and process lifecycle.
+
+## Bind the complete Codex publisher package
+
+The [Codex distribution admission](../scripts/qualification_codex_files.py)
+authenticates the reviewed Windows package before archive parsing. It retains all
+six publisher files, including the command runner, code-mode host, resource
+directory and search-path directory, and validates the publisher's layout
+metadata. The final executable must match both that package and the fixture in
+the genuine candidate archive. The frozen model and effort come from the
+candidate's governed report contract.
+
+The existing `codex_executable` role identifies the selected executable. The
+separate immutable package capability preserves the rest of its publisher
+namespace for the later execution owner; it does not invent another artifact
+role or make a single executable stand for the whole installation. Admission and
+binding do not execute Codex or its sandbox setup, provision credentials, or
+establish the full host's isolated launch environment.
 
 ## Retain before consuming
 
@@ -213,6 +272,45 @@ Kokoro, select an execution namespace, prove provider behavior, or admit Moonshi
 resources. The full host still needs the execution protocol's sealed pre-load
 namespace and fixed provider profile.
 
+The [Moonshine catalog observer](../scripts/qualification_moonshine_catalog.py)
+uses one live installed Windows runtime authority. It derives the candidate,
+source-selected worker, package distribution, tool environment and sealed import
+namespace from that owner. The fixed native request observes English medium
+resources with and without spelling resources before model construction. The
+controller verifies the actual process, implementation bytes, output, publisher
+origin, resource bounds and the identical primary selection in both responses.
+
+The catalog owns resource names, sizes and CRC32C checksums; it does not turn a
+caller-supplied model SHA-256 into publisher evidence. Catalog observations
+survive successful execution-tree cleanup while their final input authorities
+remain live; they provide no execution authority over removed trees.
+
+The [preparation owner](../scripts/qualification_moonshine_preparation.py) acquires
+resources before the final input document exists. It authenticates the
+source-locked wheel and invokes the candidate-archived worker with that wheel's
+native catalog API. The worker fetches the seven English medium resources and
+two spelling resources from their fixed publisher origins, with normal TLS
+verification and no redirects. Both worker and controller verify sizes and
+CRC32C checksums; SHA-256 then identifies each acquired resource. The execution
+owner must finish cleanup before preparation exposes its sealed outputs.
+The separate resource owner retains those originals for final transfer.
+
+The [final resource binder](../scripts/qualification_moonshine_resources.py)
+compares those originals with the final sealed manifest and resource bytes. It
+requires the same candidate, dependency purpose, wheel, worker, native API and
+complete catalog selection. Transfer occurs while both sets of seals are live.
+The resulting receipt becomes consumable only after original-resource cleanup
+succeeds, then relies on retained transfer facts and the final input seals.
+Unknown, pending or failed cleanup refuses consumption. The two Windows runtime
+purposes each require their corresponding catalog authority.
+
+Public provider-resource identifiers contain the provider and SHA-256 of the
+relative resource name. Exact names remain in the sealed manifest and its model
+identity calculation. Nested publisher cache paths therefore fit both existing
+report schemas without weakening either schema's identifier grammar. Catalog,
+acquisition and transfer evidence do not establish model loading or speech
+recognition behavior.
+
 ## Admit the Linux runtime descriptor
 
 The [Linux image admission](../scripts/qualification_linux_image.py) selects the
@@ -226,6 +324,58 @@ Descriptor admission does not establish downloaded image layers, an immutable
 container, observed Linux ABI compatibility, installed execution, cleanup, or
 an authenticated GitHub Actions receipt. The Linux executor must establish those
 before this prerequisite can support complete input acceptance.
+
+## Bind authenticated Linux execution records
+
+The [GitHub receipt consumer](../scripts/github_actions_linux_receipt.py) binds
+service observations to one final Linux dependency-purpose authority and the
+admitted image. It checks the exact repository, workflow source, candidate,
+first run attempt, successful Linux job and artifact identities, then hashes the
+transferred archive and parses its single canonical receipt. Supplied JSON or a
+successful job label alone cannot mint its authenticated capability. Signed
+artifact transfers receive no GitHub API bearer credential.
+
+The authenticated receipt retains its input, runtime, ABI and installation facts
+and revalidates the final input seals on consumption. Parsing the private payload
+produces ordinary validated data, with no execution or service authority.
+
+The [prerequisite owner](../scripts/qualification_linux_prerequisite.py) accepts
+the earlier source/build capabilities, independently produced direct wheel,
+source-locked Linux wheelhouse and admitted image descriptor. It seals that
+recipe before observing the service, without requiring a final input document.
+Both phases reuse one HTTPS and service-identity verifier.
+
+`bind_prefinal_linux_receipt` compares the authenticated prerequisite with the
+final Linux dependency and image facts while the original and final seals are
+live. Transfer is single-use. The resulting binding retains completed service
+facts and the final input seals, allowing intermediate workspaces to close.
+The earlier final-only consumer cannot substitute for that phase transition.
+
+The preliminary recipe admits source-locked wheel bytes without claiming ABI
+compatibility. After service authentication, the observed CPython ABI and glibc
+version determine the supported manylinux tags. The verifier checks the complete
+dependency graph and retains that target with the exact source, wheelhouse,
+candidate wheel and image identities. Both the single-purpose and five-purpose
+final dependency binders accept that same opaque target; a target from another
+recipe cannot authorize the final Linux inputs.
+
+The [hosted producer](../scripts/qualification_linux_producer.py) owns two
+containers and one fresh installation volume. The first container installs the
+runtime-only, hash-pinned wheel recipe offline. After it exits and is removed,
+the second container observes the same volume read-only. The admitted image,
+source and input mounts are immutable during observation; writable temporary
+data stays outside the installed import namespace. The
+[stdlib worker](../scripts/qualification_linux_worker.py) compares installed
+wheel bytes, installer-generated entry points and RECORD coverage, checks import
+origins, and runs the installed Linux null-capture behavior. The producer writes
+the receipt only after container, volume and observation-workspace cleanup
+succeeds. The existing portable tests use a separate environment.
+
+The workflow publishes the receipt from its Linux job. Acceptance still requires
+the trusted service's completed first-attempt run and artifact observations;
+local controller tests and an uploaded JSON file do not supply that authority.
+Adapter tests use synthetic build/service observations and real Windows file
+owners. Native hosted execution remains a distinct validation requirement.
 
 ## Own immutable execution files
 
@@ -328,6 +478,23 @@ native build evidence. A successful native recipe establishes its exercised
 builds and cleanup, without supplying the separate Linux, runtime, provider,
 Hermes, browser, benchmark or full-run prerequisites.
 
+## Produce benchmark inputs together
+
+The [benchmark recipe](../scripts/qualification_benchmark.py) consumes the
+pre-build source and admitted Python authority. One archived isolated worker
+creates the live machine manifest and admission benchmark report in the same
+owned invocation. The existing benchmark validators check the output grammar,
+source identity and threshold results; the owner additionally binds those bytes
+to the actual process and its cleanup. Machine and input identities use the
+same canonical Python patch version.
+
+Produced artifacts stay sealed for transfer into the two final input roles.
+`bind_benchmark_output_files` requires the source, Python identity and both
+outputs to agree while the produced and final seals are live. Completed facts
+survive disposal of the benchmark execution tree; final bindings expire with the
+final input owner. A supplied report, synthetic test timing or ordinary local
+preparation run does not establish qualification on a dedicated target host.
+
 ## Install each runtime purpose
 
 The runtime recipe reuses the same offline installer and installed-file inspector
@@ -355,6 +522,87 @@ The [runtime tests](../tests/test_qualification_runtime_environment.py) exercise
 purpose and source binding, unavailable prerequisites and installed candidate
 selection. Worker tests use synthetic modules to test import isolation and
 refusals; those fixtures do not establish a complete installed runtime closure.
+
+## Bind and exercise upstream Hermes source
+
+The [Hermes source admission](../scripts/qualification_hermes_source.py)
+authenticates the reviewed official release archive before parsing it. It checks
+the decompressed archive separately, preserves every source file and mode, and
+normalizes archive metadata under the harness's expected source prefix. The
+complete publisher source is retained in an owned immutable namespace. Only the
+dedicated source-archive role uses the larger archive bound; ordinary source
+files keep their existing limit.
+
+Final transfer compares that normalized source and the candidate's PluginManager
+harness with their final sealed artifact roles while both authorities are live.
+The [runtime qualifier](../scripts/qualification_hermes_pluginmanager_runtime.py)
+uses the matching installed Hermes-purpose runtime. A candidate-archived stdlib
+worker selects the harness's three fixed literal stages: discovery while
+disabled, CLI enablement, and enabled PluginManager registration. Each stage runs
+in an isolated child under the existing process owner. Imports use the immutable
+official source and installed packages; the qualifier does not create another
+venv or install missing dependencies.
+
+The candidate's `qualification-hermes` dependency group supplies the additional
+packages required by the reviewed upstream import path. The dependency verifier
+checks that group's exact pins in the genuine source archive, then checks its
+wheel bytes against the same archived lockfile. These roots apply only to the
+Hermes PluginManager purpose. Ordinary runtime, local-provider, Linux and build
+dependency selections retain their own policies; callers cannot add roots or
+select another group.
+
+The Hermes and development groups are
+[explicitly mutually exclusive](https://docs.astral.sh/uv/concepts/projects/config/#conflicting-dependencies)
+in the shared lockfile: the pinned upstream requires a different `cryptography`
+version from development. Export the Hermes recipe with default groups disabled
+and `qualification-hermes` selected. This preserves the ordinary development
+selection while keeping the upstream compatibility environment reproducible.
+
+The parent checks the stage results against actual installed module and
+distribution identities, the exact permitted configuration change, and its
+disposable profile roots. Preparation creates the pinned upstream's fixed profile
+skeleton, empty plugin directory and default document before the tested
+stages, without creating a configuration file. Those prepared entries form the
+unchanged baseline. The child's home and default-profile lookups resolve inside a
+separate owned temporary
+directory; that entire directory must remain unchanged.
+
+The configuration comparison includes the pinned upstream CLI's version and
+disabled-plugin fields. The verifier checks the complete profile tree with
+bounded traversal and file reads, rejecting unrelated changes. CLI output has a
+bounded private channel separate from the harness's one canonical JSON result;
+neither profile contents nor output text enters the completed receipt.
+The isolated flow admits no log files and makes no logging-initialization claim.
+
+Its completed receipt requires worker/child exit and
+cleanup of the qualifier's own workspace. The caller's installed runtime may
+remain operational afterward; final input acceptance separately requires the
+matching completed runtime-cleanup receipt. Missing upstream dependencies refuse
+execution and require a reviewed dependency recipe. Synthetic stage tests do not
+establish compatibility with the complete official upstream source.
+
+## Accept the complete input authority
+
+The [acceptance boundary](../scripts/qualification_input_acceptance.py) consumes
+the existing file, build, dependency, publisher, benchmark, Linux and completed
+Windows runtime capabilities. It requires all three Windows runtime purposes,
+both Windows provider bindings, the matching Hermes PluginManager result, and
+completed cleanup of the original preparation and tool owners. It checks exact
+shared authority objects as well as their source and artifact identities.
+
+The accepted capability retains those receipts and revalidates them whenever it
+is consumed. Its metadata is the existing input-closure record; it adds no
+report fields. Missing purposes, mismatched lineage, failed cleanup or expired
+final seals refuse acceptance. Operational file bindings remain usable while
+their owners are working; completed input acceptance has the stricter cleanup
+requirement. Removed execution trees are never reopened to validate historical
+facts.
+
+This boundary does not launch scenarios or produce a full qualification report.
+The complete runner must preserve the three-stage preparation order, retain the
+final input seals through its consumers, and compose actual scenario, operator
+and cleanup evidence under the execution protocol. Passing input-acceptance tests
+does not establish a completed desktop qualification.
 
 ## Evidence and privacy
 

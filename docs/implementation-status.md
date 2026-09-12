@@ -31,13 +31,15 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 The [input-binding implementation](qualification-input-files.md) adds retained
 file and tool owners, source-locked dependency verification, six independent
-build recipes, and purpose-specific Windows runtime installation. These are
-separate prerequisites for the scenario runner. Input bindings and installed
-import receipts cannot create a full qualification report; Linux execution,
-provider resources, external host identities, and the complete runner retain
-their separately documented requirements. [Issue #47](https://github.com/sushiHex/hermes-realtime/issues/47)
-owns the input closure and its exact candidate evidence. This addition does not
-advance the page-wide reviewed baseline above.
+build recipes, purpose-specific Windows runtime installation, publisher and
+provider-resource bindings, and an authenticated Linux prerequisite. Its final
+acceptance boundary requires the complete matching input graph and completed
+preparation cleanup. These are prerequisites for the scenario runner; they cannot
+create a full qualification report. Native recipe evidence and synthetic
+acceptance tests retain their distinct limits. [Issue #47](https://github.com/sushiHex/hermes-realtime/issues/47)
+owns the input closure and its exact candidate evidence; [#62](https://github.com/sushiHex/hermes-realtime/issues/62)
+owns composition with scenario and report evidence. This addition does not advance
+the page-wide reviewed baseline above.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
