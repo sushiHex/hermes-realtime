@@ -2,7 +2,9 @@ import hashlib
 import io
 import json
 import os
+import ssl
 import traceback
+import urllib.request
 import zipfile
 from dataclasses import replace
 from email.message import Message
@@ -301,6 +303,146 @@ def test_artifact_redirect_drops_the_api_bearer(monkeypatch):
     assert raw == b"receipt"
     assert seen[0][1]["Authorization"] == "Bearer existing-read-token"
     assert "Authorization" not in seen[1][1]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SSL_CERT_FILE", "controlled-unbound-trust"),
+        ("SSL_CERT_FILE", ""),
+        ("SSL_CERT_DIR", "controlled-unbound-trust"),
+        ("SSL_CERT_DIR", ""),
+        ("SSLKEYLOGFILE", "controlled-unbound-key-log"),
+        ("SSLKEYLOGFILE", ""),
+    ],
+)
+def test_transport_refuses_ambient_trust_store_before_opener_creation(
+    name, value, monkeypatch
+):
+    from scripts.github_actions_linux_receipt import _HttpsTransport
+
+    created = []
+    for variable in ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(ssl, "create_default_context", lambda: created.append("context"))
+    monkeypatch.setattr(
+        "urllib.request.build_opener", lambda *handlers: created.append("opener")
+    )
+
+    with pytest.raises(ValueError, match="ambient TLS"):
+        _HttpsTransport("not-a-real-token")
+    assert created == []
+
+
+def test_transport_refuses_key_log_before_native_context_touches_path(tmp_path, monkeypatch):
+    from scripts.github_actions_linux_receipt import _HttpsTransport
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    marker = tmp_path / "unbound-tls-keys.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(marker))
+    refused = False
+    try:
+        _HttpsTransport(None)
+    except ValueError:
+        refused = True
+    assert (refused, marker.exists()) == (True, False)
+
+
+def test_transport_constructs_one_explicit_no_proxy_verified_opener(monkeypatch):
+    from scripts.github_actions_linux_receipt import _HttpsTransport, _NoRedirect
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
+
+    def refuse_proxy_discovery():
+        raise AssertionError("ambient proxy discovery ran")
+
+    contexts = []
+    create_default_context = ssl.create_default_context
+    build_opener = urllib.request.build_opener
+    opener_arguments = []
+
+    def create_context():
+        context = create_default_context()
+        contexts.append(context)
+        return context
+
+    def build(*handlers):
+        opener_arguments.append(handlers)
+        return build_opener(*handlers)
+
+    monkeypatch.setattr(urllib.request, "getproxies", refuse_proxy_discovery)
+    monkeypatch.setattr(ssl, "create_default_context", create_context)
+    monkeypatch.setattr(urllib.request, "build_opener", build)
+    transport = _HttpsTransport(None)
+    assert len(opener_arguments) == 1
+    proxies = [
+        handler
+        for handler in opener_arguments[0]
+        if isinstance(handler, urllib.request.ProxyHandler)
+    ]
+    https = [
+        handler
+        for handler in transport._opener.handlers
+        if isinstance(handler, urllib.request.HTTPSHandler)
+    ]
+    redirects = [
+        handler for handler in transport._opener.handlers if isinstance(handler, _NoRedirect)
+    ]
+    assert len(proxies) == len(https) == len(redirects) == 1
+    assert len(contexts) == 1 and https[0]._context is contexts[0]
+    assert proxies[0].proxies == {}
+    assert isinstance(https[0]._context, ssl.SSLContext)
+    assert https[0]._context.verify_mode == ssl.CERT_REQUIRED
+    assert https[0]._context.check_hostname is True
+
+
+def test_transport_suppresses_context_failure_details_before_opener_creation(monkeypatch):
+    from scripts.github_actions_linux_receipt import _HttpsTransport
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
+    created = []
+
+    def refuse_context():
+        raise OSError("private trust location")
+
+    monkeypatch.setattr(ssl, "create_default_context", refuse_context)
+    monkeypatch.setattr("urllib.request.build_opener", lambda *handlers: created.append(handlers))
+    token = "not-a-real-token"
+    with pytest.raises(ValueError) as raised:
+        _HttpsTransport(token)
+    rendered = "".join(traceback.format_exception(raised.type, raised.value, raised.tb))
+    assert "private trust location" not in rendered
+    assert "not-a-real-token" not in rendered
+    assert created == []
+
+
+def test_transport_explicit_context_preserves_urllib_http11_alpn(monkeypatch):
+    from scripts.github_actions_linux_receipt import _HttpsTransport
+
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"):
+        monkeypatch.delenv(name, raising=False)
+
+    class _Context:
+        verify_mode = ssl.CERT_REQUIRED
+        check_hostname = True
+
+        def __init__(self):
+            self.protocols = []
+
+        def set_alpn_protocols(self, protocols):
+            self.protocols.append(protocols)
+
+    context = _Context()
+    monkeypatch.setattr(ssl, "create_default_context", lambda: context)
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_: object())
+    _HttpsTransport(None)
+    assert context.protocols == [["http/1.1"]]
 
 
 def test_signed_storage_failure_suppresses_signed_url_and_credential(monkeypatch):

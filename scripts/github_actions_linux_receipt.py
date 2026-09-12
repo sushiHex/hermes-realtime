@@ -16,7 +16,9 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
+import ssl
 import tarfile
 import urllib.error
 import urllib.request
@@ -145,6 +147,27 @@ class _HttpsTransport:
                 and "\n" not in api_bearer,
                 "GitHub receipt credential differs",
             )
+        _require(
+            all(
+                name not in os.environ
+                for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE")
+            ),
+            "GitHub receipt ambient TLS configuration differs",
+        )
+        try:
+            context = ssl.create_default_context()
+            _require(
+                context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True,
+                "GitHub receipt TLS context differs",
+            )
+            context.set_alpn_protocols(["http/1.1"])
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=context),
+                _NoRedirect(),
+            )
+        except (OSError, ValueError, NotImplementedError):
+            raise ValueError("GitHub receipt TLS context is unavailable") from None
         self._api_bearer = api_bearer
 
     def get(self, url: str, headers: dict[str, str]) -> object:
@@ -160,9 +183,8 @@ class _HttpsTransport:
         if self._api_bearer is not None:
             request_headers["Authorization"] = "Bearer " + self._api_bearer
         request = urllib.request.Request(url, headers=request_headers, method="GET")
-        opener = urllib.request.build_opener(_NoRedirect())
         try:
-            with opener.open(request, timeout=20) as response:
+            with self._opener.open(request, timeout=20) as response:
                 _require(
                     response.url == url and response.status == 200,
                     "GitHub receipt response differs",
@@ -197,7 +219,7 @@ class _HttpsTransport:
                     headers={"Accept": "application/octet-stream"},
                     method="GET",
                 )
-                with opener.open(storage, timeout=20) as response:
+                with self._opener.open(storage, timeout=20) as response:
                     _require(
                         response.url == location and response.status == 200,
                         "GitHub receipt artifact response differs",

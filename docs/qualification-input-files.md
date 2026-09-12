@@ -335,6 +335,15 @@ transferred archive and parses its single canonical receipt. Supplied JSON or a
 successful job label alone cannot mint its authenticated capability. Signed
 artifact transfers receive no GitHub API bearer credential.
 
+The transport [disables automatic proxy configuration](https://docs.python.org/3.11/library/urllib.request.html#urllib.request.ProxyHandler)
+and retains one explicitly created, verified native TLS context for both GitHub
+and signed artifact requests. It refuses `SSL_CERT_FILE`, `SSL_CERT_DIR`, and
+`SSLKEYLOGFILE` overrides before creating the context or opener, including empty
+values, without changing the environment or reporting those values. The latter
+prevents the native context factory from opening an ambient TLS key log. Native
+certificate and hostname verification remain within the accepted
+[trusted computing base](qualification-execution.md#own-the-execution-environment).
+
 The authenticated receipt retains its input, runtime, ABI and installation facts
 and revalidates the final input seals on consumption. Parsing the private payload
 produces ordinary validated data, with no execution or service authority.
