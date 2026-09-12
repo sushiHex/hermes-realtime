@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import urllib.error
 import urllib.request
@@ -17,6 +18,14 @@ def _sha(raw: bytes) -> str:
 
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _python_docker():
+    from scripts.qualification_linux_producer import _Docker
+
+    docker = object.__new__(_Docker)
+    docker.executable = sys.executable
+    return docker
 
 
 def _input(tmp_path: Path) -> Path:
@@ -180,6 +189,325 @@ def test_cleanup_failure_cannot_mint_receipt(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="cleanup"):
         producer._produce(root, Path.cwd(), output, docker, object())
     assert not output.exists() and docker.events[-1] == "cleanup"
+
+
+def test_docker_runner_preserves_bounded_output_and_nonzero_policy():
+    docker = _python_docker()
+    script = (
+        "import os,sys;"
+        "os.write(1,b'bounded stdout\\n');"
+        "os.write(2,b'bounded stderr\\n');"
+        "sys.exit(int(sys.argv[1]))"
+    )
+    normal = docker._run("-c", script, "0")
+    assert normal.stdout == "bounded stdout\n"
+    assert normal.stderr == "bounded stderr\n"
+    assert normal.returncode == 0
+
+    nonzero = docker._run("-c", script, "7", check=False)
+    assert nonzero.stdout == "bounded stdout\n"
+    assert nonzero.stderr == "bounded stderr\n"
+    assert nonzero.returncode == 7
+    with pytest.raises(ValueError, match="^owned Docker operation failed$") as stopped:
+        docker._run("-c", script, "7")
+    assert "bounded" not in str(stopped.value)
+
+    with pytest.raises(ValueError, match="^owned Docker output differs$") as stopped:
+        docker._run("-c", "import os;os.write(1,b'private-\\xff-output')")
+    assert "private" not in str(stopped.value)
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "chunks"),
+    [(1, 256), (2, 16)],
+)
+def test_docker_runner_accepts_output_at_the_exact_bound(descriptor, chunks):
+    result = _python_docker()._run(
+        "-c",
+        "import os,sys\n"
+        "for _ in range(int(sys.argv[1])):\n"
+        f"    os.write({descriptor},b'x'*65536)\n",
+        str(chunks),
+    )
+    selected = result.stdout if descriptor == 1 else result.stderr
+    other = result.stderr if descriptor == 1 else result.stdout
+    assert len(selected.encode()) == chunks * 65536
+    assert other == ""
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "chunks"),
+    [(1, 257), (2, 17)],
+)
+def test_docker_runner_stops_and_reaps_on_output_overflow(
+    tmp_path, monkeypatch, descriptor, chunks
+):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "child-survived.txt"
+    processes = []
+    original = producer.subprocess.Popen
+
+    def record(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(producer.subprocess, "Popen", record)
+    script = (
+        "import os,sys,time,pathlib\n"
+        "for _ in range(int(sys.argv[2])):\n"
+        f"    os.write({descriptor},b'x'*65536)\n"
+        "time.sleep(2)\n"
+        "pathlib.Path(sys.argv[1]).write_text('survived')\n"
+    )
+    with pytest.raises(ValueError, match="^owned Docker output exceeds its bound$"):
+        _python_docker()._run("-c", script, str(marker), str(chunks))
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert not marker.exists()
+
+
+def test_docker_runner_stops_and_reaps_at_one_bounded_deadline(tmp_path, monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "timed-out-child-survived.txt"
+    processes = []
+    original = producer.subprocess.Popen
+
+    def record(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(producer.subprocess, "Popen", record)
+    monkeypatch.setattr(producer, "_DOCKER_TIMEOUT_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(producer, "_DOCKER_CLEANUP_RESERVE_SECONDS", 0.5, raising=False)
+    script = (
+        "import sys,time,pathlib;"
+        "time.sleep(3);"
+        "pathlib.Path(sys.argv[1]).write_text('survived')"
+    )
+    with pytest.raises(ValueError, match="^owned Docker operation timed out$"):
+        _python_docker()._run("-c", script, str(marker))
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert not marker.exists()
+
+
+def test_docker_runner_kills_and_reaps_when_termination_does_not_stop_child(
+    tmp_path, monkeypatch
+):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "termination-ignored.txt"
+    processes = []
+    wrappers = []
+    original = producer.subprocess.Popen
+
+    class _TerminationIgnored:
+        def __init__(self, process):
+            self.process = process
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+            self.process.kill()
+
+    def ignore_termination(*args, **kwargs):
+        process = original(*args, **kwargs)
+        wrapper = _TerminationIgnored(process)
+        processes.append(process)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(producer.subprocess, "Popen", ignore_termination)
+    monkeypatch.setattr(producer, "_DOCKER_TIMEOUT_SECONDS", 5.0, raising=False)
+    monkeypatch.setattr(producer, "_DOCKER_CLEANUP_RESERVE_SECONDS", 2.0, raising=False)
+    script = (
+        "import os,sys,time,pathlib\n"
+        "for _ in range(17):\n"
+        "    os.write(2,b'x'*65536)\n"
+        "time.sleep(5)\n"
+        "pathlib.Path(sys.argv[1]).write_text('survived')\n"
+    )
+    with pytest.raises(ValueError, match="^owned Docker output exceeds its bound$"):
+        _python_docker()._run("-c", script, str(marker))
+    assert len(processes) == len(wrappers) == 1
+    assert wrappers[0].terminate_calls == wrappers[0].kill_calls == 1
+    assert processes[0].poll() is not None
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("control_interruption", [True, False])
+def test_docker_runner_reaps_before_resolving_monitor_failure(
+    tmp_path, monkeypatch, control_interruption
+):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "interrupted-child-survived.txt"
+    failure = (
+        KeyboardInterrupt("synthetic monitor interruption")
+        if control_interruption
+        else RuntimeError("private monitor failure sentinel")
+    )
+    processes = []
+    original = producer.subprocess.Popen
+
+    class _InterruptedPoll:
+        def __init__(self, process):
+            self.process = process
+            self.interrupted = False
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        def poll(self):
+            if not self.interrupted:
+                self.interrupted = True
+                raise failure
+            return self.process.poll()
+
+    def interrupt_poll(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        return _InterruptedPoll(process)
+
+    monkeypatch.setattr(producer.subprocess, "Popen", interrupt_poll)
+    script = (
+        "import sys,time,pathlib;"
+        "time.sleep(2);"
+        "pathlib.Path(sys.argv[1]).write_text('survived')"
+    )
+    try:
+        expected = KeyboardInterrupt if control_interruption else ValueError
+        with pytest.raises(expected) as stopped:
+            _python_docker()._run("-c", script, str(marker))
+        if control_interruption:
+            assert stopped.value is failure
+        else:
+            assert str(stopped.value) == "owned Docker operation failed"
+            assert "private monitor failure sentinel" not in str(stopped.value)
+        assert len(processes) == 1 and processes[0].poll() is not None
+        assert not marker.exists()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_docker_runner_retries_cleanup_after_wait_interruption(tmp_path, monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "cleanup-interrupted-child-survived.txt"
+    interruption = KeyboardInterrupt("synthetic cleanup interruption")
+    processes = []
+    wrappers = []
+    original = producer.subprocess.Popen
+
+    class _WaitInterrupted:
+        def __init__(self, process):
+            self.process = process
+            self.interrupted = False
+            self.kill_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.process, name)
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            if not self.interrupted:
+                self.interrupted = True
+                raise interruption
+            return self.process.wait(timeout=timeout)
+
+        def kill(self):
+            self.kill_calls += 1
+            self.process.kill()
+
+    def interrupt_wait(*args, **kwargs):
+        process = original(*args, **kwargs)
+        wrapper = _WaitInterrupted(process)
+        processes.append(process)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(producer.subprocess, "Popen", interrupt_wait)
+    monkeypatch.setattr(producer, "_DOCKER_TIMEOUT_SECONDS", 5.0, raising=False)
+    monkeypatch.setattr(producer, "_DOCKER_CLEANUP_RESERVE_SECONDS", 2.0, raising=False)
+    script = (
+        "import os,sys,time,pathlib\n"
+        "for _ in range(17):\n"
+        "    os.write(2,b'x'*65536)\n"
+        "time.sleep(5)\n"
+        "pathlib.Path(sys.argv[1]).write_text('survived')\n"
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt) as stopped:
+            _python_docker()._run("-c", script, str(marker))
+        assert stopped.value is interruption
+        assert len(processes) == len(wrappers) == 1
+        assert wrappers[0].interrupted and wrappers[0].kill_calls == 1
+        assert processes[0].poll() is not None
+        assert not marker.exists()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_docker_runner_reaps_before_propagating_reader_start_failure(tmp_path, monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    marker = tmp_path / "reader-start-failure-child-survived.txt"
+    failure = RuntimeError("synthetic reader start failure")
+    processes = []
+    original_popen = producer.subprocess.Popen
+
+    class _UnstartedReader:
+        ident = None
+
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            raise failure
+
+        def is_alive(self):
+            return False
+
+    def record(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(producer.subprocess, "Popen", record)
+    monkeypatch.setattr(producer.threading, "Thread", _UnstartedReader)
+    script = (
+        "import sys,time,pathlib;"
+        "time.sleep(2);"
+        "pathlib.Path(sys.argv[1]).write_text('survived')"
+    )
+    try:
+        with pytest.raises(ValueError, match="^owned Docker operation failed$") as stopped:
+            _python_docker()._run("-c", script, str(marker))
+        assert "synthetic reader start failure" not in str(stopped.value)
+        assert len(processes) == 1 and processes[0].poll() is not None
+        assert not marker.exists()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def test_docker_specs_make_inputs_and_observed_installation_read_only(tmp_path):

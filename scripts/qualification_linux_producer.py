@@ -11,6 +11,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +35,12 @@ _TOKEN = (
 _OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 _WORKFLOW = ".github/workflows/release-gates.yml"
 _FAILURE_MAX = 1024
+_DOCKER_STDOUT_MAX = 16 * 1024**2
+_DOCKER_STDERR_MAX = 1024**2
+_DOCKER_READ_CHUNK = 64 * 1024
+_DOCKER_TIMEOUT_SECONDS = 360.0
+_DOCKER_CLEANUP_RESERVE_SECONDS = 5.0
+_DOCKER_POLL_SECONDS = 0.02
 
 
 def _require(condition: bool, message: str) -> None:
@@ -263,19 +271,242 @@ class _Docker:
         self._owned_volumes: set[str] = set()
 
     def _run(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            (self.executable, *arguments),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=360,
-            env={"PATH": os.environ["PATH"]},
-        )
+        timeout = _DOCKER_TIMEOUT_SECONDS
+        reserve = _DOCKER_CLEANUP_RESERVE_SECONDS
         _require(
-            len(result.stdout) <= 16 * 1024**2 and len(result.stderr) <= 1024**2,
-            "owned Docker output exceeds its bound",
+            type(timeout) in {int, float}
+            and type(reserve) in {int, float}
+            and 0 < reserve < timeout,
+            "owned Docker time budget differs",
         )
+        command = (self.executable, *arguments)
+        started = time.monotonic()
+        hard_deadline = started + timeout
+        operation_deadline = hard_deadline - reserve
+        process: subprocess.Popen[bytes] | None = None
+        streams: tuple[Any, ...] = ()
+        outputs = (bytearray(), bytearray())
+        overflow = threading.Event()
+        reader_failure = threading.Event()
+        readers: tuple[threading.Thread, ...] = ()
+        started_readers: list[threading.Thread] = []
+        starting_reader: threading.Thread | None = None
+        primary: BaseException | None = None
+        outcome: str | None = None
+        reaped = False
+        readers_joined = False
+        readers_alive = True
+        unstarted_stream_close_failed = False
+        closed_unstarted_streams: set[int] = set()
+        finalized = False
+        cleanup_interrupted = False
+
+        def remember(error: BaseException) -> None:
+            nonlocal primary
+            if primary is None:
+                primary = error
+
+        def drain(stream: Any, output: bytearray, maximum: int) -> None:
+            try:
+                while True:
+                    chunk = stream.read(_DOCKER_READ_CHUNK)
+                    if not chunk:
+                        break
+                    remaining = maximum + 1 - len(output)
+                    if remaining > 0:
+                        output.extend(chunk[:remaining])
+                    if len(output) > maximum:
+                        overflow.set()
+            except BaseException:
+                reader_failure.set()
+            finally:
+                try:
+                    stream.close()
+                except BaseException:
+                    reader_failure.set()
+
+        def finalize() -> None:
+            nonlocal finalized
+            nonlocal readers_alive
+            nonlocal readers_joined
+            nonlocal reaped
+            nonlocal unstarted_stream_close_failed
+            finalized = False
+            owned_process = process
+            if owned_process is None:
+                finalized = True
+                return
+            active_streams = streams
+            if not active_streams:
+                active_streams = tuple(
+                    stream
+                    for stream in (owned_process.stdout, owned_process.stderr)
+                    if stream is not None
+                )
+            if (
+                outcome is not None or primary is not None
+            ) and owned_process.returncode is None:
+                try:
+                    owned_process.terminate()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as error:
+                    remember(error)
+                remaining = hard_deadline - time.monotonic()
+                if remaining > 0 and owned_process.returncode is None:
+                    try:
+                        owned_process.wait(timeout=min(1.0, remaining / 2))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as error:
+                        remember(error)
+                if owned_process.returncode is None:
+                    try:
+                        owned_process.kill()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as error:
+                        remember(error)
+
+            if owned_process.returncode is None:
+                remaining = hard_deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        owned_process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as error:
+                        remember(error)
+            reaped = owned_process.returncode is not None
+            for active_reader in started_readers:
+                remaining = hard_deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        active_reader.join(remaining)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as error:
+                        remember(error)
+            if reaped:
+                for index, stream in enumerate(active_streams[len(started_readers) :]):
+                    stream_index = len(started_readers) + index
+                    if stream_index in closed_unstarted_streams:
+                        continue
+                    try:
+                        stream.close()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        unstarted_stream_close_failed = True
+                    else:
+                        closed_unstarted_streams.add(stream_index)
+            readers_alive = any(active_reader.is_alive() for active_reader in started_readers)
+            readers_joined = len(started_readers) == len(readers) and not readers_alive
+            finalized = True
+
+        try:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
+                    env={"PATH": os.environ["PATH"]},
+                )
+                _require(
+                    process.stdout is not None and process.stderr is not None,
+                    "owned Docker operation failed",
+                )
+                streams = (process.stdout, process.stderr)
+                readers = (
+                    threading.Thread(
+                        target=drain,
+                        args=(streams[0], outputs[0], _DOCKER_STDOUT_MAX),
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=drain,
+                        args=(streams[1], outputs[1], _DOCKER_STDERR_MAX),
+                        daemon=True,
+                    ),
+                )
+                for reader in readers:
+                    starting_reader = reader
+                    reader.start()
+                    started_readers.append(reader)
+                    starting_reader = None
+                while outcome is None:
+                    if overflow.is_set():
+                        outcome = "overflow"
+                    elif reader_failure.is_set():
+                        outcome = "lifecycle"
+                    elif process.poll() is not None:
+                        break
+                    else:
+                        remaining = operation_deadline - time.monotonic()
+                        if remaining <= 0:
+                            outcome = "timeout"
+                        else:
+                            overflow.wait(min(_DOCKER_POLL_SECONDS, remaining))
+                if outcome is None and time.monotonic() > operation_deadline:
+                    outcome = "timeout"
+            except BaseException as error:
+                # Thread.start may be interrupted after the thread became live.
+                if (
+                    starting_reader is not None
+                    and starting_reader not in started_readers
+                    and starting_reader.ident is not None
+                ):
+                    started_readers.append(starting_reader)
+                remember(error)
+                outcome = "lifecycle"
+        finally:
+            try:
+                if process is not None:
+                    finalize()
+            except BaseException as error:
+                remember(error)
+                outcome = "lifecycle"
+                try:
+                    finalize()
+                except BaseException:
+                    cleanup_interrupted = True
+
+        if process is None:
+            if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+                raise primary
+            raise ValueError("owned Docker operation failed") from None
+        if (
+            not finalized
+            or cleanup_interrupted
+            or not reaped
+            or readers_alive
+            or unstarted_stream_close_failed
+        ):
+            raise ValueError("owned Docker process cleanup failed") from None
+        if primary is not None:
+            if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+                raise primary
+            raise ValueError("owned Docker operation failed") from None
+        if not readers_joined or reader_failure.is_set():
+            raise ValueError("owned Docker process cleanup failed") from None
+        if overflow.is_set() or outcome == "overflow":
+            raise ValueError("owned Docker output exceeds its bound")
+        if outcome == "timeout":
+            raise ValueError("owned Docker operation timed out")
+        try:
+            stdout = bytes(outputs[0]).decode("utf-8")
+            stderr = bytes(outputs[1]).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("owned Docker output differs") from None
+        assert process.returncode is not None
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         if check:
             _require(result.returncode == 0, "owned Docker operation failed")
         return result

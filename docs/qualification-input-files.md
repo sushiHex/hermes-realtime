@@ -373,6 +373,13 @@ origins, and runs the installed Linux null-capture behavior. The producer writes
 the receipt only after container, volume and observation-workspace cleanup
 succeeds. The existing portable tests use a separate environment.
 
+Docker commands drain both output streams into bounded buffers while running:
+16 MiB for stdout and 1 MiB for stderr. Exceeding either bound stops the command.
+One 360-second deadline includes termination, process reaping and reader cleanup;
+the final five seconds are reserved for cleanup. Success requires complete reads,
+valid UTF-8 and a reaped process. Refusals expose fixed messages rather than child
+output, and interrupted observation cannot produce an installation receipt.
+
 If observation fails, the worker attempts to write one bounded, transient marker
 containing only its version and a stage from a closed vocabulary. The producer
 validates the marker before reporting the stage; missing or malformed markers
