@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from scripts import candidate_source_archive_oracle as archives
@@ -46,6 +47,16 @@ from scripts.task13_artifact_orchestrator import CandidateIdentityV1
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+_HERMES_GROUP = "qualification-hermes"
+_HERMES_ROOTS = (
+    ("concurrent-log-handler", "0.9.29"),
+    ("cryptography", "48.0.1"),
+    ("python-dotenv", "1.2.2"),
+    ("pyyaml", "6.0.3"),
+    ("rich", "14.3.3"),
+)
 
 
 def _include_candidate_wheel(
@@ -130,6 +141,62 @@ def _source_locked_wheels(
 ) -> tuple[str, frozenset[tuple[str, str, str, str, int]]]:
     binding = _candidate_files_for_consumer(candidate)
     return _archive_locked_wheels(binding.archive, binding.identity)
+
+
+def _source_locked_hermes_roots(
+    candidate: BoundCandidateFilesV1,
+) -> tuple[tuple[str, str], ...]:
+    binding = _candidate_files_for_consumer(candidate)
+    source = archives.verified_candidate_source_archive_metadata(binding.archive)
+    payload = archives._archive_bytes_for_consumer(binding.archive, binding.identity)
+    entries = [item for item in source.manifest if item.path == "pyproject.toml"]
+    _require(
+        len(entries) == 1 and entries[0].kind == "file" and 0 < entries[0].size <= 1024**2,
+        "Hermes qualification dependency group is unavailable",
+    )
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as contents:
+        stream = contents.extractfile(source.prefix + "/pyproject.toml")
+        _require(stream is not None, "Hermes qualification dependency group is unreadable")
+        assert stream is not None
+        with stream:
+            raw = stream.read(1024**2 + 1)
+    _require(
+        (len(raw), hashlib.sha256(raw).hexdigest()) == (entries[0].size, entries[0].sha256),
+        "Hermes qualification dependency group differs from its candidate blob",
+    )
+    project = tomllib.loads(raw.decode("utf-8"))
+    groups = project.get("dependency-groups")
+    _require(type(groups) is dict, "Hermes qualification dependency group is unavailable")
+    assert isinstance(groups, dict)
+    selected = groups.get(_HERMES_GROUP)
+    _require(
+        type(selected) is list and 1 <= len(selected) <= 16,
+        "Hermes qualification dependency group differs",
+    )
+    assert isinstance(selected, list)
+    roots: list[tuple[str, str]] = []
+    try:
+        for item in selected:
+            _require(type(item) is str and len(item) <= 256, "Hermes dependency root differs")
+            requirement = Requirement(item)
+            specifiers = tuple(requirement.specifier)
+            _require(
+                requirement.url is None
+                and requirement.marker is None
+                and not requirement.extras
+                and len(specifiers) == 1
+                and specifiers[0].operator == "=="
+                and "*" not in specifiers[0].version,
+                "Hermes dependency root differs",
+            )
+            roots.append((canonicalize_name(requirement.name), specifiers[0].version))
+    except InvalidRequirement as error:
+        raise ValueError("Hermes dependency root differs") from error
+    _require(
+        tuple(roots) == _HERMES_ROOTS and len(roots) == len(set(roots)),
+        "Hermes qualification dependency group differs",
+    )
+    return tuple(roots)
 
 
 def _archive_locked_wheels(
@@ -234,6 +301,11 @@ def _inspect_dependency_files(
     references = {item["role"]: item for item in document["files"]}
     tools = {item["role"]: item for item in document["toolIdentities"]}
     lock_digest, locked_wheels = _source_locked_wheels(candidate)
+    hermes_roots = (
+        _source_locked_hermes_roots(candidate)
+        if "hermes_v020_pluginmanager_runtime" in purposes
+        else ()
+    )
     observed = []
     for purpose in purposes:
         role = core._WHEELHOUSE_ROLES[purpose]
@@ -293,12 +365,17 @@ def _inspect_dependency_files(
                 reference["relativePath"],
                 reference["sha256"],
             )
+        roots = (
+            tuple(sorted(("hermes-realtime", *(name for name, _ in hermes_roots))))
+            if purpose == "hermes_v020_pluginmanager_runtime"
+            else (("hatchling",) if purpose == "build" else ("hermes-realtime",))
+        )
         options = {
             "requirements": requirements,
             "constraints": constraints,
             "wheels": wheels,
             "site_processing": False,
-            "roots": ("hatchling",) if purpose == "build" else ("hermes-realtime",),
+            "roots": roots,
             "root_extras": {"hermes-realtime": ("local",)}
             if purpose
             in {"realtime_windows_direct_runtime", "realtime_windows_sdist_built_runtime"}
@@ -335,6 +412,12 @@ def _inspect_dependency_files(
         else:
             inventory = inspect_wheelhouse_files(
                 **options, python_version=manifest["pythonVersion"], platform=platform
+            )
+        if purpose == "hermes_v020_pluginmanager_runtime":
+            versions = {item.name: item.version for item in inventory}
+            _require(
+                all(versions.get(name) == version for name, version in hermes_roots),
+                "Hermes qualification dependency roots differ",
             )
         if purpose == "build":
             hatchling = [item for item in inventory if item.name == "hatchling"]

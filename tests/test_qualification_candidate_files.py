@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -47,6 +48,9 @@ def _make_source(tmp_path_factory, extra_package_members=None):
         wheel_helpers["_SOURCE_PROJECT"].replace(
             b"local = [", b'local = ["moonshine-voice==0.1.0", "kokoro-onnx==0.6.1", '
         )
+        + b'\n[dependency-groups]\nqualification-hermes = ["concurrent-log-handler==0.9.29", '
+        b'"cryptography==48.0.1", "python-dotenv==1.2.2", "pyyaml==6.0.3", '
+        b'"rich==14.3.3"]\n'
         + b'\n[tool.hatch.build.targets.sdist]\ninclude = ["/LICENSE", "/README.md", '
         b'"/pyproject.toml", "/src/**", "/docs/**", "/scripts/**"]\nexclude = []\n'
     )
@@ -62,8 +66,29 @@ def _make_source(tmp_path_factory, extra_package_members=None):
         ("numpy", "1.26.0"),
         ("moonshine-voice", "0.1.0"),
         ("kokoro-onnx", "0.6.1"),
+        ("python-dotenv", "1.2.2"),
+        ("pyyaml", "6.0.3"),
+        ("rich", "14.3.3"),
+        ("concurrent-log-handler", "0.9.29"),
+        ("cryptography", "48.0.1"),
+        ("cryptography", "50.0.1"),
+        ("cffi", "2.1.0"),
+        ("pycparser", "3.0"),
+        ("portalocker", "4.3.0"),
+        ("markdown-it-py", "4.2.0"),
+        ("mdurl", "0.1.2"),
+        ("pygments", "2.20.0"),
     ):
-        basename, raw = dependency_helpers["wheel"](name.replace("-", "_"), version)
+        requires = {
+            "cffi": ('pycparser; implementation_name != "PyPy"',),
+            "concurrent-log-handler": ("portalocker",),
+            "cryptography": ('cffi>=2.0.0; platform_python_implementation != "PyPy"',),
+            "markdown-it-py": ("mdurl~=0.1",),
+            "rich": ("markdown-it-py>=4,<5", "pygments>=2.13,<3"),
+        }.get(name, ())
+        basename, raw = dependency_helpers["wheel"](
+            name.replace("-", "_"), version, requires=requires
+        )
         lock += (
             f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
             'source = { registry = "https://pypi.org/simple" }\n'
@@ -326,6 +351,33 @@ def dependency_graph(bound_graph):
             helpers["wheel"]("kokoro_onnx", "0.6.1"),
         ]
     )
+    hermes = dict(
+        [
+            helpers["wheel"]("python_dotenv", "1.2.2"),
+            helpers["wheel"]("pyyaml", "6.0.3"),
+            helpers["wheel"](
+                "cryptography",
+                "48.0.1",
+                requires=('cffi>=2.0.0; platform_python_implementation != "PyPy"',),
+            ),
+            helpers["wheel"](
+                "cffi", "2.1.0", requires=('pycparser; implementation_name != "PyPy"',)
+            ),
+            helpers["wheel"]("pycparser", "3.0"),
+            helpers["wheel"](
+                "concurrent_log_handler", "0.9.29", requires=("portalocker",)
+            ),
+            helpers["wheel"]("portalocker", "4.3.0"),
+            helpers["wheel"](
+                "rich",
+                "14.3.3",
+                requires=("markdown-it-py>=4,<5", "pygments>=2.13,<3"),
+            ),
+            helpers["wheel"]("markdown_it_py", "4.2.0", requires=("mdurl~=0.1",)),
+            helpers["wheel"]("mdurl", "0.1.2"),
+            helpers["wheel"]("pygments", "2.20.0"),
+        ]
+    )
     for provider, package, version in (
         ("moonshine", "moonshine_voice", "0.1.0"),
         ("kokoro", "kokoro_onnx", "0.6.1"),
@@ -344,6 +396,8 @@ def dependency_graph(bound_graph):
         elif purpose != "build":
             # NumPy and providers are activated by the candidate's local extra.
             selected.pop("numpy-1.26.0-py3-none-any.whl")
+            if purpose == "hermes_v020_pluginmanager_runtime":
+                selected.update(hermes)
         reference = next(item for item in document["files"] if item["role"] == role)
         path = root / reference["relativePath"]
         value = json.loads(path.read_bytes())
@@ -472,6 +526,132 @@ def test_retained_dependency_binding_checks_purposes_tools_and_pins(dependency_g
     if mutation is None:
         with pytest.raises(ValueError, match="closed"):
             dependency_file_metadata(receipt)
+
+
+def test_lock_exports_mutually_exclusive_cryptography_versions():
+    def export(*selection):
+        result = subprocess.run(
+            (
+                "uv",
+                "export",
+                "--frozen",
+                "--no-emit-project",
+                "--no-header",
+                "--no-annotate",
+                *selection,
+            ),
+            check=True,
+            capture_output=True,
+            cwd=Path.cwd(),
+            text=True,
+            timeout=30,
+        )
+        return result.stdout
+
+    hermes = export("--no-default-groups", "--group", "qualification-hermes")
+    development = export("--only-dev")
+    production = export("--no-default-groups")
+    assert "cryptography==48.0.1 " in hermes
+    assert "cryptography==50.0.1 " not in hermes
+    assert "cffi==2.1.0 " in hermes
+    assert "cryptography==50.0.1 " in development
+    assert "cryptography==48.0.1 " not in development
+    assert "cryptography==" not in production
+
+
+@pytest.mark.parametrize("mutation", ["missing", "altered", "cryptography_substitution"])
+def test_hermes_dependency_group_is_exactly_source_governed(
+    dependency_graph, monkeypatch, mutation
+):
+    from scripts import qualification_dependency_files as dependencies
+    from scripts.qualification_candidate_files import bind_candidate_files
+    from scripts.qualification_dependency_files import bind_dependency_purpose
+
+    root, _, _, archive, identity = dependency_graph
+    parse = dependencies.tomllib.loads
+
+    def changed(raw):
+        value = parse(raw)
+        groups = value.get("dependency-groups")
+        if type(groups) is dict and "qualification-hermes" in groups:
+            if mutation == "missing":
+                del groups["qualification-hermes"]
+            else:
+                groups["qualification-hermes"] = [
+                    "concurrent-log-handler==0.9.29",
+                    "cryptography==50.0.1"
+                    if mutation == "cryptography_substitution"
+                    else "cryptography==48.0.1",
+                    "python-dotenv==1.2.1" if mutation == "altered" else "python-dotenv==1.2.2",
+                    "pyyaml==6.0.3",
+                    "rich==14.3.3",
+                ]
+        return value
+
+    monkeypatch.setattr(dependencies.tomllib, "loads", changed)
+    with freeze(dependency_graph) as files:
+        candidate = bind_candidate_files(files, archive, identity)
+        with pytest.raises(ValueError, match="Hermes qualification dependency group"):
+            bind_dependency_purpose(
+                files, candidate, purpose="hermes_v020_pluginmanager_runtime"
+            )
+
+
+@pytest.mark.parametrize("mutation", ["missing_from_hermes", "added_to_linux"])
+def test_hermes_group_roots_are_required_only_for_the_hermes_purpose(
+    dependency_graph, mutation
+):
+    from scripts import qualify_evidence_slice_zero as core
+    from scripts.qualification_candidate_files import bind_candidate_files
+    from scripts.qualification_dependency_files import bind_dependency_purpose
+
+    root, _, document, archive, identity = dependency_graph
+    references = {row["role"]: row for row in document["files"]}
+    hermes_reference = references[core._WHEELHOUSE_ROLES["hermes_v020_pluginmanager_runtime"]]
+    hermes_path = root / hermes_reference["relativePath"]
+    hermes = json.loads(hermes_path.read_bytes())
+    dotenv = next(
+        row for row in hermes["wheels"] if row["basename"].startswith("python_dotenv-")
+    )
+    if mutation == "missing_from_hermes":
+        hermes["wheels"].remove(dotenv)
+        (root / dotenv["relativePath"]).unlink()
+        requirement = hermes["requirements"]
+        requirement_path = root / requirement["relativePath"]
+        raw = b"".join(
+            line + b"\n"
+            for line in requirement_path.read_bytes().splitlines()
+            if dotenv["sha256"].encode() not in line
+        )
+        requirement_path.write_bytes(raw)
+        requirement.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+        manifest_path, manifest, reference = hermes_path, hermes, hermes_reference
+        purpose = "hermes_v020_pluginmanager_runtime"
+    else:
+        purpose = "realtime_linux_runtime"
+        reference = references[core._WHEELHOUSE_ROLES[purpose]]
+        manifest_path = root / reference["relativePath"]
+        manifest = json.loads(manifest_path.read_bytes())
+        copied = manifest_path.parent / "wheels" / dotenv["basename"]
+        copied.write_bytes((root / dotenv["relativePath"]).read_bytes())
+        manifest["wheels"].append(
+            {**dotenv, "relativePath": copied.relative_to(root).as_posix()}
+        )
+        manifest["wheels"].sort(key=lambda row: row["basename"])
+        requirement = manifest["requirements"]
+        requirement_path = root / requirement["relativePath"]
+        raw = requirement_path.read_bytes() + (
+            f"python-dotenv==1.2.2 --hash=sha256:{dotenv['sha256']}\n"
+        ).encode()
+        requirement_path.write_bytes(raw)
+        requirement.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+    raw = core.canonical_json_bytes(manifest)
+    manifest_path.write_bytes(raw)
+    reference.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+    with freeze(dependency_graph) as files:
+        candidate = bind_candidate_files(files, archive, identity)
+        with pytest.raises(ValueError, match="missing|unrelated"):
+            bind_dependency_purpose(files, candidate, purpose=purpose)
 
 
 @pytest.mark.parametrize(
