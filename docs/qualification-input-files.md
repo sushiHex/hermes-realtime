@@ -394,6 +394,17 @@ permissions that prevent new entries, and retains all file and ancestor handles.
 It never adopts or changes an existing caller-selected directory. Its context
 removes only its own verified snapshot after the lease ends.
 
+The controller retains noninheritable security handles before freezing the
+snapshot. Frozen permissions deny ordinary changes to permissions and ownership,
+including the owner's implicit permission-changing rights through Windows
+[Owner Rights](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-special-identities-groups#owner-rights).
+Cleanup restores permissions through those retained handles. Capability access
+and completion recheck the exact bounded namespace and frozen security state.
+These properties apply within the protocol's
+[trusted computing base](qualification-execution.md#own-the-execution-environment);
+they do not establish isolation from malicious software exercising privileged
+OS authority.
+
 This owner supplies filesystem evidence. It neither launches nor owns processes,
 authenticates the selected contents, nor turns a copied directory into an installed
 environment. The trusted process owner must verify that every consumer has stopped
