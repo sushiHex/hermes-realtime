@@ -154,6 +154,7 @@ def test_controller_mints_only_after_two_owned_invocations_and_cleanup(tmp_path,
     monkeypatch.setattr(
         producer, "_git", lambda root, *args: "b" * 40 if args[-1] == "HEAD" else "c" * 40
     )
+    monkeypatch.setattr(producer, "_owned_output_identity", lambda path: (1001, 1001))
     monkeypatch.setenv("HERMES_CANDIDATE_HEAD", "b" * 40)
     monkeypatch.setenv("GITHUB_REPOSITORY_ID", "1351392603")
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
@@ -174,6 +175,7 @@ def test_cleanup_failure_cannot_mint_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(
         producer, "_git", lambda root, *args: "b" * 40 if args[-1] == "HEAD" else "c" * 40
     )
+    monkeypatch.setattr(producer, "_owned_output_identity", lambda path: (1001, 1001))
     monkeypatch.setenv("HERMES_CANDIDATE_HEAD", "b" * 40)
     with pytest.raises(ValueError, match="cleanup"):
         producer._produce(root, Path.cwd(), output, docker, object())
@@ -192,11 +194,47 @@ def test_docker_specs_make_inputs_and_observed_installation_read_only(tmp_path):
         "volume",
         True,
         tmp_path,
+        (1001, 1002),
     )
     arguments = _Docker._create_arguments(object.__new__(_Docker), spec)
     assert "--read-only" in arguments and "--network" in arguments
+    assert arguments[arguments.index("--user") + 1] == "1001:1002"
     assert f"type=bind,source={tmp_path},target=/input,readonly" in arguments
     assert "type=volume,source=volume,target=/installation,readonly" in arguments
+    assert "/tmp:rw,nosuid,nodev,noexec,size=268435456,mode=1777" in arguments
+    assert "/scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=1001,gid=1002" in arguments
+
+    malformed = _ContainerSpec(
+        "observe",
+        "image@sha256:digest",
+        ("python", "worker.py"),
+        tmp_path,
+        tmp_path,
+        "volume",
+        True,
+        tmp_path,
+        (1001, 1002, 1003),
+    )
+    with pytest.raises(ValueError, match="container user differs"):
+        _Docker._create_arguments(object.__new__(_Docker), malformed)
+
+
+def test_observer_identity_is_the_exact_fresh_output_owner(tmp_path, monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    observed = SimpleNamespace(
+        st_mode=producer.stat.S_IFDIR | 0o700,
+        st_uid=1001,
+        st_gid=1002,
+    )
+    monkeypatch.setattr(producer.os, "lstat", lambda path: observed)
+    monkeypatch.setattr(producer.os, "geteuid", lambda: observed.st_uid, raising=False)
+    monkeypatch.setattr(producer.os, "getegid", lambda: observed.st_gid, raising=False)
+    assert producer._owned_output_identity(tmp_path) == (observed.st_uid, observed.st_gid)
+
+    monkeypatch.setattr(producer.os, "geteuid", lambda: observed.st_uid + 1)
+    with pytest.raises(ValueError, match="owner differs"):
+        producer._owned_output_identity(tmp_path)
 
 
 def test_official_image_reference_accepts_only_docker_native_normalizations():
@@ -224,11 +262,12 @@ def test_container_observation_binds_complete_mount_identity(tmp_path):
         "owned-volume",
         True,
         output_root,
+        (1001, 1002),
     )
     row = {
         "Id": "identifier",
         "Name": "/observe",
-        "Config": {"Image": spec.image, "Cmd": list(spec.command)},
+        "Config": {"Image": spec.image, "Cmd": list(spec.command), "User": "1001:1002"},
         "HostConfig": {
             "ReadonlyRootfs": True,
             "NetworkMode": "none",
@@ -236,8 +275,8 @@ def test_container_observation_binds_complete_mount_identity(tmp_path):
             "PidsLimit": 256,
             "SecurityOpt": ["no-new-privileges"],
             "Tmpfs": {
-                "/tmp": "rw,nosuid,nodev,noexec,size=268435456",
-                "/scratch": "rw,nosuid,nodev,noexec,size=67108864",
+                "/tmp": "rw,nosuid,nodev,noexec,size=268435456,mode=1777",
+                "/scratch": "rw,nosuid,nodev,noexec,size=67108864,mode=700,uid=1001,gid=1002",
             },
         },
         "Mounts": [
@@ -252,6 +291,10 @@ def test_container_observation_binds_complete_mount_identity(tmp_path):
     docker._validate_container("identifier", spec)
     row["Mounts"][0]["Source"] = str(tmp_path / "substitute")
     with pytest.raises(ValueError, match="mounts"):
+        docker._validate_container("identifier", spec)
+    row["Mounts"][0]["Source"] = str(input_root)
+    row["Config"]["User"] = "1001:1003"
+    with pytest.raises(ValueError, match="configuration"):
         docker._validate_container("identifier", spec)
 
 
@@ -268,6 +311,87 @@ def test_cleanup_absence_requires_successful_daemon_inventory():
     docker._run = unavailable
     with pytest.raises(ValueError, match="Docker operation"):
         docker.require_absent(("first", "second"), "volume")
+
+
+def test_owned_observation_failure_surfaces_only_closed_stage_and_cleans_up(tmp_path):
+    from scripts import qualification_linux_producer as producer
+
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / producer.worker._FAILURE).write_bytes(
+        b'{"stage":"candidate_imports","version":1}\n'
+    )
+    spec = producer._ContainerSpec(
+        "observe",
+        "image@sha256:digest",
+        ("python", "worker.py"),
+        tmp_path,
+        tmp_path,
+        "volume",
+        True,
+        output,
+        (1001, 1002),
+    )
+    docker = object.__new__(producer._Docker)
+    docker._owned_containers = set()
+    docker._owned_volumes = set()
+    docker._container_names = lambda: set()
+    docker._validate_container = lambda identifier, value: None
+    events = []
+
+    def run(*arguments, check=True):
+        events.append(arguments[0])
+        if arguments[0] == "create":
+            return SimpleNamespace(stdout="a" * 64, stderr="", returncode=0)
+        if arguments[0] == "start":
+            return SimpleNamespace(
+                stdout="private stdout", stderr="private exception and path", returncode=7
+            )
+        if arguments[0] == "rm":
+            return SimpleNamespace(stdout="observe", stderr="", returncode=0)
+        raise AssertionError(arguments)
+
+    docker._run = run
+    with pytest.raises(ValueError, match="observation failed at candidate_imports") as stopped:
+        docker.run_owned(spec)
+    assert "private" not in str(stopped.value)
+    assert events == ["create", "start", "rm"]
+
+    (output / producer.worker._FAILURE).unlink()
+    events.clear()
+    with pytest.raises(ValueError, match="^owned Docker operation failed$") as stopped:
+        docker.run_owned(spec)
+    assert "private" not in str(stopped.value)
+    assert events == ["create", "start", "rm"]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"stage":"foreign","version":1}\n',
+        b'{"stage":"source_binding","version":1,"detail":"private"}\n',
+        b'{"version":1,"stage":"source_binding"}\n',
+        b'{"stage":"source_binding","version":true}\n',
+        b'{"stage":"source_binding","version":1.0}\n',
+        b"x" * 1025,
+    ],
+)
+def test_failure_stage_refuses_malformed_or_unbounded_diagnostics(tmp_path, raw):
+    from scripts import qualification_linux_producer as producer
+
+    (tmp_path / producer.worker._FAILURE).write_bytes(raw)
+    assert producer._failure_stage(tmp_path) is None
+
+
+def test_failure_stage_does_not_follow_an_indirect_diagnostic(tmp_path, monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    monkeypatch.setattr(
+        producer.os,
+        "lstat",
+        lambda path: SimpleNamespace(st_mode=producer.stat.S_IFLNK | 0o777, st_size=45),
+    )
+    assert producer._failure_stage(tmp_path) is None
 
 
 def test_publisher_redirect_does_not_forward_registry_bearer(monkeypatch):

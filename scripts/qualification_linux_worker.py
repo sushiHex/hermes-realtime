@@ -22,6 +22,8 @@ import tarfile
 import tempfile
 import threading
 import zipfile
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
@@ -31,6 +33,29 @@ _PREFIX = "hermes-realtime-0.0.3/"
 _SELF = "scripts/qualification_linux_worker.py"
 _PRODUCER = "scripts/qualification_linux_producer.py"
 _WORKFLOW = ".github/workflows/release-gates.yml"
+_FAILURE = "linux-worker-failure-v1.json"
+_FAILURE_STAGES = frozenset(
+    {
+        "platform",
+        "source_binding",
+        "installed_inventory",
+        "runtime_paths",
+        "import_roots",
+        "dependency_imports",
+        "candidate_imports",
+        "entrypoint_discovery",
+        "scratch",
+        "host_help",
+        "local_help",
+        "local_refusal",
+        "host_refusal",
+        "residue",
+        "stdlib_inventory",
+        "runtime_facts",
+        "observation_encoding",
+        "output_write",
+    }
+)
 _MAX_FILE = 512 * 1024**2
 _MAX_TOTAL = 4 * 1024**3
 
@@ -439,10 +464,13 @@ def prove_linux_null_capture(
     site: Path | None = None,
     scratch_parent: Path | None = None,
     import_roots: tuple[str, ...] = (),
+    _progress: Callable[[str], None] | None = None,
 ) -> int:
     """Run the Linux null-capture behavior without pytest or a dev dependency."""
     _require(sys.platform == "linux", "Linux null capture requires Linux")
+    progress = _progress or (lambda stage: None)
     if site is not None:
+        progress("dependency_imports")
         sys.path.insert(0, str(site))
         resolved_site = site.resolve(strict=True)
         for name in import_roots:
@@ -459,6 +487,7 @@ def prove_linux_null_capture(
                 ),
                 "Linux dependency import escaped the installed namespace",
             )
+    progress("candidate_imports")
     import hermes_realtime
 
     names = sorted(
@@ -487,10 +516,12 @@ def prove_linux_null_capture(
         }
     else:
         installed_origins = hermes_origins
+    progress("entrypoint_discovery")
     host = shutil.which("hermes-realtime-host", path=str(site / "bin") if site else None)
     local = shutil.which("hermes-realtime-local", path=str(site / "bin") if site else None)
     _require(host is not None and local is not None, "Linux installed CLI is unavailable")
     assert host is not None and local is not None
+    progress("scratch")
     with tempfile.TemporaryDirectory(
         prefix="hermes-linux-null-capture-", dir=scratch_parent
     ) as temporary:
@@ -523,13 +554,17 @@ def prove_linux_null_capture(
                 command, check=False, capture_output=True, env=environment, text=True, timeout=30
             )
 
+        progress("host_help")
         _require(run(host, "--help").returncode == 0, "Linux host help failed")
+        progress("local_help")
         _require(run(local, "--help").returncode == 0, "Linux local help failed")
+        progress("local_refusal")
         local_evidence = run(local, "--evidence-capture")
         _require(
             local_evidence.returncode == 2 and "unrecognized arguments" in local_evidence.stderr,
             "Linux local capture surface differs",
         )
+        progress("host_refusal")
         for flag in ("--evidence-capture", "--evidence-status", "--purge-evidence"):
             response = run(host, flag)
             _require(
@@ -537,6 +572,7 @@ def prove_linux_null_capture(
                 and response.stdout == '{"error":"unsupported_platform","version":1}\n',
                 "Linux host null capture differs",
             )
+        progress("residue")
         after = {path.relative_to(root) for path in root.rglob("*")}
         _require(after == before, "Linux null capture left local residue")
         _require(
@@ -546,55 +582,91 @@ def prove_linux_null_capture(
     return len(installed_origins)
 
 
-def observe(input_root: Path, installation: Path, output: Path, scratch: Path) -> None:
-    """Observe the read-only installed volume and emit one provisional fact set."""
-    _require(sys.platform == "linux", "Linux observe worker requires Linux")
-    source_archive_sha256, workflow_sha256, source_lock_sha256 = _source_binding(input_root)
-    digest, count = installed_inventory(input_root, installation)
-    site = (installation / "site").resolve(strict=True)
-    imports = prove_linux_null_capture(
-        site=site,
-        scratch_parent=scratch.resolve(strict=True),
-        import_roots=_import_roots(input_root),
-    )
-    stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
-    stdlib_rows = [
-        (path.relative_to(stdlib).as_posix(), _sha(path.read_bytes()), path.stat().st_size)
-        for path in sorted(stdlib.rglob("*"))
-        if path.is_file() and "site-packages" not in path.parts and "__pycache__" not in path.parts
-    ]
-    libc_name, libc_version = platform.libc_ver()
-    _require(libc_name == "glibc" and bool(libc_version), "Linux libc observation differs")
-    value = {
-        "version": 1,
-        "sourceArchiveSha256": source_archive_sha256,
-        "workflowSha256": workflow_sha256,
-        "sourceLockSha256": source_lock_sha256,
-        "runtime": {
-            "pythonVersion": platform.python_version(),
-            "soabi": sysconfig.get_config_var("SOABI"),
-            "extSuffix": sysconfig.get_config_var("EXT_SUFFIX"),
-            "multiarch": sysconfig.get_config_var("MULTIARCH"),
-            "glibc": libc_version,
-            "interpreterSha256": _sha(Path(sys.executable).resolve(strict=True).read_bytes()),
-            "stdlibInventorySha256": _sha(json.dumps(stdlib_rows, separators=(",", ":")).encode()),
-        },
-        "installation": {
-            "installedInventorySha256": digest,
-            "installedFileCount": count,
-            "importOriginCount": imports,
-            "nullCapturePassed": True,
-        },
-    }
-    raw = _canonical(value)
-    _require(
-        output.parent.resolve(strict=True) == output.resolve().parent and not output.exists(),
-        "Linux observation output differs",
-    )
-    with output.open("xb") as stream:
+def _record_failure(output: Path, stage: str) -> None:
+    _require(stage in _FAILURE_STAGES, "Linux worker failure stage differs")
+    raw = _canonical({"version": 1, "stage": stage})
+    with output.with_name(_FAILURE).open("xb") as stream:
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def observe(input_root: Path, installation: Path, output: Path, scratch: Path) -> None:
+    """Observe the read-only installed volume and emit one provisional fact set."""
+    stage = "platform"
+
+    def progress(value: str) -> None:
+        nonlocal stage
+        _require(value in _FAILURE_STAGES, "Linux worker failure stage differs")
+        stage = value
+
+    try:
+        _require(sys.platform == "linux", "Linux observe worker requires Linux")
+        progress("source_binding")
+        source_archive_sha256, workflow_sha256, source_lock_sha256 = _source_binding(input_root)
+        progress("installed_inventory")
+        digest, count = installed_inventory(input_root, installation)
+        progress("runtime_paths")
+        site = (installation / "site").resolve(strict=True)
+        resolved_scratch = scratch.resolve(strict=True)
+        progress("import_roots")
+        roots = _import_roots(input_root)
+        imports = prove_linux_null_capture(
+            site=site,
+            scratch_parent=resolved_scratch,
+            import_roots=roots,
+            _progress=progress,
+        )
+        progress("stdlib_inventory")
+        stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+        stdlib_rows = [
+            (path.relative_to(stdlib).as_posix(), _sha(path.read_bytes()), path.stat().st_size)
+            for path in sorted(stdlib.rglob("*"))
+            if path.is_file()
+            and "site-packages" not in path.parts
+            and "__pycache__" not in path.parts
+        ]
+        progress("runtime_facts")
+        libc_name, libc_version = platform.libc_ver()
+        _require(libc_name == "glibc" and bool(libc_version), "Linux libc observation differs")
+        value = {
+            "version": 1,
+            "sourceArchiveSha256": source_archive_sha256,
+            "workflowSha256": workflow_sha256,
+            "sourceLockSha256": source_lock_sha256,
+            "runtime": {
+                "pythonVersion": platform.python_version(),
+                "soabi": sysconfig.get_config_var("SOABI"),
+                "extSuffix": sysconfig.get_config_var("EXT_SUFFIX"),
+                "multiarch": sysconfig.get_config_var("MULTIARCH"),
+                "glibc": libc_version,
+                "interpreterSha256": _sha(Path(sys.executable).resolve(strict=True).read_bytes()),
+                "stdlibInventorySha256": _sha(
+                    json.dumps(stdlib_rows, separators=(",", ":")).encode()
+                ),
+            },
+            "installation": {
+                "installedInventorySha256": digest,
+                "installedFileCount": count,
+                "importOriginCount": imports,
+                "nullCapturePassed": True,
+            },
+        }
+        progress("observation_encoding")
+        raw = _canonical(value)
+        progress("output_write")
+        _require(
+            output.parent.resolve(strict=True) == output.resolve().parent and not output.exists(),
+            "Linux observation output differs",
+        )
+        with output.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        with suppress(BaseException):
+            _record_failure(output, stage)
+        raise
 
 
 def _run_installed_entrypoint(site: Path, script: Path, arguments: tuple[str, ...]) -> None:

@@ -175,6 +175,56 @@ def test_archived_wrapper_executes_only_the_owned_installed_cli(tmp_path):
         _run_installed_entrypoint(site, script, ("--foreign",))
 
 
+def test_observe_records_only_its_closed_failure_stage(tmp_path, monkeypatch):
+    from scripts import qualification_linux_worker as worker
+
+    installation = tmp_path / "installation"
+    (installation / "site").mkdir(parents=True)
+    output = tmp_path / "output/observation.json"
+    output.parent.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(worker.sys, "platform", "linux")
+    monkeypatch.setattr(worker, "_source_binding", lambda root: ("1" * 64,) * 3)
+
+    def fail_inventory(input_root, installed):
+        raise RuntimeError("private module and path must not escape")
+
+    monkeypatch.setattr(worker, "installed_inventory", fail_inventory)
+    with pytest.raises(RuntimeError, match="private module"):
+        worker.observe(tmp_path, installation, output, scratch)
+
+    failure = output.with_name(worker._FAILURE)
+    assert failure.read_bytes() == b'{"stage":"installed_inventory","version":1}\n'
+    assert b"private module" not in failure.read_bytes()
+    assert not output.exists()
+
+
+def test_observe_propagates_dependency_import_stage_without_global_state(tmp_path, monkeypatch):
+    from scripts import qualification_linux_worker as worker
+
+    installation = tmp_path / "installation"
+    (installation / "site").mkdir(parents=True)
+    output = tmp_path / "output/observation.json"
+    output.parent.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(worker.sys, "platform", "linux")
+    monkeypatch.setattr(worker, "_source_binding", lambda root: ("1" * 64,) * 3)
+    monkeypatch.setattr(worker, "installed_inventory", lambda input_root, installed: ("2" * 64, 1))
+    monkeypatch.setattr(worker, "_import_roots", lambda root: ("private_dependency",))
+
+    def fail_import(name):
+        raise ImportError("private loader detail")
+
+    monkeypatch.setattr(worker.importlib, "import_module", fail_import)
+    with pytest.raises(ImportError, match="private loader"):
+        worker.observe(tmp_path, installation, output, scratch)
+
+    failure = output.with_name(worker._FAILURE)
+    assert failure.read_bytes() == b'{"stage":"dependency_imports","version":1}\n'
+
+
 def test_worker_is_bound_to_its_candidate_archive_member(tmp_path):
     from scripts import qualification_linux_worker as worker
 

@@ -362,14 +362,22 @@ recipe cannot authorize the final Linux inputs.
 The [hosted producer](../scripts/qualification_linux_producer.py) owns two
 containers and one fresh installation volume. The first container installs the
 runtime-only, hash-pinned wheel recipe offline. After it exits and is removed,
-the second container observes the same volume read-only. The admitted image,
-source and input mounts are immutable during observation; writable temporary
-data stays outside the installed import namespace. The
+the second container observes the same volume read-only. It runs as the verified
+numeric owner of the newly created private output directory, with all Linux
+capabilities dropped. Its private scratch mount has the same owner. The admitted
+image, source and input mounts are immutable during observation; writable
+temporary data stays outside the installed import namespace. The
 [stdlib worker](../scripts/qualification_linux_worker.py) compares installed
 wheel bytes, installer-generated entry points and RECORD coverage, checks import
 origins, and runs the installed Linux null-capture behavior. The producer writes
 the receipt only after container, volume and observation-workspace cleanup
 succeeds. The existing portable tests use a separate environment.
+
+If observation fails, the worker attempts to write one bounded, transient marker
+containing only its version and a stage from a closed vocabulary. The producer
+validates the marker before reporting the stage; missing or malformed markers
+leave a generic failure. Exception text and process output remain private. This
+diagnostic cannot mint a receipt or bypass cleanup.
 
 The workflow publishes the receipt from its Linux job. Acceptance still requires
 the trusted service's completed first-attempt run and artifact observations;

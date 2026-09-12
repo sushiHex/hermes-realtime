@@ -8,12 +8,14 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from contextlib import suppress
 from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
@@ -30,6 +32,7 @@ _TOKEN = (
 )
 _OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 _WORKFLOW = ".github/workflows/release-gates.yml"
+_FAILURE_MAX = 1024
 
 
 def _require(condition: bool, message: str) -> None:
@@ -45,6 +48,78 @@ def _canonical(value: object) -> bytes:
     return (
         json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
+
+
+def _failure_stage(root: Path) -> str | None:
+    path = root / worker._FAILURE
+    descriptor: int | None = None
+    try:
+        observed = os.lstat(path)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_size <= 0
+            or observed.st_size > _FAILURE_MAX
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (observed.st_dev, observed.st_ino, observed.st_size)
+        ):
+            return None
+        chunks = bytearray()
+        while len(chunks) <= _FAILURE_MAX:
+            chunk = os.read(descriptor, _FAILURE_MAX + 1 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        raw = bytes(chunks)
+        if len(raw) != opened.st_size or len(raw) > _FAILURE_MAX:
+            return None
+        value = json.loads(raw)
+        if (
+            type(value) is not dict
+            or set(value) != {"version", "stage"}
+            or type(value.get("version")) is not int
+            or value["version"] != 1
+            or type(value.get("stage")) is not str
+            or value["stage"] not in worker._FAILURE_STAGES
+            or _canonical(value) != raw
+        ):
+            return None
+        return cast(str, value["stage"])
+    except BaseException:
+        return None
+    finally:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _owned_output_identity(root: Path) -> tuple[int, int]:
+    observed = os.lstat(root)
+    get_uid = getattr(os, "geteuid", None)
+    get_gid = getattr(os, "getegid", None)
+    _require(
+        stat.S_ISDIR(observed.st_mode)
+        and stat.S_IMODE(observed.st_mode) == 0o700
+        and callable(get_uid)
+        and callable(get_gid)
+        and type(observed.st_uid) is int
+        and type(observed.st_gid) is int
+        and 0 <= observed.st_uid <= 2**31 - 1
+        and 0 <= observed.st_gid <= 2**31 - 1,
+        "Linux observation output owner differs",
+    )
+    assert callable(get_uid) and callable(get_gid)
+    _require(
+        observed.st_uid == get_uid() and observed.st_gid == get_gid(),
+        "Linux observation output owner differs",
+    )
+    return observed.st_uid, observed.st_gid
 
 
 def _repo_digest_matches(value: object, manifest_sha256: str) -> bool:
@@ -175,6 +250,7 @@ class _ContainerSpec:
     volume: str
     volume_read_only: bool
     output_root: Path | None = None
+    user: tuple[int, int] | None = None
 
 
 class _Docker:
@@ -263,6 +339,20 @@ class _Docker:
         )
 
     def _create_arguments(self, spec: _ContainerSpec) -> tuple[str, ...]:
+        _require(
+            (spec.output_root is None) == (spec.user is None),
+            "owned container user differs",
+        )
+        if spec.user is not None:
+            _require(
+                type(spec.user) is tuple
+                and len(spec.user) == 2
+                and all(
+                    type(value) is int and 0 <= value <= 2**31 - 1
+                    for value in spec.user
+                ),
+                "owned container user differs",
+            )
         arguments = [
             "create",
             "--name",
@@ -276,23 +366,31 @@ class _Docker:
             "no-new-privileges",
             "--pids-limit",
             "256",
-            "--mount",
-            f"type=bind,source={spec.input_root},target=/input,readonly",
-            "--mount",
-            f"type=bind,source={spec.source_root},target=/source,readonly",
-            "--mount",
-            f"type=volume,source={spec.volume},target=/installation"
-            + (",readonly" if spec.volume_read_only else ""),
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev,noexec,size=268435456",
         ]
+        if spec.user is not None:
+            arguments.extend(("--user", f"{spec.user[0]}:{spec.user[1]}"))
+        arguments.extend(
+            [
+                "--mount",
+                f"type=bind,source={spec.input_root},target=/input,readonly",
+                "--mount",
+                f"type=bind,source={spec.source_root},target=/source,readonly",
+                "--mount",
+                f"type=volume,source={spec.volume},target=/installation"
+                + (",readonly" if spec.volume_read_only else ""),
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,size=268435456,mode=1777",
+            ]
+        )
         if spec.output_root is not None:
+            assert spec.user is not None
             arguments.extend(
                 (
                     "--mount",
                     f"type=bind,source={spec.output_root},target=/output",
                     "--tmpfs",
-                    "/scratch:rw,nosuid,nodev,noexec,size=67108864",
+                    "/scratch:rw,nosuid,nodev,noexec,size=67108864,mode=700,"
+                    f"uid={spec.user[0]},gid={spec.user[1]}",
                 )
             )
         arguments.extend((spec.image, *spec.command))
@@ -316,10 +414,13 @@ class _Docker:
             and host.get("CapDrop") == ["ALL"]
             and host.get("PidsLimit") == 256
             and host.get("SecurityOpt") == ["no-new-privileges"]
-            and host.get("Tmpfs", {}).get("/tmp") == "rw,nosuid,nodev,noexec,size=268435456"
+            and host.get("Tmpfs", {}).get("/tmp")
+            == "rw,nosuid,nodev,noexec,size=268435456,mode=1777"
             and type(config) is dict
             and config.get("Image") == spec.image
             and config.get("Cmd") == list(spec.command)
+            and config.get("User")
+            == ("" if spec.user is None else f"{spec.user[0]}:{spec.user[1]}")
             and row.get("Id") == identifier
             and row.get("Name") == "/" + spec.name
             and type(mounts) is list,
@@ -331,9 +432,13 @@ class _Docker:
             "/installation": ("volume", None, spec.volume, not spec.volume_read_only),
         }
         if spec.output_root is not None:
+            _require(spec.user is not None, "owned container user differs")
+            assert spec.user is not None
             expected["/output"] = ("bind", str(spec.output_root), None, True)
             _require(
-                host.get("Tmpfs", {}).get("/scratch") == "rw,nosuid,nodev,noexec,size=67108864",
+                host.get("Tmpfs", {}).get("/scratch")
+                == "rw,nosuid,nodev,noexec,size=67108864,mode=700,"
+                f"uid={spec.user[0]},gid={spec.user[1]}",
                 "owned observation scratch mount differs",
             )
         _require(len(mounts) == len(expected), "owned container mounts differ")
@@ -362,7 +467,12 @@ class _Docker:
                 re.fullmatch(r"[0-9a-f]{64}", created) is not None, "owned container ID differs"
             )
             self._validate_container(created, spec)
-            self._run("start", "--attach", created)
+            started = self._run("start", "--attach", created, check=False)
+            if started.returncode != 0:
+                stage = _failure_stage(spec.output_root) if spec.output_root is not None else None
+                if stage is not None:
+                    raise ValueError("owned Docker observation failed at " + stage)
+                raise ValueError("owned Docker operation failed")
             state = json.loads(self._run("inspect", created).stdout)[0]["State"]
             _require(
                 state.get("Status") == "exited" and state.get("ExitCode") == 0,
@@ -706,6 +816,7 @@ def _produce(
         docker.create_volume(volume)
         with tempfile.TemporaryDirectory(prefix="hermes-linux-observation-") as temporary:
             observed = Path(temporary).resolve(strict=True)
+            observer = _owned_output_identity(observed)
             install_spec = _ContainerSpec(
                 containers[0],
                 image.image_reference,
@@ -743,6 +854,7 @@ def _produce(
                 volume,
                 True,
                 observed,
+                observer,
             )
             docker.run_owned(install_spec)
             docker.run_owned(observe_spec)
