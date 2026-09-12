@@ -14,6 +14,14 @@ from urllib.error import HTTPError
 
 import pytest
 
+_AMBIENT_TLS_CONFIGURATION = ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_tls_configuration(monkeypatch):
+    for name in _AMBIENT_TLS_CONFIGURATION:
+        monkeypatch.delenv(name, raising=False)
+
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -322,8 +330,6 @@ def test_transport_refuses_ambient_trust_store_before_opener_creation(
     from scripts.github_actions_linux_receipt import _HttpsTransport
 
     created = []
-    for variable in ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"):
-        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv(name, value)
     monkeypatch.setattr(ssl, "create_default_context", lambda: created.append("context"))
     monkeypatch.setattr(
@@ -338,8 +344,6 @@ def test_transport_refuses_ambient_trust_store_before_opener_creation(
 def test_transport_refuses_key_log_before_native_context_touches_path(tmp_path, monkeypatch):
     from scripts.github_actions_linux_receipt import _HttpsTransport
 
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     marker = tmp_path / "unbound-tls-keys.log"
     monkeypatch.setenv("SSLKEYLOGFILE", str(marker))
     refused = False
@@ -352,10 +356,6 @@ def test_transport_refuses_key_log_before_native_context_touches_path(tmp_path, 
 
 def test_transport_constructs_one_explicit_no_proxy_verified_opener(monkeypatch):
     from scripts.github_actions_linux_receipt import _HttpsTransport, _NoRedirect
-
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
-    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
 
     def refuse_proxy_discovery():
         raise AssertionError("ambient proxy discovery ran")
@@ -403,9 +403,6 @@ def test_transport_constructs_one_explicit_no_proxy_verified_opener(monkeypatch)
 def test_transport_suppresses_context_failure_details_before_opener_creation(monkeypatch):
     from scripts.github_actions_linux_receipt import _HttpsTransport
 
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
-    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
     created = []
 
     def refuse_context():
@@ -424,9 +421,6 @@ def test_transport_suppresses_context_failure_details_before_opener_creation(mon
 
 def test_transport_explicit_context_preserves_urllib_http11_alpn(monkeypatch):
     from scripts.github_actions_linux_receipt import _HttpsTransport
-
-    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"):
-        monkeypatch.delenv(name, raising=False)
 
     class _Context:
         verify_mode = ssl.CERT_REQUIRED
