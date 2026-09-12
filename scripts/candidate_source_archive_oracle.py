@@ -1278,10 +1278,16 @@ def _clean_git_environment(executable: str) -> dict[str, str]:
 
 
 class _GitExecutor:
-    def __init__(self, retained: _RetainedGitExecutableV1, root: Path) -> None:
+    def __init__(
+        self,
+        retained: _RetainedGitExecutableV1,
+        root: Path,
+        attribute_source: str | None = None,
+    ) -> None:
         self._retained = retained
         self._root = root
         self._root_text = str(root)
+        self._attribute_source = attribute_source
 
     def run(self, *arguments: str, stdout_limit: int = _MAX_ARCHIVE_BYTES) -> bytes:
         self._retained.assert_sealed()
@@ -1305,6 +1311,9 @@ class _GitExecutor:
             self._root_text,
         )
         command = (self._retained.executable, *fixed, *arguments)
+        environment = _clean_git_environment(self._retained.executable)
+        if self._attribute_source is not None:
+            environment["GIT_ATTR_SOURCE"] = self._attribute_source
         primary: BaseException | None = None
         result: bytes | None = None
         try:
@@ -1312,7 +1321,7 @@ class _GitExecutor:
                 _NativeWin32GitKernel(),
                 self._retained.executable,
                 self._root,
-                _clean_git_environment(self._retained.executable),
+                environment,
             ).run(command, stdout_limit=stdout_limit)
         except BaseException as error:
             primary = error
@@ -1392,11 +1401,6 @@ def _require_root_and_identity(
         _text(top[:-1], "checkout root")
     ) != _normal_final_path(str(root)):
         raise CandidateSourceArchiveError("candidate must be the exact checkout root")
-    status = executor.run(
-        "status", "--porcelain=v1", "-z", "--untracked-files=no", stdout_limit=1024
-    )
-    if status:
-        raise CandidateSourceArchiveError(f"candidate has tracked index/worktree drift: {status!r}")
     head = _git_line(executor, "rev-parse", "--verify", "HEAD^{commit}", label="candidate head")
     tree = _git_line(executor, "rev-parse", "--verify", "HEAD^{tree}", label="candidate tree")
     base = _git_line(
@@ -1412,11 +1416,20 @@ def _require_root_and_identity(
         "--full-index",
         "--no-renames",
         "--no-ext-diff",
+        "--no-textconv",
         f"{base}..{head}",
     )
     captured = CandidateIdentityV1(head, tree, base, hashlib.sha256(diff).hexdigest())
     if captured != supplied:
         raise CandidateSourceArchiveError("candidate identity drifted")
+
+
+def _require_clean_checkout(executor: _GitExecutor) -> None:
+    status = executor.run(
+        "status", "--porcelain=v1", "-z", "--untracked-files=no", stdout_limit=1024
+    )
+    if status:
+        raise CandidateSourceArchiveError(f"candidate has tracked index/worktree drift: {status!r}")
 
 
 def _git_object(
@@ -1520,27 +1533,33 @@ def _walk_tree(
     return files, directories
 
 
-def _attribute(executor: _GitExecutor, path: str) -> tuple[str, str]:
+def _attribute(executor: _GitExecutor, tree: str, path: str) -> tuple[str, str]:
     answer = executor.run(
         "check-attr",
-        "--cached",
+        f"--source={tree}",
         "-z",
         "export-ignore",
         "export-subst",
+        "filter",
         "--",
         path,
         stdout_limit=8192,
     )
     fields = answer.split(b"\0")
-    if len(fields) != 7 or fields[-1] != b"":
+    if len(fields) != 10 or fields[-1] != b"":
         raise CandidateSourceArchiveError("committed attribute output is malformed")
     if (
         _text(fields[0], "attribute path") != path
         or _text(fields[1], "attribute name") != "export-ignore"
         or _text(fields[3], "attribute path") != path
         or _text(fields[4], "attribute name") != "export-subst"
+        or _text(fields[6], "attribute path") != path
+        or _text(fields[7], "attribute name") != "filter"
     ):
         raise CandidateSourceArchiveError("committed attribute output is unexpected")
+    clean_filter = _text(fields[8], "attribute value")
+    if clean_filter not in {"unset", "unspecified"}:
+        raise CandidateSourceArchiveError("committed clean/process filter is forbidden")
     return _text(fields[2], "attribute value"), _text(fields[5], "attribute value")
 
 
@@ -1550,7 +1569,7 @@ def _visible_manifest(
     files, directories = _walk_tree(executor, tree)
     ignored: set[str] = set()
     for path in sorted({*files, *(item for item in directories if item)}):
-        export_ignore, export_subst = _attribute(executor, path)
+        export_ignore, export_subst = _attribute(executor, tree, path)
         if export_ignore not in {"set", "unset", "unspecified"} or export_subst not in {
             "set",
             "unset",
@@ -2032,7 +2051,7 @@ def _capture_retained_source_archive(
     minted: VerifiedCandidateSourceArchiveV1 | None = None
     failure: BaseException | None = None
     try:
-        executor = _GitExecutor(retained, checkout_root)
+        executor = _GitExecutor(retained, checkout_root, identity.candidate_head_oid)
         _verify_retained_version(executor, git_pin)
         _require_root_and_identity(executor, checkout_root, identity)
         metadata_authority = _GitMetadataAuthority(executor, checkout_root)
@@ -2046,6 +2065,7 @@ def _capture_retained_source_archive(
             metadata_authority.revalidate()
             _require_root_and_identity(executor, checkout_root, identity)
             _refuse_info_attributes(executor, metadata_authority)
+            _require_clean_checkout(executor)
             archive = executor.run(
                 "archive", "--format=tar", f"--prefix={_PREFIX}/", identity.candidate_head_oid
             )
@@ -2056,10 +2076,12 @@ def _capture_retained_source_archive(
             metadata_authority.revalidate()
             _require_root_and_identity(executor, checkout_root, identity)
             _refuse_info_attributes(executor, metadata_authority)
+            _require_clean_checkout(executor)
         archive = _require_equal_repeated_archives(archives[0], archives[1])
         metadata_authority.revalidate()
         _require_root_and_identity(executor, checkout_root, identity)
         _refuse_info_attributes(executor, metadata_authority)
+        _require_clean_checkout(executor)
         metadata = CandidateSourceArchiveMetadataV1(
             identity.candidate_head_oid,
             identity.candidate_tree_oid,

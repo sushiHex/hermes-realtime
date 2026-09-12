@@ -64,6 +64,7 @@ def _identity(root: Path, baseline: str) -> object:
         "--full-index",
         "--no-renames",
         "--no-ext-diff",
+        "--no-textconv",
         f"{base}..{head}",
         cwd=root,
     )
@@ -305,7 +306,10 @@ def test_git_executor_uses_exact_absolute_child_contract(monkeypatch: pytest.Mon
     monkeypatch.setenv("SYSTEMROOT", r"C:\\hostile-root")
     monkeypatch.setenv("WINDIR", r"C:\\hostile-windir")
     monkeypatch.setenv("GIT_DIR", r"C:\\hostile-git")
-    result = oracle._GitExecutor(Retained(), ROOT).run("status", "--porcelain=v1")
+    attribute_source = "a" * 40
+    result = oracle._GitExecutor(Retained(), ROOT, attribute_source).run(
+        "status", "--porcelain=v1"
+    )
 
     assert result == b"ok"
     command = captured["command"]
@@ -318,6 +322,7 @@ def test_git_executor_uses_exact_absolute_child_contract(monkeypatch: pytest.Mon
     assert environment["PATH"] == os.pathsep.join((str(GIT.parent), trusted_system32))
     assert environment["SystemRoot"] == trusted_root
     assert environment["WINDIR"] == trusted_root
+    assert environment["GIT_ATTR_SOURCE"] == attribute_source
     assert "hostile" not in "\0".join(environment.values())
     assert not {
         "HOME",
@@ -341,6 +346,7 @@ def test_git_executor_uses_exact_absolute_child_contract(monkeypatch: pytest.Mon
         "GIT_OPTIONAL_LOCKS",
         "GIT_TERMINAL_PROMPT",
         "GIT_NO_LAZY_FETCH",
+        "GIT_ATTR_SOURCE",
     }
 
 
@@ -569,9 +575,11 @@ def test_candidate_dirty_identity_drift_and_export_subst_fail_closed(tmp_path: P
     identity = _identity(repository, baseline)
     with pytest.raises(oracle.CandidateSourceArchiveError, match="export-subst"):
         oracle.capture_candidate_source_archive(repository, identity, _pin())
-    (repository / "visible.txt").write_text("dirty\n", encoding="utf-8")
+    dirty_repository, dirty_baseline = _repository(tmp_path / "dirty")
+    dirty_identity = _identity(dirty_repository, dirty_baseline)
+    (dirty_repository / "visible.txt").write_text("dirty\n", encoding="utf-8")
     with pytest.raises(oracle.CandidateSourceArchiveError, match="tracked index/worktree drift"):
-        oracle.capture_candidate_source_archive(repository, identity, _pin())
+        oracle.capture_candidate_source_archive(dirty_repository, dirty_identity, _pin())
     clean_repository, clean_baseline = _repository(tmp_path / "clean")
     clean_identity = _identity(clean_repository, clean_baseline)
     drifted = type(clean_identity)(
@@ -611,12 +619,22 @@ def test_object_hash_and_unsafe_tree_entries_fail_closed() -> None:
 def test_attribute_parser_requires_repeated_path_name_value_triples() -> None:
     from scripts import candidate_source_archive_oracle as oracle
 
+    tree = "1" * 40
+
     class Executor:
         def run(self, *arguments: str, **_: object) -> bytes:
-            assert arguments[:4] == ("check-attr", "--cached", "-z", "export-ignore")
-            return b"file\0export-ignore\0unset\0file\0export-subst\0set\0"
+            assert arguments[:4] == (
+                "check-attr",
+                f"--source={tree}",
+                "-z",
+                "export-ignore",
+            )
+            return (
+                b"file\0export-ignore\0unset\0file\0export-subst\0set\0"
+                b"file\0filter\0unspecified\0"
+            )
 
-    assert oracle._attribute(Executor(), "file") == ("unset", "set")
+    assert oracle._attribute(Executor(), tree, "file") == ("unset", "set")
 
 
 def test_raw_tar_rejects_empty_framing() -> None:
@@ -1533,5 +1551,74 @@ def test_candidate_revalidation_uses_exact_no_ext_diff_command(
         "--full-index",
         "--no-renames",
         "--no-ext-diff",
+        "--no-textconv",
         f"{identity.canonical_baseline_oid}..{identity.candidate_head_oid}",
     ) in observed
+
+
+def test_candidate_revalidation_never_executes_local_textconv(
+    tmp_path: Path,
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, baseline = _repository(tmp_path, "*.txt diff=owned\n")
+    (repository / "visible.txt").write_text("candidate\n", encoding="utf-8")
+    _git("add", ".", cwd=repository)
+    _git("commit", "-qm", "candidate change", cwd=repository)
+    identity = _identity(repository, baseline)
+    marker = tmp_path / "textconv-executed.txt"
+    helper = tmp_path / "owned-textconv.cmd"
+    helper.write_text(
+        f'@echo off\r\n> "{marker}" echo executed\r\ntype %1\r\n',
+        encoding="ascii",
+    )
+    _git("config", "diff.owned.textconv", helper.as_posix(), cwd=repository)
+
+    oracle.capture_candidate_source_archive(repository, identity, _pin())
+
+    assert not marker.exists()
+
+
+def test_candidate_refuses_clean_filter_before_worktree_comparison(
+    tmp_path: Path,
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, baseline = _repository(tmp_path, "*.txt filter=owned\n")
+    identity = _identity(repository, baseline)
+    marker = tmp_path / "clean-filter-executed.txt"
+    helper = tmp_path / "owned-clean.cmd"
+    helper.write_text(
+        f'@echo off\r\n> "{marker}" echo executed\r\nfindstr "^"\r\n',
+        encoding="ascii",
+    )
+    _git("config", "filter.owned.clean", helper.as_posix(), cwd=repository)
+    (repository / "visible.txt").write_text("worktree change\n", encoding="utf-8")
+
+    with pytest.raises(oracle.CandidateSourceArchiveError, match="filter"):
+        oracle.capture_candidate_source_archive(repository, identity, _pin())
+
+    assert not marker.exists()
+
+
+def test_candidate_worktree_attributes_cannot_select_local_clean_filter(
+    tmp_path: Path,
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, baseline = _repository(tmp_path)
+    identity = _identity(repository, baseline)
+    marker = tmp_path / "worktree-clean-filter-executed.txt"
+    helper = tmp_path / "owned-worktree-clean.cmd"
+    helper.write_text(
+        f'@echo off\r\n> "{marker}" echo executed\r\nfindstr "^"\r\n',
+        encoding="ascii",
+    )
+    _git("config", "filter.owned.clean", helper.as_posix(), cwd=repository)
+    (repository / ".gitattributes").write_text("*.txt filter=owned\n", encoding="utf-8")
+    (repository / "visible.txt").write_text("worktree change\n", encoding="utf-8")
+
+    with pytest.raises(oracle.CandidateSourceArchiveError, match="tracked index/worktree drift"):
+        oracle.capture_candidate_source_archive(repository, identity, _pin())
+
+    assert not marker.exists()
