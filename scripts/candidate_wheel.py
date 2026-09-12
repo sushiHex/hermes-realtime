@@ -164,29 +164,48 @@ def _bind_source_metadata(members: dict[str, bytes], project_bytes: bytes, readm
         document = tomllib.loads(project_bytes.decode("utf-8"))
         project = document["project"]
         _require(
-            set(project) == {
-                "name", "version", "description", "readme", "requires-python", "authors",
-                "license", "license-files", "keywords", "classifiers", "dependencies",
-                "entry-points", "urls", "scripts", "optional-dependencies",
+            set(project)
+            == {
+                "name",
+                "version",
+                "description",
+                "readme",
+                "requires-python",
+                "authors",
+                "license",
+                "license-files",
+                "keywords",
+                "classifiers",
+                "dependencies",
+                "entry-points",
+                "urls",
+                "scripts",
+                "optional-dependencies",
             }
             and project["readme"] == "README.md"
             and project["license-files"] == ["LICENSE"]
-            and document["build-system"] == {
-                "requires": ["hatchling==1.27.0"], "build-backend": "hatchling.build",
+            and document["build-system"]
+            == {
+                "requires": ["hatchling==1.27.0"],
+                "build-backend": "hatchling.build",
             },
             "source metadata profile is unsupported",
         )
         authors = project["authors"]
         _require(
-            type(authors) is list and bool(authors)
-            and all(type(author) is dict and set(author) == {"name"}
-                    and type(author["name"]) is str for author in authors),
+            type(authors) is list
+            and bool(authors)
+            and all(
+                type(author) is dict and set(author) == {"name"} and type(author["name"]) is str
+                for author in authors
+            ),
             "source author profile is unsupported",
         )
         dependencies = project["dependencies"]
         extras = project["optional-dependencies"]
         _require(
-            type(dependencies) is list and type(extras) is dict
+            type(dependencies) is list
+            and type(extras) is dict
             and all(type(value) is list for value in extras.values()),
             "source dependency profile is unsupported",
         )
@@ -246,14 +265,16 @@ def _bind_source_metadata(members: dict[str, bytes], project_bytes: bytes, readm
 
 
 def _metadata_source_files(
-    payload: bytes, metadata: archives.CandidateSourceArchiveMetadataV1,
+    payload: bytes,
+    metadata: archives.CandidateSourceArchiveMetadataV1,
 ) -> tuple[bytes, bytes]:
     values = []
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as source:
         for name in ("pyproject.toml", "README.md"):
             manifest = [member for member in metadata.manifest if member.path == name]
             _require(
-                len(manifest) == 1 and manifest[0].kind == "file"
+                len(manifest) == 1
+                and manifest[0].kind == "file"
                 and 0 < manifest[0].size <= 1024**2,
                 "source metadata file is missing or outside its bound",
             )
@@ -290,17 +311,19 @@ class _VerifiedWheel:
 _WHEELS: WeakKeyDictionary[VerifiedCandidateWheelV1, _VerifiedWheel] = WeakKeyDictionary()
 
 
-def verify_candidate_wheel_v1(
+def _verify_candidate_wheel_bytes_v1(
     archive: archives.VerifiedCandidateSourceArchiveV1,
     identity: CandidateIdentityV1,
-    path: Path,
+    raw: bytes,
     sha256: str,
 ) -> VerifiedCandidateWheelV1:
     metadata = archives.verified_candidate_source_archive_metadata(archive)
     # Recheck the capability's candidate identity before reading the supplied wheel.
     payload = archives._archive_bytes_for_consumer(archive, identity)
-    with path.open("rb") as stream:
-        raw = stream.read(_MAX_WHEEL + 1)
+    _require(
+        type(raw) is bytes and 0 < len(raw) <= _MAX_WHEEL,
+        "candidate wheel size is outside its bound",
+    )
     _require(
         type(sha256) is str and hashlib.sha256(raw).hexdigest() == sha256,
         "candidate wheel digest differs",
@@ -328,6 +351,20 @@ def verify_candidate_wheel_v1(
         members,
     )
     return token
+
+
+def verify_candidate_wheel_v1(
+    archive: archives.VerifiedCandidateSourceArchiveV1,
+    identity: CandidateIdentityV1,
+    path: Path,
+    sha256: str,
+) -> VerifiedCandidateWheelV1:
+    # Refuse a confused source before opening any caller-selected wheel path.
+    archives.verified_candidate_source_archive_metadata(archive)
+    archives._archive_bytes_for_consumer(archive, identity)
+    with path.open("rb") as stream:
+        raw = stream.read(_MAX_WHEEL + 1)
+    return _verify_candidate_wheel_bytes_v1(archive, identity, raw, sha256)
 
 
 def _wheel_for_consumer(

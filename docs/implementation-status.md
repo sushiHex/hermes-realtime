@@ -29,6 +29,16 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 
 ## Qualification producer status
 
+The [input-binding implementation](qualification-input-files.md) adds retained
+file and tool owners, source-locked dependency verification, six independent
+build recipes, and purpose-specific Windows runtime installation. These are
+separate prerequisites for the scenario runner. Input bindings and installed
+import receipts cannot create a full qualification report; Linux execution,
+provider resources, external host identities, and the complete runner retain
+their separately documented requirements. [Issue #47](https://github.com/sushiHex/hermes-realtime/issues/47)
+owns the input closure and its exact candidate evidence. This addition does not
+advance the page-wide reviewed baseline above.
+
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
 The `SCENARIO_REGISTRY_V1` now registers eight real producers,

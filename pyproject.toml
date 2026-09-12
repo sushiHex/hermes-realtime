@@ -61,6 +61,7 @@ speech-verification = [
 ]
 
 [dependency-groups]
+build = ["hatchling==1.27.0"]
 dev = [
   "cryptography>=50,<51",
   "jsonschema>=4.23,<5",
