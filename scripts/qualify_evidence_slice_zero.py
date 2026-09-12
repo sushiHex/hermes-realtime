@@ -2982,8 +2982,11 @@ class _CtypesWindowsKernelV1:
             raise ctypes.WinError(ctypes.get_last_error())
 
     def resume_thread(self, thread: int) -> None:
-        if self._api().ResumeThread(ctypes.c_void_p(thread)) == 0xFFFFFFFF:
+        previous = self._api().ResumeThread(ctypes.c_void_p(thread))
+        if previous == 0xFFFFFFFF:
             raise ctypes.WinError(ctypes.get_last_error())
+        if type(previous) is not int or previous != 1:
+            _windows_fail("ResumeThread did not release exactly one suspension")
 
     def _parent_pid(self, pid: int) -> int:
         api = self._api()

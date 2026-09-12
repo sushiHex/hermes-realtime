@@ -73,6 +73,69 @@ def test_invalid_or_inherited_job_is_rejected_before_process_creation(job: objec
     assert api.events == []
 
 
+@pytest.mark.parametrize("previous", [0, 2, 0xFFFFFFFF])
+def test_concrete_resume_requires_exactly_one_previous_suspension(
+    monkeypatch: pytest.MonkeyPatch, previous: int
+) -> None:
+    fixture = _helpers()
+    runner = fixture["_load_runner"]()
+    api = fixture["_ConcreteApiShim"]()
+    calls: list[int] = []
+
+    def resume(handle: Any) -> int:
+        calls.append(int(handle.value))
+        return previous
+
+    api.ResumeThread = fixture["_ApiFunction"](resume)
+    kernel = fixture["_concrete_kernel"](runner, api)
+    if previous == 0xFFFFFFFF:
+        failure = OSError("private ResumeThread failure")
+        monkeypatch.setattr(runner.ctypes, "get_last_error", lambda: 5, raising=False)
+        monkeypatch.setattr(runner.ctypes, "WinError", lambda _code: failure, raising=False)
+        expected: type[BaseException] = OSError
+    else:
+        failure = None
+        expected = runner._WindowsScenarioJobError
+
+    with pytest.raises(expected) as raised:
+        kernel.resume_thread(502)
+
+    if failure is not None:
+        assert raised.value is failure
+    assert calls == [502]
+
+
+def test_concrete_resume_accepts_one_previous_suspension() -> None:
+    fixture = _helpers()
+    runner = fixture["_load_runner"]()
+    api = fixture["_ConcreteApiShim"]()
+    calls: list[int] = []
+    api.ResumeThread = fixture["_ApiFunction"](
+        lambda handle: (calls.append(int(handle.value)), 1)[1]
+    )
+
+    assert fixture["_concrete_kernel"](runner, api).resume_thread(502) is None
+    assert calls == [502]
+
+
+def test_bad_concrete_resume_count_finalizes_the_owned_suspended_root() -> None:
+    fixture = _helpers()
+    runner = fixture["_load_runner"]()
+    api = fixture["_ConcreteApiShim"]()
+    api.ResumeThread = fixture["_ApiFunction"](lambda _handle: 2)
+    concrete = fixture["_concrete_kernel"](runner, api)
+    kernel = fixture["_FakeWindowsKernel"](runner)
+    kernel.resume_thread = concrete.resume_thread
+    job = fixture["_job"](runner, kernel)
+
+    with pytest.raises(runner._WindowsScenarioJobError):
+        job.launch_root()
+
+    assert job.last_finalization is not None and job.last_finalization.closed
+    assert ("terminate_job", 101) in kernel.events
+    assert all(event[0] != "terminate_process_pid" for event in kernel.events)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="real Windows at-creation Job membership")
 def test_real_unresumed_child_is_already_owned_and_dies_when_job_closes(tmp_path: Path) -> None:
     import msvcrt

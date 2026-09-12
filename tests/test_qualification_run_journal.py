@@ -60,6 +60,44 @@ def _filesystem_identity() -> journal.FilesystemIdentityV1:
     )
 
 
+@pytest.mark.parametrize(
+    "marker_path",
+    [
+        "C:/owned/run/host-temp",
+        "c:/OWNED/RUN/HOST-TEMP",
+    ],
+)
+def test_filesystem_identity_refuses_resource_marker_path_aliases(marker_path: str) -> None:
+    with pytest.raises(ValueError, match="filesystem identity differs"):
+        replace(_filesystem_identity(), marker_path=marker_path)
+
+
+def test_filesystem_identity_refuses_resource_marker_hardlink_identity() -> None:
+    identity = _filesystem_identity()
+
+    with pytest.raises(ValueError, match="filesystem identity differs"):
+        replace(identity, marker_file_id=identity.file_id)
+
+
+@pytest.mark.parametrize(
+    "marker_path",
+    [
+        "C:/private-recovery/run.journal",
+        "c:/PRIVATE-RECOVERY/RUN.JOURNAL",
+    ],
+)
+def test_recovery_location_refuses_journal_marker_path_aliases(marker_path: str) -> None:
+    with pytest.raises(ValueError, match="journal recovery location differs"):
+        replace(_location(), marker_path=marker_path)
+
+
+def test_recovery_location_refuses_journal_marker_hardlink_identity() -> None:
+    location = _location()
+
+    with pytest.raises(ValueError, match="journal recovery location differs"):
+        replace(location, marker_file_id=location.journal_file_id)
+
+
 def _process() -> journal.ProcessIntentV1:
     return journal.ProcessIntentV1(
         scenario_id="normal_conversation",

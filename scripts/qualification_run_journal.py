@@ -125,6 +125,10 @@ class RecoveryLocationFactsV1:
         for value in (self.journal_file_id, self.parent_file_id, self.marker_file_id):
             _exact_int(value, positive=True)
         _require(
+            self.marker_file_id != self.journal_file_id,
+            "journal recovery location differs",
+        )
+        _require(
             type(self.marker_sha256) is str and _SHA256.fullmatch(self.marker_sha256) is not None,
             "journal marker fact differs",
         )
@@ -182,12 +186,14 @@ class FilesystemIdentityV1:
         path, parent, marker = map(_path, (self.path, self.parent_path, self.marker_path))
         _require(
             PureWindowsPath(path).parent == PureWindowsPath(parent)
-            and PureWindowsPath(marker).parent == PureWindowsPath(parent),
+            and PureWindowsPath(marker).parent == PureWindowsPath(parent)
+            and PureWindowsPath(marker) != PureWindowsPath(path),
             "filesystem identity differs",
         )
         _exact_int(self.volume_serial, positive=True, maximum=2**32 - 1)
         for value in (self.file_id, self.parent_file_id, self.marker_file_id):
             _exact_int(value, positive=True)
+        _require(self.marker_file_id != self.file_id, "filesystem identity differs")
         _require(
             type(self.marker_sha256) is str
             and _SHA256.fullmatch(self.marker_sha256) is not None
