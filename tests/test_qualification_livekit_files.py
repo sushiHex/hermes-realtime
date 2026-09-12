@@ -96,7 +96,7 @@ def _close_tools(fixture, patch) -> None:
         raise
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def genuine_inputs(tmp_path_factory):
     archive, executable = _zip()
     inputs, identity, fixture, patch = _inputs_for_policy(

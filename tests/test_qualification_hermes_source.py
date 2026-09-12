@@ -83,7 +83,7 @@ def _close_tools(fixture, patch) -> None:
         patch.undo()
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def genuine_inputs(tmp_path_factory):
     inputs, identity, fixture, patch = _inputs(tmp_path_factory)
     try:
