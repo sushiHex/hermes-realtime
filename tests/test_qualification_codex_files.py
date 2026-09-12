@@ -11,6 +11,7 @@ from runpy import run_path
 import pytest
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows retained file authority")
+_MATCHING_EXECUTABLE = b"codex executable\n"
 
 
 def _archive(files: dict[str, bytes]) -> bytes:
@@ -24,7 +25,7 @@ def _archive(files: dict[str, bytes]) -> bytes:
     return stream.getvalue()
 
 
-def _distribution(monkeypatch, *, executable: bytes = b"codex executable\n"):
+def _distribution(monkeypatch, *, executable: bytes = _MATCHING_EXECUTABLE):
     from scripts import qualification_codex_files as codex
 
     files = {
@@ -100,6 +101,12 @@ def _graph(tmp_path, source, executable: bytes, *, change: str | None = None):
     return graph
 
 
+@pytest.fixture(scope="module")
+def matching_source(tmp_path_factory):
+    """One genuine candidate archive shared by all matching final-binding cases."""
+    return _candidate(tmp_path_factory, hashlib.sha256(_MATCHING_EXECUTABLE).hexdigest())
+
+
 def test_publisher_digest_is_checked_before_archive_parsing():
     from scripts.qualification_codex_files import admit_codex_distribution
 
@@ -154,15 +161,14 @@ def test_distribution_cannot_be_forged():
 
 
 def test_final_binder_requires_candidate_fixture_and_sealed_executable(
-    monkeypatch, tmp_path_factory, tmp_path
+    monkeypatch, matching_source, tmp_path
 ):
     from scripts.qualification_candidate_files import bind_candidate_files
     from scripts.qualification_codex_files import bind_codex_files, codex_file_metadata
 
     admitted, files, _ = _distribution(monkeypatch)
-    source = _candidate(tmp_path_factory, hashlib.sha256(files["bin/codex.exe"]).hexdigest())
-    graph = _graph(tmp_path, source, files["bin/codex.exe"])
-    with source[0]["freeze"](graph) as final:
+    graph = _graph(tmp_path, matching_source, files["bin/codex.exe"])
+    with matching_source[0]["freeze"](graph) as final:
         candidate = bind_candidate_files(final, graph[3], graph[4])
         bound = bind_codex_files(admitted, final, candidate)
         metadata = codex_file_metadata(bound)
@@ -178,15 +184,14 @@ def test_final_binder_requires_candidate_fixture_and_sealed_executable(
 
 @pytest.mark.parametrize("change", ["executable", "version", "model", "effort"])
 def test_final_binder_refuses_changed_final_bytes_or_expected_provider_selection(
-    monkeypatch, tmp_path_factory, tmp_path, change
+    monkeypatch, matching_source, tmp_path, change
 ):
     from scripts.qualification_candidate_files import bind_candidate_files
     from scripts.qualification_codex_files import bind_codex_files
 
     admitted, files, _ = _distribution(monkeypatch)
-    source = _candidate(tmp_path_factory, hashlib.sha256(files["bin/codex.exe"]).hexdigest())
-    graph = _graph(tmp_path, source, files["bin/codex.exe"], change=change)
-    with source[0]["freeze"](graph) as final:
+    graph = _graph(tmp_path, matching_source, files["bin/codex.exe"], change=change)
+    with matching_source[0]["freeze"](graph) as final:
         candidate = bind_candidate_files(final, graph[3], graph[4])
         with pytest.raises(ValueError, match="Codex final"):
             bind_codex_files(admitted, final, candidate)
