@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import inspect
 import json
+import platform
 import threading
 from pathlib import Path
 from types import ModuleType
@@ -233,6 +234,39 @@ def test_machine_manifest_semantics_reject_shape_identity_paths_and_bounds(
             ValueError, match="machine|cpuModel|Windows|architecture|power|SHA|identity"
         ):
             module.validate_machine_manifest(broken)
+
+
+def test_live_machine_manifest_uses_canonical_patch_python_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = benchmark()
+    monkeypatch.setattr(module, "_native_windows_values", lambda: {
+        "cpuModel": "Synthetic Test CPU",
+        "logicalCpuCount": 8,
+        "installedRamBytes": 17_179_869_184,
+        "windowsEdition": "Windows Test Edition",
+        "windowsBuild": "26000.1",
+        "windowsArchitecture": "AMD64",
+        "acPower": True,
+    })
+    monkeypatch.setattr(platform, "python_version", lambda: "3.11.16")
+
+    observed = module.collect_live_machine_manifest()
+
+    assert observed["pythonFullVersion"] == "3.11.16"
+
+
+def test_atomic_machine_writer_fsyncs_reopens_and_revalidates(tmp_path: Path) -> None:
+    module = benchmark()
+    output = tmp_path / "machine.json"
+    manifest = machine_value()
+    manifest["benchmarkScriptSha256"] = module.sha256_bytes(SCRIPT.read_bytes())
+
+    digest = module.write_machine_manifest_atomic(output, manifest)
+
+    assert digest == module.sha256_bytes(output.read_bytes())
+    assert module.parse_canonical_json_bytes(output.read_bytes()) == manifest
+    assert not tuple(tmp_path.glob("machine.json.tmp-*"))
 
 
 def test_report_semantics_reject_every_material_cross_field_drift() -> None:
