@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, sleep
@@ -20,6 +21,10 @@ from typing import Any
 from weakref import WeakKeyDictionary
 
 from scripts import qualify_evidence_slice_zero as core
+from scripts.candidate_source_archive_oracle import (
+    _require_local_nonreparse_path,
+    _trusted_windows_directories,
+)
 from scripts.qualification_tool_environment import (
     ImmutableToolEnvironmentV1,
     _tool_image_for_consumer,
@@ -49,21 +54,114 @@ def _exit_code(kernel: Any, handle: int) -> int:
     return int(code.value)
 
 
-def _wait_for_tool_exit(kernel: Any, process: int, job: int, timeout_ms: int) -> None:
-    """Require root exit and Job quiescence within one shared wait budget."""
+def _system_environment() -> dict[str, str]:
+    windows, system = _trusted_windows_directories()
+    for value in (windows, system):
+        _require_local_nonreparse_path(Path(value))
+    _require(Path(system).is_relative_to(Path(windows)), "native Windows directories disagree")
+    return {"SystemRoot": windows, "WINDIR": windows, "SystemDrive": Path(windows).drive}
+
+
+def _os_process_rules() -> tuple[core._WindowsRoleRuleV1, ...]:
+    # Windowless tools can create conhost. CPython's platform.win32_ver also uses
+    # cmd /c ver during uv's interpreter probe. Both use the accepted OS boundary.
+    # https://github.com/python/cpython/blob/v3.11.16/Lib/platform.py
+    _, system = _trusted_windows_directories()
+    rules = []
+    for role, name in (("console_host", "conhost.exe"), ("command_shell", "cmd.exe")):
+        image = Path(system) / name
+        _require_local_nonreparse_path(image)
+        with image.open("rb") as stream:
+            raw = stream.read(16 * 1024**2 + 1)
+        _require(0 < len(raw) <= 16 * 1024**2, "native OS image is unbounded")
+        parents = {"tool_root", "build_python", "uv"}
+        if role == "console_host":
+            parents.add("command_shell")
+        rules.append(
+            core._WindowsRoleRuleV1(
+                role,
+                image.name,
+                hashlib.sha256(raw).hexdigest(),
+                frozenset(parents),
+                False,
+            )
+        )
+    return tuple(rules)
+
+
+def _job_accounting(kernel: Any, job: int) -> tuple[int, int, int]:
+    info = core._JOBOBJECT_BASIC_ACCOUNTING_INFORMATION_V1()
+    _require(
+        bool(
+            kernel._api().QueryInformationJobObject(
+                ctypes.c_void_p(job),
+                1,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                None,
+            )
+        ),
+        "tool Job lifetime accounting is unavailable",
+    )
+    return int(info.TotalProcesses), int(info.ActiveProcesses), int(info.TotalTerminatedProcesses)
+
+
+def _wait_for_tool_exit(
+    kernel: Any,
+    process: int,
+    owner: core._WindowsScenarioJobV1,
+    timeout_ms: int,
+) -> int:
+    """Authenticate live members and reconcile the entire Job lifetime at exit.
+
+    Polling may miss a short-lived child. Cumulative TotalProcesses includes exited
+    children, so an unobserved lifetime refuses instead of minting a receipt.
+    Completion-port notifications alone cannot supply that guarantee.
+    """
+    job = owner._job_handle
+    _require(job is not None, "tool Job ownership is unavailable")
+    assert job is not None
     deadline = monotonic() + timeout_ms / 1000
-    kernel.wait(process, timeout_ms)
-    code = _exit_code(kernel, process)
     while True:
-        active = kernel.query_job_active_process_count(job)
-        _require(type(active) is int and active >= 0, "tool Job accounting is invalid")
+        pids = kernel.query_job_processes(job)
+        _require(
+            type(pids) is tuple
+            and len(set(pids)) == len(pids)
+            and all(type(pid) is int and pid > 0 for pid in pids),
+            "tool Job membership is invalid",
+        )
+        if set(pids) - owner._members.keys():
+            # The existing checkpoint permits an exited parent only when its
+            # retained process handle independently proves that exit.
+            owner.checkpoint("pre-cleanup")
+        total, active, terminated = _job_accounting(kernel, job)
+        _require(
+            all(type(value) is int for value in (total, active, terminated))
+            and 1 <= total <= 128
+            and 0 <= active <= total
+            and terminated == 0,
+            "tool Job lifetime accounting or limit outcome is invalid",
+        )
         _require(monotonic() <= deadline, "tool retains active consumers beyond its wait budget")
         if active == 0:
+            _require(
+                total == len(owner._members), "tool Job contains an unobserved process lifetime"
+            )
+            for member in owner._members.values():
+                kernel.wait(member.process_handle, 0)
+                _require(
+                    _exit_code(kernel, member.process_handle) == 0, "tool did not exit normally"
+                )
+            _require(monotonic() <= deadline, "tool exit observation exceeded its wait budget")
             break
         remaining = deadline - monotonic()
         _require(remaining > 0, "tool retains active consumers beyond its wait budget")
-        sleep(min(0.01, remaining))
-    _require(code == 0, "tool did not exit normally")
+        sleep(min(0.005, remaining))
+    _require(
+        any(row.process_handle == process for row in owner._members.values()),
+        "tool root is unowned",
+    )
+    return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +172,9 @@ class ToolInvocationMetadataV1:
     environment_sha256: str
     distribution_sha256s: tuple[tuple[str, str], ...]
     exit_code: int
+    process_count: int
+    process_role_counts: tuple[tuple[str, int], ...]
+    os_image_sha256s: tuple[tuple[str, str], ...]
 
 
 class CompletedToolInvocationV1:
@@ -91,6 +192,7 @@ class _Invocation:
     process: core._WindowsProcessIdentityV1
     cleanup: core._WindowsFinalizationResultV1
     metadata: ToolInvocationMetadataV1
+    processes: tuple[core._WindowsProcessIdentityV1, ...]
 
 
 _COMPLETED: WeakKeyDictionary[CompletedToolInvocationV1, _Invocation] = WeakKeyDictionary()
@@ -125,11 +227,7 @@ def _run_tool(
     _require(directory == workspace and directory.is_dir(), "tool workspace is indirect")
     isolation = ("-I", "-S", "-B") if role == "build_python" else ()
     command = (str(image), *isolation, *arguments)
-    environment = {
-        name: os.environ[name]
-        for name in ("SystemRoot", "SystemDrive", "WINDIR")
-        if name in os.environ
-    } | {
+    environment = _system_environment() | {
         "PATH": str(image.parent),
         "TEMP": str(directory),
         "TMP": str(directory),
@@ -140,6 +238,7 @@ def _run_tool(
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     pairs = tuple(sorted(environment.items(), key=lambda item: (item[0].casefold(), item[0])))
+    os_rules = _os_process_rules()
     kernel = core._CtypesWindowsKernelV1()
     runner_handle = kernel.open_process(
         os.getpid(), core._SYNCHRONIZE | core._PROCESS_QUERY_LIMITED_INFORMATION
@@ -166,7 +265,10 @@ def _run_tool(
                 no_window=True,
             )
             rules = tuple(
-                [core._WindowsRoleRuleV1("tool_root", image.name, digest, frozenset(), True)]
+                [
+                    core._WindowsRoleRuleV1("tool_root", image.name, digest, frozenset(), True),
+                    *os_rules,
+                ]
                 + [
                     core._WindowsRoleRuleV1(
                         child_role,
@@ -186,7 +288,7 @@ def _run_tool(
                 _wait_for_tool_exit(
                     kernel,
                     root.process_handle,
-                    job._job_handle,
+                    job,
                     timeout_milliseconds,
                 )
                 _require(
@@ -219,10 +321,19 @@ def _run_tool(
         _digest(pairs),
         tuple((item.role, item.distribution_sha256) for item in distributions),
         0,
+        len(job._members),
+        tuple(sorted(Counter(row.role for row in job._members.values()).items())),
+        tuple((rule.role, rule.image_sha256) for rule in os_rules),
     )
     receipt = object.__new__(CompletedToolInvocationV1)
     _COMPLETED[receipt] = _Invocation(
-        command, pairs, str(directory), root.identity, cleanup, metadata
+        command,
+        pairs,
+        str(directory),
+        root.identity,
+        cleanup,
+        metadata,
+        tuple(row.identity for row in job._members.values()),
     )
     return receipt
 

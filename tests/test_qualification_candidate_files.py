@@ -18,6 +18,10 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="retained Windows source
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
+    return _make_source(tmp_path_factory)
+
+
+def _make_source(tmp_path_factory, extra_package_members=None):
     if os.name != "nt":
         pytest.skip("genuine Windows source authority")
     from scripts.candidate_source_archive_oracle import capture_candidate_source_archive
@@ -27,13 +31,22 @@ def source(tmp_path_factory):
     wheel_helpers = run_path(str(root / "tests/test_revoke_race.py"))
     repository, baseline = helpers["_repository"](tmp_path_factory.mktemp("bound-source"))
     members = wheel_helpers["_source_members"]()
+    members.update(extra_package_members or {})
+    metadata_name = "hermes_realtime-0.0.3.dist-info/METADATA"
+    members[metadata_name] = members[metadata_name].replace(
+        b"Requires-Dist: numpy",
+        b'Requires-Dist: moonshine-voice==0.1.0; extra == "local"\n'
+        b'Requires-Dist: kokoro-onnx==0.6.1; extra == "local"\nRequires-Dist: numpy',
+    )
     for name, raw in members.items():
         if name.startswith("hermes_realtime/"):
             path = repository / "src" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
     (repository / "pyproject.toml").write_bytes(
-        wheel_helpers["_SOURCE_PROJECT"]
+        wheel_helpers["_SOURCE_PROJECT"].replace(
+            b"local = [", b'local = ["moonshine-voice==0.1.0", "kokoro-onnx==0.6.1", '
+        )
         + b'\n[tool.hatch.build.targets.sdist]\ninclude = ["/LICENSE", "/README.md", '
         b'"/pyproject.toml", "/src/**", "/docs/**", "/scripts/**"]\nexclude = []\n'
     )
@@ -307,12 +320,15 @@ def dependency_graph(bound_graph):
             helpers["wheel"]("numpy", "1.26.0"),
         ]
     )
-    providers = dict([
-        helpers["wheel"]("moonshine_voice", "0.1.0"),
-        helpers["wheel"]("kokoro_onnx", "0.6.1"),
-    ])
+    providers = dict(
+        [
+            helpers["wheel"]("moonshine_voice", "0.1.0"),
+            helpers["wheel"]("kokoro_onnx", "0.6.1"),
+        ]
+    )
     for provider, package, version in (
-        ("moonshine", "moonshine_voice", "0.1.0"), ("kokoro", "kokoro_onnx", "0.6.1")
+        ("moonshine", "moonshine_voice", "0.1.0"),
+        ("kokoro", "kokoro_onnx", "0.6.1"),
     ):
         raw = providers[f"{package}-{version}-py3-none-any.whl"]
         item = next(
@@ -325,6 +341,9 @@ def dependency_graph(bound_graph):
         selected = dict([build]) if purpose == "build" else dict(runtime)
         if purpose in {"realtime_windows_direct_runtime", "realtime_windows_sdist_built_runtime"}:
             selected.update(providers)
+        elif purpose != "build":
+            # NumPy and providers are activated by the candidate's local extra.
+            selected.pop("numpy-1.26.0-py3-none-any.whl")
         reference = next(item for item in document["files"] if item["role"] == role)
         path = root / reference["relativePath"]
         value = json.loads(path.read_bytes())
@@ -535,7 +554,8 @@ def test_provider_roles_require_the_same_real_windows_wheel_files(
     else:
         role = (
             "windows_direct_runtime_wheelhouse_manifest"
-            if mutation == "missing_direct" else "windows_sdist_built_runtime_wheelhouse_manifest"
+            if mutation == "missing_direct"
+            else "windows_sdist_built_runtime_wheelhouse_manifest"
         )
         reference = next(v for v in document["files"] if v["role"] == role)
         path = root / reference["relativePath"]
@@ -547,7 +567,8 @@ def test_provider_roles_require_the_same_real_windows_wheel_files(
         target.unlink()
         requirements = value["requirements"]
         raw = b"".join(
-            line + b"\n" for line in (root / requirements["relativePath"]).read_bytes().splitlines()
+            line + b"\n"
+            for line in (root / requirements["relativePath"]).read_bytes().splitlines()
             if removed["sha256"].encode() not in line
         )
         (root / requirements["relativePath"]).write_bytes(raw)
@@ -557,5 +578,53 @@ def test_provider_roles_require_the_same_real_windows_wheel_files(
         reference.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
     with freeze(dependency_graph) as files:
         candidate = bind_candidate_files(files, archive, identity)
-        with pytest.raises(ValueError, match="provider distribution"):
+        with pytest.raises(ValueError, match="provider distribution|dependency closure"):
             bind_dependency_files(files, candidate)
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [
+        "build",
+        "realtime_windows_direct_runtime",
+        "realtime_windows_sdist_built_runtime",
+        "realtime_linux_runtime",
+        "hermes_v020_pluginmanager_runtime",
+    ],
+)
+def test_source_locked_but_unrelated_package_cannot_join_a_purpose(dependency_graph, purpose):
+    from scripts import qualify_evidence_slice_zero as core
+    from scripts.qualification_candidate_files import bind_candidate_files
+    from scripts.qualification_dependency_files import bind_dependency_purpose
+
+    root, _, document, archive, identity = dependency_graph
+    references = {row["role"]: row for row in document["files"]}
+    origin = (
+        "windows_direct_runtime_wheelhouse_manifest"
+        if purpose == "build"
+        else "build_wheelhouse_manifest"
+    )
+    original = json.loads((root / references[origin]["relativePath"]).read_bytes())
+    prefix = "kokoro_onnx-" if purpose == "build" else "hatchling-"
+    extra = next(row for row in original["wheels"] if row["basename"].startswith(prefix))
+    raw = (root / extra["relativePath"]).read_bytes()
+    reference = references[core._WHEELHOUSE_ROLES[purpose]]
+    path = root / reference["relativePath"]
+    manifest = json.loads(path.read_bytes())
+    target = path.parent / "wheels" / extra["basename"]
+    target.write_bytes(raw)
+    manifest["wheels"].append({**extra, "relativePath": target.relative_to(root).as_posix()})
+    manifest["wheels"].sort(key=lambda row: row["basename"])
+    requirements = manifest["requirements"]
+    target = root / requirements["relativePath"]
+    name, version = ("kokoro-onnx", "0.6.1") if purpose == "build" else ("hatchling", "1.27.0")
+    raw = target.read_bytes() + f"{name}=={version} --hash=sha256:{extra['sha256']}\n".encode()
+    target.write_bytes(raw)
+    requirements.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+    raw = core.canonical_json_bytes(manifest)
+    path.write_bytes(raw)
+    reference.update(sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+    with freeze(dependency_graph) as files:
+        candidate = bind_candidate_files(files, archive, identity)
+        with pytest.raises(ValueError, match="unrelated"):
+            bind_dependency_purpose(files, candidate, purpose=purpose)

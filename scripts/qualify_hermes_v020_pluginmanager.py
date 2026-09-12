@@ -589,7 +589,13 @@ def _verify_bound_wheelhouse_closure(
         raise ValueError("wheelhouse manifest schemaVersion is invalid")
     if manifest["purpose"] != "hermes_v020_pluginmanager_runtime":
         raise ValueError("wheelhouse manifest purpose is invalid")
-    if manifest["pythonVersion"] != "3.11":
+    # The standalone v1 harness historically used the minor version. Complete
+    # input binding additionally requires the admitted interpreter's full patch
+    # version; accept that canonical spelling here without weakening its check.
+    python_version = manifest["pythonVersion"]
+    if type(python_version) is not str or re.fullmatch(
+        r"3\.11(?:\.(?:0|[1-9][0-9]*))?", python_version
+    ) is None:
         raise ValueError("wheelhouse manifest Python pin is invalid")
     if manifest["platform"] != "windows_amd64":
         raise ValueError("wheelhouse manifest platform pin is invalid")

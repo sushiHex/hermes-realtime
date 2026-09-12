@@ -13,24 +13,25 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows immutable tool 
 def distributions(monkeypatch, *, python_version="synthetic"):
     from scripts import qualification_tool_distributions as tools
 
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, "w") as archive:
-        archive.writestr("tool.exe", b"synthetic image")
-        archive.writestr("Lib/resource file.txt", b"synthetic resource")
-    raw = stream.getvalue()
-    policies = {
-        role: tools._ToolPolicy(
+    payloads = {}
+    policies = {}
+    for role in ("git", "uv", "build_python"):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr(role + ".exe", b"synthetic image")
+            archive.writestr("Lib/resource file.txt", b"synthetic resource")
+        raw = stream.getvalue()
+        payloads[role] = raw
+        policies[role] = tools._ToolPolicy(
             python_version if role == "build_python" else "synthetic",
             "synthetic.zip",
-            "tool.exe",
+            role + ".exe",
             "zip",
             hashlib.sha256(raw).hexdigest(),
             len(raw),
         )
-        for role in ("git", "uv", "build_python")
-    }
     monkeypatch.setattr(tools, "_TOOLS", policies)
-    return {role: tools.admit_tool_distribution(role, raw) for role in policies}
+    return {role: tools.admit_tool_distribution(role, payloads[role]) for role in policies}
 
 
 def test_complete_admitted_trees_remain_sealed_until_owner_cleanup(monkeypatch):

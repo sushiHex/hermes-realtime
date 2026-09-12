@@ -2386,7 +2386,9 @@ class _WindowsScenarioJobV1:
             _windows_fail("Job membership query is not a complete unique PID set")
         current = set(pids)
         pending: dict[int, tuple[_WindowsKernelProcessV1, int]] = {}
-        for pid in pids:
+        # Capture new lifetimes before potentially expensive rechecks of known
+        # images. Their existing retained handles already preserve identity.
+        for pid in sorted(pids, key=lambda value: value in self._members):
             existing = self._members.get(pid)
             if existing is None:
                 handle = self._pending_process_handles.get(pid)

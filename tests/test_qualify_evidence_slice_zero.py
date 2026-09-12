@@ -919,6 +919,30 @@ def test_windows_membership_resolves_child_first_kernel_order() -> None:
     ]
 
 
+def test_windows_membership_captures_new_child_before_rechecking_a_retained_parent() -> None:
+    runner = _load_runner()
+    kernel = _FakeWindowsKernel(runner)
+    job = _job(runner, kernel)
+    job.launch_root()
+    kernel.members = [42, 43]
+    original = kernel.query_process_identity
+    child_captured = False
+
+    def short_lived_child(handle):
+        nonlocal child_captured
+        if handle == 201 and not child_captured:
+            # Reopening a large known parent image can outlive a short child.
+            kernel.fail.add("identity:203")
+        identity = original(handle)
+        if handle == 203:
+            child_captured = True
+        return identity
+
+    kernel.query_process_identity = short_lived_child
+    snapshot = job.checkpoint("short-child")
+    assert child_captured and len(snapshot.members) == 2
+
+
 def test_windows_membership_identity_failure_retains_handle_for_job_cleanup() -> None:
     runner = _load_runner()
     kernel = _FakeWindowsKernel(runner)

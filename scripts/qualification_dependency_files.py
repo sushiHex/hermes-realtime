@@ -254,6 +254,15 @@ def _inspect_dependency_files(
                 in locked_wheels,
                 "dependency wheel differs from the candidate source lock",
             )
+        if purpose != "build":
+            reference = references[wheel_role]
+            requirements = _include_candidate_wheel(
+                wheels,
+                requirements,
+                selected.seals,
+                reference["relativePath"],
+                reference["sha256"],
+            )
         inventory = inspect_wheelhouse_files(
             requirements=requirements,
             constraints=constraints,
@@ -261,6 +270,11 @@ def _inspect_dependency_files(
             python_version=manifest["pythonVersion"],
             platform=platform,
             site_processing=False,
+            roots=("hatchling",) if purpose == "build" else ("hermes-realtime",),
+            root_extras={"hermes-realtime": ("local",)}
+            if purpose
+            in {"realtime_windows_direct_runtime", "realtime_windows_sdist_built_runtime"}
+            else None,
         )
         if purpose == "build":
             hatchling = [item for item in inventory if item.name == "hatchling"]
@@ -273,37 +287,6 @@ def _inspect_dependency_files(
             _require(
                 tools["build_python"]["version"] == manifest["pythonVersion"],
                 "dependency build Python differs from its tool role",
-            )
-        else:
-            reference = references[wheel_role]
-            package = [item for item in inventory if item.name == "hermes-realtime"]
-            if package:
-                _require(
-                    len(package) == 1 and package[0].sha256 == reference["sha256"],
-                    "dependency candidate wheel differs from its genuine source binding",
-                )
-            else:
-                requirements = _include_candidate_wheel(
-                    wheels,
-                    requirements,
-                    selected.seals,
-                    reference["relativePath"],
-                    reference["sha256"],
-                )
-            inventory = inspect_wheelhouse_files(
-                requirements=requirements,
-                constraints=constraints,
-                wheels=wheels,
-                python_version=manifest["pythonVersion"],
-                platform=platform,
-                site_processing=False,
-                root_extras={"hermes-realtime": ("local",)}
-                if purpose
-                in {
-                    "realtime_windows_direct_runtime",
-                    "realtime_windows_sdist_built_runtime",
-                }
-                else None,
             )
         if purpose in {"realtime_windows_direct_runtime", "realtime_windows_sdist_built_runtime"}:
             for provider, package_name in (

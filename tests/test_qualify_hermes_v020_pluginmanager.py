@@ -75,14 +75,18 @@ def test_source_archive_authority_is_shared_without_pluginmanager_policy_couplin
     module = runner()
 
     assert authority.SourceArchivePolicyV1.__module__ == "scripts.source_archive_authority"
-    assert authority.WindowsSourceWorkspaceAuthorityV1.__module__ == "scripts.source_archive_authority"
+    assert (
+        authority.WindowsSourceWorkspaceAuthorityV1.__module__ == "scripts.source_archive_authority"
+    )
     assert "ParentRequest" not in vars(authority)
     assert "PluginManager" not in vars(authority)
     assert module._validated_archive_members.__module__ == "scripts.source_archive_authority"
     assert module._ExtractedSourceV1 is authority.WindowsSourceWorkspaceAuthorityV1
-    assert tuple(
-        inspect.signature(authority.WindowsSourceWorkspaceAuthorityV1).parameters
-    ) == ("workspace", "policy", "watcher_factory")
+    assert tuple(inspect.signature(authority.WindowsSourceWorkspaceAuthorityV1).parameters) == (
+        "workspace",
+        "policy",
+        "watcher_factory",
+    )
     expected_policy = authority.SourceArchivePolicyV1(
         prefix="hermes-agent-v0.20.0",
         workspace_child=".pluginmanager-hermes-v020-source",
@@ -521,17 +525,41 @@ def test_parent_request_requires_distinct_external_owned_roots_and_initially_abs
         module.validate_parent_request(request._replace(active_profile=roots["evidence"]))
 
 
+@pytest.mark.parametrize("python_version", ["3.11", "3.11.16"])
 def test_parent_supplied_manifest_binds_the_exact_closed_wheelhouse_before_any_child(
     tmp_path: Path,
+    python_version: str,
 ) -> None:
     module = runner()
     request, files = write_request_inputs(module, tmp_path)
+    manifest = json.loads(files["manifest"].read_bytes())
+    manifest["pythonVersion"] = python_version
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    files["manifest"].write_bytes(raw)
+    request = request._replace(wheelhouse_manifest_sha256=hashlib.sha256(raw).hexdigest())
     closure = module._verify_bound_wheelhouse_closure(request)
     assert closure["candidate"] == files["candidate"]
     assert closure["requirements"] == files["requirements"]
     assert closure["constraints"] == files["constraints"]
     assert closure["wheels"] == (files["candidate"],)
     assert module.validate_parent_request(request) is request
+
+
+@pytest.mark.parametrize(
+    "python_version", ["3.12.0", "3.11.16rc1", "3.11.016", "3.11.16+local", "3.11.16\n", 3.11, True]
+)
+def test_pluginmanager_rejects_unsupported_or_ambiguous_python_manifest_versions(
+    tmp_path, python_version
+):
+    module = runner()
+    request, files = write_request_inputs(module, tmp_path)
+    manifest = json.loads(files["manifest"].read_bytes())
+    manifest["pythonVersion"] = python_version
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    files["manifest"].write_bytes(raw)
+    request = request._replace(wheelhouse_manifest_sha256=hashlib.sha256(raw).hexdigest())
+    with pytest.raises(ValueError, match="Python pin"):
+        module._verify_bound_wheelhouse_closure(request)
 
 
 @pytest.mark.parametrize(
