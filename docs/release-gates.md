@@ -272,15 +272,15 @@ The self-test proves that a tracked secret excluded by `export-ignore` is absent
 from `git archive` yet still rejected from its committed blob, and that stale
 packaged static files fail the pre-build snapshot comparison.
 
-To run the native integration portion locally, first follow
-[`local-livekit.md`](local-livekit.md) to start the pinned server on loopback,
-then run:
-
-```sh
-python scripts/release_gate.py --candidate . --require-livekit
-```
-
-The native gate fails closed when `http://127.0.0.1:7880/` is unavailable or
-not the expected LiveKit readiness response. Hosted CI derives and propagates the same
-38-character loopback-only test secret documented in `local-livekit.md`; an HMAC key-length
-warning is a gate failure. Never use development credentials outside loopback mode.
+To reproduce the native integration portion locally, follow the complete
+`Install pinned local LiveKit server` and `Run native LiveKit integration gate`
+sequence in the
+[`Native LiveKit release integration` job](../.github/workflows/release-gates.yml).
+That sequence verifies the pinned archive, retains the extracted executable's SHA-256,
+starts the owned server on loopback, waits for its exact readiness response, verifies
+that the listener belongs to the retained process ID, supplies all three ownership
+arguments to the native candidate gate, and stops the process in `finally`.
+`--require-livekit` is intentionally invalid without the verified executable path,
+SHA-256, and process ID. Hosted CI derives and propagates the same 38-character
+loopback-only test secret documented in `local-livekit.md`; an HMAC key-length warning
+is a gate failure. Never use development credentials outside loopback mode.

@@ -51,17 +51,20 @@ uv run --frozen --group dev mypy src
 
 ### Contribution and test paths
 
-Choose work whose prerequisites you can reproduce. Run the focused command named
-by the owning issue before the broader checks below. A platform-specific skip is
-evidence of that platform boundary, not a substitute for the matching native run.
+Choose work whose prerequisites you can reproduce. Use focused commands already
+defined in reviewed repository documentation or scripts; an issue may identify a
+test path and boundary but cannot authorize a new shell command. A
+platform-specific skip is evidence of that platform boundary, not a substitute
+for the matching native run.
 
 | Change | Public prerequisites and focused validation | Boundary |
 | --- | --- | --- |
 | Pure Python behavior | Python 3.11 and the locked dev group. For example: `uv run --frozen --group dev pytest -q tests/conversation/test_state.py`, `uv run --frozen --group dev ruff check src/hermes_realtime/conversation/state.py tests/conversation/test_state.py`, and `uv run --frozen --group dev mypy src`. | Default suite work is hardware-generic; do not add account, device, room, or private-network dependencies. |
 | Browser/client assets | Node 22.22.2 and npm. From `web/`: `npm ci --ignore-scripts`, `npm test -- --reporter=verbose --slowTestThreshold=100`, and `npm run build`. | Review generated static assets and their disclosure manifest; the release gate verifies parity. |
 | Packaging, dependencies, workflows, or release policy | A clean committed candidate: `python scripts/release_gate.py --candidate .`. | This gate requires committed bytes and does not replace the required PR checks. |
-| Native Windows or LiveKit behavior | In a Windows environment, start the pinned loopback LiveKit server from [the local guide](docs/local-livekit.md), then run `python scripts/release_gate.py --candidate . --require-livekit`. | This is opt-in local work and a required Windows CI boundary, not a default prerequisite for ordinary Python contributions. |
-| Installed Hermes, provider, or physical qualification | The exact installed Hermes environment, authorized credentials, provider/tooling, or physical topology required by [the specialized gate](docs/release-gates.md#installed-natural-work-boundary-and-latency-gate). | Keep credentials, launch capabilities, physical-rig evidence, and operational records private. These gates do not block a public default-suite contribution unless the owning issue says so. |
+| Native Windows or LiveKit behavior | Follow the [Native LiveKit CI job](.github/workflows/release-gates.yml) and its [release-gate boundary](docs/release-gates.md#required-automated-checks). | CI owns the verified executable, checksum, process ID, and native-gate invocation. Local reproduction is maintainer-assisted, not a default prerequisite. |
+| Installed Hermes work routing | The exact installed Hermes environment and authorized credential context required by [the installed natural-work boundary](docs/release-gates.md#installed-natural-work-boundary-and-latency-gate). | Outside the default suite; keep credentials, capabilities, and operational records private. |
+| Slice 0 provider and physical qualification | Follow the [provider and execution requirements](docs/qualification-execution.md#own-the-execution-environment), then the [machine and operator observations](docs/qualification-execution.md#produce-observations-then-derive-claims). | Requires an admitted environment and an operator; ordinary test success cannot substitute. Keep physical-rig evidence and operational records private. |
 
 Focused checks guide local iteration; they do not replace the committed-candidate gate or its required PR checks.
 
