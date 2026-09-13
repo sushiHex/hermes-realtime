@@ -14,6 +14,17 @@ _ZAP_ROOM_UPDATE_LINE = "\t".join(
         '"name": "browser-acceptance-deadbeef00"}}}',
     )
 )
+_ZAP_BRACE_MESSAGE_LINE = "\t".join(
+    (
+        "2026-09-13T01:38:45.001Z",
+        "DEBUG",
+        "livekit",
+        "service/rtcservice.go:612",
+        "failed {phase} for participant",
+        '{"room": {"sid": "RM_abcdefghijkl", "name": "browser-acceptance-deadbeef00"}, '
+        '"participant": "browser_521adaa098e88a55"}',
+    )
+)
 
 
 def _renderer() -> dict[str, object]:
@@ -163,6 +174,7 @@ def test_livekit_log_sanitization_is_idempotent_for_existing_probe_corpus() -> N
         "endpoint=http://127.0.0.1:7880/rooms/private-room",
         "ordinary diagnostic line",
         _ZAP_ROOM_UPDATE_LINE,
+        _ZAP_BRACE_MESSAGE_LINE,
     )
 
     for line in probes:
@@ -242,6 +254,22 @@ def test_zap_json_suffix_redacts_nested_sensitive_object(tmp_path: Path) -> None
     assert '"room":"[REDACTED]"' in rendered
     assert "browser-acceptance" not in rendered
     assert '[REDACTED] "[REDACTED]"' not in rendered
+
+
+def test_zap_json_suffix_is_parsed_at_the_tab_boundary_not_the_first_brace(
+    tmp_path: Path,
+) -> None:
+    renderer = _renderer()
+    render_log = renderer["render_log"]
+    path = tmp_path / "brace.err"
+    path.write_text(_ZAP_BRACE_MESSAGE_LINE + "\n", encoding="utf-8")
+
+    rendered = render_log(path)
+
+    assert '"room":"[REDACTED]"' in rendered
+    assert "browser-acceptance" not in rendered
+    assert "browser_521adaa098e88a55" not in rendered
+    assert "failed {phase} for participant" in rendered
 
 
 def test_bounded_tail_keeps_early_warnings_over_late_debug(tmp_path: Path) -> None:

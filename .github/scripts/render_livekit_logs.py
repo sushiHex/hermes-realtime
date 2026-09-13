@@ -94,15 +94,15 @@ def _sanitize_line(value: str) -> str:
         except (json.JSONDecodeError, RecursionError):
             pass
     else:
-        start = printable.find("{")
-        if start > 0:
+        fields = printable.split("\t")
+        if len(fields) >= 2 and fields[-1].startswith(("{", "[")):
             try:
-                payload = json.loads(printable[start:])
+                payload = json.loads(fields[-1])
             except (json.JSONDecodeError, RecursionError):
                 pass
             else:
                 sanitized = json.dumps(_sanitize_json(payload), separators=(",", ":"))
-                return _sanitize_text(printable[:start]) + sanitized
+                return _sanitize_text("\t".join(fields[:-1]) + "\t") + sanitized
     return _sanitize_text(printable)
 
 
