@@ -43,6 +43,16 @@ the page-wide reviewed baseline above.
 
 The [qualification module](../scripts/qualify_evidence_slice_zero.py) implements
 candidate/input validation, report semantics, and Windows process ownership.
+The process owner now associates its noninherited Job during suspended child
+creation and exposes a single resume step. The separate
+[private journal](../scripts/qualification_run_journal.py) durably records bounded
+ownership observations through a borrowed file handle. Their
+[implementation boundaries](qualification-execution.md#finalize-validate-and-retain)
+and tests distinguish these primitives from verified recovery, producer
+orchestration and complete-report acceptance. Exact candidate evidence belongs
+to [#62](https://github.com/sushiHex/hermes-realtime/issues/62); this addition does
+not advance the page-wide reviewed baseline.
+
 The `SCENARIO_REGISTRY_V1` now registers eight real producers,
 [`deterministic_equivalence`](deterministic-equivalence.md),
 [`revoke_race`](revoke-race.md), [`capacity_rollover`](capacity-rollover.md),
