@@ -51,6 +51,11 @@ body:
     validations:
       required: true
   - type: textarea
+    id: contribution
+    attributes:
+      label: Contribution setup
+      description: For contributor pickup, identify owned files/interfaces, shared integration work, required tools/platform, focused verification, and a reviewer. Follow docs/work-tracking.md; leave ownership unassigned until a volunteer agrees.
+  - type: textarea
     id: acceptance
     attributes:
       label: Observable completion criteria

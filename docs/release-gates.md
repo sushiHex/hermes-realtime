@@ -273,15 +273,90 @@ The self-test proves that a tracked secret excluded by `export-ignore` is absent
 from `git archive` yet still rejected from its committed blob, and that stale
 packaged static files fail the pre-build snapshot comparison.
 
-To run the native integration portion locally, first follow
-[`local-livekit.md`](local-livekit.md) to start the pinned server on loopback,
-then run:
+To reproduce the native integration portion locally, first download, verify, and
+extract the pinned Windows archive exactly as described in
+[`local-livekit.md`](local-livekit.md), but do not start the server separately. From
+a clean, committed repository root, run this PowerShell block. It retains the exact
+executable hash and process ID, verifies that the owned process has the only loopback
+listener, and supplies all three ownership facts required by the native gate:
 
-```sh
-python scripts/release_gate.py --candidate . --require-livekit
+```powershell
+$ErrorActionPreference = 'Stop'
+$repo = (Resolve-Path -LiteralPath '.').Path
+$server = (Resolve-Path -LiteralPath '.tools/livekit/livekit-server.exe').Path
+$serverHash = (Get-FileHash -LiteralPath $server -Algorithm SHA256).Hash.ToLowerInvariant()
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ('hermes-livekit-' + [guid]::NewGuid().ToString('N'))
+$names = @('LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_KEYS')
+$prior = @{}
+$present = @{}
+foreach ($name in $names) {
+  $present[$name] = Test-Path -LiteralPath "Env:$name"
+  if ($present[$name]) { $prior[$name] = (Get-Item -LiteralPath "Env:$name").Value }
+}
+$process = $null
+$gateExit = $null
+New-Item -ItemType Directory -Path $scratch -ErrorAction Stop | Out-Null
+try {
+  $env:LIVEKIT_URL = 'ws://127.0.0.1:7880'
+  $env:LIVEKIT_API_KEY = 'dev' + 'key'
+  $env:LIVEKIT_API_SECRET = 'local' + '-' + ('x' * 32)
+  $env:LIVEKIT_KEYS = "${env:LIVEKIT_API_KEY}: ${env:LIVEKIT_API_SECRET}`n"
+  $process = Start-Process -FilePath $server -ArgumentList '--dev', '--bind', '127.0.0.1' `
+    -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $scratch 'livekit.out') `
+    -RedirectStandardError (Join-Path $scratch 'livekit.err')
+  $ready = $false
+  for ($attempt = 1; $attempt -le 30; $attempt++) {
+    try {
+      if ((Invoke-WebRequest 'http://127.0.0.1:7880/' -UseBasicParsing -TimeoutSec 2).Content.Trim() -eq 'OK') {
+        $ready = $true
+        break
+      }
+    } catch {}
+    Start-Sleep -Seconds 1
+  }
+  if (-not $ready) { throw 'LiveKit did not become ready on loopback' }
+  $listeners = @(Get-NetTCPConnection -LocalPort 7880 -State Listen -ErrorAction Stop)
+  if ($listeners.Count -ne 1 -or $listeners[0].LocalAddress -ne '127.0.0.1' -or
+      $listeners[0].OwningProcess -ne $process.Id) {
+    throw 'LiveKit signaling listener is not the owned loopback process'
+  }
+  python scripts/release_gate.py --candidate $repo `
+    --require-livekit `
+    --livekit-executable $server --livekit-executable-sha256 $serverHash `
+    --livekit-pid $process.Id
+  $gateExit = $LASTEXITCODE
+  if ($gateExit -ne 0) { throw "Native release gate failed with exit code $gateExit" }
+} finally {
+  try {
+    if ($null -ne $process) {
+      try {
+        if (-not $process.HasExited) {
+          $process.Kill()
+          if (-not $process.WaitForExit(10000)) { throw 'LiveKit cleanup timed out' }
+        }
+      } finally {
+        $process.Dispose()
+      }
+    }
+  } finally {
+    try {
+      foreach ($name in $names) {
+        if ($present[$name]) { Set-Item -LiteralPath "Env:$name" -Value $prior[$name] }
+        else { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+      }
+    } finally {
+      foreach ($logName in @('livekit.out', 'livekit.err')) {
+        $logPath = Join-Path $scratch $logName
+        if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop }
+      }
+      Remove-Item -LiteralPath $scratch -ErrorAction Stop
+    }
+  }
+}
 ```
 
-The native gate fails closed when `http://127.0.0.1:7880/` is unavailable or
-not the expected LiveKit readiness response. Hosted CI derives and propagates the same
-38-character loopback-only test secret documented in `local-livekit.md`; an HMAC key-length
-warning is a gate failure. Never use development credentials outside loopback mode.
+Readiness uses at most 30 attempts with a two-second timeout per request. Cleanup
+runs for both gate success and failure. The block exercises the native automated gate; it does not establish the
+separate physical, perceptual, provider-account, or full-host qualification claims.
+Never use these public development credentials outside loopback mode.

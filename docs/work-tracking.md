@@ -33,6 +33,14 @@ for unconditional issue prerequisites. Explain conditional choices and external
 prerequisites in the body. A closed blocker may have been declined or superseded;
 read its outcome before assuming its required proof exists.
 
+If a large outcome has prerequisites that block completion but independent work
+can start now, scope that work as a native sub-issue with its own actual
+prerequisites. Explain the distinction in the parent. For example, a complete
+qualification report needs every producer, while an interface assessment can
+proceed from reviewed source. The assessment cannot claim the report is complete.
+Read parent contracts for scope; do not copy all parent blockers onto each child
+or remove real completion prerequisites just to make the parent appear ready.
+
 ## Milestones and triage
 
 [Milestones](https://github.com/sushiHex/hermes-realtime/milestones) group issues
@@ -48,12 +56,62 @@ Reuse `bug`, `enhancement`, and `documentation`. Keep additional labels small:
 | `investigation` | The deliverable is evidence and a bounded conclusion |
 | `decision` | An explicit owner or maintainer choice is needed |
 | `qualification` | Work concerns candidate-bound qualification |
+| `help wanted` | A maintainer has scoped a contribution and welcomes a volunteer |
+| `good first issue` | A small, self-contained contribution with a clear starting point |
 
 New forms receive `needs-triage`. Maintainers remove it after disposition;
 removing it is not design approval. Assign responsibility when work is agreed,
 not automatically to one person across the backlog. Contributors can volunteer
 in a comment. Recheck ownership, dependencies, and the active user's authorization
 before starting. A review or status request alone does not authorize mutations.
+
+## Pick up a contribution
+
+Start with [unassigned help-wanted work](https://github.com/sushiHex/hermes-realtime/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22%20no%3Aassignee%20-label%3Aneeds-triage).
+This is a view of the existing issues, not a second backlog. Before adding
+`help wanted`, a maintainer records:
+
+- the bounded deliverable and its design authority, or the precise question for
+  an investigation;
+- prerequisites that are satisfied and any remaining external requirements;
+- the intended files or interfaces, excluded shared work, and relevant open PRs;
+- required tools/platform, a focused verification command or read-only procedure,
+  and observable completion criteria;
+- a reviewer or acceptance owner who can assess the result.
+
+Keep work needing scope or prerequisite decisions in `needs-triage`. Use
+`good first issue` only when the scope and setup are suitable for a newcomer;
+an investigation involving ownership or security is not automatically a beginner
+task. Labels advertise the recorded scope, not approval for a proposed design.
+
+Volunteer in the issue with the slice you will take and the environment you can
+exercise. A maintainer confirms the scope and assigns the issue before parallel
+implementation begins. Record the branch and draft PR when work starts. If the
+work pauses, leave the evidence handoff; if the contributor releases the task,
+remove its assignee so it returns to the same queue. A reviewer is not necessarily
+the implementation owner. PR review routing follows [CODEOWNERS](../.github/CODEOWNERS).
+
+## Parallel changes
+
+Agree on interfaces before splitting production work. Each issue names its owned
+modules or bounded sections and the person responsible for integrating changes
+to shared entry points. New producers should use adjacent modules and existing
+interfaces where appropriate; registry, schema and lifecycle changes need one
+coordinated integration PR. Avoid unrelated extraction or formatting in a feature
+PR solely to make concurrent edits easier.
+
+The qualification registry/process owner and its central tests, host composition,
+and foreground lifecycle are shared entry points. Check their open PRs before
+editing. Work against an unmerged interface must name the exact dependency and
+base; do not assume draft code is already on `main`. Independent investigations
+can inspect that code with its draft status explicit and should produce separate
+review records rather than modifying the shared implementation.
+
+Use a small coordination block in the owning issue: **owner, reviewer, owned
+files/interfaces, shared integration owner, prerequisites, verification, and
+branch/PR**. Update it there as the work changes; do not maintain assignments or
+file reservations in repository Markdown. If two changes need the same shared
+section, sequence their integration and revalidate the successor candidate.
 
 ## Implement and close
 
