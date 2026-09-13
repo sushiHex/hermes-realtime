@@ -8,6 +8,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # qualification-hermes mirrors the qualified upstream commit
+      # (see tests/test_qualification_candidate_files.py). These roots are synced deliberately,
+      # never by bot. cryptography is deliberately NOT listed: an ignore cannot be scoped to that
+      # group and would silence dev's security updates; the pin test rejects a bot bump instead.
+      - dependency-name: "concurrent-log-handler"
+      - dependency-name: "python-dotenv"
+      - dependency-name: "pyyaml"
+      - dependency-name: "rich"
   - package-ecosystem: npm
     directory: /web
     schedule:

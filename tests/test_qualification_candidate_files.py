@@ -16,6 +16,15 @@ import pytest
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="retained Windows source and input files")
 
+# The qualification-hermes group mirrors the QUALIFIED upstream commit pinned by
+# scripts/qualification_hermes_source.py (_COMMIT 3c27eb6), not hermes-agent main. That commit's
+# pyproject.toml pins cryptography==48.0.1 and says why 49+ is unavailable to it: msal and
+# alibabacloud-tea-openapi cap cryptography<49. Upstream main has since moved to 50.0.0 behind a
+# [tool.uv] override, but main is not what this repo qualifies, so that version does not belong
+# here until _COMMIT moves. Sync deliberately. Dependabot ignores the group's other roots;
+# a bot bump of cryptography is rejected by this test instead.
+UPSTREAM_HERMES_CRYPTOGRAPHY = "48.0.1"
+
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
@@ -528,7 +537,7 @@ def test_retained_dependency_binding_checks_purposes_tools_and_pins(dependency_g
             dependency_file_metadata(receipt)
 
 
-def test_lock_exports_mutually_exclusive_cryptography_versions():
+def test_lock_exports_hermes_cryptography_pinned_to_upstream():
     def export(*selection):
         result = subprocess.run(
             (
@@ -548,15 +557,41 @@ def test_lock_exports_mutually_exclusive_cryptography_versions():
         )
         return result.stdout
 
+    import tomllib
+
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    from scripts.qualification_dependency_files import _HERMES_ROOTS
+
+    # The dependency binder rejects a candidate whose own group differs from these roots, so the
+    # upstream pin has to reach the binder too, not only the lock.
+    assert ("cryptography", UPSTREAM_HERMES_CRYPTOGRAPHY) in _HERMES_ROOTS
+
+    def exported(recipe, name):
+        """Every version of ``name`` the recipe pins, so a second one cannot hide behind a first."""
+        return [
+            line.split("==", 1)[1].split(" ", 1)[0].strip()
+            for line in recipe.splitlines()
+            if line.startswith(f"{name}==")
+        ]
+
     hermes = export("--no-default-groups", "--group", "qualification-hermes")
     development = export("--only-dev")
     production = export("--no-default-groups")
-    assert "cryptography==48.0.1 " in hermes
-    assert "cryptography==50.0.1 " not in hermes
-    assert "cffi==2.1.0 " in hermes
-    assert "cryptography==50.0.1 " in development
-    assert "cryptography==48.0.1 " not in development
-    assert "cryptography==" not in production
+    assert exported(hermes, "cryptography") == [UPSTREAM_HERMES_CRYPTOGRAPHY]
+    assert exported(hermes, "cffi") == ["2.1.0"]
+    assert exported(production, "cryptography") == []
+    # Development owns its own range; whether it coincides with the upstream Hermes pin is an
+    # outcome of resolution, not an invariant, so read the declared constraint instead of a literal.
+    groups = tomllib.loads((Path.cwd() / "pyproject.toml").read_text("utf-8"))["dependency-groups"]
+    declared = [
+        Requirement(item) for item in groups["dev"] if Requirement(item).name == "cryptography"
+    ]
+    assert len(declared) == 1
+    resolved = exported(development, "cryptography")
+    assert len(resolved) == 1
+    assert declared[0].specifier.contains(Version(resolved[0]))
 
 
 @pytest.mark.parametrize("mutation", ["missing", "altered", "cryptography_substitution"])
