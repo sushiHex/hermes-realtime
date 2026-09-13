@@ -284,7 +284,6 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath '.').Path
 $server = (Resolve-Path -LiteralPath '.tools/livekit/livekit-server.exe').Path
 $serverHash = (Get-FileHash -LiteralPath $server -Algorithm SHA256).Hash.ToLowerInvariant()
-$gitExecutable = (Get-Command git.exe -CommandType Application -ErrorAction Stop).Source
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('hermes-livekit-' + [guid]::NewGuid().ToString('N'))
 $names = @('LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_KEYS')
 $prior = @{}
@@ -321,7 +320,7 @@ try {
       $listeners[0].OwningProcess -ne $process.Id) {
     throw 'LiveKit signaling listener is not the owned loopback process'
   }
-  python scripts/candidate_e2e_fast_track.py --candidate $repo --git-executable $gitExecutable `
+  python scripts/release_gate.py --candidate $repo `
     --require-livekit `
     --livekit-executable $server --livekit-executable-sha256 $serverHash `
     --livekit-pid $process.Id
