@@ -4,8 +4,9 @@ Hermes Realtime welcomes focused bug fixes, tests, documentation, provider integ
 
 ## Before opening a pull request
 
-- Start with [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues)
-  and [Milestones](https://github.com/sushiHex/hermes-realtime/milestones) for current
+- Start with [unassigned `help wanted` work](docs/work-tracking.md#pick-up-a-contribution),
+  then [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) and
+  [Milestones](https://github.com/sushiHex/hermes-realtime/milestones) for current
   work. Follow the [tracking guide](docs/work-tracking.md) for scope, ownership,
   dependencies, handoffs, and closure.
 - Read the [Collaborator guide](docs/README.md) and
@@ -48,6 +49,22 @@ uv run --frozen --group dev ruff check .
 uv run --frozen --group dev mypy src
 ```
 
+### Contribution and test paths
+
+Choose work whose prerequisites you can reproduce. Run the focused command named
+by the owning issue before the broader checks below. A platform-specific skip is
+evidence of that platform boundary, not a substitute for the matching native run.
+
+| Change | Public prerequisites and focused validation | Boundary |
+| --- | --- | --- |
+| Pure Python behavior | Python 3.11 and the locked dev group. For example: `uv run --frozen --group dev pytest -q tests/conversation/test_state.py`, `uv run --frozen --group dev ruff check src/hermes_realtime/conversation/state.py tests/conversation/test_state.py`, and `uv run --frozen --group dev mypy src`. | Default suite work is hardware-generic; do not add account, device, room, or private-network dependencies. |
+| Browser/client assets | Node 22.22.2 and npm. From `web/`: `npm ci --ignore-scripts`, `npm test -- --reporter=verbose --slowTestThreshold=100`, and `npm run build`. | Review generated static assets and their disclosure manifest; the release gate verifies parity. |
+| Packaging, dependencies, workflows, or release policy | A clean committed candidate: `python scripts/release_gate.py --candidate .`. | This gate requires committed bytes and does not replace the required PR checks. |
+| Native Windows or LiveKit behavior | In a Windows environment, start the pinned loopback LiveKit server from [the local guide](docs/local-livekit.md), then run `python scripts/release_gate.py --candidate . --require-livekit`. | This is opt-in local work and a required Windows CI boundary, not a default prerequisite for ordinary Python contributions. |
+| Installed Hermes, provider, or physical qualification | The exact installed Hermes environment, authorized credentials, provider/tooling, or physical topology required by [the specialized gate](docs/release-gates.md#installed-natural-work-boundary-and-latency-gate). | Keep credentials, launch capabilities, physical-rig evidence, and operational records private. These gates do not block a public default-suite contribution unless the owning issue says so. |
+
+Focused checks guide local iteration; they do not replace the committed-candidate gate or its required PR checks.
+
 For changes that affect packaging, browser assets, dependencies, workflows, or release policy, run the full committed-candidate gate after committing:
 
 ```bash
@@ -59,11 +76,13 @@ The gate intentionally refuses dirty or untracked candidate bytes.
 ## Change discipline
 
 1. Start from current `main` and create a focused branch.
-2. Add a failing test for behavior changes where practical.
+2. For production behavior, work RED-GREEN-REFACTOR: add a failing test, make it pass with the smallest change, then improve the design without changing behavior.
 3. Make the smallest production change that satisfies the contract.
 4. Run focused tests, then the relevant broader gates.
 5. Update documentation when behavior, configuration, or limitations change.
 6. Open a pull request; do not push feature work directly to `main`.
+
+Documentation-only changes need no contrived behavioral test; validate their links and formatting.
 
 Use Conventional Commit-style subjects when convenient, for example:
 
