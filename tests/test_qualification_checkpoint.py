@@ -9,13 +9,15 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Win32 handle contract")
 
 _CHECKPOINT_STARTUP_TIMEOUT_SECONDS = 10.0
+# Fixed token the test-owned child writes as the last action of its host close().
+_HOST_CLOSED_MARKER = b"[host-closed]\n"
 
 
 def _read_line(fd: int) -> bytes:
@@ -173,7 +175,7 @@ async def test_external_cli_checkpoint_failure_reaps_with_stderr_backpressure(
     observation = _checkpoint_observation(capsys)
     assert set(observation) == {
         "version", "case", "pid", "completed", "killed", "reaped", "exit_code",
-        "stderr_bytes", "events_ms", "child_events",
+        "stderr_bytes", "host_closed", "events_ms", "child_events",
     }
     assert observation["version"] == 2
     assert observation["child_events"] == [
@@ -183,6 +185,7 @@ async def test_external_cli_checkpoint_failure_reaps_with_stderr_backpressure(
     assert observation["reaped"] is True
     assert observation["killed"] is False
     assert observation["stderr_bytes"] >= 64 * 1024
+    assert observation["host_closed"] is True
     assert observation["exit_code"] != 0
     assert type(observation["pid"]) is int
     events = observation["events_ms"]
@@ -206,10 +209,54 @@ async def test_checkpoint_diagnostics_distinguish_host_settlement_from_interpret
     assert observation["completed"] is False
     assert observation["killed"] is True
     assert observation["reaped"] is True
-    assert observation["stderr_bytes"] > 0
+    assert observation["stderr_bytes"] >= len(_HOST_CLOSED_MARKER)
+    # close() returned before the interpreter stalled, so the marker survives the kill.
+    assert observation["host_closed"] is True
     assert observation["child_events"] == [
         "launcher_close_entered", "launcher_close_returned", "host_main_settled", "atexit_entered",
     ]
+
+
+@pytest.mark.asyncio
+async def test_external_cli_checkpoint_timeout_after_host_close_reports_marker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as failure:
+        await _assert_external_cli_checkpoint_failure(
+            "ack_eof", tmp_path, close_stall="after_marker",
+        )
+    assert failure.value.timeout == 5.0
+    observation = _checkpoint_observation(capsys)
+    assert observation["completed"] is False
+    assert observation["killed"] is True
+    assert observation["reaped"] is True
+    assert type(observation["stderr_bytes"]) is int
+    assert observation["stderr_bytes"] >= len(_HOST_CLOSED_MARKER)
+    assert observation["host_closed"] is True
+    # The marker reports that close() reached its last action, not that it returned:
+    # close() is still parked here, so the returned milestone must stay absent.
+    assert observation["child_events"] == ["launcher_close_entered"]
+
+
+@pytest.mark.asyncio
+async def test_external_cli_checkpoint_timeout_before_host_close_reports_no_marker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as failure:
+        await _assert_external_cli_checkpoint_failure(
+            "ack_eof", tmp_path, close_stall="before_marker",
+        )
+    assert failure.value.timeout == 5.0
+    observation = _checkpoint_observation(capsys)
+    assert observation["completed"] is False
+    assert observation["killed"] is True
+    assert observation["reaped"] is True
+    assert type(observation["stderr_bytes"]) is int
+    assert observation["host_closed"] is False
+    # Absence of the marker is only evidence once close() is known to have started.
+    assert observation["child_events"] == ["launcher_close_entered"]
 
 
 def _checkpoint_observation(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
@@ -327,6 +374,8 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
     assert observation["reaped"] is True
     assert child.drained_stderr is not None
     assert observation["stderr_bytes"] == len(child.drained_stderr)
+    # close() is parked before its last action, so the marker must never appear.
+    assert observation["host_closed"] is False
     if expect_timeout:
         assert observation["stderr_bytes"] == 17
         assert observation["child_events"] == ["launcher_close_entered"]
@@ -391,7 +440,7 @@ async def _settle_checkpoint_communication(
     communication: asyncio.Task[tuple[bytes | None, bytes | None]],
     *,
     deadline: float,
-) -> tuple[asyncio.CancelledError | None, int | None]:
+) -> tuple[asyncio.CancelledError | None, int | None, bool | None]:
     """Join the current call before any retry; all cleanup shares one deadline."""
     loop = asyncio.get_running_loop()
     interrupted: asyncio.CancelledError | None = None
@@ -426,7 +475,10 @@ async def _settle_checkpoint_communication(
         )
         await settle(drain)
         _, stderr = drain.result()
-    return interrupted, None if stderr is None else len(stderr)
+    if stderr is None:
+        # Settlement observed no bytes at all; the marker question stays unanswered.
+        return interrupted, None, None
+    return interrupted, len(stderr), _HOST_CLOSED_MARKER in stderr
 
 
 @pytest.mark.parametrize("raw", [b"private-output", b"CCCC", b"AC", b"CcHAC"])
@@ -474,6 +526,7 @@ async def _assert_external_cli_checkpoint_failure(
     stderr_bytes: int = 0,
     hold_close: bool = False,
     hold_atexit: bool = False,
+    close_stall: Literal["none", "after_marker", "before_marker"] = "none",
 ) -> None:
     import msvcrt
 
@@ -496,8 +549,16 @@ async def _assert_external_cli_checkpoint_failure(
     )
     if hold_close:
         close_body += "; await asyncio.Event().wait()"
+    if close_stall == "before_marker":
+        close_body += "; time.sleep(30)"
+    # The marker is the last action of close(); a stalled close() must never emit it.
+    close_body += (
+        f"; sys.stderr.buffer.write({_HOST_CLOSED_MARKER!r}); sys.stderr.buffer.flush()"
+    )
+    if close_stall == "after_marker":
+        close_body += "; time.sleep(30)"
     child = (
-        "import asyncio,sys,os,msvcrt,atexit,threading\n"
+        "import asyncio,sys,os,msvcrt,atexit,threading,time\n"
         "os.set_handle_inheritable(int(sys.argv[4]),False)\n"
         "progress=msvcrt.open_osfhandle(int(sys.argv[4]),os.O_WRONLY|os.O_BINARY)\n"
         "import hermes_realtime.host_launcher as h\n"
@@ -539,6 +600,7 @@ async def _assert_external_cli_checkpoint_failure(
     completed = False
     killed = False
     stderr_size: int | None = None
+    host_closed: bool | None = None
     child_events: list[str] | None = None
 
     def mark(event: str) -> None:
@@ -609,6 +671,7 @@ async def _assert_external_cli_checkpoint_failure(
         mark("completion_returned")
         assert stderr is not None
         stderr_size = len(stderr)
+        host_closed = _HOST_CLOSED_MARKER in stderr
         assert process.returncode != 0
         assert process.poll() is not None
         assert await asyncio.to_thread(_read_line, checkpoint_read_fd) == b""
@@ -630,7 +693,9 @@ async def _assert_external_cli_checkpoint_failure(
                             timeout=max(0.0, cleanup_deadline - asyncio.get_running_loop().time()),
                         )
                     else:
-                        cleanup_interruption, stderr_size = await _settle_checkpoint_communication(
+                        (
+                            cleanup_interruption, stderr_size, host_closed,
+                        ) = await _settle_checkpoint_communication(
                             process, communication, deadline=cleanup_deadline,
                         )
                     if process.stderr is not None:
@@ -659,6 +724,7 @@ async def _assert_external_cli_checkpoint_failure(
                 "reaped": process is not None and process.poll() is not None,
                 "exit_code": None if process is None else process.returncode,
                 "stderr_bytes": stderr_size,
+                "host_closed": host_closed,
                 "child_events": child_events,
                 "events_ms": events_ms,
             }))
