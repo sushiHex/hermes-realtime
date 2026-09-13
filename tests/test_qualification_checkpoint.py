@@ -374,15 +374,22 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
     assert observation["reaped"] is True
     assert child.drained_stderr is not None
     assert observation["stderr_bytes"] == len(child.drained_stderr)
-    # close() is parked before its last action, so the marker must never appear.
-    assert observation["host_closed"] is False
     if expect_timeout:
         assert observation["stderr_bytes"] == 17
         assert observation["child_events"] == ["launcher_close_entered"]
+        # close() is parked before its last action, so the marker must never appear.
+        assert observation["host_closed"] is False
     else:
         # Cancellation may win before the child enters close or writes anything.
         assert observation["stderr_bytes"] in {0, 17}
         assert observation["child_events"] in ([], ["launcher_close_entered"])
+        if observation["child_events"]:
+            assert observation["host_closed"] is False
+        else:
+            # Without the entered milestone an absent marker is not a stalled close();
+            # empty stderr is indistinguishable from a child that never reached close().
+            assert "launcher_close_entered" not in observation["child_events"]
+            assert observation["host_closed"] is None
     assert "completion_entered" in observation["events_ms"]
     assert "completion_returned" not in observation["events_ms"]
     assert "cleanup_returned" in observation["events_ms"]
@@ -519,6 +526,22 @@ def _read_checkpoint_child_events(fd: int) -> list[str] | None:
     return [names[value] for value in raw]
 
 
+def _checkpoint_host_closed(
+    marker_seen: bool | None, child_events: list[str] | None,
+) -> bool | None:
+    """Report the marker only once close() is known to have started.
+
+    An absent marker is evidence of a stalled close() only against a close() that
+    actually began; without the entered milestone, empty stderr is indistinguishable
+    from a child killed before it ever reached close().
+    """
+    if marker_seen is None or child_events is None:
+        return None
+    if "launcher_close_entered" not in child_events:
+        return None
+    return marker_seen
+
+
 async def _assert_external_cli_checkpoint_failure(
     failure_case: str,
     tmp_path: Path,
@@ -600,7 +623,7 @@ async def _assert_external_cli_checkpoint_failure(
     completed = False
     killed = False
     stderr_size: int | None = None
-    host_closed: bool | None = None
+    marker_seen: bool | None = None
     child_events: list[str] | None = None
 
     def mark(event: str) -> None:
@@ -671,7 +694,7 @@ async def _assert_external_cli_checkpoint_failure(
         mark("completion_returned")
         assert stderr is not None
         stderr_size = len(stderr)
-        host_closed = _HOST_CLOSED_MARKER in stderr
+        marker_seen = _HOST_CLOSED_MARKER in stderr
         assert process.returncode != 0
         assert process.poll() is not None
         assert await asyncio.to_thread(_read_line, checkpoint_read_fd) == b""
@@ -694,7 +717,7 @@ async def _assert_external_cli_checkpoint_failure(
                         )
                     else:
                         (
-                            cleanup_interruption, stderr_size, host_closed,
+                            cleanup_interruption, stderr_size, marker_seen,
                         ) = await _settle_checkpoint_communication(
                             process, communication, deadline=cleanup_deadline,
                         )
@@ -724,7 +747,7 @@ async def _assert_external_cli_checkpoint_failure(
                 "reaped": process is not None and process.poll() is not None,
                 "exit_code": None if process is None else process.returncode,
                 "stderr_bytes": stderr_size,
-                "host_closed": host_closed,
+                "host_closed": _checkpoint_host_closed(marker_seen, child_events),
                 "child_events": child_events,
                 "events_ms": events_ms,
             }))
