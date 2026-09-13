@@ -5,9 +5,9 @@ boundaries. Use these pages to choose work and understand the implementation:
 
 | Question | Start here |
 | --- | --- |
-| What should we work on next? | [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) and [Milestones](https://github.com/sushiHex/hermes-realtime/milestones); follow the [tracking guide](work-tracking.md) |
+| What should we work on next? | [Unassigned `help wanted` work](work-tracking.md#pick-up-a-contribution), [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues), and [Milestones](https://github.com/sushiHex/hermes-realtime/milestones); follow the [tracking guide](work-tracking.md) |
 | What exists, and what has been verified? | [Implementation status](implementation-status.md): source, tests, defaults, and outstanding qualification |
-| How do I contribute a change? | [Contributing](../CONTRIBUTING.md): setup, public-repository boundaries, and PR expectations |
+| How do I contribute a change? | [Contributing](../CONTRIBUTING.md): setup, the [contribution and test paths](../CONTRIBUTING.md#contribution-and-test-paths), public-repository boundaries, and PR expectations |
 | Which engineering rules apply? | [Development guide](../AGENTS.md): protocol, ownership, cancellation, and change discipline |
 
 ## Implementation guides
