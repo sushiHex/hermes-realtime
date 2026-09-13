@@ -19,8 +19,16 @@ from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Protocol, TypeVar, cast
 
-_MAGIC = b"HRQJ1\x00\r\n"
+_MAGIC = b"HRQJ2\x00\r\n"
 _ZERO_DIGEST = bytes(32)
+_HEAD_COUNT_BYTES = 4
+_HEAD_DIGEST_BYTES = 32
+_HEAD_BODY_BYTES = _HEAD_COUNT_BYTES + _HEAD_DIGEST_BYTES
+_HEAD_SEALED_BYTES = _HEAD_BODY_BYTES + _HEAD_DIGEST_BYTES
+_HEADER_BYTES = 72
+_HEADER_RESERVED = bytes(_HEADER_BYTES - _HEAD_SEALED_BYTES)
+_HEADER_OFFSET = len(_MAGIC)
+_FRAMES_OFFSET = _HEADER_OFFSET + _HEADER_BYTES
 _MAX_FRAME_BYTES = 64 * 1024
 _MAX_PAYLOAD_BYTES = _MAX_FRAME_BYTES - 4 - 32
 _MAX_RECORDS = 2048
@@ -253,6 +261,7 @@ class RunJournalFactsV1:
     """Structural private facts only; never cleanup, recovery, or acceptance authority."""
 
     frame_count: int
+    unconfirmed_frames: int
     byte_count: int
     integrity_complete: bool
     partial_tail: bool
@@ -441,6 +450,30 @@ def _ordinal(value: object) -> int:
     return value
 
 
+def _header_bytes(count: int, digest: bytes) -> bytes:
+    """The committed head: the only frames a reader may apply are those it seals."""
+    _require(type(count) is int and 0 <= count <= _MAX_RECORDS, "journal head count differs")
+    _require(
+        type(digest) is bytes and len(digest) == _HEAD_DIGEST_BYTES, "journal head digest differs"
+    )
+    body = struct.pack(">I", count) + digest
+    return body + hashlib.sha256(body).digest() + _HEADER_RESERVED
+
+
+def _parse_header(raw: bytes) -> tuple[int, bytes] | None:
+    if type(raw) is not bytes or len(raw) != _HEADER_BYTES:
+        return None
+    if raw[_HEAD_SEALED_BYTES:] != _HEADER_RESERVED:
+        return None
+    body = raw[:_HEAD_BODY_BYTES]
+    if raw[_HEAD_BODY_BYTES:_HEAD_SEALED_BYTES] != hashlib.sha256(body).digest():
+        return None
+    count = struct.unpack(">I", body[:_HEAD_COUNT_BYTES])[0]
+    if count > _MAX_RECORDS:
+        return None
+    return count, body[_HEAD_COUNT_BYTES:]
+
+
 def _record(sequence: int, previous: bytes, kind: str, facts: dict[str, Any]) -> bytes:
     value = {
         "facts": facts,
@@ -609,7 +642,14 @@ def _apply(state: _State, record: dict[str, Any], expected_sequence: int) -> Non
 
 
 def _facts(
-    state: _State, count: int, size: int, *, integrity: bool, partial: bool, reason: str | None
+    state: _State,
+    count: int,
+    size: int,
+    *,
+    integrity: bool,
+    partial: bool,
+    reason: str | None,
+    unconfirmed: int = 0,
 ) -> RunJournalFactsV1:
     pending_files = tuple(
         sorted(key for key, row in state.filesystems.items() if row[1] not in {"removed", "absent"})
@@ -619,6 +659,7 @@ def _facts(
     )
     return RunJournalFactsV1(
         count,
+        unconfirmed,
         size,
         integrity,
         partial,
@@ -652,6 +693,32 @@ class _RunJournalWriterV1:
         self._size = size
         self._poisoned = False
 
+    def _durable(
+        self, plan: tuple[tuple[int, bytes], ...], before_size: int, after_size: int
+    ) -> None:
+        try:
+            before = self._io.handle_fact(self._handle)
+            _validate_handle(before, self._io.final_path(self._handle), self._location, before_size)
+            for offset, raw in plan:
+                count = self._io.write(self._handle, offset, raw)
+                if type(count) is not int or count != len(raw):
+                    raise OSError("incomplete")
+                self._io.flush(self._handle)
+            after = self._io.handle_fact(self._handle)
+            _validate_handle(after, self._io.final_path(self._handle), self._location, after_size)
+        except BaseException as error:
+            self._poisoned = True
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RunJournalDurabilityError("journal append is not durable") from None
+
+    def _open_preamble(self) -> None:
+        if self._poisoned:
+            raise RunJournalDurabilityError("journal writer is poisoned")
+        raw = _MAGIC + _header_bytes(0, _ZERO_DIGEST)
+        self._durable(((0, raw),), 0, len(raw))
+        self._size = len(raw)
+
     def _append(self, kind: str, facts: dict[str, Any]) -> int:
         if self._poisoned:
             raise RunJournalDurabilityError("journal writer is poisoned")
@@ -667,28 +734,17 @@ class _RunJournalWriterV1:
         candidate = copy.deepcopy(self._state)
         _apply(candidate, record, sequence)
         frame = _record(sequence, self._digest, kind, facts)
-        raw = (_MAGIC if sequence == 0 else b"") + frame
-        _require(self._size + len(raw) <= _MAX_JOURNAL_BYTES, "journal bytes exceed their bound")
-        try:
-            before = self._io.handle_fact(self._handle)
-            _validate_handle(before, self._io.final_path(self._handle), self._location, self._size)
-            count = self._io.write(self._handle, self._size, raw)
-            if type(count) is not int or count != len(raw):
-                raise OSError("incomplete")
-            self._io.flush(self._handle)
-            after = self._io.handle_fact(self._handle)
-            _validate_handle(
-                after, self._io.final_path(self._handle), self._location, self._size + len(raw)
-            )
-        except BaseException as error:
-            self._poisoned = True
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise
-            raise RunJournalDurabilityError("journal append is not durable") from None
+        _require(self._size + len(frame) <= _MAX_JOURNAL_BYTES, "journal bytes exceed their bound")
+        digest = hashlib.sha256(self._digest + frame[:4] + frame[4:-32]).digest()
+        self._durable(
+            ((self._size, frame), (_HEADER_OFFSET, _header_bytes(sequence + 1, digest))),
+            self._size,
+            self._size + len(frame),
+        )
         self._state = candidate
-        self._digest = hashlib.sha256(self._digest + frame[:4] + frame[4:-32]).digest()
+        self._digest = digest
         self._count += 1
-        self._size += len(raw)
+        self._size += len(frame)
         return sequence
 
     def intend_filesystem(self, intent: FilesystemIntentV1) -> int:
@@ -819,10 +875,33 @@ def _parse(
             state,
             digest,
         )
-    offset = len(_MAGIC)
+    if len(raw) < _FRAMES_OFFSET:
+        return _Parsed(
+            _facts(state, 0, len(raw), integrity=False, partial=True, reason="partial-tail"),
+            state,
+            digest,
+        )
+    head = _parse_header(raw[_HEADER_OFFSET:_FRAMES_OFFSET])
+    if head is None:
+        return _Parsed(
+            _facts(state, 0, len(raw), integrity=False, partial=False, reason="head"),
+            state,
+            digest,
+        )
+    confirmed_count, confirmed_digest = head
+    offset = _FRAMES_OFFSET
     reason: str | None = None
     partial = False
-    while offset < len(raw):
+    sealed = False
+    unconfirmed = 0
+    while True:
+        if count == confirmed_count and not sealed:
+            if digest != confirmed_digest:
+                reason = "head-chain"
+                break
+            sealed = True
+        if offset >= len(raw):
+            break
         if count >= _MAX_RECORDS:
             reason = "record-bound"
             break
@@ -843,21 +922,36 @@ def _parse(
         if observed != expected:
             reason = "digest"
             break
-        try:
-            record = _strict_object(payload)
-            _require(record.get("previousSha256") == digest.hex(), "journal digest chain differs")
-            _apply(state, record, count)
-        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
-            reason = "state"
-            break
+        if sealed:
+            unconfirmed += 1
+        else:
+            try:
+                record = _strict_object(payload)
+                _require(
+                    record.get("previousSha256") == digest.hex(), "journal digest chain differs"
+                )
+                _apply(state, record, count)
+            except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+                reason = "state"
+                break
         digest, count, offset = observed, count + 1, end
-    integrity = reason is None and offset == len(raw) and count > 0
+    if reason is None and not sealed:
+        reason = "head-chain"
+    integrity = reason is None and offset == len(raw) and confirmed_count > 0
     if integrity or state.binding is not None:
         _require(state.binding == binding and state.location == location, "journal binding differs")
     return _Parsed(
-        _facts(state, count, len(raw), integrity=integrity, partial=partial, reason=reason),
+        _facts(
+            state,
+            min(count, confirmed_count),
+            len(raw),
+            integrity=integrity,
+            partial=partial,
+            reason=reason,
+            unconfirmed=unconfirmed,
+        ),
         state,
-        digest,
+        confirmed_digest if sealed else digest,
     )
 
 
@@ -873,6 +967,7 @@ def _create_run_journal(
     fact = io.handle_fact(handle)
     _validate_handle(fact, io.final_path(handle), location, 0)
     writer = _RunJournalWriterV1(handle, io, location, _new_state(), _ZERO_DIGEST, 0, 0)
+    writer._open_preamble()
     writer._append("opened", {"binding": _dict(binding), "location": _dict(location)})
     return writer
 
@@ -891,7 +986,9 @@ def _resume_run_journal(
     io = _journal_io()
     parsed = _parse(handle, binding, location, io)
     _require(
-        parsed.facts.integrity_complete and not parsed.facts.recorded_complete,
+        parsed.facts.integrity_complete
+        and not parsed.facts.recorded_complete
+        and parsed.facts.unconfirmed_frames == 0,
         "journal cannot be resumed",
     )
     return _RunJournalWriterV1(

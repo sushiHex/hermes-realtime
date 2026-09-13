@@ -127,6 +127,7 @@ class _FakeIo:
         self.partial: int | None = None
         self.fail_flush = False
         self.flush_error: BaseException | None = None
+        self.fail_write_offset: int | None = None
         self.grow_on_read = False
         self.read_completed = False
         self.fact_after_read: dict[str, object] = {}
@@ -154,10 +155,13 @@ class _FakeIo:
         return raw
 
     def write(self, handle: int, offset: int, raw: bytes) -> int:
-        assert handle == 41 and offset == len(self.raw)
+        assert handle == 41 and 0 <= offset <= len(self.raw)
+        if self.fail_write_offset is not None and offset == self.fail_write_offset:
+            self.events.append(("write", offset, len(raw), 0))
+            raise OSError("injected write detail")
         count = len(raw) if self.partial is None else self.partial
         self.events.append(("write", offset, len(raw), count))
-        self.raw.extend(raw[:count])
+        self.raw[offset : offset + count] = raw[:count]
         return count
 
     def flush(self, handle: int) -> None:
@@ -193,10 +197,14 @@ def test_journal_records_each_transition_only_after_write_and_flush(
     writer = _new(monkeypatch, io)
     _complete(writer)
 
-    assert [event[0] for event in io.events] == ["write", "flush"] * 10
+    assert [event[0] for event in io.events] == ["write", "flush"] * 21
+    assert [event[1] for event in io.events if event[0] == "write"][2::2] == (
+        [journal._HEADER_OFFSET] * 10
+    )
     facts = journal._inspect_run_journal(41, _binding(), _location())
     assert facts == journal.RunJournalFactsV1(
         frame_count=10,
+        unconfirmed_frames=0,
         byte_count=len(io.raw),
         integrity_complete=True,
         partial_tail=False,
@@ -445,14 +453,15 @@ def test_boolean_schema_version_is_not_an_integer_version(
 ) -> None:
     io = _FakeIo()
     _new(monkeypatch, io)
-    size = struct.unpack(">I", io.raw[len(journal._MAGIC) : len(journal._MAGIC) + 4])[0]
-    start = len(journal._MAGIC) + 4
+    size = struct.unpack(">I", io.raw[journal._FRAMES_OFFSET : journal._FRAMES_OFFSET + 4])[0]
+    start = journal._FRAMES_OFFSET + 4
     record = json.loads(io.raw[start : start + size])
     record["schemaVersion"] = True
     payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
     length = struct.pack(">I", len(payload))
+    digest = hashlib.sha256(bytes(32) + length + payload).digest()
     io.raw = bytearray(
-        journal._MAGIC + length + payload + hashlib.sha256(bytes(32) + length + payload).digest()
+        journal._MAGIC + journal._header_bytes(1, digest) + length + payload + digest
     )
 
     facts = journal._inspect_run_journal(41, _binding(), _location())
@@ -494,6 +503,119 @@ def test_real_windows_borrowed_handle_flushes_and_reopens(tmp_path: Path) -> Non
         handle = msvcrt.get_osfhandle(reopened.fileno())
         facts = journal._inspect_run_journal(handle, _binding(), location)
     assert facts.integrity_complete and facts.recorded_complete
+
+
+def _head(io: _FakeIo) -> tuple[int, bytes]:
+    """The committed head exactly as any later reader of the file sees it."""
+    parsed = journal._parse_header(bytes(io.raw[journal._HEADER_OFFSET : journal._FRAMES_OFFSET]))
+    assert parsed is not None
+    return parsed
+
+
+def test_unflushed_final_record_is_never_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    filesystem = writer.intend_filesystem(_filesystem())
+    writer.bind_filesystem(filesystem, _filesystem_identity())
+    writer.record_filesystem_removed(filesystem, _filesystem_identity())
+    io.fail_flush = True
+    with pytest.raises(journal.RunJournalDurabilityError, match="journal append is not durable"):
+        writer.record_sequence_complete()
+    io.fail_flush = False
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert not facts.recorded_complete
+    assert facts.frame_count == 4
+    assert facts.unconfirmed_frames == 1
+
+
+def test_unflushed_removal_leaves_the_obligation_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    filesystem = writer.intend_filesystem(_filesystem())
+    writer.bind_filesystem(filesystem, _filesystem_identity())
+    io.fail_flush = True
+    with pytest.raises(journal.RunJournalDurabilityError, match="journal append is not durable"):
+        writer.record_filesystem_removed(filesystem, _filesystem_identity())
+    io.fail_flush = False
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert facts.pending_filesystems == (filesystem,)
+    assert facts.unconfirmed_frames == 1
+
+
+def test_truncation_to_a_frame_boundary_below_the_head_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    filesystem = writer.intend_filesystem(_filesystem())
+    writer.bind_filesystem(filesystem, _filesystem_identity())
+    boundary = len(io.raw)
+    writer.record_filesystem_removed(filesystem, _filesystem_identity())
+    writer.record_sequence_complete()
+    del io.raw[boundary:]
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert not facts.integrity_complete
+    assert not facts.recorded_complete
+    assert facts.reason == "head-chain"
+    with pytest.raises(ValueError, match="journal cannot be resumed"):
+        journal._resume_run_journal(41, _binding(), _location())
+
+
+def test_forged_frame_beyond_the_head_is_unconfirmed_and_unapplied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    filesystem = writer.intend_filesystem(_filesystem())
+    confirmed = journal._inspect_run_journal(41, _binding(), _location())
+    count, digest = _head(io)
+    io.raw.extend(journal._record(count, digest, "filesystem_absent", {"ordinal": filesystem}))
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert facts.unconfirmed_frames == 1
+    assert facts.frame_count == confirmed.frame_count == count
+    assert facts.pending_filesystems == confirmed.pending_filesystems == (filesystem,)
+    with pytest.raises(ValueError, match="journal cannot be resumed"):
+        journal._resume_run_journal(41, _binding(), _location())
+
+
+@pytest.mark.parametrize("offset", [0, 4, 36, 68])
+def test_any_flipped_head_byte_refuses_the_journal(
+    monkeypatch: pytest.MonkeyPatch, offset: int
+) -> None:
+    io = _FakeIo()
+    _new(monkeypatch, io)
+    io.raw[journal._HEADER_OFFSET + offset] ^= 1
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert not facts.integrity_complete
+    assert not facts.recorded_complete
+    assert facts.reason == "head"
+
+
+def test_failed_head_update_after_a_flushed_frame_leaves_it_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    confirmed = journal._inspect_run_journal(41, _binding(), _location())
+    io.fail_write_offset = journal._HEADER_OFFSET
+
+    with pytest.raises(journal.RunJournalDurabilityError, match="journal append is not durable"):
+        writer.intend_filesystem(_filesystem())
+    with pytest.raises(journal.RunJournalDurabilityError, match="journal writer is poisoned"):
+        writer.intend_process(_process())
+    io.fail_write_offset = None
+
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert facts.frame_count == confirmed.frame_count == 1
+    assert facts.unconfirmed_frames == 1
+    assert not facts.recorded_complete
+    with pytest.raises(ValueError, match="journal cannot be resumed"):
+        journal._resume_run_journal(41, _binding(), _location())
 
 
 def test_supplied_location_facts_never_gain_cleanup_or_acceptance_methods() -> None:
