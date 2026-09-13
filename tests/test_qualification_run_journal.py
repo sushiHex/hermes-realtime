@@ -402,8 +402,11 @@ def test_binding_and_handle_identity_drift_refuse(monkeypatch: pytest.MonkeyPatc
     io = _FakeIo()
     _new(monkeypatch, io)
 
-    with pytest.raises(ValueError, match="journal binding differs"):
-        journal._inspect_run_journal(41, replace(_binding(), candidate_tree="9" * 40), _location())
+    drifted = journal._inspect_run_journal(
+        41, replace(_binding(), candidate_tree="9" * 40), _location()
+    )
+    assert not drifted.integrity_complete
+    assert drifted.reason == "head-chain"
     io.fact = replace(io.fact, file_id=99)
     with pytest.raises(ValueError, match="journal handle identity differs"):
         journal._inspect_run_journal(41, _binding(), _location())
@@ -459,7 +462,7 @@ def test_boolean_schema_version_is_not_an_integer_version(
     record["schemaVersion"] = True
     payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
     length = struct.pack(">I", len(payload))
-    digest = hashlib.sha256(bytes(32) + length + payload).digest()
+    digest = hashlib.sha256(journal._genesis(_binding(), _location()) + length + payload).digest()
     io.raw = bytearray(
         journal._MAGIC + journal._header_bytes(1, digest) + length + payload + digest
     )
@@ -580,6 +583,28 @@ def test_forged_frame_beyond_the_head_is_unconfirmed_and_unapplied(
     assert facts.pending_filesystems == confirmed.pending_filesystems == (filesystem,)
     with pytest.raises(ValueError, match="journal cannot be resumed"):
         journal._resume_run_journal(41, _binding(), _location())
+
+
+def test_a_journal_replayed_into_another_location_fails_the_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    _complete(writer)
+    foreign = bytes(io.raw)
+
+    other = replace(_location(), journal_file_id=31, parent_file_id=32, marker_file_id=33)
+    copied = _FakeIo(foreign)
+    copied.fact = replace(copied.fact, file_id=other.journal_file_id)
+    monkeypatch.setattr(journal, "_journal_io", lambda: copied)
+
+    facts = journal._inspect_run_journal(41, _binding(), other)
+    assert not facts.integrity_complete
+    assert not facts.recorded_complete
+    assert facts.reason == "head-chain"
+    assert facts.frame_count == 0
+    with pytest.raises(ValueError, match="journal cannot be resumed"):
+        journal._resume_run_journal(41, _binding(), other)
 
 
 @pytest.mark.parametrize("offset", [0, 4, 36, 68])

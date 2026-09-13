@@ -514,10 +514,12 @@ Frames bind canonical JSON, sequence and prior digest, with limits of 64 KiB per
 frame, 2,048 frames and 8 MiB in total. A fixed committed head after the magic
 seals the confirmed frame count and chain digest; it is rewritten and flushed
 only once the frame it confirms is durable, and frames beyond it read as
-unconfirmed and are never applied. That head is what detects a torn write,
-truncation to a frame boundary and an appended forged frame, against any party
-that cannot rewrite it consistently; a writer inside the access-controlled
-private recovery root is outside that model. Inspection refuses to treat a torn,
+unconfirmed and are never applied. The chain is seeded from the journal's own run
+binding and recovery location, so another journal's bytes never chain in this
+file. That head is what detects a torn write, truncation to a frame boundary and
+an appended forged frame, against any party that cannot rewrite it consistently;
+a writer inside the access-controlled private recovery root is outside that
+model. Inspection refuses to treat a torn,
 corrupt, changing or unfinished sequence as recorded complete.
 
 Journal facts are private observations, including paths and process identities.

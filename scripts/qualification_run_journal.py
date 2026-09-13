@@ -19,8 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Protocol, TypeVar, cast
 
-_MAGIC = b"HRQJ2\x00\r\n"
-_ZERO_DIGEST = bytes(32)
+_MAGIC = b"HRQJ3\x00\r\n"
+_GENESIS_TAG = b"hermes-realtime/run-journal/genesis/1\x00"
 _HEAD_COUNT_BYTES = 4
 _HEAD_DIGEST_BYTES = 32
 _HEAD_BODY_BYTES = _HEAD_COUNT_BYTES + _HEAD_DIGEST_BYTES
@@ -478,6 +478,15 @@ def _ordinal(value: object) -> int:
     return value
 
 
+def _genesis(binding: RunJournalBindingV1, location: RecoveryLocationFactsV1) -> bytes:
+    """Seed the chain from this journal's own facts, so foreign bytes never chain here."""
+    value = {"binding": _dict(binding), "location": _dict(location)}
+    raw = json.dumps(
+        value, allow_nan=False, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(_GENESIS_TAG + raw).digest()
+
+
 def _header_bytes(count: int, digest: bytes) -> bytes:
     """The committed head: the only frames a reader may apply are those it seals."""
     _require(type(count) is int and 0 <= count <= _MAX_RECORDS, "journal head count differs")
@@ -743,7 +752,8 @@ class _RunJournalWriterV1:
     def _open_preamble(self) -> None:
         if self._poisoned:
             raise RunJournalDurabilityError("journal writer is poisoned")
-        raw = _MAGIC + _header_bytes(0, _ZERO_DIGEST)
+        _require(self._count == 0 and self._size == 0, "journal preamble differs")
+        raw = _MAGIC + _header_bytes(0, self._digest)
         self._durable(((0, raw),), 0, len(raw))
         self._size = len(raw)
 
@@ -847,12 +857,13 @@ def _parse(
 ) -> _Parsed:
     before = io.handle_fact(handle)
     _validate_handle(before, io.final_path(handle), location, before.size)
+    genesis = _genesis(binding, location)
     if before.size > _MAX_JOURNAL_BYTES:
         state = _new_state()
         return _Parsed(
             _facts(state, 0, before.size, integrity=False, partial=False, reason="size-bound"),
             state,
-            _ZERO_DIGEST,
+            genesis,
         )
     try:
         raw = io.read(handle, _MAX_JOURNAL_BYTES)
@@ -863,7 +874,7 @@ def _parse(
         return _Parsed(
             _facts(state, 0, before.size, integrity=False, partial=False, reason="read"),
             state,
-            _ZERO_DIGEST,
+            genesis,
         )
     try:
         _validate_handle(after, after_path, location, before.size)
@@ -887,9 +898,9 @@ def _parse(
                 reason="changed-while-read",
             ),
             state,
-            _ZERO_DIGEST,
+            genesis,
         )
-    state, digest, count, offset = _new_state(), _ZERO_DIGEST, 0, 0
+    state, digest, count, offset = _new_state(), genesis, 0, 0
     if not raw.startswith(_MAGIC):
         return _Parsed(
             _facts(
@@ -948,7 +959,7 @@ def _parse(
         observed = raw[offset + 4 + size : end]
         expected = hashlib.sha256(digest + raw[offset : offset + 4] + payload).digest()
         if observed != expected:
-            reason = "digest"
+            reason = "head-chain" if count == 0 else "digest"
             break
         if sealed:
             unconfirmed += 1
@@ -994,7 +1005,9 @@ def _create_run_journal(
     io = _journal_io()
     fact = io.handle_fact(handle)
     _validate_handle(fact, io.final_path(handle), location, 0)
-    writer = _RunJournalWriterV1(handle, io, location, _new_state(), _ZERO_DIGEST, 0, 0)
+    writer = _RunJournalWriterV1(
+        handle, io, location, _new_state(), _genesis(binding, location), 0, 0
+    )
     writer._open_preamble()
     writer._append("opened", {"binding": _dict(binding), "location": _dict(location)})
     return writer
