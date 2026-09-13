@@ -2977,10 +2977,6 @@ class _CtypesWindowsKernelV1:
         finally:
             api.DeleteProcThreadAttributeList(ctypes.byref(attributes))
 
-    def assign_process_to_job(self, job: int, process: int) -> None:
-        if not self._api().AssignProcessToJobObject(ctypes.c_void_p(job), ctypes.c_void_p(process)):
-            raise ctypes.WinError(ctypes.get_last_error())
-
     def resume_thread(self, thread: int) -> None:
         previous = self._api().ResumeThread(ctypes.c_void_p(thread))
         if previous == 0xFFFFFFFF:

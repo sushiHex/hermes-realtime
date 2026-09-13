@@ -690,11 +690,6 @@ class _FakeWindowsKernel:
             return self.launch_value
         return self.runner._WindowsKernelLaunchV1(42, 201, 202)
 
-    def assign_process_to_job(self, job: int, process: int) -> None:
-        self.events.append(("assign", job, process))
-        if "assign" in self.fail:
-            raise OSError("assign")
-
     def resume_thread(self, thread: int) -> None:
         self.events.append(("resume", thread))
         if "resume" in self.fail:
@@ -1096,6 +1091,12 @@ def test_ctypes_windows_api_configures_all_used_prototypes() -> None:
     assert api.OpenProcess.restype is ctypes.c_void_p
     for name in names:
         assert getattr(api, name).argtypes is not None
+
+
+def test_windows_kernel_surface_has_no_post_creation_job_assignment() -> None:
+    runner = _load_runner()
+
+    assert not hasattr(runner._CtypesWindowsKernelV1, "assign_process_to_job")
 
 
 def test_ctypes_windows_kernel_is_import_safe_and_fails_closed_off_windows() -> None:

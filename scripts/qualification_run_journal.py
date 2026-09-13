@@ -63,9 +63,12 @@ def _path(value: object) -> str:
     path = PureWindowsPath(result)
     _require(
         path.is_absolute()
-        and not result.startswith("\\\\")
+        and not result.startswith("//")
+        and result.count(":") == 1
+        and result[1] == ":"
         and ".." not in path.parts
-        and path.as_posix() == result,
+        and path.as_posix() == result
+        and all(part == part.rstrip(". ") for part in result.split("/")[1:]),
         "journal path fact differs",
     )
     return result
@@ -74,14 +77,25 @@ def _path(value: object) -> str:
 def _relative(value: str) -> str:
     _require(type(value) is str and 1 <= len(value) <= 512, "journal artifact fact differs")
     path = PurePosixPath(value)
+    windows = PureWindowsPath(value)
     _require(
         not path.is_absolute()
         and path.as_posix() == value
         and value not in {".", ".."}
         and ".." not in path.parts
-        and "\\" not in value,
+        and "\\" not in value
+        and not windows.is_absolute()
+        and not windows.drive
+        and not windows.root,
         "journal artifact fact differs",
     )
+    for part in path.parts:
+        _require(
+            ":" not in part
+            and part == part.rstrip(". ")
+            and not PureWindowsPath(part).is_reserved(),
+            "journal artifact fact differs",
+        )
     return value
 
 
@@ -133,7 +147,9 @@ class RecoveryLocationFactsV1:
         for value in (self.journal_file_id, self.parent_file_id, self.marker_file_id):
             _exact_int(value, positive=True)
         _require(
-            self.marker_file_id != self.journal_file_id,
+            self.marker_file_id != self.journal_file_id
+            and self.marker_file_id != self.parent_file_id
+            and self.journal_file_id != self.parent_file_id,
             "journal recovery location differs",
         )
         _require(
@@ -201,7 +217,12 @@ class FilesystemIdentityV1:
         _exact_int(self.volume_serial, positive=True, maximum=2**32 - 1)
         for value in (self.file_id, self.parent_file_id, self.marker_file_id):
             _exact_int(value, positive=True)
-        _require(self.marker_file_id != self.file_id, "filesystem identity differs")
+        _require(
+            self.marker_file_id != self.file_id
+            and self.marker_file_id != self.parent_file_id
+            and self.file_id != self.parent_file_id,
+            "filesystem identity differs",
+        )
         _require(
             type(self.marker_sha256) is str
             and _SHA256.fullmatch(self.marker_sha256) is not None
@@ -334,6 +355,10 @@ def _dict(value: _Fact) -> dict[str, Any]:
     return asdict(value)
 
 
+def _refuse_constant(value: str) -> Any:
+    raise ValueError("journal record constant differs")
+
+
 def _strict_object(raw: bytes) -> dict[str, Any]:
     def pairs(rows: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -343,10 +368,13 @@ def _strict_object(raw: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
-    value = json.loads(raw, object_pairs_hook=pairs)
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=_refuse_constant)
     _require(type(value) is dict, "journal record differs")
     _require(
-        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode() == raw,
+        json.dumps(
+            value, allow_nan=False, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode()
+        == raw,
         "journal record is noncanonical",
     )
     return cast(dict[str, Any], value)

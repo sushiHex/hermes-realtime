@@ -618,6 +618,69 @@ def test_failed_head_update_after_a_flushed_frame_leaves_it_unconfirmed(
         journal._resume_run_journal(41, _binding(), _location())
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:/abs",
+        "logs/out.txt:hidden-stream",
+        "CON",
+        "NUL",
+        "COM1",
+        "trailing.",
+        "trailing ",
+    ],
+)
+def test_relative_artifact_names_refuse_windows_escapes(value: str) -> None:
+    with pytest.raises(ValueError, match="journal artifact fact differs"):
+        journal._relative(value)
+
+
+def test_relative_artifact_names_still_accept_an_ordinary_subpath() -> None:
+    assert journal._relative("sub/dir/file") == "sub/dir/file"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "//server/share/x",
+        "//?/C:/x",
+        "//./C:/x",
+        "C:/private/run.journal.",
+        "C:/private/run.journal ",
+        "C:/private/run.journal:marker",
+    ],
+)
+def test_absolute_paths_refuse_unc_device_and_stream_spellings(value: str) -> None:
+    with pytest.raises(ValueError, match="journal path fact differs"):
+        journal._path(value)
+
+
+def test_absolute_paths_still_accept_the_owned_journal_spelling() -> None:
+    assert journal._path("C:/private/run.journal") == "C:/private/run.journal"
+
+
+@pytest.mark.parametrize("field", ["marker_file_id", "journal_file_id"])
+def test_recovery_location_refuses_parent_hardlink_identity(field: str) -> None:
+    location = _location()
+
+    with pytest.raises(ValueError, match="journal recovery location differs"):
+        replace(location, **{field: location.parent_file_id})
+
+
+@pytest.mark.parametrize("field", ["marker_file_id", "file_id"])
+def test_filesystem_identity_refuses_parent_hardlink_identity(field: str) -> None:
+    identity = _filesystem_identity()
+
+    with pytest.raises(ValueError, match="filesystem identity differs"):
+        replace(identity, **{field: identity.parent_file_id})
+
+
+@pytest.mark.parametrize("raw", [b'{"a":NaN}', b'{"a":Infinity}', b'{"a":-Infinity}'])
+def test_strict_object_refuses_nonfinite_json_constants(raw: bytes) -> None:
+    with pytest.raises(ValueError, match="journal record constant differs"):
+        journal._strict_object(raw)
+
+
 def test_supplied_location_facts_never_gain_cleanup_or_acceptance_methods() -> None:
     location = _location()
     facts_type = journal.RunJournalFactsV1
