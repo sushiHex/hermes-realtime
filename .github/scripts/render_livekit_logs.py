@@ -8,9 +8,11 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
-_DEFAULT_MAX_BYTES = 65_536
+_DEFAULT_MAX_BYTES = 4_194_304
 _DEFAULT_MAX_LINES = 200
 _DEFAULT_MAX_LINE_CHARS = 1_000
+_ZAP_LEVELS = frozenset({"DEBUG", "INFO", "WARN", "ERROR", "DPANIC", "PANIC", "FATAL"})
+_LOW_SEVERITY_LEVELS = frozenset({"DEBUG", "INFO"})
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 _SAFE_LOOPBACK_PATHS = {"", "/", "/rtc/v1", "/rtc/v1/validate"}
 _URL = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
@@ -91,7 +93,47 @@ def _sanitize_line(value: str) -> str:
             return json.dumps(_sanitize_json(json.loads(printable)), separators=(",", ":"))
         except (json.JSONDecodeError, RecursionError):
             pass
+    else:
+        fields = printable.split("\t")
+        if len(fields) >= 2 and fields[-1].startswith(("{", "[")):
+            try:
+                payload = json.loads(fields[-1])
+            except (json.JSONDecodeError, RecursionError):
+                pass
+            else:
+                sanitized = json.dumps(_sanitize_json(payload), separators=(",", ":"))
+                return _sanitize_text("\t".join(fields[:-1]) + "\t") + sanitized
     return _sanitize_text(printable)
+
+
+def _line_level(value: str) -> str:
+    """Return the zap severity of a console-encoded line, defaulting to INFO."""
+
+    fields = value.split("\t")
+    if len(fields) < 2:
+        return "INFO"
+    candidate = fields[1].strip().upper()
+    return candidate if candidate in _ZAP_LEVELS else "INFO"
+
+
+def _select_ranked_lines(lines: list[str], max_lines: int) -> list[str]:
+    """Keep the newest severe lines, then the most recent remainder, in original order."""
+
+    selected: set[int] = set()
+    for index in range(len(lines) - 1, -1, -1):
+        if len(selected) >= max_lines:
+            break
+        if _line_level(lines[index]) not in _LOW_SEVERITY_LEVELS:
+            selected.add(index)
+    remaining = max_lines - len(selected)
+    for index in range(len(lines) - 1, -1, -1):
+        if remaining <= 0:
+            break
+        if index in selected:
+            continue
+        selected.add(index)
+        remaining -= 1
+    return [line for index, line in enumerate(lines) if index in selected]
 
 
 def _bound_line(value: str, maximum: int) -> str:
@@ -133,7 +175,7 @@ def render_log(
     lines = payload.decode("utf-8", errors="replace").splitlines()
     if size > max_bytes:
         lines = lines[1:]
-    lines = lines[-max_lines:]
+    lines = _select_ranked_lines(lines, max_lines)
     rendered: list[str] = []
     if size > max_bytes:
         marker = f"[input truncated to final {max_bytes} bytes]"
