@@ -67,7 +67,7 @@ qualification-hermes = [
   "cryptography==48.0.1",
   "python-dotenv==1.2.2",
   "pyyaml==6.0.3",
-  "rich==14.3.3",
+  "rich==15.0.0",
 ]
 dev = [
   "cryptography>=50,<51",
