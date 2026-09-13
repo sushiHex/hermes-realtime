@@ -599,9 +599,10 @@ select another group.
 
 The Hermes group's pins are owned by the qualified upstream commit, not by this
 project and not by upstream's moving branch. They change only when that commit
-pin changes, and they are synced deliberately;
-`UPSTREAM_HERMES_CRYPTOGRAPHY` in `tests/test_qualification_candidate_files.py`
-records the mirrored `cryptography` version and why it is that version.
+pin changes, and they are synced deliberately; `QUALIFIED_HERMES` in
+`tests/test_qualification_candidate_files.py` records the admitted commit and the
+`cryptography` version read from it as a single pair, so the version cannot
+outlive the revision it describes.
 Dependabot ignores the other four roots so a bot never moves them, and
 deliberately does not ignore `cryptography`: an ignore cannot be scoped to one
 dependency group and would silence the development group's security updates, so
