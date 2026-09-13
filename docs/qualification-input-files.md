@@ -597,10 +597,20 @@ Hermes PluginManager purpose. Ordinary runtime, local-provider, Linux and build
 dependency selections retain their own policies; callers cannot add roots or
 select another group.
 
-The Hermes and development groups are
+The Hermes group's pins are owned by the qualified upstream commit, not by this
+project and not by upstream's moving branch. They change only when that commit
+pin changes, and they are synced deliberately; `QUALIFIED_HERMES` in
+`tests/test_qualification_candidate_files.py` records the admitted commit and the
+`cryptography` version read from it as a single pair, so the version cannot
+outlive the revision it describes.
+Dependabot ignores the other four roots so a bot never moves them, and
+deliberately does not ignore `cryptography`: an ignore cannot be scoped to one
+dependency group and would silence the development group's security updates, so
+a bot bump of the mirror pin is left to fail that test visibly instead. The
+Hermes and development groups stay
 [explicitly mutually exclusive](https://docs.astral.sh/uv/concepts/projects/config/#conflicting-dependencies)
-in the shared lockfile: the pinned upstream requires a different `cryptography`
-version from development. Export the Hermes recipe with default groups disabled
+in the shared lockfile so that development keeps its own version policy whether or
+not the two currently coincide. Export the Hermes recipe with default groups disabled
 and `qualification-hermes` selected. This preserves the ordinary development
 selection while keeping the upstream compatibility environment reproducible.
 

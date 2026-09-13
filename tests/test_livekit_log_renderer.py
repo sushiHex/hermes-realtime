@@ -1,6 +1,30 @@
 import json
+import re
 from pathlib import Path
 from runpy import run_path
+
+_ZAP_ROOM_UPDATE_LINE = "\t".join(
+    (
+        "2026-09-13T01:38:44.870Z",
+        "DEBUG",
+        "livekit",
+        "service/rtcservice.go:537",
+        "sending room update",
+        '{"connID": "CO_x", "roomUpdate": {"room": {"sid": "RM_abcdefghijkl", '
+        '"name": "browser-acceptance-deadbeef00"}}}',
+    )
+)
+_ZAP_BRACE_MESSAGE_LINE = "\t".join(
+    (
+        "2026-09-13T01:38:45.001Z",
+        "DEBUG",
+        "livekit",
+        "service/rtcservice.go:612",
+        "failed {phase} for participant",
+        '{"room": {"sid": "RM_abcdefghijkl", "name": "browser-acceptance-deadbeef00"}, '
+        '"participant": "browser_521adaa098e88a55"}',
+    )
+)
 
 
 def _renderer() -> dict[str, object]:
@@ -128,6 +152,7 @@ def test_livekit_log_renderer_redacts_authority_credentials_and_identifiers(
 def test_livekit_log_sanitization_is_idempotent_for_existing_probe_corpus() -> None:
     renderer = _renderer()
     sanitize_text = renderer["_sanitize_text"]
+    sanitize_line = renderer["_sanitize_line"]
     short_credential = "-".join(("short", "credential"))
     jwt = ".".join(("headerpart", "payloadpart", "signaturepart"))
     probes = (
@@ -148,11 +173,15 @@ def test_livekit_log_sanitization_is_idempotent_for_existing_probe_corpus() -> N
         "endpoint=http://127.0.0.1:99999/rtc/v1?access_token=value",
         "endpoint=http://127.0.0.1:7880/rooms/private-room",
         "ordinary diagnostic line",
+        _ZAP_ROOM_UPDATE_LINE,
+        _ZAP_BRACE_MESSAGE_LINE,
     )
 
     for line in probes:
         sanitized = sanitize_text(line)
         assert sanitize_text(sanitized) == sanitized
+        rendered = sanitize_line(line)
+        assert sanitize_line(rendered) == rendered
 
 
 def test_livekit_log_renderer_emits_only_a_bounded_tail(tmp_path: Path) -> None:
@@ -211,6 +240,98 @@ def test_livekit_log_renderer_handles_missing_and_invalid_bytes(tmp_path: Path) 
     path_rendered = render_log(private_path)
     assert "private-room" not in path_rendered
     assert "/[REDACTED]" in path_rendered
+
+
+def test_zap_json_suffix_redacts_nested_sensitive_object(tmp_path: Path) -> None:
+    renderer = _renderer()
+    render_log = renderer["render_log"]
+    path = tmp_path / "zap.err"
+    path.write_text(_ZAP_ROOM_UPDATE_LINE + "\n", encoding="utf-8")
+
+    rendered = render_log(path)
+
+    assert rendered.startswith("2026-09-13T01:38:44.870Z\tDEBUG\t")
+    assert '"room":"[REDACTED]"' in rendered
+    assert "browser-acceptance" not in rendered
+    assert '[REDACTED] "[REDACTED]"' not in rendered
+
+
+def test_zap_json_suffix_is_parsed_at_the_tab_boundary_not_the_first_brace(
+    tmp_path: Path,
+) -> None:
+    renderer = _renderer()
+    render_log = renderer["render_log"]
+    path = tmp_path / "brace.err"
+    path.write_text(_ZAP_BRACE_MESSAGE_LINE + "\n", encoding="utf-8")
+
+    rendered = render_log(path)
+
+    assert '"room":"[REDACTED]"' in rendered
+    assert "browser-acceptance" not in rendered
+    assert "browser_521adaa098e88a55" not in rendered
+    assert "failed {phase} for participant" in rendered
+
+
+def test_bounded_tail_keeps_early_warnings_over_late_debug(tmp_path: Path) -> None:
+    renderer = _renderer()
+    render_log = renderer["render_log"]
+    warn_line = "\t".join(
+        (
+            "2026-09-13T01:00:00.000Z",
+            "WARN",
+            "livekit",
+            "service/rtcservice.go:101",
+            "warn-canary-early",
+        )
+    )
+    debug_lines = [
+        "\t".join(
+            (
+                "2026-09-13T01:00:01.000Z",
+                "DEBUG",
+                "livekit",
+                "service/rtcservice.go:537",
+                f"teardown-flood-{index:05d}",
+            )
+        )
+        for index in range(5_000)
+    ]
+    path = tmp_path / "flood.err"
+    path.write_text("\n".join([warn_line, *debug_lines]), encoding="utf-8")
+
+    rendered = render_log(path, max_lines=50)
+
+    content = [line for line in rendered.splitlines() if not line.startswith("[input truncated")]
+    assert "warn-canary-early" in rendered
+    assert len(content) <= 50
+    present = sorted(int(match) for match in re.findall(r"teardown-flood-(\d{5})", rendered))
+    assert present == list(range(4_951, 5_000))
+
+
+def test_bounded_tail_keeps_newest_severe_lines_when_they_exceed_budget(
+    tmp_path: Path,
+) -> None:
+    renderer = _renderer()
+    render_log = renderer["render_log"]
+    warn_lines = [
+        "\t".join(
+            (
+                "2026-09-13T01:00:00.000Z",
+                "WARN",
+                "livekit",
+                "service/rtcservice.go:101",
+                f"warn-burst-{index:05d}",
+            )
+        )
+        for index in range(300)
+    ]
+    path = tmp_path / "warnings.err"
+    path.write_text("\n".join(warn_lines), encoding="utf-8")
+
+    rendered = render_log(path, max_lines=50)
+
+    present = [int(match) for match in re.findall(r"warn-burst-(\d{5})", rendered)]
+    assert present == list(range(250, 300))
 
 
 def test_livekit_log_renderer_honors_tiny_line_bounds(tmp_path: Path) -> None:
