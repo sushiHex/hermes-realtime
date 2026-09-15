@@ -333,75 +333,82 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
                     ],
                 )
                 page = await browser.new_page()
-                def record_console_error(message: object) -> None:
-                    if message.type != "error":
-                        return
-                    location = message.location
-                    url = location["url"]
-                    # Chrome requests the absent favicon; deterministic composition has no catalog.
-                    if url.endswith("/favicon.ico") or url.endswith("/api/v1/models"):
-                        return
-                    console_errors.append(f"{message.text} @ {url}")
+                try:
+                    def record_console_error(message: object) -> None:
+                        if message.type != "error":
+                            return
+                        location = message.location
+                        url = location["url"]
+                        # Chrome requests the absent favicon; deterministic composition
+                        # has no catalog.
+                        if url.endswith("/favicon.ico") or url.endswith("/api/v1/models"):
+                            return
+                        console_errors.append(f"{message.text} @ {url}")
 
-                page.on("console", record_console_error)
-                page.on("pageerror", lambda error: console_errors.append(str(error)))
-                launch_origin, launch_fragment = urldefrag(running.url)
-                assert launch_fragment
-                navigated = asyncio.get_running_loop().create_future()
+                    page.on("console", record_console_error)
+                    page.on("pageerror", lambda error: console_errors.append(str(error)))
+                    launch_origin, launch_fragment = urldefrag(running.url)
+                    assert launch_fragment
+                    navigated = asyncio.get_running_loop().create_future()
 
-                def record_navigation(frame: object) -> None:
-                    if (
-                        not navigated.done()
-                        and frame == page.main_frame
-                        and frame.url.startswith(launch_origin)
-                    ):
-                        navigated.set_result(None)
+                    def record_navigation(frame: object) -> None:
+                        if (
+                            not navigated.done()
+                            and frame == page.main_frame
+                            and frame.url.startswith(launch_origin)
+                        ):
+                            navigated.set_result(None)
 
-                page.on("framenavigated", record_navigation)
-                await page.evaluate(
-                    "([origin, fragment]) => {"
-                    " setTimeout(() => window.location.replace(`${origin}#${fragment}`), 0);"
-                    "}",
-                    [launch_origin, launch_fragment],
-                )
-                await asyncio.wait_for(navigated, timeout=30)
-                await page.wait_for_load_state("networkidle")
-                await page.get_by_role("button", name="Connect").click()
-                await expect(page.locator("#typed-input")).to_be_enabled(timeout=30_000)
-                await page.locator("#typed-input").fill("browser deterministic typed turn")
-                await page.get_by_role("button", name="Send message").click()
-                await page.get_by_role("listitem").filter(
-                    has_text="Browser qualification response."
-                ).wait_for(timeout=30_000)
-                remote_audio = page.locator("#remote-audio")
-                async with asyncio.timeout(30):
-                    while await remote_audio.evaluate("element => element.currentTime") <= 0:
-                        await asyncio.sleep(0.1)
-                assert console_errors == []
-                await page.get_by_role("button", name="Stop session").click()
-                await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
-                assert await remote_audio.evaluate("element => element.srcObject === null")
+                    page.on("framenavigated", record_navigation)
+                    await page.evaluate(
+                        "([origin, fragment]) => {"
+                        " setTimeout(() => window.location.replace(`${origin}#${fragment}`), 0);"
+                        "}",
+                        [launch_origin, launch_fragment],
+                    )
+                    await asyncio.wait_for(navigated, timeout=30)
+                    await page.wait_for_load_state("networkidle")
+                    await page.get_by_role("button", name="Connect").click()
+                    await expect(page.locator("#typed-input")).to_be_enabled(timeout=30_000)
+                    await page.locator("#typed-input").fill("browser deterministic typed turn")
+                    await page.get_by_role("button", name="Send message").click()
+                    await page.get_by_role("listitem").filter(
+                        has_text="Browser qualification response."
+                    ).wait_for(timeout=30_000)
+                    remote_audio = page.locator("#remote-audio")
+                    async with asyncio.timeout(30):
+                        while await remote_audio.evaluate("element => element.currentTime") <= 0:
+                            await asyncio.sleep(0.1)
+                    assert console_errors == []
+                    await page.get_by_role("button", name="Stop session").click()
+                    await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
+                    assert await remote_audio.evaluate("element => element.srcObject === null")
+                finally:
+                    # The page already records why readiness stalled; read it here, while
+                    # the Playwright context is still open. Stopping the driver closes every
+                    # page, so an outer finally can only ever observe a dead page. Never let
+                    # this reporting mask the original failure.
+                    observed_markers: tuple[str, ...] | None = None
+                    typed_input_enabled: bool | None = None
+                    if page is not None:
+                        try:
+                            observed_markers = tuple(
+                                await page.locator("#markers li").all_text_contents()
+                            )
+                        except Exception:
+                            observed_markers = None
+                        try:
+                            typed_input_enabled = await page.locator("#typed-input").is_enabled()
+                        except Exception:
+                            typed_input_enabled = None
+                    print(
+                        _browser_observation(
+                            observed_markers,
+                            console_errors=len(console_errors),
+                            typed_input_enabled=typed_input_enabled,
+                        )
+                    )
         finally:
-            # The page already records why readiness stalled; read it before teardown
-            # discards it, and never let this reporting mask the original failure.
-            observed_markers: tuple[str, ...] | None = None
-            typed_input_enabled: bool | None = None
-            if page is not None:
-                try:
-                    observed_markers = tuple(await page.locator("#markers li").all_text_contents())
-                except Exception:
-                    observed_markers = None
-                try:
-                    typed_input_enabled = await page.locator("#typed-input").is_enabled()
-                except Exception:
-                    typed_input_enabled = None
-            print(
-                _browser_observation(
-                    observed_markers,
-                    console_errors=len(console_errors),
-                    typed_input_enabled=typed_input_enabled,
-                )
-            )
             await _close_browser(browser)
             if running is not None:
                 await composition.close_host(running)
