@@ -74,6 +74,39 @@ def test_browser_observation_refuses_unexpected_marker_shapes() -> None:
     assert payload["typed_input_enabled"] is False
 
 
+def test_browser_observation_accepts_server_monotonic_markers() -> None:
+    # `addObjectiveMarker` renders `${event.kind}: server monotonic NNN.N ms`, and
+    # `event.kind` is closed by the parse boundary's allowlist, so this shape carries
+    # no more content than the elapsed-millisecond one.
+    observed = (
+        "typed_input_admitted: server monotonic 1234.5 ms",
+        "first_playable_audio: server monotonic 0.0 ms",
+        "transcript_to_first_token: 41.2 ms",
+    )
+
+    payload = _payload(
+        _browser_observation(observed, console_errors=0, typed_input_enabled=False)
+    )
+
+    assert payload["markers"] == list(observed)
+    assert payload["markers_dropped"] == 0
+
+
+def test_browser_observation_refuses_server_monotonic_lookalikes() -> None:
+    lookalikes = (
+        "room: server monotonic http://example.invalid/x 1.0 ms",
+        "name: server monotonic abc ms",
+        "kind: server monotonic 1.0 ms trailing",
+        "spaced kind: server monotonic 1.0 ms",
+    )
+
+    line = _browser_observation(lookalikes, console_errors=0, typed_input_enabled=None)
+
+    assert _payload(line)["markers"] == [_UNEXPECTED] * len(lookalikes)
+    for leaked in ("example.invalid", "abc ms", "trailing", "spaced kind"):
+        assert leaked not in line
+
+
 def test_browser_observation_bounds_and_counts_dropped_markers() -> None:
     markers = tuple(f"marker_{index}: {index}.0 ms" for index in range(200))
 

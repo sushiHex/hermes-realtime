@@ -44,9 +44,24 @@ from tests.support.qualification import InProcessQualificationComposition
 _PINNED_LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd916"
 
 _BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "
-_MARKER_SHAPE = re.compile(r"[A-Za-z0-9_]{1,64}: \d+\.\d ms\Z")
+# Three writers append to the page's marker list, emitting two shapes: `addMarker` and
+# `addObjectiveLatency` render an elapsed duration, and `addObjectiveMarker` renders a
+# protocol event kind against the server monotonic clock. Both leading identifiers are
+# closed sets — fixed marker names, the parse boundary's event-kind allowlist, and the
+# objective-latency name union — so both shapes are content-free.
+_MARKER_SHAPES = (
+    re.compile(r"[A-Za-z0-9_]{1,64}: \d+\.\d ms\Z"),
+    re.compile(r"[A-Za-z0-9_]{1,64}: server monotonic \d+\.\d ms\Z"),
+)
 _MARKER_LIMIT = 128
 _UNEXPECTED_MARKER = "[unexpected-marker-shape]"
+
+
+def _is_content_free_marker(entry: object) -> bool:
+    """Accept only a fully anchored match against one of the two rendered shapes."""
+    if type(entry) is not str:
+        return False
+    return any(shape.match(entry) is not None for shape in _MARKER_SHAPES)
 
 
 def _browser_observation(
@@ -57,20 +72,18 @@ def _browser_observation(
 ) -> str:
     """Render one bounded line describing why the browser did or did not become ready.
 
-    Marker names are fixed identifiers, so the enforced shape — and not trust in the
-    client — is what keeps this content-free. Anything that does not match the shape is
-    replaced rather than emitted, so a future marker interpolating runtime content (a
-    transcript, URL, identity, or error) cannot leak through this line. ``markers=None``
-    means the page could not be read.
+    Marker names are fixed identifiers, so the enforced shapes — and not trust in the
+    client — are what keep this content-free. An entry matching none of them is replaced
+    rather than emitted, so a future marker interpolating runtime content (a transcript,
+    URL, identity, or error) cannot leak through this line. ``markers=None`` means the
+    page could not be read.
     """
     retained: list[str] | None = None
     dropped = 0
     if markers is not None:
         dropped = max(len(markers) - _MARKER_LIMIT, 0)
         retained = [
-            entry
-            if type(entry) is str and _MARKER_SHAPE.match(entry) is not None
-            else _UNEXPECTED_MARKER
+            entry if _is_content_free_marker(entry) else _UNEXPECTED_MARKER
             for entry in markers[-_MARKER_LIMIT:]
         ]
     payload: dict[str, Any] = {
