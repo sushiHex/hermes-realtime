@@ -216,11 +216,11 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
         "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",  # v10.0.1
     )
 
-    expected_uses = (4, 4, 3, 3)
+    expected_uses = (5, 5, 3, 4)
     for pin, expected_count in zip(node24_pins, expected_uses, strict=True):
         assert workflow.count(f"uses: {pin}") == expected_count
-    assert workflow.count("prune-cache: true") == 3
-    assert workflow.count('version: "0.11.28"') == 3
+    assert workflow.count("prune-cache: true") == 4
+    assert workflow.count('version: "0.11.28"') == 4
 
     setup_uv = "      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d\n"
     hermetic_setup_uv = setup_uv + (
@@ -443,6 +443,79 @@ def test_native_livekit_gate_binds_the_verified_executable_and_owned_listener() 
     assert "--livekit-pid $process.Id" in native_job
 
 
+def test_packaged_capture_runs_every_scenario_in_its_own_job() -> None:
+    workflow = _release_workflow()
+    packaged_job = workflow.split("  packaged-capture:", maxsplit=1)[1].split(
+        "  candidate-wheel:", maxsplit=1
+    )[0]
+    native_job = workflow.split("  native-livekit:", maxsplit=1)[1]
+    livekit_arguments = (
+        "--livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256"
+    )
+    wheel_arguments = "--candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest"
+    scenarios = (
+        ("qualify_revoke_race", True),
+        ("qualify_capacity_rollover", True),
+        ("qualify_over_budget_turn", True),
+        ("qualify_spool_crash_matrix", False),
+        ("qualify_synthetic_fault_matrix", False),
+        ("qualify_full_purge_cleanup", False),
+        ("qualify_owned_close_faults", True),
+    )
+
+    assert "name: Packaged capture and spool recovery" in packaged_job
+    assert "needs: candidate-wheel" in packaged_job
+    assert "runs-on: windows-latest" in packaged_job
+    assert "name: hermes-realtime-pure-candidate-wheel" in packaged_job
+    assert "path: ${{ runner.temp }}/revoke-candidate-input" in packaged_job
+    assert "revoke-candidate-input" not in native_job
+
+    offsets = []
+    for scenario, needs_livekit in scenarios:
+        command = f"uv run --frozen --group dev python -m scripts.{scenario} `"
+        assert packaged_job.count(command) == 1
+        assert command not in native_job
+        invocation = packaged_job.split(command, maxsplit=1)[1].split(
+            "\n          if ($LASTEXITCODE", maxsplit=1
+        )[0]
+        assert "--candidate $env:GITHUB_WORKSPACE" in invocation
+        assert wheel_arguments in invocation
+        assert (livekit_arguments in invocation) is needs_livekit
+        offsets.append(packaged_job.index(command))
+
+    assert offsets == sorted(offsets)
+
+
+def test_packaged_capture_provisions_its_own_owner_only_temp() -> None:
+    workflow = _release_workflow()
+    packaged_job = workflow.split("  packaged-capture:", maxsplit=1)[1].split(
+        "  candidate-wheel:", maxsplit=1
+    )[0]
+    provision_marker = "      - name: Provision owner-only Windows test temp"
+    cleanup_marker = "      - name: Remove owner-only Windows test temp"
+
+    assert packaged_job.count(provision_marker) == 1
+    assert packaged_job.count(cleanup_marker) == 1
+
+    provision = packaged_job.split(provision_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert (
+        '$testTemp = Join-Path $env:RUNNER_TEMP "hermes-realtime-owner-only-$env:GITHUB_JOB"'
+    ) in provision
+    assert '"TEMP=$testTemp"' in provision
+    assert '"TMP=$testTemp"' in provision
+
+    cleanup = packaged_job.split(cleanup_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+    assert "if: always()" in cleanup
+    assert (
+        '$testTemp = Join-Path $env:RUNNER_TEMP "hermes-realtime-owner-only-$env:GITHUB_JOB"'
+    ) in cleanup
+    assert "Remove-Item -LiteralPath $testTemp" in cleanup
+
+
 def test_linux_null_capture_consumes_the_single_hash_identified_candidate_wheel() -> None:
     workflow = _release_workflow()
     candidate = workflow.split("  candidate-wheel:", maxsplit=1)[1].split(
@@ -490,7 +563,7 @@ def test_linux_null_capture_consumes_the_single_hash_identified_candidate_wheel(
 
 def test_release_jobs_checkout_the_exact_event_head() -> None:
     workflow = _release_workflow()
-    assert workflow.count("ref: ${{ github.event.pull_request.head.sha || github.sha }}") == 4
+    assert workflow.count("ref: ${{ github.event.pull_request.head.sha || github.sha }}") == 5
 
 
 def test_committed_test_source_contains_no_credential_shaped_literals() -> None:

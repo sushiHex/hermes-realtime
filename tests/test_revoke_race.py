@@ -445,17 +445,20 @@ def test_only_the_canonical_revoke_registration_can_invoke_the_packaged_producer
         )
 
 
-def test_native_gate_uses_the_existing_candidate_wheel_for_revoke_qualification() -> None:
+def test_packaged_capture_gate_uses_the_existing_candidate_wheel_for_revoke_qualification() -> None:
     from pathlib import Path
 
     workflow = (
         Path(__file__).resolve().parents[1] / ".github/workflows/release-gates.yml"
     ).read_text(encoding="utf-8")
-    native = workflow.split("  native-livekit:", 1)[1]
-    assert "needs: candidate-wheel" in native
-    assert "name: hermes-realtime-pure-candidate-wheel" in native
-    assert "scripts.qualify_revoke_race" in native
-    assert "--candidate-wheel" in native and "--wheel-sha256" in native
-    assert native.index("Qualify packaged capture and spool recovery") < native.index(
-        "Run real-browser"
+    packaged = workflow.split("  packaged-capture:", 1)[1].split("  candidate-wheel:", 1)[0]
+    assert "needs: candidate-wheel" in packaged
+    assert "name: hermes-realtime-pure-candidate-wheel" in packaged
+    assert "scripts.qualify_revoke_race" in packaged
+    assert "--candidate-wheel" in packaged and "--wheel-sha256" in packaged
+    assert packaged.index("name: hermes-realtime-pure-candidate-wheel") < packaged.index(
+        "Qualify packaged capture and spool recovery"
+    )
+    assert packaged.index("Qualify packaged capture and spool recovery") < packaged.index(
+        "Remove owner-only Windows test temp"
     )
