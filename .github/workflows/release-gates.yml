@@ -10,6 +10,129 @@ permissions:
   contents: read
 
 jobs:
+  packaged-capture:
+    name: Packaged capture and spool recovery
+    needs: candidate-wheel
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+      # v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          prune-cache: true
+          save-cache: false
+      - name: Provision owner-only Windows test temp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testTemp = Join-Path $env:RUNNER_TEMP "hermes-realtime-owner-only-$env:GITHUB_JOB"
+          if (Test-Path -LiteralPath $testTemp) {
+            Remove-Item -LiteralPath $testTemp -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "Windows CI test-temp authority requires an elevated Administrators token"
+          }
+          $authoritySid = 'S-1-5-32-544'
+          & "$env:SystemRoot\System32\icacls.exe" $testTemp /inheritance:r
+          if ($LASTEXITCODE -ne 0) { throw "failed to remove inherited test-temp ACLs" }
+          & "$env:SystemRoot\System32\icacls.exe" $testTemp /grant:r "*${authoritySid}:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) { throw "failed to grant the permitted test-temp authority SID" }
+          & "$env:SystemRoot\System32\icacls.exe" $testTemp /setowner "*${authoritySid}"
+          if ($LASTEXITCODE -ne 0) { throw "failed to set the permitted test-temp authority SID as owner" }
+          $probe = Join-Path $testTemp "owner-inheritance-probe"
+          New-Item -ItemType Directory -Path $probe | Out-Null
+          python -c "import sys; from pathlib import Path; sys.path.insert(0, 'src'); from hermes_realtime.evidence.storage_security import _path_grants_only_owner; paths = tuple(map(Path, sys.argv[1:])); raise SystemExit(not all(_path_grants_only_owner(path) for path in paths))" $testTemp $probe
+          if ($LASTEXITCODE -ne 0) { throw "test-temp owner/DACL inheritance is not permitted" }
+          Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction Stop
+          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install pinned local LiveKit server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
+          Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = 'a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe'
+          if ($actual -ne $expected) { throw "LiveKit checksum mismatch: $actual" }
+          $target = Join-Path $env:RUNNER_TEMP 'livekit'
+          Expand-Archive -Path $archive -DestinationPath $target -Force
+          $server = Join-Path $target 'livekit-server.exe'
+          $serverHash = (Get-FileHash $server -Algorithm SHA256).Hash.ToLowerInvariant()
+          "LIVEKIT_SERVER=$server" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIVEKIT_SERVER_SHA256=$serverHash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: hermes-realtime-pure-candidate-wheel
+          path: ${{ runner.temp }}/revoke-candidate-input
+      - name: Qualify packaged capture and spool recovery
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wheelRoot = Join-Path $env:RUNNER_TEMP 'revoke-candidate-input/candidate'
+          $wheels = @(Get-ChildItem -LiteralPath $wheelRoot -Filter '*.whl' -File)
+          if ($wheels.Count -ne 1) { throw 'Expected one candidate wheel' }
+          $manifest = (Get-Content -LiteralPath (Join-Path $wheelRoot 'candidate-wheel.sha256') -Raw).Trim()
+          if ($manifest -notmatch '^([0-9a-f]{64})  candidate/hermes_realtime-0\.0\.3-py3-none-any\.whl$') {
+            throw 'Candidate wheel digest manifest is not exact'
+          }
+          $wheelDigest = $Matches[1]
+          uv run --frozen --group dev python -m scripts.qualify_revoke_race `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Revocation qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_capacity_rollover `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Capacity rollover qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_over_budget_turn `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Capture overflow qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_spool_crash_matrix `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
+          if ($LASTEXITCODE -ne 0) { throw "Spool crash qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_synthetic_fault_matrix `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
+          if ($LASTEXITCODE -ne 0) { throw "Synthetic fault qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_full_purge_cleanup `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
+          if ($LASTEXITCODE -ne 0) { throw "Full-purge qualification failed with exit code $LASTEXITCODE" }
+          uv run --frozen --group dev python -m scripts.qualify_owned_close_faults `
+            --candidate $env:GITHUB_WORKSPACE `
+            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
+            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
+          if ($LASTEXITCODE -ne 0) { throw "Owned-close qualification failed with exit code $LASTEXITCODE" }
+      - name: Remove owner-only Windows test temp
+        if: always()
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP "hermes-realtime-owner-only-$env:GITHUB_JOB"
+          if (Test-Path -LiteralPath $testTemp) {
+            Remove-Item -LiteralPath $testTemp -Recurse -Force -ErrorAction Stop
+          }
+
   candidate-wheel:
     name: Pure candidate wheel
     runs-on: ubuntu-24.04
@@ -304,11 +427,6 @@ jobs:
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }
-      # v8.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: hermes-realtime-pure-candidate-wheel
-          path: ${{ runner.temp }}/revoke-candidate-input
       - name: Qualify archived deterministic equivalence
         shell: pwsh
         run: |
@@ -317,50 +435,6 @@ jobs:
             --candidate $env:GITHUB_WORKSPACE `
             --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
           if ($LASTEXITCODE -ne 0) { throw "Deterministic equivalence failed with exit code $LASTEXITCODE" }
-      - name: Qualify packaged capture and spool recovery
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $wheelRoot = Join-Path $env:RUNNER_TEMP 'revoke-candidate-input/candidate'
-          $wheels = @(Get-ChildItem -LiteralPath $wheelRoot -Filter '*.whl' -File)
-          if ($wheels.Count -ne 1) { throw 'Expected one candidate wheel' }
-          $manifest = (Get-Content -LiteralPath (Join-Path $wheelRoot 'candidate-wheel.sha256') -Raw).Trim()
-          if ($manifest -notmatch '^([0-9a-f]{64})  candidate/hermes_realtime-0\.0\.3-py3-none-any\.whl$') {
-            throw 'Candidate wheel digest manifest is not exact'
-          }
-          $wheelDigest = $Matches[1]
-          uv run --frozen --group dev python -m scripts.qualify_revoke_race `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
-            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
-          if ($LASTEXITCODE -ne 0) { throw "Revocation qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_capacity_rollover `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
-            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
-          if ($LASTEXITCODE -ne 0) { throw "Capacity rollover qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_over_budget_turn `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
-            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
-          if ($LASTEXITCODE -ne 0) { throw "Capture overflow qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_spool_crash_matrix `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
-          if ($LASTEXITCODE -ne 0) { throw "Spool crash qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_synthetic_fault_matrix `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
-          if ($LASTEXITCODE -ne 0) { throw "Synthetic fault qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_full_purge_cleanup `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest
-          if ($LASTEXITCODE -ne 0) { throw "Full-purge qualification failed with exit code $LASTEXITCODE" }
-          uv run --frozen --group dev python -m scripts.qualify_owned_close_faults `
-            --candidate $env:GITHUB_WORKSPACE `
-            --candidate-wheel $wheels[0].FullName --wheel-sha256 $wheelDigest `
-            --livekit-executable $env:LIVEKIT_SERVER --livekit-sha256 $env:LIVEKIT_SERVER_SHA256
-          if ($LASTEXITCODE -ne 0) { throw "Owned-close qualification failed with exit code $LASTEXITCODE" }
       - name: Run real-browser self-acceptance gate
         shell: pwsh
         run: |
