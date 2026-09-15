@@ -372,6 +372,27 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     assert "tests/integration/test_browser_self_acceptance.py" in browser_step
 
 
+def test_browser_self_acceptance_retains_captured_observation_output() -> None:
+    workflow = _release_workflow()
+    native_job = workflow.split("  native-livekit:", maxsplit=1)[1]
+    browser_marker = "      - name: Run real-browser self-acceptance gate"
+    browser_step = native_job.split(browser_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+
+    # Without -s pytest captures the observation and replays it only on failure, so a
+    # passing run retains no healthy marker sequence to compare a recurrence against.
+    assert (
+        "uv run --frozen --group dev --extra browser-acceptance pytest -q -s"
+    ) in browser_step
+
+    browser_source = (
+        Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py"
+    ).read_text(encoding="utf-8")
+    assert '_BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "' in browser_source
+    assert "_browser_observation(" in browser_source
+
+
 def test_native_failure_prints_only_bounded_sanitized_logs_from_each_owned_server() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = _release_workflow()
