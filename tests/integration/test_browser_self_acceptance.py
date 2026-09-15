@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -21,9 +23,10 @@ from urllib.parse import urldefrag
 import pytest
 
 try:
-    from playwright.async_api import Browser, async_playwright, expect
+    from playwright.async_api import Browser, Page, async_playwright, expect
 except ModuleNotFoundError:
     Browser = Any
+    Page = Any
     async_playwright = None
     expect = None
 
@@ -39,6 +42,47 @@ from hermes_realtime.speech import (
 from tests.support.qualification import InProcessQualificationComposition
 
 _PINNED_LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd916"
+
+_BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "
+_MARKER_SHAPE = re.compile(r"[A-Za-z0-9_]{1,64}: \d+\.\d ms\Z")
+_MARKER_LIMIT = 128
+_UNEXPECTED_MARKER = "[unexpected-marker-shape]"
+
+
+def _browser_observation(
+    markers: tuple[str, ...] | None,
+    *,
+    console_errors: int,
+    typed_input_enabled: bool | None,
+) -> str:
+    """Render one bounded line describing why the browser did or did not become ready.
+
+    Marker names are fixed identifiers, so the enforced shape — and not trust in the
+    client — is what keeps this content-free. Anything that does not match the shape is
+    replaced rather than emitted, so a future marker interpolating runtime content (a
+    transcript, URL, identity, or error) cannot leak through this line. ``markers=None``
+    means the page could not be read.
+    """
+    retained: list[str] | None = None
+    dropped = 0
+    if markers is not None:
+        dropped = max(len(markers) - _MARKER_LIMIT, 0)
+        retained = [
+            entry
+            if type(entry) is str and _MARKER_SHAPE.match(entry) is not None
+            else _UNEXPECTED_MARKER
+            for entry in markers[-_MARKER_LIMIT:]
+        ]
+    payload: dict[str, Any] = {
+        "version": 1,
+        "markers": retained,
+        "markers_dropped": dropped,
+        "console_errors": console_errors,
+        "typed_input_enabled": typed_input_enabled,
+    }
+    return _BROWSER_OBSERVATION_PREFIX + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -273,6 +317,7 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
     )
     running = None
     browser: Browser | None = None
+    page: Page | None = None
     console_errors: list[str] = []
     with _owned_livekit():
         try:
@@ -337,6 +382,26 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
                 await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
                 assert await remote_audio.evaluate("element => element.srcObject === null")
         finally:
+            # The page already records why readiness stalled; read it before teardown
+            # discards it, and never let this reporting mask the original failure.
+            observed_markers: tuple[str, ...] | None = None
+            typed_input_enabled: bool | None = None
+            if page is not None:
+                try:
+                    observed_markers = tuple(await page.locator("#markers li").all_text_contents())
+                except Exception:
+                    observed_markers = None
+                try:
+                    typed_input_enabled = await page.locator("#typed-input").is_enabled()
+                except Exception:
+                    typed_input_enabled = None
+            print(
+                _browser_observation(
+                    observed_markers,
+                    console_errors=len(console_errors),
+                    typed_input_enabled=typed_input_enabled,
+                )
+            )
             await _close_browser(browser)
             if running is not None:
                 await composition.close_host(running)
