@@ -372,6 +372,62 @@ def test_native_job_runs_browser_self_acceptance_with_fresh_owned_livekit() -> N
     assert "tests/integration/test_browser_self_acceptance.py" in browser_step
 
 
+def test_browser_self_acceptance_retains_captured_observation_output() -> None:
+    workflow = _release_workflow()
+    native_job = workflow.split("  native-livekit:", maxsplit=1)[1]
+    browser_marker = "      - name: Run real-browser self-acceptance gate"
+    browser_step = native_job.split(browser_marker, maxsplit=1)[1].split(
+        "\n      - name:", maxsplit=1
+    )[0]
+
+    # Without -s pytest captures the observation and replays it only on failure, so a
+    # passing run retains no healthy marker sequence to compare a recurrence against.
+    assert (
+        "uv run --frozen --group dev --extra browser-acceptance pytest -q -s"
+    ) in browser_step
+
+    browser_source = (
+        Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py"
+    ).read_text(encoding="utf-8")
+    assert '_BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "' in browser_source
+    assert "_browser_observation(" in browser_source
+
+
+def test_browser_observation_is_captured_before_the_page_is_torn_down() -> None:
+    # A source-shape assertion, because this defect is invisible on a passing run:
+    # leaving the `async with async_playwright()` context stops the driver and closes
+    # every page, so a capture placed after it reads a dead page, degrades to
+    # `"markers":null`, and the gate still reports success.
+    lines = (
+        (Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+
+    def indent(index: int) -> int:
+        return len(lines[index]) - len(lines[index].lstrip())
+
+    context = [i for i, line in enumerate(lines) if "async with async_playwright()" in line]
+    capture = [
+        i for i, line in enumerate(lines) if line.lstrip().startswith("_browser_observation(")
+    ]
+    close = [i for i, line in enumerate(lines) if line.strip() == "await _close_browser(browser)"]
+    assert len(context) == 1
+    assert len(capture) == 1
+    assert len(close) == 1
+    # The outer finally is the nearest `finally:` above the browser teardown.
+    outer_finally = max(i for i in range(close[0]) if lines[i].rstrip().endswith("finally:"))
+
+    assert context[0] < capture[0] < outer_finally
+    assert indent(capture[0]) > indent(context[0])
+    assert indent(capture[0]) > indent(outer_finally)
+    assert [
+        i
+        for i in range(context[0], capture[0])
+        if lines[i].rstrip().endswith("finally:") and indent(i) > indent(outer_finally)
+    ]
+
+
 def test_native_failure_prints_only_bounded_sanitized_logs_from_each_owned_server() -> None:
     root = Path(__file__).resolve().parents[1]
     workflow = _release_workflow()

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -21,9 +23,10 @@ from urllib.parse import urldefrag
 import pytest
 
 try:
-    from playwright.async_api import Browser, async_playwright, expect
+    from playwright.async_api import Browser, Page, async_playwright, expect
 except ModuleNotFoundError:
     Browser = Any
+    Page = Any
     async_playwright = None
     expect = None
 
@@ -39,6 +42,60 @@ from hermes_realtime.speech import (
 from tests.support.qualification import InProcessQualificationComposition
 
 _PINNED_LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd916"
+
+_BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "
+# Three writers append to the page's marker list, emitting two shapes: `addMarker` and
+# `addObjectiveLatency` render an elapsed duration, and `addObjectiveMarker` renders a
+# protocol event kind against the server monotonic clock. Both leading identifiers are
+# closed sets — fixed marker names, the parse boundary's event-kind allowlist, and the
+# objective-latency name union — so both shapes are content-free.
+_MARKER_SHAPES = (
+    re.compile(r"[A-Za-z0-9_]{1,64}: \d+\.\d ms\Z"),
+    re.compile(r"[A-Za-z0-9_]{1,64}: server monotonic \d+\.\d ms\Z"),
+)
+_MARKER_LIMIT = 128
+_UNEXPECTED_MARKER = "[unexpected-marker-shape]"
+
+
+def _is_content_free_marker(entry: object) -> bool:
+    """Accept only a fully anchored match against one of the two rendered shapes."""
+    if type(entry) is not str:
+        return False
+    return any(shape.match(entry) is not None for shape in _MARKER_SHAPES)
+
+
+def _browser_observation(
+    markers: tuple[str, ...] | None,
+    *,
+    console_errors: int,
+    typed_input_enabled: bool | None,
+) -> str:
+    """Render one bounded line describing why the browser did or did not become ready.
+
+    Marker names are fixed identifiers, so the enforced shapes — and not trust in the
+    client — are what keep this content-free. An entry matching none of them is replaced
+    rather than emitted, so a future marker interpolating runtime content (a transcript,
+    URL, identity, or error) cannot leak through this line. ``markers=None`` means the
+    page could not be read.
+    """
+    retained: list[str] | None = None
+    dropped = 0
+    if markers is not None:
+        dropped = max(len(markers) - _MARKER_LIMIT, 0)
+        retained = [
+            entry if _is_content_free_marker(entry) else _UNEXPECTED_MARKER
+            for entry in markers[-_MARKER_LIMIT:]
+        ]
+    payload: dict[str, Any] = {
+        "version": 1,
+        "markers": retained,
+        "markers_dropped": dropped,
+        "console_errors": console_errors,
+        "typed_input_enabled": typed_input_enabled,
+    }
+    return _BROWSER_OBSERVATION_PREFIX + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -273,6 +330,7 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
     )
     running = None
     browser: Browser | None = None
+    page: Page | None = None
     console_errors: list[str] = []
     with _owned_livekit():
         try:
@@ -288,54 +346,81 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
                     ],
                 )
                 page = await browser.new_page()
-                def record_console_error(message: object) -> None:
-                    if message.type != "error":
-                        return
-                    location = message.location
-                    url = location["url"]
-                    # Chrome requests the absent favicon; deterministic composition has no catalog.
-                    if url.endswith("/favicon.ico") or url.endswith("/api/v1/models"):
-                        return
-                    console_errors.append(f"{message.text} @ {url}")
+                try:
+                    def record_console_error(message: object) -> None:
+                        if message.type != "error":
+                            return
+                        location = message.location
+                        url = location["url"]
+                        # Chrome requests the absent favicon; deterministic composition
+                        # has no catalog.
+                        if url.endswith("/favicon.ico") or url.endswith("/api/v1/models"):
+                            return
+                        console_errors.append(f"{message.text} @ {url}")
 
-                page.on("console", record_console_error)
-                page.on("pageerror", lambda error: console_errors.append(str(error)))
-                launch_origin, launch_fragment = urldefrag(running.url)
-                assert launch_fragment
-                navigated = asyncio.get_running_loop().create_future()
+                    page.on("console", record_console_error)
+                    page.on("pageerror", lambda error: console_errors.append(str(error)))
+                    launch_origin, launch_fragment = urldefrag(running.url)
+                    assert launch_fragment
+                    navigated = asyncio.get_running_loop().create_future()
 
-                def record_navigation(frame: object) -> None:
-                    if (
-                        not navigated.done()
-                        and frame == page.main_frame
-                        and frame.url.startswith(launch_origin)
-                    ):
-                        navigated.set_result(None)
+                    def record_navigation(frame: object) -> None:
+                        if (
+                            not navigated.done()
+                            and frame == page.main_frame
+                            and frame.url.startswith(launch_origin)
+                        ):
+                            navigated.set_result(None)
 
-                page.on("framenavigated", record_navigation)
-                await page.evaluate(
-                    "([origin, fragment]) => {"
-                    " setTimeout(() => window.location.replace(`${origin}#${fragment}`), 0);"
-                    "}",
-                    [launch_origin, launch_fragment],
-                )
-                await asyncio.wait_for(navigated, timeout=30)
-                await page.wait_for_load_state("networkidle")
-                await page.get_by_role("button", name="Connect").click()
-                await expect(page.locator("#typed-input")).to_be_enabled(timeout=30_000)
-                await page.locator("#typed-input").fill("browser deterministic typed turn")
-                await page.get_by_role("button", name="Send message").click()
-                await page.get_by_role("listitem").filter(
-                    has_text="Browser qualification response."
-                ).wait_for(timeout=30_000)
-                remote_audio = page.locator("#remote-audio")
-                async with asyncio.timeout(30):
-                    while await remote_audio.evaluate("element => element.currentTime") <= 0:
-                        await asyncio.sleep(0.1)
-                assert console_errors == []
-                await page.get_by_role("button", name="Stop session").click()
-                await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
-                assert await remote_audio.evaluate("element => element.srcObject === null")
+                    page.on("framenavigated", record_navigation)
+                    await page.evaluate(
+                        "([origin, fragment]) => {"
+                        " setTimeout(() => window.location.replace(`${origin}#${fragment}`), 0);"
+                        "}",
+                        [launch_origin, launch_fragment],
+                    )
+                    await asyncio.wait_for(navigated, timeout=30)
+                    await page.wait_for_load_state("networkidle")
+                    await page.get_by_role("button", name="Connect").click()
+                    await expect(page.locator("#typed-input")).to_be_enabled(timeout=30_000)
+                    await page.locator("#typed-input").fill("browser deterministic typed turn")
+                    await page.get_by_role("button", name="Send message").click()
+                    await page.get_by_role("listitem").filter(
+                        has_text="Browser qualification response."
+                    ).wait_for(timeout=30_000)
+                    remote_audio = page.locator("#remote-audio")
+                    async with asyncio.timeout(30):
+                        while await remote_audio.evaluate("element => element.currentTime") <= 0:
+                            await asyncio.sleep(0.1)
+                    assert console_errors == []
+                    await page.get_by_role("button", name="Stop session").click()
+                    await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
+                    assert await remote_audio.evaluate("element => element.srcObject === null")
+                finally:
+                    # The page already records why readiness stalled; read it here, while
+                    # the Playwright context is still open. Stopping the driver closes every
+                    # page, so an outer finally can only ever observe a dead page. Never let
+                    # this reporting mask the original failure.
+                    observed_markers: tuple[str, ...] | None = None
+                    typed_input_enabled: bool | None = None
+                    if page is not None:
+                        try:
+                            observed_markers = tuple(
+                                await page.locator("#markers li").all_text_contents()
+                            )
+                        except Exception:
+                            observed_markers = None
+                        try:
+                            typed_input_enabled = await page.locator("#typed-input").is_enabled()
+                        except Exception:
+                            typed_input_enabled = None
+                    print(
+                        _browser_observation(
+                            observed_markers,
+                            console_errors=len(console_errors),
+                            typed_input_enabled=typed_input_enabled,
+                        )
+                    )
         finally:
             await _close_browser(browser)
             if running is not None:
