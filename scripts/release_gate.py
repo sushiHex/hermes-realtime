@@ -264,7 +264,11 @@ def canonical_candidate_diff_sha256(source: Path, baseline_commit: str | None) -
     return hashlib.sha256(diff).hexdigest()
 
 
-def git_archive(source: Path, destination: Path) -> None:
+def git_archive(source: Path, destination: Path, *, revision: str) -> None:
+    """Materialize one explicitly named commit, never a symbolic ref."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        fail("archived revision must be a full lowercase Git commit OID")
     probe = subprocess.run(
         ("git", "rev-parse", "--is-inside-work-tree"),
         cwd=source,
@@ -275,7 +279,7 @@ def git_archive(source: Path, destination: Path) -> None:
     if probe.returncode != 0 or probe.stdout.strip() != "true":
         fail(f"candidate must be a Git checkout: {source}")
     archive = subprocess.run(
-        ("git", "archive", "--format=tar", "HEAD"),
+        ("git", "archive", "--format=tar", revision),
         cwd=source,
         env=clean_git_environment(),
         capture_output=True,
@@ -880,13 +884,17 @@ def gate(
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
 ) -> None:
+    # Resolved once, printed, then archived, so the named revision is the
+    # archived revision by construction rather than by two reads agreeing.
+    revision = _resolved_commit_oid(source, "HEAD", label="candidate HEAD")
+    print(f"archived revision: {revision}", flush=True)
     diff_sha256 = canonical_candidate_diff_sha256(source, None)
     print(f"canonical candidate diff SHA-256: {diff_sha256}", flush=True)
     with tempfile.TemporaryDirectory(prefix="hermes-realtime-release-") as temporary:
         root = Path(temporary) / "candidate"
         root.mkdir()
         scan_git_blobs(source)
-        git_archive(source, root)
+        git_archive(source, root, revision=revision)
         gate_materialized_candidate(
             root,
             livekit=livekit,
@@ -933,7 +941,11 @@ def self_test() -> None:
         )
         archived = root / "archived"
         archived.mkdir()
-        git_archive(repository, archived)
+        git_archive(
+            repository,
+            archived,
+            revision=_resolved_commit_oid(repository, "HEAD", label="self-test fixture HEAD"),
+        )
         if (archived / "secret.txt").exists():
             fail("self-test fixture did not exercise export-ignore")
         expect_failure(lambda: scan_git_blobs(repository), "github-token: secret.txt")
