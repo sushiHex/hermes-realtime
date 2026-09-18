@@ -133,6 +133,20 @@ def _ticket_signal_status(event: Event, *, deadline: float | None) -> bool | Non
         return None
 
 
+def _ticket_signal_time(event: Event) -> float | None:
+    """Report an exact ticket event's recorded production milestone time.
+
+    The classification above collapses this to a bool.  A refused observation
+    still owns the retrievable time, so a timeout can name the milestone it
+    reached instead of reporting only that it did not finish.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("ticket signal must be an exact threading.Event")
+    with _TICKET_SIGNAL_TIMES_LOCK:
+        return _TICKET_SIGNAL_TIMES.get(event)
+
+
 class ReservationError(RuntimeError):
     """A process-local reservation was stale, forged, or used incorrectly."""
 
