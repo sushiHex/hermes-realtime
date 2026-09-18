@@ -2015,10 +2015,152 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
             )
             assert "synthetic activation failure" not in lines[0]
             assert str(tmp_path) not in lines[0]
+            # Only the held create reaches the real control bound, so only that
+            # case may name a milestone it never reached.
+            timeout_lines = [
+                line
+                for line in output.splitlines()
+                if line.startswith("[consent-activation] ")
+            ]
+            if failure == "pending_timeout":
+                assert len(timeout_lines) == 1
+                timed_out = json.loads(
+                    timeout_lines[0].removeprefix("[consent-activation] ")
+                )
+                assert timed_out["version"] == 1
+                assert timed_out["operation"] == "consent"
+                assert timed_out["bound_seconds"] == 2.0
+                assert timed_out["offset_ms"] == {"create_durable": None}
+                assert str(tmp_path) not in timeout_lines[0]
+            else:
+                assert timeout_lines == []
     finally:
         # A RED regression must not itself contaminate the remaining test process.
         for runtime in runtimes:
             await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("milestone", ["unsignalled", "late", "early"])
+async def test_consent_control_timeout_names_its_reached_durability_milestone(
+    tmp_path: Path, capsys, milestone: str,
+) -> None:
+    """One control timeout disposition hides materially different failures.
+
+    Admission already records every production milestone's monotonic time, so a
+    timeout can say whether the writer never reached the milestone or reached it
+    late, and by how much.  A milestone recorded before the bound is rescued by
+    the wait itself and must never reach the timeout path at all.
+    """
+
+    import threading
+    from time import monotonic, sleep
+
+    from hermes_realtime.client import BrowserEventProjection
+    from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence import runtime as runtime_module
+    from hermes_realtime.evidence.admission import _set_ticket_signal
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+
+    # The rescued case must clear a real dispatch, so it keeps the production bound.
+    bound = 2.0 if milestone == "early" else 0.05
+    release = threading.Event()
+
+    class Transport:
+        def create_epoch(self, _command: m.CreateEpochV1) -> m.StoreDisposition:
+            if milestone != "early":
+                assert release.wait(timeout=5.0)
+            return m.StoreDisposition.COMMITTED
+
+        def append_binding_close(self, _command: m.BindingCloseV1) -> m.StoreDisposition:
+            return m.StoreDisposition.COMMITTED
+
+        def drain_and_close(self, _command: m.DrainAndStopV1) -> m.DrainDisposition:
+            return m.DrainDisposition.STOPPED
+
+        def __getattr__(self, name: str) -> object:
+            if name in {
+                "append_record",
+                "rollover_session",
+                "expire_session",
+                "seal_epoch",
+                "commit_revoke_request",
+                "finalize_revoke",
+            }:
+                return lambda *_args: m.StoreDisposition.COMMITTED
+            raise AttributeError(name)
+
+    runtime = HostEvidenceRuntimeV1(
+        database=tmp_path / "capture-v1.sqlite3",
+        owner_generation=7,
+        retention_hours=24,
+    )
+    projection = BrowserEventProjection()
+    authority = runtime.reserve_consent_authority(
+        _create_epoch(),
+        projection.reserve_capture_status(),
+        projection.validate_capture_status_reservation,
+    )
+
+    original_status = runtime_module._ticket_signal_status
+    signalled_after_deadline = False
+
+    def coordinated_status(candidate, *, deadline):
+        # Publish the milestone exactly once, strictly after its own deadline,
+        # so the late case is a measured margin instead of a race.
+        nonlocal signalled_after_deadline
+        ticket = runtime._pending_consent_ticket
+        if (
+            milestone == "late"
+            and not signalled_after_deadline
+            and ticket is not None
+            and candidate is ticket.durability_event
+            and deadline is not None
+            and monotonic() >= deadline
+        ):
+            signalled_after_deadline = True
+            sleep(0.02)
+            _set_ticket_signal(candidate)
+        return original_status(candidate, deadline=deadline)
+
+    runtime_module._ticket_signal_status = coordinated_status
+    try:
+        disposition = await runtime.activate_consent(
+            authority,
+            transport=Transport(),
+            binding_is_current=lambda _command: True,
+            timeout_seconds=bound,
+        )
+    finally:
+        runtime_module._ticket_signal_status = original_status
+        release.set()
+        await runtime.close()
+
+    observations = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[consent-activation] ")
+    ]
+    if milestone == "early":
+        assert disposition is m.ConsentDisposition.CONSENT_ACTIVATED
+        assert observations == []
+        return
+    assert milestone != "late" or signalled_after_deadline
+    assert disposition is m.ConsentDisposition.CONTROL_TIMED_OUT
+    assert len(observations) == 1
+    observation = json.loads(observations[0].removeprefix("[consent-activation] "))
+    assert set(observation) == {"bound_seconds", "offset_ms", "operation", "version"}
+    assert observation["version"] == 1
+    assert observation["operation"] == "consent"
+    assert observation["bound_seconds"] == bound
+    offsets = observation["offset_ms"]
+    assert set(offsets) == {"create_durable"}
+    if milestone == "unsignalled":
+        assert offsets["create_durable"] is None
+    else:
+        assert type(offsets["create_durable"]) is float
+        assert offsets["create_durable"] > 5.0
+    assert str(tmp_path) not in observations[0]
 
 
 @pytest.mark.asyncio
@@ -2227,7 +2369,9 @@ async def test_sqlite_consent_observer_locates_an_injected_root_validation_delay
         await releaser
 
     output = capsys.readouterr().out
-    observation = json.loads(output.removeprefix("[sqlite-consent] "))
+    lines = [line for line in output.splitlines() if line.startswith("[sqlite-consent] ")]
+    assert len(lines) == 1
+    observation = json.loads(lines[0].removeprefix("[sqlite-consent] "))
     assert observation["activation"] == "control_timed_out"
     assert observation["store"] == "committed"
     assert observation["closed"] is True
@@ -2236,6 +2380,16 @@ async def test_sqlite_consent_observer_locates_an_injected_root_validation_delay
     assert offsets["root_validation_exit"] - offsets["root_validation_enter"] >= 2_000
     assert offsets["activation_exit"] <= offsets["root_validation_exit"]
     assert offsets["root_validation_exit"] <= offsets["root_occupancy_enter"]
+    # A store that never finished opening cannot have reached the durable
+    # milestone, and the timeout must say so rather than only that it expired.
+    timeout_lines = [
+        line for line in output.splitlines() if line.startswith("[consent-activation] ")
+    ]
+    assert len(timeout_lines) == 1
+    timed_out = json.loads(timeout_lines[0].removeprefix("[consent-activation] "))
+    assert timed_out["operation"] == "consent"
+    assert timed_out["bound_seconds"] == 2.0
+    assert timed_out["offset_ms"] == {"create_durable": None}
 
 
 @pytest.mark.asyncio
