@@ -188,7 +188,7 @@ The canonical committed-`HEAD` qualification is:
 uv run --frozen --group dev python scripts/release_gate.py --candidate .
 ```
 
-It builds and inspects the wheel and sdist, scans committed Git blobs for secret patterns, verifies browser assets, and tests an isolated installation. It does not qualify dirty, staged, or untracked bytes.
+It builds and inspects the wheel and sdist, scans committed Git blobs for secret patterns, verifies browser assets, and tests an isolated installation. It does not qualify dirty, staged, or untracked bytes; they are excluded from the candidate rather than rejected.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Public contributions must be hardware-generic, secret-free, reproducible, and useful outside one private deployment.
 
