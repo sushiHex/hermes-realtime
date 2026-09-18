@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 from runpy import run_path
@@ -135,7 +136,11 @@ def test_public_release_gate_ignores_hostile_git_repository_selection(
     release_gate["scan_git_blobs"](candidate)
     archived = tmp_path / "archived"
     archived.mkdir()
-    release_gate["git_archive"](candidate, archived)
+    release_gate["git_archive"](
+        candidate,
+        archived,
+        revision=release_gate["_resolved_commit_oid"](candidate, "HEAD", label="candidate HEAD"),
+    )
 
     assert (archived / "public.txt").read_text(encoding="utf-8") == "public\n"
     assert not (archived / ".env").exists()
@@ -145,6 +150,14 @@ def test_public_gate_has_no_private_history_baseline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    _run("git", "init", "-q", "-b", "main", cwd=candidate)
+    _run("git", "config", "user.email", "gate@example.invalid", cwd=candidate)
+    _run("git", "config", "user.name", "gate", cwd=candidate)
+    (candidate / "public.txt").write_text("public\n", encoding="utf-8")
+    _run("git", "add", "public.txt", cwd=candidate)
+    _run("git", "commit", "-qm", "fixture", cwd=candidate)
     release_gate = run_path(str(ROOT / "scripts" / "release_gate.py"))
     gate = release_gate["gate"]
     events: list[tuple[object, ...]] = []
@@ -161,7 +174,9 @@ def test_public_gate_has_no_private_history_baseline(
     monkeypatch.setitem(
         gate.__globals__,
         "git_archive",
-        lambda source, destination: events.append(("archive", source, destination.name)),
+        lambda source, destination, *, revision: events.append(
+            ("archive", source, destination.name)
+        ),
     )
     monkeypatch.setitem(
         gate.__globals__,
@@ -169,11 +184,11 @@ def test_public_gate_has_no_private_history_baseline(
         lambda root, **arguments: events.append(("materialized", root.name, arguments)),
     )
 
-    gate(tmp_path, False)
+    gate(candidate, False)
 
-    assert events[0] == ("diff", tmp_path, None)
-    assert events[1] == ("scan", tmp_path)
-    assert events[2][0:2] == ("archive", tmp_path)
+    assert events[0] == ("diff", candidate, None)
+    assert events[1] == ("scan", candidate)
+    assert events[2][0:2] == ("archive", candidate)
     assert events[3] == (
         "materialized",
         "candidate",
@@ -240,3 +255,72 @@ def test_materialized_gate_requires_current_lock_before_build_preparation(
     assert (decoy / "uv.lock").read_bytes() == decoy_lock
     assert not (candidate / ".venv").exists()
     assert not (decoy / ".venv").exists()
+
+
+def test_release_gate_prints_the_one_revision_it_archives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The named revision is the archived revision, and the working tree cannot move it.
+
+    ``docs/contributor-setup-validation.md`` established that the gate validates
+    committed bytes and silently excludes the working tree.  Naming the revision
+    makes that property observable instead of merely documented.
+    """
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _run("git", "init", "-q", "-b", "main", cwd=repository)
+    _run("git", "config", "user.email", "gate@example.invalid", cwd=repository)
+    _run("git", "config", "user.name", "gate", cwd=repository)
+    (repository / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    _run("git", "add", "tracked.txt", cwd=repository)
+    _run("git", "commit", "-qm", "candidate fixture", cwd=repository)
+    head = _run("git", "rev-parse", "HEAD", cwd=repository).decode("ascii").strip()
+    digest = "0" * 64
+
+    release_gate = run_path(str(ROOT / "scripts" / "release_gate.py"))
+    gate = release_gate["gate"]
+    archived: list[str] = []
+    resolutions: list[str] = []
+    resolve = release_gate["_resolved_commit_oid"]
+
+    def observed_resolve(source: Path, rev: str, *, label: str) -> str:
+        resolutions.append(rev)
+        return str(resolve(source, rev, label=label))
+
+    monkeypatch.setitem(gate.__globals__, "_resolved_commit_oid", observed_resolve)
+    monkeypatch.setitem(
+        gate.__globals__, "canonical_candidate_diff_sha256", lambda source, baseline: digest
+    )
+    monkeypatch.setitem(gate.__globals__, "scan_git_blobs", lambda source: None)
+    monkeypatch.setitem(
+        gate.__globals__,
+        "git_archive",
+        lambda source, destination, *, revision: archived.append(revision),
+    )
+    monkeypatch.setitem(
+        gate.__globals__, "gate_materialized_candidate", lambda root, **arguments: None
+    )
+
+    gate(repository, False)
+    clean = capsys.readouterr().out.splitlines()
+    (repository / "tracked.txt").write_text("uncommitted edit\n", encoding="utf-8")
+    (repository / "untracked.txt").write_text("uncommitted addition\n", encoding="utf-8")
+    gate(repository, False)
+    dirty = capsys.readouterr().out.splitlines()
+
+    named = [line for line in clean if head in line]
+    assert len(named) == 1, clean
+    revision = named[0].split()[-1]
+    assert revision == head
+    assert re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+    # One resolution used twice: the printed value is the archived value.
+    assert resolutions == ["HEAD", "HEAD"]
+    assert archived == [revision, revision]
+    # No explanatory prose beside the OID, and ahead of the digest a contributor
+    # cannot look up.
+    assert len(named[0].split()) <= 3
+    assert clean.index(named[0]) < clean.index(next(line for line in clean if digest in line))
+    assert dirty == clean
