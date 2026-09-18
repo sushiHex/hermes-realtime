@@ -255,10 +255,12 @@ that knowledge controls grant no Hermes work authority.
 Run the ordinary hermetic candidate gate:
 
 ```sh
-python scripts/release_gate.py --candidate .
+uv run --frozen --group dev python scripts/release_gate.py --candidate .
 ```
 
 The script validates committed `HEAD`, not staged, dirty, or untracked files.
+Its first output line is `archived revision: <commit>`, which names the exact
+commit it archived, so that claim is checkable against `git rev-parse HEAD`.
 Commit review changes before treating its result as release evidence; staging is
 not sufficient. It intentionally leaves
 no release artifacts in the checkout.
@@ -266,7 +268,7 @@ no release artifacts in the checkout.
 For a fast adversarial regression check of the release script itself, run:
 
 ```sh
-python scripts/release_gate.py --self-test
+uv run --frozen --group dev python scripts/release_gate.py --self-test
 ```
 
 The self-test proves that a tracked secret excluded by `export-ignore` is absent
@@ -321,7 +323,7 @@ try {
       $listeners[0].OwningProcess -ne $process.Id) {
     throw 'LiveKit signaling listener is not the owned loopback process'
   }
-  python scripts/release_gate.py --candidate $repo `
+  uv run --frozen --group dev python scripts/release_gate.py --candidate $repo `
     --require-livekit `
     --livekit-executable $server --livekit-executable-sha256 $serverHash `
     --livekit-pid $process.Id
