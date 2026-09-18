@@ -43,6 +43,7 @@ from .admission import (
     RevokeTicketV1,
     _AdmissionRolloverPreparationV1,
     _ticket_signal_status,
+    _ticket_signal_time,
 )
 from .lifecycle import (
     EvidenceConversationAuthorityV1,
@@ -94,6 +95,45 @@ _CLOSE_DRAIN_TIMEOUT_SECONDS = 2.0
 _CLOSE_WRITER_TIMEOUT_SECONDS = 2.0
 _THREAD_SIGNAL_INITIAL_POLL_SECONDS = 0.001
 _THREAD_SIGNAL_MAX_POLL_SECONDS = 0.05
+_CONSENT_ACTIVATION_OBSERVATION_PREFIX = "[consent-activation] "
+
+
+def _milestone_offset_ms(signal_time: float | None, *, deadline: float) -> float | None:
+    """Express one recorded milestone as its signed offset from its own bound.
+
+    ``None`` means the milestone was never reached.  A negative offset means it
+    was reached before the bound and refused anyway; a positive offset is the
+    measured margin by which the producer was late.
+    """
+
+    if signal_time is None:
+        return None
+    return round((signal_time - deadline) * 1000.0, 3)
+
+
+def _observe_consent_control_timeout(
+    *,
+    operation: str,
+    bound_seconds: float,
+    offset_ms: dict[str, float | None],
+) -> None:
+    """Name which milestone a control timeout reached, and by how much it missed.
+
+    Content-free by construction: the milestone names are fixed identifiers and
+    every other value is a number or null.
+    """
+
+    observation: dict[str, object] = {
+        "version": 1,
+        "operation": operation,
+        "bound_seconds": bound_seconds,
+        "offset_ms": offset_ms,
+    }
+    print(
+        _CONSENT_ACTIVATION_OBSERVATION_PREFIX
+        + json.dumps(observation, separators=(",", ":"), sort_keys=True),
+        flush=True,
+    )
 
 
 async def _wait_for_thread_signal(event: Event, *, timeout_seconds: float | None) -> bool:
@@ -1789,11 +1829,18 @@ class HostEvidenceRuntimeV1:
             return ConsentDisposition.CREATE_FAILED
         assert ticket is not None
         assert command is not None
+        # The wait owns its own deadline.  Reconstructing it from the same bound
+        # keeps the timeout observation bound-relative without changing what the
+        # wait measures or when it returns.
+        wait_started = monotonic()
         completed = await _wait_for_thread_signal(
             ticket.durability_event,
             timeout_seconds=float(timeout_seconds),
         )
         if not completed:
+            # Read the milestone at the timeout instant; the settlement below is
+            # free to reach it afterwards.
+            durability_signal = _ticket_signal_time(ticket.durability_event)
             self._begin_timed_out_consent_settlement(
                 authority,
                 ticket,
@@ -1801,6 +1848,16 @@ class HostEvidenceRuntimeV1:
                 binding_is_current,
             )
             await self._clear_timed_out_consent_activation(authority, operation)
+            _observe_consent_control_timeout(
+                operation="consent",
+                bound_seconds=float(timeout_seconds),
+                offset_ms={
+                    "create_durable": _milestone_offset_ms(
+                        durability_signal,
+                        deadline=wait_started + float(timeout_seconds),
+                    ),
+                },
+            )
             return ConsentDisposition.CONTROL_TIMED_OUT
         return await self._finalize_consent_activation(
             authority,
