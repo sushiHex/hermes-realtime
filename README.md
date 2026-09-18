@@ -81,8 +81,10 @@ uv build
 Then install the generated wheel into the environment that will run Hermes Realtime:
 
 ```bash
-python -m pip install dist/hermes_realtime-*.whl
+uv pip install --python <path-to-python-3.11> dist/hermes_realtime-<version>-py3-none-any.whl
 ```
+
+Substitute the path to that environment's Python 3.11 interpreter and the exact wheel filename printed by `uv build`.
 
 The functional work-dispatch route is the separately launched, authenticated `hermes-realtime-host`. It talks to the configured Hermes API server and does not require in-process plugin bridge dispatch.
 
@@ -95,7 +97,7 @@ hermes plugins doctor hermes-realtime --ci
 hermes plugins list --enabled
 ```
 
-If Hermes uses an isolated environment, use that environment's Python or install with `uv pip install --python <path-to-hermes-python> dist/hermes_realtime-*.whl`.
+If Hermes uses an isolated environment, use that environment's Python or install with `uv pip install --python <path-to-hermes-python> dist/hermes_realtime-<version>-py3-none-any.whl`.
 
 A source checkout alone is not an installation. Do not use `hermes plugins install owner/repository` for this package: that command targets directory-style plugins, while Hermes Realtime is a pip entry-point distribution.
 
@@ -183,7 +185,7 @@ uv run --frozen --group dev mypy src
 The canonical committed-`HEAD` qualification is:
 
 ```bash
-python scripts/release_gate.py --candidate .
+uv run --frozen --group dev python scripts/release_gate.py --candidate .
 ```
 
 It builds and inspects the wheel and sdist, scans committed Git blobs for secret patterns, verifies browser assets, and tests an isolated installation. It does not qualify dirty, staged, or untracked bytes.

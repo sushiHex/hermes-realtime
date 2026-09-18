@@ -38,7 +38,7 @@ Requirements:
 
 - Python 3.11
 - `uv`
-- Node.js 22.22.2 or newer 22.x, with npm, for browser assets
+- Node.js 22.22.2 or newer 22.x, with npm, for browser assets. `web/package.json` declares this as `"engines": { "node": "^22.22.2" }`; npm warns rather than fails when it is unmet.
 
 ```bash
 git clone https://github.com/sushiHex/hermes-realtime.git
@@ -48,6 +48,8 @@ uv run --frozen --group dev pytest -q
 uv run --frozen --group dev ruff check .
 uv run --frozen --group dev mypy src
 ```
+
+Expect roughly 13 minutes for the full suite and seconds for each of the other three commands. These times are approximate and machine-dependent, and a first run is slower because `uv` downloads the interpreter and the locked dependencies.
 
 ### Contribution and test paths
 
@@ -61,7 +63,7 @@ for the matching native run.
 | --- | --- | --- |
 | Pure Python behavior | Python 3.11 and the locked dev group. For example: `uv run --frozen --group dev pytest -q tests/conversation/test_state.py`, `uv run --frozen --group dev ruff check src/hermes_realtime/conversation/state.py tests/conversation/test_state.py`, and `uv run --frozen --group dev mypy src`. | Default suite work is hardware-generic; do not add account, device, room, or private-network dependencies. |
 | Browser/client assets | Node 22.22.2 and npm. From `web/`: `npm ci --ignore-scripts`, `npm test -- --reporter=verbose --slowTestThreshold=100`, and `npm run build`. | Review generated static assets and their disclosure manifest; the release gate verifies parity. |
-| Packaging, dependencies, workflows, or release policy | A clean committed candidate: `python scripts/release_gate.py --candidate .`. | This gate requires committed bytes and does not replace the required PR checks. |
+| Packaging, dependencies, workflows, or release policy | A clean committed candidate: `uv run --frozen --group dev python scripts/release_gate.py --candidate .`. | This gate validates committed bytes and does not replace the required PR checks. |
 | Native Windows or LiveKit behavior | Follow the [local native-gate procedure](docs/release-gates.md#local-use) and the [required CI boundary](docs/release-gates.md#required-automated-checks). | Requires Windows and a verified, owned local server; ordinary Python contributions can use the default suite. |
 | Installed Hermes work routing | The exact installed Hermes environment and authorized credential context required by [the installed natural-work boundary](docs/release-gates.md#installed-natural-work-boundary-and-latency-gate). | Outside the default suite; keep credentials, capabilities, and operational records private. |
 | Slice 0 provider and physical qualification | Follow the [provider and execution requirements](docs/qualification-execution.md#own-the-execution-environment), then the [machine and operator observations](docs/qualification-execution.md#produce-observations-then-derive-claims). | Requires an admitted environment and an operator; ordinary test success cannot substitute. Keep physical-rig evidence and operational records private. |
@@ -71,10 +73,12 @@ Focused checks guide local iteration; they do not replace the committed-candidat
 For changes that affect packaging, browser assets, dependencies, workflows, or release policy, run the full committed-candidate gate after committing:
 
 ```bash
-python scripts/release_gate.py --candidate .
+uv run --frozen --group dev python scripts/release_gate.py --candidate .
 ```
 
-The gate intentionally refuses dirty or untracked candidate bytes.
+The gate validates committed bytes. It archives `HEAD` into a temporary checkout, so uncommitted and untracked working-tree changes are excluded rather than rejected, and the gate can pass without ever reading them. Commit first, or the result is not evidence for the change in your working tree.
+
+Expect roughly 14 minutes, again approximate and machine-dependent.
 
 ## Change discipline
 
