@@ -1,23 +1,53 @@
 version: 2
 updates:
+  # Action pins are a review record, not a version: tests/test_release_workflow.py
+  # asserts the exact reviewed Node 24 SHAs, their counts, and the uv cache-save
+  # ownership block built around one of them. A bot cannot supply that review, so
+  # batch it: one grouped pull request needs one review pass.
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-  - package-ecosystem: pip
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
+  # uv owns pyproject.toml and uv.lock together. The pip ecosystem rewrites the
+  # manifest without regenerating the lock, so every such pull request failed
+  # `uv lock --check` before a single test ran.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
     ignore:
-      # qualification-hermes mirrors the qualified upstream commit
-      # (see tests/test_qualification_candidate_files.py). These roots are synced deliberately,
-      # never by bot. cryptography is deliberately NOT listed: an ignore cannot be scoped to that
-      # group and would silence dev's security updates; the pin test rejects a bot bump instead.
+      # qualification-hermes mirrors the qualified upstream commit pinned by
+      # scripts/qualification_hermes_source.py (see tests/test_qualification_candidate_files.py).
+      # These roots are derived from that commit rather than chosen here, so a bot bump
+      # proposes a version that cannot resolve against it. cryptography is deliberately NOT
+      # listed: it is also an independent dev constraint, and an ignore cannot be scoped to one
+      # dependency group. tests/test_dependabot_policy.py binds this list to the group so it
+      # cannot drift from pyproject.toml.
       - dependency-name: "concurrent-log-handler"
       - dependency-name: "python-dotenv"
       - dependency-name: "pyyaml"
       - dependency-name: "rich"
+  # The isolated Kokoro CUDA worker keeps its own pinned requirements files with no
+  # lockfile coupling, so a bot change to them is already complete. These are the only
+  # Python updates that currently land green.
+  - package-ecosystem: pip
+    directory: /requirements
+    schedule:
+      interval: weekly
+  # Generated browser assets under src/hermes_realtime/client/static/ are tracked, and
+  # the release gate compares the committed bytes against a fresh build. A bot cannot
+  # regenerate them, so batch the ecosystem: one grouped pull request needs one
+  # `npm run build`. Grouping also lets vite and esbuild move together, which is the
+  # only way either can move at all once their peer ranges disagree.
   - package-ecosystem: npm
     directory: /web
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      web:
+        patterns:
+          - "*"
