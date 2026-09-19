@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from packaging.requirements import Requirement
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -86,73 +88,54 @@ def _ignored_names(ecosystem: str = "uv", directory: str = "/") -> frozenset[str
     return frozenset(_IGNORED.findall(_entry_body(ecosystem, directory)))
 
 
-def test_every_mirrored_root_is_ignored_except_the_unscopable_one() -> None:
-    """A derived pin is not a version a bot may propose.
+# Every ignore list is derived, never authored. Each entry names the set it must equal and
+# the roots it may leave out, so the binding holds in both directions at once: a source
+# root that stops being ignored is caught, and so is an ignore that outlives its root.
+_IGNORE_BINDINGS = (
+    pytest.param(
+        "uv",
+        "/",
+        "the qualification-hermes group in pyproject.toml",
+        _mirrored_roots,
+        _UNSCOPABLE,
+        id="uv-mirrors-the-qualified-commit",
+    ),
+    pytest.param(
+        "pip",
+        "/requirements",
+        f"the roots declared in {_WORKER_ROOTS.name}",
+        _declared_worker_roots,
+        frozenset(),
+        id="pip-mirrors-the-worker-closure-roots",
+    ),
+)
 
-    The qualification-hermes group mirrors the commit pinned by
-    scripts/qualification_hermes_source.py, so each of its roots is computed rather than
-    chosen. Adding a root without ignoring it reopens a class of pull requests that cannot
-    resolve against that commit, and this binding is the only thing that notices.
+
+@pytest.mark.parametrize(("ecosystem", "directory", "source", "derive", "exempt"), _IGNORE_BINDINGS)
+def test_each_ignore_list_equals_the_set_it_is_derived_from(
+    ecosystem: str,
+    directory: str,
+    source: str,
+    derive: Callable[[], frozenset[str]],
+    exempt: frozenset[str],
+) -> None:
+    """An ignore list states which versions are not this repository's to choose.
+
+    Both lists are computed elsewhere. The uv entry follows the group that mirrors the
+    qualified upstream commit; the /requirements entry follows the roots the worker
+    closure is compiled from. Equality is what binds them, because either direction alone
+    leaves a hole: a subset check misses a stale ignore that goes on suppressing security
+    updates after its root is gone, and a superset check misses a new root that a bot is
+    then free to propose.
     """
-    unignored = _mirrored_roots() - _ignored_names()
-    assert unignored == _UNSCOPABLE, (
-        "the Dependabot ignore list no longer matches the qualification-hermes group in "
-        f"pyproject.toml; unignored mirrored roots are {sorted(unignored)} but only "
-        f"{sorted(_UNSCOPABLE)} can be left out. Ignore the new root, or record here why it "
-        "cannot be scoped."
-    )
-
-
-def test_the_uv_ignore_list_holds_nothing_but_mirrored_roots() -> None:
-    """An ignore hides a dependency from security updates too, so it needs a stated reason.
-
-    The mirrored group is that reason for the root project. Anything else accumulating
-    there would be silently unwatched, which is the failure this file exists to prevent
-    rather than to permit.
-    """
-    unexplained = _ignored_names() - _mirrored_roots()
-    assert not unexplained, (
-        f"{sorted(unexplained)} is ignored under the root uv entry but is not a "
-        "qualification-hermes root. An ignore also suppresses security updates, so add the "
-        "reason here deliberately rather than leaving it unexplained in the configuration."
-    )
-
-
-def test_no_mirrored_root_is_ignored_outside_the_root_uv_entry() -> None:
-    """A mirrored ignore under another entry reads as present and covers nothing.
-
-    The mirrored roots belong to the root project, so their ignores are only effective
-    under the uv entry. Moved beneath the /requirements pip entry or the /web npm entry
-    they would still satisfy a flat reading of this file while Dependabot resumed
-    proposing the very bumps these tests exist to refuse. Other entries keep their own
-    ignores for their own reasons; only the mirrored group is bound here.
-    """
-    mirrored = _mirrored_roots()
-    for ecosystem, directory, body in _entries():
-        if (ecosystem, directory) == ("uv", "/"):
-            continue
-        strays = frozenset(_IGNORED.findall(body)) & mirrored
-        assert not strays, (
-            f"{sorted(strays)} is ignored under the {ecosystem} entry for {directory}, "
-            "where it does not cover the root project; move it to the uv entry"
-        )
-
-
-def test_the_worker_closure_roots_are_never_bot_updated() -> None:
-    """A declared root moves by recompiling the closure, never by editing its output.
-
-    requirements/kokoro-cuda-worker-win-py311.txt is generated from the roots in
-    kokoro-cuda-worker.in. Its derived entries are safe for a bot, which supplies the
-    version and every published wheel hash, but a root changed in the output alone would
-    contradict the file it was compiled from. Attempting them also fails the whole
-    evaluation, because the pinned kokoro-onnx is a win32-only wheel that cannot resolve
-    on Dependabot's Linux runner.
-    """
-    unignored = _declared_worker_roots() - _ignored_names("pip", "/requirements")
-    assert not unignored, (
-        f"{sorted(unignored)} is declared in {_WORKER_ROOTS.name} but not ignored for the "
-        "/requirements entry; a bot changing a declared root in the compiled output would "
-        "contradict the roots it was compiled from"
+    expected = derive() - exempt
+    ignored = _ignored_names(ecosystem, directory)
+    assert ignored == expected, (
+        f"the {ecosystem} entry for {directory} no longer matches {source}. "
+        f"It ignores {sorted(ignored)} but should ignore exactly {sorted(expected)}: "
+        f"{sorted(expected - ignored)} is unignored and {sorted(ignored - expected)} is "
+        "ignored without a source. An ignore also suppresses security updates, so both "
+        "directions are deliberate."
     )
 
 
