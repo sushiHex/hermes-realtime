@@ -1,15 +1,22 @@
 """Connect the Windows process owner to the run journal without granting either authority.
 
-[ADR 0002](../docs/adr/0002-qualification-recovery-handoff.md) fixes the shape this module
-implements. The kernel decides process liveness: the Job carries
-``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` and is associated at creation, so a controller death
-at any boundary terminates the child. What survives a restart is therefore not a process
-question but an effects question, and the journal answers only that.
+The [accepted execution protocol](../docs/qualification-execution.md#finalize-validate-and-retain)
+is the authority here. It requires that process acquisition be made recoverable by durably
+recording a launch intent before creation, creating the child suspended with its
+noninherited kill-on-close Job already associated, persisting the observed creation and
+image identity while it remains suspended, and resuming only after that update is durable.
+[ADR 0002](../docs/adr/0002-qualification-recovery-handoff.md) maps that requirement onto
+the merged primitives and is proposed rather than accepted; nothing below depends on it.
 
-Two things follow, and they are the whole module. Acquisition has one call site, so the
-durable write that brackets each kernel call cannot be reordered or skipped by a caller.
-Recovery is a pure function from recorded facts to a refusal, because no recorded fact can
-resume a child, establish an exit, or mint acceptance.
+The protocol draws the consequence that makes this module small: a controller death before
+the identity update leaves an unresumed child owned by the closing Job, never an unassigned
+running worker. What survives a restart is therefore not a process question but an effects
+question, and the journal answers only that.
+
+Two things follow. Acquisition has one call site, so the durable write that brackets each
+kernel call cannot be reordered or skipped by a caller. Recovery is a pure function from
+recorded facts to a refusal, because no recorded fact can resume a child, establish an
+exit, or mint acceptance.
 """
 
 from __future__ import annotations
@@ -31,6 +38,8 @@ class _RootOwnerV1(Protocol):
     def launch_root_suspended(self) -> object: ...
 
     def resume_root(self, root: object, /) -> None: ...
+
+    def finalize(self) -> object: ...
 
 
 class _ProcessRecorderV1(Protocol):
@@ -65,15 +74,19 @@ class AttemptDispositionV1(StrEnum):
     REFUSE_CLEANING = "refuse_cleaning"
 
 
-def _identity_of(root: object, scenario_id: str) -> ProcessIdentityFactsV1:
+def _identity_of(root: object) -> ProcessIdentityFactsV1:
     """Restate the owner's proven root identity in the journal's vocabulary.
 
-    Every field is copied from what the kernel reported through a handle the owner still
-    holds. Nothing here observes the process independently, and nothing invents a value.
+    Every field comes from the owner, including the scenario and role. Taking the scenario
+    from the caller's intent instead would launder that value into both sides of the
+    journal's own ``process_bound`` comparison, which checks the recorded identity against
+    the recorded intent: the check would compare the caller's value with itself and could
+    never refuse a root belonging to another scenario. Copying only what the owner proved
+    is what leaves that guard able to fire.
     """
     identity = root.identity  # type: ignore[attr-defined]
     return ProcessIdentityFactsV1(
-        scenario_id,
+        identity.scenario_id,
         root.role,  # type: ignore[attr-defined]
         identity.pid,
         identity.parent_pid,
@@ -94,21 +107,36 @@ def acquire_recorded_root(
     nothing of the kernel calls around it. Composing them here is what makes the wrong
     order unreachable, because there is no caller left to interleave them.
 
-    Failure needs no handling, and that is deliberate. A raise anywhere below leaves the
-    last durable record short of the boundary it was about to cross, and the owner
-    finalizes itself, which permanently revokes resume. A restart then reads a pending
-    intent and refuses. Recording an optimistic ``process_absent`` here would replace that
-    conservative refusal with a claim this module cannot support: after a failed launch it
-    does not know whether a child was created before the owner terminated the Job.
+    The owner finalizes itself only when one of its own operations raises. A recorder that
+    raises leaves it untouched, so every such path finalizes here instead. Without that a
+    failed ``record_resumed`` would be the worst case in the module: the resume already
+    returned, so the child is running, and the caller receives an exception in place of the
+    root it needed to shut down. Finalizing on any failure is what keeps "no path leaves a
+    live child behind" true rather than merely usual.
+
+    No path records ``process_absent``. A raise leaves the last durable record short of the
+    boundary it was about to cross, and a restart reads a pending intent and refuses.
+    Claiming absence would replace that conservative refusal with a statement this module
+    cannot support: after a failed launch it does not know whether a child was created
+    before the Job was terminated.
     """
     if type(intent) is not ProcessIntentV1:
         raise TypeError("process intent must be exact")
     ordinal = recorder.intend_process(intent)
-    root = owner.launch_root_suspended()
-    recorder.bind_suspended_process(ordinal, _identity_of(root, intent.scenario_id))
-    recorder.intend_resume(ordinal)
-    owner.resume_root(root)
-    recorder.record_resumed(ordinal)
+    try:
+        root = owner.launch_root_suspended()
+        recorder.bind_suspended_process(ordinal, _identity_of(root))
+        recorder.intend_resume(ordinal)
+        owner.resume_root(root)
+        recorder.record_resumed(ordinal)
+    except BaseException as primary:
+        try:
+            owner.finalize()
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "recorded root acquisition and finalization both failed", [primary, cleanup]
+            ) from None
+        raise
     return RecordedRootV1(ordinal, root)
 
 

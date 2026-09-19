@@ -29,6 +29,7 @@ def _intent() -> journal.ProcessIntentV1:
 
 @dataclass(frozen=True, slots=True)
 class _Identity:
+    scenario_id: str = "deterministic_equivalence"
     pid: int = 4242
     parent_pid: int = 17
     parent_creation_filetime: int = 130_000_000_000_000_000
@@ -63,31 +64,41 @@ class _TracingOwner:
         del root
         self._step("resume_root")
 
+    def finalize(self) -> object:
+        self._trace.append("finalize")
+        return None
+
 
 class _TracingRecorder:
-    """A journal writer that records its transitions in order, and nothing else."""
+    """A journal writer that records its transitions in order, and can fail at one."""
 
-    def __init__(self, trace: list[str]) -> None:
+    def __init__(self, trace: list[str], *, fail_at: str | None = None) -> None:
         self._trace = trace
+        self._fail_at = fail_at
+
+    def _step(self, name: str) -> None:
+        self._trace.append(name)
+        if name == self._fail_at:
+            raise RuntimeError(f"recorder refused at {name}")
 
     def intend_process(self, intent: journal.ProcessIntentV1, /) -> int:
         del intent
-        self._trace.append("intend_process")
+        self._step("intend_process")
         return 1
 
     def bind_suspended_process(
         self, ordinal: int, identity: journal.ProcessIdentityFactsV1, /
     ) -> None:
         del ordinal, identity
-        self._trace.append("bind_suspended_process")
+        self._step("bind_suspended_process")
 
     def intend_resume(self, ordinal: int, /) -> None:
         del ordinal
-        self._trace.append("intend_resume")
+        self._step("intend_resume")
 
     def record_resumed(self, ordinal: int, /) -> None:
         del ordinal
-        self._trace.append("record_resumed")
+        self._step("record_resumed")
 
 
 def test_every_boundary_is_durable_before_the_kernel_call_that_crosses_it() -> None:
@@ -128,7 +139,7 @@ def test_a_refused_launch_leaves_the_intent_pending_rather_than_claiming_absence
             _intent(),
         )
 
-    assert trace == ["intend_process", "launch_root_suspended"]
+    assert trace == ["intend_process", "launch_root_suspended", "finalize"]
 
 
 def test_a_refused_resume_leaves_execution_uncertain() -> None:
@@ -150,8 +161,65 @@ def test_a_refused_resume_leaves_execution_uncertain() -> None:
         "bind_suspended_process",
         "intend_resume",
         "resume_root",
+        "finalize",
     ]
     assert "record_resumed" not in trace
+
+
+def test_a_recorder_failure_after_the_resume_still_finalizes_the_owner() -> None:
+    """The owner self-finalizes only for its own failures, so this path must do it.
+
+    ``resume_root`` has already returned, which means the child is running and the owner
+    saw nothing go wrong. Raising without finalizing would hand the caller an exception in
+    place of the root it needed to shut down, leaving a live worker behind.
+    """
+    trace: list[str] = []
+    with pytest.raises(RuntimeError):
+        recovery.acquire_recorded_root(
+            _TracingOwner(trace), _TracingRecorder(trace, fail_at="record_resumed"), _intent()
+        )
+
+    assert trace[-2:] == ["record_resumed", "finalize"]
+
+
+def test_finalization_failure_preserves_the_original_refusal() -> None:
+    """A cleanup failure must not hide what actually went wrong."""
+
+    class _UnfinalizableOwner(_TracingOwner):
+        def finalize(self) -> object:
+            raise OSError("finalization refused")
+
+    trace: list[str] = []
+    with pytest.raises(BaseExceptionGroup) as raised:
+        recovery.acquire_recorded_root(
+            _UnfinalizableOwner(trace), _TracingRecorder(trace, fail_at="intend_resume"), _intent()
+        )
+
+    assert [type(error) for error in raised.value.exceptions] == [RuntimeError, OSError]
+
+
+def test_a_root_from_another_scenario_is_refused_by_the_journals_own_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seam records what the owner proved, which is what leaves that guard able to fire.
+
+    Copying the scenario from the caller's intent would put the same value on both sides of
+    the journal's ``process_bound`` comparison, so a root belonging to another scenario
+    would bind under a false identity and then be resumed. A real writer is required here:
+    a tracing double cannot refuse anything.
+    """
+
+    class _ForeignOwner(_TracingOwner):
+        def launch_root_suspended(self) -> object:
+            self._step("launch_root_suspended")
+            return _Root(_Identity(scenario_id="revoke_race"))
+
+    io = _HELPERS["_FakeIo"]()
+    monkeypatch.setattr(journal, "_journal_io", lambda: io)
+    writer = journal._create_run_journal(41, _HELPERS["_binding"](), _HELPERS["_location"]())
+
+    with pytest.raises(ValueError, match="process identity differs"):
+        recovery.acquire_recorded_root(_ForeignOwner([]), writer, _intent())
 
 
 def _facts(**overrides: object) -> journal.RunJournalFactsV1:
