@@ -12,6 +12,7 @@ import sys
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any, cast
 
@@ -181,6 +182,40 @@ class _Transcriber:
 
     async def close(self) -> None:
         return None
+
+
+_INGRESS_OBSERVATION_PREFIX = "[full-host-ingress] "
+_ACCEPTANCE_BOUND_SECONDS = 30.0
+
+
+def _evidence_observation(database: Path) -> dict[str, object]:
+    """Summarise what the writer has durably accepted, without any of its content.
+
+    The acceptance wait below collapses to a bare ``TimeoutError``, which names neither
+    the source that failed to arrive nor how far the evidence path got. Both are already
+    recorded in the database the wait is polling, so read them once and keep them: the
+    event kinds present bound the milestone reached, and the accepted sources say whether
+    the missing final is the typed one, the microphone one, or both.
+
+    Only kinds, counts and the ``typed``/``microphone`` category are reported. Transcript
+    text, identities and paths stay in the database.
+    """
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
+        milestones = {
+            str(kind): int(count)
+            for kind, count in connection.execute(
+                "SELECT event_kind, COUNT(*) FROM evidence_events GROUP BY event_kind"
+            ).fetchall()
+        }
+        finals = connection.execute(
+            "SELECT canonical_payload FROM evidence_events "
+            "WHERE event_kind = 'user_final_accepted'"
+        ).fetchall()
+    return {
+        "version": 1,
+        "milestones": dict(sorted(milestones.items())),
+        "accepted_sources": sorted(json.loads(row[0])["source"] for row in finals),
+    }
 
 
 class _Vad:
@@ -361,18 +396,22 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
         async with asyncio.timeout(10):
             while transcriber._armed:
                 await asyncio.sleep(0.05)
-        async with asyncio.timeout(30):
-            while True:
-                with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-                    rows = connection.execute(
-                        "SELECT canonical_payload FROM evidence_events "
-                        "WHERE event_kind = 'user_final_accepted'"
-                    ).fetchall()
-                if len(rows) >= 2:
-                    break
-                await asyncio.sleep(0.1)
-        payloads = [json.loads(row[0]) for row in rows]
-        assert {payload["source"] for payload in payloads} == {"typed", "microphone"}
+        observation: dict[str, object] = {}
+        try:
+            async with asyncio.timeout(_ACCEPTANCE_BOUND_SECONDS):
+                while True:
+                    observation = _evidence_observation(database)
+                    if len(cast(list[str], observation["accepted_sources"])) >= 2:
+                        break
+                    await asyncio.sleep(0.1)
+        finally:
+            print(
+                _INGRESS_OBSERVATION_PREFIX
+                + json.dumps(
+                    {"bound_seconds": _ACCEPTANCE_BOUND_SECONDS, **observation}, sort_keys=True
+                )
+            )
+        assert set(cast(list[str], observation["accepted_sources"])) == {"typed", "microphone"}
     finally:
         await room.disconnect()
         if running is not None:
