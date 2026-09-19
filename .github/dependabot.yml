@@ -31,13 +31,21 @@ updates:
       - dependency-name: "python-dotenv"
       - dependency-name: "pyyaml"
       - dependency-name: "rich"
-  # The isolated Kokoro CUDA worker keeps its own pinned requirements files with no
-  # lockfile coupling, so a bot change to them is already complete. These are the only
-  # Python updates that currently land green.
+  # The isolated Kokoro CUDA worker keeps its own hashed closure. A derived entry in it
+  # is one a bot can complete: it carries the version and every published wheel hash,
+  # which is what `uv pip compile --generate-hashes` emits and what the README sanctions
+  # via --upgrade-package. Its two declared roots are not, because they live in
+  # requirements/kokoro-cuda-worker.in and only move by recompiling the closure, and
+  # kokoro-onnx moves in lockstep with pyproject.toml besides. Attempting them also makes
+  # the whole evaluation fail: the pinned kokoro-onnx is a win32-only wheel that cannot
+  # resolve on Dependabot's Linux runner.
   - package-ecosystem: pip
     directory: /requirements
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "kokoro-onnx"
+      - dependency-name: "onnxruntime-gpu"
   # Generated browser assets under src/hermes_realtime/client/static/ are tracked, and
   # the release gate compares the committed bytes against a fresh build. A bot cannot
   # regenerate them, so batch the ecosystem: one grouped pull request needs one
