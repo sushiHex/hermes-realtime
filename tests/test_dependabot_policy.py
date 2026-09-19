@@ -32,8 +32,23 @@ def _mirrored_roots() -> frozenset[str]:
     return frozenset(Requirement(item).name for item in group)
 
 
+def _entry_body(ecosystem: str, directory: str) -> str:
+    """Return one update entry's text, so an ignore cannot be read from a neighbour's.
+
+    An ignore belongs to the entry that encloses it. Reading the file as a flat list of
+    `dependency-name` lines would accept one that had drifted under another ecosystem,
+    where it covers nothing, while still reading as present.
+    """
+    text = _CONFIG.read_text(encoding="utf-8")
+    for entry in re.split(r"^  - (?=package-ecosystem:)", text, flags=re.MULTILINE)[1:]:
+        lines = [line.strip() for line in entry.splitlines()]
+        if lines[0] == f"package-ecosystem: {ecosystem}" and f"directory: {directory}" in lines:
+            return entry
+    raise AssertionError(f"no {ecosystem} entry for {directory} in {_CONFIG.name}")
+
+
 def _ignored_names() -> frozenset[str]:
-    return frozenset(_IGNORED.findall(_CONFIG.read_text(encoding="utf-8")))
+    return frozenset(_IGNORED.findall(_entry_body("uv", "/")))
 
 
 def test_every_mirrored_root_is_ignored_except_the_unscopable_one() -> None:
@@ -64,6 +79,22 @@ def test_the_ignore_list_holds_nothing_but_mirrored_roots() -> None:
         f"{sorted(unexplained)} is ignored but is not a qualification-hermes root. An ignore "
         "also suppresses security updates, so add the reason here deliberately rather than "
         "leaving it unexplained in the configuration."
+    )
+
+
+def test_every_ignore_belongs_to_the_root_uv_entry() -> None:
+    """An ignore under the wrong ecosystem reads as present and covers nothing.
+
+    The mirrored roots are Python dependencies of the root project, so their ignores are
+    only effective under the uv entry. Moved beneath the /requirements pip entry or the
+    /web npm entry they would still satisfy a flat reading of this file while Dependabot
+    resumed proposing the very bumps these tests exist to refuse.
+    """
+    everywhere = sorted(_IGNORED.findall(_CONFIG.read_text(encoding="utf-8")))
+    assert everywhere == sorted(_IGNORED.findall(_entry_body("uv", "/"))), (
+        "an ignored dependency is declared outside the root uv entry, where it has no "
+        f"effect; the file ignores {everywhere} but the uv entry covers "
+        f"{sorted(_ignored_names())}"
     )
 
 
