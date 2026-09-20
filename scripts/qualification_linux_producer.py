@@ -17,10 +17,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -41,6 +43,8 @@ _DOCKER_READ_CHUNK = 64 * 1024
 _DOCKER_TIMEOUT_SECONDS = 360.0
 _DOCKER_CLEANUP_RESERVE_SECONDS = 5.0
 _DOCKER_POLL_SECONDS = 0.02
+_PUBLISHER_REQUEST_BUDGET_SECONDS = 30.0
+_PUBLISHER_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -156,10 +160,116 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _open(request: urllib.request.Request) -> Any:
+def _open(request: urllib.request.Request, timeout: float) -> Any:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect).open(
-        request, timeout=30
+        request, timeout=timeout
     )
+
+
+def _retry_after_seconds(value: object, *, now: float) -> int | float | None:
+    if type(value) is not str:
+        return None
+    raw = value.strip()
+    if re.fullmatch(r"[0-9]+", raw):
+        return int(raw)
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            return None
+        return max(0.0, parsed.timestamp() - now)
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+class _PublisherRequestBudget:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._sleeper = sleeper
+        self._deadline = clock() + _PUBLISHER_REQUEST_BUDGET_SECONDS
+        self._attempts = 0
+        self._retries = 0
+        self._refusal_category: str | None = None
+
+    def remaining(self) -> float:
+        remaining = self._deadline - self._clock()
+        if remaining <= 0:
+            self._refusal_category = "deadline_exhausted"
+        _require(remaining > 0, "Linux image publisher request budget exhausted")
+        return remaining
+
+    def begin_attempt(self) -> float:
+        timeout = self.remaining()
+        self._attempts += 1
+        return timeout
+
+    def retry_delay(self, value: object) -> float | None:
+        if self._retries >= len(_PUBLISHER_RETRY_DELAYS):
+            self._refusal_category = "retry_limit"
+            return None
+        advertised = _retry_after_seconds(value, now=self._wall_clock())
+        delay = _PUBLISHER_RETRY_DELAYS[self._retries] if advertised is None else advertised
+        if delay >= self.remaining():
+            self._refusal_category = "retry_delay_exceeds_budget"
+            return None
+        self._retries += 1
+        return float(delay)
+
+    def sleep(self, delay: float) -> None:
+        self._sleeper(delay)
+        self.remaining()
+
+    def summary(self, *, phase: str, outcome: str) -> dict[str, int | str]:
+        return {
+            "attempts": self._attempts,
+            "outcome": outcome,
+            "phase": phase,
+            "refusalCategory": (
+                "none"
+                if outcome == "accepted"
+                else self._refusal_category or "publisher_refused"
+            ),
+            "retriesScheduled": self._retries,
+            "version": 1,
+        }
+
+
+def _open_with_budget(
+    request: urllib.request.Request, budget: _PublisherRequestBudget
+) -> Any:
+    while True:
+        try:
+            response = _open(request, budget.begin_attempt())
+        except urllib.error.HTTPError as error:
+            retry_after = None
+            if error.code == 429:
+                get_header = getattr(error.headers, "get", None)
+                if callable(get_header):
+                    retry_after = get_header("Retry-After")
+                try:
+                    delay = budget.retry_delay(retry_after)
+                except BaseException:
+                    error.close()
+                    raise
+            else:
+                delay = None
+            if delay is None:
+                raise
+            error.close()
+            budget.sleep(delay)
+            continue
+        try:
+            budget.remaining()
+        except BaseException:
+            response.close()
+            raise
+        return response
 
 
 def _http_bytes(
@@ -168,7 +278,10 @@ def _http_bytes(
     accept: str | None = None,
     bearer: str | None = None,
     allow_redirect: bool = False,
+    budget: _PublisherRequestBudget | None = None,
 ) -> bytes:
+    if budget is None:
+        budget = _PublisherRequestBudget()
     parsed = urllib.parse.urlsplit(url)
     _require(
         parsed.scheme == "https"
@@ -183,7 +296,7 @@ def _http_bytes(
         headers["Authorization"] = "Bearer " + bearer
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        response = _open(request)
+        response = _open_with_budget(request, budget)
     except urllib.error.HTTPError as error:
         location = error.headers.get("Location")
         if not allow_redirect or error.code not in {302, 307} or type(location) is not str:
@@ -202,50 +315,75 @@ def _http_bytes(
         redirect_headers = {} if accept is None else {"Accept": accept}
         redirected_request = urllib.request.Request(target, headers=redirect_headers, method="GET")
         try:
-            response = _open(redirected_request)
+            response = _open_with_budget(redirected_request, budget)
         except urllib.error.HTTPError as redirected_error:
             redirected_error.close()
             raise ValueError("Linux image publisher redirect differs") from redirected_error
-        _require(
-            response.status == 200 and response.url == target,
-            "Linux image publisher redirect differs",
-        )
+        with response:
+            _require(
+                response.status == 200 and response.url == target,
+                "Linux image publisher redirect differs",
+            )
+            raw = response.read(64 * 1024 + 1)
+            budget.remaining()
     else:
-        _require(
-            response.status == 200 and response.url == url, "Linux image publisher response differs"
-        )
-    with response:
-        raw = response.read(64 * 1024 + 1)
+        with response:
+            _require(
+                response.status == 200 and response.url == url,
+                "Linux image publisher response differs",
+            )
+            raw = response.read(64 * 1024 + 1)
+            budget.remaining()
     _require(len(raw) <= 64 * 1024, "Linux image publisher response exceeds its bound")
     return cast(bytes, raw)
 
 
-def _publisher_image() -> tuple[images.AdmittedLinuxRuntimeImageV1, bytes, bytes]:
-    token_raw = _http_bytes(_TOKEN)
-    token_value = json.loads(token_raw)
-    _require(
-        type(token_value) is dict and type(token_value.get("token")) is str,
-        "Linux image registry token differs",
-    )
-    token = cast(str, token_value["token"])
-    _require(0 < len(token) <= 8192, "Linux image registry token differs")
-    digest = images._POLICY.manifest_sha256
-    manifest_url = _REGISTRY + "/v2/library/python/manifests/sha256:" + digest
-    manifest = _http_bytes(manifest_url, accept=_OCI_MANIFEST, bearer=token)
-    _require(_sha(manifest) == digest, "Linux image publisher manifest differs")
-    document = json.loads(manifest)
-    config_digest = document["config"]["digest"]
-    _require(
-        type(config_digest) is str and config_digest.startswith("sha256:"),
-        "Linux image config reference differs",
-    )
-    config = _http_bytes(
-        _REGISTRY + "/v2/library/python/blobs/" + config_digest,
-        accept="application/octet-stream",
-        bearer=token,
-        allow_redirect=True,
-    )
-    return images.admit_linux_runtime_image(manifest, config), manifest, config
+def _publisher_image(
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> tuple[images.AdmittedLinuxRuntimeImageV1, bytes, bytes]:
+    budget = _PublisherRequestBudget(clock=clock, wall_clock=wall_clock, sleeper=sleeper)
+    phase = "token"
+    outcome = "refused"
+    try:
+        token_raw = _http_bytes(_TOKEN, budget=budget)
+        token_value = json.loads(token_raw)
+        _require(
+            type(token_value) is dict and type(token_value.get("token")) is str,
+            "Linux image registry token differs",
+        )
+        token = cast(str, token_value["token"])
+        _require(0 < len(token) <= 8192, "Linux image registry token differs")
+        phase = "manifest"
+        digest = images._POLICY.manifest_sha256
+        manifest_url = _REGISTRY + "/v2/library/python/manifests/sha256:" + digest
+        manifest = _http_bytes(manifest_url, accept=_OCI_MANIFEST, bearer=token, budget=budget)
+        _require(_sha(manifest) == digest, "Linux image publisher manifest differs")
+        document = json.loads(manifest)
+        config_digest = document["config"]["digest"]
+        _require(
+            type(config_digest) is str and config_digest.startswith("sha256:"),
+            "Linux image config reference differs",
+        )
+        phase = "config"
+        config = _http_bytes(
+            _REGISTRY + "/v2/library/python/blobs/" + config_digest,
+            accept="application/octet-stream",
+            bearer=token,
+            allow_redirect=True,
+            budget=budget,
+        )
+        admitted = images.admit_linux_runtime_image(manifest, config)
+        outcome = "accepted"
+        return admitted, manifest, config
+    finally:
+        with suppress(OSError, ValueError):
+            print(
+                "[linux-publisher] "
+                + json.dumps(budget.summary(phase=phase, outcome=outcome), sort_keys=True)
+            )
 
 
 @dataclass(frozen=True, slots=True)

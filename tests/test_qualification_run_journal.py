@@ -283,6 +283,52 @@ def test_failed_durable_append_permanently_poisons_the_live_writer(
         assert io.events[-1] == ("flush",)
 
 
+@pytest.mark.parametrize(
+    ("bound", "message"),
+    [
+        pytest.param("records", "journal record count exceeds its bound", id="record-count"),
+        pytest.param("bytes", "journal bytes exceed their bound", id="byte-count"),
+    ],
+)
+def test_live_append_capacity_refuses_before_io_without_losing_pending_state(
+    monkeypatch: pytest.MonkeyPatch, bound: str, message: str
+) -> None:
+    """A capacity refusal is pre-I/O and leaves the live writer usable.
+
+    The existing filesystem intent is meaningful state: the refused append would resolve
+    it.  Completing that same transition after restoring the configured bound proves the
+    failed candidate was not applied in memory and the writer was not poisoned.
+    """
+    io = _FakeIo()
+    writer = _new(monkeypatch, io)
+    pending = writer.intend_filesystem(_filesystem())
+    original_records = journal._MAX_RECORDS
+    original_bytes = journal._MAX_JOURNAL_BYTES
+    if bound == "records":
+        monkeypatch.setattr(journal, "_MAX_RECORDS", writer._count)
+    else:
+        monkeypatch.setattr(journal, "_MAX_JOURNAL_BYTES", writer._size)
+    before = bytes(io.raw)
+    events = tuple(io.events)
+
+    with pytest.raises(ValueError, match=message):
+        writer.record_filesystem_absent(pending)
+
+    assert bytes(io.raw) == before
+    assert tuple(io.events) == events
+    assert writer._poisoned is False
+    refused = journal._inspect_run_journal(41, _binding(), _location())
+    assert refused.integrity_complete is True
+    assert refused.pending_filesystems == (pending,)
+    monkeypatch.setattr(journal, "_MAX_RECORDS", original_records)
+    monkeypatch.setattr(journal, "_MAX_JOURNAL_BYTES", original_bytes)
+    writer.record_filesystem_absent(pending)
+    writer.record_sequence_complete()
+    facts = journal._inspect_run_journal(41, _binding(), _location())
+    assert facts.pending_filesystems == ()
+    assert facts.recorded_complete is True
+
+
 def test_control_interruption_preserves_identity_and_poisons_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
