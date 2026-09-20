@@ -17,17 +17,22 @@ from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _ROOT / ".github" / "dependabot.yml"
 _WORKER_ROOTS = _ROOT / "requirements" / "kokoro-cuda-worker.in"
 _IGNORED = re.compile(r'^\s*- dependency-name: "([^"]+)"\s*$', re.MULTILINE)
 
-# The one mirrored root an ignore cannot cover. cryptography is pinned by the qualified
-# upstream commit *and* constrained independently by the dev group, and an ignore applies
-# to a dependency, not to one dependency group. Silencing it would silence dev's own
-# security updates, so the bump is refused downstream instead.
-_UNSCOPABLE = frozenset({"cryptography"})
+# Every mirrored root is ignored. cryptography used to be the exception, because it is also
+# an independent dev constraint and an ignore applies to a dependency rather than to one
+# dependency group. It is covered now by a narrower means: the two constraints sit two
+# majors apart, so refusing only major updates refuses the derived bump alone. That
+# separation is a precondition, not a coincidence, and the tests below bind it.
+_UNSCOPABLE: frozenset[str] = frozenset()
+_MAJOR_ONLY = re.compile(
+    r'- dependency-name: "cryptography"\n\s+update-types: \["version-update:semver-major"\]'
+)
 
 
 def _entries() -> list[tuple[str, str, str]]:
@@ -136,6 +141,47 @@ def test_each_ignore_list_equals_the_set_it_is_derived_from(
         f"{sorted(expected - ignored)} is unignored and {sorted(ignored - expected)} is "
         "ignored without a source. An ignore also suppresses security updates, so both "
         "directions are deliberate."
+    )
+
+
+def _cryptography_majors() -> tuple[int, int]:
+    """Return the mirrored pin's major and the dev range's lowest admissible major."""
+    groups = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "dependency-groups"
+    ]
+
+    def lowest(group: str) -> int:
+        requirement = next(
+            parsed
+            for parsed in (Requirement(item) for item in groups[group])
+            if parsed.name == "cryptography"
+        )
+        return min(
+            Version(spec.version) for spec in requirement.specifier if spec.operator in {"==", ">="}
+        ).major
+
+    return lowest("qualification-hermes"), lowest("dev")
+
+
+def test_the_mirrored_cryptography_ignore_stays_narrowed_to_major_updates() -> None:
+    """One dependency carries a derived pin and a live range, separated only by distance.
+
+    A blanket ignore would refuse the derived bump and dev's real updates together, which is
+    why cryptography was left unignored and its pull request reopened every week. Refusing
+    only major updates separates them, but only while the mirrored pin and the dev range
+    remain in different majors. Should they converge, the qualifier would silently stop
+    distinguishing a derived bump from one dev can adopt, so the distance is asserted rather
+    than assumed.
+    """
+    assert _MAJOR_ONLY.search(_entry_body("uv", "/")), (
+        "cryptography's ignore must stay narrowed to version-update:semver-major; a blanket "
+        "ignore would also suppress the dev range's own patch and minor updates"
+    )
+    mirrored, dev = _cryptography_majors()
+    assert dev > mirrored, (
+        f"the mirrored cryptography pin (major {mirrored}) and the dev range (major {dev}) no "
+        "longer sit in different majors, so refusing major updates no longer separates the "
+        "derived bump from one dev can adopt. Re-decide the ignore rather than widening it."
     )
 
 

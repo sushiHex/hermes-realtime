@@ -23,14 +23,22 @@ updates:
       # qualification-hermes mirrors the qualified upstream commit pinned by
       # scripts/qualification_hermes_source.py (see tests/test_qualification_candidate_files.py).
       # These roots are derived from that commit rather than chosen here, so a bot bump
-      # proposes a version that cannot resolve against it. cryptography is deliberately NOT
-      # listed: it is also an independent dev constraint, and an ignore cannot be scoped to one
-      # dependency group. tests/test_dependabot_policy.py binds this list to the group so it
-      # cannot drift from pyproject.toml.
+      # proposes a version that cannot resolve against it and the pin test refuses.
+      # tests/test_dependabot_policy.py binds this list to the group so it cannot drift
+      # from pyproject.toml.
       - dependency-name: "concurrent-log-handler"
       - dependency-name: "python-dotenv"
       - dependency-name: "pyyaml"
       - dependency-name: "rich"
+      # cryptography is the one root that is also an independent dev constraint, so a blanket
+      # ignore would silence dev's own updates. It does not need one. The mirrored pin is
+      # ==48.0.1 and the dev range is >=50,<51, two majors apart, so refusing only major
+      # updates refuses exactly the derived bump while leaving every patch and minor release
+      # dev can actually adopt. Narrowing this to a blanket ignore, or letting the two
+      # constraints converge into one major, breaks that separation; the policy test binds
+      # both conditions.
+      - dependency-name: "cryptography"
+        update-types: ["version-update:semver-major"]
   # The isolated Kokoro CUDA worker keeps its own hashed closure. A derived entry in it
   # is one a bot can complete: it carries the version and every published wheel hash,
   # which is what `uv pip compile --generate-hashes` emits and what the README sanctions
