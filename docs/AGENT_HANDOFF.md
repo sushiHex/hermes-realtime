@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Durable rules live in [`AGENTS.md`](../AGENTS.md) and `CLAUDE.md`; contribution paths live in
+Durable rules live in [`AGENTS.md`](../AGENTS.md); contribution paths live in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md). Accepted design lives in
 [ADRs](adr/0001-github-work-tracking.md). [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues)
 owns current work, ownership, status and acceptance, and
@@ -75,8 +75,11 @@ in `AGENTS.md` rather than lessons.
 
 ## Deployment context
 
-Release, tag and package remain gated on the physical microphone test; the public flip does
-not lower that bar. Use the owning issue, its pull request and the actual landing manifest for
-deployment and rollback revisions, and record checks and acceptance evidence there. Keep
+Whether a candidate may be released, tagged or packaged is current status, so it lives in the
+owning issue and its milestone, never here. Use that issue, its pull request and the actual
+landing manifest for deployment and rollback revisions, and record checks and acceptance
+evidence there.
+
+What is durable: a merge is not a release, and local review is not acceptance. Keep
 credentials, one-use launch fragments, private URLs, transcripts and user audio out of
 commits, logs, screenshots and evidence artifacts alike.
