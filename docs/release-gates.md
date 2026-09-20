@@ -19,7 +19,7 @@ still inspects export-ignored paths.
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
 | Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
 | Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
-| Packaged capture and spool recovery | Qualify the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), [capture admission overflow](over-budget-turn.md), [spool crash recovery](spool-crash-matrix.md), and [synthetic fault matrix](synthetic-fault-matrix.md) against the Pure candidate wheel. |
+| Packaged capture and spool recovery | Qualify the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), [capture admission overflow](over-budget-turn.md), [spool crash recovery](spool-crash-matrix.md), [synthetic fault matrix](synthetic-fault-matrix.md), [full-purge cleanup](full-purge-cleanup.md), and [owned-close faults](owned-close-faults.md) against the Pure candidate wheel. |
 
 Before an authorized merge, require the reviewed candidate's five PR checks to
 pass. After merging, wait for all five jobs in the resulting exact-commit `main`
