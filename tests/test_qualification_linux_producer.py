@@ -741,7 +741,7 @@ def test_publisher_redirect_does_not_forward_registry_bearer(monkeypatch):
         def read(self, size: int) -> bytes:
             return b"config"
 
-    def open_request(request):
+    def open_request(request, timeout):
         requests.append(request)
         if len(requests) == 1:
             raise urllib.error.HTTPError(
@@ -764,6 +764,270 @@ def test_publisher_redirect_does_not_forward_registry_bearer(monkeypatch):
     )
     assert requests[0].get_header("Authorization") == "Bearer secret"
     assert requests[1].get_header("Authorization") is None
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "wall_time", "expected_delay"),
+    [
+        ("2", 0.0, 2.0),
+        ("Thu, 01 Jan 1970 00:00:05 GMT", 1.0, 4.0),
+        ("not-a-delay", 0.0, 1.0),
+    ],
+)
+def test_publisher_429_retries_at_advertised_or_fallback_delay(
+    monkeypatch, retry_after, wall_time, expected_delay
+):
+    from scripts import qualification_linux_producer as producer
+
+    now = [0.0]
+    sleeps: list[float] = []
+    errors: list[urllib.error.HTTPError] = []
+    requests: list[urllib.request.Request] = []
+    url = "https://registry-1.docker.io/v2/library/python/manifests/sha256:digest"
+
+    class Response:
+        status = 200
+
+        def __init__(self) -> None:
+            self.url = url
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *arguments):
+            self.closed = True
+
+        def read(self, size: int) -> bytes:
+            return b"manifest"
+
+    def open_request(request, timeout):
+        requests.append(request)
+        assert 0 < timeout <= 30.0
+        if len(requests) == 1:
+            error = urllib.error.HTTPError(
+                request.full_url,
+                429,
+                "throttled",
+                {"Retry-After": retry_after},
+                io.BytesIO(),
+            )
+            errors.append(error)
+            raise error
+        return Response()
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    budget = producer._PublisherRequestBudget(
+        clock=lambda: now[0], wall_clock=lambda: wall_time, sleeper=sleep
+    )
+    assert producer._http_bytes(url, budget=budget) == b"manifest"
+    assert sleeps == [expected_delay]
+    assert len(requests) == 2
+    assert errors[0].fp.closed is True
+
+
+def test_publisher_429_zero_delay_still_has_a_finite_global_retry_cap(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    opens = 0
+    errors: list[urllib.error.HTTPError] = []
+    sleeps: list[float] = []
+
+    def open_request(request, timeout):
+        nonlocal opens
+        opens += 1
+        error = urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "throttled",
+            {"Retry-After": "0"},
+            io.BytesIO(),
+        )
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    budget = producer._PublisherRequestBudget(
+        clock=lambda: 0.0, wall_clock=lambda: 0.0, sleeper=sleeps.append
+    )
+    with pytest.raises(ValueError, match="publisher response differs"):
+        producer._http_bytes("https://auth.docker.io/token", budget=budget)
+    assert opens == 4
+    assert sleeps == [0.0, 0.0, 0.0]
+    assert all(error.fp.closed for error in errors)
+
+
+def test_publisher_non_429_http_failure_is_not_retried(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    errors: list[urllib.error.HTTPError] = []
+
+    def open_request(request, timeout):
+        error = urllib.error.HTTPError(request.full_url, 503, "unavailable", {}, io.BytesIO())
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    with pytest.raises(ValueError, match="publisher response differs"):
+        producer._http_bytes("https://auth.docker.io/token")
+    assert len(errors) == 1
+    assert errors[0].fp.closed is True
+
+
+def test_publisher_uses_one_retry_budget_across_token_and_manifest(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    now = [0.0]
+    sleeps: list[float] = []
+    errors: list[urllib.error.HTTPError] = []
+    opens = 0
+
+    class Response:
+        status = 200
+        url = producer._TOKEN
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *arguments):
+            return None
+
+        def read(self, size: int) -> bytes:
+            return b'{"token":"secret"}'
+
+    def open_request(request, timeout):
+        nonlocal opens
+        opens += 1
+        if opens == 1:
+            error = urllib.error.HTTPError(
+                request.full_url, 429, "throttled", {"Retry-After": "20"}, io.BytesIO()
+            )
+            errors.append(error)
+            raise error
+        if opens == 2:
+            return Response()
+        error = urllib.error.HTTPError(
+            request.full_url, 429, "throttled", {"Retry-After": "11"}, io.BytesIO()
+        )
+        errors.append(error)
+        raise error
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    with pytest.raises(ValueError, match="publisher response differs"):
+        producer._publisher_image(
+            clock=lambda: now[0], wall_clock=lambda: 0.0, sleeper=sleep
+        )
+    assert opens == 3
+    assert sleeps == [20.0]
+    assert all(error.fp.closed for error in errors)
+
+
+def test_publisher_revalidates_manifest_after_429_recovery(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    opens = 0
+
+    class Response:
+        status = 200
+
+        def __init__(self, url: str, raw: bytes) -> None:
+            self.url = url
+            self.raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *arguments):
+            return None
+
+        def read(self, size: int) -> bytes:
+            return self.raw
+
+    def open_request(request, timeout):
+        nonlocal opens
+        opens += 1
+        if opens == 1:
+            return Response(request.full_url, b'{"token":"secret"}')
+        if opens == 2:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "throttled", {"Retry-After": "0"}, None
+            )
+        return Response(request.full_url, b"not-the-admitted-manifest")
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    with pytest.raises(ValueError, match="publisher manifest differs"):
+        producer._publisher_image(clock=lambda: 0.0, wall_clock=lambda: 0.0, sleeper=lambda _: None)
+    assert opens == 3
+
+
+def test_publisher_closes_a_response_that_arrives_after_deadline(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    now = [0.0]
+
+    class Response:
+        status = 200
+        url = "https://auth.docker.io/token"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = Response()
+
+    def open_request(request, timeout):
+        now[0] = 31.0
+        return response
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    budget = producer._PublisherRequestBudget(
+        clock=lambda: now[0], wall_clock=lambda: 0.0, sleeper=lambda _: None
+    )
+    with pytest.raises(ValueError, match="request budget exhausted"):
+        producer._http_bytes(response.url, budget=budget)
+    assert response.closed is True
+
+
+def test_publisher_closes_a_response_read_that_finishes_after_deadline(monkeypatch):
+    from scripts import qualification_linux_producer as producer
+
+    now = [0.0]
+
+    class Response:
+        status = 200
+        url = "https://auth.docker.io/token"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *arguments):
+            self.closed = True
+
+        def read(self, size: int) -> bytes:
+            now[0] = 31.0
+            return b"late"
+
+    response = Response()
+    monkeypatch.setattr(producer, "_open", lambda request, timeout: response)
+    budget = producer._PublisherRequestBudget(
+        clock=lambda: now[0], wall_clock=lambda: 0.0, sleeper=lambda _: None
+    )
+    with pytest.raises(ValueError, match="request budget exhausted"):
+        producer._http_bytes(response.url, budget=budget)
+    assert response.closed is True
 
 
 def test_prepare_inputs_writes_runtime_only_manifest_and_source_archive(tmp_path, monkeypatch):
