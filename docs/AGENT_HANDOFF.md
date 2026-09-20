@@ -29,9 +29,13 @@ criterion sorted every case and is what `.github/dependabot.yml` now encodes (#1
 Three readings were refused by checking the artifact rather than reasoning forward, and each
 refusal improved the result. "Exact pins are reviewed decisions" was over-theorised: the
 failures were the lockfile gate, and exactness was irrelevant. "The closure is generated
-output, so remove the entry" was wrong: `nvidia-cuda-runtime` 13.3.29 publishes three wheels
-and the committed file lists exactly those three, so a derived entry carrying every published
-hash is one a bot *can* complete, and `requirements/README.md` sanctions it. "The entry scoped
+output, so remove the entry" was wrong: at exact public commit
+[`8e427265`](https://github.com/sushiHex/hermes-realtime/commit/8e4272651a06bcb6720d282cab147356a20e30f7),
+`nvidia-cuda-runtime` 13.3.29 [published three wheels](https://pypi.org/pypi/nvidia-cuda-runtime/13.3.29/json),
+and the [committed file](https://github.com/sushiHex/hermes-realtime/blob/8e4272651a06bcb6720d282cab147356a20e30f7/requirements/kokoro-cuda-worker-win-py311.txt#L101-L104)
+lists exactly those three hashes. A derived entry carrying every published hash is one a bot
+*can* complete under the [requirements update procedure](https://github.com/sushiHex/hermes-realtime/blob/8e4272651a06bcb6720d282cab147356a20e30f7/requirements/README.md#L21-L41).
+"The entry scoped
 to a directory is the entry that reaches its files" was disproved by the bot itself, which
 proposed a declared-root change in `kokoro-cuda-worker.in` through the `uv` entry — an ignore
 is per entry, so a root ignored on one entry is proposed by the other.
