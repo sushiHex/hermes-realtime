@@ -39,6 +39,13 @@ updates:
       # both conditions.
       - dependency-name: "cryptography"
         update-types: ["version-update:semver-major"]
+      # The CUDA worker closure's declared roots are reachable from here too, so they are
+      # refused here too. uv reads requirements/kokoro-cuda-worker.in as well as
+      # pyproject.toml, and kokoro-onnx is additionally pinned in the local extra and moves
+      # in lockstep with the worker's package manifest. A root ignored on only one entry is
+      # not ignored; it is proposed by the other.
+      - dependency-name: "kokoro-onnx"
+      - dependency-name: "onnxruntime-gpu"
   # The isolated Kokoro CUDA worker keeps its own hashed closure. A derived entry in it
   # is one a bot can complete: it carries the version and every published wheel hash,
   # which is what `uv pip compile --generate-hashes` emits and what the README sanctions
