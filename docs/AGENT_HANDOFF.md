@@ -62,11 +62,14 @@ assert. Read history and correlate runs; do not write turns. One precondition wa
 the first pass and corrected: enabling an external memory provider forwards raw turn text
 off-machine, which is configured in Hermes and invisible from here.
 
-Instrumentation: #121 made an ingress timeout name itself. On its first recurrence the
-bounded line reported `turn_opened: 1` where two turns were expected, moving the fault off the
-evidence writer — where the first reading had put it — and onto the gap between a final
-transcript and a turn being opened (#120). A widened bound would have produced neither
-reading.
+Instrumentation: #121 distinguished the durable typed acceptance from the missing microphone
+acceptance in #120. The first reading of `turn_opened: 1` incorrectly excluded the evidence
+writer: `try_admit_user_final` enqueues `turn_opened` and `user_final_accepted` together, so
+their shared absence cannot establish whether the runtime opened a second turn. The test
+double did return a microphone final; filtering, routing, admission and persistence remained
+undistinguished. The [source-bound correction](https://github.com/sushiHex/hermes-realtime/issues/120#issuecomment-5752463790)
+records that limit. Observe an independent boundary before assigning a cause; preserve the
+bound that made the missing acceptance visible.
 
 Process: a review found a genuine defect in each of three consecutive changes here, twice a
 check that passed in the broken state and once a fail-open in production code where a caller's
