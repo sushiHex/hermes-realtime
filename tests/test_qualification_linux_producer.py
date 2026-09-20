@@ -884,6 +884,7 @@ def test_publisher_uses_one_retry_budget_across_token_and_manifest(monkeypatch):
     now = [0.0]
     sleeps: list[float] = []
     errors: list[urllib.error.HTTPError] = []
+    timeouts: list[float] = []
     opens = 0
 
     class Response:
@@ -902,6 +903,7 @@ def test_publisher_uses_one_retry_budget_across_token_and_manifest(monkeypatch):
     def open_request(request, timeout):
         nonlocal opens
         opens += 1
+        timeouts.append(timeout)
         if opens == 1:
             error = urllib.error.HTTPError(
                 request.full_url, 429, "throttled", {"Retry-After": "20"}, io.BytesIO()
@@ -927,6 +929,7 @@ def test_publisher_uses_one_retry_budget_across_token_and_manifest(monkeypatch):
         )
     assert opens == 3
     assert sleeps == [20.0]
+    assert timeouts == [30.0, 10.0, 10.0]
     assert all(error.fp.closed for error in errors)
 
 
