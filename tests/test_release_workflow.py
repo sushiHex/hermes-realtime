@@ -213,7 +213,7 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
         "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",  # v7.0.0
         "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",  # v7.0.0
-        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",  # v10.0.1
+        "astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4",  # v10.1.0
     )
 
     expected_uses = (5, 5, 3, 4)
@@ -222,7 +222,7 @@ def test_release_workflow_uses_reviewed_node24_action_pins() -> None:
     assert workflow.count("prune-cache: true") == 4
     assert workflow.count('version: "0.11.28"') == 4
 
-    setup_uv = "      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d\n"
+    setup_uv = "      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4\n"
     hermetic_setup_uv = setup_uv + (
         "        with:\n"
         '          version: "0.11.28"\n'
