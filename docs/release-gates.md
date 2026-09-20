@@ -1,6 +1,6 @@
 # Release gates
 
-Automated candidate acceptance requires all four jobs in the tracked
+Automated candidate acceptance requires all five jobs in the tracked
 [Release Gates workflow](../.github/workflows/release-gates.yml). These checks
 qualify their exercised scope; human-assisted and installed-service claims retain
 the separate gates documented below. See [Implementation status](implementation-status.md)
@@ -18,10 +18,11 @@ still inspects export-ignored paths.
 | Pure candidate wheel | Verify the Linux browser build and committed asset parity, then build the candidate wheel and hash-identified offline dependency closure. |
 | Linux null capture | Install that wheel offline and verify the Linux null-capture boundary. |
 | Hermetic release candidate | Run the Windows source, browser, packaging, and isolated-installation gates. |
-| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), [capture admission overflow](over-budget-turn.md), the [synthetic fault matrix](synthetic-fault-matrix.md), and real-browser self-acceptance. |
+| Native LiveKit release integration | Run the Windows gates with pinned LiveKit, the [archived source-equivalence producer](deterministic-equivalence.md), and real-browser self-acceptance. |
+| Packaged capture and spool recovery | Qualify the [packaged revocation race](revoke-race.md), [capacity rollover](capacity-rollover.md), [capture admission overflow](over-budget-turn.md), [spool crash recovery](spool-crash-matrix.md), and [synthetic fault matrix](synthetic-fault-matrix.md) against the Pure candidate wheel. |
 
-Before an authorized merge, require the reviewed candidate's four PR checks to
-pass. After merging, wait for all four jobs in the resulting exact-commit `main`
+Before an authorized merge, require the reviewed candidate's five PR checks to
+pass. After merging, wait for all five jobs in the resulting exact-commit `main`
 push run to complete on attempt 1 before advancing to the next candidate. Preserve
 any failed run and investigate it; an earlier green PR run does not replace the
 main push result. Head or base changes require requalification of the new candidate.
@@ -64,7 +65,7 @@ The `release-candidate` job runs, from that fresh candidate:
    `git archive`, so `.gitattributes export-ignore` cannot hide a committed
    secret; the second scans the extracted distributable candidate.
 
-The Native job also consumes the existing Pure candidate wheel artifact. Its
+The Packaged capture and spool recovery job consumes the existing Pure candidate wheel artifact. Its
 packaged producers verify the wheel digest and every runtime source blob,
 then execute the unpacked pure wheel in an owned process. These packaged
 scenarios do not establish the full installed dependency or physical matrix.
