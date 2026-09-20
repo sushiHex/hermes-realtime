@@ -9,6 +9,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | What exists, and what has been verified? | [Implementation status](implementation-status.md): source, tests, defaults, and outstanding qualification |
 | How do I contribute a change? | [Contributing](../CONTRIBUTING.md): setup, the [contribution and test paths](../CONTRIBUTING.md#contribution-and-test-paths), public-repository boundaries, and PR expectations |
 | Which engineering rules apply? | [Development guide](../AGENTS.md): protocol, ownership, cancellation, and change discipline |
+| What did the last session learn? | [Agent handoff](AGENT_HANDOFF.md): findings and how they were established, so they are not re-derived or re-refuted. Context, not a task ledger — status stays in the owning issue |
 
 ## Implementation guides
 
