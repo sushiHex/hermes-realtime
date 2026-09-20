@@ -1033,6 +1033,142 @@ def test_publisher_closes_a_response_read_that_finishes_after_deadline(monkeypat
     assert response.closed is True
 
 
+def test_publisher_emits_a_bounded_refusal_marker_without_publisher_data(monkeypatch, capsys):
+    from scripts import qualification_linux_producer as producer
+
+    error = urllib.error.HTTPError(
+        producer._TOKEN,
+        429,
+        "private-reason",
+        {"Retry-After": "30", "X-Private": "private-header"},
+        io.BytesIO(b"private-body"),
+    )
+    monkeypatch.setattr(producer, "_open", lambda request, timeout: (_ for _ in ()).throw(error))
+
+    with pytest.raises(ValueError, match="publisher response differs"):
+        producer._publisher_image(clock=lambda: 0.0, wall_clock=lambda: 0.0, sleeper=lambda _: None)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("[linux-publisher] ")
+    assert json.loads(lines[0].removeprefix("[linux-publisher] ")) == {
+        "attempts": 1,
+        "outcome": "refused",
+        "phase": "token",
+        "refusalCategory": "retry_delay_exceeds_budget",
+        "retriesScheduled": 0,
+        "version": 1,
+    }
+    assert all(
+        secret not in lines[0] for secret in ("private-reason", "private-header", "private-body")
+    )
+    assert error.fp.closed is True
+
+
+def test_publisher_keeps_the_shared_deadline_through_config_redirect(monkeypatch, capsys):
+    from scripts import qualification_linux_producer as producer
+
+    now = [0.0]
+    sleeps: list[float] = []
+    requests: list[urllib.request.Request] = []
+    timeouts: list[float] = []
+    target = "https://signed.publisher.invalid/config?signature=opaque"
+    config_digest = "b" * 64
+    manifest = json.dumps({"config": {"digest": "sha256:" + config_digest}}).encode()
+    config = b"config"
+    admitted = object()
+
+    class Response:
+        status = 200
+
+        def __init__(self, url: str, raw: bytes) -> None:
+            self.url = url
+            self.raw = raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *arguments):
+            return None
+
+        def read(self, size: int) -> bytes:
+            return self.raw
+
+    def open_request(request, timeout):
+        requests.append(request)
+        timeouts.append(timeout)
+        if len(requests) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "throttled", {"Retry-After": "20"}, io.BytesIO()
+            )
+        if len(requests) == 2:
+            return Response(request.full_url, b'{"token":"secret"}')
+        if len(requests) == 3:
+            return Response(request.full_url, manifest)
+        if len(requests) == 4:
+            raise urllib.error.HTTPError(
+                request.full_url, 307, "redirect", {"Location": target}, io.BytesIO()
+            )
+        assert len(requests) == 5
+        return Response(request.full_url, config)
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(producer, "_open", open_request)
+    monkeypatch.setattr(
+        producer.images, "_POLICY", SimpleNamespace(manifest_sha256=_sha(manifest))
+    )
+    monkeypatch.setattr(
+        producer.images,
+        "admit_linux_runtime_image",
+        lambda actual_manifest, actual_config: admitted
+        if (actual_manifest, actual_config) == (manifest, config)
+        else pytest.fail("publisher admitted substituted bytes"),
+    )
+
+    assert producer._publisher_image(
+        clock=lambda: now[0], wall_clock=lambda: 0.0, sleeper=sleep
+    ) == (admitted, manifest, config)
+    assert sleeps == [20.0]
+    assert timeouts == [30.0, 10.0, 10.0, 10.0, 10.0]
+    assert requests[3].get_header("Authorization") == "Bearer secret"
+    assert requests[4].get_header("Authorization") is None
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0].removeprefix("[linux-publisher] ")) == {
+        "attempts": 5,
+        "outcome": "accepted",
+        "phase": "config",
+        "refusalCategory": "none",
+        "retriesScheduled": 1,
+        "version": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "write_error", [OSError("closed marker stream"), ValueError("closed marker stream")]
+)
+def test_publisher_marker_write_does_not_replace_the_refusal(monkeypatch, write_error):
+    from scripts import qualification_linux_producer as producer
+
+    error = urllib.error.HTTPError(
+        producer._TOKEN, 429, "throttled", {"Retry-After": "30"}, io.BytesIO()
+    )
+    monkeypatch.setattr(producer, "_open", lambda request, timeout: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(
+        producer,
+        "print",
+        lambda *arguments, **keywords: (_ for _ in ()).throw(write_error),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="publisher response differs"):
+        producer._publisher_image(clock=lambda: 0.0, wall_clock=lambda: 0.0, sleeper=lambda _: None)
+    assert error.fp.closed is True
+
+
 def test_prepare_inputs_writes_runtime_only_manifest_and_source_archive(tmp_path, monkeypatch):
     from scripts import qualification_linux_producer as producer
 
