@@ -124,6 +124,24 @@ def test_every_boundary_is_durable_before_the_kernel_call_that_crosses_it() -> N
     assert recorded.ordinal == 1
 
 
+def test_journal_capacity_refuses_before_root_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full journal cannot hand an unrecorded launch permission to the owner."""
+    io = _HELPERS["_FakeIo"]()
+    monkeypatch.setattr(journal, "_journal_io", lambda: io)
+    writer = journal._create_run_journal(41, _HELPERS["_binding"](), _HELPERS["_location"]())
+    monkeypatch.setattr(journal, "_MAX_RECORDS", writer._count)
+    trace: list[str] = []
+
+    with pytest.raises(ValueError, match="journal record count exceeds its bound"):
+        recovery.acquire_recorded_root(_TracingOwner(trace), writer, _intent())
+
+    assert trace == []
+    assert writer._poisoned is False
+    facts = journal._inspect_run_journal(41, _HELPERS["_binding"](), _HELPERS["_location"]())
+    assert facts.integrity_complete is True
+    assert facts.pending_processes == ()
+
+
 def test_a_refused_launch_leaves_the_intent_pending_rather_than_claiming_absence() -> None:
     """After a failed launch this module does not know whether a child was created.
 
