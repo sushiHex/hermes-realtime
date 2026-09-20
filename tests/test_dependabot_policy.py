@@ -96,14 +96,20 @@ def _ignored_names(ecosystem: str = "uv", directory: str = "/") -> frozenset[str
 # Every ignore list is derived, never authored. Each entry names the set it must equal and
 # the roots it may leave out, so the binding holds in both directions at once: a source
 # root that stops being ignored is caught, and so is an ignore that outlives its root.
+#
+# An entry's set is the union of every derived source it can reach, not of the one it was
+# added for. uv reads requirements/kokoro-cuda-worker.in as well as pyproject.toml, and
+# kokoro-onnx is pinned in the local extra besides, so the worker's declared roots are
+# proposable from the uv entry and must be refused there as well. A root ignored on only one
+# entry is not ignored; it is proposed by the other.
 _IGNORE_BINDINGS = (
     pytest.param(
         "uv",
         "/",
-        "the qualification-hermes group in pyproject.toml",
-        _mirrored_roots,
+        f"the qualification-hermes group in pyproject.toml and the roots in {_WORKER_ROOTS.name}",
+        lambda: _mirrored_roots() | _declared_worker_roots(),
         _UNSCOPABLE,
-        id="uv-mirrors-the-qualified-commit",
+        id="uv-mirrors-the-qualified-commit-and-the-worker-roots",
     ),
     pytest.param(
         "pip",
