@@ -23,8 +23,8 @@ artifact the bot does not write: `uv.lock` after a manifest edit, the tracked br
 after a `/web` bump, the reviewed action pin in `tests/test_release_workflow.py` after an
 action bump, the recompiled closure after one of its declared roots moves. The three that
 were green touched `requirements/*.txt`, which has no second artifact at all. That single
-criterion sorted every case and is what `.github/dependabot.yml` now encodes (#107, #119,
-#129, #144).
+criterion explained the evaluated cases and guides `.github/dependabot.yml` (#107, #119,
+#129, #144). The `cryptography` exception below does not cover every proposal in that class.
 
 Three readings were refused by checking the artifact rather than reasoning forward, and each
 refusal improved the result. "Exact pins are reviewed decisions" was over-theorised: the
@@ -41,17 +41,20 @@ proposed a declared-root change in `kokoro-cuda-worker.in` through the `uv` entr
 is per entry, so a root ignored on one entry is proposed by the other.
 
 `cryptography` was the standing exception, its pull request reopening weekly and never able to
-merge because the pin is derived from `_COMMIT`. A blanket ignore would have silenced the dev
-group's real updates; `update-types: ["version-update:semver-major"]` refuses only the derived
-bump, and works solely because the mirrored pin (`==48.0.1`) and the dev range (`>=50,<51`)
-are two majors apart. That distance is a precondition, not a coincidence, so
-`tests/test_dependabot_policy.py` asserts it and fails if they converge.
+merge because the pin is derived from `_COMMIT`. A blanket ignore would also silence the dev
+group's updates. `update-types: ["version-update:semver-major"]` suppresses major proposals
+while preserving the dev range's eligible updates, and `tests/test_dependabot_policy.py`
+asserts that the mirrored pin (`==48.0.1`) and dev range (`>=50,<51`) remain in different
+majors. It does **not** suppress a later 48.x patch or minor proposal: that proposal still
+cannot move independently of `_COMMIT`, and the exact-source pin test in
+`tests/test_qualification_candidate_files.py` refuses it.
 
 Recovery: ADR 0002 (#106) mapped the merged process owner and run journal onto an ordered
 state table. Its finding is that **the kernel decides process liveness and the journal decides
-only whether effects were possible** — because the kill-on-close Job is associated at creation
-and the child is created suspended, a controller death at any boundary terminates it. That
-removes custody transfer, adoption, reconciliation and recovery-side termination from #62's
+only whether effects were possible** — within the owner's documented single-Job topology, the
+kill-on-close Job is associated at creation and the child is created suspended, so a controller
+death at any boundary terminates it. That removes custody transfer, adoption, reconciliation
+and recovery-side termination from #62's
 scope entirely. `scripts/qualification_recovery.py` (#128) implements the first slice as one
 call site, because the ordering it enforces is one nothing else can: the owner has no journal
 awareness and the journal knows nothing of the kernel calls around it. The ADR is **proposed,
@@ -60,11 +63,11 @@ not accepted**, so that module cites the accepted execution protocol instead.
 Upstream (#80): at the qualified commit, Hermes has **no API surface for saving an externally
 generated assistant turn** — the only message write in the API server is a fork handler
 copying an existing transcript, and `GET /v1/capabilities` advertises `"memory_write_api":
-False`. Compounding it, the message schema carries no delivered or interrupted state, so a
-saved message would assert audition this project's delivery ledger deliberately refuses to
-assert. Read history and correlate runs; do not write turns. One precondition was missed on
-the first pass and corrected: enabling an external memory provider forwards raw turn text
-off-machine, which is configured in Hermes and invisible from here.
+False`. Compounding it, the message schema carries no delivered or interrupted state, so
+treating saved history as delivered context would erase the distinction this project's
+delivery ledger preserves. Read history and correlate runs; do not write turns. One precondition
+was missed on the first pass and corrected: enabling an external memory provider forwards raw
+turn text off-machine, which is configured in Hermes and invisible from here.
 
 Instrumentation: #121 distinguished the durable typed acceptance from the missing microphone
 acceptance in #120. The first reading of `turn_opened: 1` incorrectly excluded the evidence
