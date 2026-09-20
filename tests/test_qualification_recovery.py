@@ -135,11 +135,38 @@ def test_journal_capacity_refuses_before_root_dispatch(monkeypatch: pytest.Monke
     with pytest.raises(ValueError, match="journal record count exceeds its bound"):
         recovery.acquire_recorded_root(_TracingOwner(trace), writer, _intent())
 
-    assert trace == []
+    assert trace == ["finalize"]
     assert writer._poisoned is False
     facts = journal._inspect_run_journal(41, _HELPERS["_binding"](), _HELPERS["_location"]())
     assert facts.integrity_complete is True
     assert facts.pending_processes == ()
+
+
+def test_journal_capacity_finalizes_the_concrete_owner_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capacity refusal releases prior owner resources and permanently revokes launch."""
+    owner_helpers = run_path(
+        str(Path(__file__).with_name("test_qualify_evidence_slice_zero.py"))
+    )
+    runner = owner_helpers["_load_runner"]()
+    kernel = owner_helpers["_FakeWindowsKernel"](runner)
+    owner = owner_helpers["_job"](runner, kernel)
+    owner.retain_auxiliary_handle(301, "stdout")
+    io = _HELPERS["_FakeIo"]()
+    monkeypatch.setattr(journal, "_journal_io", lambda: io)
+    writer = journal._create_run_journal(41, _HELPERS["_binding"](), _HELPERS["_location"]())
+    monkeypatch.setattr(journal, "_MAX_RECORDS", writer._count)
+
+    with pytest.raises(ValueError, match="journal record count exceeds its bound"):
+        recovery.acquire_recorded_root(owner, writer, _intent())
+
+    assert ("close", 301) in kernel.events
+    assert owner.last_finalization is not None and owner.last_finalization.closed
+    before = list(kernel.events)
+    with pytest.raises(runner._WindowsScenarioJobError):
+        owner.launch_root_suspended()
+    assert kernel.events == before
 
 
 def test_a_refused_launch_leaves_the_intent_pending_rather_than_claiming_absence() -> None:
@@ -200,7 +227,8 @@ def test_a_recorder_failure_after_the_resume_still_finalizes_the_owner() -> None
     assert trace[-2:] == ["record_resumed", "finalize"]
 
 
-def test_finalization_failure_preserves_the_original_refusal() -> None:
+@pytest.mark.parametrize("recorder_failure", ["intend_process", "intend_resume"])
+def test_finalization_failure_preserves_the_original_refusal(recorder_failure: str) -> None:
     """A cleanup failure must not hide what actually went wrong."""
 
     class _UnfinalizableOwner(_TracingOwner):
@@ -210,7 +238,9 @@ def test_finalization_failure_preserves_the_original_refusal() -> None:
     trace: list[str] = []
     with pytest.raises(BaseExceptionGroup) as raised:
         recovery.acquire_recorded_root(
-            _UnfinalizableOwner(trace), _TracingRecorder(trace, fail_at="intend_resume"), _intent()
+            _UnfinalizableOwner(trace),
+            _TracingRecorder(trace, fail_at=recorder_failure),
+            _intent(),
         )
 
     assert [type(error) for error in raised.value.exceptions] == [RuntimeError, OSError]

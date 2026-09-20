@@ -122,8 +122,8 @@ def acquire_recorded_root(
     """
     if type(intent) is not ProcessIntentV1:
         raise TypeError("process intent must be exact")
-    ordinal = recorder.intend_process(intent)
     try:
+        ordinal = recorder.intend_process(intent)
         root = owner.launch_root_suspended()
         recorder.bind_suspended_process(ordinal, _identity_of(root))
         recorder.intend_resume(ordinal)
