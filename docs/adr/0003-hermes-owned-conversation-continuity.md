@@ -191,5 +191,14 @@ profile mismatch, and long-history pagination. It must also prove that a restore
 assistant row is never labeled delivered without a matching realtime receipt,
 and that restored history cannot grant live task or approval authority.
 
+New terminal-authority, profile, resume-serialization, delivery, task-authority,
+and refusal guards must follow the repository evidence rules. Every refusal path
+emits one stable, bounded, content-free JSON marker from a `finally`: counts,
+kinds, and categories only, with no transcript text, paths, or identifiers.
+Mutation tests must prove, one at a time, that missing or misbound terminal
+authority, a wrong profile, a concurrent writer, false delivery or task
+authority, a missing refusal marker, and leaking refusal evidence each fail
+alone while an adjacent passing case remains green.
+
 Until those proofs pass, #77 remains a design and compatibility dependency for
 the integrated MVP in #159 rather than a supported runtime promise.
