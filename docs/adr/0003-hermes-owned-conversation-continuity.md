@@ -90,8 +90,12 @@ admitted into, the existing background-task identifier grammar.
 
 ### Identity and minimal realtime state
 
-The binding consists of a schema version, the exact profile route, and the
-Hermes transcript session ID. Realtime may retain delivery receipts keyed to the
+The binding consists of a schema version, the exact profile route, the Hermes
+transcript session ID, and the exact optional memory-scope selection. Memory
+scope is stored privately as either explicit `unset` or the exact opaque
+`X-Hermes-Session-Key` value accepted by Hermes. The value is not treated as a
+secret, but its raw form must never enter public evidence, logs, refusal markers,
+or user-visible diagnostics. Realtime may retain delivery receipts keyed to the
 stable message identity supplied by the required terminal contract. It will not
 persist transcript text, audio, summaries, embeddings, or a second searchable
 history database.
@@ -102,9 +106,13 @@ rejects unknown profile routes and uses profile-scoped runtime state
 `X-Hermes-Session-Key` is an optional long-term-memory scope, not the transcript
 session ID
 ([header validation](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2285-L2335)).
+When it is absent, v0.21.0 uses the transcript session ID as the agent memory key
+([agent binding](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L7297-L7334)),
+so omission is a material scope change. Resume requires exact equality of the
+stored tagged selection, including explicit `unset`.
 Resume therefore fails closed on a missing or changed profile, an inaccessible
-session, or a conflicting binding. It never falls back to another profile or
-guesses a memory key.
+session, a wrong, omitted, or changed memory scope, or any other conflicting
+binding. It never falls back to another profile or guesses a memory key.
 
 ### Resume and history
 
@@ -196,9 +204,10 @@ and refusal guards must follow the repository evidence rules. Every refusal path
 emits one stable, bounded, content-free JSON marker from a `finally`: counts,
 kinds, and categories only, with no transcript text, paths, or identifiers.
 Mutation tests must prove, one at a time, that missing or misbound terminal
-authority, a wrong profile, a concurrent writer, false delivery or task
-authority, a missing refusal marker, and leaking refusal evidence each fail
-alone while an adjacent passing case remains green.
+authority, a wrong profile, a wrong, omitted, or changed exact memory scope, a
+concurrent writer, false delivery or task authority, a missing refusal marker,
+and leaking refusal evidence each fail alone while an adjacent passing case
+remains green.
 
 Until those proofs pass, #77 remains a design and compatibility dependency for
 the integrated MVP in #159 rather than a supported runtime promise.
