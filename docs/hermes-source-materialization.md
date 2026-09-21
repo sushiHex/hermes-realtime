@@ -118,6 +118,10 @@ decompressed identities, the three inventory digests, counts/bytes, the exact
 exclusion record, and the selected derivative identity. A separate review must
 approve any new exact upstream identity or profile revision.
 
+Each mutation fixture must rebind any enclosing reviewed identity that would
+otherwise reject first, so it reaches its nominated guard. It must prove that
+guard fails alone, rather than treating another refusal as coverage.
+
 Tests must first fail for each of these mutations:
 
 - change the tag, commit, tree, codeload, decompressed archive, root, member
