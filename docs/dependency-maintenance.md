@@ -21,6 +21,12 @@ version level because their peer ranges can require a coordinated browser-toolch
 Grouping by semantic version level is queue shaping, not evidence that the grouped versions
 are compatible.
 
+The root Python patch/minor group leaves `hatchling` and `cryptography` as individual
+proposals without ignoring them. A Hatchling minor can require a governed metadata/profile
+migration, while `cryptography` is shared with a source-derived qualification pin and can
+produce same-major residual noise. Isolating them keeps either proposal from holding an
+otherwise routine group; it does not approve, defer, or suppress the change.
+
 The two-pull-request cap bounds new version proposals; changing it does not close proposals
 that are already open. Do not leave a deliberately deferred governed migration occupying a
 slot indefinitely. Record the bounded follow-up in its GitHub issue, then close the bot

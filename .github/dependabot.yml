@@ -32,6 +32,9 @@ updates:
       python-minor-patch:
         patterns:
           - "*"
+        exclude-patterns:
+          - "hatchling"
+          - "cryptography"
         update-types:
           - "minor"
           - "patch"
