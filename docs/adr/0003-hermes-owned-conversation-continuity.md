@@ -55,7 +55,8 @@ Implementation is gated on a narrow upstream-supported terminal contract, or an
 equivalent verified contract in a later Hermes release. A terminal result must
 bind all of these facts:
 
-- the selected profile and transcript session;
+- the binding schema version, exact profile route, transcript session ID, and
+  tagged exact memory-scope selection;
 - stable persisted identities for the admitted user row and completed assistant
   row;
 - whether the generation completed, was partial, was interrupted, or failed;
@@ -204,10 +205,13 @@ and refusal guards must follow the repository evidence rules. Every refusal path
 emits one stable, bounded, content-free JSON marker from a `finally`: counts,
 kinds, and categories only, with no transcript text, paths, or identifiers.
 Mutation tests must prove, one at a time, that missing or misbound terminal
-authority, a wrong profile, a wrong, omitted, or changed exact memory scope, a
-concurrent writer, false delivery or task authority, a missing refusal marker,
-and leaking refusal evidence each fail alone while an adjacent passing case
-remains green.
+authority fails. For both resume state and a terminal response, independently
+omitting or mismatching each authoritative binding component must fail: schema
+version, exact profile, transcript session ID, and tagged exact memory scope.
+Wrong and omitted transcript sessions are explicit cases. A concurrent writer,
+false delivery or task authority, a missing refusal marker, and leaking refusal
+evidence must likewise each fail alone while an adjacent passing case remains
+green.
 
 Until those proofs pass, #77 remains a design and compatibility dependency for
 the integrated MVP in #159 rather than a supported runtime promise.
