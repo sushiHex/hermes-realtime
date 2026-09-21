@@ -81,6 +81,15 @@ cancellation, cleanup, continuity, or complete qualification.
 This design changes neither the current v0.20.0 source profile nor any existing
 runtime pin, dependency recipe, parser, input schema, or acceptance rule.
 
+### Refusal evidence
+
+Every new logical-inventory or selection guard/bound introduced for this profile
+must emit exactly one bounded JSON line from its `finally` path when it refuses.
+The stable marker is `[hermes-source-selection-refused]`; its payload may carry
+counts, kinds, and categories only. It must not carry paths, member names,
+process IDs, handles, or error text. A successful neighboring case emits no
+such marker.
+
 ## Alternatives considered
 
 **Keep complete materialization.** Correctly refuses the selected tree on
@@ -121,6 +130,9 @@ Tests must first fail for each of these mutations:
 - substitute a selected archive or provenance record from another exact source;
 - bypass the unchanged selected-archive validator or try to consume full-source
   materialization metadata as selected-source authority.
+- omit, duplicate, or leak disallowed content through refusal evidence for a new
+  logical/selection guard or bound, while its passing neighboring case remains
+  marker-free.
 
 The [qualification input authority](qualification-input-files.md) and
 [execution protocol](qualification-execution.md) remain the governing plans for
