@@ -135,6 +135,8 @@ documentation.
 
 ## Dependencies and generated assets
 
+- Follow the [dependency maintenance procedure](docs/dependency-maintenance.md) for
+  complete upgrade artifacts, security assessment, qualification, and serial landing.
 - Keep runtime dependencies narrow and upper-bounded.
 - Commit `uv.lock` changes with dependency metadata changes.
 - Follow the [optional Windows speech dependency procedure](requirements/README.md) when updating the CPU or CUDA worker closure.

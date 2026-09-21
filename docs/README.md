@@ -9,6 +9,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | What exists, and what has been verified? | [Implementation status](implementation-status.md): source, tests, defaults, and outstanding qualification |
 | How do I contribute a change? | [Contributing](../CONTRIBUTING.md): setup, the [contribution and test paths](../CONTRIBUTING.md#contribution-and-test-paths), public-repository boundaries, and PR expectations |
 | Which engineering rules apply? | [Development guide](../AGENTS.md): protocol, ownership, cancellation, and change discipline |
+| What did the last session learn? | [Agent handoff](AGENT_HANDOFF.md): findings and how they were established, so they are not re-derived or re-refuted. Context, not a task ledger — status stays in the owning issue |
 
 ## Implementation guides
 
@@ -16,6 +17,8 @@ boundaries. Use these pages to choose work and understand the implementation:
 | --- | --- |
 | Host, browser, and media composition | [Local LiveKit and full-host setup](local-livekit.md) |
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
+| Dependency upgrades, security assessment, and serial landing | [Dependency maintenance](dependency-maintenance.md) |
+| Hermes-owned persisted foreground conversation | [Proposed continuity design](adr/0003-hermes-owned-conversation-continuity.md) |
 | Foreground lookup, consent, and latency | [Source-backed routing](source-backed-latency.md) |
 | Candidate-bound source conversation comparison | [Deterministic equivalence](deterministic-equivalence.md) |
 | Wheel binding, revocation, admission closure, and purge | [Packaged revocation race](revoke-race.md) |
@@ -28,6 +31,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |
 | Frozen inputs, scenario authority, operator observations, and cleanup | [Slice 0 execution protocol](qualification-execution.md) |
 | Admitted tools, retained input files, independent builds, and installed runtimes | [Qualification input bindings](qualification-input-files.md) |
+| Proposed exact-source Windows materialization boundary | [Hermes v0.21.0 source-materialization profile](hermes-source-materialization.md) |
 | Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |
 

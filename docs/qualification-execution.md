@@ -628,7 +628,7 @@ counts, closed outcome codes, exact CI run/attempt links, and evidence limits.
 Apply the [public-repository boundary](../CONTRIBUTING.md#public-repository-boundary)
 to every publication surface, including comments and attachments.
 
-Require both exact reviews and the four [automated PR/main checks](release-gates.md#required-automated-checks)
+Require both exact reviews and all [required automated PR/main checks](release-gates.md#required-automated-checks)
 for each implementation candidate. Full desktop qualification additionally needs
 one frozen complete run with independently accepted machine and human evidence.
 The subsequent release decision names supported scope and unresolved risks;
