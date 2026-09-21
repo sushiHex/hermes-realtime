@@ -40,6 +40,10 @@ from hermes_realtime.speech import (
     Transcript,
     VoiceActivity,
 )
+from tests.support.ingress_observation import (
+    ingress_event_cursor,
+    ingress_event_observation,
+)
 from tests.support.qualification import InProcessQualificationComposition
 
 pytestmark = [
@@ -164,6 +168,8 @@ class _Synthesizer:
 class _Transcriber:
     def __init__(self) -> None:
         self._armed = False
+        self.finish_calls = 0
+        self.finals_returned = 0
 
     async def push(self, frame: AudioFrame) -> tuple[Transcript, ...]:
         del frame
@@ -172,9 +178,11 @@ class _Transcriber:
         return (Transcript("microphone evidence", final=False),)
 
     async def finish_utterance(self) -> Transcript | None:
+        self.finish_calls += 1
         if not self._armed:
             return None
         self._armed = False
+        self.finals_returned += 1
         return Transcript("microphone evidence turn", final=True)
 
     async def cancel(self) -> None:
@@ -186,6 +194,7 @@ class _Transcriber:
 
 _INGRESS_OBSERVATION_PREFIX = "[full-host-ingress] "
 _ACCEPTANCE_BOUND_SECONDS = 30.0
+_INGRESS_EVENT_FETCH_TIMEOUT_SECONDS = 1.0
 
 
 def _evidence_observation(database: Path) -> dict[str, object]:
@@ -216,6 +225,23 @@ def _evidence_observation(database: Path) -> dict[str, object]:
         "milestones": dict(sorted(milestones.items())),
         "accepted_sources": sorted(json.loads(row[0])["source"] for row in finals),
     }
+
+
+async def _best_effort_ingress_event_observation(
+    *, port: int, origin: str, token: str, after: int
+) -> dict[str, object]:
+    """Read one bounded public event window without changing the primary qualification result."""
+
+    try:
+        status, events = await asyncio.wait_for(
+            _events(port=port, origin=origin, token=token, after=after),
+            timeout=_INGRESS_EVENT_FETCH_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return {"available": False}
+    if status != 200:
+        return {"available": False}
+    return ingress_event_observation(events, after=after)
 
 
 class _Vad:
@@ -385,8 +411,17 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
             body=b'{"sequence":1,"text":"typed evidence turn"}',
         )
         assert status == 202
-        await _wait_event(port=port, origin=origin, token=token, kind="assistant_turn_completed")
-        await _wait_event(port=port, origin=origin, token=token, kind="voice_input_ready")
+        typed_completed = await _wait_event(
+            port=port, origin=origin, token=token, kind="assistant_turn_completed"
+        )
+        typed_completed_sequence = typed_completed["sequence"]
+        assert type(typed_completed_sequence) is int
+        voice_ready = await _wait_event(
+            port=port, origin=origin, token=token, kind="voice_input_ready"
+        )
+        voice_ready_sequence = voice_ready["sequence"]
+        assert type(voice_ready_sequence) is int
+        event_cursor = ingress_event_cursor(typed_completed_sequence, voice_ready_sequence)
         transcriber._armed = True
         frame = rtc.AudioFrame(
             data=_pcm(), sample_rate=48_000, num_channels=1, samples_per_channel=480
@@ -405,12 +440,30 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
                         break
                     await asyncio.sleep(0.1)
         finally:
-            print(
-                _INGRESS_OBSERVATION_PREFIX
-                + json.dumps(
-                    {"bound_seconds": _ACCEPTANCE_BOUND_SECONDS, **observation}, sort_keys=True
+            event_observation: dict[str, object] = {"available": False}
+            try:
+                event_observation = await _best_effort_ingress_event_observation(
+                    port=port,
+                    origin=origin,
+                    token=token,
+                    after=event_cursor,
                 )
-            )
+            finally:
+                print(
+                    _INGRESS_OBSERVATION_PREFIX
+                    + json.dumps(
+                        {
+                            **observation,
+                            "bound_seconds": _ACCEPTANCE_BOUND_SECONDS,
+                            "public_event_window": event_observation,
+                            "transcriber": {
+                                "finals_returned": transcriber.finals_returned,
+                                "finish_calls": transcriber.finish_calls,
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                )
         assert set(cast(list[str], observation["accepted_sources"])) == {"typed", "microphone"}
     finally:
         await room.disconnect()
