@@ -387,7 +387,13 @@ class HermesApiTaskSession:
         if usable_run_id:
             assert isinstance(api_run_id, str)
             claimed = await self._claim_unpublished(api_run_id)
-        if type(payload) is not dict or set(payload) != {"run_id", "status"}:
+        response_keys = set(payload) if type(payload) is dict else set()
+        legacy_first_admission = response_keys == {"run_id", "status"}
+        v021_first_admission = (
+            response_keys == {"run_id", "status", "replayed"}
+            and payload.get("replayed") is False
+        )
+        if not (legacy_first_admission or v021_first_admission):
             if claimed:
                 assert isinstance(api_run_id, str)
                 await self._settle_unpublished(api_run_id)
