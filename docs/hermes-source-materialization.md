@@ -45,10 +45,12 @@ Admission has two namespaces with separate purposes:
    full logical-inventory digest and its exact exclusion record. Derive the
    selected inventory as every logical member minus that record. Require the
    selected names, modes, payload digests, count, bytes, and case-folded
-   namespace to match the profile. Serialize that selected inventory
-   deterministically beneath a new fixed source root, retaining every selected
-   relative spelling and mode. Submit this derived archive to the existing
-   `SourceArchivePolicyV1` validator unchanged before any Windows extraction.
+   namespace to match the profile. This proposal does not yet authorize a
+   selected-archive digest or byte serialization. After its separate review,
+   the bound serializer must retain every selected relative spelling and mode
+   beneath its fixed source root, then submit its derived archive unchanged to
+   the existing [`SourceArchivePolicyV1`](../scripts/source_archive_authority.py)
+   validator before any Windows extraction.
 
 The profile stores the complete logical inventory digest, selected inventory
 digest, and exclusion inventory digest. Its exclusion entries bind a path-name
@@ -83,6 +85,17 @@ exactly one zero-length-path directory root row; `E` contains no root row. No
 other kinds, payload tags, duplicate paths, or alternate encodings are valid.
 The paths are the exact bytes beneath the authenticated upstream prefix, so
 framing, ordering, directory payloads, and each digest domain are explicit.
+
+### Selected-archive serialization gate
+
+No selected-archive digest or size may be recorded or approved until a separate
+review binds `HermesSelectedArchiveSerializationV1` to an immutable builder
+revision and exact emitted-byte contract. That review must specify the archive
+and compression formats; fixed source-root and member-path encoding; inventory
+order; every header field; payload block framing and padding; terminator; and
+the hash over the resulting bytes. It must also provide independent
+reproduction evidence or fixed reference vectors. The present selected
+inventory and unchanged validator do not substitute for that byte contract.
 
 The selected archive is a derivative with its own reviewed digest and size. It
 is bound to the authenticated complete archive and the exact profile; it is not
