@@ -532,6 +532,98 @@ async def test_api_session_settles_nonstarted_accepted_run_with_usable_id() -> N
 
 
 @pytest.mark.asyncio
+async def test_api_session_accepts_exact_v021_first_admission_response() -> None:
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8765",
+            bearer="first-admission-test-bearer-value-32-characters",
+        ),
+        session_id="session_first_admission",
+        private_id_factory=lambda: "first_admission_private",
+    )
+    stopped: list[str] = []
+
+    async def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, object]:
+        del body
+        return 202, {
+            "run_id": "run_2323232323232323",
+            "status": "started",
+            "replayed": False,
+        }
+
+    async def stop_and_wait(api_run_id: str) -> None:
+        stopped.append(api_run_id)
+
+    session._started = True
+    session._request_json = request_json  # type: ignore[method-assign]
+    session._stop_and_wait = stop_and_wait  # type: ignore[method-assign]
+    acknowledgment = await session.dispatch(_dispatch_request())
+    assert acknowledgment.payload.accepted is True
+    assert acknowledgment.payload.run_id == "deleg_first_admission_private"
+    assert stopped == []
+    authority = session._runs_by_task["task_release_check"]
+    authority.terminal = True
+    if authority.event_task is not None:
+        authority.event_task.cancel()
+        await asyncio.gather(authority.event_task, return_exceptions=True)
+    await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replayed",
+    [
+        pytest.param(True, id="replayed-true"),
+        pytest.param(0, id="integer-zero"),
+        pytest.param(None, id="null"),
+        pytest.param("false", id="string-false"),
+    ],
+)
+async def test_api_session_rejects_nonfalse_replay_marker_and_settles_run(
+    replayed: object,
+) -> None:
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8765",
+            bearer="replayed-response-test-bearer-value-32-characters",
+        ),
+        session_id="session_replayed_response",
+    )
+    stopped: list[str] = []
+
+    async def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, object]:
+        del body
+        return 202, {
+            "run_id": "run_2424242424242424",
+            "status": "started",
+            "replayed": replayed,
+        }
+
+    async def stop_and_wait(api_run_id: str) -> None:
+        stopped.append(api_run_id)
+
+    session._started = True
+    session._request_json = request_json  # type: ignore[method-assign]
+    session._stop_and_wait = stop_and_wait  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="malformed"):
+        await session.dispatch(_dispatch_request())
+    assert stopped == ["run_2424242424242424"]
+    assert session._unpublished_api_run_ids == set()
+    assert session._reserved_api_run_ids == {"run_2424242424242424"}
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_api_session_cancelled_dispatch_settles_remote_acceptance() -> None:
     accepted = asyncio.Event()
     release = asyncio.Event()
