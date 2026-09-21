@@ -57,6 +57,10 @@ each digest resolves to exactly one logical member. Public metadata reports only
 these digests and aggregate counts. It does not publish contributor identifiers
 or raw upstream member names.
 
+An exclusion path-name digest is SHA-256 of the same exact, unnormalized UTF-8
+relative-path bytes used by `HermesInventoryDigestV1`; those raw bytes remain
+private.
+
 ### `HermesInventoryDigestV1`
 
 The existing archive authorities expose ordered manifests but do not define an
