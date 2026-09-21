@@ -693,7 +693,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-livekit-client@2.22.2
+livekit-client@2.22.3
 Declared license: Apache-2.0
 Source: git@github.com:livekit/client-sdk-js.git
 
