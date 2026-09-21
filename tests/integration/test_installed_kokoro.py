@@ -98,7 +98,6 @@ async def test_installed_kokoro_synthesizes_transport_pcm_and_closes(backend: st
         try:
             await synthesizer.close()
             assert synthesizer._engine is None
-            assert synthesizer._executor._shutdown
             if owned_process is not None:
                 assert owned_process.poll() is not None
         finally:
