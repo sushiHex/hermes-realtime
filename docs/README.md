@@ -30,6 +30,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Evidence consent, admission, storage, and purge | [Evidence capture boundary](evidence-capture.md) |
 | Frozen inputs, scenario authority, operator observations, and cleanup | [Slice 0 execution protocol](qualification-execution.md) |
 | Admitted tools, retained input files, independent builds, and installed runtimes | [Qualification input bindings](qualification-input-files.md) |
+| Proposed exact-source Windows materialization boundary | [Hermes v0.21.0 source-materialization profile](hermes-source-materialization.md) |
 | Packaging, CI, publication, and installed-path qualification | [Release gates](release-gates.md) |
 | Checkpoint exit diagnostics and their evidence limits | [Windows child-exit investigation](windows-checkpoint-child-exit.md) |
 
