@@ -40,3 +40,24 @@ CPU ONNX Runtime out of the worker manifest. Qualify both installed CPU synthesi
 and the separate CUDA worker, including provider selection and owned cleanup, in
 addition to the [committed-candidate release gate](../docs/release-gates.md).
 Generated PCM checks do not establish physical audio quality or deployment latency.
+
+## Installed Kokoro smoke test
+
+On Windows, pre-provision the two pinned assets in one cache directory and create the
+separate CUDA worker environment with the setup script above. Then run both installed
+backends explicitly:
+
+```powershell
+$env:HERMES_REALTIME_INSTALLED_KOKORO = "1"
+$env:HERMES_REALTIME_KOKORO_ASSET_CACHE = "C:\path\to\kokoro-cache"
+$env:HERMES_REALTIME_KOKORO_CUDA_PYTHON = "C:\path\to\cuda-worker\Scripts\python.exe"
+uv run --frozen --group dev --extra local pytest tests/integration/test_installed_kokoro.py -q
+```
+
+The test verifies the pinned assets before startup and does not download them. Once opted
+in, missing assets, dependencies, CUDA support, or worker prerequisites fail the requested
+case. For candidate-bound evidence, start from a clean checkout, record `git rev-parse HEAD`,
+create the CPU environment with `uv sync --frozen --group dev --extra local`, and create the
+CUDA environment from that checkout with `scripts/setup-kokoro-cuda-worker.sh`. Record the
+commit, installed package versions, and test result without publishing private paths. The
+smoke test does not qualify audio quality or latency.
