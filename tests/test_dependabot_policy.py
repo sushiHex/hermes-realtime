@@ -24,11 +24,12 @@ _CONFIG = _ROOT / ".github" / "dependabot.yml"
 _WORKER_ROOTS = _ROOT / "requirements" / "kokoro-cuda-worker.in"
 _IGNORED = re.compile(r'^\s*- dependency-name: "([^"]+)"\s*$', re.MULTILINE)
 
-# Every mirrored root is ignored. cryptography used to be the exception, because it is also
-# an independent dev constraint and an ignore applies to a dependency rather than to one
-# dependency group. It is covered now by a narrower means: the two constraints sit two
-# majors apart, so refusing only major updates refuses the derived bump alone. That
-# separation is a precondition, not a coincidence, and the tests below bind it.
+# Every mirrored root is ignored. cryptography remains the exception, because it is also an
+# independent dev constraint and an ignore applies to a dependency rather than to one
+# dependency group. The two constraints sit two majors apart, so refusing major updates
+# suppresses the recurring cross-major proposal without silencing eligible dev updates.
+# Same-major proposal noise remains possible and the exact-source qualification check refuses
+# an independent derived-pin change. The tests below bind the useful major separation.
 _UNSCOPABLE: frozenset[str] = frozenset()
 _MAJOR_ONLY = re.compile(
     r'- dependency-name: "cryptography"\n\s+update-types: \["version-update:semver-major"\]'
@@ -172,12 +173,12 @@ def _cryptography_majors() -> tuple[int, int]:
 def test_the_mirrored_cryptography_ignore_stays_narrowed_to_major_updates() -> None:
     """One dependency carries a derived pin and a live range, separated only by distance.
 
-    A blanket ignore would refuse the derived bump and dev's real updates together, which is
-    why cryptography was left unignored and its pull request reopened every week. Refusing
-    only major updates separates them, but only while the mirrored pin and the dev range
-    remain in different majors. Should they converge, the qualifier would silently stop
-    distinguishing a derived bump from one dev can adopt, so the distance is asserted rather
-    than assumed.
+    A blanket ignore would refuse derived-pin proposals and dev's real updates together,
+    which is why cryptography was left unignored and its pull request reopened every week.
+    Refusing major updates separates the observed cross-major proposal from updates inside
+    the dev range, but only while the constraints remain in different majors. It does not
+    suppress a future 48.x proposal. Should the constraints converge, the qualifier would
+    stop providing even that separation, so the distance is asserted rather than assumed.
     """
     assert _MAJOR_ONLY.search(_entry_body("uv", "/")), (
         "cryptography's ignore must stay narrowed to version-update:semver-major; a blanket "

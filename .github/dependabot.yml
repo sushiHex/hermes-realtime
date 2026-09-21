@@ -1,17 +1,23 @@
 version: 2
 updates:
-  # Action pins are a review record, not a version: tests/test_release_workflow.py
+  # Action pins are a review record, not just a version: tests/test_release_workflow.py
   # asserts the exact reviewed Node 24 SHAs, their counts, and the uv cache-save
-  # ownership block built around one of them. A bot cannot supply that review, so
-  # batch it: one grouped pull request needs one review pass.
+  # ownership block built around one of them. Routine patch/minor proposals share
+  # one review; major migrations remain separate.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
     groups:
-      actions:
+      actions-minor-patch:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
   # uv owns pyproject.toml and uv.lock together. The pip ecosystem rewrites the
   # manifest without regenerating the lock, so every such pull request failed
   # `uv lock --check` before a single test ran.
@@ -19,6 +25,19 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "hatchling"
+          - "cryptography"
+        update-types:
+          - "minor"
+          - "patch"
     ignore:
       # qualification-hermes mirrors the qualified upstream commit pinned by
       # scripts/qualification_hermes_source.py (see tests/test_qualification_candidate_files.py).
@@ -31,12 +50,13 @@ updates:
       - dependency-name: "pyyaml"
       - dependency-name: "rich"
       # cryptography is the one root that is also an independent dev constraint, so a blanket
-      # ignore would silence dev's own updates. It does not need one. The mirrored pin is
-      # ==48.0.1 and the dev range is >=50,<51, two majors apart, so refusing only major
-      # updates refuses exactly the derived bump while leaving every patch and minor release
-      # dev can actually adopt. Narrowing this to a blanket ignore, or letting the two
-      # constraints converge into one major, breaks that separation; the policy test binds
-      # both conditions.
+      # ignore would silence dev's own updates. The mirrored pin is ==48.0.1 and the dev
+      # range is >=50,<51, two majors apart, so refusing major updates suppresses the
+      # recurring 48-to-50 proposal while leaving eligible updates within the dev range.
+      # It does not suppress a later 48.x proposal to the derived pin; the exact-source
+      # qualification check still refuses that independent change. Narrowing this to a
+      # blanket ignore, or letting the two constraints converge into one major, breaks the
+      # useful separation; the policy test binds both conditions.
       - dependency-name: "cryptography"
         update-types: ["version-update:semver-major"]
       # The CUDA worker closure's declared roots are reachable from here too, so they are
@@ -58,19 +78,39 @@ updates:
     directory: /requirements
     schedule:
       interval: weekly
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+    groups:
+      worker-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
     ignore:
       - dependency-name: "kokoro-onnx"
       - dependency-name: "onnxruntime-gpu"
   # Generated browser assets under src/hermes_realtime/client/static/ are tracked, and
   # the release gate compares the committed bytes against a fresh build. A bot cannot
-  # regenerate them, so batch the ecosystem: one grouped pull request needs one
-  # `npm run build`. Grouping also lets vite and esbuild move together, which is the
-  # only way either can move at all once their peer ranges disagree.
+  # regenerate them, so every proposal must be adopted into an owned branch before it is
+  # complete. Vite and esbuild may need to move together when their peer ranges disagree;
+  # other major migrations remain separate.
   - package-ecosystem: npm
     directory: /web
     schedule:
       interval: monthly
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
     groups:
-      web:
+      browser-toolchain:
+        patterns:
+          - "vite"
+          - "esbuild"
+      web-minor-patch:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
