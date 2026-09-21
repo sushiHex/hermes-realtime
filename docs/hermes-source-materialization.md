@@ -95,8 +95,9 @@ selection rule.
 complete import/configuration closure before source preparation and would widen
 the design beyond the materialization blocker.
 
-**Rename, drop, or overwrite colliding members.** Rejected. Those choices lose
-provenance or weaken the Windows collision boundary.
+**Unrecorded omission, renaming, or overwrite of colliding members.** Rejected.
+The exact reviewed two-member exclusion above is the proposed mechanism; any
+other omission loses provenance or weakens the Windows collision boundary.
 
 **Use a case-sensitive host for the full tree.** It may support a separate
 upstream inspection, but it does not create a Windows qualification input.
