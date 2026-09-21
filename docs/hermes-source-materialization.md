@@ -57,6 +57,29 @@ each digest resolves to exactly one logical member. Public metadata reports only
 these digests and aggregate counts. It does not publish contributor identifiers
 or raw upstream member names.
 
+### `HermesInventoryDigestV1`
+
+The existing archive authorities expose ordered manifests but do not define an
+inventory-digest preimage suitable for this profile. Each of the three inventory
+digests therefore uses this exact, versioned SHA-256 preimage. It begins with
+the ASCII bytes `HermesInventoryDigestV1` followed by `0x00`, then one domain
+byte: `C` for the complete inventory, `S` for selected, or `E` for exclusions.
+It then contains the row count as an unsigned 64-bit big-endian integer and the
+rows in strict lexicographic order by their raw relative-path bytes.
+
+Each row is: an unsigned 32-bit big-endian path-byte length; that many raw,
+UTF-8 relative-path bytes with no Unicode normalization; a one-byte kind (`D`
+or `F`); an unsigned 32-bit big-endian permission mode. That mode is the
+validated member permission value, constrained to `0..0o7777`; type bits are
+represented only by the kind byte. It is followed by an unsigned 64-bit
+big-endian size and a payload tag. The payload tag is `0x00` for a directory,
+which requires size zero and has no following payload digest, or `0x01` for a
+regular file, followed by its 32 raw SHA-256 digest bytes. `C` and `S` contain
+exactly one zero-length-path directory root row; `E` contains no root row. No
+other kinds, payload tags, duplicate paths, or alternate encodings are valid.
+The paths are the exact bytes beneath the authenticated upstream prefix, so
+framing, ordering, directory payloads, and each digest domain are explicit.
+
 The selected archive is a derivative with its own reviewed digest and size. It
 is bound to the authenticated complete archive and the exact profile; it is not
 a replacement publisher archive. The retained authority carries both facts so a
