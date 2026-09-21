@@ -79,14 +79,19 @@ other.
 
 ## Land one qualified candidate at a time
 
-1. Work from current `main` on a repository-owned branch. Review every review thread, review,
-   and conversation comment, and leave nothing unaddressed. Do not resolve a thread merely to
-   clear a gate.
+Auto-merge may be enabled only after the complete review and exact-candidate merge
+authorization described here; a green bot proposal alone is insufficient.
+
+1. Refresh the selected proposal against current `main`; use a repository-owned branch when
+   completing missing artifacts. Review every review thread, review, and conversation comment,
+   and leave nothing unaddressed. Do not resolve a thread merely to clear a gate.
 2. Run the focused checks for every changed artifact and exercise the actual installed profile,
    including optional providers. Then run the committed-candidate release gate. Required checks
    must pass on attempt 1; a rerun does not establish the gate.
-3. Obtain the user's explicit permission for the merge. Immediately before an authorized
-   squash merge, record the current `main` commit and the approved head tree.
+3. Merge only when the user has explicitly authorized that exact candidate. Existing
+   authorization remains valid within its stated scope and does not need to be requested
+   again. Immediately before an authorized squash merge, record the current `main` commit and
+   the approved head tree.
 4. Verify the resulting squash commit has exactly one parent, that parent is the recorded
    pre-merge `main` commit, and its tree is byte-identical to the approved head tree. Wait for
    the exact-commit `main` push checks to pass on attempt 1.
