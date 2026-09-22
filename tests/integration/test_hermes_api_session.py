@@ -1841,6 +1841,15 @@ async def test_event_stream_failure_settles_run_that_failed_before_its_stop() ->
             "output": "Another run finished.",
         },
         {"object": "hermes.run", "run_id": "run_0123456789abcdef", "status": "running"},
+        # A terminal status for this run is not evidence unless the body is a run status
+        # object; a stop 200 has two shapes, and the discriminator is what tells them apart.
+        {"run_id": "run_0123456789abcdef", "status": "completed", "output": "Unlabelled."},
+        {
+            "object": "hermes.run.steer",
+            "run_id": "run_0123456789abcdef",
+            "status": "completed",
+            "output": "Misrouted.",
+        },
     ],
 )
 @pytest.mark.asyncio

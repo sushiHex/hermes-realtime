@@ -949,6 +949,10 @@ class HermesApiTaskSession:
             if payload.get("run_id") != api_run_id:
                 raise RuntimeError("Hermes API stop response is not authoritative")
             if payload.get("status") != "stopping":
+                # A stop 200 is either the bare stopping acknowledgment or, for a run that
+                # already finished, its full status object; only the latter is evidence.
+                if payload.get("object") != "hermes.run":
+                    raise RuntimeError("Hermes API stop response is not authoritative")
                 terminal = self._terminal_from_status(api_run_id, payload)
                 if terminal is None:
                     raise RuntimeError("Hermes API stop response is not authoritative")
