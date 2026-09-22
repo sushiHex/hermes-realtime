@@ -14,6 +14,13 @@ cooldown and version-update limit do not apply to security updates.
 [GitHub's Dependabot options reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference)
 defines these native keys and their version-update scope.
 
+**Version updates are currently paused.** Until the Windows desktop MVP (#159) lands, every
+entry sets `open-pull-requests-limit: 0`, which GitHub documents as temporarily disabling
+version updates. Security updates are not governed by that limit and continue. No
+version-update pull requests appearing during the pause is expected, not a fault to
+investigate. To resume, restore each entry to `2`; the rest of this guide describes the policy
+that applies once they do.
+
 Patch and minor version updates are grouped within each ecosystem to reduce review traffic.
 Major updates remain separate so a migration has an attributable diff and qualification
 record. Vite and esbuild are the narrow exception: Dependabot may propose them together at any
