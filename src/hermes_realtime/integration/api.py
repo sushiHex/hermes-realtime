@@ -946,8 +946,13 @@ class HermesApiTaskSession:
             body={},
         )
         if status == 200:
-            if payload.get("run_id") != api_run_id or payload.get("status") != "stopping":
+            if payload.get("run_id") != api_run_id:
                 raise RuntimeError("Hermes API stop response is not authoritative")
+            if payload.get("status") != "stopping":
+                terminal = self._terminal_from_status(api_run_id, payload)
+                if terminal is None:
+                    raise RuntimeError("Hermes API stop response is not authoritative")
+                return terminal
         elif status != 409:
             raise RuntimeError("Hermes API stop request failed")
         try:
@@ -966,6 +971,10 @@ class HermesApiTaskSession:
         status, payload = await self._request_json("GET", f"/v1/runs/{quote(api_run_id, safe='')}")
         if status != 200 or payload.get("run_id") != api_run_id:
             raise RuntimeError("Hermes API run status is not authoritative")
+        return self._terminal_from_status(api_run_id, payload)
+
+    @staticmethod
+    def _terminal_from_status(api_run_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         run_status = payload.get("status")
         if run_status == "completed":
             return {
