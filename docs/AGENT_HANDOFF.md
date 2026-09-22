@@ -33,8 +33,15 @@ output, so remove the entry" was wrong: at exact public commit
 [`8e427265`](https://github.com/sushiHex/hermes-realtime/commit/8e4272651a06bcb6720d282cab147356a20e30f7),
 `nvidia-cuda-runtime` 13.3.29 [published three wheels](https://pypi.org/pypi/nvidia-cuda-runtime/13.3.29/json),
 and the [committed file](https://github.com/sushiHex/hermes-realtime/blob/8e4272651a06bcb6720d282cab147356a20e30f7/requirements/kokoro-cuda-worker-win-py311.txt#L101-L104)
-lists exactly those three hashes. A derived entry carrying every published hash is one a bot
-*can* complete under the [requirements update procedure](https://github.com/sushiHex/hermes-realtime/blob/8e4272651a06bcb6720d282cab147356a20e30f7/requirements/README.md#L21-L41).
+lists exactly those three hashes. That was read as showing a derived entry carrying every
+published hash is one a bot *can* complete. **That reading was itself wrong** (#169): the hash
+set matching is necessary, not sufficient. The bot resolves without the closure's
+`--python-version 3.11` and platform, so #112 moved joblib to a release that newly required
+cloudpickle without adding it, and #130 moved numpy to a release requiring Python 3.12 — both
+with complete, correct hash sets, both green, both breaking the worker setup. The original
+premise was right after all: the closure is generated output. The wrong step was the
+conclusion drawn from it. Removing a producer is not the mechanism; checking the output against
+its generation is, and `tests/test_worker_closure.py` now does that whoever proposes the change.
 "The entry scoped
 to a directory is the entry that reaches its files" was disproved by the bot itself, which
 proposed a declared-root change in `kokoro-cuda-worker.in` through the `uv` entry — an ignore
