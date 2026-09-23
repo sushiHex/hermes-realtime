@@ -151,6 +151,7 @@ _IGNORED_THREAD_NOTIFICATIONS = frozenset(
         "thread/status/changed",
         "turn/moderationMetadata",
         "turn/started",
+        "warning",
     }
 )
 _ITEM_LIFECYCLE_NOTIFICATIONS = frozenset({"item/started", "item/completed"})

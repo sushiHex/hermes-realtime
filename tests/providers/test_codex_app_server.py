@@ -1247,6 +1247,22 @@ class ModerationMetadataCodexTransport(EofOnCloseCodexTransport):
         await super().send(message)
 
 
+class ThreadWarningCodexTransport(EofOnCloseCodexTransport):
+    async def send(self, message: Mapping[str, object]) -> None:
+        await super().send(message)
+        if message.get("method") == "turn/start":
+            # Codex 0.155 reports each disabled feature it would otherwise have used.
+            await self._messages.put(
+                {
+                    "method": "warning",
+                    "params": {
+                        "threadId": "thread_server_1",
+                        "message": "Code Mode is unavailable because code-mode host is disabled.",
+                    },
+                }
+            )
+
+
 class UnknownNotificationCodexTransport(EofOnCloseCodexTransport):
     async def send(self, message: Mapping[str, object]) -> None:
         if message.get("method") == "turn/start":
@@ -3768,6 +3784,20 @@ async def test_codex_moderation_metadata_is_accepted_as_status_only() -> None:
         async for segment in inference.stream(_snapshot(), turn_id="turn_moderation_metadata")
     ] == ["Four."]
     await asyncio.sleep(0)
+    await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_warning_is_accepted_as_status_only() -> None:
+    transport = ThreadWarningCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+    )
+    assert [
+        segment async for segment in inference.stream(_snapshot(), turn_id="turn_thread_warning")
+    ] == ["Four."]
     await inference.close()
 
 
