@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
-from collections import Counter
+from collections import defaultdict
 from pathlib import Path
 
 # The owner-selected qualification baseline (#67, #159): a reference, not a version ceiling.
@@ -56,14 +56,27 @@ def installed_hermes_identity(version: str, checkout: Path) -> dict[str, object]
 
 
 def _unrepresentable_paths(checkout: Path) -> set[str]:
-    """Tracked paths a case-insensitive checkout cannot hold apart, so git sees them changed."""
+    """Committed paths a case-insensitive checkout cannot hold apart, left exactly as committed.
+
+    Such spellings share one file on disk, so git reports all but one as changed. They are
+    unchanged when that one file is byte-identical to one of their committed versions.
+    """
 
     ignorecase = _git(checkout, "config", "--type=bool", "--default=false", "core.ignorecase")
     if ignorecase.strip() != "true":
         return set()
-    tracked = [path for path in _git(checkout, "ls-files", "-z").split("\0") if path]
-    spellings = Counter(path.casefold() for path in tracked)
-    return {path for path in tracked if spellings[path.casefold()] > 1}
+    spellings: dict[str, dict[str, str]] = defaultdict(dict)
+    for entry in _git(checkout, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split("\0"):
+        if entry:
+            header, path = entry.split("\t", 1)
+            spellings[path.casefold()][path] = header.split()[2]
+    exempt: set[str] = set()
+    for committed in spellings.values():
+        if len(committed) > 1:
+            on_disk = _git(checkout, "hash-object", "--", next(iter(committed))).strip()
+            if on_disk in committed.values():
+                exempt.update(committed)
+    return exempt
 
 
 def _git(checkout: Path, *arguments: str) -> str:

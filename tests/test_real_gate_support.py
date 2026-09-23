@@ -50,7 +50,8 @@ def test_the_gate_records_the_exact_installed_hermes(
     assert capsys.readouterr().out == ""
 
 
-def test_the_gate_identifies_a_checkout_whose_paths_differ_only_in_case(checkout: Path) -> None:
+@pytest.fixture
+def case_colliding_checkout(checkout: Path) -> Path:
     # Upstream 29112bef tracks such paths; a case-insensitive filesystem holds only one.
     (checkout / "spare.txt").write_text("other spelling\n", encoding="utf-8")
     blob = _git(checkout, "hash-object", "-w", "spare.txt")
@@ -58,10 +59,24 @@ def test_the_gate_identifies_a_checkout_whose_paths_differ_only_in_case(checkout
     _git(checkout, "update-index", "--add", "--cacheinfo", f"100644,{blob},HERMES.py")
     _git(checkout, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "case")
     _git(checkout, "checkout", "-q", "-f", "HEAD")
+    return checkout
 
-    assert installed_hermes_identity("0.21.0", checkout)["commit"] == _git(
-        checkout, "rev-parse", "HEAD"
-    )
+
+def test_the_gate_identifies_a_checkout_whose_paths_differ_only_in_case(
+    case_colliding_checkout: Path,
+) -> None:
+    identity = installed_hermes_identity("0.21.0", case_colliding_checkout)
+
+    assert identity["commit"] == _git(case_colliding_checkout, "rev-parse", "HEAD")
+
+
+def test_the_gate_refuses_an_edit_to_a_path_that_differs_only_in_case(
+    case_colliding_checkout: Path,
+) -> None:
+    (case_colliding_checkout / "hermes.py").write_text("VERSION = 3\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no commit describes"):
+        installed_hermes_identity("0.21.0", case_colliding_checkout)
 
 
 @pytest.mark.parametrize(

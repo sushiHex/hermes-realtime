@@ -74,7 +74,8 @@ Its passing record names the exact Hermes it ran against: the installed version,
 commit, and whether that pair is the qualification baseline (v0.21.0 at `29112bef`), which is a
 reference rather than a version ceiling. It refuses a checkout with tracked changes, because no
 commit describes that code. Paths that differ only in case are exempt on a case-insensitive
-checkout: `29112bef` tracks such paths, and Windows can hold only one of each.
+checkout only while their one file on disk matches one of their committed versions:
+`29112bef` tracks such paths, and Windows can hold only one of each.
 
 ## Worker
 
