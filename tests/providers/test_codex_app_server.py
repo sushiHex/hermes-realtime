@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import importlib.util
 import json
 import sys
+import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -576,7 +578,7 @@ async def test_codex_subprocess_spawn_failure_removes_isolated_auth(
     monkeypatch.setattr(
         codex_app_server_module,
         "_isolated_subscription_environment",
-        lambda _source: ({"PATH": "safe-path"}, isolated_home),
+        lambda _source: ({"PATH": "safe-path"}, isolated_home, None),
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
 
@@ -1515,7 +1517,7 @@ def test_codex_process_boundary_uses_auth_only_temporary_home(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    environment, isolated_home = _isolated_subscription_environment(
+    environment, isolated_home, _expiry = _isolated_subscription_environment(
         {
             "PATH": "safe-path",
             "CODEX_HOME": str(source_home),
@@ -1547,7 +1549,7 @@ def test_codex_process_boundary_auth_isolation_fails_closed_and_falls_back(
     codex_home = user_home / ".codex"
     codex_home.mkdir(parents=True)
     (codex_home / "auth.json").write_text('{"fixture":"credential"}', encoding="utf-8")
-    environment, isolated_home = _isolated_subscription_environment(
+    environment, isolated_home, _expiry = _isolated_subscription_environment(
         {"USERPROFILE": str(user_home), "PATH": "safe-path"}
     )
     try:
@@ -1555,6 +1557,134 @@ def test_codex_process_boundary_auth_isolation_fails_closed_and_falls_back(
         assert (Path(environment["CODEX_HOME"]) / "auth.json").is_file()
     finally:
         isolated_home.cleanup()
+
+
+def _access_token(expires_in_seconds: float) -> str:
+    claims = json.dumps({"exp": int(time.time() + expires_in_seconds)}).encode()
+    payload = base64.urlsafe_b64encode(claims).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _chatgpt_login(access_token: str) -> dict[str, object]:
+    return {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": "id-fixture",
+            "access_token": access_token,
+            "refresh_token": "refresh-fixture",
+            "account_id": "account-fixture",
+        },
+        "last_refresh": "2026-09-20T00:00:00Z",
+    }
+
+
+def _isolated_login(
+    tmp_path: Path, login: dict[str, object]
+) -> tuple[dict[str, object], float | None]:
+    (tmp_path / "auth.json").write_text(json.dumps(login), encoding="utf-8")
+    environment, isolated_home, expires_at = _isolated_subscription_environment(
+        {"CODEX_HOME": str(tmp_path), "PATH": "safe-path"}
+    )
+    try:
+        copied = Path(environment["CODEX_HOME"], "auth.json").read_text(encoding="utf-8")
+        return cast(dict[str, object], json.loads(copied)), expires_at
+    finally:
+        isolated_home.cleanup()
+
+
+def _session_auth_markers(output: str) -> list[object]:
+    prefix = "[codex-session-auth] "
+    lines = output.splitlines()
+    return [json.loads(line.removeprefix(prefix)) for line in lines if line.startswith(prefix)]
+
+
+def test_codex_session_login_withholds_only_the_refresh_token(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    access_token = _access_token(expires_in_seconds=86_400)
+    login = _chatgpt_login(access_token)
+
+    copied, expires_at = _isolated_login(tmp_path, login)
+
+    # A refresh in the temporary home would rotate the user's token and discard the replacement.
+    tokens = cast(dict[str, object], login["tokens"])
+    assert copied == login | {"tokens": tokens | {"refresh_token": ""}}
+    assert expires_at == json.loads(base64.urlsafe_b64decode(access_token.split(".")[1] + "=="))[
+        "exp"
+    ]
+    assert _session_auth_markers(capsys.readouterr().out) == []
+
+
+@pytest.mark.parametrize(
+    "access_token",
+    [_access_token(expires_in_seconds=600), _access_token(expires_in_seconds=-60)],
+    ids=["expiring", "expired"],
+)
+def test_codex_session_login_refuses_an_access_token_it_would_have_to_refresh(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], access_token: str
+) -> None:
+    with pytest.raises(RuntimeError, match="run codex once"):
+        _isolated_login(tmp_path, _chatgpt_login(access_token))
+
+    assert _session_auth_markers(capsys.readouterr().out) == [
+        {"refusal": "expiring", "version": 1}
+    ]
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [["not", "a", "mapping"], {"access_token": 7}, {"access_token": "not-a-jwt"}],
+    ids=["tokens-not-mapping", "token-not-string", "token-not-jwt"],
+)
+def test_codex_session_login_refuses_malformed_tokens(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], tokens: object
+) -> None:
+    login = _chatgpt_login(_access_token(expires_in_seconds=86_400)) | {"tokens": tokens}
+
+    with pytest.raises(RuntimeError, match="auth is malformed"):
+        _isolated_login(tmp_path, login)
+
+    assert _session_auth_markers(capsys.readouterr().out) == [
+        {"refusal": "malformed", "version": 1}
+    ]
+
+
+def _transport_with_login(expires_in_seconds: float) -> EofOnCloseCodexTransport:
+    transport = EofOnCloseCodexTransport()
+    transport.login_expires_at = time.time() + expires_in_seconds  # type: ignore[attr-defined]
+    return transport
+
+
+@pytest.mark.asyncio
+async def test_codex_process_is_replaced_before_its_login_expires() -> None:
+    expiring = _transport_with_login(expires_in_seconds=600)
+    fresh = _transport_with_login(expires_in_seconds=86_400)
+    remaining = iter((expiring, fresh))
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: next(remaining)
+    )
+
+    first = [segment async for segment in inference.stream(_snapshot(), turn_id="turn_first")]
+    second = [segment async for segment in inference.stream(_snapshot(), turn_id="turn_second")]
+
+    assert first == second == ["Four."]
+    assert expiring.closed is True and fresh.closed is False
+    await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_process_with_a_valid_login_is_kept() -> None:
+    remaining = iter((_transport_with_login(expires_in_seconds=86_400),))
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: next(remaining)
+    )
+
+    for turn_id in ("turn_first", "turn_second"):
+        assert [
+            segment async for segment in inference.stream(_snapshot(), turn_id=turn_id)
+        ] == ["Four."]
+    await inference.close()
 
 
 def _snapshot(*, active_task: bool = False) -> ConversationContextSnapshot:
