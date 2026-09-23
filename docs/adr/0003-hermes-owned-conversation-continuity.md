@@ -61,6 +61,10 @@ message ID:
 An assistant row may belong to an ordinary reply, an announcement with no user turn, or a
 resumed replay. A `task:` command becomes a user row plus its delivered announcement.
 
+Appends form one ordered queue: a message is sent only after every earlier message is
+acknowledged. When an outage loses messages, appending resumes at the next user message. The
+record therefore never holds a reply without the question it answers.
+
 The assistant text is the transport-confirmed prefix, followed by a fixed interruption marker
 when speech was cut off. Confirmation comes from the delivery ledger. It proves the audio
 reached the room's verifier, not that a person heard it, and no wording in this record claims
@@ -89,13 +93,22 @@ wherever real work happens.
 ### 3. Realtime keeps one binding record
 
 The binding record holds `{profile, voice session ID, task ID → run ID and run session ID}`. It
-is bounded and holds no transcript text. It is the only persisted realtime state, and #77 item 4
-admits exactly this kind of session reference.
+is bounded, and it is the only persisted realtime state. #77 item 4 admits exactly this kind of
+session reference and bounded transient context.
 
-- **Restart.** Realtime reconciles each bound task with `GET /v1/runs/{id}`. A run Hermes no
+- **Before dispatch.** A task is recorded before its request is sent, together with that exact
+  request. Hermes's acknowledgment promotes the entry to its run ID and drops the request. The
+  request is the only transcript-bearing content the record ever holds, and only until it is
+  acknowledged.
+- **Restart, pending entry.** Realtime replays the stored request verbatim under the same
+  idempotency key. Hermes returns the original run if it accepted the request, or starts the
+  work if the request never arrived. A replay must be byte-identical: a different body is
+  refused as a conflict
+  ([replay](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L562-L594)).
+- **Restart, promoted entry.** Realtime reconciles it with `GET /v1/runs/{id}`. A run Hermes no
   longer knows is reported as lost, never as running.
-- **Retries.** The idempotency key covers the window in which an acknowledgment was lost, so a
-  retry cannot start the work twice.
+
+No accepted run can therefore go untracked, and no retry can start work twice.
 
 ### Live context follows the same rule
 
@@ -132,8 +145,9 @@ storage.
 
 A backend outage never silences the voice.
 
-- **Appends are best-effort.** Realtime keeps a bounded count of unremembered messages and
-  announces the gap once.
+- **Appends are best-effort.** A bounded queue holds messages until they are acknowledged. On
+  overflow, realtime drops the unacknowledged tail, announces the gap once, and resumes at the
+  next user message.
 - **A failed resume read** starts an explicit no-continuity conversation.
 - **Task truth stays live.** It always comes from the live backend, never from the record, and
   restored text cannot grant dispatch, approval, or cancellation authority.
@@ -149,8 +163,12 @@ A backend outage never silences the voice.
 - **Memory egress.** Before a voice tail reaches a run, the profile must use built-in memory
   only, because a run's memory sync passes its messages to any configured external provider
   ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
-- **Forgetting.** "Forget this conversation" deletes the voice session and every run session in
-  the binding record. Run sessions hold objectives, not voice text. Curated memory is a
+- **Forgetting.** "Forget this conversation" deletes every run session in the binding record,
+  which hold objectives rather than voice text, and the voice session's whole compression chain.
+  Hermes deletes only the named session and leaves compression successors in place. So forget
+  resolves the latest continuation and walks `parent_session_id` back to the bound session,
+  deleting each link. If the walk cannot reach the bound session, forget reports itself
+  incomplete. Curated memory is a
   separate, explicit operation, and complete file-level erasure is not promised until the delete
   path is qualified
   ([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
@@ -182,12 +200,14 @@ A backend outage never silences the voice.
 
 Each step must prove its guarantees against a qualified exact target:
 
-- a retried run never starts twice;
+- a retried or replayed run never starts twice;
+- a crash between dispatch and acknowledgment leaves a pending entry that restart resolves;
 - a restarted host reports every bound task truthfully;
 - live context and the record contain only transport-confirmed text and markers;
-- appends are idempotent and never block the voice;
+- appends are idempotent, ordered, and never block the voice;
+- the record never holds a reply without its question;
 - resume admits only text rows from the bound session;
-- forgetting removes every bound session.
+- forgetting removes every bound run session and the voice session's whole compression chain.
 
 Each guard follows the repository evidence rules: one bounded, content-free refusal marker, and
 one mutation per guard shown to fail alone.
