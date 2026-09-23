@@ -1248,6 +1248,10 @@ class ModerationMetadataCodexTransport(EofOnCloseCodexTransport):
 
 
 class ThreadWarningCodexTransport(EofOnCloseCodexTransport):
+    def __init__(self, warning: object) -> None:
+        super().__init__()
+        self._warning = warning
+
     async def send(self, message: Mapping[str, object]) -> None:
         await super().send(message)
         if message.get("method") == "turn/start":
@@ -1255,10 +1259,7 @@ class ThreadWarningCodexTransport(EofOnCloseCodexTransport):
             await self._messages.put(
                 {
                     "method": "warning",
-                    "params": {
-                        "threadId": "thread_server_1",
-                        "message": "Code Mode is unavailable because code-mode host is disabled.",
-                    },
+                    "params": {"threadId": "thread_server_1", "message": self._warning},
                 }
             )
 
@@ -3789,7 +3790,9 @@ async def test_codex_moderation_metadata_is_accepted_as_status_only() -> None:
 
 @pytest.mark.asyncio
 async def test_codex_thread_warning_is_accepted_as_status_only() -> None:
-    transport = ThreadWarningCodexTransport()
+    transport = ThreadWarningCodexTransport(
+        "Code Mode is unavailable because code-mode host is disabled."
+    )
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
         effort="low",
@@ -3798,6 +3801,22 @@ async def test_codex_thread_warning_is_accepted_as_status_only() -> None:
     assert [
         segment async for segment in inference.stream(_snapshot(), turn_id="turn_thread_warning")
     ] == ["Four."]
+    await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warning", [None, 7, {"text": "disabled"}])
+async def test_codex_malformed_thread_warning_fails_closed(warning: object) -> None:
+    transport = ThreadWarningCodexTransport(warning)
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+        request_timeout_seconds=1,
+    )
+    with pytest.raises(RuntimeError, match="reader failed"):
+        async for _segment in inference.stream(_snapshot(), turn_id="turn_malformed_warning"):
+            pass
     await inference.close()
 
 
