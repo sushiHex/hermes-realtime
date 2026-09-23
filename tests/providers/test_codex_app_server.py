@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import importlib.util
 import json
 import sys
+import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -1555,6 +1557,72 @@ def test_codex_process_boundary_auth_isolation_fails_closed_and_falls_back(
         assert (Path(environment["CODEX_HOME"]) / "auth.json").is_file()
     finally:
         isolated_home.cleanup()
+
+
+def _access_token(expires_in_seconds: float) -> str:
+    claims = json.dumps({"exp": int(time.time() + expires_in_seconds)}).encode()
+    payload = base64.urlsafe_b64encode(claims).decode().rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _chatgpt_login(access_token: str) -> dict[str, object]:
+    return {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": "id-fixture",
+            "access_token": access_token,
+            "refresh_token": "refresh-fixture",
+            "account_id": "account-fixture",
+        },
+        "last_refresh": "2026-09-20T00:00:00Z",
+    }
+
+
+def _isolated_login(tmp_path: Path, login: dict[str, object]) -> dict[str, object]:
+    (tmp_path / "auth.json").write_text(json.dumps(login), encoding="utf-8")
+    environment, isolated_home = _isolated_subscription_environment(
+        {"CODEX_HOME": str(tmp_path), "PATH": "safe-path"}
+    )
+    try:
+        copied = Path(environment["CODEX_HOME"], "auth.json").read_text(encoding="utf-8")
+        return cast(dict[str, object], json.loads(copied))
+    finally:
+        isolated_home.cleanup()
+
+
+def test_codex_session_login_withholds_only_the_refresh_token(tmp_path: Path) -> None:
+    login = _chatgpt_login(_access_token(expires_in_seconds=86_400))
+
+    copied = _isolated_login(tmp_path, login)
+
+    # A refresh in the temporary home would rotate the user's token and discard the replacement.
+    tokens = cast(dict[str, object], login["tokens"])
+    assert copied == login | {"tokens": tokens | {"refresh_token": ""}}
+
+
+@pytest.mark.parametrize(
+    "access_token",
+    [_access_token(expires_in_seconds=600), _access_token(expires_in_seconds=-60)],
+    ids=["expiring", "expired"],
+)
+def test_codex_session_login_refuses_an_access_token_it_would_have_to_refresh(
+    tmp_path: Path, access_token: str
+) -> None:
+    with pytest.raises(RuntimeError, match="run codex once"):
+        _isolated_login(tmp_path, _chatgpt_login(access_token))
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [["not", "a", "mapping"], {"access_token": 7}, {"access_token": "not-a-jwt"}],
+    ids=["tokens-not-mapping", "token-not-string", "token-not-jwt"],
+)
+def test_codex_session_login_refuses_malformed_tokens(tmp_path: Path, tokens: object) -> None:
+    login = _chatgpt_login(_access_token(expires_in_seconds=86_400)) | {"tokens": tokens}
+
+    with pytest.raises(RuntimeError, match="auth is malformed"):
+        _isolated_login(tmp_path, login)
 
 
 def _snapshot(*, active_task: bool = False) -> ConversationContextSnapshot:

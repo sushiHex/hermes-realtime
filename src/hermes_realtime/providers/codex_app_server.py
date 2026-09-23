@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -43,6 +44,8 @@ _REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max",
 _VERIFIED_NONE_EFFORT_MODELS = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
 _MAX_SEGMENT_CHARS = 4096
 _MAX_PROTOCOL_LINE_BYTES = 1_048_576
+# A session starting this close to expiry would need Codex to refresh, which it cannot here.
+_MIN_SESSION_ACCESS_SECONDS = 3600
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -227,7 +230,7 @@ def _subscription_environment(source: Mapping[str, str]) -> dict[str, str]:
 def _isolated_subscription_environment(
     source: Mapping[str, str],
 ) -> tuple[dict[str, str], tempfile.TemporaryDirectory[str]]:
-    """Copy only first-party auth into a fresh Codex home for one process."""
+    """Give one process a fresh Codex home holding only the login, minus its refresh token."""
 
     environment = _subscription_environment(source)
     configured_home = environment.get("CODEX_HOME")
@@ -239,15 +242,57 @@ def _isolated_subscription_environment(
     auth_file = Path(configured_home) / "auth.json"
     if not auth_file.is_file():
         raise RuntimeError("Codex subscription auth is unavailable")
+    session_auth = _session_auth(auth_file)
 
     isolated_home = tempfile.TemporaryDirectory(prefix="hermes-realtime-codex-auth-")
     try:
-        shutil.copyfile(auth_file, Path(isolated_home.name) / "auth.json")
+        Path(isolated_home.name, "auth.json").write_text(session_auth, encoding="utf-8")
     except BaseException:
         isolated_home.cleanup()
         raise
     environment["CODEX_HOME"] = isolated_home.name
     return environment, isolated_home
+
+
+def _session_auth(auth_file: Path) -> str:
+    """Return the login for one process, without the refresh token it must never spend.
+
+    A refresh inside the temporary home would rotate the user's refresh token and discard its
+    replacement, signing the Codex CLI out. Codex requires the field, so it is left blank, and
+    an access token that Codex would refresh before the session is under way is refused.
+    """
+
+    text = auth_file.read_text(encoding="utf-8")
+    try:
+        auth = json.loads(text)
+    except ValueError:
+        raise RuntimeError("Codex subscription auth is malformed") from None
+    if type(auth) is not dict:
+        raise RuntimeError("Codex subscription auth is malformed")
+    tokens = auth.get("tokens")
+    if tokens is None:
+        return text  # An API-key login holds no refresh token.
+    if type(tokens) is not dict or type(tokens.get("access_token")) is not str:
+        raise RuntimeError("Codex subscription auth is malformed")
+    if _jwt_expiry(tokens["access_token"]) - time.time() < _MIN_SESSION_ACCESS_SECONDS:
+        raise RuntimeError(
+            "Codex subscription access token expires within the hour; run codex once to refresh it"
+        )
+    return json.dumps(auth | {"tokens": tokens | {"refresh_token": ""}})
+
+
+def _jwt_expiry(token: str) -> float:
+    parts = token.split(".")
+    try:
+        if len(parts) != 3:
+            raise ValueError
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        expiry = claims["exp"]
+    except (ValueError, TypeError, KeyError):
+        raise RuntimeError("Codex subscription auth is malformed") from None
+    if type(expiry) not in (int, float) or not math.isfinite(expiry):
+        raise RuntimeError("Codex subscription auth is malformed")
+    return float(expiry)
 
 
 def _resolve_codex_executable(explicit: str | None) -> str:
