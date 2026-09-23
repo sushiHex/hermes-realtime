@@ -60,6 +60,9 @@ _MAX_TERMINAL_TEXT_CHARS = 4096
 _MAX_ACTIVE_RUNS = 8
 _MAX_PENDING_APPROVALS = 32
 _MAX_SEQUENCE = (1 << 63) - 1
+# Every status Hermes can report for a run it holds, and so every status a replay may carry.
+_LIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_for_approval", "stopping"})
+_RUN_STATUSES = _LIVE_RUN_STATUSES | {"completed", "failed", "cancelled", "interrupted"}
 _BACKGROUND_INSTRUCTIONS = (
     "Complete this bounded background objective with a hard latency target. "
     "Stay exactly within the requested scope; do not add a topic, domain, category, "
@@ -178,6 +181,10 @@ class HermesApiConfig:
     __str__ = __repr__
 
 
+class _NoResponse(RuntimeError):
+    """A request may have reached Hermes, but no response came back."""
+
+
 @dataclass(slots=True)
 class _RunAuthority:
     task_id: str
@@ -238,6 +245,7 @@ class HermesApiTaskSession:
         self._approval_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
+        self._idempotent_runs = False
         self._started = False
         self._closed = False
 
@@ -284,6 +292,15 @@ class HermesApiTaskSession:
             )
             if missing:
                 raise RuntimeError("Hermes API lacks required capability: " + ", ".join(missing))
+            idempotency = features.get("runs_idempotency")
+            if idempotency is not None and (
+                type(idempotency) is not dict
+                or idempotency.get("supported") is not True
+                or type(idempotency.get("durable")) is not bool
+            ):
+                raise RuntimeError("Hermes API run idempotency capability is malformed")
+            # Only a durable record can answer a resend truthfully across a Hermes restart.
+            idempotent_runs = idempotency is not None and idempotency["durable"] is True
             endpoints = payload.get("endpoints")
             if type(endpoints) is not dict:
                 raise RuntimeError("Hermes API endpoint capabilities are malformed")
@@ -302,6 +319,7 @@ class HermesApiTaskSession:
             if self._closed:
                 await self._close_client()
                 raise RuntimeError("Hermes API task session closed during startup")
+            self._idempotent_runs = idempotent_runs
             self._started = True
 
     async def dispatch(
@@ -367,12 +385,10 @@ class HermesApiTaskSession:
             model_options["service_tier"] = self._config.run_service_tier
         if model_options:
             body["model_options"] = model_options
-        status, payload = await self._request_json(
-            "POST",
-            "/v1/runs",
-            body=body,
-        )
+        status, payload, ambiguous = await self._submit_run(body)
         if status != 202:
+            if ambiguous:
+                raise RuntimeError("Hermes API dispatch outcome is unknown")
             logger.warning("Hermes API rejected background dispatch with HTTP %d", status)
             return self._dispatch_ack(
                 trusted,
@@ -388,22 +404,28 @@ class HermesApiTaskSession:
             assert isinstance(api_run_id, str)
             claimed = await self._claim_unpublished(api_run_id)
         response_keys = set(payload) if type(payload) is dict else set()
-        legacy_first_admission = response_keys == {"run_id", "status"}
-        v021_first_admission = (
-            response_keys == {"run_id", "status", "replayed"}
-            and payload.get("replayed") is False
-        )
-        if not (legacy_first_admission or v021_first_admission):
+        replayed = payload.get("replayed")
+        if self._idempotent_runs:
+            well_formed = response_keys == {"run_id", "status", "replayed"} and (
+                type(replayed) is bool
+            )
+        else:
+            well_formed = response_keys == {"run_id", "status"} or (
+                response_keys == {"run_id", "status", "replayed"} and replayed is False
+            )
+        if not well_formed:
             if claimed:
                 assert isinstance(api_run_id, str)
                 await self._settle_unpublished(api_run_id)
             raise RuntimeError("Hermes API dispatch response is malformed")
-        exact_started = (
+        # A first admission reports "started"; a replay reports the run's current status.
+        admitted_statuses = _RUN_STATUSES if replayed is True else {"started"}
+        exact_authority = (
             type(api_run_id) is str
             and _RUN_ID_EXACT.fullmatch(api_run_id) is not None
-            and payload.get("status") == "started"
+            and payload.get("status") in admitted_statuses
         )
-        if not exact_started:
+        if not exact_authority:
             if claimed:
                 assert isinstance(api_run_id, str)
                 await self._settle_unpublished(api_run_id)
@@ -452,6 +474,33 @@ class HermesApiTaskSession:
             accepted=True,
             run_id=protocol_run_id,
         )
+
+    async def _submit_run(self, body: dict[str, object]) -> tuple[int, dict[str, Any], bool]:
+        """POST one run, resending it once unchanged if the first attempt got no response.
+
+        Both attempts carry one idempotency key, so Hermes admits the run at most once. The
+        resend is the only way to learn a run the lost attempt may have started, so it happens
+        even for an abandoned dispatch, and publication then stops what it recovers. The flag
+        reports an ambiguous earlier attempt, after which a refusal proves nothing.
+        """
+        if not self._idempotent_runs:
+            status, payload = await self._request_json("POST", "/v1/runs", body=body)
+            return status, payload, False
+        headers = {"Idempotency-Key": secrets.token_hex(16)}
+        try:
+            status, payload = await self._request_json(
+                "POST", "/v1/runs", body=body, headers=headers
+            )
+            return status, payload, False
+        except _NoResponse:
+            pass
+        try:
+            status, payload = await self._request_json(
+                "POST", "/v1/runs", body=body, headers=headers
+            )
+        except _NoResponse as error:
+            raise RuntimeError("Hermes API dispatch outcome is unknown") from error
+        return status, payload, True
 
     async def _settle_unpublished(self, api_run_id: str) -> None:
         await self._stop_and_wait(api_run_id)
@@ -874,6 +923,7 @@ class HermesApiTaskSession:
         path: str,
         *,
         body: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         client = self._client
         if client is None:
@@ -882,7 +932,7 @@ class HermesApiTaskSession:
             async with client.request(
                 method,
                 self._config.base_url + path,
-                headers=self._headers(json_body=body is not None),
+                headers=self._headers(json_body=body is not None) | (headers or {}),
                 json=body,
                 allow_redirects=False,
             ) as response:
@@ -898,7 +948,7 @@ class HermesApiTaskSession:
         except asyncio.CancelledError:
             raise
         except (aiohttp.ClientError, TimeoutError) as error:
-            raise RuntimeError("Hermes API request failed") from error
+            raise _NoResponse("Hermes API request failed") from error
 
     def _headers(self, *, json_body: bool = False) -> dict[str, str]:
         headers = {
@@ -992,9 +1042,10 @@ class HermesApiTaskSession:
                 "run_id": api_run_id,
                 "error": payload.get("error"),
             }
-        if run_status == "cancelled":
+        # Hermes reports a run whose gateway restarted before it settled as interrupted.
+        if run_status in {"cancelled", "interrupted"}:
             return {"event": "run.cancelled", "run_id": api_run_id}
-        if run_status not in {"queued", "running", "waiting_for_approval", "stopping"}:
+        if run_status not in _LIVE_RUN_STATUSES:
             raise RuntimeError("Hermes API run status is malformed")
         return None
 
