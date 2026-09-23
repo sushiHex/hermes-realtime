@@ -26,7 +26,6 @@ import json
 import math
 import os
 import secrets
-import socket
 import subprocess
 import sys
 import tempfile
@@ -35,7 +34,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
+from real_gate_support import HERMES_BASELINE, available_port
+
+_COMMIT = HERMES_BASELINE["commit"]
 _UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
 _CACHE = Path(__file__).resolve().parents[1] / ".hermes" / "bench" / f"hermes-{_COMMIT[:12]}"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -80,12 +81,6 @@ def _history(turns: int) -> list[dict[str, str]]:
             }
         )
     return messages
-
-
-def _free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
 
 
 def _codex_access_token() -> str:
@@ -316,7 +311,7 @@ async def _measure(args: argparse.Namespace) -> list[dict[str, Any]]:
     from gateway.platforms.api_server import APIServerAdapter  # type: ignore[import-not-found]
 
     key = secrets.token_urlsafe(32)
-    port = _free_port()
+    port = available_port()
     adapter = APIServerAdapter(
         PlatformConfig(
             enabled=True,

@@ -1,9 +1,15 @@
-"""Shared credential and loopback helpers for installed-boundary gates."""
+"""Shared credential, identity and loopback helpers for installed-boundary gates."""
 
 from __future__ import annotations
 
+import json
 import socket
+import subprocess
+from collections import defaultdict
 from pathlib import Path
+
+# The owner-selected qualification baseline (#67, #159): a reference, not a version ceiling.
+HERMES_BASELINE = {"version": "0.21.0", "commit": "29112bef099274229cadff79cdff7bf7b99c4b77"}
 
 
 def load_api_key(env_file: Path) -> str:
@@ -19,6 +25,64 @@ def load_api_key(env_file: Path) -> str:
     if len(matches) != 1 or len(matches[0]) < 32:
         raise RuntimeError("Hermes env file must contain one explicit strong API_SERVER_KEY")
     return matches[0]
+
+
+def installed_hermes_identity(version: str, checkout: Path) -> dict[str, object]:
+    """Name the exact Hermes a gate ran against, and whether it is the qualified baseline.
+
+    Evidence binds to a commit, so a checkout whose tracked files differ from every commit is
+    refused. Untracked files, such as the installer's virtual environment, do not change it.
+    """
+
+    refusal: str | None = "unidentifiable"
+    try:
+        commit = _git(checkout, "rev-parse", "HEAD").strip()
+        refusal = "modified"
+        status = _git(checkout, "status", "--porcelain", "-z", "--untracked-files=no")
+        changed = {entry[3:] for entry in status.split("\0") if entry}
+        if changed - _unrepresentable_paths(checkout):
+            raise RuntimeError("installed Hermes has local changes that no commit describes")
+        refusal = None
+    except subprocess.CalledProcessError:
+        raise RuntimeError(
+            "installed Hermes is not a git checkout, so no commit describes it"
+        ) from None
+    finally:
+        if refusal is not None:
+            evidence = json.dumps({"refusal": refusal, "version": 1}, separators=(",", ":"))
+            print(f"[hermes-identity] {evidence}", flush=True)
+    identity = {"version": version, "commit": commit}
+    return identity | {"baseline": identity == HERMES_BASELINE}
+
+
+def _unrepresentable_paths(checkout: Path) -> set[str]:
+    """Committed paths a case-insensitive checkout cannot hold apart, left exactly as committed.
+
+    Such spellings share one file on disk, so git reports all but one as changed. They are
+    unchanged when that one file is byte-identical to one of their committed versions.
+    """
+
+    ignorecase = _git(checkout, "config", "--type=bool", "--default=false", "core.ignorecase")
+    if ignorecase.strip() != "true":
+        return set()
+    spellings: dict[str, dict[str, str]] = defaultdict(dict)
+    for entry in _git(checkout, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split("\0"):
+        if entry:
+            header, path = entry.split("\t", 1)
+            spellings[path.casefold()][path] = header.split()[2]
+    exempt: set[str] = set()
+    for committed in spellings.values():
+        if len(committed) > 1:
+            on_disk = _git(checkout, "hash-object", "--", next(iter(committed))).strip()
+            if on_disk in committed.values():
+                exempt.update(committed)
+    return exempt
+
+
+def _git(checkout: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ("git", *arguments), cwd=checkout, check=True, capture_output=True, text=True
+    ).stdout
 
 
 def available_port() -> int:

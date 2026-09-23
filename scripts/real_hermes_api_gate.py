@@ -11,9 +11,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import hermes_cli  # type: ignore[import-not-found]
 from gateway.config import PlatformConfig  # type: ignore[import-not-found]
 from gateway.platforms.api_server import APIServerAdapter  # type: ignore[import-not-found]
-from real_gate_support import available_port, load_api_key
+from real_gate_support import available_port, installed_hermes_identity, load_api_key
 
 from hermes_realtime.host_launcher import build_local_host_launcher
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
@@ -47,6 +48,10 @@ def _dispatch(
 
 
 async def main() -> None:
+    # hermes_cli sits at the root of the installer's checkout.
+    hermes = installed_hermes_identity(
+        hermes_cli.__version__, Path(hermes_cli.__file__).resolve().parents[1]
+    )
     key = load_api_key(Path.cwd() / ".env")
     api_port = available_port()
     adapter = APIServerAdapter(
@@ -244,7 +249,7 @@ async def main() -> None:
                     "task_id": "task_full_host_gate",
                 }
             )
-        print(json.dumps({"gate": "passed", "results": results}, sort_keys=True))
+        print(json.dumps({"gate": "passed", "hermes": hermes, "results": results}, sort_keys=True))
     finally:
         await session.close()
         await adapter.disconnect()
