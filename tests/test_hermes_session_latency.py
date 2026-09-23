@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "hermes_session_latency.py"
+sys.path.insert(0, str(_SCRIPT_PATH.parent))  # The script imports its sibling gate support.
 _SCRIPT_SPEC = importlib.util.spec_from_file_location("hermes_session_latency", _SCRIPT_PATH)
 assert _SCRIPT_SPEC is not None and _SCRIPT_SPEC.loader is not None
 _SCRIPT = importlib.util.module_from_spec(_SCRIPT_SPEC)

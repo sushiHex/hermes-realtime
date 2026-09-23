@@ -70,6 +70,11 @@ Codex natural-work tools, the `natural_v1` conversation profile, knowledge overl
 Moonshine v2 Medium, and Kokoro. It behaviorally exercises authenticated Hermes API work,
 actionable approval rejection, exact cancellation, proactive completion, LiveKit composition, and
 bounded startup/shutdown. Spoken-turn media remains covered by the LiveKit acceptance tests.
+Its passing record names the exact Hermes it ran against: the installed version, the checkout
+commit, and whether that pair is the qualification baseline (v0.21.0 at `29112bef`), which is a
+reference rather than a version ceiling. It refuses a checkout with tracked changes, because no
+commit describes that code. Paths that differ only in case are exempt on a case-insensitive
+checkout: `29112bef` tracks such paths, and Windows can hold only one of each.
 
 ## Worker
 
