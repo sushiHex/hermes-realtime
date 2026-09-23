@@ -759,6 +759,7 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "scripts/real_natural_work_gate.py",
         "scripts/real_gate_support.py",
         "scripts/real_hermes_api_gate.py",
+        "scripts/hermes_session_latency.py",
         "scripts/task13_artifact_orchestrator.py",
         "scripts/candidate_source_archive_oracle.py",
         "scripts/candidate_e2e_fast_track.py",
