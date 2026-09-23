@@ -1,217 +1,213 @@
-# ADR 0003: Hermes owns persisted foreground conversation
+# ADR 0003: Realtime converses; Hermes keeps the turns
 
-Status: Proposed for review. Work items: [#77](https://github.com/sushiHex/hermes-realtime/issues/77),
+Status: Proposed for review (revised; owner-agreed direction). Work items:
+[#77](https://github.com/sushiHex/hermes-realtime/issues/77),
 [#80](https://github.com/sushiHex/hermes-realtime/issues/80), and
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159).
 
 Reviewed upstream source: Hermes Agent
-[`v0.21.0` at `29112bef`](https://github.com/NousResearch/hermes-agent/commit/29112bef099274229cadff79cdff7bf7b99c4b77).
-That version is the owner's baseline, not a compatibility ceiling. This record
-does not claim that the proposed integration is implemented.
+[`v0.21.0` at `29112bef`](https://github.com/NousResearch/hermes-agent/commit/29112bef099274229cadff79cdff7bf7b99c4b77),
+the owner's qualification baseline rather than a compatibility ceiling. This record does not
+claim that the design is implemented.
 
 ## Context
 
-The current realtime context is deliberately bounded and event-loop-local. It
-records a model response separately from confirmed speech delivery
-([context.py](../../src/hermes_realtime/conversation/context.py) and
-[delivery.py](../../src/hermes_realtime/speech/delivery.py)). It is therefore
-useful for one live room, but it cannot be the user's durable conversation or
-memory after restart.
+hermes-realtime is the orchestrating messenger agent. It owns the voice: foreground inference,
+speech, barge-in, and the ledger of what was delivered. It wields the Hermes agent harness for
+everything else: real work, recall, and Hermes's self-learning. Hermes never speaks through
+realtime. To the user this is one assistant.
 
-Hermes v0.21.0 advertises authenticated session chat and streaming session chat,
-while it explicitly advertises no memory-write API
-([capabilities](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L3341-L3371)).
-The session chat handlers reload the named session and run Hermes Agent with that
-session identity
-([synchronous handler](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4605-L4719),
-[streaming handler](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4722-L4942)).
-This is the supported path for Hermes to own inference and persistence. Running
-a second foreground model and writing its output into Hermes is not a supported
-v0.21.0 contract.
+#77 already fixes the integration approach, and this record applies it. Hermes stays
+authoritative for sessions, history, memory, search, and compaction. Realtime adds the smallest
+layer it can. Reading history, saving an externally produced turn, and running a Hermes agent
+turn are three distinct operations. A missing capability is met by a small upstream extension,
+never by writing Hermes's private files.
 
-A blocking evidence gap is the terminal event. A streamed turn emits a random stream-local
-message ID, then emits `assistant.completed` with `partial: false` and
-`interrupted: false` after the agent call returns
-([event construction](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4790-L4894)).
-The agent finalizer separately records its real `interrupted` result and catches
-persistence failures as `cleanup_errors`
-([finalizer result](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_finalizer.py#L718-L766)).
-The stream handler does not bind those facts to its terminal event. It requests a
-hard interrupt and drains the agent task when the transport disconnects
-([disconnect drain](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4944-L5000)),
-but the disconnected client receives no terminal result. The present terminal
-event consequently cannot prove which assistant row was persisted, whether the
-turn was interrupted, or whether final persistence succeeded.
+The #80 audit of v0.21.0 established four facts this design rests on:
+
+- **No write without a model run.** No route adds a message without running a model. The
+  session routes create, read, patch, delete, fork, and chat
+  ([routes](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2237-L2246)),
+  and the server reports no external memory-write API.
+- **Learning happens only in a live turn.** Hermes learns through its background memory and
+  skill review. That review starts only at the end of a live agent turn
+  ([spawn](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_finalizer.py#L806-L817)),
+  and its memory cadence counts the user turns in the loaded history
+  ([counter](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_context.py#L782-L790)).
+  Nothing reviews a stored session.
+- **Runs accept what delegation needs.** `/v1/runs` accepts a client `session_id`, an
+  `Idempotency-Key` backed by a durable unique reservation, and explicit `conversation_history`
+  that is used as context but not re-persisted
+  ([session](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L546),
+  [idempotency](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L452-L465),
+  [history](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L502-L520),
+  [not re-persisted](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L2234-L2238)).
+- **Runs cannot be listed.** Hermes can report one run by ID, but has no route that lists runs
+  ([routes](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L83-L91)).
 
 ## Decision
 
-Hermes will own each persisted foreground conversation. Realtime will use one
-explicit Hermes profile and one Hermes transcript session for a conversation.
-It will call the supported streaming session-chat route once for each final user
-utterance and will not also run a separate foreground inference for that turn.
-Realtime will never write Hermes state files or its SQLite database directly.
+Three mechanisms, and nothing else.
 
-Implementation is gated on a narrow upstream-supported terminal contract, or an
-equivalent verified contract in a later Hermes release. A terminal result must
-bind all of these facts:
+### 1. One Hermes session holds the voice conversation
 
-- the binding schema version, exact profile route, transcript session ID, and
-  tagged exact memory-scope selection;
-- stable persisted identities for the admitted user row and completed assistant
-  row;
-- whether the generation completed, was partial, was interrupted, or failed;
-- whether the terminal transcript write succeeded.
+Each voice conversation is bound to one Hermes session, the voice session, in the one selected
+profile. Every voice message is appended to it individually, carrying a realtime-generated
+message ID:
 
-The extension should strengthen session chat rather than create a general
-external-assistant append API. If session chat cannot meet the measured latency,
-tool, and cancellation requirements, an external-turn extension needs a
-separate upstream design and review. Its existence must not be inferred from
-the current `memory_write_api: false` capability.
+- a user row when its transcript is final;
+- an assistant row when its delivery settles.
 
-### Truth boundaries
+An assistant row may belong to an ordinary reply, an announcement with no user turn, or a
+resumed replay. A `task:` command becomes a user row plus its delivered announcement.
 
-A Hermes message row proves only persisted conversation content. It does not
-prove that speech synthesis began, audio entered the room, or the user heard it.
-Hermes' message response fields contain content and generation metadata, but no
-speech-delivery state
-([response projection](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4190-L4197)).
-Realtime remains authoritative for the delivery stages it observes. After a
-restart, a persisted assistant row without a matching delivery receipt is shown
-as delivery unknown and is not silently replayed or described as heard.
+Appends form one ordered queue: a message is sent only after every earlier message is
+acknowledged. When an outage loses messages, appending resumes at the next user message. The
+record therefore never holds a reply without the question it answers.
 
-Task truth also remains outside conversation history. Live run status, events,
-approval state, and cancellation decide whether background work exists or may
-be controlled. Text in a restored transcript cannot recreate a dispatch,
-authorize a tool, or prove that a task is active or complete. Before adoption,
-qualification must also show how the session-chat tool set is restricted so a
-foreground turn cannot duplicate the realtime task-dispatch path; v0.21.0 source
-review did not establish that restriction. The opaque run ID emitted by session
-chat is also a foreground-operation identifier; it must not be parsed with, or
-admitted into, the existing background-task identifier grammar.
+The assistant text is the transport-confirmed prefix, followed by a fixed interruption marker
+when speech was cut off. Confirmation comes from the delivery ledger. It proves the audio
+reached the room's verifier, not that a person heard it, and no wording in this record claims
+more. The marker is a constant, never model-authored. Generated but undelivered text is never
+written.
 
-### Identity and minimal realtime state
+Resume reads the newest bounded page of the voice session. It admits only user and assistant
+text rows and skips anything else. Reads already follow Hermes's compression continuation
+([resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4508)).
+Older recall is delegated: a run can search sessions.
 
-The binding consists of a schema version, the exact profile route, the Hermes
-transcript session ID, and the exact optional memory-scope selection. Memory
-scope is stored privately as either explicit `unset` or the exact opaque
-`X-Hermes-Session-Key` value accepted by Hermes. The value is not treated as a
-secret, but its raw form must never enter public evidence, logs, refusal markers,
-or user-visible diagnostics. Realtime may retain delivery receipts keyed to the
-stable message identity supplied by the required terminal contract. It will not
-persist transcript text, audio, summaries, embeddings, or a second searchable
-history database.
+### 2. Every delegated run is its own Hermes session
 
-Profile, transcript session, and memory scope are separate identities. Hermes
-rejects unknown profile routes and uses profile-scoped runtime state
-([profile routing](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2097-L2206)).
-`X-Hermes-Session-Key` is an optional long-term-memory scope, not the transcript
-session ID
-([header validation](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2285-L2335)).
-When it is absent, v0.21.0 uses the transcript session ID as the agent memory key
-([agent binding](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L7297-L7334)),
-so omission is a material scope change. Resume requires exact equality of the
-stored tagged selection, including explicit `unset`.
-Resume therefore fails closed on a missing or changed profile, an inaccessible
-session, a wrong, omitted, or changed memory scope, or any other conflicting
-binding. It never falls back to another profile or guesses a memory key.
+Each run carries three things:
 
-### Resume and history
+- a realtime-generated session ID derived from the task;
+- `Idempotency-Key` set to the task ID;
+- a bounded tail of the voice conversation as `conversation_history`.
 
-Realtime resumes only when no foreground writer is active for the bound session.
-The v0.21.0 API exposes no snapshot or writer lease, and a realtime-local lock
-cannot exclude another Hermes client. Implementation must either obtain an
-upstream serialization contract or fail qualification under a concurrent
-external writer; this design does not assume quiescence from its own process.
-It reads the newest bounded page, follows further pages only within an explicit
-message and character budget, and presents the retained rows oldest first. The
-API caps pages at 500 and supports `limit`, `offset`, and latest/oldest order
-([messages endpoint](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4498-L4555)).
-It supplies no snapshot token or `has_more` marker, so stable offset pagination
-under a concurrent writer is not assumed. Long-session latency and compaction
-behavior require measurement against the installed Hermes version.
+Runs never use the voice session. A run holds its session's cross-process turn lease for its
+whole duration, and a voice write must never wait behind background work. With separate
+sessions it cannot. The tail gives the work the conversation's context. It also lets Hermes's
+own skill review, which runs over the whole message snapshot, learn from voice conversations
+wherever real work happens.
 
-Hermes persists the user message before the first model call for crash recovery
-([turn admission](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_context.py#L1567-L1588)).
-An interrupted or failed turn can therefore leave a durable user row without an
-ordinary final assistant row. Resume preserves that history; it does not invent
-or backfill a reply. Hermes compaction is non-destructive: inactive pre-compaction
-rows remain stored and searchable
-([compaction contract](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L12235-L12284)).
+### 3. Realtime keeps one binding record
 
-### Retention, deletion, and correction
+The binding record holds `{profile, voice session ID, task ID → run ID and run session ID}`. It
+is bounded, and it is the only persisted realtime state. #77 item 4 admits exactly this kind of
+session reference and bounded transient context.
 
-Starting a separate conversation creates a fresh Hermes session binding and does
-not delete the previous session. Ending a realtime room does not end or delete
-the Hermes conversation.
+- **Before dispatch.** A task is recorded before its request is sent, together with that exact
+  request. Hermes's acknowledgment promotes the entry to its run ID and drops the request. The
+  request is the only transcript-bearing content the record ever holds, and only until it is
+  acknowledged.
+- **Restart, pending entry.** Realtime replays the stored request verbatim under the same
+  idempotency key. Hermes returns the original run if it accepted the request, or starts the
+  work if the request never arrived. A replay must be byte-identical: a different body is
+  refused as a conflict
+  ([replay](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L562-L594)).
+- **Restart, promoted entry.** Realtime reconciles it with `GET /v1/runs/{id}`. A run Hermes no
+  longer knows is reported as lost, never as running.
 
-For the initial MVP, Hermes session auto-pruning must remain disabled. Upstream
-documents it as opt-in and limited to ended sessions; its default retention is
-90 days when enabled
-([session retention](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/website/docs/user-guide/sessions.md#L872-L906)).
-This prevents elapsed time alone from deleting an ended conversation in the
-supported profile.
+No accepted run can therefore go untracked, and no retry can start work twice.
 
-"Forget this conversation" cannot yet promise complete erasure through the
-v0.21.0 API. Its authenticated delete handler calls
-`db.delete_session(session_id)` without a transcript-directory argument
-([API handler](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L4485-L4496)).
-That removes the SQLite session and message rows, including delegate children,
-but the database implementation removes `.json`, `.jsonl`, and request-dump
-files only when its optional `sessions_dir` argument is supplied
-([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
-Full conversation erasure therefore needs an upstream API fix and a filesystem
-proof before it can be offered. The user must also be told that branch and
-compression children are preserved as orphaned sessions. v0.21.0 exposes no
-per-message edit/delete route, so a correction is a new user turn unless the
-whole conversation is deleted after that gap is closed.
+### Live context follows the same rule
 
-Conversation deletion does not claim to erase long-term memory. Built-in memory
-reset deletes the profile's complete `MEMORY.md` and/or `USER.md`, not one
-session's contributions
-([reset command](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_cli/main.py#L12872-L12914)).
-That is a separate, explicit user operation.
+Today the live foreground context records every generated segment
+([`record_assistant_generation`](../../src/hermes_realtime/conversation/streaming.py#L803)),
+while the Codex prompt tells the model that earlier assistant messages "represent only speech
+confirmed delivered"
+([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2800)). That claim is
+false, and the live context diverges from any resumed one.
 
-### Privacy and memory egress
+Live context becomes heard-first: the transport-confirmed prefix plus the same fixed marker. The
+undelivered remainder stays in the resumable-replay machinery. The live context, the Hermes
+record, and what the user experienced then match by construction.
 
-The initial supported profile uses built-in memory only. Preflight refuses an
-external memory provider until its destination, content sent, retention, and
-message/session deletion behavior have a reviewed disposition. This is needed
-because the Honcho integration sends sanitized user and assistant text to its
-configured session
-([turn synchronization](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/plugins/memory/honcho/__init__.py#L1419-L1468)),
-and an unset base URL can let the SDK select an environment default, including a
-hosted endpoint
-([client target resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/plugins/memory/honcho/client.py#L1283-L1323)).
-Rotating a Honcho session removes only local cache bindings and explicitly keeps
-the old remote session for user modeling
-([rotation behavior](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/plugins/memory/honcho/session.py#L821-L850)).
-The existence of a conclusion-deletion operation does not establish remote
-message or session erasure.
+### The one upstream extension
 
-Evidence capture and optional search remain outside this decision. Neither may
-be enabled as a side effect of conversation continuity.
+`POST /api/sessions/{id}/messages` appends externally produced turns without a model call:
 
-## Required qualification before implementation acceptance
+- **Body:** `{"messages": [{"client_id", "role", "content"}]}`, with role `user` or `assistant`.
+- **Idempotency:** idempotent per `(session, client_id)`, enforced by the route itself. The
+  existing `platform_message_id` index is not unique.
+- **Target session:** resolves the ID through the compression continuation, as reads do.
+- **Writing:** takes the session's turn lease and writes through the existing batch append.
+- **Learning:** runs the accounting a live turn runs. It hydrates the memory counter from
+  stored user rows and spawns Hermes's existing background review when the profile's cadence
+  is reached. Externally produced turns are turns, and no client flag changes that.
 
-Qualification must pin the installed Hermes source and prove the terminal
-contract on normal completion, interruption before first token, interruption
-after partial output, persistence failure, transport disconnect, process restart,
-profile mismatch, and long-history pagination. It must also prove that a restored
-assistant row is never labeled delivered without a matching realtime receipt,
-and that restored history cannot grant live task or approval authority.
+This single route provides persisted voice history, memory learning at Hermes's own cadence, and
+searchable voice recall, with no realtime store. A memory-read route is separable and deferred.
+Until the route ships, voice history is not persisted. No interim adapter writes Hermes's
+storage.
 
-New terminal-authority, profile, resume-serialization, delivery, task-authority,
-and refusal guards must follow the repository evidence rules. Every refusal path
-emits one stable, bounded, content-free JSON marker from a `finally`: counts,
-kinds, and categories only, with no transcript text, paths, or identifiers.
-Mutation tests must prove, one at a time, that missing or misbound terminal
-authority fails. For both resume state and a terminal response, independently
-omitting or mismatching each authoritative binding component must fail: schema
-version, exact profile, transcript session ID, and tagged exact memory scope.
-Wrong and omitted transcript sessions are explicit cases. A concurrent writer,
-false delivery or task authority, a missing refusal marker, and leaking refusal
-evidence must likewise each fail alone while an adjacent passing case remains
-green.
+## Degraded mode
 
-Until those proofs pass, #77 remains a design and compatibility dependency for
-the integrated MVP in #159 rather than a supported runtime promise.
+A backend outage never silences the voice.
+
+- **Appends are best-effort.** A bounded queue holds messages until they are acknowledged. On
+  overflow, realtime drops the unacknowledged tail, announces the gap once, and resumes at the
+  next user message.
+- **A failed resume read** starts an explicit no-continuity conversation.
+- **Task truth stays live.** It always comes from the live backend, never from the record, and
+  restored text cannot grant dispatch, approval, or cancellation authority.
+
+## Consequences
+
+- **Voice latency is unchanged.** It is today's foreground path.
+- **Learning on v0.21.0 is partial.** Skills learning reaches voice through delegated runs.
+  Memory learning waits for the route, because the counter would fire only if a supplied tail
+  happened to land on the cadence, and the tail is not sized to game it.
+- **What the MVP resumes.** On v0.21.0, #159's MVP resumes tasks across a restart but not
+  voice history. That limit is stated in #159, not hidden.
+- **Memory egress.** Before a voice tail reaches a run, the profile must use built-in memory
+  only, because a run's memory sync passes its messages to any configured external provider
+  ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
+- **Forgetting.** "Forget this conversation" deletes every run session in the binding record,
+  which hold objectives rather than voice text, and the voice session's whole compression chain.
+  Hermes deletes only the named session and leaves compression successors in place. So forget
+  resolves the latest continuation and walks `parent_session_id` back to the bound session,
+  deleting each link. If the walk cannot reach the bound session, forget reports itself
+  incomplete. Curated memory is a
+  separate, explicit operation, and complete file-level erasure is not promised until the delete
+  path is qualified
+  ([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
+- **Retention.** Hermes session auto-pruning stays disabled for the MVP.
+
+## Rejected alternatives
+
+- **Hermes as the voice foreground** (session chat per utterance). It contradicts the product's
+  shape. It also cannot hold the invariants on v0.21.0:
+  - tools are per profile only;
+  - an interrupted reply is persisted as an ordinary assistant message
+    ([interruption](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/conversation_loop.py#L4581-L4595));
+  - the stream's terminal event is unreliable;
+  - no client-defined tools exist to keep delegation with realtime.
+- **Runs in the voice session.** The lease would make voice writes wait behind background work.
+- **An in-process plugin writer.** It is unreachable in the current host, and it breaks #77 item
+  4.
+
+## Implementation sequence
+
+1. **Run adapter.** Add the idempotency key, a per-task session, and a bounded voice tail to
+   `/v1/runs`.
+2. **Heard-first live context.** Correct the Codex prompt to match.
+3. **Binding record.** Add restart reconciliation.
+4. **Upstream route.** Propose it. After it lands and a pinned target carries it, append voice
+   messages and resume from the voice session.
+
+## Required qualification before acceptance
+
+Each step must prove its guarantees against a qualified exact target:
+
+- a retried or replayed run never starts twice;
+- a crash between dispatch and acknowledgment leaves a pending entry that restart resolves;
+- a restarted host reports every bound task truthfully;
+- live context and the record contain only transport-confirmed text and markers;
+- appends are idempotent, ordered, and never block the voice;
+- the record never holds a reply without its question;
+- resume admits only text rows from the bound session;
+- forgetting removes every bound run session and the voice session's whole compression chain.
+
+Each guard follows the repository evidence rules: one bounded, content-free refusal marker, and
+one mutation per guard shown to fail alone.
