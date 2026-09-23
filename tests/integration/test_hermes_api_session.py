@@ -1688,3 +1688,227 @@ async def test_failed_close_retains_run_authority_for_retry() -> None:
     finally:
         release_events.set()
         await runner.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("terminal_body", "expected_status", "expected_summary", "expected_reason"),
+    [
+        (
+            {"status": "completed", "output": "Finished before the stop."},
+            WorkTerminalStatus.COMPLETED,
+            "Finished before the stop.",
+            None,
+        ),
+        (
+            {"status": "cancelled"},
+            WorkTerminalStatus.INTERRUPTED,
+            None,
+            "Hermes run was interrupted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_close_settles_run_that_finished_before_its_stop(
+    terminal_body: dict[str, str],
+    expected_status: WorkTerminalStatus,
+    expected_summary: str | None,
+    expected_reason: str | None,
+) -> None:
+    port = _available_port()
+    api_run_id = "run_0123456789abcdef"
+    state: _RunState = {"status": "running", "stop_calls": 0}
+    release_events = asyncio.Event()
+
+    async def events(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await release_events.wait()
+        return response
+
+    async def stop(_request: web.Request) -> web.Response:
+        state["stop_calls"] += 1
+        return web.json_response({"object": "hermes.run", "run_id": api_run_id, **terminal_body})
+
+    async def status_handler(_request: web.Request) -> web.Response:
+        return web.json_response({"run_id": api_run_id, "status": state["status"]})
+
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", _capabilities_response)
+    app.router.add_post("/v1/runs", _started_run_response)
+    app.router.add_get("/v1/runs/{run_id}/events", events)
+    app.router.add_get("/v1/runs/{run_id}", status_handler)
+    app.router.add_post("/v1/runs/{run_id}/stop", stop)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            bearer="terminal-stop-test-bearer-value-32-chars",
+            settlement_timeout_seconds=1,
+            settlement_poll_seconds=0.01,
+        ),
+        session_id="session_api_1",
+        private_id_factory=lambda: "terminal_stop_private",
+    )
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        await session.close()
+        terminal = await asyncio.wait_for(session.next_update(), timeout=1)
+        assert terminal.type == "work.completed"
+        assert terminal.task_id == "task_release_check"
+        assert terminal.run_id == "deleg_terminal_stop_private"
+        assert terminal.payload.status is expected_status
+        assert terminal.payload.summary == expected_summary
+        assert terminal.payload.reason == expected_reason
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(session.next_update(), timeout=0.05)
+        assert state["stop_calls"] == 1
+    finally:
+        release_events.set()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_event_stream_failure_settles_run_that_failed_before_its_stop() -> None:
+    port = _available_port()
+    api_run_id = "run_0123456789abcdef"
+    state: _RunState = {"status": "running", "stop_calls": 0}
+
+    async def events(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write_eof()
+        return response
+
+    async def stop(_request: web.Request) -> web.Response:
+        state["stop_calls"] += 1
+        return web.json_response(
+            {
+                "object": "hermes.run",
+                "run_id": api_run_id,
+                "status": "failed",
+                "error": "Tool crashed before the stop.",
+            }
+        )
+
+    async def status_handler(_request: web.Request) -> web.Response:
+        return web.json_response({"run_id": api_run_id, "status": state["status"]})
+
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", _capabilities_response)
+    app.router.add_post("/v1/runs", _started_run_response)
+    app.router.add_get("/v1/runs/{run_id}/events", events)
+    app.router.add_get("/v1/runs/{run_id}", status_handler)
+    app.router.add_post("/v1/runs/{run_id}/stop", stop)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            bearer="terminal-stop-test-bearer-value-32-chars",
+            settlement_timeout_seconds=1,
+            settlement_poll_seconds=0.01,
+        ),
+        session_id="session_api_1",
+        private_id_factory=lambda: "failed_stop_private",
+    )
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        terminal = await asyncio.wait_for(session.next_update(), timeout=2)
+        assert terminal.task_id == "task_release_check"
+        assert terminal.run_id == "deleg_failed_stop_private"
+        assert terminal.payload.status is WorkTerminalStatus.FAILED
+        assert terminal.payload.reason == "Tool crashed before the stop."
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(session.next_update(), timeout=0.05)
+        assert state["stop_calls"] == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize(
+    "stop_body",
+    [
+        {
+            "object": "hermes.run",
+            "run_id": "run_ffffffffffffffff",
+            "status": "completed",
+            "output": "Another run finished.",
+        },
+        {"object": "hermes.run", "run_id": "run_0123456789abcdef", "status": "running"},
+        # A terminal status for this run is not evidence unless the body is a run status
+        # object; a stop 200 has two shapes, and the discriminator is what tells them apart.
+        {"run_id": "run_0123456789abcdef", "status": "completed", "output": "Unlabelled."},
+        {
+            "object": "hermes.run.steer",
+            "run_id": "run_0123456789abcdef",
+            "status": "completed",
+            "output": "Misrouted.",
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_close_rejects_nonauthoritative_stop_status_body(
+    stop_body: dict[str, str],
+) -> None:
+    port = _available_port()
+    api_run_id = "run_0123456789abcdef"
+    state: _RunState = {"status": "running", "stop_calls": 0}
+    release_events = asyncio.Event()
+
+    async def events(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await release_events.wait()
+        return response
+
+    async def stop(_request: web.Request) -> web.Response:
+        state["stop_calls"] += 1
+        if state["stop_calls"] == 1:
+            return web.json_response(stop_body)
+        state["status"] = "cancelled"
+        release_events.set()
+        return web.json_response({"run_id": api_run_id, "status": "stopping"})
+
+    async def status_handler(_request: web.Request) -> web.Response:
+        return web.json_response({"run_id": api_run_id, "status": state["status"]})
+
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", _capabilities_response)
+    app.router.add_post("/v1/runs", _started_run_response)
+    app.router.add_get("/v1/runs/{run_id}/events", events)
+    app.router.add_get("/v1/runs/{run_id}", status_handler)
+    app.router.add_post("/v1/runs/{run_id}/stop", stop)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            bearer="terminal-stop-test-bearer-value-32-chars",
+            settlement_timeout_seconds=1,
+            settlement_poll_seconds=0.01,
+        ),
+        session_id="session_api_1",
+    )
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        with pytest.raises(BaseExceptionGroup, match="unresolved run authority") as raised:
+            await session.close()
+        assert raised.group_contains(RuntimeError, match="stop response is not authoritative")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(session.next_update(), timeout=0.05)
+
+        await session.close()
+        terminal = await asyncio.wait_for(session.next_update(), timeout=1)
+        assert terminal.payload.status is WorkTerminalStatus.INTERRUPTED
+        assert state["stop_calls"] == 2
+    finally:
+        release_events.set()
+        await runner.cleanup()
