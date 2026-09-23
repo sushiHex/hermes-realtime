@@ -44,8 +44,9 @@ _REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max",
 _VERIFIED_NONE_EFFORT_MODELS = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
 _MAX_SEGMENT_CHARS = 4096
 _MAX_PROTOCOL_LINE_BYTES = 1_048_576
-# A session starting this close to expiry would need Codex to refresh, which it cannot here.
+# A Codex process never serves a turn on a login this close to expiry: it cannot refresh.
 _MIN_SESSION_ACCESS_SECONDS = 3600
+_SESSION_AUTH_REFUSAL_PREFIX = "[codex-session-auth] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -229,8 +230,11 @@ def _subscription_environment(source: Mapping[str, str]) -> dict[str, str]:
 
 def _isolated_subscription_environment(
     source: Mapping[str, str],
-) -> tuple[dict[str, str], tempfile.TemporaryDirectory[str]]:
-    """Give one process a fresh Codex home holding only the login, minus its refresh token."""
+) -> tuple[dict[str, str], tempfile.TemporaryDirectory[str], float | None]:
+    """Give one process a fresh Codex home holding only the login, minus its refresh token.
+
+    Also returns when that login's access token expires, or ``None`` for an API-key login.
+    """
 
     environment = _subscription_environment(source)
     configured_home = environment.get("CODEX_HOME")
@@ -242,7 +246,7 @@ def _isolated_subscription_environment(
     auth_file = Path(configured_home) / "auth.json"
     if not auth_file.is_file():
         raise RuntimeError("Codex subscription auth is unavailable")
-    session_auth = _session_auth(auth_file)
+    session_auth, expires_at = _session_auth(auth_file)
 
     isolated_home = tempfile.TemporaryDirectory(prefix="hermes-realtime-codex-auth-")
     try:
@@ -251,34 +255,52 @@ def _isolated_subscription_environment(
         isolated_home.cleanup()
         raise
     environment["CODEX_HOME"] = isolated_home.name
-    return environment, isolated_home
+    return environment, isolated_home, expires_at
 
 
-def _session_auth(auth_file: Path) -> str:
+def _session_auth(auth_file: Path) -> tuple[str, float | None]:
     """Return the login for one process, without the refresh token it must never spend.
 
     A refresh inside the temporary home would rotate the user's refresh token and discard its
     replacement, signing the Codex CLI out. Codex requires the field, so it is left blank, and
-    an access token that Codex would refresh before the session is under way is refused.
+    an access token too close to expiry to serve a session is refused.
     """
 
-    text = auth_file.read_text(encoding="utf-8")
+    refusal: str | None = "malformed"
     try:
-        auth = json.loads(text)
-    except ValueError:
-        raise RuntimeError("Codex subscription auth is malformed") from None
-    if type(auth) is not dict:
-        raise RuntimeError("Codex subscription auth is malformed")
-    tokens = auth.get("tokens")
-    if tokens is None:
-        return text  # An API-key login holds no refresh token.
-    if type(tokens) is not dict or type(tokens.get("access_token")) is not str:
-        raise RuntimeError("Codex subscription auth is malformed")
-    if _jwt_expiry(tokens["access_token"]) - time.time() < _MIN_SESSION_ACCESS_SECONDS:
-        raise RuntimeError(
-            "Codex subscription access token expires within the hour; run codex once to refresh it"
-        )
-    return json.dumps(auth | {"tokens": tokens | {"refresh_token": ""}})
+        text = auth_file.read_text(encoding="utf-8")
+        try:
+            auth = json.loads(text)
+        except ValueError:
+            raise RuntimeError("Codex subscription auth is malformed") from None
+        if type(auth) is not dict:
+            raise RuntimeError("Codex subscription auth is malformed")
+        tokens = auth.get("tokens")
+        if tokens is None:
+            refusal = None
+            return text, None  # An API-key login holds no refresh token.
+        if type(tokens) is not dict or type(tokens.get("access_token")) is not str:
+            raise RuntimeError("Codex subscription auth is malformed")
+        expires_at = _jwt_expiry(tokens["access_token"])
+        if _login_expiring(expires_at):
+            refusal = "expiring"
+            raise RuntimeError(
+                "Codex subscription access token expires within the hour; "
+                "run codex once to refresh it"
+            )
+        refusal = None
+        return json.dumps(auth | {"tokens": tokens | {"refresh_token": ""}}), expires_at
+    finally:
+        if refusal is not None:
+            print(
+                _SESSION_AUTH_REFUSAL_PREFIX
+                + json.dumps({"refusal": refusal, "version": 1}, separators=(",", ":")),
+                flush=True,
+            )
+
+
+def _login_expiring(expires_at: float | None) -> bool:
+    return expires_at is not None and expires_at - time.time() < _MIN_SESSION_ACCESS_SECONDS
 
 
 def _jwt_expiry(token: str) -> float:
@@ -355,9 +377,11 @@ class SubprocessCodexJsonLineTransport:
         *,
         close_timeout_seconds: float,
         isolated_home: tempfile.TemporaryDirectory[str] | None = None,
+        login_expires_at: float | None = None,
     ) -> None:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RuntimeError("Codex app-server requires piped stdio")
+        self.login_expires_at = login_expires_at
         self._process = process
         self._stdin = process.stdin
         self._stdout = process.stdout
@@ -382,7 +406,7 @@ class SubprocessCodexJsonLineTransport:
         close_timeout_seconds: float = 5.0,
     ) -> SubprocessCodexJsonLineTransport:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        process_environment, isolated_home = _isolated_subscription_environment(
+        process_environment, isolated_home, login_expires_at = _isolated_subscription_environment(
             os.environ if environment is None else environment
         )
         try:
@@ -403,6 +427,7 @@ class SubprocessCodexJsonLineTransport:
             process,
             close_timeout_seconds=close_timeout_seconds,
             isolated_home=isolated_home,
+            login_expires_at=login_expires_at,
         )
 
     async def send(self, message: Mapping[str, object]) -> None:
@@ -1737,7 +1762,11 @@ class CodexAppServerStreamingInference:
             if self._closed:
                 raise RuntimeError("Codex inference adapter is closed")
             if self._transport is not None:
-                return
+                if not _login_expiring(getattr(self._transport, "login_expires_at", None)):
+                    return
+                # Callers hold the turn lock, so no turn is using this process. Its replacement
+                # reads the login afresh, and is refused if that login is expiring too.
+                await self._retire_transport_locked()
             created = self._transport_factory()
             transport = await created if inspect.isawaitable(created) else created
             self._transport = transport
@@ -1755,6 +1784,17 @@ class CodexAppServerStreamingInference:
                 },
             )
             await self._send({"method": "initialized"})
+
+    async def _retire_transport_locked(self) -> None:
+        transport, reader = self._transport, self._reader_task
+        self._transport = None
+        self._reader_task = None
+        if transport is not None:
+            await transport.close()
+        if reader is not None:
+            # The reader ends with its transport; a stalled one is cancelled by the bound.
+            with suppress(_CodexTransportClosed, asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(reader, timeout=_READER_CLOSE_DRAIN_SECONDS)
 
     async def _request(self, method: str, params: Mapping[str, object]) -> Mapping[str, object]:
         async with self._send_lock:
