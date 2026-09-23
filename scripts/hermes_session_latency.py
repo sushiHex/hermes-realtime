@@ -21,14 +21,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
 import secrets
 import socket
 import subprocess
+import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +40,10 @@ _UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
 _CACHE = Path(__file__).resolve().parents[1] / ".hermes" / "bench" / f"hermes-{_COMMIT[:12]}"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
-_TOKEN_EVENT = "assistant.delta"
+_DELTA = "assistant.delta"
 _TURN_TIMEOUT_SECONDS = 180
+# CodexAppServerStreamingInference's default: text this long is spoken without a sentence end.
+_MAX_SEGMENT_CHARS = 1024
 
 # Ordinary conversation that no knowledge route selects, so both paths answer from the model.
 _UTTERANCES = (
@@ -162,11 +167,6 @@ def _hermes_arm(
         Path(home, "config.yaml").write_text(
             _config(args.provider, args.model, args.effort, tools), encoding="utf-8"
         )
-        env = os.environ | {
-            "HERMES_HOME": home,
-            "CODEX_HOME": str(Path(home, "no-codex-login")),
-            "HERMES_LATENCY_ACCESS_TOKEN": token,
-        }
         worker = subprocess.run(
             (
                 str(python),
@@ -177,7 +177,7 @@ def _hermes_arm(
                 "--history-turns",
                 str(args.history_turns),
             ),
-            env=env,
+            env=_worker_environment(home, token),
             capture_output=True,
             text=True,
         )
@@ -185,8 +185,50 @@ def _hermes_arm(
         # The utterances are synthetic, so the worker's diagnostics hold no user content.
         raise RuntimeError(f"the Hermes worker failed:\n{worker.stderr[-4000:]}")
     # Hermes may log to stdout; the worker's result is always its last line.
-    results = json.loads(worker.stdout.strip().splitlines()[-1])
-    return [sample | {"path": f"hermes-tools-{tools}"} for sample in results]
+    return [
+        {
+            "path": f"hermes-tools-{tools}",
+            "history_turns": sample["history_turns"],
+            "cold": sample["cold"],
+            "first_speech_ms": _first_speech_ms(sample["deltas"], sample["completed_ms"]),
+            "completed_ms": sample["completed_ms"],
+            "input_tokens": sample["input_tokens"],
+        }
+        for sample in json.loads(worker.stdout.strip().splitlines()[-1])
+    ]
+
+
+def _worker_environment(home: str, token: str) -> dict[str, str]:
+    """OS runtime discovery, the isolated homes, and the one promised token; nothing else."""
+
+    from hermes_realtime.providers.codex_app_server import _subscription_environment
+
+    discovery: dict[str, str] = _subscription_environment(os.environ)
+    return discovery | {
+        "HERMES_HOME": home,
+        "CODEX_HOME": str(Path(home, "no-codex-login")),
+        "HERMES_LATENCY_ACCESS_TOKEN": token,
+    }
+
+
+@contextlib.contextmanager
+def _refusal_evidence(path: str, samples: list[dict[str, Any]], planned: int) -> Iterator[None]:
+    """Record why a measurement stopped early: counts and the failure's kind, never its text."""
+
+    failure: str | None = None
+    try:
+        yield
+    except BaseException as error:
+        failure = type(error).__name__
+        raise
+    finally:
+        if failure is not None:
+            evidence = {"path": path, "completed": len(samples), "planned": planned}
+            print(
+                "[hermes-latency] " + json.dumps(evidence | {"failure": failure}),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 async def _codex_arm(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -201,29 +243,30 @@ async def _codex_arm(args: argparse.Namespace) -> list[dict[str, Any]]:
         for message in _history(args.history_turns)
     )
     inference = CodexAppServerStreamingInference(model=args.model, effort=args.effort)
+    schedule = _schedule(args.samples, args.history_turns)
     samples: list[dict[str, Any]] = []
     try:
-        for index, (utterance, prior) in enumerate(_schedule(args.samples, args.history_turns)):
-            snapshot = ConversationContextSnapshot(
-                revision=index,
-                messages=(history if prior else ()) + (ConversationMessage("user", utterance),),
-                active_tasks=(),
-            )
-            started = time.perf_counter()
-            first: float | None = None
-            async for _ in inference.stream(snapshot, turn_id=f"latency_{index}"):
-                first = first or time.perf_counter()
-            if first is None:
-                raise RuntimeError("the Codex baseline produced no speech")
-            samples.append(
-                {
-                    "path": "realtime-codex",
-                    "history_turns": prior,
-                    "cold": index == 0,
-                    "first_token_ms": (first - started) * 1000,
-                    "completed_ms": (time.perf_counter() - started) * 1000,
-                }
-            )
+        with _refusal_evidence("realtime-codex", samples, len(schedule)):
+            for index, (utterance, prior) in enumerate(schedule):
+                prompt = (history if prior else ()) + (ConversationMessage("user", utterance),)
+                snapshot = ConversationContextSnapshot(
+                    revision=index, messages=prompt, active_tasks=()
+                )
+                started = time.perf_counter()
+                first: float | None = None
+                async for _ in inference.stream(snapshot, turn_id=f"latency_{index}"):
+                    first = first or time.perf_counter()
+                if first is None:
+                    raise RuntimeError("the Codex baseline produced no speech")
+                samples.append(
+                    {
+                        "path": "realtime-codex",
+                        "history_turns": prior,
+                        "cold": index == 0,
+                        "first_speech_ms": (first - started) * 1000,
+                        "completed_ms": (time.perf_counter() - started) * 1000,
+                    }
+                )
     finally:
         await inference.close()
     return samples
@@ -283,30 +326,41 @@ async def _measure(args: argparse.Namespace) -> list[dict[str, Any]]:
     if not await adapter.connect():
         raise RuntimeError("the pinned Hermes API server did not start")
     base = f"http://127.0.0.1:{port}/api/sessions"
+    schedule = _schedule(args.samples, args.history_turns)
     samples: list[dict[str, Any]] = []
     try:
         async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {key}"}) as http:
-            for index, (utterance, prior) in enumerate(_schedule(args.samples, args.history_turns)):
-                session_id = f"latency_{index}"
-                async with http.post(base, json={"id": session_id}) as created:
-                    created.raise_for_status()
-                if prior:
-                    db = await adapter._ensure_session_db_async()
-                    await asyncio.to_thread(db.replace_messages, session_id, _history(prior))
-                sample = await asyncio.wait_for(
-                    _turn(http, f"{base}/{session_id}/chat/stream", utterance),
-                    _TURN_TIMEOUT_SECONDS,
-                )
-                samples.append(sample | {"history_turns": prior, "cold": index == 0})
+            with _refusal_evidence("hermes", samples, len(schedule)):
+                await _measure_turns(adapter, http, base, schedule, samples)
     finally:
         await adapter.disconnect()
     return samples
 
 
+async def _measure_turns(
+    adapter: Any,
+    http: Any,
+    base: str,
+    schedule: list[tuple[str, int]],
+    samples: list[dict[str, Any]],
+) -> None:
+    for index, (utterance, prior) in enumerate(schedule):
+        session_id = f"latency_{index}"
+        async with http.post(base, json={"id": session_id}) as created:
+            created.raise_for_status()
+        if prior:
+            db = await adapter._ensure_session_db_async()
+            await asyncio.to_thread(db.replace_messages, session_id, _history(prior))
+        sample = await asyncio.wait_for(
+            _turn(http, f"{base}/{session_id}/chat/stream", utterance),
+            _TURN_TIMEOUT_SECONDS,
+        )
+        samples.append(sample | {"history_turns": prior, "cold": index == 0})
+
+
 async def _turn(http: Any, url: str, utterance: str) -> dict[str, Any]:
     started = time.perf_counter()
-    marks: dict[str, float] = {}
-    usage: dict[str, Any] = {}
+    frames: list[tuple[float, str, str]] = []
     event = ""
     async with http.post(url, json={"message": utterance}) as response:
         response.raise_for_status()
@@ -314,21 +368,43 @@ async def _turn(http: Any, url: str, utterance: str) -> dict[str, Any]:
             line = raw.decode("utf-8").rstrip("\r\n")
             if line.startswith("event: "):
                 event = line.removeprefix("event: ")
-                marks.setdefault(event, time.perf_counter())
-            elif line.startswith("data: ") and event == "run.completed":
-                usage = json.loads(line.removeprefix("data: ")).get("usage") or {}
-            if event == "error":
-                raise RuntimeError("Hermes reported an error event")  # Its text may hold content.
-            if event == "done":
-                break
-    if _TOKEN_EVENT not in marks or "run.completed" not in marks:
+            elif line.startswith("data: "):
+                elapsed = (time.perf_counter() - started) * 1000
+                frames.append((elapsed, event, line.removeprefix("data: ")))
+                if event in ("error", "done"):
+                    break
+    return _turn_sample(frames)
+
+
+def _turn_sample(frames: list[tuple[float, str, str]]) -> dict[str, Any]:
+    """Admit one session-chat stream, given its ``(elapsed ms, event, data)`` frames."""
+
+    if any(event == "error" for _, event, _ in frames):
+        raise RuntimeError("Hermes reported an error event")  # Its text may hold content.
+    deltas = [(ms, json.loads(data)["delta"]) for ms, event, data in frames if event == _DELTA]
+    completions = [(ms, json.loads(data)) for ms, event, data in frames if event == "run.completed"]
+    if not deltas or not completions:
         raise RuntimeError("the Hermes stream ended without speech and completion")
+    completed_ms, completion = completions[0]
     return {
-        "run_started_ms": (marks["run.started"] - started) * 1000,
-        "first_token_ms": (marks[_TOKEN_EVENT] - started) * 1000,
-        "completed_ms": (marks["run.completed"] - started) * 1000,
-        "input_tokens": usage.get("input_tokens"),
+        "deltas": deltas,
+        "completed_ms": completed_ms,
+        "input_tokens": (completion.get("usage") or {}).get("input_tokens"),
     }
+
+
+def _first_speech_ms(deltas: list[tuple[float, str]], completed_ms: float) -> float:
+    """When today's voice path would hand the accumulated text its first speakable segment."""
+
+    from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
+
+    text = ""
+    for elapsed, delta in deltas:
+        text += delta
+        end = first_speakable_sentence_end(text)
+        if (end is not None and end <= _MAX_SEGMENT_CHARS) or len(text) >= _MAX_SEGMENT_CHARS:
+            return elapsed
+    return completed_ms  # The unfinished remainder is spoken when the reply completes.
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -347,11 +423,11 @@ def _report(samples: list[dict[str, Any]]) -> None:
             "path": cold["path"],
             "history_turns": history,
             "n": len(warm),
-            "first_token_ms_p50": _percentile([s["first_token_ms"] for s in warm], 0.5),
-            "first_token_ms_p90": _percentile([s["first_token_ms"] for s in warm], 0.9),
+            "first_speech_ms_p50": _percentile([s["first_speech_ms"] for s in warm], 0.5),
+            "first_speech_ms_p90": _percentile([s["first_speech_ms"] for s in warm], 0.9),
             "completed_ms_p50": _percentile([s["completed_ms"] for s in warm], 0.5),
             "input_tokens_p50": tokens[len(tokens) // 2] if tokens else None,
-            "cold_first_token_ms": round(cold["first_token_ms"]),
+            "cold_first_speech_ms": round(cold["first_speech_ms"]),
         }
         print(json.dumps(row), flush=True)
 
