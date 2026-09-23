@@ -1932,6 +1932,10 @@ class CodexAppServerStreamingInference:
                 continue
             if method in _IGNORED_THREAD_NOTIFICATIONS:
                 continue
+            if method == "warning":
+                # Advisory status, such as a deliberately disabled feature; only its shape matters.
+                self._exact_string(params.get("message"), "warning message")
+                continue
             if method in _ITEM_LIFECYCLE_NOTIFICATIONS:
                 item = self._exact_mapping(params.get("item"), "lifecycle item")
                 item_type = self._exact_string(item.get("type"), "lifecycle item type")
