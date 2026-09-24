@@ -153,7 +153,7 @@ def parse_run_record(
         return None
     try:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     if type(document) is not dict or set(document) != {"admitted", "pending", "version"}:
         return None

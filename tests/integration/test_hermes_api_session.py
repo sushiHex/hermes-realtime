@@ -3071,6 +3071,7 @@ def _record_text(**fields: object) -> str:
             _record_text(pending=[_VALID_PENDING | {"objective": "Inspect"}]), id="entry-extra"
         ),
         pytest.param('{"admitted": [], "admitted": [], "pending": [], "version": 1}', id="dup"),
+        pytest.param("[" * 5_000 + "]" * 5_000, id="nested-past-the-recursion-limit"),
         pytest.param(_record_text() + " " * api_module._MAX_RUN_RECORD_BYTES, id="over-size"),
     ],
 )

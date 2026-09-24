@@ -114,6 +114,7 @@ def _row_document(**overrides: object) -> bytes:
         pytest.param(b"not json", id="not-json"),
         pytest.param(b"\xff\xfe{}", id="not-utf8"),
         pytest.param(b"[]", id="not-an-object"),
+        pytest.param(b"[" * 5_000 + b"]" * 5_000, id="nested-past-the-recursion-limit"),
         pytest.param(
             b'{"messages":[],"prior_work":false,"version":1,"version":1}',
             id="duplicate-top-level-key",
