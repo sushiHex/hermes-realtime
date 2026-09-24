@@ -63,6 +63,7 @@ _MAX_SEQUENCE = (1 << 63) - 1
 # Every status Hermes can report for a run it holds, and so every status a replay may carry.
 _LIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_for_approval", "stopping"})
 _RUN_STATUSES = _LIVE_RUN_STATUSES | {"completed", "failed", "cancelled", "interrupted"}
+_DISPATCH_RECOVERY_PREFIX = "[hermes-dispatch-recovery] "
 _BACKGROUND_INSTRUCTIONS = (
     "Complete this bounded background objective with a hard latency target. "
     "Stay exactly within the requested scope; do not add a topic, domain, category, "
@@ -494,15 +495,30 @@ class HermesApiTaskSession:
         headers = {"Idempotency-Key": secrets.token_hex(16)}
         with contextlib.suppress(_NoResponse):
             return await self._request_json("POST", "/v1/runs", body=body, headers=headers)
+        cause: str | None = "error"
+        status: int | None = None
         try:
-            status, payload = await self._request_json(
-                "POST", "/v1/runs", body=body, headers=headers
-            )
-        except _NoResponse as error:
-            raise RuntimeError("Hermes API dispatch outcome is unknown") from error
-        if status != 202:
-            raise RuntimeError("Hermes API dispatch outcome is unknown")
-        return status, payload
+            try:
+                status, payload = await self._request_json(
+                    "POST", "/v1/runs", body=body, headers=headers
+                )
+            except _NoResponse as error:
+                cause = "no_response"
+                raise RuntimeError("Hermes API dispatch outcome is unknown") from error
+            if status != 202:
+                cause = "refused"
+                raise RuntimeError("Hermes API dispatch outcome is unknown")
+            cause = None
+            return status, payload
+        finally:
+            if cause is not None:
+                # The lost attempt may have started a run nothing now tracks; count it.
+                evidence = {"cause": cause, "status": status, "version": 1}
+                print(
+                    _DISPATCH_RECOVERY_PREFIX
+                    + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                    flush=True,
+                )
 
     async def _settle_unpublished(self, api_run_id: str) -> None:
         await self._stop_and_wait(api_run_id)

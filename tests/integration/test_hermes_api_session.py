@@ -2055,6 +2055,12 @@ class _IdempotentHermes:
 _ABSENT = object()
 
 
+def _recovery_markers(capsys: pytest.CaptureFixture[str]) -> list[object]:
+    prefix = "[hermes-dispatch-recovery] "
+    lines = capsys.readouterr().out.splitlines()
+    return [json.loads(line.removeprefix(prefix)) for line in lines if line.startswith(prefix)]
+
+
 def _recovery_session(port: int) -> HermesApiTaskSession:
     return HermesApiTaskSession(
         config=HermesApiConfig(
@@ -2069,7 +2075,9 @@ def _recovery_session(port: int) -> HermesApiTaskSession:
 
 
 @pytest.mark.asyncio
-async def test_a_lost_dispatch_response_recovers_the_same_run() -> None:
+async def test_a_lost_dispatch_response_recovers_the_same_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     hermes = _IdempotentHermes("lose_response")
     runner, port = await hermes.serve()
     session = _recovery_session(port)
@@ -2086,6 +2094,7 @@ async def test_a_lost_dispatch_response_recovers_the_same_run() -> None:
         (first_key, first_body), (second_key, second_body) = hermes.attempts
         assert first_key is not None and second_key == first_key
         assert second_body == first_body
+        assert _recovery_markers(capsys) == []
     finally:
         await session.close()
         await runner.cleanup()
@@ -2111,7 +2120,9 @@ async def test_a_dispatch_that_never_arrived_is_admitted_by_its_resend() -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resend_status", [500, 503, 429])
-async def test_an_ambiguous_dispatch_never_reports_a_rejection(resend_status: int) -> None:
+async def test_an_ambiguous_dispatch_never_reports_a_rejection(
+    resend_status: int, capsys: pytest.CaptureFixture[str]
+) -> None:
     # A refused resend says nothing about the first attempt, which Hermes admitted.
     hermes = _IdempotentHermes("lose_response", resend_status=resend_status)
     runner, port = await hermes.serve()
@@ -2121,6 +2132,9 @@ async def test_an_ambiguous_dispatch_never_reports_a_rejection(resend_status: in
         with pytest.raises(RuntimeError, match="outcome is unknown"):
             await session.dispatch(_dispatch_request())
         assert hermes.runs_created == 1
+        assert _recovery_markers(capsys) == [
+            {"cause": "refused", "status": resend_status, "version": 1}
+        ]
     finally:
         await session.close()
         await runner.cleanup()
@@ -2250,7 +2264,9 @@ async def test_a_refused_first_attempt_is_a_rejection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_dispatch_whose_resend_is_also_lost_has_an_unknown_outcome() -> None:
+async def test_a_dispatch_whose_resend_is_also_lost_has_an_unknown_outcome(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     hermes = _IdempotentHermes("lose_response", lose_resend=True)
     runner, port = await hermes.serve()
     session = _recovery_session(port)
@@ -2260,6 +2276,7 @@ async def test_a_dispatch_whose_resend_is_also_lost_has_an_unknown_outcome() -> 
             await session.dispatch(_dispatch_request())
         assert len(hermes.attempts) == 2
         assert hermes.runs_created == 1
+        assert _recovery_markers(capsys) == [{"cause": "no_response", "status": None, "version": 1}]
     finally:
         await session.close()
         await runner.cleanup()
