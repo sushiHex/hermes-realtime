@@ -49,6 +49,28 @@ def write_run_record(path: Path, data: bytes) -> None:
         raise
 
 
+def remove_orphaned_temporaries(path: Path) -> int:
+    """Delete the temporaries a kill between mkstemp and os.replace left beside ``path``.
+
+    They hold plaintext, and only the lock holder may call this, since a live
+    writer's in-flight temporary looks the same. Matches exactly the names
+    ``write_run_record`` creates for this path, never a neighbour's.
+    """
+    pattern = re.compile(re.escape(f".{path.name}.") + r"[a-z0-9_]{8}\.tmp\Z")
+    try:
+        entries = list(path.parent.iterdir())
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if pattern.fullmatch(entry.name) is None:
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            entry.unlink()
+            removed += 1
+    return removed
+
+
 def lock_run_record(path: Path) -> int | None:
     """Hold the record's sibling lock file exclusively; None when another holder has it."""
     lock_path = path.with_name(path.name + ".lock")
