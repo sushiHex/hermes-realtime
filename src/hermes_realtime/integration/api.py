@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import secrets
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -183,7 +184,7 @@ class HermesApiConfig:
 
 
 class _NoResponse(RuntimeError):
-    """A request may have reached Hermes, but no response came back."""
+    """A request may have reached Hermes, but no complete response came back."""
 
 
 @dataclass(slots=True)
@@ -246,7 +247,8 @@ class HermesApiTaskSession:
         self._approval_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
-        self._idempotent_runs = False
+        # Seconds Hermes retains a run's idempotency record; None when a resend is unsafe.
+        self._resend_window: float | None = None
         self._started = False
         self._closed = False
 
@@ -293,19 +295,21 @@ class HermesApiTaskSession:
             )
             if missing:
                 raise RuntimeError("Hermes API lacks required capability: " + ", ".join(missing))
-            idempotency = features.get("runs_idempotency")
-            if idempotency is not None and (
-                type(idempotency) is not dict
-                or type(idempotency.get("supported")) is not bool
-                or type(idempotency.get("durable")) is not bool
-            ):
-                raise RuntimeError("Hermes API run idempotency capability is malformed")
-            # Only a durable record can answer a resend truthfully across a Hermes restart.
-            idempotent_runs = (
-                idempotency is not None
-                and idempotency["supported"] is True
-                and idempotency["durable"] is True
-            )
+            resend_window: float | None = None
+            if "runs_idempotency" in features:
+                idempotency = features["runs_idempotency"]
+                if (
+                    type(idempotency) is not dict
+                    or type(idempotency.get("supported")) is not bool
+                    or type(idempotency.get("durable")) is not bool
+                    or type(idempotency.get("retention_seconds")) is not int
+                    or idempotency["retention_seconds"] <= 0
+                ):
+                    raise RuntimeError("Hermes API run idempotency capability is malformed")
+                # Only a durable record can answer a resend truthfully across a Hermes
+                # restart, and only while Hermes still retains it.
+                if idempotency["supported"] is True and idempotency["durable"] is True:
+                    resend_window = float(idempotency["retention_seconds"])
             endpoints = payload.get("endpoints")
             if type(endpoints) is not dict:
                 raise RuntimeError("Hermes API endpoint capabilities are malformed")
@@ -324,7 +328,7 @@ class HermesApiTaskSession:
             if self._closed:
                 await self._close_client()
                 raise RuntimeError("Hermes API task session closed during startup")
-            self._idempotent_runs = idempotent_runs
+            self._resend_window = resend_window
             self._started = True
 
     async def dispatch(
@@ -411,7 +415,7 @@ class HermesApiTaskSession:
             claimed = await self._claim_unpublished(api_run_id)
         response_keys = set(payload) if type(payload) is dict else set()
         replayed = payload.get("replayed")
-        if self._idempotent_runs:
+        if self._resend_window is not None:
             well_formed = response_keys == {"run_id", "status", "replayed"} and (
                 type(replayed) is bool
             )
@@ -429,7 +433,8 @@ class HermesApiTaskSession:
         exact_authority = (
             type(api_run_id) is str
             and _RUN_ID_EXACT.fullmatch(api_run_id) is not None
-            and payload.get("status") in admitted_statuses
+            and type(payload.get("status")) is str
+            and payload["status"] in admitted_statuses
         )
         if not exact_authority:
             if claimed:
@@ -482,22 +487,30 @@ class HermesApiTaskSession:
         )
 
     async def _submit_run(self, body: dict[str, object]) -> tuple[int, dict[str, Any]]:
-        """POST one run, resending it once unchanged if the first attempt got no response.
+        """POST one run, resending it once unchanged if the first attempt got no complete response.
 
-        Both attempts carry one idempotency key, so Hermes admits the run at most once. The
-        resend is the only way to learn a run the lost attempt may have started, so it happens
+        Both attempts carry one idempotency key, so Hermes admits the run at most once while it
+        retains the key; a resend older than that retention is never sent. The resend is the
+        only way to learn a run the lost attempt may have started, so it happens
         even for an abandoned dispatch, and publication then stops what it recovers. After a
         lost attempt only an admission settles the dispatch: a refused resend proves nothing
         about the first attempt, so its outcome is unknown rather than rejected.
         """
-        if not self._idempotent_runs:
+        window = self._resend_window
+        if window is None:
             return await self._request_json("POST", "/v1/runs", body=body)
         headers = {"Idempotency-Key": secrets.token_hex(16)}
+        # Wall-clock time also counts a suspended host, which the retention window does.
+        minted_at = time.time()
         with contextlib.suppress(_NoResponse):
             return await self._request_json("POST", "/v1/runs", body=body, headers=headers)
         cause: str | None = "error"
         status: int | None = None
         try:
+            if time.time() - minted_at >= window:
+                # Hermes may have pruned the key, and would then start the work again.
+                cause = "expired"
+                raise RuntimeError("Hermes API dispatch outcome is unknown")
             try:
                 status, payload = await self._request_json(
                     "POST", "/v1/runs", body=body, headers=headers
@@ -505,8 +518,15 @@ class HermesApiTaskSession:
             except _NoResponse as error:
                 cause = "no_response"
                 raise RuntimeError("Hermes API dispatch outcome is unknown") from error
+            except RuntimeError as error:
+                raise RuntimeError("Hermes API dispatch outcome is unknown") from error
+            run_id = payload.get("run_id")
             if status != 202:
                 cause = "refused"
+                raise RuntimeError("Hermes API dispatch outcome is unknown")
+            if type(run_id) is not str or _RUN_ID_EXACT.fullmatch(run_id) is None:
+                # Only a run it can name lets recovery stop or track what was started.
+                cause = "unidentified"
                 raise RuntimeError("Hermes API dispatch outcome is unknown")
             cause = None
             return status, payload

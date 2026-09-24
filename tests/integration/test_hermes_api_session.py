@@ -1921,6 +1921,10 @@ async def test_close_rejects_nonauthoritative_stop_status_body(
         await runner.cleanup()
 
 
+_ABSENT = object()
+_DURABLE_IDEMPOTENCY = {"supported": True, "durable": True, "retention_seconds": 86400}
+
+
 class _IdempotentHermes:
     """A fake Hermes whose /v1/runs keeps idempotency records the way v0.21.0 does.
 
@@ -1937,8 +1941,9 @@ class _IdempotentHermes:
         self,
         first_attempt: str,
         *,
-        idempotency: object = None,
+        idempotency: object = _DURABLE_IDEMPOTENCY,
         resend_status: int = 202,
+        resend_text: str | None = None,
         replay_status: str = "running",
         run_status: str = "running",
         events_status: int = 200,
@@ -1949,12 +1954,9 @@ class _IdempotentHermes:
         self.first_attempt = first_attempt
         self.lose_resend = lose_resend
         self.first_replayed = first_replayed
-        self.idempotency = (
-            {"supported": True, "durable": True, "retention_seconds": 86400}
-            if idempotency is None
-            else idempotency
-        )
+        self.idempotency = idempotency
         self.resend_status = resend_status
+        self.resend_text = resend_text
         self.replay_status = replay_status
         self.run_status = run_status
         self.events_status = events_status
@@ -1989,6 +1991,10 @@ class _IdempotentHermes:
             return self._drop(request)
         if not first and self.resend_status != 202:
             return web.json_response({"error": "unavailable"}, status=self.resend_status)
+        if not first and self.resend_text is not None:
+            return web.Response(
+                status=202, text=self.resend_text, content_type="application/json"
+            )
         # Hermes fingerprints the parsed body, not its bytes.
         fingerprint = json.dumps(json.loads(raw), sort_keys=True)
         if key is not None and key in self.records:
@@ -2022,7 +2028,7 @@ class _IdempotentHermes:
         return web.Response(status=202)
 
     async def events(self, request: web.Request) -> web.StreamResponse:
-        if self.events_status != 200:
+        if self.events_status != 200 or request.match_info["run_id"] != self.run_id:
             return web.json_response({"error": "not found"}, status=self.events_status)
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
@@ -2050,9 +2056,6 @@ class _IdempotentHermes:
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()
         return runner, port
-
-
-_ABSENT = object()
 
 
 def _recovery_markers(capsys: pytest.CaptureFixture[str]) -> list[object]:
@@ -2149,7 +2152,10 @@ async def test_an_ambiguous_dispatch_never_reports_a_rejection(
             {"supported": True, "durable": False, "retention_seconds": 86400},
             id="not-durable",
         ),
-        pytest.param({"supported": False, "durable": True}, id="not-supported"),
+        pytest.param(
+            {"supported": False, "durable": True, "retention_seconds": 86400},
+            id="not-supported",
+        ),
     ],
 )
 async def test_without_durable_idempotency_a_dispatch_is_sent_once(idempotency: object) -> None:
@@ -2315,6 +2321,95 @@ async def test_an_idempotent_dispatch_requires_an_exact_replay_marker(replayed: 
 
 
 @pytest.mark.asyncio
+async def test_a_resend_older_than_the_retention_window_is_never_sent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Past retention Hermes may have pruned the key and would start the work again.
+    hermes = _IdempotentHermes(
+        "lose_response",
+        idempotency={"supported": True, "durable": True, "retention_seconds": 1},
+        hold_first_attempt=True,
+    )
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        dispatch = asyncio.create_task(session.dispatch(_dispatch_request()))
+        await asyncio.wait_for(hermes.first_attempt_admitted.wait(), timeout=1)
+        await asyncio.sleep(1.1)
+        hermes.release_first_attempt.set()
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            await dispatch
+        assert len(hermes.attempts) == 1
+        assert _recovery_markers(capsys) == [{"cause": "expired", "status": None, "version": 1}]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resend_text", "cause", "status"),
+    [
+        pytest.param("{}", "unidentified", 202, id="no-run-id"),
+        pytest.param(
+            '{"run_id": "not-a-run", "status": "running"}', "unidentified", 202, id="bad-id"
+        ),
+        # The body never parsed, so no status was ever returned to the adapter.
+        pytest.param("not json", "error", None, id="not-json"),
+    ],
+)
+async def test_an_unusable_resend_admission_leaves_the_outcome_unknown(
+    resend_text: str, cause: str, status: int | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Recovery needs a run it can name; anything less cannot stop or track the lost run.
+    hermes = _IdempotentHermes("lose_response", resend_text=resend_text)
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            await session.dispatch(_dispatch_request())
+        assert _recovery_markers(capsys) == [{"cause": cause, "status": status, "version": 1}]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [[], {}], ids=["list", "object"])
+async def test_an_unhashable_admission_status_still_stops_the_run(status: object) -> None:
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8765",
+            bearer="unhashable-status-test-bearer-value-32-chars",
+        ),
+        session_id="session_unhashable_status",
+    )
+    stopped: list[str] = []
+
+    async def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, object]:
+        del body
+        return 202, {"run_id": "run_3434343434343434", "status": status}
+
+    async def stop_and_wait(api_run_id: str) -> None:
+        stopped.append(api_run_id)
+
+    session._started = True
+    session._request_json = request_json  # type: ignore[method-assign]
+    session._stop_and_wait = stop_and_wait  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="lacks exact authority"):
+        await session.dispatch(_dispatch_request())
+    assert stopped == ["run_3434343434343434"]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_close_waits_for_a_dispatch_whose_caller_was_cancelled_twice() -> None:
     # The second cancellation releases the caller early; close must still await the work.
     hermes = _IdempotentHermes("lose_response", hold_first_attempt=True)
@@ -2346,7 +2441,16 @@ async def test_close_waits_for_a_dispatch_whose_caller_was_cancelled_twice() -> 
 @pytest.mark.parametrize(
     "idempotency",
     [
+        pytest.param(None, id="null"),
         pytest.param("yes", id="not-an-object"),
+        pytest.param({"supported": True, "durable": True}, id="retention-missing"),
+        pytest.param(
+            {"supported": True, "durable": True, "retention_seconds": 0}, id="retention-zero"
+        ),
+        pytest.param(
+            {"supported": True, "durable": True, "retention_seconds": "86400"},
+            id="retention-not-int",
+        ),
         pytest.param({"supported": True}, id="durable-missing"),
         pytest.param({"supported": True, "durable": "true"}, id="durable-not-bool"),
         pytest.param({"durable": True}, id="supported-missing"),

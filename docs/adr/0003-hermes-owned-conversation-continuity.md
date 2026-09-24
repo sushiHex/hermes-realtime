@@ -105,6 +105,11 @@ for an abandoned dispatch, because it is the only way to learn a run that must t
 Resending requires Hermes to advertise durable run idempotency, the only record that answers a
 resend truthfully across a Hermes restart
 ([capability](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L94-L99)).
+A resend is also refused once the dispatch is older, by the wall clock, than the retention
+Hermes advertises. A host suspended past that window could otherwise find its key pruned and
+start the work again. Durability is known only as advertised at startup. If Hermes restarts
+onto its in-memory fallback store, the resend guarantee does not hold, and no capability check
+can make it atomic.
 
 ### 3. Realtime keeps one binding record
 
@@ -197,8 +202,9 @@ A backend outage never silences the voice.
   A run dispatched with a key also has its status persisted by Hermes, including its output,
   error, and any approval request still pending
   ([persistence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L138-L152)).
-  A terminal record is pruned only once it is more than 24 hours old, and a record left
-  non-terminal by a gateway crash is not pruned at all
+  Under the default policy for bearer clients, a terminal record is pruned once it is more than
+  24 hours past its last status update. A record left non-terminal by a gateway crash is not
+  pruned until Hermes rehydrates it as interrupted
   ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
   No API route deletes it, so forget does not remove it.
 - **Retention.** Hermes session auto-pruning stays disabled for the MVP.
