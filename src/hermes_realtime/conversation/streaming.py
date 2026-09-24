@@ -94,12 +94,15 @@ class _TerminalEvidenceState:
 def _committed_conversation_context_snapshot_bytes(
     *,
     revision: int,
-    messages: tuple[tuple[str, str], ...],
+    messages: tuple[tuple[str, str] | tuple[str, str, bool], ...],
     active_tasks: tuple[tuple[str, str], ...],
     terminal_task_count: int,
     updates: tuple[tuple[int, str, str, str], ...] = (),
 ) -> bytes:
-    """Encode the authoritative adapter boundary for content-free observation."""
+    """Encode the authoritative adapter boundary for content-free observation.
+
+    An interrupted assistant row carries a trailing ``True``; other rows are pairs.
+    """
 
     return json.dumps(
         {
@@ -826,7 +829,10 @@ class StreamingSpeechLoop:
                         _committed_conversation_context_snapshot_bytes(
                             revision=snapshot.revision,
                             messages=tuple(
-                                (message.role, message.text) for message in snapshot.messages
+                                (message.role, message.text, True)
+                                if message.interrupted
+                                else (message.role, message.text)
+                                for message in snapshot.messages
                             ),
                             active_tasks=tuple(
                                 (task.task_id, task.objective)

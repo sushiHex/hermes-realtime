@@ -141,12 +141,15 @@ gets no response ends with its outcome unknown.
 
 Live foreground context is heard-first. Assistant rows fill only from delivery-confirmed chunks:
 each generated segment has one row, holding the exact slice of the segment text through its
-latest confirmed chunk. A turn that ends abnormally after some of its speech was confirmed gets
-the fixed ` [speech interrupted]` marker once, on its last confirmed row. A turn with nothing
-confirmed writes no assistant row. A replay adds only newly confirmed text, as its own row. The
-undelivered remainder stays in the resumable-replay machinery. The Codex prompt's statement that
-earlier assistant messages "represent only speech confirmed delivered"
-([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2803)) is therefore true, and
+latest confirmed chunk. Interruption is data, not text: a turn that ends abnormally after some of
+its speech was confirmed sets `interrupted` once on its last confirmed row, whose text stays
+exactly what was delivered. Providers render the flag deterministically, as an `"interrupted":
+true` field in the Codex snapshot and as a fixed suffix in Ollama's chat messages. Model text
+can never forge the flag. A turn with nothing confirmed writes no assistant row. A replay adds
+only newly confirmed text, as its own row. The undelivered remainder stays in the
+resumable-replay machinery. The Codex prompt's statement that earlier assistant messages
+"represent only speech confirmed delivered"
+([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801)) is therefore true, and
 the live context, the Hermes record, and what the user experienced match by construction.
 
 ### The one upstream extension

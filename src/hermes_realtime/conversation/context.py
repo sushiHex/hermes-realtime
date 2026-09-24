@@ -55,18 +55,27 @@ class AssistantTextCapacityError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ConversationMessage:
-    """One compact model-visible conversation item."""
+    """One compact model-visible conversation item.
+
+    ``interrupted`` marks an assistant row whose speech was cut off after
+    ``text``; the text itself is always exactly what was delivered.
+    """
 
     role: str
     text: str
+    interrupted: bool = False
 
     def __post_init__(self) -> None:
         if type(self.role) is not str:
             raise TypeError("conversation role must be an exact built-in string")
         if type(self.text) is not str:
             raise TypeError("conversation text must be an exact built-in string")
+        if type(self.interrupted) is not bool:
+            raise TypeError("conversation interrupted flag must be an exact boolean")
         if self.role not in (ConversationRole.USER.value, ConversationRole.ASSISTANT.value):
             raise ValueError("conversation role is not supported")
+        if self.interrupted and self.role != ConversationRole.ASSISTANT.value:
+            raise ValueError("only assistant messages may be interrupted")
         if not self.text.strip():
             raise ValueError("conversation text must not be blank")
         if len(self.text) > _MAX_ITEM_CHARS_LIMIT:
@@ -97,9 +106,6 @@ class ActiveTaskSummary:
 
 
 AssistantTextAdmission = SpeechDeliveryAdmission
-
-INTERRUPTED_SPEECH_MARKER = " [speech interrupted]"
-"""Fixed suffix on the last heard assistant row of a turn that did not complete normally."""
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -152,7 +158,12 @@ class ConversationContextSnapshot:
         if len(self.active_tasks) > _MAX_ACTIVE_TASKS_LIMIT:
             raise ValueError("snapshot task capacity exceeds supported maximum")
         messages = tuple(
-            ConversationMessage(role=message.role, text=message.text) for message in self.messages
+            ConversationMessage(
+                role=message.role,
+                text=message.text,
+                interrupted=message.interrupted,
+            )
+            for message in self.messages
         )
         active_tasks = tuple(
             ActiveTaskSummary(task_id=task.task_id, objective=task.objective)
@@ -184,12 +195,10 @@ class ConversationContextStore:
             "max_active_tasks",
             _MAX_ACTIVE_TASKS_LIMIT,
         )
-        # Reserve room for the fixed interruption marker so a marked heard row
-        # always fits the absolute per-message bound.
         self._max_item_chars = self._bounded_positive_integer(
             max_item_chars,
             "max_item_chars",
-            _MAX_ITEM_CHARS_LIMIT - len(INTERRUPTED_SPEECH_MARKER),
+            _MAX_ITEM_CHARS_LIMIT,
         )
         self._max_task_incarnations = self._bounded_positive_integer(
             max_task_incarnations,
@@ -322,7 +331,7 @@ class ConversationContextStore:
         return delivered_text
 
     def mark_assistant_segment_interrupted(self, segment: AssistantSegmentKey) -> None:
-        """Append the fixed interruption marker to ``segment``'s open heard row once."""
+        """Flag ``segment``'s open heard row as interrupted, exactly once."""
 
         if type(segment) is not AssistantSegmentKey:
             raise TypeError("segment must be an exact AssistantSegmentKey")
@@ -334,11 +343,12 @@ class ConversationContextStore:
             or self._messages[-1] is not open_segment[1]
         ):
             raise KeyError("segment is not the open heard assistant row")
-        # Replacing the row object displaces the open segment, so neither a
-        # second marker nor a later upsert can apply to it.
+        # Same heard text, now flagged. Replacing the row object displaces the
+        # open segment, so neither a second flag nor a later upsert can apply.
         self._messages[-1] = ConversationMessage(
             role=ConversationRole.ASSISTANT.value,
-            text=open_segment[1].text + INTERRUPTED_SPEECH_MARKER,
+            text=open_segment[1].text,
+            interrupted=True,
         )
         self._revision += 1
 
@@ -467,7 +477,11 @@ class ConversationContextStore:
         return ConversationContextSnapshot(
             revision=self._revision,
             messages=tuple(
-                ConversationMessage(role=message.role, text=message.text)
+                ConversationMessage(
+                    role=message.role,
+                    text=message.text,
+                    interrupted=message.interrupted,
+                )
                 for message in self._messages
             ),
             active_tasks=tuple(

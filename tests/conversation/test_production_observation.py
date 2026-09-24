@@ -568,6 +568,69 @@ async def test_disabled_foreground_keeps_private_exact_source_trace_without_term
 
 
 @pytest.mark.asyncio
+async def test_committed_context_snapshot_flags_only_interrupted_assistant_rows() -> None:
+    from hermes_realtime.conversation import AssistantSegmentKey
+    from tests.support.qualification import (
+        InProcessQualificationComposition,
+        committed_conversation_context_snapshot_bytes,
+    )
+
+    context = ConversationContextStore()
+    ledger = DeliveredSpeechLedger()
+    segment = AssistantSegmentKey()
+    chunk = SpeechChunk(
+        turn_id="turn_prior",
+        chunk_id="chunk_prior",
+        text="Cut off here.",
+        audio=AudioFrame(pcm=b"\x00\x00", sample_rate_hz=16_000, channels=1),
+    )
+    admission = context.prepare_assistant_text(
+        chunk.text,
+        segment=segment,
+        heard_text=chunk.text,
+    )
+    ledger.queue(chunk, admission=admission)
+    context.record_assistant_delivery(
+        admission=admission,
+        ledger=ledger,
+        confirmation=ledger.mark_delivered_confirmed(
+            ledger.mark_started(chunk.turn_id, chunk.chunk_id)
+        ),
+    )
+    ledger.close_turn(chunk.turn_id)
+    context.mark_assistant_segment_interrupted(segment)
+
+    qualification = InProcessQualificationComposition()
+    loop = qualification.compose(
+        lambda: StreamingSpeechLoop(
+            context=context,
+            foreground=ForegroundTurnCoordinator(),
+            inference=_Inference(),
+            synthesizer=_Synthesizer(),
+            playback=_Playback(),
+            ledger=ledger,
+        )
+    )
+
+    await loop.respond("turn_001", Transcript(text="What happened?", final=True))
+
+    records = qualification.trace.records()
+    assert records[0].committed_conversation_context_snapshot == (
+        committed_conversation_context_snapshot_bytes(
+            revision=3,
+            messages=(
+                ("assistant", "Cut off here.", True),
+                ("user", "What happened?"),
+            ),
+            active_tasks=(),
+            terminal_task_count=0,
+        )
+    )
+
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_bounded_private_trace_reports_incomplete_without_evicting_earlier_context() -> None:
     from tests.support.qualification import InProcessQualificationComposition
 

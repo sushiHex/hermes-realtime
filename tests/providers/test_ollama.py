@@ -99,6 +99,27 @@ async def test_ollama_streams_bounded_speakable_segments_without_tool_schema() -
     assert "tool_choice" not in body
 
 
+def test_ollama_renders_the_interrupted_flag_as_a_fixed_suffix_only_when_set() -> None:
+    snapshot = ConversationInferenceRequest(
+        revision=2,
+        messages=(
+            ConversationMessage(role="assistant", text="Cut off here.", interrupted=True),
+            ConversationMessage(role="assistant", text="I said [speech interrupted]"),
+        ),
+        active_tasks=(),
+        updates=(),
+    )
+
+    assert OllamaStreamingInference._messages(snapshot) == [
+        {
+            "role": "assistant",
+            "content": "Cut off here." + ollama_module._INTERRUPTED_SPEECH_SUFFIX,
+        },
+        {"role": "assistant", "content": "I said [speech interrupted]"},
+    ]
+    assert ollama_module._INTERRUPTED_SPEECH_SUFFIX == " [speech interrupted]"
+
+
 def test_ollama_keeps_ordered_list_markers_with_their_items() -> None:
     inference = object.__new__(OllamaStreamingInference)
     inference._max_segment_chars = 4096

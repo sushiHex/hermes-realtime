@@ -3,7 +3,6 @@ from typing import cast
 import pytest
 
 from hermes_realtime.conversation import (
-    INTERRUPTED_SPEECH_MARKER,
     ActiveTaskCapacityError,
     ActiveTaskIdentityError,
     ActiveTaskSummary,
@@ -829,7 +828,9 @@ def test_interruption_marker_applies_once_to_the_open_heard_row() -> None:
 
     context.mark_assistant_segment_interrupted(segment)
 
-    assert _texts(context) == ["Partial reply." + INTERRUPTED_SPEECH_MARKER]
+    interrupted = ConversationMessage("assistant", "Partial reply.", interrupted=True)
+    assert context.snapshot().messages == (interrupted,)
+    assert context.snapshot().messages[0].interrupted is True
     assert context.snapshot().revision == 2
     with pytest.raises(KeyError, match="open heard"):
         context.mark_assistant_segment_interrupted(segment)
@@ -841,7 +842,7 @@ def test_interruption_marker_applies_once_to_the_open_heard_row() -> None:
             segment=segment,
             heard_text="Partial reply. More.",
         )
-    assert _texts(context) == ["Partial reply." + INTERRUPTED_SPEECH_MARKER]
+    assert context.snapshot().messages == (interrupted,)
     assert context.snapshot().revision == 2
 
 
@@ -861,17 +862,45 @@ def test_interruption_marker_requires_the_exact_open_heard_row() -> None:
     with pytest.raises(KeyError, match="open heard"):
         context.mark_assistant_segment_interrupted(segment)
 
-    assert _texts(context) == ["Heard reply.", "Next question"]
+    assert context.snapshot().messages == (
+        ConversationMessage("assistant", "Heard reply."),
+        ConversationMessage("user", "Next question"),
+    )
+    assert not any(message.interrupted for message in context.snapshot().messages)
 
 
-def test_interruption_marker_always_fits_the_absolute_message_bound() -> None:
-    maximum = 65_536 - len(INTERRUPTED_SPEECH_MARKER)
-    with pytest.raises(ValueError, match="supported maximum"):
-        ConversationContextStore(max_item_chars=maximum + 1)
-    context = ConversationContextStore(max_item_chars=maximum)
+def test_interrupted_row_keeps_exact_heard_text_at_the_per_item_limit() -> None:
+    context = ConversationContextStore(max_item_chars=64)
     segment = AssistantSegmentKey()
-    _confirm_assistant_text(context, "x" * maximum, chunk_id="chunk_001", segment=segment)
+    _confirm_assistant_text(context, "x" * 64, chunk_id="chunk_001", segment=segment)
 
     context.mark_assistant_segment_interrupted(segment)
 
-    assert _texts(context) == ["x" * maximum + INTERRUPTED_SPEECH_MARKER]
+    [message] = context.snapshot().messages
+    assert message.text == "x" * 64
+    assert len(message.text) == context.max_item_chars
+    assert message.interrupted is True
+
+
+def test_store_accepts_the_full_supported_item_bound() -> None:
+    assert ConversationContextStore(max_item_chars=65_536).max_item_chars == 65_536
+
+
+def test_interrupted_flag_is_an_exact_boolean_on_assistant_rows_only() -> None:
+    with pytest.raises(TypeError, match="exact boolean"):
+        ConversationMessage("assistant", "cut", interrupted=cast(bool, 1))
+    with pytest.raises(ValueError, match="assistant"):
+        ConversationMessage("user", "not speech", interrupted=True)
+
+    mutated = ConversationMessage("user", "question")
+    object.__setattr__(mutated, "interrupted", True)
+    with pytest.raises(ValueError, match="assistant"):
+        ConversationContextSnapshot(0, (mutated,), ())
+
+    snapshot = ConversationContextSnapshot(
+        0,
+        (ConversationMessage("assistant", "cut", interrupted=True),),
+        (),
+    )
+    assert snapshot.messages[0].interrupted is True
+

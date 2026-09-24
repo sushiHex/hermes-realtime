@@ -8,7 +8,6 @@ from typing import cast
 import pytest
 
 from hermes_realtime.conversation import (
-    INTERRUPTED_SPEECH_MARKER,
     ConversationContextSnapshot,
     ConversationContextStore,
     ConversationInferenceRequest,
@@ -947,6 +946,13 @@ def _context_texts(context: ConversationContextStore) -> list[str]:
     return [message.text for message in context.snapshot().messages]
 
 
+def _context_rows(context: ConversationContextStore) -> list[tuple[str, str, bool]]:
+    return [
+        (message.role, message.text, message.interrupted)
+        for message in context.snapshot().messages
+    ]
+
+
 @pytest.mark.asyncio
 async def test_interrupt_update_uses_foreground_delivery_without_inference() -> None:
     context = ConversationContextStore()
@@ -1781,7 +1787,10 @@ async def test_multi_chunk_segment_upserts_one_row_equal_to_the_exact_segment_sl
         ["Question?"],
         ["Question?", "Hello there."],
     ]
-    assert _context_texts(context) == ["Question?", "Hello there.  How are you?"]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "Hello there.  How are you?", False),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1798,7 +1807,31 @@ async def test_normal_completion_records_each_heard_segment_without_marker() -> 
 
     await loop.respond("turn_001", Transcript(text="Question?", final=True))
 
-    assert _context_texts(context) == ["Question?", "First answer.", "Second answer."]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer.", False),
+        ("assistant", "Second answer.", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_text_that_reads_like_an_interruption_is_not_flagged() -> None:
+    context = ConversationContextStore()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("I said [speech interrupted]"),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "I said [speech interrupted]", False),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1825,7 +1858,10 @@ async def test_interruption_mid_segment_records_heard_slice_plus_marker() -> Non
     with pytest.raises(asyncio.CancelledError):
         await response
 
-    assert _context_texts(context) == ["Question?", "First part." + INTERRUPTED_SPEECH_MARKER]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+    ]
     assert [
         data["text"] for kind, data in observed if kind == "assistant_text_generated"
     ] == ["First part. Second part. Third part."]
@@ -1857,9 +1893,9 @@ async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
     with pytest.raises(asyncio.CancelledError):
         await response
 
-    assert _context_texts(context) == [
-        "Question?",
-        "First answer." + INTERRUPTED_SPEECH_MARKER,
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer.", True),
     ]
 
 
@@ -1897,7 +1933,10 @@ async def test_unheard_interrupted_turn_never_marks_an_earlier_turns_row() -> No
     with pytest.raises(asyncio.CancelledError):
         await announcement
 
-    assert _context_texts(context) == ["Question?", "Answer for turn_001."]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "Answer for turn_001.", False),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1933,7 +1972,10 @@ async def test_abnormal_end_after_hearing_all_generated_speech_still_marks_cut_o
         await response
 
     # The turn did not complete normally, so the reply was cut off.
-    assert _context_texts(context) == ["Question?", "First answer." + INTERRUPTED_SPEECH_MARKER]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer.", True),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1959,10 +2001,10 @@ async def test_resume_records_only_newly_heard_text_as_its_own_row() -> None:
     assert await loop.resume_interrupted() is True
 
     assert [chunk.text for chunk in playback.chunks[-2:]] == ["Second part.", "Third part."]
-    assert _context_texts(context) == [
-        "Question?",
-        "First part." + INTERRUPTED_SPEECH_MARKER,
-        " Second part. Third part.",
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+        ("assistant", " Second part. Third part.", False),
     ]
 
 
@@ -2192,10 +2234,10 @@ async def test_resume_replays_publication_when_later_speech_subchunk_was_interru
         "Second subchunk.",
     ]
     # The original turn heard only its first subchunk; the replay adds only the rest.
-    assert [message.text for message in context.snapshot().messages] == [
-        "Question?",
-        "First subchunk." + INTERRUPTED_SPEECH_MARKER,
-        "Second subchunk.",
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First subchunk.", True),
+        ("assistant", "Second subchunk.", False),
     ]
     assert [event for event in observed if event[0] == "assistant_text_generated"] == [
         (

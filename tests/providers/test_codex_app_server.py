@@ -1809,9 +1809,7 @@ def test_codex_prompt_requests_a_short_natural_opening_without_filler() -> None:
     assert "Do not add filler or a preamble" in prompt
 
 
-def test_codex_prompt_explains_the_heard_only_context_and_interruption_marker() -> None:
-    from hermes_realtime.conversation import INTERRUPTED_SPEECH_MARKER
-
+def test_codex_prompt_explains_the_heard_only_context_and_interrupted_field() -> None:
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
         effort="none",
@@ -1821,10 +1819,33 @@ def test_codex_prompt_explains_the_heard_only_context_and_interruption_marker() 
     prompt = inference._prompt(inference._trusted_snapshot(_snapshot()))
 
     assert "Earlier assistant messages represent only speech confirmed delivered." in prompt
-    assert (
-        f"An assistant message ending in {INTERRUPTED_SPEECH_MARKER.strip()} was cut off there"
-        in prompt
+    assert 'An assistant message with "interrupted": true was cut off' in prompt
+
+
+def test_codex_snapshot_adds_interrupted_field_only_to_interrupted_rows() -> None:
+    snapshot = ConversationContextSnapshot(
+        revision=2,
+        messages=(
+            ConversationMessage(role="assistant", text="Cut off here.", interrupted=True),
+            ConversationMessage(role="assistant", text="I said [speech interrupted]"),
+            ConversationMessage(role="user", text="Go on."),
+        ),
+        active_tasks=(),
+        terminal_task_count=0,
     )
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=FakeCodexTransport,
+    )
+
+    payload = json.loads(inference._prompt(inference._trusted_snapshot(snapshot)).splitlines()[-1])
+
+    assert payload["messages"] == [
+        {"role": "assistant", "text": "Cut off here.", "interrupted": True},
+        {"role": "assistant", "text": "I said [speech interrupted]"},
+        {"role": "user", "text": "Go on."},
+    ]
 
 
 def test_codex_prompt_makes_background_results_detailed_and_conversational() -> None:
