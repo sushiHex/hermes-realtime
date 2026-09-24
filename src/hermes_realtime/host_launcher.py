@@ -2087,6 +2087,7 @@ def build_local_host_launcher(
             if evidence_runtime is not None
             else None
         ),
+        validate_user_input=context.validate_user_text,
         record_user_input=record_command_input,
     )
     search_egress_authority, current_fact_lookup, knowledge_coordinator = (
@@ -2596,9 +2597,8 @@ def build_local_host_launcher(
         )
         announcement = _restart_announcement(settlement)
         if announcement is not None:
-            assert settlement is not None
             # Stopped work is history, never active: the prompt must not imply it runs.
-            context.record_tasks_ended_by_restart(settlement.stopped + settlement.unknown)
+            context.mark_prior_work_ended()
             restart_announcement = announcement
 
     stt_providers = (

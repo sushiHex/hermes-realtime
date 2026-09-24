@@ -1859,9 +1859,11 @@ class _FullHostHarness:
         monkeypatch: pytest.MonkeyPatch,
         *,
         settlement: object | None = None,
+        preflight_error: BaseException | None = None,
     ) -> None:
         from hermes_realtime.integration.voice_tail import VoiceTailWriter
 
+        self.preflight_terminal_task_count: int | None = None
         self.events: list[str] = []
         self.announced: list[tuple[str, str]] = []
         self.recorded_inputs: list[object] = []
@@ -1953,6 +1955,11 @@ class _FullHostHarness:
                 (message.role, message.text, message.interrupted)
                 for message in surface._context.snapshot().messages
             ]
+            harness.preflight_terminal_task_count = (
+                surface._context.snapshot().terminal_task_count
+            )
+            if preflight_error is not None:
+                raise preflight_error
             if settlement is not None:
                 task_session._restart_settlement = settlement
 
@@ -2018,13 +2025,16 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from hermes_realtime.conversation import ConversationMessage
+    from hermes_realtime.conversation import ConversationMessage, DurableConversation
     from hermes_realtime.integration.run_record import write_run_record
     from hermes_realtime.integration.voice_tail import parse_voice_tail, voice_tail_bytes
 
-    tail = (
-        ConversationMessage("user", "Earlier question"),
-        ConversationMessage("assistant", "Earlier answer", interrupted=True),
+    tail = DurableConversation(
+        messages=(
+            ConversationMessage("user", "Earlier question"),
+            ConversationMessage("assistant", "Earlier answer", interrupted=True),
+        ),
+        prior_work=True,
     )
     path = tmp_path / "state" / "voice-tail-v1.json"
     write_run_record(path, voice_tail_bytes(tail))
@@ -2038,16 +2048,43 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
             ("user", "Earlier question", False),
             ("assistant", "Earlier answer", True),
         ]
+        # Work from before the restart is ended history before the first turn.
+        assert harness.preflight_terminal_task_count == 1
         assert harness.context is not None
+        assert harness.context.snapshot().active_tasks == ()
         harness.context.record_user_transcript(Transcript(text="Later question", final=True))
     finally:
         await launcher.close()
 
     assert harness.events[3:] == ["actions:closed", "tail:close"]
-    assert parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=1024) == (
-        *tail,
-        ConversationMessage("user", "Later question"),
+    assert parse_voice_tail(
+        path.read_bytes(), max_messages=16, max_item_chars=1024
+    ) == DurableConversation(
+        messages=(*tail.messages, ConversationMessage("user", "Later question")),
+        prior_work=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_full_host_start_failure_after_the_tail_opened_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+    path = tmp_path / "voice-tail-v1.json"
+    harness = _FullHostHarness(monkeypatch, preflight_error=RuntimeError("preflight failed"))
+    launcher = harness.build(voice_tail=path)
+
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        await launcher.start()
+
+    assert harness.events[:2] == ["tail:open", "preflight"]
+    assert "tail:close" in harness.events
+    successor = VoiceTailWriter(path)
+    await successor.open(ConversationContextStore(on_change=successor.update))
+    await successor.close()
+    await launcher.close()
 
 
 @pytest.mark.asyncio
@@ -2100,7 +2137,7 @@ async def test_full_host_restart_settlement_is_inactive_history_announced_once_v
     try:
         assert harness.context is not None
         snapshot = harness.context.snapshot()
-        assert snapshot.terminal_task_count == 3
+        assert snapshot.terminal_task_count == 1
         assert snapshot.active_tasks == ()
         assert harness.announced == []
 
@@ -2154,6 +2191,8 @@ async def test_full_host_records_explicit_commands_through_the_speech_loop(
 
     await launcher.start()
     try:
+        assert harness.context is not None
+        assert harness.router["validate_user_input"] == harness.context.validate_user_text
         await harness.router["record_user_input"]("task: check the build")
 
         assert harness.recorded_inputs == [Transcript(text="task: check the build", final=True)]
