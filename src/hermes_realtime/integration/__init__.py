@@ -1,6 +1,6 @@
 """Hermes integration boundary for the realtime runtime."""
 
-from .api import HermesApiConfig, HermesApiTaskSession
+from .api import HermesApiConfig, HermesApiTaskSession, HermesRestartSettlement
 from .bridge import (
     BridgeAuthenticationError,
     BridgeProtocolError,
@@ -39,6 +39,7 @@ __all__ = [
     "HermesPluginContext",
     "HermesPluginDispatcher",
     "HermesPluginRuntime",
+    "HermesRestartSettlement",
     "HermesRunCompletion",
     "HermesWorkDispatcher",
     "LocalHermesBridgeClient",

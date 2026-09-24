@@ -14,11 +14,14 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
 import aiohttp
 
+from hermes_realtime.integration import run_record
+from hermes_realtime.integration.run_record import PendingRun
 from hermes_realtime.protocol import (
     CancelScope,
     ControlCancelAcknowledgedEvent,
@@ -65,6 +68,11 @@ _MAX_SEQUENCE = (1 << 63) - 1
 _LIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_for_approval", "stopping"})
 _RUN_STATUSES = _LIVE_RUN_STATUSES | {"completed", "failed", "cancelled", "interrupted"}
 _DISPATCH_RECOVERY_PREFIX = "[hermes-dispatch-recovery] "
+_RESTART_SETTLEMENT_PREFIX = "[hermes-restart-settlement] "
+_RUN_RECORD_LOCK_PREFIX = "[hermes-run-record-lock] "
+_MAX_RUN_RECORD_BYTES = run_record.max_run_record_bytes(_MAX_ACTIVE_RUNS, _MAX_HTTP_BODY_BYTES)
+# Path() constructs the platform's concrete class, which is the only accepted record path type.
+_CONCRETE_PATH = type(Path())
 _BACKGROUND_INSTRUCTIONS = (
     "Complete this bounded background objective with a hard latency target. "
     "Stay exactly within the requested scope; do not add a topic, domain, category, "
@@ -187,6 +195,28 @@ class _NoResponse(RuntimeError):
     """A request may have reached Hermes, but no complete response came back."""
 
 
+class _RunNotFound(RuntimeError):
+    """Hermes answered that it does not know the run."""
+
+
+@dataclass(frozen=True, slots=True)
+class HermesRestartSettlement:
+    """What a start settled from the run record a previous process left behind.
+
+    ``stopped`` counts runs confirmed no longer running on Hermes: stopped now, already
+    ended, or no longer known to Hermes. ``unknown`` counts dispatches whose outcome could not
+    be learned without risking starting the work again; nothing was resent for them.
+    """
+
+    stopped: int
+    unknown: int
+
+
+def _is_run_not_found(status: int, payload: dict[str, Any]) -> bool:
+    error = payload.get("error")
+    return status == 404 and type(error) is dict and error.get("code") == "run_not_found"
+
+
 @dataclass(slots=True)
 class _RunAuthority:
     task_id: str
@@ -214,6 +244,7 @@ class HermesApiTaskSession:
         private_id_factory: Callable[[], str] | None = None,
         approval_observer: Callable[[dict[str, str | int | bool | None]], None] | None = None,
         event_observer: Callable[[str, str | None], None] | None = None,
+        run_record_path: Path | None = None,
     ) -> None:
         if type(config) is not HermesApiConfig:
             raise TypeError("config must be an exact HermesApiConfig")
@@ -225,6 +256,8 @@ class HermesApiTaskSession:
             raise TypeError("approval_observer must be callable")
         if event_observer is not None and not callable(event_observer):
             raise TypeError("event_observer must be callable")
+        if run_record_path is not None and type(run_record_path) is not _CONCRETE_PATH:
+            raise TypeError("run_record_path must be an exact pathlib Path or None")
         self._config = config
         self._session_id = session_id
         self._private_id_factory = private_id_factory or (lambda: secrets.token_hex(16))
@@ -249,6 +282,15 @@ class HermesApiTaskSession:
         self._close_operation: asyncio.Task[None] | None = None
         # Seconds Hermes retains a run's idempotency record; None when a resend is unsafe.
         self._resend_window: float | None = None
+        # The durable record of runs this process may have running on Hermes, so a restart
+        # after a crash can find and stop them. It stays empty when no path is configured.
+        self._run_record_path = run_record_path
+        self._record_pending: list[PendingRun] = []
+        self._record_admitted: list[str] = []
+        self._record_lock = asyncio.Lock()
+        # The OS lock that makes this session the record's only owner while it runs.
+        self._record_owner: int | None = None
+        self._restart_settlement: HermesRestartSettlement | None = None
         self._started = False
         self._closed = False
 
@@ -265,6 +307,18 @@ class HermesApiTaskSession:
                 raise_for_status=False,
             )
         try:
+            if self._run_record_path is not None:
+                # One host owns a record at a time; any other would stop runs it does not own.
+                self._record_owner = run_record.lock_run_record(self._run_record_path)
+                if self._record_owner is None:
+                    print(
+                        _RUN_RECORD_LOCK_PREFIX
+                        + json.dumps(
+                            {"cause": "held", "version": 1}, separators=(",", ":"), sort_keys=True
+                        ),
+                        flush=True,
+                    )
+                    raise RuntimeError("another host holds the Hermes run record")
             status, payload = await self._request_json("GET", "/v1/capabilities")
             if status != 200:
                 raise RuntimeError("Hermes API capability discovery failed")
@@ -321,15 +375,114 @@ class HermesApiTaskSession:
                     or endpoint.get("path") != path
                 ):
                     raise RuntimeError(f"Hermes API endpoint capability is invalid: {name}")
+            settlement: HermesRestartSettlement | None = None
+            if self._run_record_path is not None:
+                settlement = await self._settle_run_record(self._run_record_path, resend_window)
         except BaseException:
             await self._close_client()
+            self._release_run_record()
             raise
         async with self._state_lock:
             if self._closed:
                 await self._close_client()
+                self._release_run_record()
                 raise RuntimeError("Hermes API task session closed during startup")
             self._resend_window = resend_window
+            self._restart_settlement = settlement
             self._started = True
+
+    def _release_run_record(self) -> None:
+        owner = self._record_owner
+        self._record_owner = None
+        if owner is not None:
+            run_record.unlock_run_record(owner)
+
+    @property
+    def restart_settlement(self) -> HermesRestartSettlement | None:
+        """What start settled from the run record; None without a record or before start."""
+        return self._restart_settlement
+
+    async def _settle_run_record(
+        self,
+        path: Path,
+        window: float | None,
+    ) -> HermesRestartSettlement:
+        """Stop every run a previous process may have left running; tasks are not resumed."""
+        raw = await asyncio.to_thread(run_record.read_run_record, path, _MAX_RUN_RECORD_BYTES)
+        parsed = (
+            ([], [])
+            if raw is None
+            else run_record.parse_run_record(
+                raw,
+                max_entries=_MAX_ACTIVE_RUNS,
+                max_request_bytes=_MAX_HTTP_BODY_BYTES,
+                run_id=_RUN_ID_EXACT,
+            )
+        )
+        if parsed is None:
+            raise RuntimeError("Hermes API run record is malformed")
+        pending, admitted = parsed
+        if not pending and not admitted:
+            return HermesRestartSettlement(stopped=0, unknown=0)
+        outcomes = await asyncio.gather(
+            *(self._settle_recorded_run(api_run_id) for api_run_id in admitted),
+            *(self._settle_recorded_dispatch(entry, window) for entry in pending),
+            return_exceptions=True,
+        )
+        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        # The record keeps exactly the entries still unsettled, so a later start retries them.
+        unresolved_admitted = [
+            api_run_id
+            for api_run_id, outcome in zip(admitted, outcomes[: len(admitted)], strict=True)
+            if isinstance(outcome, BaseException)
+        ]
+        unresolved_pending = [
+            entry
+            for entry, outcome in zip(pending, outcomes[len(admitted) :], strict=True)
+            if isinstance(outcome, BaseException)
+        ]
+        data = run_record.run_record_bytes(unresolved_pending, unresolved_admitted)
+        await asyncio.to_thread(run_record.write_run_record, path, data)
+        evidence = {
+            "stopped": outcomes.count("stopped"),
+            "unknown": outcomes.count("unknown"),
+            "unresolved": len(failures),
+            "version": 1,
+        }
+        print(
+            _RESTART_SETTLEMENT_PREFIX
+            + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+            flush=True,
+        )
+        if failures:
+            raise BaseExceptionGroup("Hermes API restart settlement left runs unresolved", failures)
+        return HermesRestartSettlement(stopped=evidence["stopped"], unknown=evidence["unknown"])
+
+    async def _settle_recorded_run(self, api_run_id: str) -> str:
+        # A run Hermes no longer knows has nothing left running.
+        with contextlib.suppress(_RunNotFound):
+            await self._stop_and_wait(api_run_id)
+        return "stopped"
+
+    async def _settle_recorded_dispatch(self, entry: PendingRun, window: float | None) -> str:
+        """Learn the run a recorded dispatch started, by the resend rules, and stop it."""
+        age = time.time() - entry.minted_at
+        if entry.key is None or window is None or not 0 <= age < window:
+            # Without a retained key a replay could start the work again.
+            return "unknown"
+        try:
+            status, payload = await self._request_json(
+                "POST", "/v1/runs", body=entry.body, headers={"Idempotency-Key": entry.key}
+            )
+        except RuntimeError:
+            return "unknown"
+        api_run_id = payload.get("run_id")
+        # As after a lost attempt, only an admission naming an exact run settles it.
+        if status != 202 or type(api_run_id) is not str:
+            return "unknown"
+        if _RUN_ID_EXACT.fullmatch(api_run_id) is None:
+            return "unknown"
+        return await self._settle_recorded_run(api_run_id)
 
     async def dispatch(
         self,
@@ -347,17 +500,24 @@ class HermesApiTaskSession:
                     accepted=False,
                     reason="task is already active",
                 )
-            if len(self._runs_by_task) + len(self._pending_dispatches) >= _MAX_ACTIVE_RUNS:
+            # A recorded run may still be running on Hermes until a restart settles it, so
+            # recorded entries hold capacity too; without a record there are none.
+            active = len(self._runs_by_task) + len(self._pending_dispatches)
+            recorded = len(self._record_pending) + len(self._record_admitted)
+            if max(active, recorded) >= _MAX_ACTIVE_RUNS:
                 return self._dispatch_ack(
                     trusted,
                     accepted=False,
                     reason="background task capacity exhausted",
                 )
+            pending = self._mint_pending_run(trusted)
+            if self._run_record_path is not None:
+                self._record_pending.append(pending)
             self._pending_dispatches.add(trusted.task_id)
             self._inflight_dispatches.add(operation)
         abandoned = asyncio.Event()
         dispatch_operation = asyncio.create_task(
-            self._dispatch_admitted(trusted, abandoned=abandoned),
+            self._dispatch_admitted(trusted, pending, abandoned=abandoned),
             name=f"hermes-api-dispatch:{trusted.task_id}",
         )
         # close() must wait for the work itself: a caller cancelled twice stops waiting early.
@@ -376,12 +536,7 @@ class HermesApiTaskSession:
                 self._pending_dispatches.discard(trusted.task_id)
                 self._inflight_dispatches.discard(operation)
 
-    async def _dispatch_admitted(
-        self,
-        trusted: WorkDispatchRequestedEvent,
-        *,
-        abandoned: asyncio.Event,
-    ) -> WorkDispatchAcknowledgedEvent:
+    def _mint_pending_run(self, trusted: WorkDispatchRequestedEvent) -> PendingRun:
         body: dict[str, object] = {
             "input": trusted.payload.objective,
             "instructions": _BACKGROUND_INSTRUCTIONS,
@@ -397,8 +552,29 @@ class HermesApiTaskSession:
             model_options["service_tier"] = self._config.run_service_tier
         if model_options:
             body["model_options"] = model_options
-        status, payload = await self._submit_run(body)
+        # Only durable idempotency makes a key answerable after a lost attempt or a restart.
+        key = secrets.token_hex(16) if self._resend_window is not None else None
+        # Wall-clock time also counts a suspended host, which the retention window does.
+        return PendingRun(key=key, minted_at=time.time(), body=body)
+
+    async def _dispatch_admitted(
+        self,
+        trusted: WorkDispatchRequestedEvent,
+        pending: PendingRun,
+        *,
+        abandoned: asyncio.Event,
+    ) -> WorkDispatchAcknowledgedEvent:
+        try:
+            # Write-ahead: a crash after the POST must find the dispatch in the record.
+            await self._persist_record()
+        except BaseException:
+            async with self._state_lock:
+                if pending in self._record_pending:
+                    self._record_pending.remove(pending)
+            raise
+        status, payload = await self._submit_run(pending)
         if status != 202:
+            await self._forget_pending(pending)
             logger.warning("Hermes API rejected background dispatch with HTTP %d", status)
             return self._dispatch_ack(
                 trusted,
@@ -413,6 +589,16 @@ class HermesApiTaskSession:
         if usable_run_id:
             assert isinstance(api_run_id, str)
             claimed = await self._claim_unpublished(api_run_id)
+            if not claimed:
+                # Hermes named a run this session already accounts for.
+                await self._forget_pending(pending)
+            elif _RUN_ID_EXACT.fullmatch(api_run_id) is not None:
+                try:
+                    await self._promote_pending(pending, api_run_id)
+                except BaseException:
+                    # An unrecorded run could outlive a crash unfound, so it stops at once.
+                    await self._settle_unpublished(api_run_id)
+                    raise
         response_keys = set(payload) if type(payload) is dict else set()
         replayed = payload.get("replayed")
         if self._resend_window is not None:
@@ -486,22 +672,23 @@ class HermesApiTaskSession:
             run_id=protocol_run_id,
         )
 
-    async def _submit_run(self, body: dict[str, object]) -> tuple[int, dict[str, Any]]:
+    async def _submit_run(self, pending: PendingRun) -> tuple[int, dict[str, Any]]:
         """POST one run, resending it once unchanged if the first attempt got no complete response.
 
-        Both attempts carry one idempotency key, so Hermes admits the run at most once while it
-        retains the key; a resend older than that retention is never sent. The resend is the
+        Both attempts carry the dispatch's recorded idempotency key, so Hermes admits the run at
+        most once while it retains the key; a resend older than that retention, counted from
+        the key's mint time, is never sent. The resend is the
         only way to learn a run the lost attempt may have started, so it happens
         even for an abandoned dispatch, and publication then stops what it recovers. After a
         lost attempt only an admission settles the dispatch: a refused resend proves nothing
         about the first attempt, so its outcome is unknown rather than rejected.
         """
+        body = pending.body
         window = self._resend_window
-        if window is None:
+        if window is None or pending.key is None:
             return await self._request_json("POST", "/v1/runs", body=body)
-        headers = {"Idempotency-Key": secrets.token_hex(16)}
-        # Wall-clock time also counts a suspended host, which the retention window does.
-        minted_at = time.time()
+        headers = {"Idempotency-Key": pending.key}
+        minted_at = pending.minted_at
         with contextlib.suppress(_NoResponse):
             return await self._request_json("POST", "/v1/runs", body=body, headers=headers)
         cause: str | None = "error"
@@ -544,6 +731,60 @@ class HermesApiTaskSession:
         await self._stop_and_wait(api_run_id)
         async with self._state_lock:
             self._unpublished_api_run_ids.discard(api_run_id)
+            recorded = self._discard_admitted_locked(api_run_id)
+        if recorded:
+            await self._persist_record_best_effort()
+
+    async def _forget_pending(self, pending: PendingRun) -> None:
+        async with self._state_lock:
+            recorded = pending in self._record_pending
+            if recorded:
+                self._record_pending.remove(pending)
+        if recorded:
+            await self._persist_record_best_effort()
+
+    async def _promote_pending(self, pending: PendingRun, api_run_id: str) -> None:
+        if self._run_record_path is None:
+            return
+        async with self._state_lock:
+            if pending in self._record_pending:
+                self._record_pending.remove(pending)
+            if api_run_id not in self._record_admitted:
+                self._record_admitted.append(api_run_id)
+        await self._persist_record()
+
+    def _discard_admitted_locked(self, api_run_id: str) -> bool:
+        if api_run_id not in self._record_admitted:
+            return False
+        self._record_admitted.remove(api_run_id)
+        return True
+
+    async def _persist_record(self) -> None:
+        path = self._run_record_path
+        if path is None:
+            return
+        operation = asyncio.create_task(
+            self._persist_record_owned(path),
+            name="hermes-api-run-record",
+        )
+        # A cancelled caller must not let a later snapshot be overtaken by this one.
+        await asyncio.shield(operation)
+
+    async def _persist_record_owned(self, path: Path) -> None:
+        async with self._record_lock:
+            async with self._state_lock:
+                data = run_record.run_record_bytes(
+                    list(self._record_pending), list(self._record_admitted)
+                )
+            await asyncio.to_thread(run_record.write_run_record, path, data)
+
+    async def _persist_record_best_effort(self) -> None:
+        try:
+            await self._persist_record()
+        except Exception:
+            # Only a removal is lost, so the record over-approximates: a restart settles the
+            # stale entry again, stopping anything its replay reveals.
+            logger.warning("Hermes run record update failed; a restart re-settles its entries")
 
     async def _claim_unpublished(self, api_run_id: str) -> bool:
         operation = asyncio.create_task(
@@ -744,6 +985,11 @@ class HermesApiTaskSession:
             self._inflight_dispatches.clear()
             self._unpublished_api_run_ids.clear()
             self._pending_approvals.clear()
+        # Wait for every earlier record write; dispatches whose outcome is unknown stay
+        # recorded, so the next start can still find and stop what they started.
+        await self._persist_record_best_effort()
+        # Only after the final write may another host take the record.
+        self._release_run_record()
         await self._close_client()
 
     async def _consume_events(self, authority: _RunAuthority) -> None:
@@ -924,6 +1170,7 @@ class HermesApiTaskSession:
             if self._updates.full():
                 raise RuntimeError("Hermes API terminal update capacity exhausted")
             authority.terminal = True
+            recorded = self._discard_admitted_locked(authority.api_run_id)
             if self._runs_by_task.get(authority.task_id) is authority:
                 del self._runs_by_task[authority.task_id]
             if self._runs_by_api.get(authority.api_run_id) is authority:
@@ -937,6 +1184,8 @@ class HermesApiTaskSession:
             self._updates.put_nowait(update)
         for pending in removed:
             self._publish_approval_closed(pending, state="withdrawn")
+        if recorded:
+            await self._persist_record_best_effort()
 
     def _publish_approval_closed(self, pending: _PendingApproval, *, state: str) -> None:
         observer = self._approval_observer
@@ -1000,7 +1249,7 @@ class HermesApiTaskSession:
     @staticmethod
     def _strict_json(raw: bytes) -> object:
         try:
-            return json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_object)
+            return json.loads(raw.decode("utf-8"), object_pairs_hook=run_record.strict_object)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise RuntimeError("Hermes API returned malformed JSON") from error
 
@@ -1045,6 +1294,8 @@ class HermesApiTaskSession:
                 if terminal is None:
                     raise RuntimeError("Hermes API stop response is not authoritative")
                 return terminal
+        elif _is_run_not_found(status, payload):
+            raise _RunNotFound("Hermes API stop request failed")
         elif status != 409:
             raise RuntimeError("Hermes API stop request failed")
         try:
@@ -1061,6 +1312,8 @@ class HermesApiTaskSession:
 
     async def _poll_run_once(self, api_run_id: str) -> dict[str, Any] | None:
         status, payload = await self._request_json("GET", f"/v1/runs/{quote(api_run_id, safe='')}")
+        if _is_run_not_found(status, payload):
+            raise _RunNotFound("Hermes API run status is not authoritative")
         if status != 200 or payload.get("run_id") != api_run_id:
             raise RuntimeError("Hermes API run status is not authoritative")
         return self._terminal_from_status(api_run_id, payload)
@@ -1180,12 +1433,3 @@ class HermesApiTaskSession:
         if "deleg_" in text or _RUN_ID_DISCLOSURE.search(text) is not None:
             raise RuntimeError(f"Hermes API terminal {field_name} contains private authority")
         return text
-
-
-def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON field")
-        result[key] = value
-    return result

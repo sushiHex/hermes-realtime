@@ -113,29 +113,55 @@ can make it atomic.
 
 ### 3. Realtime keeps one binding record
 
-The binding record holds `{profile, voice session ID, task ID → run ID}`; a run's ID also names
-its session. It is bounded, and it is the only persisted realtime state. #77 item 4 admits
-exactly this kind of session reference and bounded transient context.
+Crash recovery stops what a crashed process may have left running; tasks are not resumed. A
+crash must end like an orderly shutdown, which already stops every active run. Hermes cannot
+list runs, so without a record a restarted host could not find them.
 
-- **Before dispatch.** A task is recorded before its request is sent, together with that exact
-  request, its idempotency key, and when it was minted. Hermes's acknowledgment promotes the
-  entry to its run ID and drops the request. The request is the only transcript-bearing content
-  the record ever holds, and only until it is acknowledged.
-- **Restart, pending entry.** Realtime replays the stored request verbatim under its stored
-  idempotency key. Hermes returns the original run if it accepted the request, or starts the
-  work if the request never arrived. A replay must carry the same parsed body, because Hermes
-  fingerprints the parsed JSON; a different body is refused as a conflict
+The binding record holds only the runs this process may have running on Hermes, as two kinds of
+entry:
+
+- **Pending:** a dispatch sent but not yet admitted, with its idempotency key, when that key was
+  minted, and the exact request. The request is the only transcript-bearing content the record
+  ever holds, and only until admission. Without durable run idempotency no key is sent, so none
+  is recorded.
+- **Admitted:** the run's Hermes ID, which also names its session. Never the private protocol
+  ID, never the objective.
+
+The record is versioned, bounded by the active-run capacity, and the only persisted realtime
+state. It is owned by one host at a time: a host holds an exclusive lock on it from before it
+settles the record until after its final write, and a second host fails to start rather than
+stop runs it does not own. #77 item 4 admits exactly this kind of bounded transient reference. The profile and the
+voice session join it in step 4.
+
+- **Write-ahead.** A dispatch is recorded before its first request is sent. The entry becomes
+  the run ID as soon as the run is claimed. It is removed when the run is authoritatively
+  terminal, when a stop of it completes, or when Hermes truthfully rejects the dispatch. A
+  dispatch whose outcome is unknown stays recorded, and holds a capacity slot, until a restart
+  settles it. Every write replaces the record atomically: a temporary file in the same
+  directory, flushed and synced, then renamed over the record.
+- **Restart, admitted entry.** Realtime stops the run and waits for its terminal status. A run
+  Hermes answers `404 run_not_found` for has nothing left running
+  ([status](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L1052-L1068),
+  [stop](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L1371-L1387)).
+- **Restart, pending entry.** An entry with a key younger than the advertised retention is
+  replayed once, verbatim, under its stored key, by the rules of the in-process resend: only an
+  admission naming an exact run counts. Hermes returns the original run if it accepted the
+  request, or starts the work if the request never arrived; either way realtime then stops it. A
+  replay must carry the same parsed body, because Hermes fingerprints the parsed JSON; a
+  different body is refused as a conflict
   ([replay](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L562-L594)).
-  An entry older than the advertised retention is never replayed, because Hermes may have pruned
-  its record and would start the work again
+  An entry without a key, older than the retention, or whose replay is refused or unanswered is
+  never resent, because Hermes may have pruned its record and would start the work again
   ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
   Its outcome is reported as unknown.
-- **Restart, promoted entry.** Realtime reconciles it with `GET /v1/runs/{id}`. A run Hermes no
-  longer knows is reported as lost, never as running.
+- **Reported once.** The restart then writes the record empty, emits one content-free marker
+  with the counts, and tells the operator once how many runs were stopped or had already ended
+  and how many outcomes are unknown. If any settlement fails, start fails closed and the record
+  keeps exactly the unsettled entries.
 
-With the record in place, no accepted run can go untracked and no retry can start work twice.
-Before it, the in-process resend recovers one lost acknowledgment; a dispatch whose resend also
-gets no response ends with its outcome unknown.
+With the record in place, a recorded run cannot outlive the next successful start, and no
+replay can start work twice. Before it, the in-process resend recovers one lost acknowledgment;
+a dispatch whose resend also gets no response ends with its outcome unknown.
 
 ### Live context follows the same rule
 
@@ -185,13 +211,16 @@ A backend outage never silences the voice.
 - **Learning on v0.21.0 is partial.** Skills learning reaches voice through delegated runs.
   Memory learning waits for the route, because the counter would fire only if a supplied tail
   happened to land on the cadence, and the tail is not sized to game it.
-- **What the MVP resumes.** On v0.21.0, #159's MVP resumes tasks across a restart but not
-  voice history. That limit is stated in #159, not hidden.
+- **What the MVP resumes.** Not tasks: a restart stops the background runs a crashed process
+  left running and says so. On v0.21.0 it does not resume voice history either. These limits
+  belong in #159's statement of the MVP, not hidden.
 - **Memory egress.** Before a voice tail reaches a run, the profile must use built-in memory
   only, because a run's memory sync passes its messages to any configured external provider
   ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
 - **Forgetting.** "Forget this conversation" deletes every run session in the binding record,
   which hold objectives rather than voice text, and the voice session's whole compression chain.
+  The record keeps a run only while it may be running, so how forget names the sessions of
+  finished runs is open until step 4.
   Hermes deletes only the named session and leaves compression successors in place. So forget
   resolves the latest continuation and walks `parent_session_id` back to the bound session,
   deleting each link. If the walk cannot reach the bound session, forget reports itself
@@ -228,9 +257,12 @@ A backend outage never silences the voice.
    Settle Hermes's `interrupted` status, which a replay after a Hermes restart reports.
 2. **Heard-first live context.** Correct the Codex prompt to match, then add the bounded voice
    tail to runs.
-3. **Binding record.** Add restart reconciliation.
+3. **Binding record.** Crash recovery stops what a crashed process may have left running; tasks
+   are not resumed. The record holds pending entries (key, mint time, request) and admitted run
+   IDs only.
 4. **Upstream route.** Propose it. After it lands and a pinned target carries it, append voice
-   messages and resume from the voice session.
+   messages and resume from the voice session. The profile and the voice session join the
+   binding record.
 
 ## Required qualification before acceptance
 
@@ -238,7 +270,8 @@ Each step must prove its guarantees against a qualified exact target:
 
 - a retried or replayed run never starts twice;
 - a crash between dispatch and acknowledgment leaves a pending entry that restart resolves;
-- a restarted host reports every bound task truthfully;
+- a restarted host stops every recorded run, and reports what it stopped and what stayed
+  unknown;
 - live context and the record contain only transport-confirmed text and markers;
 - appends are idempotent, ordered, and never block the voice;
 - the record never holds a reply without its question;
