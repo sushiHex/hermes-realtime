@@ -2849,10 +2849,20 @@ def _resolve_hermes_run_record_path(
 ) -> Path:
     if configured is not None:
         return Path(configured)
+    tail = ("HermesRealtime", "state", "hermes-runs-v1.json")
     local_app_data = environment.get("LOCALAPPDATA")
-    if not local_app_data:
-        raise ValueError("LOCALAPPDATA is required for the default Hermes run record")
-    return Path(local_app_data) / "HermesRealtime" / "state" / "hermes-runs-v1.json"
+    if local_app_data:
+        return Path(local_app_data).joinpath(*tail)
+    # XDG requires an absolute XDG_STATE_HOME and says a relative one must be ignored.
+    state_home = environment.get("XDG_STATE_HOME")
+    if state_home and state_home.startswith("/"):
+        return Path(state_home).joinpath(*tail)
+    home = environment.get("HOME")
+    if home:
+        return Path(home, ".local", "state").joinpath(*tail)
+    raise ValueError(
+        "no state directory for the default Hermes run record; pass --hermes-run-record"
+    )
 
 
 def _operator_evidence_capture_enabled(
@@ -2922,7 +2932,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hermes-run-record",
         help="JSON file recording Hermes runs a crashed host may have left running "
-        "(default: %%LOCALAPPDATA%%\\HermesRealtime\\state\\hermes-runs-v1.json)",
+        "(default: HermesRealtime/state/hermes-runs-v1.json under %%LOCALAPPDATA%%, "
+        "else $XDG_STATE_HOME, else ~/.local/state)",
     )
     parser.add_argument(
         "--remote",

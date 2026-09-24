@@ -523,17 +523,54 @@ def test_evidence_database_path_uses_only_custom_or_localappdata_root() -> None:
             _resolve_evidence_database_path(None, environment)
 
 
-def test_hermes_run_record_path_uses_only_custom_or_localappdata_root() -> None:
+_RECORD_TAIL = ("HermesRealtime", "state", "hermes-runs-v1.json")
+
+
+@pytest.mark.parametrize(
+    ("environment", "root"),
+    [
+        pytest.param(
+            {
+                "LOCALAPPDATA": r"C:\Users\owner\AppData\Local",
+                "XDG_STATE_HOME": "/home/owner/.xdg-state",
+                "HOME": "/home/owner",
+            },
+            r"C:\Users\owner\AppData\Local",
+            id="windows-localappdata",
+        ),
+        pytest.param(
+            {"XDG_STATE_HOME": "/home/owner/.xdg-state", "HOME": "/home/owner"},
+            "/home/owner/.xdg-state",
+            id="xdg-state-home",
+        ),
+        pytest.param(
+            {"LOCALAPPDATA": "", "XDG_STATE_HOME": "", "HOME": "/home/owner"},
+            "/home/owner/.local/state",
+            id="home-when-others-empty",
+        ),
+        # The XDG specification says a relative XDG_STATE_HOME is invalid and must be ignored.
+        pytest.param(
+            {"XDG_STATE_HOME": "relative/state", "HOME": "/home/owner"},
+            "/home/owner/.local/state",
+            id="relative-xdg-ignored",
+        ),
+    ],
+)
+def test_hermes_run_record_default_path_follows_the_platform_state_directory(
+    environment: dict[str, str], root: str
+) -> None:
+    assert _resolve_hermes_run_record_path(None, environment) == Path(root).joinpath(
+        *_RECORD_TAIL
+    )
+
+
+def test_hermes_run_record_path_prefers_the_explicit_flag_and_fails_without_a_home() -> None:
     assert _resolve_hermes_run_record_path(
         r"D:\private-state\hermes-runs-v1.json",
-        {},
-    ) == Path(r"D:\private-state\hermes-runs-v1.json")
-    assert _resolve_hermes_run_record_path(
-        None,
         {"LOCALAPPDATA": r"C:\Users\owner\AppData\Local"},
-    ) == Path(r"C:\Users\owner\AppData\Local\HermesRealtime\state\hermes-runs-v1.json")
-    for environment in ({}, {"LOCALAPPDATA": ""}):
-        with pytest.raises(ValueError, match="LOCALAPPDATA"):
+    ) == Path(r"D:\private-state\hermes-runs-v1.json")
+    for environment in ({}, {"LOCALAPPDATA": "", "XDG_STATE_HOME": "", "HOME": ""}):
+        with pytest.raises(ValueError, match="--hermes-run-record"):
             _resolve_hermes_run_record_path(None, environment)
 
 

@@ -3074,7 +3074,9 @@ def _record_text(**fields: object) -> str:
         pytest.param(_record_text() + " " * api_module._MAX_RUN_RECORD_BYTES, id="over-size"),
     ],
 )
-async def test_a_malformed_run_record_fails_start(text: str, tmp_path: Path) -> None:
+async def test_a_malformed_run_record_fails_start(
+    text: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     record = tmp_path / "hermes-runs-v1.json"
     record.write_text(text, encoding="utf-8")
     original = record.read_bytes()
@@ -3088,6 +3090,8 @@ async def test_a_malformed_run_record_fails_start(text: str, tmp_path: Path) -> 
         assert hermes.attempts == []
         assert hermes.stop_calls == 0
         assert record.read_bytes() == original
+        # The refusal leaves one bounded, content-free piece of evidence.
+        assert _restart_markers(capsys) == [{"refusal": "malformed", "version": 1}]
     finally:
         await session.close()
         await runner.cleanup()

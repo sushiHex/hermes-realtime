@@ -408,55 +408,66 @@ class HermesApiTaskSession:
         window: float | None,
     ) -> HermesRestartSettlement:
         """Stop every run a previous process may have left running; tasks are not resumed."""
-        raw = await asyncio.to_thread(run_record.read_run_record, path, _MAX_RUN_RECORD_BYTES)
-        parsed = (
-            ([], [])
-            if raw is None
-            else run_record.parse_run_record(
-                raw,
-                max_entries=_MAX_ACTIVE_RUNS,
-                max_request_bytes=_MAX_HTTP_BODY_BYTES,
-                run_id=_RUN_ID_EXACT,
+        # Counts after a settlement, or a bounded refusal category; never record content.
+        evidence: dict[str, str | int] | None = None
+        try:
+            raw = await asyncio.to_thread(run_record.read_run_record, path, _MAX_RUN_RECORD_BYTES)
+            parsed = (
+                ([], [])
+                if raw is None
+                else run_record.parse_run_record(
+                    raw,
+                    max_entries=_MAX_ACTIVE_RUNS,
+                    max_request_bytes=_MAX_HTTP_BODY_BYTES,
+                    run_id=_RUN_ID_EXACT,
+                )
             )
-        )
-        if parsed is None:
-            raise RuntimeError("Hermes API run record is malformed")
-        pending, admitted = parsed
-        if not pending and not admitted:
-            return HermesRestartSettlement(stopped=0, unknown=0)
-        outcomes = await asyncio.gather(
-            *(self._settle_recorded_run(api_run_id) for api_run_id in admitted),
-            *(self._settle_recorded_dispatch(entry, window) for entry in pending),
-            return_exceptions=True,
-        )
-        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-        # The record keeps exactly the entries still unsettled, so a later start retries them.
-        unresolved_admitted = [
-            api_run_id
-            for api_run_id, outcome in zip(admitted, outcomes[: len(admitted)], strict=True)
-            if isinstance(outcome, BaseException)
-        ]
-        unresolved_pending = [
-            entry
-            for entry, outcome in zip(pending, outcomes[len(admitted) :], strict=True)
-            if isinstance(outcome, BaseException)
-        ]
-        data = run_record.run_record_bytes(unresolved_pending, unresolved_admitted)
-        await asyncio.to_thread(run_record.write_run_record, path, data)
-        evidence = {
-            "stopped": outcomes.count("stopped"),
-            "unknown": outcomes.count("unknown"),
-            "unresolved": len(failures),
-            "version": 1,
-        }
-        print(
-            _RESTART_SETTLEMENT_PREFIX
-            + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
-            flush=True,
-        )
-        if failures:
-            raise BaseExceptionGroup("Hermes API restart settlement left runs unresolved", failures)
-        return HermesRestartSettlement(stopped=evidence["stopped"], unknown=evidence["unknown"])
+            if parsed is None:
+                # Oversized, unknown-version, and malformed records are all refused unread.
+                evidence = {"refusal": "malformed", "version": 1}
+                raise RuntimeError("Hermes API run record is malformed")
+            pending, admitted = parsed
+            if not pending and not admitted:
+                return HermesRestartSettlement(stopped=0, unknown=0)
+            outcomes = await asyncio.gather(
+                *(self._settle_recorded_run(api_run_id) for api_run_id in admitted),
+                *(self._settle_recorded_dispatch(entry, window) for entry in pending),
+                return_exceptions=True,
+            )
+            failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+            # The record keeps exactly the entries still unsettled, so a later start retries them.
+            unresolved_admitted = [
+                api_run_id
+                for api_run_id, outcome in zip(admitted, outcomes[: len(admitted)], strict=True)
+                if isinstance(outcome, BaseException)
+            ]
+            unresolved_pending = [
+                entry
+                for entry, outcome in zip(pending, outcomes[len(admitted) :], strict=True)
+                if isinstance(outcome, BaseException)
+            ]
+            data = run_record.run_record_bytes(unresolved_pending, unresolved_admitted)
+            await asyncio.to_thread(run_record.write_run_record, path, data)
+            stopped = outcomes.count("stopped")
+            unknown = outcomes.count("unknown")
+            evidence = {
+                "stopped": stopped,
+                "unknown": unknown,
+                "unresolved": len(failures),
+                "version": 1,
+            }
+            if failures:
+                raise BaseExceptionGroup(
+                    "Hermes API restart settlement left runs unresolved", failures
+                )
+            return HermesRestartSettlement(stopped=stopped, unknown=unknown)
+        finally:
+            if evidence is not None:
+                print(
+                    _RESTART_SETTLEMENT_PREFIX
+                    + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                    flush=True,
+                )
 
     async def _settle_recorded_run(self, api_run_id: str) -> str:
         # A run Hermes no longer knows has nothing left running.
