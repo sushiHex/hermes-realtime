@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol, overload
 
 from hermes_realtime.evidence import (
@@ -16,7 +16,7 @@ from hermes_realtime.evidence import (
 )
 from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
 
-from .context import ActiveTaskIdentityError
+from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 from .work_tools import WorkCancelResult, WorkStartResult
 
@@ -61,7 +61,13 @@ class _WorkControlSurface(Protocol):
 
 
 class ConversationTaskCommandRouter:
-    """Consume only explicit task commands before foreground inference."""
+    """Consume only explicit task commands before foreground inference.
+
+    A command starts no turn, so ``record_user_input`` records its exact text as
+    the user row before the command acts; every other final input becomes a
+    user row through the turn it starts. A command the context cannot hold is
+    invalid.
+    """
 
     def __init__(
         self,
@@ -73,7 +79,10 @@ class ConversationTaskCommandRouter:
         surface: _WorkControlSurface | None = None,
         lifecycle_owner: EvidenceConversationAuthorityV1 | None = None,
         on_command_accepted: _CommandAcceptedHook | None = None,
+        record_user_input: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        if record_user_input is not None and not callable(record_user_input):
+            raise TypeError("record_user_input must be callable or None")
         if surface is None and not callable(getattr(controller, "dispatch", None)):
             raise TypeError("controller must provide dispatch()")
         if surface is None and not callable(getattr(controller, "request_cancel", None)):
@@ -103,6 +112,19 @@ class ConversationTaskCommandRouter:
         self._surface = surface
         self._lifecycle_owner = lifecycle_owner
         self._on_command_accepted = on_command_accepted
+        self._record_user_input = record_user_input
+
+    async def _recorded(self, text: str) -> bool:
+        """Record one command's user row; False when the context refuses the text."""
+
+        record = self._record_user_input
+        if record is None:
+            return True
+        try:
+            await record(text)
+        except (ValueError, PrivateRunDisclosureError):
+            return False
+        return True
 
     @overload
     async def route(self, text: str) -> bool: ...
@@ -128,6 +150,9 @@ class ConversationTaskCommandRouter:
             raise TypeError("command text must be an exact built-in string")
         stripped = text.strip()
         folded = stripped.casefold()
+        if folded.startswith(("task:", "cancel task:")) and not await self._recorded(text):
+            self._publish_invalid()
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
         if folded.startswith("task:"):
             objective = stripped[len("task:") :].strip()
             if not self._valid_objective(objective):

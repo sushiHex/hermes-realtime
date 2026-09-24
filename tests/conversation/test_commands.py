@@ -510,3 +510,154 @@ async def test_post_ack_projection_failure_rolls_back_new_task() -> None:
     assert controller.cancellations == [
         ("task_release_check", "task state projection failed")
     ]
+
+
+class _OrderedControllerProbe(TaskControllerProbe):
+    order: list[str]
+
+    async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome:
+        self.order.append("dispatch")
+        return await super().dispatch(objective=objective, utterance_id=utterance_id)
+
+    async def request_cancel(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+    ) -> TaskCancelOutcome:
+        self.order.append("cancel")
+        return await super().request_cancel(task_id, reason=reason)
+
+
+def _ordered_probe(order: list[str]) -> _OrderedControllerProbe:
+    probe = _OrderedControllerProbe(
+        dispatch_outcome=TaskDispatchOutcome(task_id="task_release_check", accepted=True),
+        cancel_outcome=TaskCancelOutcome(task_id="task_release_check", accepted=True),
+    )
+    probe.order = order
+    return probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "action"),
+    [
+        pytest.param("task: Inspect the release evidence", "dispatch", id="task"),
+        pytest.param("cancel task: task_release_check", "cancel", id="cancel"),
+        pytest.param("task:", None, id="invalid-task"),
+        pytest.param("cancel task: release_check", None, id="invalid-cancel"),
+    ],
+)
+async def test_every_command_becomes_one_user_row_before_the_router_acts(
+    text: str,
+    action: str | None,
+) -> None:
+    order: list[str] = []
+
+    async def record_user_input(recorded: str) -> None:
+        order.append(f"record:{recorded}")
+
+    router = ConversationTaskCommandRouter(
+        controller=_ordered_probe(order),
+        observer=lambda _kind, _data: None,
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "command_1",
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route("Please inspect the release evidence") is False
+    assert order == []
+    assert await router.route(text) is True
+
+    assert order == [f"record:{text}", *([action] if action is not None else [])]
+
+
+@pytest.mark.asyncio
+async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> None:
+    order: list[str] = []
+
+    class SurfaceProbe:
+        max_objective_chars = 1024
+
+        async def start_work(self, *, objective: str, invocation_id: str) -> object:
+            del objective, invocation_id
+            order.append("start")
+            from hermes_realtime.conversation.work_tools import WorkStartResult
+
+            return WorkStartResult(accepted=False, state="rejected", reason="probe")
+
+        async def cancel_work(self, **_kwargs: object) -> object:
+            order.append("cancel")
+            from hermes_realtime.conversation.work_tools import WorkCancelResult
+
+            return WorkCancelResult(accepted=False, state="rejected", reason="probe")
+
+    async def record_user_input(recorded: str) -> None:
+        order.append(f"record:{recorded}")
+
+    router = ConversationTaskCommandRouter(
+        surface=SurfaceProbe(),  # type: ignore[arg-type]
+        observer=lambda _kind, _data: None,
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "command_1",
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route("task: Inspect it") is True
+    assert await router.route("cancel task: task_release_check") is True
+
+    assert order == [
+        "record:task: Inspect it",
+        "start",
+        "record:cancel task: task_release_check",
+        "cancel",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("task: " + "x" * 12, id="over-the-context-item-bound"),
+        pytest.param("cancel task: task_deleg_private", id="private-run-token"),
+    ],
+)
+async def test_a_command_the_context_cannot_hold_is_invalid_before_transport(text: str) -> None:
+    from hermes_realtime.speech import Transcript
+
+    context = ConversationContextStore(max_item_chars=16)
+    controller = _probe()
+    events: list[tuple[str, dict[str, str | int | bool | None]]] = []
+
+    async def record_user_input(recorded: str) -> None:
+        context.record_user_transcript(Transcript(text=recorded, final=True))
+
+    router = ConversationTaskCommandRouter(
+        controller=controller,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "unused",
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route(text) is True
+
+    assert controller.dispatches == []
+    assert controller.cancellations == []
+    assert context.snapshot().messages == ()
+    assert events == [
+        (
+            "task_state",
+            {"reason": "invalid explicit task command", "status": "rejected", "taskId": None},
+        )
+    ]
+
+
+def test_the_user_input_recorder_must_be_callable() -> None:
+    with pytest.raises(TypeError, match="record_user_input"):
+        ConversationTaskCommandRouter(
+            controller=_probe(),
+            observer=lambda _kind, _data: None,
+            reserve_observer_capacity=lambda: None,
+            record_user_input="not callable",  # type: ignore[arg-type]
+        )
