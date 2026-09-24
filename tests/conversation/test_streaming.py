@@ -4399,8 +4399,41 @@ async def test_recording_user_input_settles_live_speech_before_its_row() -> None
     await loop.record_user_input(Transcript(text="task: check the build", final=True))
 
     with pytest.raises(asyncio.CancelledError):
-        await response
+        await asyncio.wait_for(response, timeout=2)
     assert loop.foreground_active is False
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+        ("user", "task: check the build", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recording_user_input_waits_for_a_revoked_turns_cleanup() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    # Another owner revoked the turn; its interruption marker has not landed yet.
+    cancelling = asyncio.create_task(loop.cancel())
+    await asyncio.sleep(0)
+    assert loop.foreground_active is False
+
+    await loop.record_user_input(Transcript(text="task: check the build", final=True))
+
+    await asyncio.wait_for(cancelling, timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(response, timeout=2)
     assert _context_rows(context) == [
         ("user", "Question?", False),
         ("assistant", "First part.", True),

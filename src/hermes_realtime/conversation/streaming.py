@@ -507,10 +507,6 @@ class StreamingSpeechLoop:
     async def announce(self, turn_id: str, text: str) -> bool:
         """Speak one fixed announcement when the floor is idle, as heard context."""
 
-        if type(turn_id) is not str:
-            raise TypeError("turn_id must be an exact built-in string")
-        if not turn_id.strip():
-            raise ValueError("turn_id must not be blank")
         return await self._run_turn(
             turn_id,
             transcript=None,

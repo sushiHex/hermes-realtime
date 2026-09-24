@@ -419,13 +419,17 @@ async def test_close_waits_for_an_in_flight_write_so_the_newest_lands_last(
     written: list[bytes] = []
     first_started = threading.Event()
     release_first = threading.Event()
+    first_finished = threading.Event()
 
     def write(path: Path, data: bytes) -> None:
-        if not first_started.is_set():
+        first = not first_started.is_set()
+        if first:
             first_started.set()
             release_first.wait(timeout=5)
         written.append(data)
         run_record_module.write_run_record(path, data)
+        if first:
+            first_finished.set()
 
     monkeypatch.setattr(voice_tail_module, "write_run_record", write)
     path = tmp_path / "voice-tail-v1.json"
@@ -439,6 +443,8 @@ async def test_close_waits_for_an_in_flight_write_so_the_newest_lands_last(
     await asyncio.sleep(0.05)
     release_first.set()
     await asyncio.wait_for(closing, timeout=2)
+    # Every write has landed before the assertions, whichever order they took.
+    assert await asyncio.to_thread(first_finished.wait, 2)
 
     assert written[-1] == voice_tail_bytes(_rows(("user", "newest", False)))
     assert path.read_bytes() == voice_tail_bytes(_rows(("user", "newest", False)))
