@@ -35,6 +35,8 @@ from hermes_realtime.host_launcher import (
     _reserve_host_evidence_revoke,
     _resolve_evidence_database_path,
     _resolve_hermes_run_record_path,
+    _resolve_voice_tail_path,
+    _restart_announcement,
     _run_full_host_preflight,
     _run_host_cli,
     _SerializedSpeechPlayback,
@@ -502,6 +504,7 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
 
     assert captured["hermes_api_bearer"] is None
     assert captured["hermes_run_record"] is None
+    assert captured["voice_tail"] is None
     assert "qualification_no_hermes_tasks" not in captured
     assert captured["private_no_tasks"] is True
     assert captured["closed"] is True
@@ -561,6 +564,49 @@ def test_hermes_run_record_default_path_follows_the_platform_state_directory(
 ) -> None:
     assert _resolve_hermes_run_record_path(None, environment) == Path(root).joinpath(
         *_RECORD_TAIL
+    )
+    # The voice tail lives beside the run record, resolved by the same rules.
+    assert _resolve_voice_tail_path(None, environment) == Path(root).joinpath(
+        "HermesRealtime", "state", "voice-tail-v1.json"
+    )
+
+
+def test_voice_tail_path_prefers_the_explicit_flag_and_fails_without_a_home() -> None:
+    assert _resolve_voice_tail_path(
+        r"D:\private-state\voice-tail-v1.json",
+        {"LOCALAPPDATA": r"C:\Users\owner\AppData\Local"},
+    ) == Path(r"D:\private-state\voice-tail-v1.json")
+    for environment in ({}, {"LOCALAPPDATA": "", "XDG_STATE_HOME": "", "HOME": ""}):
+        with pytest.raises(ValueError, match="--voice-tail"):
+            _resolve_voice_tail_path(None, environment)
+
+
+def test_host_cli_voice_tail_flag_defaults_to_the_resolved_path() -> None:
+    parser = _build_argument_parser()
+
+    assert parser.parse_args([]).voice_tail is None
+    assert (
+        parser.parse_args(["--voice-tail", r"D:\state\tail.json"]).voice_tail
+        == r"D:\state\tail.json"
+    )
+    assert "voice-tail-v1.json" in parser.format_help()
+
+
+def test_restart_announcement_is_a_constant_sentence_with_counts_only() -> None:
+    assert _restart_announcement(None) is None
+    assert _restart_announcement(HermesRestartSettlement(stopped=0, unknown=0)) is None
+    assert _restart_announcement(HermesRestartSettlement(stopped=2, unknown=1)) == (
+        "I restarted, so background work from before will not resume. "
+        "2 tasks were stopped or had already ended. "
+        "I could not confirm whether 1 task started."
+    )
+    assert _restart_announcement(HermesRestartSettlement(stopped=1, unknown=0)) == (
+        "I restarted, so background work from before will not resume. "
+        "1 task was stopped or had already ended."
+    )
+    assert _restart_announcement(HermesRestartSettlement(stopped=0, unknown=3)) == (
+        "I restarted, so background work from before will not resume. "
+        "I could not confirm whether 3 tasks started."
     )
 
 

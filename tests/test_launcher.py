@@ -55,7 +55,7 @@ from hermes_realtime.providers.codex_app_server import HermesRepresentativeConte
 from hermes_realtime.providers.current_facts import (
     DdgsCurrentFactLookup,
 )
-from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
+from hermes_realtime.speech import AudioFrame, SpeechChunk, Transcript, WordTiming
 
 
 @pytest.fixture(autouse=True)
@@ -979,6 +979,9 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
     assert captured["hermes_run_record"] == Path(
         r"C:\Users\owner\AppData\Local\HermesRealtime\state\hermes-runs-v1.json"
     )
+    assert captured["voice_tail"] == Path(
+        r"C:\Users\owner\AppData\Local\HermesRealtime\state\voice-tail-v1.json"
+    )
 
 
 def test_host_parser_accepts_bounded_repeatable_kokoro_pronunciations() -> None:
@@ -1825,6 +1828,341 @@ def test_qualification_no_task_composition_rejects_a_hermes_run_record() -> None
             hermes_api_bearer=None,
             hermes_run_record=Path("hermes-runs-v1.json"),
         )
+
+
+@pytest.mark.parametrize("tail", ["voice-tail-v1.json", b"voice-tail-v1.json"])
+def test_full_host_rejects_a_voice_tail_that_is_not_a_path(tail: object) -> None:
+    with pytest.raises(TypeError, match="voice_tail"):
+        build_local_host_launcher(
+            hermes_api_bearer="host-test-bearer-value-32-characters",
+            allow_unsandboxed_tasks=True,
+            voice_tail=tail,  # type: ignore[arg-type]
+        )
+
+
+def test_qualification_no_task_composition_rejects_a_voice_tail() -> None:
+    with (
+        host_launcher_module._qualification_no_task_composition(),
+        pytest.raises(ValueError, match="voice tail"),
+    ):
+        build_local_host_launcher(
+            hermes_api_bearer=None,
+            voice_tail=Path("voice-tail-v1.json"),
+        )
+
+
+class _FullHostHarness:
+    """Compose the real full host with only transport and providers replaced."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        settlement: object | None = None,
+    ) -> None:
+        from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+        self.events: list[str] = []
+        self.announced: list[tuple[str, str]] = []
+        self.recorded_inputs: list[object] = []
+        self.preflight_rows: list[tuple[str, str, bool]] | None = None
+        self.context: ConversationContextStore | None = None
+        self.browser: dict[str, Any] = {}
+        self.conversation: dict[str, Any] = {}
+        self.router: dict[str, Any] = {}
+        self.bindings: list[dict[str, Any]] = []
+        harness = self
+        events = self.events
+
+        class RecordingTail(VoiceTailWriter):
+            async def open(self, store: ConversationContextStore) -> None:
+                events.append("tail:open")
+                await super().open(store)
+
+            async def close(self) -> None:
+                events.append("tail:close")
+                await super().close()
+
+        action_constructor = host_launcher_module.ConversationUpdateExecutor
+        speech_constructor = host_launcher_module.StreamingSpeechLoop
+
+        # The composition checks exact types, so record on the real instances.
+        def recording_actions(**kwargs: Any) -> ConversationUpdateExecutor:
+            actions = action_constructor(**kwargs)
+            close_actions = actions.close
+
+            async def close() -> None:
+                await close_actions()
+                events.append("actions:closed")
+
+            actions.close = close  # type: ignore[method-assign]
+            return actions
+
+        def recording_speech(**kwargs: Any) -> StreamingSpeechLoop:
+            speech = speech_constructor(**kwargs)
+            record_input = speech.record_user_input
+
+            async def announce(turn_id: str, text: str) -> bool:
+                harness.announced.append((turn_id, text))
+                return True
+
+            async def record_user_input(transcript: Transcript) -> None:
+                harness.recorded_inputs.append(transcript)
+                await record_input(transcript)
+
+            speech.announce = announce  # type: ignore[method-assign]
+            speech.record_user_input = record_user_input  # type: ignore[method-assign]
+            return speech
+
+        class RuntimeStub:
+            async def start(self) -> str:
+                events.append("runtime:start")
+                return "http://127.0.0.1:8765/#bootstrap=private"
+
+            async def close_ingress(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        def capture_browser(**kwargs: Any) -> RuntimeStub:
+            harness.browser.update(kwargs)
+            return RuntimeStub()
+
+        class ConversationStub:
+            def __init__(self, **kwargs: Any) -> None:
+                harness.conversation.update(kwargs)
+
+            async def activate_media(self, **_kwargs: object) -> None:
+                return None
+
+        class LiveKitWorkerStub:
+            active_generation = 1
+
+            def __init__(self, **_kwargs: object) -> None:
+                return None
+
+        class BindingProbe:
+            def __init__(self, **kwargs: Any) -> None:
+                harness.bindings.append(kwargs)
+
+        async def fake_preflight(*, task_session: Any, surface: Any, **_kwargs: object) -> None:
+            events.append("preflight")
+            harness.context = surface._context
+            harness.preflight_rows = [
+                (message.role, message.text, message.interrupted)
+                for message in surface._context.snapshot().messages
+            ]
+            if settlement is not None:
+                task_session._restart_settlement = settlement
+
+        async def no_peer(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        original_router = host_launcher_module.ConversationTaskCommandRouter
+
+        def capture_router(**kwargs: Any) -> object:
+            harness.router.update(kwargs)
+            return original_router(**kwargs)
+
+        class TranscriberStub:
+            async def push(self, _frame: AudioFrame) -> tuple[()]:
+                return ()
+
+            async def finish_utterance(self) -> None:
+                return None
+
+            async def cancel(self) -> None:
+                return None
+
+        monkeypatch.setattr(host_launcher_module, "VoiceTailWriter", RecordingTail)
+        monkeypatch.setattr(host_launcher_module, "ConversationUpdateExecutor", recording_actions)
+        monkeypatch.setattr(host_launcher_module, "StreamingSpeechLoop", recording_speech)
+        monkeypatch.setattr(host_launcher_module, "BrowserClientRuntime", capture_browser)
+        monkeypatch.setattr(
+            host_launcher_module, "ReconnectSafeConversationWorker", ConversationStub
+        )
+        monkeypatch.setattr(host_launcher_module, "LiveKitConversationWorker", LiveKitWorkerStub)
+        monkeypatch.setattr(host_launcher_module, "ConversationSessionWorker", BindingProbe)
+        monkeypatch.setattr(host_launcher_module, "ConversationTaskCommandRouter", capture_router)
+        monkeypatch.setattr(host_launcher_module, "_run_full_host_preflight", fake_preflight)
+        monkeypatch.setattr(host_launcher_module.LiveKitRoomPeer, "connect", no_peer)
+        monkeypatch.setattr(host_launcher_module.LiveKitRoomPeer, "disconnect", no_peer)
+        monkeypatch.setattr(
+            host_launcher_module, "FasterWhisperTranscriber", lambda **_kwargs: TranscriberStub()
+        )
+        monkeypatch.setattr(
+            host_launcher_module,
+            "_build_synthesizer",
+            lambda **_kwargs: ProviderProbe([], "synthesizer"),
+        )
+        monkeypatch.setattr(
+            host_launcher_module,
+            "_build_voice_activity_detector",
+            lambda **_kwargs: type("VadProbe", (), {"required_pre_roll_frames": 1})(),
+        )
+
+    def build(self, **kwargs: Any) -> LocalBrowserLauncher:
+        return build_local_host_launcher(
+            hermes_api_bearer="host-test-bearer-value-32-characters",
+            inference_provider="ollama",
+            stt_provider="faster-whisper",
+            tts_provider="edge",
+            allow_unsandboxed_tasks=True,
+            **kwargs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_after_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.conversation import ConversationMessage
+    from hermes_realtime.integration.run_record import write_run_record
+    from hermes_realtime.integration.voice_tail import parse_voice_tail, voice_tail_bytes
+
+    tail = (
+        ConversationMessage("user", "Earlier question"),
+        ConversationMessage("assistant", "Earlier answer", interrupted=True),
+    )
+    path = tmp_path / "state" / "voice-tail-v1.json"
+    write_run_record(path, voice_tail_bytes(tail))
+    harness = _FullHostHarness(monkeypatch)
+    launcher = harness.build(voice_tail=path)
+
+    await launcher.start()
+    try:
+        assert harness.events == ["tail:open", "preflight", "runtime:start"]
+        assert harness.preflight_rows == [
+            ("user", "Earlier question", False),
+            ("assistant", "Earlier answer", True),
+        ]
+        assert harness.context is not None
+        harness.context.record_user_transcript(Transcript(text="Later question", final=True))
+    finally:
+        await launcher.close()
+
+    assert harness.events[3:] == ["actions:closed", "tail:close"]
+    assert parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=1024) == (
+        *tail,
+        ConversationMessage("user", "Later question"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_host_without_a_voice_tail_never_touches_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _FullHostHarness(monkeypatch)
+    launcher = harness.build()
+
+    await launcher.start()
+    await launcher.close()
+
+    assert "tail:open" not in harness.events
+    assert "tail:close" not in harness.events
+    assert harness.preflight_rows == []
+
+
+@pytest.mark.asyncio
+async def test_full_host_fails_start_closed_while_another_host_holds_the_voice_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+
+    path = tmp_path / "voice-tail-v1.json"
+    live_host = VoiceTailWriter(path)
+    await live_host.open(ConversationContextStore(on_change=live_host.update))
+    harness = _FullHostHarness(monkeypatch)
+    launcher = harness.build(voice_tail=path)
+    try:
+        with pytest.raises(RuntimeError, match="another host holds the voice tail"):
+            await launcher.start()
+        assert "preflight" not in harness.events
+    finally:
+        await launcher.close()
+        await live_host.close()
+
+
+@pytest.mark.asyncio
+async def test_full_host_restart_settlement_is_inactive_history_announced_once_voice_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.integration import HermesRestartSettlement
+
+    settlement = HermesRestartSettlement(stopped=2, unknown=1)
+    harness = _FullHostHarness(monkeypatch, settlement=settlement)
+    launcher = harness.build()
+
+    await launcher.start()
+    try:
+        assert harness.context is not None
+        snapshot = harness.context.snapshot()
+        assert snapshot.terminal_task_count == 3
+        assert snapshot.active_tasks == ()
+        assert harness.announced == []
+
+        await harness.browser["activate_media"]("browser_0123456789abcdef", 1, 1)
+        harness.conversation["binding_factory"](
+            "browser_0123456789abcdef", 1, harness.conversation["actions"]
+        )
+        voice_input_ready = harness.bindings[-1]["on_audio_ready"]
+        voice_input_ready()
+        voice_input_ready()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    finally:
+        await launcher.close()
+
+    assert harness.announced == [
+        ("restart_announcement", host_launcher_module._restart_announcement(settlement))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_full_host_without_a_restart_settlement_announces_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _FullHostHarness(monkeypatch)
+    launcher = harness.build()
+
+    await launcher.start()
+    try:
+        assert harness.context is not None
+        assert harness.context.snapshot().terminal_task_count == 0
+        await harness.browser["activate_media"]("browser_0123456789abcdef", 1, 1)
+        harness.conversation["binding_factory"](
+            "browser_0123456789abcdef", 1, harness.conversation["actions"]
+        )
+        harness.bindings[-1]["on_audio_ready"]()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    finally:
+        await launcher.close()
+
+    assert harness.announced == []
+
+
+@pytest.mark.asyncio
+async def test_full_host_records_explicit_commands_through_the_speech_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _FullHostHarness(monkeypatch)
+    launcher = harness.build()
+
+    await launcher.start()
+    try:
+        await harness.router["record_user_input"]("task: check the build")
+
+        assert harness.recorded_inputs == [Transcript(text="task: check the build", final=True)]
+        assert harness.context is not None
+        assert [
+            (message.role, message.text) for message in harness.context.snapshot().messages
+        ] == [("user", "task: check the build")]
+    finally:
+        await launcher.close()
 
 
 def test_full_host_loads_only_one_strong_api_key_from_explicit_env_file(

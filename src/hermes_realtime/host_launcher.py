@@ -99,6 +99,7 @@ from hermes_realtime.integration import (
     HermesApiTaskSession,
     HermesRestartSettlement,
 )
+from hermes_realtime.integration.voice_tail import VoiceTailWriter
 from hermes_realtime.launcher import (
     ConversationOnlyTaskSession,
     ConversationOnlyUpdatePolicy,
@@ -153,6 +154,7 @@ from hermes_realtime.speech import (
     DeliveredSpeechLedger,
     SpeechChunk,
     SpeechPlayback,
+    Transcript,
 )
 
 _PublicValue = str | int | bool | None
@@ -1290,6 +1292,23 @@ def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | 
     )
 
 
+def _tasks(count: int) -> str:
+    return f"{count} task" if count == 1 else f"{count} tasks"
+
+
+def _restart_announcement(settlement: HermesRestartSettlement | None) -> str | None:
+    """Tell the user once, in constant words with counts only, what a restart stopped."""
+    if settlement is None or settlement.stopped + settlement.unknown == 0:
+        return None
+    sentences = ["I restarted, so background work from before will not resume."]
+    if settlement.stopped:
+        verb = "was" if settlement.stopped == 1 else "were"
+        sentences.append(f"{_tasks(settlement.stopped)} {verb} stopped or had already ended.")
+    if settlement.unknown:
+        sentences.append(f"I could not confirm whether {_tasks(settlement.unknown)} started.")
+    return " ".join(sentences)
+
+
 async def _run_full_host_preflight(
     *,
     task_session: _TaskSessionStarter,
@@ -1791,8 +1810,12 @@ def build_local_host_launcher(
     evidence_retention_hours: int = 24,
     evidence_database: Path | None = None,
     hermes_run_record: Path | None = None,
+    voice_tail: Path | None = None,
 ) -> LocalBrowserLauncher:
-    """Compose the explicit full host without provider fallback."""
+    """Compose the explicit full host without provider fallback.
+
+    ``voice_tail`` names the durable heard-context file; None disables it.
+    """
 
     qualification_dependencies = _current_qualification_full_host_dependencies()
     qualification_no_hermes_tasks = (
@@ -1804,6 +1827,8 @@ def build_local_host_launcher(
         raise TypeError("allow_unsandboxed_tasks must be an exact boolean")
     if hermes_run_record is not None and not isinstance(hermes_run_record, Path):
         raise TypeError("hermes_run_record must be a pathlib Path or None")
+    if voice_tail is not None and not isinstance(voice_tail, Path):
+        raise TypeError("voice_tail must be a pathlib Path or None")
     if qualification_no_hermes_tasks:
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
@@ -1811,6 +1836,8 @@ def build_local_host_launcher(
             raise ValueError("qualification no-task composition rejects task flags")
         if hermes_run_record is not None:
             raise ValueError("qualification no-task composition rejects a Hermes run record")
+        if voice_tail is not None:
+            raise ValueError("qualification no-task composition rejects a voice tail")
     elif type(hermes_api_bearer) is not str:
         raise TypeError("hermes_api_bearer must be an exact string outside qualification mode")
     if type(evidence_capture) is not bool:
@@ -2005,7 +2032,12 @@ def build_local_host_launcher(
             return None
         return ownership[1]
 
-    context = ConversationContextStore()
+    # The store owns the heard conversation; the tail only mirrors its durable view.
+    voice_tail_writer = VoiceTailWriter(voice_tail) if voice_tail is not None else None
+    context = ConversationContextStore(
+        on_change=voice_tail_writer.update if voice_tail_writer is not None else None,
+    )
+    restart_announcement: str | None = None
     foreground = ForegroundTurnCoordinator(
         drain_timeout=10.0,
         output_capacity=DEFAULT_MAX_RESPONSE_SEGMENTS,
@@ -2041,6 +2073,9 @@ def build_local_host_launcher(
         reserve_observer_capacity=projection.ensure_capacity,
         utterance_id_factory=lambda: uuid.uuid4().hex,
     )
+    async def record_command_input(text: str) -> None:
+        await speech.record_user_input(Transcript(text=text, final=True))
+
     command_router = ConversationTaskCommandRouter(
         surface=work_surface,
         observer=observe,
@@ -2051,6 +2086,7 @@ def build_local_host_launcher(
             if evidence_runtime is not None
             else None
         ),
+        record_user_input=record_command_input,
     )
     search_egress_authority, current_fact_lookup, knowledge_coordinator = (
         _compose_public_search(
@@ -2202,6 +2238,19 @@ def build_local_host_launcher(
             name=f"readiness-cue:{generation}:{media_incarnation}",
         )
 
+    def schedule_restart_announcement() -> None:
+        # Spoken once, as ordinary heard speech, the first time voice input is ready.
+        nonlocal restart_announcement
+        text = restart_announcement
+        if text is None:
+            return
+        restart_announcement = None
+
+        async def announce_restart() -> None:
+            await speech.announce("restart_announcement", text)
+
+        readiness_cue_tasks.create(announce_restart(), name="restart-announcement")
+
     speech = StreamingSpeechLoop(
         context=context,
         foreground=foreground,
@@ -2284,6 +2333,7 @@ def build_local_host_launcher(
                     generation,
                     media_incarnation,
                 )
+                schedule_restart_announcement()
 
         return ConversationSessionWorker(
             participant_identity=participant_identity,
@@ -2501,7 +2551,10 @@ def build_local_host_launcher(
     )
 
     async def preflight() -> None:
-        nonlocal readiness_cue_template
+        nonlocal readiness_cue_template, restart_announcement
+        if voice_tail_writer is not None:
+            # Before preflight and so before any turn: the conversation resumes heard-first.
+            await voice_tail_writer.open(context)
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2535,6 +2588,17 @@ def build_local_host_launcher(
             surface=work_surface,
             natural_work_tools=natural_work_tools,
         )
+        settlement = (
+            task_session.restart_settlement
+            if type(task_session) is HermesApiTaskSession
+            else None
+        )
+        announcement = _restart_announcement(settlement)
+        if announcement is not None:
+            assert settlement is not None
+            # Stopped work is history, never active: the prompt must not imply it runs.
+            context.record_tasks_ended_by_restart(settlement.stopped + settlement.unknown)
+            restart_announcement = announcement
 
     stt_providers = (
         (cast(MoonshineStreamingTranscriber, transcriber),) if stt_provider == "moonshine" else ()
@@ -2597,6 +2661,8 @@ def build_local_host_launcher(
         providers=(
             readiness_cue_tasks,
             work_close_owner,
+            # After the runtime closed actions and speech, so the final flag is written.
+            *((voice_tail_writer,) if voice_tail_writer is not None else ()),
             *((knowledge_coordinator,) if knowledge_coordinator is not None else ()),
             synthesizer,
             *stt_providers,
@@ -2638,6 +2704,11 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         None
         if qualification_no_hermes_tasks
         else _resolve_hermes_run_record_path(args.hermes_run_record, os.environ)
+    )
+    voice_tail = (
+        None
+        if qualification_no_hermes_tasks
+        else _resolve_voice_tail_path(args.voice_tail, os.environ)
     )
     shutdown_requested = asyncio.Event()
     checkpoint_failures: list[BaseException] = []
@@ -2707,6 +2778,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             evidence_retention_hours=args.evidence_retention_hours,
             evidence_database=evidence_database,
             hermes_run_record=hermes_run_record,
+            voice_tail=voice_tail,
             ),
         )
     except BaseException:
@@ -2843,13 +2915,18 @@ def _resolve_evidence_database_path(
     return Path(local_app_data) / "HermesRealtime" / "evidence" / "capture-v1.sqlite3"
 
 
-def _resolve_hermes_run_record_path(
+def _resolve_state_file_path(
     configured: str | None,
     environment: Mapping[str, str],
+    *,
+    file_name: str,
+    purpose: str,
+    flag: str,
 ) -> Path:
+    """Place one host state file under HermesRealtime/state in the platform state directory."""
     if configured is not None:
         return Path(configured)
-    tail = ("HermesRealtime", "state", "hermes-runs-v1.json")
+    tail = ("HermesRealtime", "state", file_name)
     local_app_data = environment.get("LOCALAPPDATA")
     if local_app_data:
         return Path(local_app_data).joinpath(*tail)
@@ -2860,8 +2937,32 @@ def _resolve_hermes_run_record_path(
     home = environment.get("HOME")
     if home:
         return Path(home, ".local", "state").joinpath(*tail)
-    raise ValueError(
-        "no state directory for the default Hermes run record; pass --hermes-run-record"
+    raise ValueError(f"no state directory for the default {purpose}; pass {flag}")
+
+
+def _resolve_hermes_run_record_path(
+    configured: str | None,
+    environment: Mapping[str, str],
+) -> Path:
+    return _resolve_state_file_path(
+        configured,
+        environment,
+        file_name="hermes-runs-v1.json",
+        purpose="Hermes run record",
+        flag="--hermes-run-record",
+    )
+
+
+def _resolve_voice_tail_path(
+    configured: str | None,
+    environment: Mapping[str, str],
+) -> Path:
+    return _resolve_state_file_path(
+        configured,
+        environment,
+        file_name="voice-tail-v1.json",
+        purpose="voice tail",
+        flag="--voice-tail",
     )
 
 
@@ -2933,6 +3034,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--hermes-run-record",
         help="JSON file recording Hermes runs a crashed host may have left running "
         "(default: HermesRealtime/state/hermes-runs-v1.json under %%LOCALAPPDATA%%, "
+        "else $XDG_STATE_HOME, else ~/.local/state)",
+    )
+    parser.add_argument(
+        "--voice-tail",
+        help="plaintext JSON file holding the recent heard voice conversation, restored after "
+        "a crash (default: HermesRealtime/state/voice-tail-v1.json under %%LOCALAPPDATA%%, "
         "else $XDG_STATE_HOME, else ~/.local/state)",
     )
     parser.add_argument(
