@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TypedDict
 
 import pytest
 from aiohttp import web
 
-from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
+from hermes_realtime.integration import (
+    HermesApiConfig,
+    HermesApiTaskSession,
+    HermesRestartSettlement,
+)
+from hermes_realtime.integration import api as api_module
+from hermes_realtime.integration import run_record as run_record_module
 from hermes_realtime.integration.api import _RunAuthority
+from hermes_realtime.integration.run_record import write_run_record
 from hermes_realtime.protocol import (
     CancelScope,
     ControlCancelEvent,
@@ -1950,7 +1961,17 @@ class _IdempotentHermes:
         hold_first_attempt: bool = False,
         lose_resend: bool = False,
         first_replayed: object = False,
+        on_post: Callable[[], None] | None = None,
+        release_events: asyncio.Event | None = None,
+        run_known: bool = True,
+        status_http: int = 200,
+        answer_status: int = 202,
     ) -> None:
+        self.answer_status = answer_status
+        self.on_post = on_post
+        self.release_events = release_events
+        self.run_known = run_known
+        self.status_http = status_http
         self.first_attempt = first_attempt
         self.lose_resend = lose_resend
         self.first_replayed = first_replayed
@@ -1969,6 +1990,7 @@ class _IdempotentHermes:
         self.stop_calls = 0
 
     async def capabilities(self, _request: web.Request) -> web.Response:
+        self.capability_calls = getattr(self, "capability_calls", 0) + 1
         payload = _capabilities()
         features = payload["features"]
         assert isinstance(features, dict)
@@ -1977,6 +1999,8 @@ class _IdempotentHermes:
         return web.json_response(payload)
 
     async def runs(self, request: web.Request) -> web.StreamResponse:
+        if self.on_post is not None:
+            self.on_post()
         raw = await request.read()
         key = request.headers.get("Idempotency-Key")
         self.attempts.append((key, raw))
@@ -2017,7 +2041,7 @@ class _IdempotentHermes:
             return web.json_response({"run_id": self.run_id, "status": "started"}, status=202)
         return web.json_response(
             {"run_id": self.run_id, "status": "started", "replayed": self.first_replayed},
-            status=202,
+            status=self.answer_status,
         )
 
     @staticmethod
@@ -2032,14 +2056,30 @@ class _IdempotentHermes:
             return web.json_response({"error": "not found"}, status=self.events_status)
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
+        if self.release_events is not None:
+            await self.release_events.wait()
         terminal = {"event": "run.completed", "run_id": self.run_id, "output": "Recovered."}
         await response.write(b"data: " + json.dumps(terminal).encode() + b"\n\n")
         return response
 
+    @staticmethod
+    def _not_found() -> web.Response:
+        # Hermes v0.21.0 answers an unknown run with this OpenAI-style envelope.
+        error = {"message": "Run not found", "type": "invalid_request_error"}
+        return web.json_response(
+            {"error": error | {"param": None, "code": "run_not_found"}}, status=404
+        )
+
     async def status(self, _request: web.Request) -> web.Response:
+        if not self.run_known:
+            return self._not_found()
+        if self.status_http != 200:
+            return web.json_response({"error": "unavailable"}, status=self.status_http)
         return web.json_response({"run_id": self.run_id, "status": self.run_status})
 
     async def stop(self, _request: web.Request) -> web.Response:
+        if not self.run_known:
+            return self._not_found()
         self.stop_calls += 1
         self.run_status = "cancelled"
         return web.json_response({"run_id": self.run_id, "status": "stopping"})
@@ -2467,3 +2507,775 @@ async def test_a_malformed_idempotency_capability_fails_start(idempotency: objec
     finally:
         await session.close()
         await runner.cleanup()
+
+
+_RECORD_RUN_ID = _IdempotentHermes.run_id
+_RECORD_KEY = "0123456789abcdef0123456789abcdef"
+_RECORD_REQUEST: dict[str, object] = {
+    "input": "Inspect the release evidence",
+    "instructions": "Stay within the requested scope.",
+}
+_RESTART_PREFIX = "[hermes-restart-settlement] "
+
+
+def _record_session(port: int, record: Path) -> HermesApiTaskSession:
+    return HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            bearer="dispatch-recovery-test-bearer-value-32-chars",
+            settlement_timeout_seconds=1,
+            settlement_poll_seconds=0.01,
+        ),
+        session_id="session_api_1",
+        private_id_factory=lambda: "recovery_private",
+        run_record_path=record,
+    )
+
+
+def _read_record(record: Path) -> object:
+    return json.loads(record.read_bytes())
+
+
+def _write_record(
+    record: Path,
+    *,
+    pending: list[dict[str, object]] | None = None,
+    admitted: list[str] | None = None,
+) -> None:
+    record.parent.mkdir(parents=True, exist_ok=True)
+    document = {"admitted": admitted or [], "pending": pending or [], "version": 1}
+    record.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _empty_record() -> dict[str, object]:
+    return {"admitted": [], "pending": [], "version": 1}
+
+
+def _restart_markers(capsys: pytest.CaptureFixture[str]) -> list[object]:
+    lines = capsys.readouterr().out.splitlines()
+    return [
+        json.loads(line.removeprefix(_RESTART_PREFIX))
+        for line in lines
+        if line.startswith(_RESTART_PREFIX)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("idempotency", "keyed"),
+    [
+        pytest.param(_DURABLE_IDEMPOTENCY, True, id="keyed"),
+        # Without durable idempotency no key is sent, so none is recorded.
+        pytest.param(_ABSENT, False, id="keyless"),
+    ],
+)
+async def test_a_dispatch_is_recorded_as_pending_before_its_post(
+    idempotency: object, keyed: bool, tmp_path: Path
+) -> None:
+    record = tmp_path / "state" / "hermes-runs-v1.json"
+    observed: list[object] = []
+    hermes = _IdempotentHermes(
+        "answer",
+        idempotency=idempotency,
+        on_post=lambda: observed.append(_read_record(record)),
+    )
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        before = time.time()
+        acknowledgment = await session.dispatch(_dispatch_request())
+
+        assert acknowledgment.payload.accepted is True
+        [(key, raw)] = hermes.attempts
+        assert (key is not None) is keyed
+        [snapshot] = observed
+        assert type(snapshot) is dict
+        [entry] = snapshot["pending"]
+        assert snapshot == {"admitted": [], "pending": [entry], "version": 1}
+        assert entry == {"key": key, "minted_at": entry["minted_at"], "request": json.loads(raw)}
+        assert type(entry["minted_at"]) is float
+        assert before <= entry["minted_at"] <= time.time()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_admission_promotes_the_pending_entry_to_its_run_id(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        acknowledgment = await session.dispatch(_dispatch_request())
+
+        assert acknowledgment.payload.accepted is True
+        assert _read_record(record) == {
+            "admitted": [_RECORD_RUN_ID],
+            "pending": [],
+            "version": 1,
+        }
+        # The acknowledgment drops the request: no transcript or private authority remains.
+        assert b"Inspect the release evidence" not in record.read_bytes()
+        assert b"deleg_" not in record.read_bytes()
+    finally:
+        release.set()
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_terminal_settlement_removes_the_admitted_entry(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        terminal = await asyncio.wait_for(session.next_update(), timeout=1)
+        await session.close()
+
+        assert terminal.payload.status is WorkTerminalStatus.COMPLETED
+        assert hermes.stop_calls == 0
+        assert _read_record(record) == _empty_record()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_close_removes_the_entry_of_the_run_it_stops(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        await session.close()
+
+        assert hermes.stop_calls == 1
+        assert _read_record(record) == _empty_record()
+    finally:
+        release.set()
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_dispatch_leaves_no_entry(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    observed: list[object] = []
+    hermes = _IdempotentHermes("refuse", on_post=lambda: observed.append(_read_record(record)))
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        acknowledgment = await session.dispatch(_dispatch_request())
+
+        assert acknowledgment.payload.accepted is False
+        [snapshot] = observed
+        assert type(snapshot) is dict and len(snapshot["pending"]) == 1
+        assert _read_record(record) == _empty_record()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_with_an_unknown_outcome_stays_pending_for_restart(
+    tmp_path: Path,
+) -> None:
+    # The lost attempt may have started a run; only a restart can still find and stop it.
+    record = tmp_path / "hermes-runs-v1.json"
+    hermes = _IdempotentHermes("lose_response", lose_resend=True)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            await session.dispatch(_dispatch_request())
+        await session.close()
+
+        snapshot = _read_record(record)
+        assert type(snapshot) is dict and snapshot["admitted"] == []
+        [entry] = snapshot["pending"]
+        assert entry["key"] == hermes.attempts[0][0]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_unknown_dispatches_hold_record_capacity_until_restart(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    hermes = _IdempotentHermes("lose_response", lose_resend=True)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        for index in range(8):
+            with pytest.raises(RuntimeError, match="outcome is unknown"):
+                await session.dispatch(_dispatch_request(task_id=f"task_unknown_{index}"))
+        attempts = len(hermes.attempts)
+
+        acknowledgment = await session.dispatch(_dispatch_request(task_id="task_over_capacity"))
+
+        assert acknowledgment.payload.accepted is False
+        assert acknowledgment.payload.reason == "background task capacity exhausted"
+        assert len(hermes.attempts) == attempts
+        snapshot = _read_record(record)
+        assert type(snapshot) is dict and len(snapshot["pending"]) == 8
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_whose_pending_entry_cannot_be_written_is_never_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        def refuse(_path: Path, _data: bytes) -> None:
+            raise OSError("record volume is full")
+
+        monkeypatch.setattr(run_record_module, "write_run_record", refuse)
+        with pytest.raises(OSError, match="record volume is full"):
+            await session.dispatch(_dispatch_request())
+        assert hermes.attempts == []
+
+        monkeypatch.undo()
+        acknowledgment = await session.dispatch(_dispatch_request())
+        assert acknowledgment.payload.accepted is True
+        # The unsent dispatch left nothing behind in the record.
+        assert _read_record(record) == {
+            "admitted": [_RECORD_RUN_ID],
+            "pending": [],
+            "version": 1,
+        }
+    finally:
+        release.set()
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_promotion_cannot_be_written_is_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A keyless pending entry cannot recover its run after a crash, so an unrecorded run stops.
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    writes: list[bytes] = []
+    original = run_record_module.write_run_record
+
+    def fail_promotion(path: Path, data: bytes) -> None:
+        writes.append(data)
+        if len(writes) == 2:
+            raise OSError("record volume is full")
+        original(path, data)
+
+    monkeypatch.setattr(run_record_module, "write_run_record", fail_promotion)
+    try:
+        await session.start()
+        with pytest.raises(OSError, match="record volume is full"):
+            await session.dispatch(_dispatch_request())
+
+        assert hermes.stop_calls == 1
+        assert session._runs_by_task == {}
+        assert _read_record(record) == _empty_record()
+    finally:
+        release.set()
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_restart_stops_an_admitted_run_once_and_empties_the_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record, admitted=[_RECORD_RUN_ID])
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert hermes.stop_calls == 1
+        assert hermes.attempts == []
+        assert _read_record(record) == _empty_record()
+        assert session.restart_settlement == HermesRestartSettlement(stopped=1, unknown=0)
+        assert _restart_markers(capsys) == [
+            {"stopped": 1, "unknown": 0, "unresolved": 0, "version": 1}
+        ]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_restart_counts_a_run_hermes_no_longer_knows_as_ended(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record, admitted=[_RECORD_RUN_ID])
+    hermes = _IdempotentHermes("answer", run_known=False)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert hermes.stop_calls == 0
+        assert _read_record(record) == _empty_record()
+        assert session.restart_settlement == HermesRestartSettlement(stopped=1, unknown=0)
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_restart_treats_an_unexplained_not_found_as_unresolved(tmp_path: Path) -> None:
+    # Only Hermes's own run_not_found answer shows the run is gone; any other 404 proves nothing.
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record, admitted=[_RECORD_RUN_ID])
+    hermes = _IdempotentHermes("answer", status_http=404)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        with pytest.raises(BaseExceptionGroup, match="restart settlement left runs unresolved"):
+            await session.start()
+        assert _read_record(record) == {"admitted": [_RECORD_RUN_ID], "pending": [], "version": 1}
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_naming_a_retired_run_leaves_no_entry(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+        await session.dispatch(_dispatch_request())
+        await asyncio.wait_for(session.next_update(), timeout=1)
+        with pytest.raises(RuntimeError, match="reused a run authority"):
+            await session.dispatch(_dispatch_request(task_id="task_second"))
+
+        assert _read_record(record) == _empty_record()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_restart_with_no_record_settles_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = tmp_path / "missing" / "hermes-runs-v1.json"
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert session.restart_settlement == HermesRestartSettlement(stopped=0, unknown=0)
+        assert not record.exists()
+        assert _restart_markers(capsys) == []
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arrived", [True, False], ids=["accepted-before-crash", "never-arrived"])
+async def test_restart_replays_a_young_pending_entry_then_stops_its_run(
+    arrived: bool, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(
+        record,
+        pending=[{"key": _RECORD_KEY, "minted_at": time.time() - 60, "request": _RECORD_REQUEST}],
+    )
+    hermes = _IdempotentHermes("answer")
+    if arrived:
+        hermes.records[_RECORD_KEY] = json.dumps(_RECORD_REQUEST, sort_keys=True)
+        hermes.runs_created = 1
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        [(key, raw)] = hermes.attempts
+        assert key == _RECORD_KEY
+        assert json.loads(raw) == _RECORD_REQUEST
+        assert hermes.runs_created == 1
+        assert hermes.stop_calls == 1
+        assert _read_record(record) == _empty_record()
+        assert session.restart_settlement == HermesRestartSettlement(stopped=1, unknown=0)
+        assert _restart_markers(capsys) == [
+            {"stopped": 1, "unknown": 0, "unresolved": 0, "version": 1}
+        ]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_key", "age", "idempotency"),
+    [
+        pytest.param(None, 60.0, _DURABLE_IDEMPOTENCY, id="keyless"),
+        # Past retention Hermes may have pruned the key and would start the work again.
+        pytest.param(_RECORD_KEY, 86400.0 + 60, _DURABLE_IDEMPOTENCY, id="expired"),
+        pytest.param(_RECORD_KEY, -3600.0, _DURABLE_IDEMPOTENCY, id="minted-in-the-future"),
+        pytest.param(_RECORD_KEY, 60.0, _ABSENT, id="no-durable-idempotency"),
+    ],
+)
+async def test_restart_never_replays_a_pending_entry_it_cannot_replay_safely(
+    entry_key: str | None,
+    age: float,
+    idempotency: object,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(
+        record,
+        pending=[{"key": entry_key, "minted_at": time.time() - age, "request": _RECORD_REQUEST}],
+    )
+    hermes = _IdempotentHermes("answer", idempotency=idempotency)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert hermes.attempts == []
+        assert hermes.stop_calls == 0
+        assert _read_record(record) == _empty_record()
+        assert session.restart_settlement == HermesRestartSettlement(stopped=0, unknown=1)
+        assert _restart_markers(capsys) == [
+            {"stopped": 0, "unknown": 1, "unresolved": 0, "version": 1}
+        ]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replay", "answer_status", "run_id"),
+    [
+        pytest.param("refuse", 202, _RECORD_RUN_ID, id="refused"),
+        pytest.param("never_arrive", 202, _RECORD_RUN_ID, id="unanswered"),
+        pytest.param("malformed", 202, _RECORD_RUN_ID, id="malformed"),
+        pytest.param("answer", 202, "run_short", id="inexact-run"),
+        pytest.param("answer", 200, _RECORD_RUN_ID, id="not-an-admission"),
+    ],
+)
+async def test_restart_counts_a_refused_or_unanswered_replay_as_unknown(
+    replay: str, answer_status: int, run_id: str, tmp_path: Path
+) -> None:
+    # Only a 202 naming an exact run identifies what the lost attempt started; nothing is resent.
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(
+        record,
+        pending=[{"key": _RECORD_KEY, "minted_at": time.time() - 60, "request": _RECORD_REQUEST}],
+    )
+    hermes = _IdempotentHermes(replay, answer_status=answer_status)
+    hermes.run_id = run_id
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert len(hermes.attempts) == 1
+        assert hermes.stop_calls == 0
+        assert _read_record(record) == _empty_record()
+        assert session.restart_settlement == HermesRestartSettlement(stopped=0, unknown=1)
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+_VALID_PENDING: dict[str, object] = {
+    "key": _RECORD_KEY,
+    "minted_at": 1.5,
+    "request": _RECORD_REQUEST,
+}
+
+
+def _record_text(**fields: object) -> str:
+    document: dict[str, object] = {"admitted": [], "pending": [], "version": 1}
+    document.update(fields)
+    return json.dumps(document)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("not json", id="not-json"),
+        pytest.param("[]", id="not-an-object"),
+        pytest.param(_record_text(version=2), id="unknown-version"),
+        pytest.param(_record_text(version=True), id="version-not-int"),
+        pytest.param(_record_text(extra=1), id="extra-field"),
+        pytest.param(json.dumps({"admitted": [], "version": 1}), id="missing-field"),
+        pytest.param(_record_text(admitted=["deleg_recovery_private"]), id="private-id"),
+        pytest.param(_record_text(admitted=["run_short"]), id="inexact-run-id"),
+        pytest.param(_record_text(admitted=[_RECORD_RUN_ID] * 2), id="duplicate-run"),
+        pytest.param(
+            _record_text(admitted=[f"run_{index:016x}" for index in range(9)]), id="over-capacity"
+        ),
+        pytest.param(
+            _record_text(
+                admitted=[f"run_{index:016x}" for index in range(8)], pending=[_VALID_PENDING]
+            ),
+            id="over-capacity-combined",
+        ),
+        pytest.param(_record_text(pending=[_VALID_PENDING] * 2), id="duplicate-key"),
+        pytest.param(_record_text(pending=[_VALID_PENDING | {"key": "ABC"}]), id="bad-key"),
+        pytest.param(
+            _record_text(pending=[_VALID_PENDING | {"minted_at": "1.5"}]), id="time-not-number"
+        ),
+        pytest.param(_record_text(pending=[_VALID_PENDING | {"minted_at": 2}]), id="time-int"),
+        pytest.param(_record_text(pending=[_VALID_PENDING | {"minted_at": True}]), id="time-bool"),
+        pytest.param(_record_text(pending=[_VALID_PENDING]).replace("1.5", "NaN"), id="time-nan"),
+        pytest.param(_record_text(pending=[_VALID_PENDING | {"request": []}]), id="request-list"),
+        pytest.param(
+            _record_text(pending=[_VALID_PENDING | {"request": {"input": "Inspect"}}]),
+            id="request-incomplete",
+        ),
+        pytest.param(
+            _record_text(
+                pending=[_VALID_PENDING | {"request": _RECORD_REQUEST | {"session_id": "voice"}}]
+            ),
+            id="request-extra-field",
+        ),
+        pytest.param(
+            _record_text(pending=[_VALID_PENDING | {"objective": "Inspect"}]), id="entry-extra"
+        ),
+        pytest.param('{"admitted": [], "admitted": [], "pending": [], "version": 1}', id="dup"),
+        pytest.param(_record_text() + " " * api_module._MAX_RUN_RECORD_BYTES, id="over-size"),
+    ],
+)
+async def test_a_malformed_run_record_fails_start(
+    text: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    record.write_text(text, encoding="utf-8")
+    original = record.read_bytes()
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        with pytest.raises(RuntimeError, match="run record is malformed"):
+            await session.start()
+
+        assert hermes.attempts == []
+        assert hermes.stop_calls == 0
+        assert record.read_bytes() == original
+        # The refusal leaves one bounded, content-free piece of evidence.
+        assert _restart_markers(capsys) == [{"refusal": "malformed", "version": 1}]
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_restart_settlement_keeps_its_entry_and_fails_start(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(
+        record,
+        admitted=[_RECORD_RUN_ID],
+        pending=[{"key": None, "minted_at": time.time() - 60, "request": _RECORD_REQUEST}],
+    )
+    hermes = _IdempotentHermes("answer", status_http=500)
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    retry = _record_session(port, record)
+    try:
+        with pytest.raises(BaseExceptionGroup, match="restart settlement left runs unresolved"):
+            await session.start()
+
+        # The settled entry is gone; only the unsettled run is kept for the next start.
+        assert _read_record(record) == {"admitted": [_RECORD_RUN_ID], "pending": [], "version": 1}
+        assert _restart_markers(capsys) == [
+            {"stopped": 0, "unknown": 1, "unresolved": 1, "version": 1}
+        ]
+        with pytest.raises(RuntimeError, match="not started"):
+            await session.dispatch(_dispatch_request())
+
+        hermes.status_http = 200
+        await retry.start()
+        assert hermes.stop_calls == 1
+        assert _read_record(record) == _empty_record()
+        assert retry.restart_settlement == HermesRestartSettlement(stopped=1, unknown=0)
+    finally:
+        await session.close()
+        await retry.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_without_a_run_record_nothing_is_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(_path: Path, _data: bytes) -> None:
+        raise AssertionError("a session without a run record must never write one")
+
+    monkeypatch.setattr(run_record_module, "write_run_record", forbidden)
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        acknowledgment = await session.dispatch(_dispatch_request())
+        await asyncio.wait_for(session.next_update(), timeout=1)
+        await session.close()
+
+        assert acknowledgment.payload.accepted is True
+        assert session.restart_settlement is None
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+_LOCK_PREFIX = "[hermes-run-record-lock] "
+
+
+@pytest.mark.asyncio
+async def test_a_second_host_cannot_take_a_live_hosts_run_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A second host must not settle, and so stop, the runs a live host still owns.
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    first = _record_session(port, record)
+    second = _record_session(port, record)
+    third = _record_session(port, record)
+    try:
+        await first.start()
+        await first.dispatch(_dispatch_request())
+        owned = record.read_bytes()
+        capability_calls = hermes.capability_calls
+        capsys.readouterr()
+
+        with pytest.raises(RuntimeError, match="another host holds the Hermes run record"):
+            await second.start()
+
+        assert hermes.capability_calls == capability_calls
+        assert hermes.stop_calls == 0
+        assert record.read_bytes() == owned
+        lines = capsys.readouterr().out.splitlines()
+        assert [line for line in lines if line.startswith(_LOCK_PREFIX)] == [
+            _LOCK_PREFIX + '{"cause":"held","version":1}'
+        ]
+
+        await first.close()
+        await third.start()
+        assert hermes.stop_calls == 1
+    finally:
+        release.set()
+        await first.close()
+        await second.close()
+        await third.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_releases_the_run_record(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    record.write_text("not json", encoding="utf-8")
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    failed = _record_session(port, record)
+    retry = _record_session(port, record)
+    try:
+        with pytest.raises(RuntimeError, match="run record is malformed"):
+            await failed.start()
+        _write_record(record)
+
+        # The failed session was never closed, yet the record is free again.
+        await retry.start()
+        assert retry.restart_settlement == HermesRestartSettlement(stopped=0, unknown=0)
+    finally:
+        await failed.close()
+        await retry.close()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize("path", ["hermes-runs-v1.json", b"hermes-runs-v1.json", 1])
+def test_run_record_path_must_be_an_exact_path(path: object) -> None:
+    with pytest.raises(TypeError, match="run_record_path"):
+        HermesApiTaskSession(
+            config=HermesApiConfig(
+                base_url="http://127.0.0.1:8765",
+                bearer="run-record-path-test-bearer-value-32-chars",
+            ),
+            session_id="session_api_1",
+            run_record_path=path,  # type: ignore[arg-type]
+        )
+
+
+def test_the_run_record_is_flushed_to_disk_before_it_replaces_the_old_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "state" / "hermes-runs-v1.json"
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def spy_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def spy_replace(source: str, destination: Path) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(run_record_module.os, "fsync", spy_fsync)
+    monkeypatch.setattr(run_record_module.os, "replace", spy_replace)
+    write_run_record(record, b'{"first":1}')
+
+    assert events == ["fsync", "replace"]
+    assert record.read_bytes() == b'{"first":1}'
+    assert [path.name for path in record.parent.iterdir()] == [record.name]
+
+
+@pytest.mark.parametrize("failing", ["fsync", "replace"])
+def test_an_interrupted_run_record_write_never_leaves_a_partial_file(
+    failing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    write_run_record(record, b'{"first":1}')
+
+    def interrupted(*_args: object) -> None:
+        raise OSError("power lost")
+
+    monkeypatch.setattr(run_record_module.os, failing, interrupted)
+    with pytest.raises(OSError, match="power lost"):
+        write_run_record(record, b'{"second":2}')
+
+    assert record.read_bytes() == b'{"first":1}'
+    assert [path.name for path in tmp_path.iterdir()] == [record.name]

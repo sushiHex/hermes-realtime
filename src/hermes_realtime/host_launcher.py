@@ -94,7 +94,11 @@ from hermes_realtime.evidence.sqlite_spool import (
     SQLiteEvidenceSpool,
     SQLiteEvidenceWriterDaemonV1,
 )
-from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
+from hermes_realtime.integration import (
+    HermesApiConfig,
+    HermesApiTaskSession,
+    HermesRestartSettlement,
+)
 from hermes_realtime.launcher import (
     ConversationOnlyTaskSession,
     ConversationOnlyUpdatePolicy,
@@ -1275,6 +1279,17 @@ def _bind_natural_work_tools(
     inference.bind_work_tools(surface)
 
 
+def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | None:
+    """Tell the operator once what a start settled from a crashed session's run record."""
+    if settlement is None or settlement.stopped + settlement.unknown == 0:
+        return None
+    return (
+        "NOTICE: a previous session left Hermes background work behind: "
+        f"{settlement.stopped} run(s) were stopped or had already ended, and "
+        f"{settlement.unknown} dispatch(es) have an unknown outcome. Tasks are not resumed."
+    )
+
+
 async def _run_full_host_preflight(
     *,
     task_session: _TaskSessionStarter,
@@ -1286,6 +1301,11 @@ async def _run_full_host_preflight(
     """Warm tool-less dependencies, then grant the exact Codex instance work authority."""
 
     await task_session.start()
+    if type(task_session) is HermesApiTaskSession:
+        # Start has already emptied the run record, so this is the only chance to tell.
+        notice = _hermes_restart_notice(task_session.restart_settlement)
+        if notice is not None:
+            print(notice, flush=True)
     snapshot = ConversationInferenceRequest(
         revision=0,
         messages=(
@@ -1770,6 +1790,7 @@ def build_local_host_launcher(
     evidence_capture: bool = False,
     evidence_retention_hours: int = 24,
     evidence_database: Path | None = None,
+    hermes_run_record: Path | None = None,
 ) -> LocalBrowserLauncher:
     """Compose the explicit full host without provider fallback."""
 
@@ -1781,11 +1802,15 @@ def build_local_host_launcher(
         qualification_dependencies = qualification_dependencies.take()
     if type(allow_unsandboxed_tasks) is not bool:
         raise TypeError("allow_unsandboxed_tasks must be an exact boolean")
+    if hermes_run_record is not None and not isinstance(hermes_run_record, Path):
+        raise TypeError("hermes_run_record must be a pathlib Path or None")
     if qualification_no_hermes_tasks:
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
         if allow_unsandboxed_tasks or natural_work_tools:
             raise ValueError("qualification no-task composition rejects task flags")
+        if hermes_run_record is not None:
+            raise ValueError("qualification no-task composition rejects a Hermes run record")
     elif type(hermes_api_bearer) is not str:
         raise TypeError("hermes_api_bearer must be an exact string outside qualification mode")
     if type(evidence_capture) is not bool:
@@ -1996,6 +2021,7 @@ def build_local_host_launcher(
             config=cast(HermesApiConfig, api_config),
             session_id="session_local_host",
             approval_observer=observe_approval,
+            run_record_path=hermes_run_record,
         )
     )
     task_controller = ConversationTaskController(
@@ -2608,6 +2634,11 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         if evidence_capture
         else None
     )
+    hermes_run_record = (
+        None
+        if qualification_no_hermes_tasks
+        else _resolve_hermes_run_record_path(args.hermes_run_record, os.environ)
+    )
     shutdown_requested = asyncio.Event()
     checkpoint_failures: list[BaseException] = []
 
@@ -2675,6 +2706,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             evidence_capture=evidence_capture,
             evidence_retention_hours=args.evidence_retention_hours,
             evidence_database=evidence_database,
+            hermes_run_record=hermes_run_record,
             ),
         )
     except BaseException:
@@ -2811,6 +2843,28 @@ def _resolve_evidence_database_path(
     return Path(local_app_data) / "HermesRealtime" / "evidence" / "capture-v1.sqlite3"
 
 
+def _resolve_hermes_run_record_path(
+    configured: str | None,
+    environment: Mapping[str, str],
+) -> Path:
+    if configured is not None:
+        return Path(configured)
+    tail = ("HermesRealtime", "state", "hermes-runs-v1.json")
+    local_app_data = environment.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data).joinpath(*tail)
+    # XDG requires an absolute XDG_STATE_HOME and says a relative one must be ignored.
+    state_home = environment.get("XDG_STATE_HOME")
+    if state_home and state_home.startswith("/"):
+        return Path(state_home).joinpath(*tail)
+    home = environment.get("HOME")
+    if home:
+        return Path(home, ".local", "state").joinpath(*tail)
+    raise ValueError(
+        "no state directory for the default Hermes run record; pass --hermes-run-record"
+    )
+
+
 def _operator_evidence_capture_enabled(
     requested: bool,
     environment: Mapping[str, str],
@@ -2875,6 +2929,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help="UTF-8 version-1 JSON file containing bounded descriptive Hermes profile data",
     )
     parser.add_argument("--hermes-api-url", default="http://127.0.0.1:8642")
+    parser.add_argument(
+        "--hermes-run-record",
+        help="JSON file recording Hermes runs a crashed host may have left running "
+        "(default: HermesRealtime/state/hermes-runs-v1.json under %%LOCALAPPDATA%%, "
+        "else $XDG_STATE_HOME, else ~/.local/state)",
+    )
     parser.add_argument(
         "--remote",
         action="store_true",
