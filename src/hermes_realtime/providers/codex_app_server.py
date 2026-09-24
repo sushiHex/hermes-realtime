@@ -23,7 +23,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 from hermes_realtime import __version__
-from hermes_realtime.conversation.context import ConversationContextSnapshot
+from hermes_realtime.conversation.context import (
+    INTERRUPTED_SPEECH_MARKER,
+    ConversationContextSnapshot,
+)
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
@@ -2798,6 +2801,8 @@ class CodexAppServerStreamingInference:
         instruction = (
             "Respond to the final user message in this authoritative JSON conversation "
             "snapshot. Earlier assistant messages represent only speech confirmed delivered. "
+            f"An assistant message ending in {INTERRUPTED_SPEECH_MARKER.strip()} was cut off "
+            "there, and the user did not hear the rest. "
             "The work_state field is authoritative lifecycle context. Only active_tasks establish "
             "active background work. inactive_with_history means prior work ended and cannot be "
             "continued as active; never claim it is still running. Interpret continuation wording "

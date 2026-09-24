@@ -1809,6 +1809,24 @@ def test_codex_prompt_requests_a_short_natural_opening_without_filler() -> None:
     assert "Do not add filler or a preamble" in prompt
 
 
+def test_codex_prompt_explains_the_heard_only_context_and_interruption_marker() -> None:
+    from hermes_realtime.conversation import INTERRUPTED_SPEECH_MARKER
+
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="none",
+        transport_factory=FakeCodexTransport,
+    )
+
+    prompt = inference._prompt(inference._trusted_snapshot(_snapshot()))
+
+    assert "Earlier assistant messages represent only speech confirmed delivered." in prompt
+    assert (
+        f"An assistant message ending in {INTERRUPTED_SPEECH_MARKER.strip()} was cut off there"
+        in prompt
+    )
+
+
 def test_codex_prompt_makes_background_results_detailed_and_conversational() -> None:
     snapshot = ConversationInferenceRequest(
         revision=2,

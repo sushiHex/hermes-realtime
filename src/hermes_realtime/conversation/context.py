@@ -98,6 +98,14 @@ class ActiveTaskSummary:
 
 AssistantTextAdmission = SpeechDeliveryAdmission
 
+INTERRUPTED_SPEECH_MARKER = " [speech interrupted]"
+"""Fixed suffix on the last heard assistant row of a turn that did not complete normally."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class AssistantSegmentKey:
+    """Opaque identity of one generated segment's heard-text context row."""
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class TaskAdmission:
@@ -176,10 +184,12 @@ class ConversationContextStore:
             "max_active_tasks",
             _MAX_ACTIVE_TASKS_LIMIT,
         )
+        # Reserve room for the fixed interruption marker so a marked heard row
+        # always fits the absolute per-message bound.
         self._max_item_chars = self._bounded_positive_integer(
             max_item_chars,
             "max_item_chars",
-            _MAX_ITEM_CHARS_LIMIT,
+            _MAX_ITEM_CHARS_LIMIT - len(INTERRUPTED_SPEECH_MARKER),
         )
         self._max_task_incarnations = self._bounded_positive_integer(
             max_task_incarnations,
@@ -203,8 +213,12 @@ class ConversationContextStore:
         ] = {}
         self._assistant_admissions_by_object_id: dict[
             int,
-            tuple[AssistantTextAdmission, str, bool],
+            tuple[AssistantTextAdmission, str, AssistantSegmentKey, str | None],
         ] = {}
+        # The only heard row that a later chunk of the same segment may replace.
+        self._open_assistant_segment: tuple[AssistantSegmentKey, ConversationMessage] | None = (
+            None
+        )
         self._revision = 0
 
     @property
@@ -232,30 +246,34 @@ class ConversationContextStore:
         self,
         text: str,
         *,
-        record_delivery: bool = True,
+        segment: AssistantSegmentKey,
+        heard_text: str | None,
     ) -> AssistantTextAdmission:
-        """Validate and bind text before admitting it to playback."""
+        """Validate and bind one chunk before admitting it to playback.
+
+        ``text`` is the exact chunk the ledger must confirm. ``heard_text`` is
+        the segment's heard text through the end of this chunk; confirmed
+        delivery upserts it as ``segment``'s single context row. ``None``
+        records nothing because no heard text could be located.
+        """
 
         self._validate_text(text)
         self._validate_model_visible_text(text)
-        if type(record_delivery) is not bool:
-            raise TypeError("record_delivery must be an exact boolean")
+        if type(segment) is not AssistantSegmentKey:
+            raise TypeError("segment must be an exact AssistantSegmentKey")
+        if heard_text is not None:
+            self._validate_text(heard_text)
+            self._validate_model_visible_text(heard_text)
         if len(self._assistant_admissions_by_object_id) >= self._max_pending_assistant_admissions:
             raise AssistantTextCapacityError("assistant admission capacity exhausted")
         admission = AssistantTextAdmission()
         self._assistant_admissions_by_object_id[id(admission)] = (
             admission,
             text,
-            record_delivery,
+            segment,
+            heard_text,
         )
         return admission
-
-    def record_assistant_generation(self, text: str) -> None:
-        """Commit validated model output independently from speech delivery."""
-
-        self.validate_assistant_generation(text)
-        self._messages.append(ConversationMessage(role=ConversationRole.ASSISTANT.value, text=text))
-        self._revision += 1
 
     def validate_assistant_generation(self, text: str) -> None:
         """Validate generated assistant text without mutating conversation history."""
@@ -274,23 +292,55 @@ class ConversationContextStore:
         ledger: DeliveredSpeechLedger,
         confirmation: DeliveredSpeechConfirmation,
     ) -> str:
-        """Project only text bound before playback and confirmed by its ledger."""
+        """Upsert only heard text bound before playback and confirmed by its ledger."""
 
         if type(ledger) is not DeliveredSpeechLedger:
             raise TypeError("ledger must be an exact DeliveredSpeechLedger")
-        expected_text, record_delivery = self._resolve_assistant_admission(admission)
+        expected_text, segment, heard_text = self._resolve_assistant_admission(admission)
         delivered_text = ledger.confirmed_text(confirmation, admission)
         if delivered_text != expected_text:
             raise ValueError("delivery confirmation does not match assistant admission")
         self._validate_text(expected_text)
+        replaces_open_row = False
+        open_segment = self._open_assistant_segment
+        if heard_text is not None and open_segment is not None and open_segment[0] is segment:
+            if not self._messages or self._messages[-1] is not open_segment[1]:
+                raise RuntimeError("open assistant segment row was displaced")
+            if not heard_text.startswith(open_segment[1].text):
+                raise ValueError("heard text must extend its open segment row")
+            replaces_open_row = True
         delivered_text = ledger.consume_delivery_confirmation(confirmation, admission)
         del self._assistant_admissions_by_object_id[id(admission)]
-        if record_delivery:
-            self._messages.append(
-                ConversationMessage(role=ConversationRole.ASSISTANT.value, text=expected_text)
-            )
+        if heard_text is not None:
+            message = ConversationMessage(role=ConversationRole.ASSISTANT.value, text=heard_text)
+            if replaces_open_row:
+                self._messages[-1] = message
+            else:
+                self._messages.append(message)
+            self._open_assistant_segment = (segment, message)
             self._revision += 1
         return delivered_text
+
+    def mark_assistant_segment_interrupted(self, segment: AssistantSegmentKey) -> None:
+        """Append the fixed interruption marker to ``segment``'s open heard row once."""
+
+        if type(segment) is not AssistantSegmentKey:
+            raise TypeError("segment must be an exact AssistantSegmentKey")
+        open_segment = self._open_assistant_segment
+        if (
+            open_segment is None
+            or open_segment[0] is not segment
+            or not self._messages
+            or self._messages[-1] is not open_segment[1]
+        ):
+            raise KeyError("segment is not the open heard assistant row")
+        # Replacing the row object displaces the open segment, so neither a
+        # second marker nor a later upsert can apply to it.
+        self._messages[-1] = ConversationMessage(
+            role=ConversationRole.ASSISTANT.value,
+            text=open_segment[1].text + INTERRUPTED_SPEECH_MARKER,
+        )
+        self._revision += 1
 
     def prepare_task(self, task_id: str, objective: str) -> TaskAdmission:
         """Reserve bounded task capacity before an asynchronous dispatch."""
@@ -436,13 +486,13 @@ class ConversationContextStore:
     def _resolve_assistant_admission(
         self,
         admission: AssistantTextAdmission,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, AssistantSegmentKey, str | None]:
         if type(admission) is not AssistantTextAdmission:
             raise TypeError("admission must be an exact AssistantTextAdmission")
         binding = self._assistant_admissions_by_object_id.get(id(admission))
         if binding is None or binding[0] is not admission:
             raise KeyError("unknown assistant text admission")
-        return binding[1], binding[2]
+        return binding[1], binding[2], binding[3]
 
     def _resolve_task_admission(
         self,

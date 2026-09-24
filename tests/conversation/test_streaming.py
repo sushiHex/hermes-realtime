@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from types import MethodType
@@ -7,6 +8,7 @@ from typing import cast
 import pytest
 
 from hermes_realtime.conversation import (
+    INTERRUPTED_SPEECH_MARKER,
     ConversationContextSnapshot,
     ConversationContextStore,
     ConversationInferenceRequest,
@@ -874,6 +876,77 @@ class FailingPlayback(RecordingPlayback):
         raise RuntimeError("playback failed")
 
 
+class FixedSegmentsInference(PerTurnInference):
+    def __init__(self, *segments: str) -> None:
+        super().__init__()
+        self._segments = segments
+
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        for segment in self._segments:
+            yield segment
+
+
+class SentenceSliceSynthesizer(SegmentSynthesizer):
+    """Yield exact sentence slices of a segment without the whitespace between them."""
+
+    async def _synthesize(self, text: str, turn_id: str) -> AsyncIterator[SpeechChunk]:
+        self.texts.append(text)
+        synthesis_number = len(self.texts)
+        for chunk_number, match in enumerate(re.finditer(r"\S[^.?!]*[.?!]", text), start=1):
+            yield SpeechChunk(
+                turn_id=turn_id,
+                chunk_id=f"slice_{synthesis_number}_{chunk_number}",
+                text=match.group(0),
+                audio=AudioFrame(
+                    pcm=bytes((chunk_number, 0)),
+                    sample_rate_hz=16_000,
+                    channels=1,
+                ),
+            )
+
+
+class ContextProbePlayback(RecordingPlayback):
+    """Record live context at each play and block chosen (turn, chunk) pairs forever."""
+
+    def __init__(
+        self,
+        context: ConversationContextStore,
+        *,
+        block: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        super().__init__()
+        self._context = context
+        self._block = block
+        self.context_at_play: list[list[str]] = []
+        self.blocked = asyncio.Event()
+
+    async def play(
+        self,
+        chunk: SpeechChunk,
+        *,
+        is_valid: Callable[[], bool],
+    ) -> None:
+        if not is_valid():
+            raise asyncio.CancelledError
+        self.context_at_play.append(
+            [message.text for message in self._context.snapshot().messages]
+        )
+        self.chunks.append(chunk)
+        if (chunk.turn_id, chunk.chunk_id) in self._block:
+            self.blocked.set()
+            await asyncio.Future()
+
+
+def _context_texts(context: ConversationContextStore) -> list[str]:
+    return [message.text for message in context.snapshot().messages]
+
+
 @pytest.mark.asyncio
 async def test_interrupt_update_uses_foreground_delivery_without_inference() -> None:
     context = ConversationContextStore()
@@ -1104,10 +1177,8 @@ async def test_assistant_partial_is_visible_before_delivery_confirmed_final() ->
             },
         ),
     ]
-    assert [message.text for message in context.snapshot().messages] == [
-        "Question?",
-        "I will mention the update now.",
-    ]
+    # Projection shows generated text immediately; model context waits for delivery.
+    assert [message.text for message in context.snapshot().messages] == ["Question?"]
 
     playback.release_play.set()
     await asyncio.wait_for(response, timeout=1)
@@ -1187,7 +1258,7 @@ async def test_conditional_cancel_preserves_stale_owner_and_revokes_exact_owner(
 
 
 @pytest.mark.asyncio
-async def test_generated_segment_capture_runs_after_publication_before_context_commit(
+async def test_generated_segment_capture_runs_at_publication_and_context_waits_for_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from hermes_realtime.evidence import (
@@ -1198,13 +1269,24 @@ async def test_generated_segment_capture_runs_after_publication_before_context_c
 
     trace: list[object] = []
     context = ConversationContextStore()
-    original_record = context.record_assistant_generation
+    original_record = context.record_assistant_delivery
 
-    def record_context(text: str) -> None:
-        trace.append(("context", text))
-        original_record(text)
+    def record_context(**kwargs: object) -> str:
+        delivered = original_record(**kwargs)  # type: ignore[arg-type]
+        trace.append(("context", _context_texts(context)[-1]))
+        return delivered
 
-    monkeypatch.setattr(context, "record_assistant_generation", record_context)
+    class TracingPlayback(RecordingPlayback):
+        async def play(
+            self,
+            chunk: SpeechChunk,
+            *,
+            is_valid: Callable[[], bool],
+        ) -> None:
+            trace.append(("played", chunk.text, tuple(_context_texts(context))))
+            await super().play(chunk, is_valid=is_valid)
+
+    monkeypatch.setattr(context, "record_assistant_delivery", record_context)
     admission = object.__new__(EvidenceAdmissionControllerV1)
     lease = object.__new__(EvidenceTurnLease)
     object.__setattr__(lease, "evidence_turn_id", "00000000-0000-4000-8000-000000000161")
@@ -1237,7 +1319,7 @@ async def test_generated_segment_capture_runs_after_publication_before_context_c
         foreground=ForegroundTurnCoordinator(),
         inference=EagerOneSegmentInference(),
         synthesizer=SegmentSynthesizer(),
-        playback=RecordingPlayback(),
+        playback=TracingPlayback(),
         ledger=DeliveredSpeechLedger(),
         evidence_admission=admission,
     )
@@ -1255,6 +1337,7 @@ async def test_generated_segment_capture_runs_after_publication_before_context_c
 
     assert trace == [
         ("evidence", "Complete answer."),
+        ("played", "Complete answer.", ("Question?",)),
         ("context", "Complete answer."),
     ]
 
@@ -1623,7 +1706,7 @@ async def test_generated_observer_failure_does_not_leave_orphaned_assistant_cont
 
 
 @pytest.mark.asyncio
-async def test_interruption_preserves_every_generated_segment_in_context_and_projection() -> None:
+async def test_interruption_keeps_unheard_segments_out_of_context_but_in_projection() -> None:
     context = ConversationContextStore()
     playback = PresentationBlockingPlayback()
     inference = EagerTwoSegmentInference()
@@ -1643,15 +1726,15 @@ async def test_interruption_preserves_every_generated_segment_in_context_and_pro
     await asyncio.wait_for(playback.play_started.wait(), timeout=1)
     await asyncio.wait_for(inference.second_segment_emitted.wait(), timeout=1)
 
+    # Both segments are generated and projected, but nothing has been heard.
+    assert _context_texts(context) == ["Question?"]
+
     await loop.cancel()
     with pytest.raises(asyncio.CancelledError):
         await response
 
-    assert [message.text for message in context.snapshot().messages] == [
-        "Question?",
-        "First answer.",
-        "Second answer.",
-    ]
+    # Nothing was delivered, so the interrupted reply writes no assistant row at all.
+    assert _context_texts(context) == ["Question?"]
     generated = [event for event in observed if event[0] == "assistant_text_generated"]
     assert generated == [
         (
@@ -1676,6 +1759,230 @@ async def test_interruption_preserves_every_generated_segment_in_context_and_pro
         ),
     ]
     assert observed[-1][0] == "assistant_turn_interrupted"
+
+
+@pytest.mark.asyncio
+async def test_multi_chunk_segment_upserts_one_row_equal_to_the_exact_segment_slice() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context)
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Hello there.  How are you?"),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert [chunk.text for chunk in playback.chunks] == ["Hello there.", "How are you?"]
+    assert playback.context_at_play == [
+        ["Question?"],
+        ["Question?", "Hello there."],
+    ]
+    assert _context_texts(context) == ["Question?", "Hello there.  How are you?"]
+
+
+@pytest.mark.asyncio
+async def test_normal_completion_records_each_heard_segment_without_marker() -> None:
+    context = ConversationContextStore()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First answer.", "Second answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert _context_texts(context) == ["Question?", "First answer.", "Second answer."]
+
+
+@pytest.mark.asyncio
+async def test_interruption_mid_segment_records_heard_slice_plus_marker() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    observed: list[tuple[str, dict[str, str | int | bool | None]]] = []
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part. Third part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+        observer=lambda kind, data: observed.append((kind, data)),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    assert _context_texts(context) == ["Question?", "First part."]
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert _context_texts(context) == ["Question?", "First part." + INTERRUPTED_SPEECH_MARKER]
+    assert [
+        data["text"] for kind, data in observed if kind == "assistant_text_generated"
+    ] == ["First part. Second part. Third part."]
+    assert [data["text"] for kind, data in observed if kind == "transcript_partial"] == [
+        "First part.",
+        "Second part.",
+    ]
+    assert observed[-1][0] == "assistant_turn_interrupted"
+
+
+@pytest.mark.asyncio
+async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert _context_texts(context) == [
+        "Question?",
+        "First answer." + INTERRUPTED_SPEECH_MARKER,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unheard_interrupted_turn_never_marks_an_earlier_turns_row() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("update_1", "chunk_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=PerTurnInference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+    decision = UpdateDecision(
+        sequence=1,
+        completion=TaskTerminalOutcome(
+            task_id="task_weather",
+            status="completed",
+            summary="Rain starts soon.",
+        ),
+        kind=UpdateDecisionKind.INTERRUPT.value,
+        text="Take an umbrella.",
+    )
+    authority = loop._bind_update_executor(object())
+    operation = loop._begin_update_operation(authority, "update_1")
+    announcement = asyncio.create_task(
+        loop._announce_update(authority, operation, "update_1", decision)
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await announcement
+
+    assert _context_texts(context) == ["Question?", "Answer for turn_001."]
+
+
+@pytest.mark.asyncio
+async def test_abnormal_end_after_hearing_all_generated_speech_still_marks_cut_off() -> None:
+    context = ConversationContextStore()
+    inference = BlockingIncrementalInference()
+    first_segment_final = asyncio.Event()
+
+    def observe(kind: str, data: dict[str, str | int | bool | None]) -> None:
+        del data
+        if kind == "transcript_final":
+            first_segment_final.set()
+
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        observer=observe,
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    # Every generated segment is fully delivered, but inference is still producing.
+    await asyncio.wait_for(first_segment_final.wait(), timeout=1)
+    assert inference.completed is False
+    assert _context_texts(context) == ["Question?", "First answer."]
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    # The turn did not complete normally, so the reply was cut off.
+    assert _context_texts(context) == ["Question?", "First answer." + INTERRUPTED_SPEECH_MARKER]
+
+
+@pytest.mark.asyncio
+async def test_resume_records_only_newly_heard_text_as_its_own_row() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part. Third part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert await loop.resume_interrupted() is True
+
+    assert [chunk.text for chunk in playback.chunks[-2:]] == ["Second part.", "Third part."]
+    assert _context_texts(context) == [
+        "Question?",
+        "First part." + INTERRUPTED_SPEECH_MARKER,
+        " Second part. Third part.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chunks_not_located_in_their_segment_write_no_context_row() -> None:
+    context = ConversationContextStore()
+    playback = RecordingPlayback()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=EagerOneSegmentInference(),
+        synthesizer=TwoChunkSegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert [chunk.text for chunk in playback.chunks] == ["First subchunk.", "Second subchunk."]
+    assert _context_texts(context) == ["Question?"]
 
 
 @pytest.mark.asyncio
@@ -1884,9 +2191,11 @@ async def test_resume_replays_publication_when_later_speech_subchunk_was_interru
         "Second subchunk.",
         "Second subchunk.",
     ]
+    # The original turn heard only its first subchunk; the replay adds only the rest.
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First subchunk.Second subchunk.",
+        "First subchunk." + INTERRUPTED_SPEECH_MARKER,
+        "Second subchunk.",
     ]
     assert [event for event in observed if event[0] == "assistant_text_generated"] == [
         (
@@ -2270,9 +2579,9 @@ async def test_replacement_cancels_providers_and_releases_undelivered_speech() -
     assert ledger.retained_chunk_count == 0
     assert ledger.pending() == ()
     assert await loop.resume_interrupted() is False
+    # The replaced turn's answer was never delivered, so it never entered context.
     assert [message.text for message in context.snapshot().messages] == [
         "First question?",
-        "Answer for turn_001.",
         "Second question?",
         "Answer for turn_002.",
     ]
@@ -3257,8 +3566,6 @@ async def test_segment_count_capacity_invalidates_queued_segments_before_tts() -
     assert inference.cancelled_turns == ["turn_001"]
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "One.",
-        "Two.",
     ]
 
 
@@ -3357,7 +3664,6 @@ async def test_tts_chunk_for_wrong_turn_is_rejected_before_ledger_or_playback() 
     assert ledger.retained_chunk_count == 0
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "Answer for turn_001.",
     ]
     assert synthesizer.cancelled_turns == ["turn_001"]
 
@@ -3382,7 +3688,6 @@ async def test_duplicate_chunk_id_is_rejected_before_second_playback() -> None:
     assert [chunk.text for chunk in playback.chunks] == ["First subchunk."]
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "Answer for turn_001.",
     ]
     assert ledger.pending() == ()
     assert ledger.retained_chunk_count == 0
@@ -3542,7 +3847,6 @@ async def test_playback_failure_releases_started_but_unconfirmed_chunk(
     assert foreground.active_task_count == 0
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "Answer for turn_001.",
     ]
 
 
@@ -3603,7 +3907,6 @@ async def test_malformed_tts_value_is_rejected_before_field_access() -> None:
     assert ledger.retained_chunk_count == 0
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "Answer for turn_001.",
     ]
 
 
@@ -3648,7 +3951,6 @@ async def test_close_invalidates_active_speech_and_rejects_new_transcripts() -> 
     assert ledger.retained_chunk_count == 0
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "Answer for turn_001.",
     ]
 
 

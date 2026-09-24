@@ -3,9 +3,11 @@
 from .actions import ConversationUpdateExecutor, UpdateActionRecord
 from .commands import ConversationTaskCommandRouter
 from .context import (
+    INTERRUPTED_SPEECH_MARKER,
     ActiveTaskCapacityError,
     ActiveTaskIdentityError,
     ActiveTaskSummary,
+    AssistantSegmentKey,
     AssistantTextAdmission,
     AssistantTextCapacityError,
     ConversationContextSnapshot,
@@ -56,9 +58,11 @@ from .work_tools import (
 from .worker import ConversationSessionWorker, ReconnectSafeConversationWorker
 
 __all__ = [
+    "INTERRUPTED_SPEECH_MARKER",
     "ActiveTaskCapacityError",
     "ActiveTaskIdentityError",
     "ActiveTaskSummary",
+    "AssistantSegmentKey",
     "AssistantTextAdmission",
     "AssistantTextCapacityError",
     "ConversationContextSnapshot",

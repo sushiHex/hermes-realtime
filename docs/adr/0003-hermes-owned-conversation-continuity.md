@@ -139,16 +139,15 @@ gets no response ends with its outcome unknown.
 
 ### Live context follows the same rule
 
-Today the live foreground context records every generated segment
-([`record_assistant_generation`](../../src/hermes_realtime/conversation/streaming.py#L803)),
-while the Codex prompt tells the model that earlier assistant messages "represent only speech
-confirmed delivered"
-([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2800)). That claim is
-false, and the live context diverges from any resumed one.
-
-Live context becomes heard-first: the transport-confirmed prefix plus the same fixed marker. The
-undelivered remainder stays in the resumable-replay machinery. The live context, the Hermes
-record, and what the user experienced then match by construction.
+Live foreground context is heard-first. Assistant rows fill only from delivery-confirmed chunks:
+each generated segment has one row, holding the exact slice of the segment text through its
+latest confirmed chunk. A turn that ends abnormally after some of its speech was confirmed gets
+the fixed ` [speech interrupted]` marker once, on its last confirmed row. A turn with nothing
+confirmed writes no assistant row. A replay adds only newly confirmed text, as its own row. The
+undelivered remainder stays in the resumable-replay machinery. The Codex prompt's statement that
+earlier assistant messages "represent only speech confirmed delivered"
+([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2803)) is therefore true, and
+the live context, the Hermes record, and what the user experienced match by construction.
 
 ### The one upstream extension
 

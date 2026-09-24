@@ -787,9 +787,9 @@ async def test_completion_interrupt_replaces_active_process_commentary() -> None
         "My plan is to verify the relevant evidence.",
         "Stop: the selected bridge is closed.",
     ]
+    # The replaced commentary never finished playing, so only the heard update enters context.
     assert [message.text for message in context.snapshot().messages] == [
         "Tell me the route.",
-        "My plan is to verify the relevant evidence.",
         "Stop: the selected bridge is closed.",
     ]
     assert record.disposition == "delivered"
