@@ -205,7 +205,7 @@ async def _arm(workspace: Path, url: str, capture: bool, key: bytes) -> dict[str
                 turn_id=turn_id,
                 chunk_id=f"synthetic-budget-{self.ordinal}",
                 text=text,
-                audio=AudioFrame(pcm=ingress._pcm(), sample_rate_hz=48_000, channels=1),
+                audio=AudioFrame(pcm=ingress._speech_pcm(), sample_rate_hz=48_000, channels=1),
             )
 
         async def cancel(self, turn_id: str) -> None:
