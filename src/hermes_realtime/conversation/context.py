@@ -252,6 +252,12 @@ class ConversationContextStore:
 
         return self._max_item_chars
 
+    @property
+    def max_messages(self) -> int:
+        """Return the configured retained-message limit."""
+
+        return self._max_messages
+
     def record_user_transcript(self, transcript: Transcript) -> None:
         if type(transcript) is not Transcript:
             raise TypeError("transcript must be an exact Transcript value")
