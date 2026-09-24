@@ -141,6 +141,8 @@ voice session join it in step 4.
   settles it. Every write replaces the record atomically: a temporary file in the same
   directory, flushed and synced, then renamed over the record. A kill between the two can leave
   that temporary behind, so a start deletes this record's temporaries once it holds the lock.
+  Deletion is best effort: one a scanner holds open is left for a later start, never a reason
+  to fail this one.
 - **Restart, admitted entry.** Realtime stops the run and waits for its terminal status. A run
   Hermes answers `404 run_not_found` for has nothing left running
   ([status](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L1052-L1068),
@@ -184,26 +186,35 @@ cut off.
 
 A final user input becomes exactly one user row: an ordinary input through the turn it starts,
 and an explicit command, which starts no turn, before the command acts. Live speech settles
-first, so a user row never lands inside an assistant row. A command the context cannot hold
-is invalid.
+first, so a user row never lands inside an assistant row. A command is invalid only when the
+store's pure text check refuses it: over the per-item bound, blank, not encodable as UTF-8, or
+carrying a private run token. So a command row must fit `max_item_chars`, prefix included. Any
+other failure while recording it propagates exactly as it would for an ordinary turn.
 
 ### Durable voice tail
 
-Until the upstream route ships, voice history survives a host crash through one realtime file,
-the voice tail. Tasks are still stopped after a crash, never resumed.
+Until the upstream route ships, voice history survives a host restart, crash or clean
+shutdown, through one realtime file, the voice tail. Every start restores it, with no age
+limit. Tasks are still stopped, never resumed.
 
 The live context store stays the only owner of the conversation and does no I/O. After every
-change to its rows it hands a callback its durable view: exactly the live rows, except that a
-row whose speech is still in progress is flagged `interrupted`, because a crash then would cut
-it off. That view is the only thing persisted. A writer off the voice path coalesces changes,
-writes the latest atomically, and retries a failed write with bounded backoff. The file is
-versioned JSON, bounded by the store's message and per-item limits, and locked by one host at a
-time like the binding record; a start deletes its crashed-write temporaries.
+change to its rows, and whenever its `prior_work` flag flips, it hands a callback its durable
+view: exactly the live rows, except that a row whose speech is still in progress is flagged
+`interrupted`, because a crash then would cut it off, plus `prior_work`, true once any task was
+active or ended. That view is the only thing persisted. One writer task off the voice path owns
+every write, the final one included: it coalesces changes, writes the latest atomically, and
+retries any failed write with bounded backoff. Closing never cuts a backoff short; it waits a
+bounded time for the tail to be clean, and on timeout keeps the tail locked so a later close
+waits again. The file is versioned JSON, bounded by the store's message and per-item limits,
+and locked by one host at a time like the binding record; a start deletes its crashed-write
+temporaries on the same best-effort terms.
 
 A start restores the tail before preflight and so before the first turn. Restore is allowed
-only into an empty store and validates every row against the store's own bounds. A malformed,
-oversized, or unknown-version tail, or one the store refuses, starts a fresh conversation with
-one content-free marker; the next write replaces the file. A refusal never blocks start.
+only into an empty store and validates every row against the store's own bounds, UTF-8 text
+included. A malformed, oversized, or unknown-version tail, or one the store refuses, starts a
+fresh conversation with one content-free marker; the next write replaces the file. A refusal
+never blocks start; a tail that cannot be read fails it, so an unread tail is never
+overwritten.
 
 Its contract:
 
@@ -212,9 +223,11 @@ Its contract:
 - a final `interrupted` flag may be conservative, so the Codex prompt says the user "may not
   have heard the rest".
 
-When a restart settlement stopped work or left it unknown, the restored context reports that
-work as ended history, never as active, and one fixed announcement with counts only is spoken
-once voice input is ready. It becomes a context row like any other speech.
+Work from before a restart is ended history, never active. A restored tail with `prior_work`,
+or a restart settlement that stopped work or left it unknown, marks it ended, once, so the
+prompt's `work_state` reads `inactive_with_history`. After a settlement, one fixed
+announcement with counts only is spoken once voice input is ready and nothing else holds the
+floor. It becomes a context row like any other speech.
 
 The tail is plaintext user data under the host state directory, outside evidence capture and
 purge. Forget clears the store and the file follows. No forget operation exists yet (#77);

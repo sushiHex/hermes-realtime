@@ -308,7 +308,8 @@ provider, or unauthenticated fallback.
 
 The full host keeps its recent delivery-confirmed voice conversation in a durable voice tail,
 `HermesRealtime/state/voice-tail-v1.json` beside the Hermes run record (override with
-`--voice-tail`), and restores it before the first turn after a crash or restart. The file is
+`--voice-tail`), and restores it before the first turn on every start, after a crash or a
+clean shutdown. Work from before the restart is ended history, never resumed. The file is
 plaintext user data outside evidence purge. One host holds it at a time. A malformed tail starts
 a fresh conversation. To forget the conversation, delete the file while the host is stopped.
 
