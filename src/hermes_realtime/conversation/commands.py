@@ -65,8 +65,9 @@ class ConversationTaskCommandRouter:
 
     A command starts no turn, so ``record_user_input`` records its exact text as
     the user row before the command acts; every other final input becomes a
-    user row through the turn it starts. A command the context cannot hold is
-    invalid.
+    user row through the turn it starts. ``validate_user_input`` is the store's
+    pure check: only its refusal makes a command invalid. A recording failure
+    propagates exactly as it would for an ordinary turn.
     """
 
     def __init__(
@@ -79,10 +80,15 @@ class ConversationTaskCommandRouter:
         surface: _WorkControlSurface | None = None,
         lifecycle_owner: EvidenceConversationAuthorityV1 | None = None,
         on_command_accepted: _CommandAcceptedHook | None = None,
+        validate_user_input: Callable[[str], None] | None = None,
         record_user_input: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        if validate_user_input is not None and not callable(validate_user_input):
+            raise TypeError("validate_user_input must be callable or None")
         if record_user_input is not None and not callable(record_user_input):
             raise TypeError("record_user_input must be callable or None")
+        if (validate_user_input is None) is not (record_user_input is None):
+            raise ValueError("user input validation and recording are configured together")
         if surface is None and not callable(getattr(controller, "dispatch", None)):
             raise TypeError("controller must provide dispatch()")
         if surface is None and not callable(getattr(controller, "request_cancel", None)):
@@ -112,18 +118,20 @@ class ConversationTaskCommandRouter:
         self._surface = surface
         self._lifecycle_owner = lifecycle_owner
         self._on_command_accepted = on_command_accepted
+        self._validate_user_input = validate_user_input
         self._record_user_input = record_user_input
 
     async def _recorded(self, text: str) -> bool:
-        """Record one command's user row; False when the context refuses the text."""
+        """Record one command's user row; False only when the text is refused as invalid."""
 
-        record = self._record_user_input
-        if record is None:
+        validate, record = self._validate_user_input, self._record_user_input
+        if validate is None or record is None:
             return True
         try:
-            await record(text)
+            validate(text)
         except (ValueError, PrivateRunDisclosureError):
             return False
+        await record(text)
         return True
 
     @overload

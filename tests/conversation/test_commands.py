@@ -563,6 +563,7 @@ async def test_every_command_becomes_one_user_row_before_the_router_acts(
         observer=lambda _kind, _data: None,
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "command_1",
+        validate_user_input=lambda checked: order.append(f"validate:{checked}"),
         record_user_input=record_user_input,
     )
 
@@ -570,7 +571,11 @@ async def test_every_command_becomes_one_user_row_before_the_router_acts(
     assert order == []
     assert await router.route(text) is True
 
-    assert order == [f"record:{text}", *([action] if action is not None else [])]
+    assert order == [
+        f"validate:{text}",
+        f"record:{text}",
+        *([action] if action is not None else []),
+    ]
 
 
 @pytest.mark.asyncio
@@ -601,6 +606,7 @@ async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> N
         observer=lambda _kind, _data: None,
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "command_1",
+        validate_user_input=lambda _text: None,
         record_user_input=record_user_input,
     )
 
@@ -621,31 +627,32 @@ async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> N
     [
         pytest.param("task: " + "x" * 12, id="over-the-context-item-bound"),
         pytest.param("cancel task: task_deleg_private", id="private-run-token"),
+        pytest.param("task: lone \ud800", id="not-utf8-encodable"),
     ],
 )
 async def test_a_command_the_context_cannot_hold_is_invalid_before_transport(text: str) -> None:
-    from hermes_realtime.speech import Transcript
-
     context = ConversationContextStore(max_item_chars=16)
     controller = _probe()
     events: list[tuple[str, dict[str, str | int | bool | None]]] = []
+    recorded: list[str] = []
 
-    async def record_user_input(recorded: str) -> None:
-        context.record_user_transcript(Transcript(text=recorded, final=True))
+    async def record_user_input(text: str) -> None:
+        recorded.append(text)
 
     router = ConversationTaskCommandRouter(
         controller=controller,
         observer=lambda kind, data: events.append((kind, data)),
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "unused",
+        validate_user_input=context.validate_user_text,
         record_user_input=record_user_input,
     )
 
     assert await router.route(text) is True
 
+    assert recorded == []
     assert controller.dispatches == []
     assert controller.cancellations == []
-    assert context.snapshot().messages == ()
     assert events == [
         (
             "task_state",
@@ -654,11 +661,59 @@ async def test_a_command_the_context_cannot_hold_is_invalid_before_transport(tex
     ]
 
 
-def test_the_user_input_recorder_must_be_callable() -> None:
-    with pytest.raises(TypeError, match="record_user_input"):
-        ConversationTaskCommandRouter(
-            controller=_probe(),
-            observer=lambda _kind, _data: None,
-            reserve_observer_capacity=lambda: None,
-            record_user_input="not callable",  # type: ignore[arg-type]
-        )
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(RuntimeError("prior turn cleanup failed"), id="cleanup-failure"),
+        pytest.param(ValueError("not a validation refusal"), id="value-error"),
+    ],
+)
+async def test_a_recording_failure_propagates_and_is_never_reported_invalid(
+    failure: Exception,
+) -> None:
+    controller = _probe()
+    events: list[tuple[str, dict[str, str | int | bool | None]]] = []
+
+    async def record_user_input(_text: str) -> None:
+        raise failure
+
+    router = ConversationTaskCommandRouter(
+        controller=controller,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "unused",
+        validate_user_input=ConversationContextStore().validate_user_text,
+        record_user_input=record_user_input,
+    )
+
+    with pytest.raises(type(failure), match=str(failure)):
+        await router.route("task: Inspect it")
+
+    assert controller.dispatches == []
+    assert events == []
+
+
+def test_the_user_input_hooks_must_be_callable_and_paired() -> None:
+    async def record(_text: str) -> None:
+        return None
+
+    for kwargs in (
+        {"record_user_input": "not callable", "validate_user_input": lambda _text: None},
+        {"record_user_input": record, "validate_user_input": "not callable"},
+    ):
+        with pytest.raises(TypeError, match="user_input"):
+            ConversationTaskCommandRouter(
+                controller=_probe(),
+                observer=lambda _kind, _data: None,
+                reserve_observer_capacity=lambda: None,
+                **kwargs,  # type: ignore[arg-type]
+            )
+    for kwargs in ({"record_user_input": record}, {"validate_user_input": lambda _text: None}):
+        with pytest.raises(ValueError, match="together"):
+            ConversationTaskCommandRouter(
+                controller=_probe(),
+                observer=lambda _kind, _data: None,
+                reserve_observer_capacity=lambda: None,
+                **kwargs,  # type: ignore[arg-type]
+            )
