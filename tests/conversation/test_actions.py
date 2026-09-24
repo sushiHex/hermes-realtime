@@ -2935,3 +2935,78 @@ async def test_rejected_idle_start_retires_real_unopened_proactive_lease() -> No
     assert admission.diagnostics().active_lease_count == 0
     assert executor.reserved_operation_count == 0
     await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_restored_tail_text_never_reaches_evidence_admission() -> None:
+    # Evidence admits only what this process heard and generated; the restored
+    # tail and the committed snapshot carrying it stay out of every admitted item.
+    from hermes_realtime.conversation import ConversationMessage, DurableConversation
+    from hermes_realtime.evidence import InputSource
+
+    lifecycle, admission, writer, _command = _active_replay_evidence(owner_generation=188)
+    context = ConversationContextStore()
+    context.restore(
+        DurableConversation(
+            messages=(
+                ConversationMessage("user", "RESTOREDUSERSENTINEL"),
+                ConversationMessage("assistant", "RESTOREDASSISTANTSENTINEL", interrupted=True),
+            ),
+            prior_work=True,
+        )
+    )
+    inference = RecordingInference()
+    speech = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=Synthesizer(),
+        playback=Playback(),
+        ledger=DeliveredSpeechLedger(),
+        evidence_admission=admission,
+    )
+    executor = ConversationUpdateExecutor(
+        director=director_for_test(
+            context,
+            CompletionSource(
+                TaskTerminalOutcome(
+                    task_id="task_evidence_tail",
+                    status="completed",
+                    summary="Unused.",
+                )
+            ),
+        ),
+        speech=speech,
+        max_owned_operations=1,
+        operation_scheduler=lifecycle.operation_scheduler,
+        evidence_lifecycle=lifecycle.conversation_authority,
+        evidence_admission=admission,
+    )
+    executor.start()
+    authority = lifecycle.decline_to_user(
+        lifecycle.mint_final_input(
+            source=InputSource.TYPED,
+            input_incarnation=1,
+            media_incarnation=None,
+            typed_sequence=1,
+        )
+    )
+
+    await executor.respond(
+        "turn_after_restore",
+        Transcript(text="FRESHQUESTION", final=True),
+        authority,
+        reservation=executor.reserve_response(),
+    )
+
+    # The model saw the restored rows, so the snapshot really carried them.
+    assert "RESTOREDUSERSENTINEL" in repr(inference.requests[0].messages)
+    admitted = []
+    while writer.ordered_count:
+        item = writer.get_nowait()
+        admitted.append(repr(item))
+        admission.complete_ordered_item(item)
+    assert any("FRESHQUESTION" in item for item in admitted)
+    assert any("I have the report." in item for item in admitted)
+    assert not any("RESTORED" in item for item in admitted)
+    await executor.close()

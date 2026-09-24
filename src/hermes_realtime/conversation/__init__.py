@@ -13,6 +13,7 @@ from .context import (
     ConversationContextStore,
     ConversationMessage,
     ConversationRole,
+    DurableConversation,
     PrivateRunDisclosureError,
     TaskAdmission,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "ConversationRole",
     "ConversationSessionWorker",
     "DEFAULT_MAX_RESPONSE_SEGMENTS",
+    "DurableConversation",
     "ConversationTaskController",
     "ConversationTaskCommandRouter",
     "ConversationWorkControlSurface",

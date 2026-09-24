@@ -174,12 +174,33 @@ class ConversationContextSnapshot:
         object.__setattr__(self, "active_tasks", active_tasks)
 
 
+@dataclass(frozen=True, slots=True)
+class DurableConversation:
+    """The conversation as a restart should see it.
+
+    ``prior_work`` is True once any task was active or ended: a restart never
+    resumes tasks, so afterwards all of it is ended history.
+    """
+
+    messages: tuple[ConversationMessage, ...]
+    prior_work: bool
+
+    def __post_init__(self) -> None:
+        if type(self.messages) is not tuple or any(
+            type(message) is not ConversationMessage for message in self.messages
+        ):
+            raise TypeError("durable messages must be an exact tuple of ConversationMessage")
+        if type(self.prior_work) is not bool:
+            raise TypeError("durable prior_work must be an exact boolean")
+
+
 class ConversationContextStore:
     """Retain a compact event-loop-local prompt context.
 
-    ``on_change`` receives :meth:`durable_messages` synchronously after every
-    mutation of the message rows, so a caller can mirror them off the voice
-    path. It must be cheap; a failure is a programming error and propagates.
+    ``on_change`` receives :meth:`durable_view` synchronously after every
+    mutation of the message rows and whenever ``prior_work`` flips, so a caller
+    can mirror it off the voice path. It must be cheap; a failure is a
+    programming error and propagates.
     """
 
     def __init__(
@@ -190,7 +211,7 @@ class ConversationContextStore:
         max_item_chars: int = 1024,
         max_task_incarnations: int = 1024,
         max_pending_assistant_admissions: int = 16,
-        on_change: Callable[[tuple[ConversationMessage, ...]], None] | None = None,
+        on_change: Callable[[DurableConversation], None] | None = None,
     ) -> None:
         if on_change is not None and not callable(on_change):
             raise TypeError("on_change must be callable or None")
@@ -362,14 +383,22 @@ class ConversationContextStore:
         self._notify_change()
 
     def close_assistant_segment(self, segment: AssistantSegmentKey) -> None:
-        """End ``segment``'s open heard row because its speech completed normally."""
+        """End ``segment``'s open heard row because its speech completed normally.
 
-        self._require_open_segment(segment)
+        A segment that is not the open row is already final, so closing it
+        changes nothing and never raises on the success path.
+        """
+
+        if type(segment) is not AssistantSegmentKey:
+            raise TypeError("segment must be an exact AssistantSegmentKey")
+        open_segment = self._open_assistant_segment
+        if open_segment is None or open_segment[0] is not segment:
+            return
         self._open_assistant_segment = None
         self._notify_change()
 
-    def durable_messages(self) -> tuple[ConversationMessage, ...]:
-        """Return the rows as a restart should see them.
+    def durable_view(self) -> DurableConversation:
+        """Return the conversation as a restart should see it.
 
         A still-open assistant row is flagged interrupted, because a crash now
         would cut it off. Every other row is exactly the live row.
@@ -377,26 +406,35 @@ class ConversationContextStore:
 
         open_segment = self._open_assistant_segment
         open_row = None if open_segment is None else open_segment[1]
-        return tuple(
-            ConversationMessage(
-                role=message.role,
-                text=message.text,
-                interrupted=message.interrupted or message is open_row,
-            )
-            for message in self._messages
+        return DurableConversation(
+            messages=tuple(
+                ConversationMessage(
+                    role=message.role,
+                    text=message.text,
+                    interrupted=message.interrupted or message is open_row,
+                )
+                for message in self._messages
+            ),
+            prior_work=self._has_prior_work(),
         )
 
-    def restore(self, messages: tuple[ConversationMessage, ...]) -> None:
-        """Seed a pristine store with a previous process's durable rows.
+    def validate_user_text(self, text: str) -> None:
+        """Refuse, without mutating anything, text this store could not hold as a user row."""
+
+        self._validate_text(text)
+        self._validate_model_visible_text(text)
+
+    def restore(self, view: DurableConversation) -> None:
+        """Seed a pristine store with a previous process's durable view.
 
         The whole tail is refused with ValueError when any row is outside this
-        store's bounds; nothing is ever truncated.
+        store's bounds; nothing is ever truncated. Prior work becomes ended
+        history, never active work.
         """
 
-        if type(messages) is not tuple:
-            raise TypeError("restored messages must be an exact tuple")
-        if any(type(message) is not ConversationMessage for message in messages):
-            raise TypeError("restored messages must be exact ConversationMessage values")
+        if type(view) is not DurableConversation:
+            raise TypeError("restored view must be an exact DurableConversation")
+        messages = view.messages
         # Revision 0 also means no rows: every row mutation advances it.
         if (
             self._revision != 0
@@ -419,19 +457,32 @@ class ConversationContextStore:
             self._validate_text(row.text)
             rows.append(row)
         self._messages.extend(rows)
+        if view.prior_work:
+            self._end_prior_work()
         self._revision = 1
         self._notify_change()
 
-    def record_tasks_ended_by_restart(self, count: int) -> None:
-        """Count tasks a previous process left behind as ended, never active, history."""
+    def mark_prior_work_ended(self) -> None:
+        """Record that work from before a restart exists and ended; idempotent."""
 
-        if (
-            type(count) is not int
-            or not 1 <= count <= self._max_task_incarnations - self._terminal_task_count
-        ):
-            raise ValueError("restart-ended task count is outside the supported range")
-        self._terminal_task_count += count
-        self._revision += 1
+        before = self._has_prior_work()
+        if self._end_prior_work():
+            self._revision += 1
+            self._notify_if_prior_work_changed(before)
+
+    def _end_prior_work(self) -> bool:
+        # Terminal history is what renders as inactive_with_history.
+        if self._terminal_task_count:
+            return False
+        self._terminal_task_count = 1
+        return True
+
+    def _has_prior_work(self) -> bool:
+        return self._terminal_task_count > 0 or bool(self._active_tasks)
+
+    def _notify_if_prior_work_changed(self, before: bool) -> None:
+        if self._has_prior_work() != before:
+            self._notify_change()
 
     def prepare_task(self, task_id: str, objective: str) -> TaskAdmission:
         """Reserve bounded task capacity before an asynchronous dispatch."""
@@ -477,6 +528,7 @@ class ConversationContextStore:
         if run_id in self._seen_run_ids:
             raise ActiveTaskIdentityError("run identity is active or retired")
         _, task_id, objective = binding
+        prior_work = self._has_prior_work()
         del self._pending_task_admissions_by_object_id[id(admission)]
         self._active_tasks[task_id] = _ActiveTaskRecord(
             task_id=task_id,
@@ -486,6 +538,7 @@ class ConversationContextStore:
         self._task_ids_by_run_id[run_id] = task_id
         self._seen_run_ids.add(run_id)
         self._revision += 1
+        self._notify_if_prior_work_changed(prior_work)
 
     def record_task_accepted(self, *, task_id: str, run_id: str, objective: str) -> None:
         self._validate_task_identifier(task_id)
@@ -499,6 +552,7 @@ class ConversationContextStore:
             raise ActiveTaskCapacityError("task incarnation capacity exhausted")
         if len(self._active_tasks) >= self._max_active_tasks:
             raise ActiveTaskCapacityError("active task summary capacity exhausted")
+        prior_work = self._has_prior_work()
         self._active_tasks[task_id] = _ActiveTaskRecord(
             task_id=task_id,
             run_id=run_id,
@@ -508,6 +562,7 @@ class ConversationContextStore:
         self._seen_task_ids.add(task_id)
         self._seen_run_ids.add(run_id)
         self._revision += 1
+        self._notify_if_prior_work_changed(prior_work)
 
     def require_active_task(self, task_id: str) -> None:
         """Fail before transport unless the public task identity is currently active."""
@@ -549,10 +604,12 @@ class ConversationContextStore:
             or self._task_ids_by_run_id.get(run_id) != task_id
         ):
             raise ActiveTaskIdentityError("task completion does not match active authority")
+        prior_work = self._has_prior_work()
         del self._active_tasks[task_id]
         del self._task_ids_by_run_id[run_id]
         self._terminal_task_count += 1
         self._revision += 1
+        self._notify_if_prior_work_changed(prior_work)
 
     def snapshot(self) -> ConversationContextSnapshot:
         return ConversationContextSnapshot(
@@ -582,7 +639,7 @@ class ConversationContextStore:
     def _notify_change(self) -> None:
         on_change = self._on_change
         if on_change is not None:
-            on_change(self.durable_messages())
+            on_change(self.durable_view())
 
     def _require_open_segment(self, segment: AssistantSegmentKey) -> ConversationMessage:
         if type(segment) is not AssistantSegmentKey:
@@ -626,6 +683,11 @@ class ConversationContextStore:
             raise ValueError("conversation text must not be blank")
         if len(text) > self._max_item_chars:
             raise ValueError("conversation text exceeds max_item_chars")
+        try:
+            # A lone surrogate would make the durable tail unreadable after a restart.
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("conversation text must be encodable as UTF-8") from None
 
     @staticmethod
     def _validate_identifier(value: str, name: str) -> None:

@@ -4292,7 +4292,7 @@ async def test_nonreturning_iterator_close_fails_closed_within_bound() -> None:
 def _durable_rows(context: ConversationContextStore) -> list[tuple[str, str, bool]]:
     return [
         (message.role, message.text, message.interrupted)
-        for message in context.durable_messages()
+        for message in context.durable_view().messages
     ]
 
 
@@ -4491,6 +4491,74 @@ async def test_announce_never_takes_the_floor_from_live_speech() -> None:
     await loop.cancel()
     with pytest.raises(asyncio.CancelledError):
         await response
+
+
+@pytest.mark.asyncio
+async def test_announce_never_discards_resumable_interrupted_speech() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(response, timeout=2)
+    resumable = loop._resumable_speech
+    assert resumable is not None
+    assert loop.foreground_active is False
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop._resumable_speech is resumable
+    assert [chunk.text for chunk in playback.chunks] == ["First part."]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_never_replaces_a_live_idle_mention() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("update_1", "chunk_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=InferenceCallProbe(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    decision = UpdateDecision(
+        sequence=1,
+        completion=TaskTerminalOutcome(
+            task_id="task_report",
+            status="completed",
+            summary="The report is ready.",
+        ),
+        kind=UpdateDecisionKind.MENTION_NEXT.value,
+        text="The report is ready.",
+    )
+    authority = loop._bind_update_executor(object())
+    operation = loop._begin_update_operation(authority, "update_1")
+    mention = asyncio.create_task(
+        loop._announce_idle_update(authority, operation, "update_1", decision)
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop.active_turn_id == "update_1"
+    assert [chunk.text for chunk in playback.chunks] == ["The report is ready."]
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(mention, timeout=2)
 
 
 @pytest.mark.asyncio

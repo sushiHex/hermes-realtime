@@ -505,7 +505,11 @@ class StreamingSpeechLoop:
             await self._settle_owned_cleanups()
 
     async def announce(self, turn_id: str, text: str) -> bool:
-        """Speak one fixed announcement when the floor is idle, as heard context."""
+        """Speak one fixed announcement when the floor is idle, as heard context.
+
+        Returns False without speaking while any speech, an idle mention
+        included, owns the floor: an announcement never replaces live speech.
+        """
 
         return await self._run_turn(
             turn_id,
@@ -515,6 +519,7 @@ class StreamingSpeechLoop:
             update_operation=None,
             idle_only=True,
             preserve_resumable_on_cancel=False,
+            yield_to_live_speech=True,
         )
 
     async def resume_interrupted(
@@ -786,6 +791,7 @@ class StreamingSpeechLoop:
         preserve_resumable_on_cancel: bool = True,
         replay_identity: _ReplayIdentity | None = None,
         evidence_lease: EvidenceTurnLease | None = None,
+        yield_to_live_speech: bool = False,
     ) -> bool:
         if sum(value is not None for value in (transcript, announcement, segments)) != 1:
             raise ValueError("exactly one turn input must be present")
@@ -944,6 +950,8 @@ class StreamingSpeechLoop:
                 or self._resumable_speech is not None
                 or self._resumable_cleanup_count
             ):
+                return False
+            if yield_to_live_speech and self.foreground_active:
                 return False
             if expected_resumable is not None and (
                 self._resumable_speech is not expected_resumable
