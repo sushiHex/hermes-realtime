@@ -34,11 +34,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from real_gate_support import HERMES_BASELINE, available_port
+from real_gate_support import HERMES_BASELINE, available_port, provision_pinned_hermes
 
 _COMMIT = HERMES_BASELINE["commit"]
-_UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
-_CACHE = Path(__file__).resolve().parents[1] / ".hermes" / "bench" / f"hermes-{_COMMIT[:12]}"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 _DELTA = "assistant.delta"
@@ -96,48 +94,6 @@ def _codex_access_token() -> str:
     if expires - time.time() < 3600:
         raise RuntimeError("the Codex access token expires within an hour; run codex once")
     return token
-
-
-def _run(*command: str, cwd: Path, env: dict[str, str] | None = None) -> str:
-    return subprocess.run(
-        command, cwd=cwd, env=env, check=True, capture_output=True, text=True
-    ).stdout.strip()
-
-
-def _provision() -> Path:
-    """Install the pinned Hermes the way its installer does, reusing the cache when current."""
-
-    source = _CACHE / "source"
-    source.mkdir(parents=True, exist_ok=True)
-    if not (source / ".git").exists():
-        _run("git", "init", "-q", cwd=source)
-        _run("git", "remote", "add", "origin", _UPSTREAM, cwd=source)
-        # The documentation site is not runtime code and exceeds Windows path limits.
-        _run("git", "sparse-checkout", "set", "--no-cone", "/*", "!/website/", cwd=source)
-    if (
-        subprocess.run(
-            ("git", "rev-parse", "HEAD"), cwd=source, capture_output=True, text=True
-        ).stdout.strip()
-        != _COMMIT
-    ):
-        _run("git", "fetch", "-q", "--depth", "1", "origin", _COMMIT, cwd=source)
-        _run("git", "checkout", "-q", "--detach", "FETCH_HEAD", cwd=source)
-    if _run("git", "rev-parse", "HEAD", cwd=source) != _COMMIT:
-        raise RuntimeError("the Hermes cache is not at the pinned commit")
-    venv = _CACHE / "venv"
-    _run(
-        "uv",
-        "sync",
-        "--extra",
-        "all",
-        "--locked",
-        "--python",
-        "3.11",
-        "--quiet",
-        cwd=source,
-        env=os.environ | {"UV_PROJECT_ENVIRONMENT": str(venv)},
-    )
-    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 def _config(provider: str, model: str, effort: str, tools: str) -> str:
@@ -440,7 +396,7 @@ def main() -> None:
         _worker(args)
         return
     token = _codex_access_token() if args.provider == "openai-codex" else ""
-    python = _provision()
+    python = provision_pinned_hermes()
     print(
         json.dumps(
             {
