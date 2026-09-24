@@ -1927,7 +1927,8 @@ class _IdempotentHermes:
     ``first_attempt`` decides what happens to the first POST: ``answer`` responds,
     ``lose_response`` admits the run and then drops the connection before responding,
     ``never_arrive`` drops the connection before admitting, ``malformed`` answers with a
-    body that is not JSON, and ``legacy`` answers without the replay marker.
+    body that is not JSON, ``legacy`` answers without the replay marker, and ``refuse``
+    answers 429. ``lose_resend`` drops the resend's connection too.
     """
 
     run_id = "run_abcdefabcdefabcd"
@@ -1942,8 +1943,12 @@ class _IdempotentHermes:
         run_status: str = "running",
         events_status: int = 200,
         hold_first_attempt: bool = False,
+        lose_resend: bool = False,
+        first_replayed: object = False,
     ) -> None:
         self.first_attempt = first_attempt
+        self.lose_resend = lose_resend
+        self.first_replayed = first_replayed
         self.idempotency = (
             {"supported": True, "durable": True, "retention_seconds": 86400}
             if idempotency is None
@@ -1978,6 +1983,10 @@ class _IdempotentHermes:
             return self._drop(request)
         if first and self.first_attempt == "malformed":
             return web.Response(status=202, text="not json", content_type="application/json")
+        if first and self.first_attempt == "refuse":
+            return web.json_response({"error": "busy"}, status=429)
+        if not first and self.lose_resend:
+            return self._drop(request)
         if not first and self.resend_status != 202:
             return web.json_response({"error": "unavailable"}, status=self.resend_status)
         # Hermes fingerprints the parsed body, not its bytes.
@@ -2001,7 +2010,8 @@ class _IdempotentHermes:
         if first and self.first_attempt == "legacy":
             return web.json_response({"run_id": self.run_id, "status": "started"}, status=202)
         return web.json_response(
-            {"run_id": self.run_id, "status": "started", "replayed": False}, status=202
+            {"run_id": self.run_id, "status": "started", "replayed": self.first_replayed},
+            status=202,
         )
 
     @staticmethod
@@ -2125,6 +2135,7 @@ async def test_an_ambiguous_dispatch_never_reports_a_rejection(resend_status: in
             {"supported": True, "durable": False, "retention_seconds": 86400},
             id="not-durable",
         ),
+        pytest.param({"supported": False, "durable": True}, id="not-supported"),
     ],
 )
 async def test_without_durable_idempotency_a_dispatch_is_sent_once(idempotency: object) -> None:
@@ -2192,7 +2203,7 @@ async def test_a_replayed_interrupted_run_settles_as_interrupted() -> None:
 
 @pytest.mark.asyncio
 async def test_a_malformed_dispatch_response_is_never_resent() -> None:
-    # A response arrived, so the dispatch is not ambiguous: resending could start a second run.
+    # A response arrived, so nothing was lost: only a missing response justifies a resend.
     hermes = _IdempotentHermes("malformed")
     runner, port = await hermes.serve()
     session = _recovery_session(port)
@@ -2222,13 +2233,107 @@ async def test_an_idempotent_dispatch_requires_the_replay_marker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_refused_first_attempt_is_a_rejection() -> None:
+    # Nothing was lost, so a refusal is a truthful answer about this dispatch.
+    hermes = _IdempotentHermes("refuse")
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        acknowledgment = await session.dispatch(_dispatch_request())
+        assert acknowledgment.payload.accepted is False
+        assert acknowledgment.payload.reason == "Hermes API rejected dispatch"
+        assert len(hermes.attempts) == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_whose_resend_is_also_lost_has_an_unknown_outcome() -> None:
+    hermes = _IdempotentHermes("lose_response", lose_resend=True)
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            await session.dispatch(_dispatch_request())
+        assert len(hermes.attempts) == 2
+        assert hermes.runs_created == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay_status", ["started", "unknown"])
+async def test_a_replay_must_report_a_status_hermes_holds(replay_status: str) -> None:
+    hermes = _IdempotentHermes("lose_response", replay_status=replay_status)
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        with pytest.raises(RuntimeError, match="lacks exact authority"):
+            await session.dispatch(_dispatch_request())
+        assert hermes.stop_calls == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replayed", [None, "true", 0])
+async def test_an_idempotent_dispatch_requires_an_exact_replay_marker(replayed: object) -> None:
+    hermes = _IdempotentHermes("answer", first_replayed=replayed)
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        with pytest.raises(RuntimeError, match="malformed"):
+            await session.dispatch(_dispatch_request())
+        assert hermes.stop_calls == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_a_dispatch_whose_caller_was_cancelled_twice() -> None:
+    # The second cancellation releases the caller early; close must still await the work.
+    hermes = _IdempotentHermes("lose_response", hold_first_attempt=True)
+    runner, port = await hermes.serve()
+    session = _recovery_session(port)
+    try:
+        await session.start()
+        dispatch = asyncio.create_task(session.dispatch(_dispatch_request()))
+        await asyncio.wait_for(hermes.first_attempt_admitted.wait(), timeout=1)
+        dispatch.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        dispatch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch
+        closing = asyncio.create_task(session.close())
+        await asyncio.sleep(0)
+        hermes.release_first_attempt.set()
+        await asyncio.wait_for(closing, timeout=5)
+
+        assert len(hermes.attempts) == 2
+        assert hermes.stop_calls == 1
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "idempotency",
     [
         pytest.param("yes", id="not-an-object"),
         pytest.param({"supported": True}, id="durable-missing"),
         pytest.param({"supported": True, "durable": "true"}, id="durable-not-bool"),
-        pytest.param({"supported": False, "durable": True}, id="not-supported"),
+        pytest.param({"durable": True}, id="supported-missing"),
+        pytest.param({"supported": "true", "durable": True}, id="supported-not-bool"),
     ],
 )
 async def test_a_malformed_idempotency_capability_fails_start(idempotency: object) -> None:

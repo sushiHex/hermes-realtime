@@ -36,7 +36,8 @@ The #80 audit of v0.21.0 established four facts this design rests on:
   ([counter](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_context.py#L782-L790)).
   Nothing reviews a stored session.
 - **Runs accept what delegation needs.** `/v1/runs` accepts a client `session_id`, an
-  `Idempotency-Key` backed by a durable unique reservation, and explicit `conversation_history`
+  `Idempotency-Key` backed by a unique reservation (durable when the server advertises it), and
+  explicit `conversation_history`
   that is used as context but not re-persisted
   ([session](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L546),
   [idempotency](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L452-L465),
@@ -108,18 +109,22 @@ resend truthfully across a Hermes restart
 ### 3. Realtime keeps one binding record
 
 The binding record holds `{profile, voice session ID, task ID → run ID}`; a run's ID also names
-its session. It is bounded, and it is the only persisted realtime state. #77 item 4 admits exactly this kind of
-session reference and bounded transient context.
+its session. It is bounded, and it is the only persisted realtime state. #77 item 4 admits
+exactly this kind of session reference and bounded transient context.
 
 - **Before dispatch.** A task is recorded before its request is sent, together with that exact
-  request. Hermes's acknowledgment promotes the entry to its run ID and drops the request. The
-  request is the only transcript-bearing content the record ever holds, and only until it is
-  acknowledged.
-- **Restart, pending entry.** Realtime replays the stored request verbatim under the same
+  request, its idempotency key, and when it was minted. Hermes's acknowledgment promotes the
+  entry to its run ID and drops the request. The request is the only transcript-bearing content
+  the record ever holds, and only until it is acknowledged.
+- **Restart, pending entry.** Realtime replays the stored request verbatim under its stored
   idempotency key. Hermes returns the original run if it accepted the request, or starts the
   work if the request never arrived. A replay must carry the same parsed body, because Hermes
   fingerprints the parsed JSON; a different body is refused as a conflict
   ([replay](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L562-L594)).
+  An entry older than the advertised retention is never replayed, because Hermes may have pruned
+  its record and would start the work again
+  ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
+  Its outcome is reported as unknown.
 - **Restart, promoted entry.** Realtime reconciles it with `GET /v1/runs/{id}`. A run Hermes no
   longer knows is reported as lost, never as running.
 
@@ -190,9 +195,12 @@ A backend outage never silences the voice.
   path is qualified
   ([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
   A run dispatched with a key also has its status persisted by Hermes, including its output,
-  error, and approval requests. That record is kept for at least 24 hours after the run ends
-  ([persistence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L138-L152)),
-  and no API route deletes it, so forget does not remove it.
+  error, and any approval request still pending
+  ([persistence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L138-L152)).
+  A terminal record is pruned only once it is more than 24 hours old, and a record left
+  non-terminal by a gateway crash is not pruned at all
+  ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
+  No API route deletes it, so forget does not remove it.
 - **Retention.** Hermes session auto-pruning stays disabled for the MVP.
 
 ## Rejected alternatives

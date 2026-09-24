@@ -295,12 +295,16 @@ class HermesApiTaskSession:
             idempotency = features.get("runs_idempotency")
             if idempotency is not None and (
                 type(idempotency) is not dict
-                or idempotency.get("supported") is not True
+                or type(idempotency.get("supported")) is not bool
                 or type(idempotency.get("durable")) is not bool
             ):
                 raise RuntimeError("Hermes API run idempotency capability is malformed")
             # Only a durable record can answer a resend truthfully across a Hermes restart.
-            idempotent_runs = idempotency is not None and idempotency["durable"] is True
+            idempotent_runs = (
+                idempotency is not None
+                and idempotency["supported"] is True
+                and idempotency["durable"] is True
+            )
             endpoints = payload.get("endpoints")
             if type(endpoints) is not dict:
                 raise RuntimeError("Hermes API endpoint capabilities are malformed")
@@ -351,6 +355,9 @@ class HermesApiTaskSession:
             self._dispatch_admitted(trusted, abandoned=abandoned),
             name=f"hermes-api-dispatch:{trusted.task_id}",
         )
+        # close() must wait for the work itself: a caller cancelled twice stops waiting early.
+        self._inflight_dispatches.add(dispatch_operation)
+        dispatch_operation.add_done_callback(self._inflight_dispatches.discard)
         try:
             return await asyncio.shield(dispatch_operation)
         except asyncio.CancelledError:
@@ -385,10 +392,8 @@ class HermesApiTaskSession:
             model_options["service_tier"] = self._config.run_service_tier
         if model_options:
             body["model_options"] = model_options
-        status, payload, ambiguous = await self._submit_run(body)
+        status, payload = await self._submit_run(body)
         if status != 202:
-            if ambiguous:
-                raise RuntimeError("Hermes API dispatch outcome is unknown")
             logger.warning("Hermes API rejected background dispatch with HTTP %d", status)
             return self._dispatch_ack(
                 trusted,
@@ -475,32 +480,29 @@ class HermesApiTaskSession:
             run_id=protocol_run_id,
         )
 
-    async def _submit_run(self, body: dict[str, object]) -> tuple[int, dict[str, Any], bool]:
+    async def _submit_run(self, body: dict[str, object]) -> tuple[int, dict[str, Any]]:
         """POST one run, resending it once unchanged if the first attempt got no response.
 
         Both attempts carry one idempotency key, so Hermes admits the run at most once. The
         resend is the only way to learn a run the lost attempt may have started, so it happens
-        even for an abandoned dispatch, and publication then stops what it recovers. The flag
-        reports an ambiguous earlier attempt, after which a refusal proves nothing.
+        even for an abandoned dispatch, and publication then stops what it recovers. After a
+        lost attempt only an admission settles the dispatch: a refused resend proves nothing
+        about the first attempt, so its outcome is unknown rather than rejected.
         """
         if not self._idempotent_runs:
-            status, payload = await self._request_json("POST", "/v1/runs", body=body)
-            return status, payload, False
+            return await self._request_json("POST", "/v1/runs", body=body)
         headers = {"Idempotency-Key": secrets.token_hex(16)}
-        try:
-            status, payload = await self._request_json(
-                "POST", "/v1/runs", body=body, headers=headers
-            )
-            return status, payload, False
-        except _NoResponse:
-            pass
+        with contextlib.suppress(_NoResponse):
+            return await self._request_json("POST", "/v1/runs", body=body, headers=headers)
         try:
             status, payload = await self._request_json(
                 "POST", "/v1/runs", body=body, headers=headers
             )
         except _NoResponse as error:
             raise RuntimeError("Hermes API dispatch outcome is unknown") from error
-        return status, payload, True
+        if status != 202:
+            raise RuntimeError("Hermes API dispatch outcome is unknown")
+        return status, payload
 
     async def _settle_unpublished(self, api_run_id: str) -> None:
         await self._stop_and_wait(api_run_id)
