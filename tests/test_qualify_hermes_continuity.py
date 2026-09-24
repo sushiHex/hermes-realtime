@@ -114,16 +114,23 @@ def test_admissions_are_read_from_hermes_store_in_admission_order(tmp_path: Path
     assert _SCRIPT._admissions(tmp_path) == ["cancelled", "interrupted"]
 
 
+_BASELINE: dict[str, object] = {"version": "0.21.0", "commit": "29112bef", "baseline": True}
+
+
 def _observed() -> dict[str, dict[str, object]]:
     return json.loads(json.dumps(_SCRIPT._EXPECTED))
 
 
 def test_the_expected_observations_pass() -> None:
-    assert _SCRIPT._passed(_observed(), 0) is True
+    assert _SCRIPT._passed(_observed(), 0, _BASELINE) is True
 
 
 def test_an_unattributed_model_request_fails() -> None:
-    assert _SCRIPT._passed(_observed(), 1) is False
+    assert _SCRIPT._passed(_observed(), 1, _BASELINE) is False
+
+
+def test_evidence_from_any_hermes_but_the_baseline_fails() -> None:
+    assert _SCRIPT._passed(_observed(), 0, _BASELINE | {"baseline": False}) is False
 
 
 @pytest.mark.parametrize(
@@ -149,10 +156,10 @@ def test_an_unattributed_model_request_fails() -> None:
 def test_any_other_observation_fails(scenario: str, field: str, value: object) -> None:
     observed = _observed()
     observed[scenario][field] = value
-    assert _SCRIPT._passed(observed, 0) is False
+    assert _SCRIPT._passed(observed, 0, _BASELINE) is False
 
 
 def test_a_missing_scenario_fails() -> None:
     observed = _observed()
     del observed["hermes_restart"]
-    assert _SCRIPT._passed(observed, 0) is False
+    assert _SCRIPT._passed(observed, 0, _BASELINE) is False

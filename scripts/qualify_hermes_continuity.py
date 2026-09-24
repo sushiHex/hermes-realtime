@@ -157,8 +157,11 @@ def _admissions(home: Path) -> list[str]:
     return [json.loads(status)["status"] for (status,) in rows]
 
 
-def _passed(observed: dict[str, dict[str, object]], unattributed: int) -> bool:
-    return observed == _EXPECTED and unattributed == 0
+def _passed(
+    observed: dict[str, dict[str, object]], unattributed: int, hermes: dict[str, object]
+) -> bool:
+    """Only the qualified baseline can pass: evidence from another Hermes qualifies nothing."""
+    return hermes["baseline"] is True and observed == _EXPECTED and unattributed == 0
 
 
 class _Hermes:
@@ -285,7 +288,8 @@ async def _qualify(python: Path) -> None:
             }
             (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
             await hermes.start()
-            evidence["hermes"] = installed_hermes_identity(hermes.version, PINNED_HERMES / "source")
+            identity = installed_hermes_identity(hermes.version, PINNED_HERMES / "source")
+            evidence["hermes"] = identity
             # Each scenario's nonce, and where its admissions begin in Hermes's store.
             marks: list[tuple[str, str, int]] = []
             for name in _EXPECTED:
@@ -299,7 +303,7 @@ async def _qualify(python: Path) -> None:
             for (name, nonce, start), end in zip(marks, ends, strict=True):
                 observed[name] |= {"admissions": admissions[start:end], "work": model.work(nonce)}
             evidence["unattributed"] = model.unattributed
-            evidence["passed"] = _passed(observed, model.unattributed)
+            evidence["passed"] = _passed(observed, model.unattributed, identity)
         except BaseException as error:
             evidence["failure"] = type(error).__name__
             raise
