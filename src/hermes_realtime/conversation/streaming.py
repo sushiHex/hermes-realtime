@@ -42,6 +42,7 @@ from hermes_realtime.speech import (
 )
 
 from .context import (
+    AssistantSegmentKey,
     AssistantTextAdmission,
     ConversationContextSnapshot,
     ConversationContextStore,
@@ -78,6 +79,8 @@ class _PrefetchedSpeech:
     chunk: SpeechChunk
     segment_text_offset_utf16: int | None
     synthesis_attempt_id: str
+    segment: AssistantSegmentKey
+    heard_text: str | None
 
 
 @dataclass(slots=True)
@@ -91,12 +94,15 @@ class _TerminalEvidenceState:
 def _committed_conversation_context_snapshot_bytes(
     *,
     revision: int,
-    messages: tuple[tuple[str, str], ...],
+    messages: tuple[tuple[str, str] | tuple[str, str, bool], ...],
     active_tasks: tuple[tuple[str, str], ...],
     terminal_task_count: int,
     updates: tuple[tuple[int, str, str, str], ...] = (),
 ) -> bytes:
-    """Encode the authoritative adapter boundary for content-free observation."""
+    """Encode the authoritative adapter boundary for content-free observation.
+
+    An interrupted assistant row carries a trailing ``True``; other rows are pairs.
+    """
 
     return json.dumps(
         {
@@ -799,8 +805,8 @@ class StreamingSpeechLoop:
                             "segmentId": publication.segment_id,
                         },
                     )
-                if record_generation:
-                    self._context.record_assistant_generation(publication.text)
+                # Model context records only transport-confirmed heard text,
+                # upserted per chunk by the consumer, never generated text.
                 generated_segments.append(publication)
 
             try:
@@ -823,7 +829,10 @@ class StreamingSpeechLoop:
                         _committed_conversation_context_snapshot_bytes(
                             revision=snapshot.revision,
                             messages=tuple(
-                                (message.role, message.text) for message in snapshot.messages
+                                (message.role, message.text, True)
+                                if message.interrupted
+                                else (message.role, message.text)
+                                for message in snapshot.messages
                             ),
                             active_tasks=tuple(
                                 (task.task_id, task.objective)
@@ -1281,6 +1290,8 @@ class StreamingSpeechLoop:
         prefetch_slots = asyncio.Semaphore(1)
         partially_delivered_sequences: set[int] = set()
         last_delivered_chunk_ids: dict[int, str] = {}
+        # This turn's most recent heard context row, if it recorded any.
+        last_heard_segment: AssistantSegmentKey | None = None
         prefetch_task = asyncio.create_task(
             self._prefetch_speech(
                 producer_done=producer_done,
@@ -1339,7 +1350,8 @@ class StreamingSpeechLoop:
                     raise asyncio.CancelledError
                 admission = self._context.prepare_assistant_text(
                     chunk.text,
-                    record_delivery=False,
+                    segment=item.segment,
+                    heard_text=item.heard_text,
                 )
                 try:
                     self._ledger.queue(chunk, admission=admission)
@@ -1406,6 +1418,8 @@ class StreamingSpeechLoop:
                     ledger=self._ledger,
                     confirmation=confirmation,
                 )
+                if item.heard_text is not None:
+                    last_heard_segment = item.segment
                 partially_delivered_sequences.add(publication.sequence)
                 delivered_chunk_counts[publication.sequence] = (
                     delivered_chunk_counts.get(publication.sequence, 0) + 1
@@ -1462,6 +1476,14 @@ class StreamingSpeechLoop:
                 turn_generation=lifecycle_generation,
             )
         except BaseException as error:
+            interruption_marker_error: BaseException | None = None
+            if last_heard_segment is not None:
+                # The turn did not complete normally after some speech was heard:
+                # mark this turn's last heard row once.
+                try:
+                    self._context.mark_assistant_segment_interrupted(last_heard_segment)
+                except BaseException as candidate:
+                    interruption_marker_error = candidate
             interruption_projection_error: BaseException | None = None
             observer = self._observer
             if observer is not None:
@@ -1490,6 +1512,8 @@ class StreamingSpeechLoop:
                     primary_error=error,
                 )
             )
+            if interruption_marker_error is not None:
+                cleanup_errors.append(interruption_marker_error)
             if interruption_projection_error is not None:
                 cleanup_errors.append(interruption_projection_error)
             evidence = self._resolve_evidence_admission()
@@ -1554,6 +1578,11 @@ class StreamingSpeechLoop:
                 raise
             iteration_error: BaseException | None = None
             text_cursor = 0
+            # Heard context for this segment is one row: the exact slice of its
+            # text from heard_start through the latest located chunk. A replay
+            # starts after the chunks the original turn already confirmed.
+            segment = AssistantSegmentKey()
+            heard_start = 0
             try:
                 while True:
                     await slots.acquire()
@@ -1581,13 +1610,17 @@ class StreamingSpeechLoop:
                         confirmed_prefix = replay_skip_counts.get(publication.sequence, 0)
                         if confirmed_prefix > 0:
                             replay_skip_counts[publication.sequence] = confirmed_prefix - 1
+                            heard_start = text_cursor
                             continue
+                        heard_text = publication.text[heard_start:text_cursor]
                         await output.put(
                             _PrefetchedSpeech(
                                 publication=publication,
                                 chunk=chunk,
                                 segment_text_offset_utf16=segment_text_offset_utf16,
                                 synthesis_attempt_id=synthesis_attempt_id,
+                                segment=segment,
+                                heard_text=heard_text if heard_text.strip() else None,
                             )
                         )
                         slot_owned = False

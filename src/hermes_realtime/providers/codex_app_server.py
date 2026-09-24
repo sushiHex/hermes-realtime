@@ -2775,10 +2775,11 @@ class CodexAppServerStreamingInference:
                 else "none"
             ),
             "messages": [
-                {
-                    "role": message.role,
-                    "text": message.text,
-                }
+                (
+                    {"role": message.role, "text": message.text, "interrupted": True}
+                    if message.interrupted
+                    else {"role": message.role, "text": message.text}
+                )
                 for message in snapshot.messages
             ],
             "active_tasks": [
@@ -2798,6 +2799,8 @@ class CodexAppServerStreamingInference:
         instruction = (
             "Respond to the final user message in this authoritative JSON conversation "
             "snapshot. Earlier assistant messages represent only speech confirmed delivered. "
+            'An assistant message with "interrupted": true was cut off after its text, and '
+            "the user did not hear the rest. "
             "The work_state field is authoritative lifecycle context. Only active_tasks establish "
             "active background work. inactive_with_history means prior work ended and cannot be "
             "continued as active; never claim it is still running. Interpret continuation wording "

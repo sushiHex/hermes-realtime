@@ -19,6 +19,8 @@ _MAX_MODEL_CHARS = 256
 _MAX_SEGMENT_CHARS = 4096
 _MAX_ACTIVE_STREAMS = 16
 _MAX_RESPONSE_LINE_BYTES = 1_048_576
+# Render-time rendering of an interrupted row; stored context text never contains it.
+_INTERRUPTED_SPEECH_SUFFIX = " [speech interrupted]"
 
 
 class _LineResponse(Protocol):
@@ -417,7 +419,14 @@ class OllamaStreamingInference:
     @staticmethod
     def _messages(snapshot: ConversationContextSnapshot) -> list[dict[str, str]]:
         messages = [
-            {"role": message.role, "content": message.text}
+            {
+                "role": message.role,
+                "content": (
+                    message.text + _INTERRUPTED_SPEECH_SUFFIX
+                    if message.interrupted
+                    else message.text
+                ),
+            }
             for message in snapshot.messages
         ]
         if snapshot.active_tasks:

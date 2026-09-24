@@ -139,12 +139,15 @@ class _QualificationTraceV1:
 def committed_conversation_context_snapshot_bytes(
     *,
     revision: int,
-    messages: tuple[tuple[str, str], ...],
+    messages: tuple[tuple[str, str] | tuple[str, str, bool], ...],
     active_tasks: tuple[tuple[str, str], ...],
     terminal_task_count: int,
     updates: tuple[tuple[int, str, str, str], ...] = (),
 ) -> bytes:
-    """Test-owner serialization of the exact conversation-adapter snapshot."""
+    """Test-owner serialization of the exact conversation-adapter snapshot.
+
+    An interrupted assistant row carries a trailing ``True``; other rows are pairs.
+    """
 
     return json.dumps(
         {

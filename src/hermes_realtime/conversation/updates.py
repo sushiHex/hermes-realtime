@@ -77,7 +77,11 @@ def _trusted_snapshot(snapshot: ConversationContextSnapshot) -> ConversationCont
     return ConversationContextSnapshot(
         revision=snapshot.revision,
         messages=tuple(
-            ConversationMessage(role=message.role, text=message.text)
+            ConversationMessage(
+                role=message.role,
+                text=message.text,
+                interrupted=message.interrupted,
+            )
             for message in snapshot.messages
         ),
         active_tasks=tuple(

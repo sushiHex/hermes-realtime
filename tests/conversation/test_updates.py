@@ -758,3 +758,23 @@ async def test_director_retries_transient_close_operation_failure() -> None:
     await director.close()
 
     assert close_attempts == 2
+
+
+def test_policy_input_context_preserves_the_interrupted_row_flag() -> None:
+    from hermes_realtime.conversation import ConversationMessage
+
+    policy_input = UpdatePolicyInput(
+        sequence=1,
+        completion=TaskTerminalOutcome(
+            task_id="task_report",
+            status="completed",
+            summary="The report is ready.",
+        ),
+        context=ConversationContextSnapshot(
+            revision=1,
+            messages=(ConversationMessage("assistant", "Cut off.", interrupted=True),),
+            active_tasks=(),
+        ),
+    )
+
+    assert policy_input.context.messages[0].interrupted is True

@@ -6,6 +6,8 @@ from hermes_realtime.conversation import (
     ActiveTaskCapacityError,
     ActiveTaskIdentityError,
     ActiveTaskSummary,
+    AssistantSegmentKey,
+    AssistantTextAdmission,
     AssistantTextCapacityError,
     ConversationContextSnapshot,
     ConversationContextStore,
@@ -26,23 +28,42 @@ def _confirm_assistant_text(
     text: str,
     *,
     chunk_id: str,
-) -> None:
-    ledger = DeliveredSpeechLedger()
+    segment: AssistantSegmentKey | None = None,
+    heard_text: str | None = None,
+    ledger: DeliveredSpeechLedger | None = None,
+) -> str:
+    ledger = DeliveredSpeechLedger() if ledger is None else ledger
     chunk = SpeechChunk(
         turn_id="turn_context",
         chunk_id=chunk_id,
         text=text,
         audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
     )
-    admission = context.prepare_assistant_text(chunk.text)
+    admission = context.prepare_assistant_text(
+        chunk.text,
+        segment=AssistantSegmentKey() if segment is None else segment,
+        heard_text=text if heard_text is None else heard_text,
+    )
     ledger.queue(chunk, admission=admission)
     receipt = ledger.mark_started(chunk.turn_id, chunk.chunk_id)
     confirmation = ledger.mark_delivered_confirmed(receipt)
-    context.record_assistant_delivery(
+    return context.record_assistant_delivery(
         admission=admission,
         ledger=ledger,
         confirmation=confirmation,
     )
+
+
+def _prepare(context: ConversationContextStore, text: str) -> AssistantTextAdmission:
+    return context.prepare_assistant_text(
+        text,
+        segment=AssistantSegmentKey(),
+        heard_text=text,
+    )
+
+
+def _texts(context: ConversationContextStore) -> list[str]:
+    return [message.text for message in context.snapshot().messages]
 
 
 def test_snapshot_is_immutable_and_message_retention_is_bounded() -> None:
@@ -321,7 +342,7 @@ def test_assistant_text_enters_context_only_after_delivery_confirmation() -> Non
         text="heard answer",
         audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
     )
-    admission = context.prepare_assistant_text(chunk.text)
+    admission = _prepare(context, chunk.text)
     ledger.queue(chunk, admission=admission)
     receipt = ledger.mark_started(chunk.turn_id, chunk.chunk_id)
 
@@ -345,7 +366,7 @@ def test_assistant_text_bound_is_checked_before_playback_admission() -> None:
     ledger = DeliveredSpeechLedger()
 
     with pytest.raises(ValueError, match="max_item_chars"):
-        context.prepare_assistant_text("x" * 65)
+        _prepare(context, "x" * 65)
 
     assert ledger.retained_chunk_count == 0
     assert context.snapshot().revision == 0
@@ -418,7 +439,7 @@ def test_task_and_private_run_identifier_namespaces_cannot_overlap() -> None:
 
 def test_forged_delivery_confirmation_cannot_enter_context() -> None:
     context = ConversationContextStore(max_messages=2, max_item_chars=64)
-    admission = context.prepare_assistant_text("forged model context")
+    admission = _prepare(context, "forged model context")
     forged = object.__new__(DeliveredSpeechConfirmation)
 
     with pytest.raises(KeyError, match="delivery confirmation"):
@@ -435,7 +456,7 @@ def test_forged_delivery_confirmation_cannot_enter_context() -> None:
 
 def test_mismatched_delivery_preserves_both_capabilities_without_projection() -> None:
     context = ConversationContextStore(max_messages=2, max_item_chars=64)
-    admission = context.prepare_assistant_text("expected")
+    admission = _prepare(context, "expected")
     ledger = DeliveredSpeechLedger()
     item = SpeechChunk(
         turn_id="turn_001",
@@ -533,7 +554,7 @@ def test_private_run_namespace_is_reserved_before_future_identity_exists() -> No
     with pytest.raises(ActiveTaskIdentityError, match="private run"):
         context.record_user_transcript(Transcript("heard deleg_future", final=True))
     with pytest.raises(ActiveTaskIdentityError, match="private run"):
-        context.prepare_assistant_text("say deleg_future")
+        _prepare(context, "say deleg_future")
     with pytest.raises(ActiveTaskIdentityError, match="deleg_ namespace"):
         context.record_task_accepted(
             task_id="task_001",
@@ -547,7 +568,7 @@ def test_private_run_namespace_is_reserved_before_future_identity_exists() -> No
 def test_assistant_admission_and_confirmation_are_identity_bound() -> None:
     context = ConversationContextStore(max_messages=2, max_item_chars=64)
     ledger = DeliveredSpeechLedger()
-    admission = context.prepare_assistant_text("trusted delivery")
+    admission = _prepare(context, "trusted delivery")
     item = SpeechChunk(
         turn_id="turn_001",
         chunk_id="chunk_001",
@@ -586,12 +607,12 @@ def test_assistant_admissions_are_bounded_and_releasable() -> None:
         max_messages=1,
         max_pending_assistant_admissions=1,
     )
-    first = context.prepare_assistant_text("first")
+    first = _prepare(context, "first")
     with pytest.raises(AssistantTextCapacityError):
-        context.prepare_assistant_text("second")
+        _prepare(context, "second")
 
     context.discard_assistant_text(first)
-    second = context.prepare_assistant_text("second")
+    second = _prepare(context, "second")
     assert second is not first
 
 
@@ -616,3 +637,270 @@ def test_task_tombstone_capacity_is_bounded() -> None:
         )
 
     assert context.snapshot().revision == 2
+
+
+def test_generation_time_context_write_does_not_exist() -> None:
+    context = ConversationContextStore()
+
+    assert not hasattr(context, "record_assistant_generation")
+    context.validate_assistant_generation("generated but not heard")
+    assert context.snapshot().messages == ()
+    assert context.snapshot().revision == 0
+
+
+def test_later_chunks_of_one_segment_upsert_its_single_heard_row() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    ledger = DeliveredSpeechLedger()
+    segment = AssistantSegmentKey()
+
+    _confirm_assistant_text(
+        context,
+        "Hello there.",
+        chunk_id="chunk_001",
+        segment=segment,
+        heard_text="Hello there.",
+        ledger=ledger,
+    )
+    assert _texts(context) == ["Hello there."]
+    assert context.snapshot().revision == 1
+
+    delivered = _confirm_assistant_text(
+        context,
+        "How are you?",
+        chunk_id="chunk_002",
+        segment=segment,
+        heard_text="Hello there.  How are you?",
+        ledger=ledger,
+    )
+
+    assert delivered == "How are you?"
+    assert _texts(context) == ["Hello there.  How are you?"]
+    assert context.snapshot().revision == 2
+
+    _confirm_assistant_text(
+        context,
+        "Next segment.",
+        chunk_id="chunk_003",
+        ledger=ledger,
+    )
+    assert _texts(context) == ["Hello there.  How are you?", "Next segment."]
+
+
+def test_heard_text_must_extend_its_open_segment_row_before_consumption() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    ledger = DeliveredSpeechLedger()
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(
+        context,
+        "Hello there.",
+        chunk_id="chunk_001",
+        segment=segment,
+        ledger=ledger,
+    )
+    chunk = SpeechChunk(
+        turn_id="turn_context",
+        chunk_id="chunk_002",
+        text="How are you?",
+        audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+    )
+    admission = context.prepare_assistant_text(
+        chunk.text,
+        segment=segment,
+        heard_text="Rewritten history. How are you?",
+    )
+    ledger.queue(chunk, admission=admission)
+    confirmation = ledger.mark_delivered_confirmed(
+        ledger.mark_started(chunk.turn_id, chunk.chunk_id)
+    )
+
+    with pytest.raises(ValueError, match="extend"):
+        context.record_assistant_delivery(
+            admission=admission,
+            ledger=ledger,
+            confirmation=confirmation,
+        )
+
+    assert _texts(context) == ["Hello there."]
+    assert context.snapshot().revision == 1
+    assert ledger.confirmed_text(confirmation, admission) == "How are you?"
+    context.discard_assistant_text(admission)
+
+
+def test_displaced_open_segment_row_fails_closed_without_overwriting() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    ledger = DeliveredSpeechLedger()
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(
+        context,
+        "Hello there.",
+        chunk_id="chunk_001",
+        segment=segment,
+        ledger=ledger,
+    )
+    context.record_user_transcript(Transcript(text="Interjection", final=True))
+
+    with pytest.raises(RuntimeError, match="displaced"):
+        _confirm_assistant_text(
+            context,
+            "How are you?",
+            chunk_id="chunk_002",
+            segment=segment,
+            heard_text="Hello there. How are you?",
+            ledger=ledger,
+        )
+
+    assert _texts(context) == ["Hello there.", "Interjection"]
+    assert context.snapshot().revision == 2
+
+
+def test_admission_without_heard_text_consumes_delivery_without_a_row() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    ledger = DeliveredSpeechLedger()
+    chunk = SpeechChunk(
+        turn_id="turn_context",
+        chunk_id="chunk_001",
+        text="unlocated speech",
+        audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+    )
+    admission = context.prepare_assistant_text(
+        chunk.text,
+        segment=AssistantSegmentKey(),
+        heard_text=None,
+    )
+    ledger.queue(chunk, admission=admission)
+    confirmation = ledger.mark_delivered_confirmed(
+        ledger.mark_started(chunk.turn_id, chunk.chunk_id)
+    )
+
+    assert (
+        context.record_assistant_delivery(
+            admission=admission,
+            ledger=ledger,
+            confirmation=confirmation,
+        )
+        == "unlocated speech"
+    )
+    assert context.snapshot().messages == ()
+    assert context.snapshot().revision == 0
+
+
+def test_admission_segment_and_heard_text_are_strict_before_capacity_use() -> None:
+    context = ConversationContextStore(
+        max_messages=4,
+        max_item_chars=64,
+        max_pending_assistant_admissions=1,
+    )
+
+    with pytest.raises(TypeError, match="segment"):
+        context.prepare_assistant_text(
+            "text",
+            segment=cast(AssistantSegmentKey, object()),
+            heard_text="text",
+        )
+    with pytest.raises(TypeError, match="exact built-in string"):
+        context.prepare_assistant_text(
+            "text",
+            segment=AssistantSegmentKey(),
+            heard_text=cast(str, b"text"),
+        )
+    with pytest.raises(ValueError, match="blank"):
+        context.prepare_assistant_text("text", segment=AssistantSegmentKey(), heard_text="  ")
+    with pytest.raises(ValueError, match="max_item_chars"):
+        context.prepare_assistant_text(
+            "text",
+            segment=AssistantSegmentKey(),
+            heard_text="x" * 65,
+        )
+    with pytest.raises(ActiveTaskIdentityError, match="private run"):
+        context.prepare_assistant_text(
+            "text",
+            segment=AssistantSegmentKey(),
+            heard_text="say deleg_future",
+        )
+
+    assert _prepare(context, "capacity was not consumed") is not None
+
+
+def test_interruption_marker_applies_once_to_the_open_heard_row() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Partial reply.", chunk_id="chunk_001", segment=segment)
+
+    context.mark_assistant_segment_interrupted(segment)
+
+    interrupted = ConversationMessage("assistant", "Partial reply.", interrupted=True)
+    assert context.snapshot().messages == (interrupted,)
+    assert context.snapshot().messages[0].interrupted is True
+    assert context.snapshot().revision == 2
+    with pytest.raises(KeyError, match="open heard"):
+        context.mark_assistant_segment_interrupted(segment)
+    with pytest.raises(RuntimeError, match="displaced"):
+        _confirm_assistant_text(
+            context,
+            "More.",
+            chunk_id="chunk_002",
+            segment=segment,
+            heard_text="Partial reply. More.",
+        )
+    assert context.snapshot().messages == (interrupted,)
+    assert context.snapshot().revision == 2
+
+
+def test_interruption_marker_requires_the_exact_open_heard_row() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    segment = AssistantSegmentKey()
+
+    with pytest.raises(TypeError, match="segment"):
+        context.mark_assistant_segment_interrupted(cast(AssistantSegmentKey, object()))
+    with pytest.raises(KeyError, match="open heard"):
+        context.mark_assistant_segment_interrupted(segment)
+
+    _confirm_assistant_text(context, "Heard reply.", chunk_id="chunk_001", segment=segment)
+    with pytest.raises(KeyError, match="open heard"):
+        context.mark_assistant_segment_interrupted(AssistantSegmentKey())
+    context.record_user_transcript(Transcript(text="Next question", final=True))
+    with pytest.raises(KeyError, match="open heard"):
+        context.mark_assistant_segment_interrupted(segment)
+
+    assert context.snapshot().messages == (
+        ConversationMessage("assistant", "Heard reply."),
+        ConversationMessage("user", "Next question"),
+    )
+    assert not any(message.interrupted for message in context.snapshot().messages)
+
+
+def test_interrupted_row_keeps_exact_heard_text_at_the_per_item_limit() -> None:
+    context = ConversationContextStore(max_item_chars=64)
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "x" * 64, chunk_id="chunk_001", segment=segment)
+
+    context.mark_assistant_segment_interrupted(segment)
+
+    [message] = context.snapshot().messages
+    assert message.text == "x" * 64
+    assert len(message.text) == context.max_item_chars
+    assert message.interrupted is True
+
+
+def test_store_accepts_the_full_supported_item_bound() -> None:
+    assert ConversationContextStore(max_item_chars=65_536).max_item_chars == 65_536
+
+
+def test_interrupted_flag_is_an_exact_boolean_on_assistant_rows_only() -> None:
+    with pytest.raises(TypeError, match="exact boolean"):
+        ConversationMessage("assistant", "cut", interrupted=cast(bool, 1))
+    with pytest.raises(ValueError, match="assistant"):
+        ConversationMessage("user", "not speech", interrupted=True)
+
+    mutated = ConversationMessage("user", "question")
+    object.__setattr__(mutated, "interrupted", True)
+    with pytest.raises(ValueError, match="assistant"):
+        ConversationContextSnapshot(0, (mutated,), ())
+
+    snapshot = ConversationContextSnapshot(
+        0,
+        (ConversationMessage("assistant", "cut", interrupted=True),),
+        (),
+    )
+    assert snapshot.messages[0].interrupted is True
+
