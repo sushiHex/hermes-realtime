@@ -24,6 +24,7 @@ from hermes_realtime.host_launcher import (
     _build_browser_selectable_model_catalog,
     _conversation_profile_duration_limit,
     _FullHostWorkCloseOwner,
+    _hermes_restart_notice,
     _load_tailnet_authorizer,
     _operator_evidence_capture_enabled,
     _project_conversation_observation,
@@ -33,12 +34,18 @@ from hermes_realtime.host_launcher import (
     _ReadinessCueTasks,
     _reserve_host_evidence_revoke,
     _resolve_evidence_database_path,
+    _resolve_hermes_run_record_path,
     _run_full_host_preflight,
     _run_host_cli,
     _SerializedSpeechPlayback,
     _SessionTokenUsageAccumulator,
     _voice_input_ready_data,
     main,
+)
+from hermes_realtime.integration import (
+    HermesApiConfig,
+    HermesApiTaskSession,
+    HermesRestartSettlement,
 )
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
@@ -494,6 +501,7 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
                 os.close(fd)
 
     assert captured["hermes_api_bearer"] is None
+    assert captured["hermes_run_record"] is None
     assert "qualification_no_hermes_tasks" not in captured
     assert captured["private_no_tasks"] is True
     assert captured["closed"] is True
@@ -513,6 +521,127 @@ def test_evidence_database_path_uses_only_custom_or_localappdata_root() -> None:
     for environment in ({}, {"LOCALAPPDATA": ""}):
         with pytest.raises(ValueError, match="LOCALAPPDATA"):
             _resolve_evidence_database_path(None, environment)
+
+
+_RECORD_TAIL = ("HermesRealtime", "state", "hermes-runs-v1.json")
+
+
+@pytest.mark.parametrize(
+    ("environment", "root"),
+    [
+        pytest.param(
+            {
+                "LOCALAPPDATA": r"C:\Users\owner\AppData\Local",
+                "XDG_STATE_HOME": "/home/owner/.xdg-state",
+                "HOME": "/home/owner",
+            },
+            r"C:\Users\owner\AppData\Local",
+            id="windows-localappdata",
+        ),
+        pytest.param(
+            {"XDG_STATE_HOME": "/home/owner/.xdg-state", "HOME": "/home/owner"},
+            "/home/owner/.xdg-state",
+            id="xdg-state-home",
+        ),
+        pytest.param(
+            {"LOCALAPPDATA": "", "XDG_STATE_HOME": "", "HOME": "/home/owner"},
+            "/home/owner/.local/state",
+            id="home-when-others-empty",
+        ),
+        # The XDG specification says a relative XDG_STATE_HOME is invalid and must be ignored.
+        pytest.param(
+            {"XDG_STATE_HOME": "relative/state", "HOME": "/home/owner"},
+            "/home/owner/.local/state",
+            id="relative-xdg-ignored",
+        ),
+    ],
+)
+def test_hermes_run_record_default_path_follows_the_platform_state_directory(
+    environment: dict[str, str], root: str
+) -> None:
+    assert _resolve_hermes_run_record_path(None, environment) == Path(root).joinpath(
+        *_RECORD_TAIL
+    )
+
+
+def test_hermes_run_record_path_prefers_the_explicit_flag_and_fails_without_a_home() -> None:
+    assert _resolve_hermes_run_record_path(
+        r"D:\private-state\hermes-runs-v1.json",
+        {"LOCALAPPDATA": r"C:\Users\owner\AppData\Local"},
+    ) == Path(r"D:\private-state\hermes-runs-v1.json")
+    for environment in ({}, {"LOCALAPPDATA": "", "XDG_STATE_HOME": "", "HOME": ""}):
+        with pytest.raises(ValueError, match="--hermes-run-record"):
+            _resolve_hermes_run_record_path(None, environment)
+
+
+def test_host_cli_hermes_run_record_flag_defaults_to_the_resolved_path() -> None:
+    parser = _build_argument_parser()
+
+    assert parser.parse_args([]).hermes_run_record is None
+    assert (
+        parser.parse_args(["--hermes-run-record", r"D:\state\runs.json"]).hermes_run_record
+        == r"D:\state\runs.json"
+    )
+
+
+def test_hermes_restart_notice_is_one_content_free_line_only_after_settling_runs() -> None:
+    assert _hermes_restart_notice(None) is None
+    assert _hermes_restart_notice(HermesRestartSettlement(stopped=0, unknown=0)) is None
+    assert _hermes_restart_notice(HermesRestartSettlement(stopped=2, unknown=1)) == (
+        "NOTICE: a previous session left Hermes background work behind: 2 run(s) were "
+        "stopped or had already ended, and 1 dispatch(es) have an unknown outcome. "
+        "Tasks are not resumed."
+    )
+    assert _hermes_restart_notice(HermesRestartSettlement(stopped=1, unknown=0)) is not None
+    assert _hermes_restart_notice(HermesRestartSettlement(stopped=0, unknown=1)) is not None
+
+
+@pytest.mark.asyncio
+async def test_full_host_preflight_announces_restart_settlement_once_tasks_start(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The record is already empty once start returns, so the notice cannot wait for readiness.
+    settlement = HermesRestartSettlement(stopped=2, unknown=1)
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8642",
+            bearer="restart-notice-test-bearer-value-32-chars",
+        ),
+        session_id="session_local_host",
+    )
+
+    async def settled_start() -> None:
+        session._restart_settlement = settlement
+
+    async def failing_stream(  # type: ignore[no-untyped-def]
+        self: CodexAppServerStreamingInference,
+        request: object,
+        *,
+        turn_id: str,
+    ):
+        del self, request, turn_id
+        raise RuntimeError("inference unavailable")
+        yield
+
+    monkeypatch.setattr(session, "start", settled_start)
+    monkeypatch.setattr(CodexAppServerStreamingInference, "stream", failing_stream)
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: None,  # type: ignore[arg-type,return-value]
+    )
+
+    with pytest.raises(RuntimeError, match="inference unavailable"):
+        await _run_full_host_preflight(
+            task_session=session,
+            inference=inference,
+            synthesizer=object(),  # type: ignore[arg-type]
+            surface=_work_surface(),
+            natural_work_tools=False,
+        )
+
+    assert capsys.readouterr().out == f"{_hermes_restart_notice(settlement)}\n"
 
 
 def test_emergency_disable_wins_over_operator_capture_enablement() -> None:

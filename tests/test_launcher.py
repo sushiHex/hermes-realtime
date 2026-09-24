@@ -951,6 +951,7 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
         "build_local_host_launcher",
         lambda **kwargs: captured.update(kwargs) or LauncherStub(),
     )
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\owner\AppData\Local")
     args = host_launcher_module._build_argument_parser().parse_args(
         [
             "--moonshine-model-tier",
@@ -975,6 +976,9 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
     assert captured["evidence_capture"] is True
     assert captured["evidence_retention_hours"] == 48
     assert captured["evidence_database"] == Path(r"C:\capture\capture-v1.sqlite3")
+    assert captured["hermes_run_record"] == Path(
+        r"C:\Users\owner\AppData\Local\HermesRealtime\state\hermes-runs-v1.json"
+    )
 
 
 def test_host_parser_accepts_bounded_repeatable_kokoro_pronunciations() -> None:
@@ -1755,6 +1759,72 @@ async def test_full_host_explicit_commands_share_the_composed_work_surface(
         assert close_owner._owners[1] is surface
     finally:
         await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class TranscriberStub:
+        async def push(self, _frame: AudioFrame) -> tuple[()]:
+            return ()
+
+        async def finish_utterance(self) -> None:
+            return None
+
+        async def cancel(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        host_launcher_module,
+        "FasterWhisperTranscriber",
+        lambda **_kwargs: TranscriberStub(),
+    )
+    monkeypatch.setattr(
+        host_launcher_module,
+        "_build_synthesizer",
+        lambda **_kwargs: ProviderProbe([], "synthesizer"),
+    )
+    record = tmp_path / "state" / "hermes-runs-v1.json"
+    launcher = build_local_host_launcher(
+        hermes_api_bearer="host-test-bearer-value-32-characters",
+        inference_provider="ollama",
+        stt_provider="faster-whisper",
+        tts_provider="edge",
+        allow_unsandboxed_tasks=True,
+        hermes_run_record=record,
+    )
+    try:
+        close_owner = next(
+            provider for provider in launcher._providers if hasattr(provider, "_owners")
+        )
+        task_session = close_owner._owners[3]
+        assert type(task_session) is host_launcher_module.HermesApiTaskSession
+        assert task_session._run_record_path == record
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.parametrize("record", ["hermes-runs-v1.json", b"hermes-runs-v1.json"])
+def test_full_host_rejects_a_hermes_run_record_that_is_not_a_path(record: object) -> None:
+    with pytest.raises(TypeError, match="hermes_run_record"):
+        build_local_host_launcher(
+            hermes_api_bearer="host-test-bearer-value-32-characters",
+            allow_unsandboxed_tasks=True,
+            hermes_run_record=record,  # type: ignore[arg-type]
+        )
+
+
+def test_qualification_no_task_composition_rejects_a_hermes_run_record() -> None:
+    with (
+        host_launcher_module._qualification_no_task_composition(),
+        pytest.raises(ValueError, match="run record"),
+    ):
+        build_local_host_launcher(
+            hermes_api_bearer=None,
+            hermes_run_record=Path("hermes-runs-v1.json"),
+        )
 
 
 def test_full_host_loads_only_one_strong_api_key_from_explicit_env_file(
