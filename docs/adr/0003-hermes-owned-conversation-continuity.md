@@ -127,8 +127,9 @@ entry:
 - **Admitted:** the run's Hermes ID, which also names its session. Never the private protocol
   ID, never the objective.
 
-The record is versioned, bounded by the active-run capacity, and the only persisted realtime
-state. It is owned by one host at a time: a host holds an exclusive lock on it from before it
+The record is versioned, bounded by the active-run capacity, and, with the durable voice tail
+below, one of only two persisted realtime files. It is owned by one host at a time: a host
+holds an exclusive lock on it from before it
 settles the record until after its final write, and a second host fails to start rather than
 stop runs it does not own. #77 item 4 admits exactly this kind of bounded transient reference. The profile and the
 voice session join it in step 4.
@@ -138,7 +139,8 @@ voice session join it in step 4.
   terminal, when a stop of it completes, or when Hermes truthfully rejects the dispatch. A
   dispatch whose outcome is unknown stays recorded, and holds a capacity slot, until a restart
   settles it. Every write replaces the record atomically: a temporary file in the same
-  directory, flushed and synced, then renamed over the record.
+  directory, flushed and synced, then renamed over the record. A kill between the two can leave
+  that temporary behind, so a start deletes this record's temporaries once it holds the lock.
 - **Restart, admitted entry.** Realtime stops the run and waits for its terminal status. A run
   Hermes answers `404 run_not_found` for has nothing left running
   ([status](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L1052-L1068),
@@ -176,7 +178,48 @@ only newly confirmed text, as its own row. The undelivered remainder stays in th
 resumable-replay machinery. The Codex prompt's statement that earlier assistant messages
 "represent only speech confirmed delivered"
 ([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801)) is therefore true, and
-the live context, the Hermes record, and what the user experienced match by construction.
+the live context, the Hermes record, and what the user experienced match by construction. A
+turn that completes normally closes its last row, so only speech still in progress can be
+cut off.
+
+A final user input becomes exactly one user row: an ordinary input through the turn it starts,
+and an explicit command, which starts no turn, before the command acts. Live speech settles
+first, so a user row never lands inside an assistant row. A command the context cannot hold
+is invalid.
+
+### Durable voice tail
+
+Until the upstream route ships, voice history survives a host crash through one realtime file,
+the voice tail. Tasks are still stopped after a crash, never resumed.
+
+The live context store stays the only owner of the conversation and does no I/O. After every
+change to its rows it hands a callback its durable view: exactly the live rows, except that a
+row whose speech is still in progress is flagged `interrupted`, because a crash then would cut
+it off. That view is the only thing persisted. A writer off the voice path coalesces changes,
+writes the latest atomically, and retries a failed write with bounded backoff. The file is
+versioned JSON, bounded by the store's message and per-item limits, and locked by one host at a
+time like the binding record; a start deletes its crashed-write temporaries.
+
+A start restores the tail before preflight and so before the first turn. Restore is allowed
+only into an empty store and validates every row against the store's own bounds. A malformed,
+oversized, or unknown-version tail, or one the store refuses, starts a fresh conversation with
+one content-free marker; the next write replaces the file. A refusal never blocks start.
+
+Its contract:
+
+- the recorded rows are a prefix of the heard sequence;
+- a recorded assistant text is a prefix of its delivered text;
+- a final `interrupted` flag may be conservative, so the Codex prompt says the user "may not
+  have heard the rest".
+
+When a restart settlement stopped work or left it unknown, the restored context reports that
+work as ended history, never as active, and one fixed announcement with counts only is spoken
+once voice input is ready. It becomes a context row like any other speech.
+
+The tail is plaintext user data under the host state directory, outside evidence capture and
+purge. Forget clears the store and the file follows. No forget operation exists yet (#77);
+until one does, delete the file while the host is stopped. The conversation-only launcher
+keeps no tail.
 
 ### The one upstream extension
 
@@ -191,10 +234,11 @@ the live context, the Hermes record, and what the user experienced match by cons
   stored user rows and spawns Hermes's existing background review when the profile's cadence
   is reached. Externally produced turns are turns, and no client flag changes that.
 
-This single route provides persisted voice history, memory learning at Hermes's own cadence, and
-searchable voice recall, with no realtime store. A memory-read route is separable and deferred.
-Until the route ships, voice history is not persisted. No interim adapter writes Hermes's
-storage.
+This single route provides Hermes-owned voice history, memory learning at Hermes's own
+cadence, and searchable voice recall. A memory-read route is separable and deferred. Until the
+route ships, the durable voice tail is the only persisted voice history, and no interim adapter
+writes Hermes's storage. Once it ships, one "delivered through" cursor drains the durable tail
+file, never memory, so appends resume exactly where the last acknowledged message ended.
 
 ## Degraded mode
 
@@ -214,12 +258,13 @@ A backend outage never silences the voice.
   Memory learning waits for the route, because the counter would fire only if a supplied tail
   happened to land on the cadence, and the tail is not sized to game it.
 - **What the MVP resumes.** Not tasks: a restart stops the background runs a crashed process
-  left running and says so. On v0.21.0 it does not resume voice history either. These limits
-  belong in #159's statement of the MVP, not hidden.
+  left running and says so. On v0.21.0 it resumes the bounded voice tail, not Hermes-owned
+  history. These limits belong in #159's statement of the MVP, not hidden.
 - **Memory egress.** Before a voice tail reaches a run, the profile must use built-in memory
   only, because a run's memory sync passes its messages to any configured external provider
   ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
-- **Forgetting.** "Forget this conversation" deletes every run session in the binding record,
+- **Forgetting.** "Forget this conversation" clears the live store, which rewrites the voice
+  tail empty, and deletes every run session in the binding record,
   which hold objectives rather than voice text, and the voice session's whole compression chain.
   The record keeps a run only while it may be running, so how forget names the sessions of
   finished runs is open until step 4.
@@ -262,9 +307,13 @@ A backend outage never silences the voice.
 3. **Binding record.** Crash recovery stops what a crashed process may have left running; tasks
    are not resumed. The record holds pending entries (key, mint time, request) and admitted run
    IDs only.
-4. **Upstream route.** Propose it. After it lands and a pinned target carries it, append voice
-   messages and resume from the voice session. The profile and the voice session join the
-   binding record.
+4. **Durable voice tail.** Mirror the live store's durable view into one bounded, locked file,
+   restore it before the first turn, and report restart-stopped work as ended history with one
+   fixed announcement.
+5. **Upstream route.** Propose it. After it lands and a pinned target carries it, drain the
+   durable tail into the voice session through one "delivered through" cursor, then append
+   voice messages and resume from the voice session. The profile and the voice session join
+   the binding record.
 
 ## Required qualification before acceptance
 
@@ -275,6 +324,8 @@ Each step must prove its guarantees against a qualified exact target:
 - a restarted host stops every recorded run, and reports what it stopped and what stayed
   unknown;
 - live context and the record contain only transport-confirmed text and markers;
+- a crash keeps every row the voice tail recorded, and a malformed tail starts a fresh
+  conversation;
 - appends are idempotent, ordered, and never block the voice;
 - the record never holds a reply without its question;
 - resume admits only text rows from the bound session;
