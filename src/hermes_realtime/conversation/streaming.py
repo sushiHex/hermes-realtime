@@ -484,6 +484,43 @@ class StreamingSpeechLoop:
         finally:
             self._priority_admissions -= 1
 
+    async def record_user_input(self, transcript: Transcript) -> None:
+        """Record one final user input that starts no turn, such as an explicit command.
+
+        Rows keep heard order: live speech is settled first, as typed input
+        already settles it, so the user row can never displace an open
+        assistant row.
+        """
+
+        self._validate_transcript(transcript)
+        while True:
+            async with self._lifecycle_lock:
+                if self._closed:
+                    raise RuntimeError("streaming speech loop is closed")
+                if not self.foreground_active and not self._cleanup_tasks:
+                    self._context.record_user_transcript(transcript)
+                    return
+                self._authority_revision += 1
+                self._revoke_active_locked(terminal_reason=TerminalReason.STOP_SPEAKING)
+            await self._settle_owned_cleanups()
+
+    async def announce(self, turn_id: str, text: str) -> bool:
+        """Speak one fixed announcement when the floor is idle, as heard context."""
+
+        if type(turn_id) is not str:
+            raise TypeError("turn_id must be an exact built-in string")
+        if not turn_id.strip():
+            raise ValueError("turn_id must not be blank")
+        return await self._run_turn(
+            turn_id,
+            transcript=None,
+            announcement=text,
+            updates=(),
+            update_operation=None,
+            idle_only=True,
+            preserve_resumable_on_cancel=False,
+        )
+
     async def resume_interrupted(
         self,
         evidence_lease: EvidenceTurnLease | None = None,
@@ -1442,6 +1479,10 @@ class StreamingSpeechLoop:
                             TerminalReason.LEDGER_CLOSE_FAILED,
                         )
                 raise
+            if last_heard_segment is not None:
+                # The turn completed: its last heard row is whole, never interrupted.
+                self._context.close_assistant_segment(last_heard_segment)
+                last_heard_segment = None
             evidence = self._resolve_evidence_admission()
             authoritative_response_settled = False
             if evidence is not None and evidence_lease is not None:

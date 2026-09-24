@@ -2,6 +2,7 @@
 
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -174,7 +175,12 @@ class ConversationContextSnapshot:
 
 
 class ConversationContextStore:
-    """Retain a compact event-loop-local prompt context."""
+    """Retain a compact event-loop-local prompt context.
+
+    ``on_change`` receives :meth:`durable_messages` synchronously after every
+    mutation of the message rows, so a caller can mirror them off the voice
+    path. It must be cheap; a failure is a programming error and propagates.
+    """
 
     def __init__(
         self,
@@ -184,7 +190,11 @@ class ConversationContextStore:
         max_item_chars: int = 1024,
         max_task_incarnations: int = 1024,
         max_pending_assistant_admissions: int = 16,
+        on_change: Callable[[tuple[ConversationMessage, ...]], None] | None = None,
     ) -> None:
+        if on_change is not None and not callable(on_change):
+            raise TypeError("on_change must be callable or None")
+        self._on_change = on_change
         self._max_messages = self._bounded_positive_integer(
             max_messages,
             "max_messages",
@@ -328,28 +338,93 @@ class ConversationContextStore:
                 self._messages.append(message)
             self._open_assistant_segment = (segment, message)
             self._revision += 1
+            self._notify_change()
         return delivered_text
 
     def mark_assistant_segment_interrupted(self, segment: AssistantSegmentKey) -> None:
         """Flag ``segment``'s open heard row as interrupted, exactly once."""
 
-        if type(segment) is not AssistantSegmentKey:
-            raise TypeError("segment must be an exact AssistantSegmentKey")
-        open_segment = self._open_assistant_segment
-        if (
-            open_segment is None
-            or open_segment[0] is not segment
-            or not self._messages
-            or self._messages[-1] is not open_segment[1]
-        ):
-            raise KeyError("segment is not the open heard assistant row")
+        open_row = self._require_open_segment(segment)
         # Same heard text, now flagged. Replacing the row object displaces the
         # open segment, so neither a second flag nor a later upsert can apply.
         self._messages[-1] = ConversationMessage(
             role=ConversationRole.ASSISTANT.value,
-            text=open_segment[1].text,
+            text=open_row.text,
             interrupted=True,
         )
+        self._revision += 1
+        self._notify_change()
+
+    def close_assistant_segment(self, segment: AssistantSegmentKey) -> None:
+        """End ``segment``'s open heard row because its speech completed normally."""
+
+        self._require_open_segment(segment)
+        self._open_assistant_segment = None
+        self._notify_change()
+
+    def durable_messages(self) -> tuple[ConversationMessage, ...]:
+        """Return the rows as a restart should see them.
+
+        A still-open assistant row is flagged interrupted, because a crash now
+        would cut it off. Every other row is exactly the live row.
+        """
+
+        open_segment = self._open_assistant_segment
+        open_row = None if open_segment is None else open_segment[1]
+        return tuple(
+            ConversationMessage(
+                role=message.role,
+                text=message.text,
+                interrupted=message.interrupted or message is open_row,
+            )
+            for message in self._messages
+        )
+
+    def restore(self, messages: tuple[ConversationMessage, ...]) -> None:
+        """Seed a pristine store with a previous process's durable rows.
+
+        The whole tail is refused with ValueError when any row is outside this
+        store's bounds; nothing is ever truncated.
+        """
+
+        if type(messages) is not tuple:
+            raise TypeError("restored messages must be an exact tuple")
+        if any(type(message) is not ConversationMessage for message in messages):
+            raise TypeError("restored messages must be exact ConversationMessage values")
+        if (
+            self._revision != 0
+            or self._messages
+            or self._assistant_admissions_by_object_id
+            or self._pending_task_admissions_by_object_id
+        ):
+            raise RuntimeError("restore requires a pristine context store")
+        if len(messages) > self._max_messages:
+            raise ValueError("restored messages exceed max_messages")
+        rows: list[ConversationMessage] = []
+        for message in messages:
+            try:
+                row = ConversationMessage(
+                    role=message.role,
+                    text=message.text,
+                    interrupted=message.interrupted,
+                )
+            except (TypeError, PrivateRunDisclosureError) as error:
+                raise ValueError("restored message is invalid") from error
+            self._validate_text(row.text)
+            rows.append(row)
+        self._messages.extend(rows)
+        self._revision = 1
+        self._notify_change()
+
+    def record_tasks_ended_by_restart(self, count: int) -> None:
+        """Count tasks a previous process left behind as ended, never active, history."""
+
+        if (
+            type(count) is not int
+            or not 1 <= count <= self._max_task_incarnations - self._terminal_task_count
+        ):
+            raise ValueError("restart-ended task count is outside the supported range")
+        self._terminal_task_count += count
         self._revision += 1
 
     def prepare_task(self, task_id: str, objective: str) -> TaskAdmission:
@@ -496,6 +571,25 @@ class ConversationContextStore:
         self._validate_model_visible_text(text)
         self._messages.append(ConversationMessage(role=role.value, text=text))
         self._revision += 1
+        self._notify_change()
+
+    def _notify_change(self) -> None:
+        on_change = self._on_change
+        if on_change is not None:
+            on_change(self.durable_messages())
+
+    def _require_open_segment(self, segment: AssistantSegmentKey) -> ConversationMessage:
+        if type(segment) is not AssistantSegmentKey:
+            raise TypeError("segment must be an exact AssistantSegmentKey")
+        open_segment = self._open_assistant_segment
+        if (
+            open_segment is None
+            or open_segment[0] is not segment
+            or not self._messages
+            or self._messages[-1] is not open_segment[1]
+        ):
+            raise KeyError("segment is not the open heard assistant row")
+        return open_segment[1]
 
     def _resolve_assistant_admission(
         self,
