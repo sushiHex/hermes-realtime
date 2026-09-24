@@ -3339,6 +3339,36 @@ async def test_start_removes_orphaned_run_record_temporaries_after_taking_the_lo
 
 
 @pytest.mark.asyncio
+async def test_a_scanner_held_run_record_orphan_never_fails_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record)
+    held = _orphan(record)
+    removable = _orphan(record)
+    real_unlink = Path.unlink
+
+    def scanner_held(self: Path, missing_ok: bool = False) -> None:
+        if self == held:
+            raise PermissionError(13, "sharing violation")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", scanner_held)
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert session.restart_settlement == HermesRestartSettlement(stopped=0, unknown=0)
+        assert held.exists()
+        assert not removable.exists()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_a_second_host_leaves_the_owners_temporaries_alone(tmp_path: Path) -> None:
     record = tmp_path / "hermes-runs-v1.json"
     release = asyncio.Event()

@@ -1,4 +1,4 @@
-"""Durable, bounded snapshot of the heard voice conversation, so a crash does not lose it.
+"""Durable, bounded snapshot of the heard voice conversation, so a restart does not lose it.
 
 The context store owns the truth and does no I/O. This module mirrors its durable view,
 off the voice path, into one file that the next start restores before its first turn.
@@ -8,12 +8,16 @@ The file is plaintext user data; it holds only rows the store would accept.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
+import math
 from pathlib import Path
 
-from hermes_realtime.conversation import ConversationContextStore, ConversationMessage
+from hermes_realtime.conversation import (
+    ConversationContextStore,
+    ConversationMessage,
+    DurableConversation,
+)
 from hermes_realtime.integration.run_record import (
     lock_run_record,
     read_run_record,
@@ -31,8 +35,11 @@ _LOCK_MARKER_PREFIX = "[voice-tail-lock] "
 _MAX_BYTES_PER_CHAR = 12
 _ROW_OVERHEAD_BYTES = 64
 _ENVELOPE_OVERHEAD_BYTES = 64
+_DOCUMENT_FIELDS = frozenset({"messages", "prior_work", "version"})
 _ROW_FIELDS = frozenset({"interrupted", "role", "text"})
 _MAX_BACKOFF_LIMIT_SECONDS = 60.0
+# A to_thread write cannot be cancelled, so close waits this long for the writer to finish.
+_DEFAULT_CLOSE_TIMEOUT_SECONDS = 10.0
 _CONCRETE_PATH = type(Path())
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,12 +52,13 @@ def max_voice_tail_bytes(max_messages: int, max_item_chars: int) -> int:
     )
 
 
-def voice_tail_bytes(messages: tuple[ConversationMessage, ...]) -> bytes:
+def voice_tail_bytes(view: DurableConversation) -> bytes:
     document = {
         "messages": [
             {"interrupted": message.interrupted, "role": message.role, "text": message.text}
-            for message in messages
+            for message in view.messages
         ],
+        "prior_work": view.prior_work,
         "version": _VERSION,
     }
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -61,18 +69,20 @@ def parse_voice_tail(
     *,
     max_messages: int,
     max_item_chars: int,
-) -> tuple[ConversationMessage, ...] | None:
-    """Return the tail's rows, or None when it is malformed, oversized, or another version."""
+) -> DurableConversation | None:
+    """Return the tail's view, or None when it is malformed, oversized, or another version."""
     if len(raw) > max_voice_tail_bytes(max_messages, max_item_chars):
         return None
     try:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
     except (UnicodeDecodeError, ValueError):
         return None
-    if type(document) is not dict or set(document) != {"messages", "version"}:
+    if type(document) is not dict or set(document) != _DOCUMENT_FIELDS:
         return None
-    version, rows = document["version"], document["messages"]
+    version, rows, prior_work = document["version"], document["messages"], document["prior_work"]
     if type(version) is not int or version != _VERSION:
+        return None
+    if type(prior_work) is not bool:
         return None
     if type(rows) is not list or len(rows) > max_messages:
         return None
@@ -84,11 +94,13 @@ def parse_voice_tail(
         if type(role) is not str or type(text) is not str or type(interrupted) is not bool:
             return None
         try:
+            # A lone surrogate decodes from JSON but is not text the store can hold.
+            text.encode("utf-8")
             messages.append(ConversationMessage(role=role, text=text, interrupted=interrupted))
         except (ValueError, RuntimeError):
             # Unknown roles, flagged user rows, blank text, and private run tokens.
             return None
-    return tuple(messages)
+    return DurableConversation(messages=tuple(messages), prior_work=prior_work)
 
 
 def _marker(prefix: str, evidence: dict[str, str | int]) -> None:
@@ -98,9 +110,10 @@ def _marker(prefix: str, evidence: dict[str, str | int]) -> None:
 class VoiceTailWriter:
     """Own one tail file: restore it once, then mirror every change with the latest winning.
 
-    ``update`` is the store's ``on_change``: synchronous and O(1). One task writes, so
-    a stale snapshot can never land after a newer one, and a failed write backs off and
-    retries with whatever is latest by then.
+    ``update`` is the store's ``on_change``: synchronous and O(1). One task owns every
+    write, the final one included, so a stale snapshot can never land after a newer one.
+    A failed write backs off within a bound and retries with whatever is latest by then;
+    closing never cuts that short, it only lets the task finish once the tail is clean.
     """
 
     def __init__(
@@ -109,15 +122,19 @@ class VoiceTailWriter:
         *,
         initial_backoff_seconds: float = 0.05,
         max_backoff_seconds: float = 2.0,
+        close_timeout_seconds: float = _DEFAULT_CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         if type(path) is not _CONCRETE_PATH:
             raise TypeError("voice tail path must be an exact pathlib Path")
         if not 0 < initial_backoff_seconds <= max_backoff_seconds <= _MAX_BACKOFF_LIMIT_SECONDS:
             raise ValueError("voice tail backoff must be positive and bounded")
+        if not (math.isfinite(close_timeout_seconds) and close_timeout_seconds > 0):
+            raise ValueError("voice tail close timeout must be finite and positive")
         self._path = path
         self._initial_backoff = float(initial_backoff_seconds)
         self._max_backoff = float(max_backoff_seconds)
-        self._latest: tuple[ConversationMessage, ...] = ()
+        self._close_timeout = float(close_timeout_seconds)
+        self._latest = DurableConversation(messages=(), prior_work=False)
         self._dirty = False
         self._wake = asyncio.Event()
         self._close_requested = asyncio.Event()
@@ -125,10 +142,10 @@ class VoiceTailWriter:
         self._owner: int | None = None
         self._task: asyncio.Task[None] | None = None
 
-    def update(self, messages: tuple[ConversationMessage, ...]) -> None:
-        if type(messages) is not tuple:
-            raise TypeError("voice tail messages must be an exact tuple")
-        self._latest = messages
+    def update(self, view: DurableConversation) -> None:
+        if type(view) is not DurableConversation:
+            raise TypeError("voice tail updates must be an exact DurableConversation")
+        self._latest = view
         self._dirty = True
         self._wake.set()
 
@@ -168,69 +185,77 @@ class VoiceTailWriter:
         # Counts or a refusal category only; never row text.
         evidence: dict[str, str | int] | None = None
         try:
-            messages = parse_voice_tail(
+            view = parse_voice_tail(
                 raw,
                 max_messages=store.max_messages,
                 max_item_chars=store.max_item_chars,
             )
             try:
-                if messages is None:
+                if view is None:
                     raise ValueError("voice tail is malformed")
-                store.restore(messages)
+                store.restore(view)
             except ValueError:
                 evidence = {"refusal": "malformed", "version": 1}
             else:
-                evidence = {"restored": len(messages), "version": 1}
+                evidence = {"restored": len(view.messages), "version": 1}
         finally:
             if evidence is not None:
                 _marker(_MARKER_PREFIX, evidence)
 
     async def close(self) -> None:
-        """Stop mirroring, write the final snapshot if it changed, and release the tail."""
+        """Let the writer finish the final snapshot, then release the tail.
+
+        On timeout the tail stays owned and RuntimeError is raised, so a later
+        close waits again instead of silently giving up the final write.
+        """
         self._close_requested.set()
         self._wake.set()
-        task, self._task = self._task, None
-        owner, self._owner = self._owner, None
+        owner = self._owner
         if owner is None:
             return
-        try:
-            if task is not None:
-                await task
-            if self._dirty:
-                self._dirty = False
-                await self._write(self._latest)
-        finally:
-            unlock_run_record(owner)
+        task = self._task
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=self._close_timeout)
+            except TimeoutError:
+                raise RuntimeError(
+                    "voice tail writer did not finish before the close timeout"
+                ) from None
+        self._task = None
+        self._owner = None
+        unlock_run_record(owner)
 
     async def _mirror(self) -> None:
         backoff = self._initial_backoff
-        while not self._close_requested.is_set():
-            await self._wake.wait()
-            self._wake.clear()
-            while self._dirty and not self._close_requested.is_set():
-                messages = self._latest
-                self._dirty = False
-                try:
-                    await self._write(messages)
-                except OSError as error:
-                    # The latest snapshot, whichever it is by now, is still unwritten.
-                    self._dirty = True
-                    _LOGGER.warning(
-                        "voice tail write failed (%s); retrying in %.2f s",
-                        type(error).__name__,
-                        backoff,
-                    )
-                    await self._wait_backoff(backoff)
-                    backoff = min(backoff * 2, self._max_backoff)
-                else:
-                    backoff = self._initial_backoff
+        while True:
+            if not self._dirty:
+                if self._close_requested.is_set():
+                    return
+                await self._wake.wait()
+                self._wake.clear()
+                continue
+            view = self._latest
+            self._dirty = False
+            try:
+                await self._write(view)
+            except Exception as error:
+                # The latest snapshot, whichever it is by now, is still unwritten.
+                self._dirty = True
+                _LOGGER.warning(
+                    "voice tail write failed (%s); retrying in %.2f s",
+                    type(error).__name__,
+                    backoff,
+                )
+                await self._wait_backoff(backoff)
+                backoff = min(backoff * 2, self._max_backoff)
+            else:
+                backoff = self._initial_backoff
 
-    async def _write(self, messages: tuple[ConversationMessage, ...]) -> None:
-        await asyncio.to_thread(write_run_record, self._path, voice_tail_bytes(messages))
+    async def _write(self, view: DurableConversation) -> None:
+        await asyncio.to_thread(write_run_record, self._path, voice_tail_bytes(view))
 
     async def _wait_backoff(self, delay: float) -> None:
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._close_requested.wait(), timeout=delay)
+        await asyncio.sleep(delay)
 
 
 __all__ = [

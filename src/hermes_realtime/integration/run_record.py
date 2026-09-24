@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 _VERSION = 1
 _KEY = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_FIELDS = frozenset({"input", "instructions", "provider", "model", "model_options"})
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -54,7 +56,8 @@ def remove_orphaned_temporaries(path: Path) -> int:
 
     They hold plaintext, and only the lock holder may call this, since a live
     writer's in-flight temporary looks the same. Matches exactly the names
-    ``write_run_record`` creates for this path, never a neighbour's.
+    ``write_run_record`` creates for this path, never a neighbour's. Removal is
+    best effort: one that cannot be deleted now is left for a later start.
     """
     pattern = re.compile(re.escape(f".{path.name}.") + r"[a-z0-9_]{8}\.tmp\Z")
     try:
@@ -65,9 +68,17 @@ def remove_orphaned_temporaries(path: Path) -> int:
     for entry in entries:
         if pattern.fullmatch(entry.name) is None:
             continue
-        with contextlib.suppress(FileNotFoundError):
+        try:
             entry.unlink()
-            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            # Best effort: a scanner holding one open must never fail start.
+            _LOGGER.warning(
+                "orphaned temporary could not be removed (%s)", type(error).__name__
+            )
+            continue
+        removed += 1
     return removed
 
 

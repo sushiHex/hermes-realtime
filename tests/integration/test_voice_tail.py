@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_realtime.conversation import ConversationContextStore, ConversationMessage
+from hermes_realtime.conversation import (
+    ConversationContextStore,
+    ConversationMessage,
+    DurableConversation,
+)
 from hermes_realtime.integration import run_record as run_record_module
 from hermes_realtime.integration import voice_tail as voice_tail_module
 from hermes_realtime.integration.voice_tail import (
@@ -25,8 +29,13 @@ _MARKER = "[voice-tail] "
 _LOCK_MARKER = "[voice-tail-lock] "
 
 
-def _rows(*rows: tuple[str, str, bool]) -> tuple[ConversationMessage, ...]:
-    return tuple(ConversationMessage(role, text, interrupted) for role, text, interrupted in rows)
+def _rows(*rows: tuple[str, str, bool], prior_work: bool = False) -> DurableConversation:
+    return DurableConversation(
+        messages=tuple(
+            ConversationMessage(role, text, interrupted) for role, text, interrupted in rows
+        ),
+        prior_work=prior_work,
+    )
 
 
 def _markers(output: str, prefix: str) -> list[str]:
@@ -35,6 +44,10 @@ def _markers(output: str, prefix: str) -> list[str]:
 
 def _writer(path: Path, **kwargs: float) -> VoiceTailWriter:
     return VoiceTailWriter(path, **kwargs)
+
+
+def _parse(raw: bytes) -> DurableConversation | None:
+    return parse_voice_tail(raw, max_messages=16, max_item_chars=64)
 
 
 def _orphan(path: Path) -> Path:
@@ -48,39 +61,41 @@ def _orphan(path: Path) -> Path:
 
 
 def test_the_tail_is_sorted_compact_versioned_json() -> None:
-    messages = _rows(("user", "Hi é", False), ("assistant", "Cut", True))
+    tail = _rows(("user", "Hi é", False), ("assistant", "Cut", True), prior_work=True)
 
-    assert voice_tail_bytes(messages) == (
+    assert voice_tail_bytes(tail) == (
         b'{"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
-        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"version":1}'
+        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":1}'
     )
-    assert parse_voice_tail(
-        voice_tail_bytes(messages), max_messages=16, max_item_chars=64
-    ) == messages
-    assert parse_voice_tail(voice_tail_bytes(()), max_messages=16, max_item_chars=64) == ()
+    assert _parse(voice_tail_bytes(tail)) == tail
+    assert _parse(voice_tail_bytes(_rows())) == _rows()
 
 
 def test_the_byte_bound_admits_a_worst_case_tail_at_the_stores_bounds() -> None:
     # One astral character is one str character but twelve escaped bytes.
-    messages = tuple(
-        ConversationMessage("assistant", "\U0001f600" * 8, interrupted=True) for _ in range(3)
+    tail = DurableConversation(
+        messages=tuple(
+            ConversationMessage("assistant", "\U0001f600" * 8, interrupted=True) for _ in range(3)
+        ),
+        prior_work=False,
     )
-    raw = voice_tail_bytes(messages)
+    raw = voice_tail_bytes(tail)
     bound = max_voice_tail_bytes(3, 8)
 
-    def parse(data: bytes) -> tuple[ConversationMessage, ...] | None:
+    def parse(data: bytes) -> DurableConversation | None:
         return parse_voice_tail(data, max_messages=3, max_item_chars=8)
 
     assert len(raw) <= bound
-    assert parse(raw) == messages
+    assert parse(raw) == tail
     assert parse(b" " * (bound + 1)) is None
     assert parse(raw + b" " * (bound + 1 - len(raw))) is None
-    assert parse(raw + b" " * (bound - len(raw))) == messages
+    assert parse(raw + b" " * (bound - len(raw))) == tail
 
 
 def _document(**overrides: object) -> bytes:
     document: dict[str, object] = {
         "messages": [{"interrupted": False, "role": "user", "text": "Hi"}],
+        "prior_work": False,
         "version": 1,
     }
     document.update(overrides)
@@ -100,17 +115,25 @@ def _row_document(**overrides: object) -> bytes:
         pytest.param(b"\xff\xfe{}", id="not-utf8"),
         pytest.param(b"[]", id="not-an-object"),
         pytest.param(
-            b'{"messages":[],"version":1,"version":1}',
+            b'{"messages":[],"prior_work":false,"version":1,"version":1}',
             id="duplicate-top-level-key",
         ),
         pytest.param(
             b'{"messages":[{"interrupted":false,"role":"user","role":"user","text":"Hi"}],'
-            b'"version":1}',
+            b'"prior_work":false,"version":1}',
             id="duplicate-row-key",
         ),
         pytest.param(_document(extra=1), id="extra-top-level-key"),
-        pytest.param(json.dumps({"version": 1}).encode(), id="missing-messages"),
-        pytest.param(json.dumps({"messages": []}).encode(), id="missing-version"),
+        pytest.param(
+            json.dumps({"prior_work": False, "version": 1}).encode(), id="missing-messages"
+        ),
+        pytest.param(
+            json.dumps({"messages": [], "prior_work": False}).encode(), id="missing-version"
+        ),
+        pytest.param(
+            json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"
+        ),
+        pytest.param(_document(prior_work=0), id="prior-work-not-a-boolean"),
         pytest.param(_document(version=2), id="unknown-version"),
         pytest.param(_document(version="1"), id="string-version"),
         pytest.param(_document(version=1.0), id="float-version"),
@@ -129,6 +152,7 @@ def _row_document(**overrides: object) -> bytes:
         pytest.param(_row_document(interrupted=True), id="interrupted-user-row"),
         pytest.param(_row_document(text="   "), id="blank-text"),
         pytest.param(_row_document(text="said deleg_private"), id="private-run-token"),
+        pytest.param(_row_document(text="lone \ud800 surrogate"), id="not-utf8-encodable"),
         pytest.param(
             _document(messages=[{"interrupted": False, "role": "user", "text": "Hi"}] * 17),
             id="more-rows-than-max-messages",
@@ -136,7 +160,7 @@ def _row_document(**overrides: object) -> bytes:
     ],
 )
 def test_every_malformed_class_is_refused(raw: bytes) -> None:
-    assert parse_voice_tail(raw, max_messages=16, max_item_chars=64) is None
+    assert _parse(raw) is None
 
 
 @pytest.mark.asyncio
@@ -144,15 +168,21 @@ async def test_open_restores_the_tail_before_anything_else_and_reports_only_a_co
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = tmp_path / "state" / "voice-tail-v1.json"
-    tail = _rows(("user", "Earlier question", False), ("assistant", "Earlier answer", True))
+    tail = _rows(
+        ("user", "Earlier question", False),
+        ("assistant", "Earlier answer", True),
+        prior_work=True,
+    )
     run_record_module.write_run_record(path, voice_tail_bytes(tail))
     writer = _writer(path)
     store = ConversationContextStore(on_change=writer.update)
 
     await writer.open(store)
     try:
-        assert store.snapshot().messages == tail
+        assert store.snapshot().messages == tail.messages
         assert store.snapshot().revision == 1
+        assert store.snapshot().terminal_task_count == 1
+        assert store.snapshot().active_tasks == ()
         output = capsys.readouterr().out
         assert _markers(output, _MARKER) == [_MARKER + '{"restored":2,"version":1}']
         assert "Earlier" not in output
@@ -209,9 +239,7 @@ async def test_a_refused_tail_starts_a_fresh_conversation_with_one_marker(
     finally:
         await writer.close()
 
-    assert parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=64) == _rows(
-        ("user", "Fresh start", False)
-    )
+    assert _parse(path.read_bytes()) == _rows(("user", "Fresh start", False))
     assert _markers(capsys.readouterr().out, _MARKER) == []
 
 
@@ -228,6 +256,35 @@ async def test_open_removes_orphaned_plaintext_temporaries_after_locking(
         assert not orphan.exists()
     finally:
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_scanner_held_orphan_never_fails_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "voice-tail-v1.json"
+    tail = _rows(("user", "Kept", False))
+    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+    held = _orphan(path)
+    real_unlink = Path.unlink
+
+    def scanner_held(self: Path, missing_ok: bool = False) -> None:
+        if self == held:
+            raise PermissionError(13, "sharing violation")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", scanner_held)
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+
+    with caplog.at_level(logging.WARNING, logger=run_record_module.__name__):
+        await writer.open(store)
+    await writer.close()
+
+    assert store.snapshot().messages == tail.messages
+    assert held.exists()
+    warnings = [record.getMessage() for record in caplog.records]
+    assert warnings == ["orphaned temporary could not be removed (PermissionError)"]
 
 
 @pytest.mark.asyncio
@@ -255,7 +312,7 @@ async def test_an_unreadable_tail_fails_start_and_releases_the_lock(
     retry_store = ConversationContextStore(on_change=retry.update)
     await retry.open(retry_store)
     await retry.close()
-    assert retry_store.snapshot().messages == tail
+    assert retry_store.snapshot().messages == tail.messages
 
 
 @pytest.mark.asyncio
@@ -282,7 +339,7 @@ async def test_a_second_host_cannot_open_a_live_hosts_tail(
         assert _markers(output, _LOCK_MARKER) == [_LOCK_MARKER + '{"cause":"held","version":1}']
         assert _markers(output, _MARKER) == []
         await second.close()
-        assert parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=64) == tail
+        assert _parse(path.read_bytes()) == tail
     finally:
         await first.close()
     in_flight.unlink()
@@ -291,7 +348,7 @@ async def test_a_second_host_cannot_open_a_live_hosts_tail(
     third_store = ConversationContextStore(on_change=third.update)
     await third.open(third_store)
     await third.close()
-    assert third_store.snapshot().messages == tail
+    assert third_store.snapshot().messages == tail.messages
 
 
 class _GatedWrites:
@@ -345,7 +402,7 @@ async def test_updates_coalesce_and_the_latest_snapshot_always_wins(
     assert writes.written == [voice_tail_bytes(first), latest]
     await writer.close()
     assert len(writes.written) == 2
-    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "four", False)))
+    assert path.read_bytes() == latest
 
 
 def test_update_only_stores_the_latest_snapshot_synchronously(tmp_path: Path) -> None:
@@ -356,7 +413,7 @@ def test_update_only_stores_the_latest_snapshot_synchronously(tmp_path: Path) ->
 
     assert not (tmp_path / "voice-tail-v1.json").exists()
     with pytest.raises(TypeError):
-        writer.update([ConversationMessage("user", "list")])  # type: ignore[arg-type]
+        writer.update(_rows(("user", "x", False)).messages)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -388,6 +445,29 @@ async def test_a_sharing_violation_backs_off_and_retries_with_the_latest_snapsho
 
 
 @pytest.mark.asyncio
+async def test_a_non_os_write_failure_is_retried_and_never_kills_the_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    writes.failures.append(ValueError("serializer bug"))
+    path = tmp_path / "voice-tail-v1.json"
+    writer = _writer(path, initial_backoff_seconds=0.01, max_backoff_seconds=0.02)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+
+    with caplog.at_level(logging.WARNING, logger=voice_tail_module.__name__):
+        writer.update(_rows(("user", "one", False)))
+        await _until(lambda: len(writes.written) == 1)
+    writer.update(_rows(("user", "two", False)))
+    await _until(lambda: len(writes.written) == 2)
+    await writer.close()
+
+    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "two", False)))
+    assert [record.getMessage() for record in caplog.records] == [
+        "voice tail write failed (ValueError); retrying in 0.01 s"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_the_backoff_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     writes = _GatedWrites(monkeypatch)
     writes.failures.extend(PermissionError(13, "sharing violation") for _ in range(8))
@@ -410,6 +490,88 @@ async def test_the_backoff_is_bounded(tmp_path: Path, monkeypatch: pytest.Monkey
     await writer.close()
 
     assert delays == [0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 0.05]
+
+
+@pytest.mark.asyncio
+async def test_close_flushes_the_final_dirty_snapshot_and_releases_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "voice-tail-v1.json"
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    writes.release.clear()
+    writer.update(_rows(("assistant", "Cut", False)))
+    await asyncio.to_thread(writes.started.wait, 2)
+    writer.update(_rows(("assistant", "Cut", True)))
+
+    closing = asyncio.create_task(writer.close())
+    await asyncio.sleep(0.02)
+    writes.release.set()
+    await asyncio.wait_for(closing, timeout=2)
+
+    assert writes.written[-1] == voice_tail_bytes(_rows(("assistant", "Cut", True)))
+    assert path.read_bytes() == voice_tail_bytes(_rows(("assistant", "Cut", True)))
+    next_owner = _writer(path)
+    await next_owner.open(ConversationContextStore(on_change=next_owner.update))
+    await next_owner.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_final_write_backs_off_fully_and_retries_before_close_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "voice-tail-v1.json"
+    delays: list[float] = []
+    writer = _writer(path, initial_backoff_seconds=0.05, max_backoff_seconds=0.05)
+    real_backoff = writer._wait_backoff
+
+    async def recording_backoff(delay: float) -> None:
+        delays.append(delay)
+        started = asyncio.get_running_loop().time()
+        await real_backoff(delay)
+        delays.append(round(asyncio.get_running_loop().time() - started, 2))
+
+    monkeypatch.setattr(writer, "_wait_backoff", recording_backoff)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    writes.failures.append(PermissionError(13, "sharing violation"))
+    writer.update(_rows(("assistant", "Final", True)))
+
+    await asyncio.wait_for(writer.close(), timeout=2)
+
+    assert writes.written == [voice_tail_bytes(_rows(("assistant", "Final", True)))]
+    assert delays[0] == 0.05
+    # Close never cuts the backoff short.
+    assert delays[1] >= 0.04
+    assert path.read_bytes() == voice_tail_bytes(_rows(("assistant", "Final", True)))
+
+
+@pytest.mark.asyncio
+async def test_a_close_timeout_keeps_the_tail_owned_and_a_retried_close_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "voice-tail-v1.json"
+    writer = _writer(path, close_timeout_seconds=0.05)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    writes.release.clear()
+    writer.update(_rows(("user", "slow", False)))
+    await asyncio.to_thread(writes.started.wait, 2)
+
+    with pytest.raises(RuntimeError, match="close timeout"):
+        await writer.close()
+
+    contender = _writer(path)
+    with pytest.raises(RuntimeError, match="another host holds the voice tail"):
+        await contender.open(ConversationContextStore(on_change=contender.update))
+    writes.release.set()
+    await writer.close()
+
+    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "slow", False)))
+    successor = _writer(path)
+    await successor.open(ConversationContextStore(on_change=successor.update))
+    await successor.close()
 
 
 @pytest.mark.asyncio
@@ -448,28 +610,6 @@ async def test_close_waits_for_an_in_flight_write_so_the_newest_lands_last(
 
     assert written[-1] == voice_tail_bytes(_rows(("user", "newest", False)))
     assert path.read_bytes() == voice_tail_bytes(_rows(("user", "newest", False)))
-
-
-@pytest.mark.asyncio
-async def test_close_flushes_the_final_dirty_snapshot_and_releases_the_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    writes = _GatedWrites(monkeypatch)
-    path = tmp_path / "voice-tail-v1.json"
-    writer = _writer(path, initial_backoff_seconds=5.0, max_backoff_seconds=5.0)
-    await writer.open(ConversationContextStore(on_change=writer.update))
-    writes.failures.append(PermissionError(13, "sharing violation"))
-    writer.update(_rows(("assistant", "Cut", False)))
-    await _until(lambda: not writes.failures)
-    writer.update(_rows(("assistant", "Cut", True)))
-
-    await asyncio.wait_for(writer.close(), timeout=2)
-
-    assert writes.written == [voice_tail_bytes(_rows(("assistant", "Cut", True)))]
-    assert path.read_bytes() == voice_tail_bytes(_rows(("assistant", "Cut", True)))
-    next_owner = _writer(path)
-    await next_owner.open(ConversationContextStore(on_change=next_owner.update))
-    await next_owner.close()
 
 
 @pytest.mark.asyncio
@@ -517,3 +657,17 @@ async def test_open_is_one_shot_and_requires_an_exact_store(tmp_path: Path) -> N
 def test_the_tail_path_must_be_an_exact_path(path: object) -> None:
     with pytest.raises(TypeError, match="path"):
         VoiceTailWriter(path)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"close_timeout_seconds": 0.0},
+        {"close_timeout_seconds": -1.0},
+        {"close_timeout_seconds": float("inf")},
+        {"close_timeout_seconds": float("nan")},
+    ],
+)
+def test_the_close_timeout_is_finite_and_positive(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="close timeout"):
+        VoiceTailWriter(Path("voice-tail-v1.json"), **kwargs)
