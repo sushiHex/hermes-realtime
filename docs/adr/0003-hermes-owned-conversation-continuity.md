@@ -36,7 +36,8 @@ The #80 audit of v0.21.0 established four facts this design rests on:
   ([counter](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/turn_context.py#L782-L790)).
   Nothing reviews a stored session.
 - **Runs accept what delegation needs.** `/v1/runs` accepts a client `session_id`, an
-  `Idempotency-Key` backed by a durable unique reservation, and explicit `conversation_history`
+  `Idempotency-Key` backed by a unique reservation (durable when the server advertises it), and
+  explicit `conversation_history`
   that is used as context but not re-persisted
   ([session](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L546),
   [idempotency](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L452-L465),
@@ -78,11 +79,16 @@ Older recall is delegated: a run can search sessions.
 
 ### 2. Every delegated run is its own Hermes session
 
-Each run carries three things:
+Hermes already gives every run a session of its own, named by its run ID
+([default](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L605-L607)).
+Realtime therefore sends no session ID. Each run carries two things:
 
-- a realtime-generated session ID derived from the task;
-- `Idempotency-Key` set to the task ID;
-- a bounded tail of the voice conversation as `conversation_history`.
+- **An `Idempotency-Key` minted for that one dispatch.** Hermes scopes keys by profile and API
+  key, which every client of the same credentials shares. A task can also be dispatched more
+  than once. A per-dispatch key is the only identity that means "this request".
+- **A bounded tail of the voice conversation as `conversation_history`.** The tail is sent only
+  once live context is heard-first (see below), and only on a profile whose memory is
+  built-in, so unheard speech never leaves realtime.
 
 Runs never use the voice session. A run holds its session's cross-process turn lease for its
 whole duration, and a voice write must never wait behind background work. With separate
@@ -90,25 +96,46 @@ sessions it cannot. The tail gives the work the conversation's context. It also 
 own skill review, which runs over the whole message snapshot, learn from voice conversations
 wherever real work happens.
 
+A dispatch whose first attempt got no response is resent once, unchanged, under the same key.
+Hermes admits a run at most once per key, so the resend either returns the run the first
+attempt started or admits the request if it never arrived. After such an ambiguous attempt,
+only an admission settles the dispatch. A refused resend proves nothing about the first
+attempt, so its outcome is reported as unknown, never as a rejection. The resend happens even
+for an abandoned dispatch, because it is the only way to learn a run that must then be stopped.
+Resending requires Hermes to advertise durable run idempotency, the only record that answers a
+resend truthfully across a Hermes restart
+([capability](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L94-L99)).
+A resend is also refused once the dispatch is older, by the wall clock, than the retention
+Hermes advertises. A host suspended past that window could otherwise find its key pruned and
+start the work again. Durability is known only as advertised at startup. If Hermes restarts
+onto its in-memory fallback store, the resend guarantee does not hold, and no capability check
+can make it atomic.
+
 ### 3. Realtime keeps one binding record
 
-The binding record holds `{profile, voice session ID, task ID → run ID and run session ID}`. It
-is bounded, and it is the only persisted realtime state. #77 item 4 admits exactly this kind of
-session reference and bounded transient context.
+The binding record holds `{profile, voice session ID, task ID → run ID}`; a run's ID also names
+its session. It is bounded, and it is the only persisted realtime state. #77 item 4 admits
+exactly this kind of session reference and bounded transient context.
 
 - **Before dispatch.** A task is recorded before its request is sent, together with that exact
-  request. Hermes's acknowledgment promotes the entry to its run ID and drops the request. The
-  request is the only transcript-bearing content the record ever holds, and only until it is
-  acknowledged.
-- **Restart, pending entry.** Realtime replays the stored request verbatim under the same
+  request, its idempotency key, and when it was minted. Hermes's acknowledgment promotes the
+  entry to its run ID and drops the request. The request is the only transcript-bearing content
+  the record ever holds, and only until it is acknowledged.
+- **Restart, pending entry.** Realtime replays the stored request verbatim under its stored
   idempotency key. Hermes returns the original run if it accepted the request, or starts the
-  work if the request never arrived. A replay must be byte-identical: a different body is
-  refused as a conflict
+  work if the request never arrived. A replay must carry the same parsed body, because Hermes
+  fingerprints the parsed JSON; a different body is refused as a conflict
   ([replay](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L562-L594)).
+  An entry older than the advertised retention is never replayed, because Hermes may have pruned
+  its record and would start the work again
+  ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
+  Its outcome is reported as unknown.
 - **Restart, promoted entry.** Realtime reconciles it with `GET /v1/runs/{id}`. A run Hermes no
   longer knows is reported as lost, never as running.
 
-No accepted run can therefore go untracked, and no retry can start work twice.
+With the record in place, no accepted run can go untracked and no retry can start work twice.
+Before it, the in-process resend recovers one lost acknowledgment; a dispatch whose resend also
+gets no response ends with its outcome unknown.
 
 ### Live context follows the same rule
 
@@ -172,6 +199,14 @@ A backend outage never silences the voice.
   separate, explicit operation, and complete file-level erasure is not promised until the delete
   path is qualified
   ([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
+  A run dispatched with a key also has its status persisted by Hermes, including its output,
+  error, and any approval request still pending
+  ([persistence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L138-L152)).
+  Under the default policy for bearer clients, a terminal record is pruned once it is more than
+  24 hours past its last status update. A record left non-terminal by a gateway crash is not
+  pruned until Hermes rehydrates it as interrupted
+  ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
+  No API route deletes it, so forget does not remove it.
 - **Retention.** Hermes session auto-pruning stays disabled for the MVP.
 
 ## Rejected alternatives
@@ -189,9 +224,10 @@ A backend outage never silences the voice.
 
 ## Implementation sequence
 
-1. **Run adapter.** Add the idempotency key, a per-task session, and a bounded voice tail to
-   `/v1/runs`.
-2. **Heard-first live context.** Correct the Codex prompt to match.
+1. **Idempotent dispatch.** Add the per-dispatch key and the single lost-acknowledgment resend.
+   Settle Hermes's `interrupted` status, which a replay after a Hermes restart reports.
+2. **Heard-first live context.** Correct the Codex prompt to match, then add the bounded voice
+   tail to runs.
 3. **Binding record.** Add restart reconciliation.
 4. **Upstream route.** Propose it. After it lands and a pinned target carries it, append voice
    messages and resume from the voice session.
