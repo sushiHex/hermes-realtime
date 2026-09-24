@@ -231,6 +231,34 @@ async def test_open_removes_orphaned_plaintext_temporaries_after_locking(
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_tail_fails_start_and_releases_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "voice-tail-v1.json"
+    tail = _rows(("user", "Kept", False))
+    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+
+    def sharing_violation(_path: Path, _max_bytes: int) -> bytes | None:
+        raise PermissionError(13, "sharing violation")
+
+    monkeypatch.setattr(voice_tail_module, "read_run_record", sharing_violation)
+    failed = _writer(path)
+    failed_store = ConversationContextStore(on_change=failed.update)
+    with pytest.raises(PermissionError):
+        await failed.open(failed_store)
+    await failed.close()
+    monkeypatch.undo()
+
+    assert failed_store.snapshot().revision == 0
+    assert _markers(capsys.readouterr().out, _MARKER) == []
+    retry = _writer(path)
+    retry_store = ConversationContextStore(on_change=retry.update)
+    await retry.open(retry_store)
+    await retry.close()
+    assert retry_store.snapshot().messages == tail
+
+
+@pytest.mark.asyncio
 async def test_a_second_host_cannot_open_a_live_hosts_tail(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -375,9 +403,45 @@ async def test_the_backoff_is_bounded(tmp_path: Path, monkeypatch: pytest.Monkey
 
     writer.update(_rows(("user", "one", False)))
     await _until(lambda: len(writes.written) == 1)
+    # A success resets the backoff for the next failure.
+    writes.failures.append(PermissionError(13, "sharing violation"))
+    writer.update(_rows(("user", "two", False)))
+    await _until(lambda: len(writes.written) == 2)
     await writer.close()
 
-    assert delays == [0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0]
+    assert delays == [0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 0.05]
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_an_in_flight_write_so_the_newest_lands_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    written: list[bytes] = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def write(path: Path, data: bytes) -> None:
+        if not first_started.is_set():
+            first_started.set()
+            release_first.wait(timeout=5)
+        written.append(data)
+        run_record_module.write_run_record(path, data)
+
+    monkeypatch.setattr(voice_tail_module, "write_run_record", write)
+    path = tmp_path / "voice-tail-v1.json"
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    writer.update(_rows(("user", "stale", False)))
+    await asyncio.to_thread(first_started.wait, 2)
+    writer.update(_rows(("user", "newest", False)))
+
+    closing = asyncio.create_task(writer.close())
+    await asyncio.sleep(0.05)
+    release_first.set()
+    await asyncio.wait_for(closing, timeout=2)
+
+    assert written[-1] == voice_tail_bytes(_rows(("user", "newest", False)))
+    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "newest", False)))
 
 
 @pytest.mark.asyncio

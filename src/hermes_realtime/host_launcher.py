@@ -2073,6 +2073,7 @@ def build_local_host_launcher(
         reserve_observer_capacity=projection.ensure_capacity,
         utterance_id_factory=lambda: uuid.uuid4().hex,
     )
+
     async def record_command_input(text: str) -> None:
         await speech.record_user_input(Transcript(text=text, final=True))
 

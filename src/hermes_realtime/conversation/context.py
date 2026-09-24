@@ -397,9 +397,9 @@ class ConversationContextStore:
             raise TypeError("restored messages must be an exact tuple")
         if any(type(message) is not ConversationMessage for message in messages):
             raise TypeError("restored messages must be exact ConversationMessage values")
+        # Revision 0 also means no rows: every row mutation advances it.
         if (
             self._revision != 0
-            or self._messages
             or self._assistant_admissions_by_object_id
             or self._pending_task_admissions_by_object_id
         ):

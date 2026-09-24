@@ -4392,6 +4392,9 @@ async def test_recording_user_input_settles_live_speech_before_its_row() -> None
         loop.respond("turn_001", Transcript(text="Question?", final=True))
     )
     await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    with pytest.raises(ValueError, match="final"):
+        await loop.record_user_input(Transcript(text="partial", final=False))
+    assert loop.foreground_active is True
 
     await loop.record_user_input(Transcript(text="task: check the build", final=True))
 
@@ -4429,3 +4432,56 @@ async def test_announce_speaks_fixed_text_as_heard_context_without_inference() -
         with pytest.raises((TypeError, ValueError), match="turn_id"):
             await loop.announce(turn_id, "Again.")
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_never_takes_the_floor_from_live_speech() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Live answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop.foreground_active is True
+    assert [chunk.text for chunk in playback.chunks] == ["Live answer."]
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_completion_never_flags_the_closed_row() -> None:
+    context = ConversationContextStore()
+
+    def observer(kind: str, _data: dict[str, str | int | bool | None]) -> None:
+        if kind == "assistant_turn_completed":
+            raise asyncio.CancelledError
+
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Whole answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        observer=observer,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "Whole answer.", False),
+    ]

@@ -543,6 +543,7 @@ def _ordered_probe(order: list[str]) -> _OrderedControllerProbe:
     ("text", "action"),
     [
         pytest.param("task: Inspect the release evidence", "dispatch", id="task"),
+        pytest.param("  Task: padded utterance  ", "dispatch", id="exact-utterance"),
         pytest.param("cancel task: task_release_check", "cancel", id="cancel"),
         pytest.param("task:", None, id="invalid-task"),
         pytest.param("cancel task: release_check", None, id="invalid-cancel"),
