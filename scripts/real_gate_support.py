@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 from collections import defaultdict
@@ -10,6 +11,43 @@ from pathlib import Path
 
 # The owner-selected qualification baseline (#67, #159): a reference, not a version ceiling.
 HERMES_BASELINE = {"version": "0.21.0", "commit": "29112bef099274229cadff79cdff7bf7b99c4b77"}
+_UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
+PINNED_HERMES = (
+    Path(__file__).resolve().parents[1]
+    / ".hermes"
+    / "bench"
+    / f"hermes-{HERMES_BASELINE['commit'][:12]}"
+)
+
+
+def provision_pinned_hermes() -> Path:
+    """Install the baseline Hermes the way its installer does, reusing the cache when current.
+
+    Returns the interpreter of its environment; the checkout is ``PINNED_HERMES / "source"``.
+    """
+
+    source = PINNED_HERMES / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    if not (source / ".git").exists():
+        _git(source, "init", "-q")
+        _git(source, "remote", "add", "origin", _UPSTREAM)
+        # The documentation site is not runtime code and exceeds Windows path limits.
+        _git(source, "sparse-checkout", "set", "--no-cone", "/*", "!/website/")
+    head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=source, capture_output=True, text=True)
+    if head.stdout.strip() != HERMES_BASELINE["commit"]:
+        _git(source, "fetch", "-q", "--depth", "1", "origin", HERMES_BASELINE["commit"])
+        _git(source, "checkout", "-q", "--detach", "FETCH_HEAD")
+    if _git(source, "rev-parse", "HEAD").strip() != HERMES_BASELINE["commit"]:
+        raise RuntimeError("the Hermes cache is not at the pinned commit")
+    venv = PINNED_HERMES / "venv"
+    subprocess.run(
+        ("uv", "sync", "--extra", "all", "--locked", "--python", "3.11", "--quiet"),
+        cwd=source,
+        env=os.environ | {"UV_PROJECT_ENVIRONMENT": str(venv)},
+        check=True,
+        capture_output=True,
+    )
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 def load_api_key(env_file: Path) -> str:
