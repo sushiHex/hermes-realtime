@@ -517,6 +517,26 @@ def test_native_git_child_owner_preserves_primary_and_cleanup_failure() -> None:
     assert {str(item) for item in error.value.exceptions} >= {"primary", "cleanup"}
 
 
+def test_a_candidate_tree_over_its_byte_budget_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, baseline = _repository(tmp_path, "ignored export-ignore\n")
+    identity = _identity(repository, baseline)
+    monkeypatch.setattr(oracle, "_MAX_CANDIDATE_TREE_BYTES", 1)
+
+    with pytest.raises(oracle.CandidateSourceArchiveError, match="aggregate byte budget"):
+        oracle.capture_candidate_source_archive(repository, identity, _pin())
+
+
+def test_the_fast_track_extracts_under_the_oracles_tree_budget() -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+    from scripts import candidate_source_archive_oracle as oracle
+
+    assert fast_track._MAX_TREE_BYTES == oracle._MAX_CANDIDATE_TREE_BYTES
+
+
 def test_real_clean_candidate_archive_is_opaque_and_candidate_bound(tmp_path: Path) -> None:
     from scripts import candidate_source_archive_oracle as oracle
 
@@ -529,7 +549,7 @@ def test_real_clean_candidate_archive_is_opaque_and_candidate_bound(tmp_path: Pa
     assert type(token) is oracle.VerifiedCandidateSourceArchiveV1
     assert metadata.candidate_head_oid == identity.candidate_head_oid
     assert metadata.prefix == "hermes-realtime-0.0.3"
-    assert 0 < metadata.archive_bytes <= 15 * 1024 * 1024
+    assert 0 < metadata.archive_bytes <= oracle._MAX_ARCHIVE_BYTES
     archive = oracle._archive_bytes_for_consumer(token, identity)
     assert archive == oracle._archive_bytes_for_consumer(repeated, identity)
     assert metadata.archive_sha256 == hashlib.sha256(archive).hexdigest()
