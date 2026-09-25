@@ -121,7 +121,6 @@ def _crash(point: str, pending: int, recovery: str, inserted: int) -> list[dict[
                 "recovery": recovery,
                 "resend_inserted": inserted,
                 "rows": 8,
-                "stale_holder_matches": 0,
                 "stale_write": "refused",
             },
             [],
@@ -161,7 +160,10 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
                 "identities": 12,
                 "max_per_identity": 1,
                 "overlap_inserted": 2,
-                "sequential_verified": 3,
+                # Hermes's own rows and the committed fingerprint, before and after three
+                # sequential retries: nothing added, nothing changed.
+                "sequential_rows_added": 0,
+                "sequential_unchanged": 1,
             },
             ["archive:conflict"],
         )
@@ -225,6 +227,31 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
             ["archive:lease_lost"],
         )
     ],
+    # Negative control: a replace_messages round trip that preserves every value is NOT a
+    # foreign mutation, live or at restart. Detecting it would be a canonicalization bug.
+    "noop_replace": [
+        _step({"detected": "accepted", "inserted": 2, "quarantine": None}, []),
+        _step({"inserted": 2, "open": "none", "quarantine": None}, []),
+    ],
+    # The same process opens again: the fresh holder differs only in its boot nonce, the
+    # previous one is released first, and neither a write nor a takeover under it passes.
+    "holder_same_process": [
+        _step(
+            {
+                "holders_differ": 1,
+                "inserted": 2,
+                "lease_owner": "fresh",
+                "same_process": 1,
+                "stale_acquire": "refused",
+                "stale_write": "refused",
+            },
+            [],
+        )
+    ],
+    # Hermes configured below FULL synchronous is never made ready, and takes no lease.
+    "durability_normal": [
+        _step({"lease_taken": 0, "level": 1, "open": "durability"}, ["open:durability"]),
+    ],
     "cap": [
         _step(
             {
@@ -252,6 +279,9 @@ _PLAN: dict[str, list[tuple[str, ...]]] = {
     "lease_false": [("lease", "false")],
     "lease_raise": [("lease", "raise")],
     "lease_stolen": [("lease", "stolen")],
+    "noop_replace": [("noop",), ("verify",)],
+    "holder_same_process": [("holders",)],
+    "durability_normal": [("durability",)],
     "cap": [("cap",)],
 }
 
@@ -627,7 +657,15 @@ async def _dedup(worker: _Worker) -> dict[str, object]:
     await archive.open(_CONVERSATION)
     first = _batch(0, 4)
     await archive.archive(_CONVERSATION, first)
-    sequential = [await archive.archive(_CONVERSATION, first) for _ in range(3)]
+    census = worker.snapshot(worker.session_id())
+    committed = worker.fresh_record().committed
+    for _ in range(3):
+        await archive.archive(_CONVERSATION, first)
+    sequential_added = len(worker.snapshot(worker.session_id())) - len(census)
+    sequential_unchanged = int(
+        worker.snapshot(worker.session_id()) == census
+        and worker.fresh_record().committed == committed
+    )
     concurrent = await asyncio.gather(
         *(archive.archive(_CONVERSATION, _batch(4, 8)) for _ in range(4))
     )
@@ -665,7 +703,8 @@ async def _dedup(worker: _Worker) -> dict[str, object]:
         "identities": len(identities),
         "max_per_identity": max(identities.values()),
         "overlap_inserted": overlap.inserted,
-        "sequential_verified": sum(ack.inserted == 0 and ack.already_applied for ack in sequential),
+        "sequential_rows_added": sequential_added,
+        "sequential_unchanged": sequential_unchanged,
     }
 
 
@@ -816,7 +855,6 @@ async def _recover(worker: _Worker) -> dict[str, object]:
         "recovery": report.recovery,
         "resend_inserted": ack.inserted,
         "rows": sum(identities.values()),
-        "stale_holder_matches": int(archive.holder(_CONVERSATION) == before.holder),
         "stale_write": stale_write,
     }
     await archive.close()
@@ -830,6 +868,7 @@ async def _lease(worker: _Worker, mode: str) -> dict[str, object]:
     await archive.archive(_CONVERSATION, _batch(0, 4))
     session_id = worker.session_id()
     acquired = False
+    await asyncio.sleep(0.2)  # Let the refresh made right after open finish first.
     if mode in ("false", "stolen"):
         # An operator frees the lease and a foreign turn takes it.
         worker.db.release_session_turn_lease(session_id, archive.holder(_CONVERSATION))
@@ -858,6 +897,97 @@ async def _lease(worker: _Worker, mode: str) -> dict[str, object]:
         "mutations": int(before != after),
         "refusal": refusal,
     }
+
+
+async def _noop(worker: _Worker) -> dict[str, object]:
+    """Negative control: a value-preserving replace_messages round trip."""
+
+    archive = worker.archive()
+    await archive.open(_CONVERSATION)
+    await archive.archive(_CONVERSATION, _batch(0, 4))
+    session_id = worker.session_id()
+    worker.db.replace_messages(session_id, worker.db.get_messages(session_id))
+    try:
+        result = await archive.archive(_CONVERSATION, _batch(4, 6))
+        detected, inserted = "accepted", result.inserted
+    except Exception as error:
+        detected, inserted = getattr(error, "category", type(error).__name__), 0
+    await archive.close()
+    return {"detected": detected, "inserted": inserted,
+            "quarantine": worker.fresh_record().quarantine}
+
+
+async def _verify(worker: _Worker) -> dict[str, object]:
+    """Restart readiness after the negative control: clean, and still archiving."""
+
+    archive = worker.archive()
+    report = await archive.open(_CONVERSATION)
+    result = await archive.archive(_CONVERSATION, _batch(6, 8))
+    await archive.close()
+    return {"inserted": result.inserted, "open": report.recovery,
+            "quarantine": worker.fresh_record().quarantine}
+
+
+async def _holders(worker: _Worker) -> dict[str, object]:
+    """Reopen in the same process after a close that left its lease behind."""
+
+    from hermes_realtime.companion.archive import VoiceArchive
+    from hermes_realtime.companion.hermes_compat import HermesArchivePort
+
+    leaky = HermesArchivePort(worker.db)
+    leaky.release_lease = lambda session_id, holder: None  # type: ignore[method-assign]
+    first = VoiceArchive(worker.store, leaky)
+    await first.open(_CONVERSATION)
+    await first.archive(_CONVERSATION, _batch(0, 4))
+    stale = first.holder(_CONVERSATION)
+    await first.close()  # The same-process lease stays: Hermes never reclaims its own PID.
+    second = worker.archive()
+    await second.open(_CONVERSATION)
+    fresh = second.holder(_CONVERSATION)
+    session_id = worker.session_id()
+    owner = worker.db._execute_write(
+        lambda conn: conn.execute(
+            "SELECT holder FROM session_turn_leases WHERE conversation_id = ?", (session_id,)
+        ).fetchone()
+    )
+    try:
+        worker.db.append_messages_batch(
+            session_id,
+            [{"role": "user", "content": "a write under the stale holder"}],
+            turn_lease_holder=stale,
+        )
+        stale_write = "accepted"
+    except worker.hermes_state.SessionTurnLeaseLostError:
+        stale_write = "refused"
+    stale_acquire = worker.db.try_acquire_session_turn_lease(session_id, stale)
+    result = await second.archive(_CONVERSATION, _batch(4, 6))
+    await second.close()
+    prefix = f"pid={os.getpid()}:voice={_CONVERSATION}:boot="
+    return {
+        "holders_differ": int(fresh != stale),
+        "inserted": result.inserted,
+        "lease_owner": "fresh" if owner is not None and owner[0] == fresh else "other",
+        "same_process": int(fresh.startswith(prefix) and stale.startswith(prefix)),
+        "stale_acquire": "acquired" if stale_acquire else "refused",
+        "stale_write": stale_write,
+    }
+
+
+async def _durability(worker: _Worker) -> dict[str, object]:
+    """Hermes configured with database.synchronous NORMAL (written before it opened)."""
+
+    from hermes_realtime.companion.hermes_compat import durability_level
+
+    archive = worker.archive()
+    opened = await _refusal(archive.open(_CONVERSATION))
+    record = worker.fresh_record()
+    session_id = None if record is None else record.session_id
+    leases = worker.db._execute_write(
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM session_turn_leases WHERE conversation_id = ?", (session_id,)
+        ).fetchone()[0]
+    )
+    return {"lease_taken": leases, "level": durability_level(worker.db), "open": opened}
 
 
 async def _cap(worker: _Worker) -> dict[str, object]:
@@ -893,8 +1023,11 @@ async def _cap(worker: _Worker) -> dict[str, object]:
 
 
 async def _run_worker(arguments: list[str], home: Path) -> None:
-    worker = _Worker(home)
     step, *options = arguments
+    if step == "durability":
+        # Hermes reads its database settings when it opens state.db.
+        (home / "config.yaml").write_text("database:\n  synchronous: NORMAL\n", encoding="utf-8")
+    worker = _Worker(home)
     if step == "surface":
         result = await _surface(worker)
     elif step == "dedup":
@@ -918,6 +1051,14 @@ async def _run_worker(arguments: list[str], home: Path) -> None:
         result = await _lease(worker, options[0])
     elif step == "cap":
         result = await _cap(worker)
+    elif step == "noop":
+        result = await _noop(worker)
+    elif step == "verify":
+        result = await _verify(worker)
+    elif step == "holders":
+        result = await _holders(worker)
+    elif step == "durability":
+        result = await _durability(worker)
     else:
         raise ValueError("unknown step")
     print(_RESULT_PREFIX + json.dumps(result, separators=(",", ":"), sort_keys=True), flush=True)

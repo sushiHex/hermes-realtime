@@ -49,7 +49,8 @@ def test_the_criteria_are_all_planned() -> None:
         "compaction", "replace_content", "replace_reorder", "display_flag", "unleased_append",
         "delete", "rotation", "replace_archived", "lineage",
     }
-    assert {"compaction_at_restart", "lineage_at_restart"} <= set(plan)
+    assert {"compaction_at_restart", "lineage_at_restart", "noop_replace",
+            "holder_same_process", "durability_normal"} <= set(plan)
     assert _SCRIPT._FOREIGN_CATEGORY["lineage"] == "lineage"
 
 
