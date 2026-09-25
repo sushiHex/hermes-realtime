@@ -178,17 +178,14 @@ def read_projection(db: Any, session_id: str, cap: int) -> Projection | None:
 
 
 def create_voice_session(db: Any, session_id: str) -> None:
-    """Create the voice session; a session already holding this id is refused."""
+    """Create the voice session.
 
-    db = _session_db(db)
+    Hermes's creation is an upsert that keeps an existing row's fields. The caller verifies
+    the created session against the expected genesis fingerprint, so a session that already
+    held this id, with any other header or any row, is quarantined rather than adopted.
+    """
 
-    def exists(conn: Any) -> bool:
-        row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        return row is not None
-
-    if _method(db, "SessionDB._execute_write")(exists):
-        raise ArchiveRefusal("session_exists")
-    _method(db, "SessionDB.create_session")(session_id, source=VOICE_SOURCE)
+    _method(_session_db(db), "SessionDB.create_session")(session_id, source=VOICE_SOURCE)
 
 
 def acquire_lease(db: Any, session_id: str, holder: str, ttl_seconds: float) -> bool:

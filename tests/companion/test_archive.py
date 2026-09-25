@@ -52,7 +52,7 @@ class FakeHermes:
     def create_session(self, session_id: str) -> None:
         self.calls.append("create_session")
         if session_id in self.sessions:
-            raise ArchiveRefusal("session_exists")
+            return  # Hermes's creation is an upsert that keeps the existing row.
         self.sessions[session_id] = {
             "parent_session_id": None,
             "source": VOICE_SOURCE,

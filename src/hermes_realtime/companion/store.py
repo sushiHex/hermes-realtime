@@ -30,9 +30,7 @@ _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
 # Categories a durable quarantine may record: the archive no longer matches its evidence.
-QUARANTINE_CATEGORIES = frozenset(
-    {"mismatch", "missing", "over_cap", "rotated", "recovery", "session_exists"}
-)
+QUARANTINE_CATEGORIES = frozenset({"mismatch", "missing", "over_cap", "rotated", "recovery"})
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS voice_archive (
     conversation_id TEXT PRIMARY KEY,

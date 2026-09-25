@@ -72,7 +72,6 @@ REFUSAL_CATEGORIES = frozenset(
         "over_cap",
         "rotated",
         "recovery",
-        "session_exists",
         # Hermes did something other than what the compatibility surface qualified.
         "drift",
         # Ownership and lifecycle.
