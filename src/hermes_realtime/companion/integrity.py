@@ -175,7 +175,9 @@ class Fingerprint:
     def __post_init__(self) -> None:
         if type(self.count) is not int or type(self.chain) is not str:
             raise TypeError("fingerprint fields must be an exact int and str")
-        if not 0 <= self.count <= MAX_ARCHIVE_ROWS:
+        # A sanity bound, not the archive cap: the pending state of a batch that would pass
+        # the cap is still computed, so the in-transaction capacity check can refuse it.
+        if not 0 <= self.count <= MAX_IDENTITY:
             raise ValueError("fingerprint count is out of range")
         if _CHAIN.fullmatch(self.chain) is None:
             raise ValueError("fingerprint chain must be 64 lowercase hex digits")

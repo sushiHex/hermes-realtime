@@ -196,9 +196,11 @@ def test_fingerprints_are_exact_and_bounded() -> None:
     with pytest.raises(ValueError):
         Fingerprint(-1, "a" * 64)
     with pytest.raises(ValueError):
-        Fingerprint(MAX_ARCHIVE_ROWS + 1, "a" * 64)
+        Fingerprint(2**53, "a" * 64)
     with pytest.raises(TypeError):
         Fingerprint(True, "a" * 64)
+    # A batch that would pass the cap still has a pending fingerprint, so it can be refused.
+    assert Fingerprint(MAX_ARCHIVE_ROWS + 1, "a" * 64).count == MAX_ARCHIVE_ROWS + 1
 
 
 # --- projection bound ----------------------------------------------------------------------
