@@ -63,6 +63,7 @@ REFUSAL_CATEGORIES = frozenset(
     {
         # The batch itself.
         "invalid",
+        "partition",
         "identity",
         "conflict",
         "capacity",
@@ -133,13 +134,19 @@ class Identity:
 
 @dataclass(frozen=True, slots=True)
 class VoiceRow:
-    """One closed conversation row, exactly as it was delivered."""
+    """One closed conversation row, exactly as it was delivered.
+
+    ``gap_before`` is ``(first, last)`` when realtime's outbox overflowed just before this
+    row: the seqs in that range were never archived. Only a user row carries a gap, and the
+    gap is hashed with the row.
+    """
 
     identity: Identity
     role: str
     text: str
     interrupted: bool
     timestamp: float
+    gap_before: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if type(self.identity) is not Identity:
@@ -162,6 +169,14 @@ class VoiceRow:
             raise ValueError("voice row text must be encodable text") from None
         if not math.isfinite(self.timestamp) or self.timestamp < 0:
             raise ValueError("voice row timestamp must be finite and non-negative")
+        if self.gap_before is not None:
+            if type(self.gap_before) is not tuple or len(self.gap_before) != 2:
+                raise TypeError("a gap must be an exact (first, last) tuple")
+            first, last = (_bounded_int(end, "gap bound") for end in self.gap_before)
+            if first > last:
+                raise ValueError("a gap must not be reversed")
+            if self.role != "user":
+                raise ValueError("only a user row may carry a gap")
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +298,7 @@ def voice_metadata(row: VoiceRow) -> dict[str, dict[str, object]]:
 
     return {
         "voice": {
+            "gap_before": None if row.gap_before is None else list(row.gap_before),
             "gen": row.identity.generation,
             "interrupted": row.interrupted,
             "seq": row.identity.seq,
@@ -364,38 +380,81 @@ def project(
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceBatch:
+    """One archive event: a generation's rows, which with their gaps cover a seq range.
+
+    Validated by ``check_partition``, which refuses a malformed batch whole.
+    """
+
+    generation: int
+    seq_from: int
+    seq_through: int
+    rows: tuple[VoiceRow, ...]
+
+
+def _bounded(value: object) -> bool:
+    return type(value) is int and 0 <= value <= MAX_IDENTITY
+
+
+def _start(row: VoiceRow) -> int:
+    """The first seq a row accounts for: its gap's start, or its own seq."""
+    return row.identity.seq if row.gap_before is None else row.gap_before[0]
+
+
+def check_partition(batch: VoiceBatch) -> VoiceBatch:
+    """Refuse a batch whose rows and gaps do not partition ``[seq_from, seq_through]``.
+
+    Each row's seq follows the previous row's, or, when the row carries a gap, the gap
+    begins right after the previous row (or at ``seq_from``) and the row follows the gap's
+    end. The last row ends the range exactly: no hole and no overlap anywhere.
+    """
+
+    if (
+        type(batch) is not VoiceBatch
+        or not all(_bounded(end) for end in (batch.generation, batch.seq_from, batch.seq_through))
+        or type(batch.rows) is not tuple
+        or not 1 <= len(batch.rows) <= MAX_BATCH_ROWS
+        or any(type(row) is not VoiceRow for row in batch.rows)
+    ):
+        raise ArchiveRefusal("invalid")
+    expected = batch.seq_from
+    for row in batch.rows:
+        gap = row.gap_before
+        if (
+            row.identity.generation != batch.generation
+            or _start(row) != expected
+            or (gap is not None and gap[1] + 1 != row.identity.seq)
+        ):
+            raise ArchiveRefusal("partition")
+        expected = row.identity.seq + 1
+    if expected != batch.seq_through + 1:
+        raise ArchiveRefusal("partition")
+    return batch
+
+
+@dataclass(frozen=True, slots=True)
 class BatchSplit:
     duplicates: tuple[VoiceRow, ...]
     new: tuple[VoiceRow, ...]
 
 
-def split_batch(
-    cursor: Identity | None, generation: int, rows: tuple[VoiceRow, ...]
-) -> BatchSplit:
-    """Split one generation's batch at the committed cursor, refusing any gap or reorder.
+def split_batch(cursor: Identity | None, batch: VoiceBatch) -> BatchSplit:
+    """Split a partitioned batch at the committed cursor.
 
-    A batch is contiguous within its generation. Rows at or before the cursor are retries to
-    verify; the rest must continue the cursor exactly, and a new generation starts at seq 0.
+    Rows at or before the cursor are retries to verify. The rest must continue the cursor
+    exactly (through a leading gap, if the first new row carries one), and a new generation
+    starts at seq 0.
     """
 
-    _bounded_int(generation, "generation")
-    if (
-        type(rows) is not tuple
-        or not 1 <= len(rows) <= MAX_BATCH_ROWS
-        or any(type(row) is not VoiceRow for row in rows)
-    ):
-        raise ArchiveRefusal("invalid")
-    for index, row in enumerate(rows):
-        if row.identity != Identity(generation, rows[0].identity.seq + index):
-            raise ArchiveRefusal("identity")
+    rows = check_partition(batch).rows
     duplicates = tuple(row for row in rows if cursor is not None and row.identity <= cursor)
     new = rows[len(duplicates) :]
     if new:
-        first = new[0].identity
+        first, start = new[0].identity, _start(new[0])
         if cursor is None or first.generation != cursor.generation:
-            continues = first.seq == 0 and (cursor is None or first > cursor)
+            continues = start == 0 and (cursor is None or first > cursor)
         else:
-            continues = first.seq == cursor.seq + 1
+            continues = start == cursor.seq + 1
         if not continues:
             raise ArchiveRefusal("identity")
     return BatchSplit(duplicates=duplicates, new=new)

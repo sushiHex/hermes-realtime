@@ -18,8 +18,10 @@ from hermes_realtime.companion.integrity import (
     Identity,
     ProjectedRow,
     Projection,
+    VoiceBatch,
     VoiceRow,
     canonical_row,
+    check_partition,
     expected_after,
     expected_row_values,
     extend,
@@ -37,13 +39,15 @@ _CONVERSATION = "conv_a"
 
 
 def _row(seq: int, *, generation: int = 0, role: str = "user", text: str = "hello",
-         interrupted: bool = False, timestamp: float = 1_700_000_000.25) -> VoiceRow:
+         interrupted: bool = False, timestamp: float = 1_700_000_000.25,
+         gap_before: tuple[int, int] | None = None) -> VoiceRow:
     return VoiceRow(
         identity=Identity(generation, seq),
         role=role,
         text=text,
         interrupted=interrupted,
         timestamp=timestamp,
+        gap_before=gap_before,
     )
 
 
@@ -111,7 +115,9 @@ def test_expected_row_values_name_the_voice_identity() -> None:
     values = expected_row_values(_CONVERSATION, row)
     assert values["platform_message_id"] == "voice:conv_a:2:3"
     assert platform_message_id(_CONVERSATION, row.identity) == "voice:conv_a:2:3"
-    assert voice_metadata(row) == {"voice": {"gen": 2, "interrupted": True, "seq": 3}}
+    assert voice_metadata(row) == {
+        "voice": {"gap_before": None, "gen": 2, "interrupted": True, "seq": 3}
+    }
     # Hermes stores display metadata with json.dumps' default separators.
     assert values["display_metadata"] == json.dumps(voice_metadata(row))
     assert values["active"] == 1 and values["compacted"] == 0
@@ -305,63 +311,160 @@ def _category(error: pytest.ExceptionInfo[ArchiveRefusal]) -> str:
     return error.value.category
 
 
+def _span(start: int, stop: int, *, generation: int = 0) -> VoiceBatch:
+    """A gapless batch covering seq ``start`` to ``stop - 1``."""
+    return VoiceBatch(generation, start, stop - 1, _batch(start, stop, generation=generation))
+
+
+def _gapped() -> VoiceBatch:
+    """Rows 0-3, then user row 6 carrying the overflow gap 4-5, then 7: covers 0-7."""
+    rows = (*_batch(0, 4), _row(6, gap_before=(4, 5)), _row(7, role="assistant"))
+    return VoiceBatch(0, 0, 7, rows)
+
+
 def test_the_first_batch_starts_at_seq_zero() -> None:
-    split = split_batch(None, 0, _batch(0, 3))
+    split = split_batch(None, _span(0, 3))
     assert split.duplicates == () and split.new == _batch(0, 3)
     with pytest.raises(ArchiveRefusal) as refusal:
-        split_batch(None, 0, _batch(1, 3))
+        split_batch(None, _span(1, 3))
     assert _category(refusal) == "identity"
 
 
 def test_a_batch_continues_the_cursor_contiguously() -> None:
-    split = split_batch(Identity(0, 3), 0, _batch(2, 6))
+    split = split_batch(Identity(0, 3), _span(2, 6))
     assert split.duplicates == _batch(2, 4)
     assert split.new == _batch(4, 6)
     with pytest.raises(ArchiveRefusal) as refusal:
-        split_batch(Identity(0, 3), 0, _batch(5, 6))
+        split_batch(Identity(0, 3), _span(5, 6))
     assert _category(refusal) == "identity"
 
 
 def test_a_fully_acknowledged_batch_is_all_duplicates() -> None:
-    split = split_batch(Identity(0, 9), 0, _batch(2, 6))
+    split = split_batch(Identity(0, 9), _span(2, 6))
     assert split.duplicates == _batch(2, 6) and split.new == ()
 
 
 def test_a_new_generation_starts_at_seq_zero() -> None:
-    split = split_batch(Identity(0, 9), 1, _batch(0, 2, generation=1))
+    split = split_batch(Identity(0, 9), _span(0, 2, generation=1))
     assert split.new == _batch(0, 2, generation=1)
     with pytest.raises(ArchiveRefusal) as refusal:
-        split_batch(Identity(0, 9), 1, _batch(1, 2, generation=1))
+        split_batch(Identity(0, 9), _span(1, 2, generation=1))
     assert _category(refusal) == "identity"
 
 
+def test_a_batch_may_continue_the_cursor_through_a_leading_gap() -> None:
+    gapped = VoiceBatch(0, 4, 7, (_row(6, gap_before=(4, 5)), _row(7, role="assistant")))
+    split = split_batch(Identity(0, 3), gapped)
+    assert split.new == gapped.rows
+    # The gap claims seq 4, which the committed cursor already covers.
+    with pytest.raises(ArchiveRefusal) as refusal:
+        split_batch(Identity(0, 4), gapped)
+    assert _category(refusal) == "identity"
+
+
+# --- the partition: rows plus their gaps cover [seq_from, seq_through] exactly -------------
+
+
+def test_rows_and_gaps_that_partition_the_range_are_accepted() -> None:
+    assert check_partition(_gapped()) == _gapped()
+    assert check_partition(_span(3, 5)) == _span(3, 5)
+    leading = VoiceBatch(0, 0, 2, (_row(2, gap_before=(0, 1)),))
+    assert check_partition(leading) == leading
+
+
 @pytest.mark.parametrize(
-    "rows",
+    "batch",
     [
-        (_row(0), _row(2)),
-        (_row(1), _row(0)),
-        (_row(0), _row(0)),
-        (_row(0, generation=1),),
+        VoiceBatch(0, 0, 2, (_row(0), _row(2))),
+        VoiceBatch(0, 0, 1, (_row(1), _row(0))),
+        VoiceBatch(0, 0, 1, (_row(0), _row(0))),
+        VoiceBatch(0, 0, 0, (_row(0, generation=1),)),
+        VoiceBatch(0, 1, 1, (_row(0),)),
+        VoiceBatch(0, 0, 1, (_row(0),)),
+        VoiceBatch(0, 0, 0, (_row(0), _row(1, role="assistant"))),
+        VoiceBatch(0, 0, 4, (_row(0), _row(4, gap_before=(2, 3)))),
+        VoiceBatch(0, 0, 4, (_row(0), _row(4, gap_before=(0, 3)))),
+        VoiceBatch(0, 0, 4, (_row(0), _row(4, gap_before=(1, 2)))),
+        VoiceBatch(0, 1, 4, (_row(4, gap_before=(2, 3)),)),
     ],
-    ids=["gap", "descending", "repeat", "other-generation"],
+    ids=[
+        "hole",
+        "descending",
+        "repeat",
+        "other-generation",
+        "starts-after-seq-from",
+        "ends-before-seq-through",
+        "ends-after-seq-through",
+        "gap-leaves-a-hole",
+        "gap-overlaps-a-row",
+        "row-does-not-follow-its-gap",
+        "gap-starts-after-seq-from",
+    ],
 )
-def test_batch_identities_are_contiguous_within_one_generation(
-    rows: tuple[VoiceRow, ...],
-) -> None:
+def test_a_batch_that_does_not_partition_its_range_is_refused_whole(batch: VoiceBatch) -> None:
     with pytest.raises(ArchiveRefusal) as refusal:
-        split_batch(None, 0, rows)
-    assert _category(refusal) == "identity"
+        check_partition(batch)
+    assert _category(refusal) == "partition"
+    with pytest.raises(ArchiveRefusal) as refusal:
+        split_batch(None, batch)
+    assert _category(refusal) == "partition"
 
 
 @pytest.mark.parametrize(
-    "rows",
-    [(), tuple(_row(seq) for seq in range(MAX_BATCH_ROWS + 1)), [_row(0)], ("row",)],
-    ids=["empty", "oversized", "list", "not-a-row"],
+    "batch",
+    [
+        VoiceBatch(0, 0, 0, ()),
+        VoiceBatch(0, 0, MAX_BATCH_ROWS, tuple(_row(seq) for seq in range(MAX_BATCH_ROWS + 1))),
+        VoiceBatch(0, 0, 0, [_row(0)]),  # type: ignore[arg-type]
+        VoiceBatch(0, 0, 0, ("row",)),  # type: ignore[arg-type]
+        VoiceBatch(True, 0, 0, (_row(0),)),
+        VoiceBatch(0, -1, 0, (_row(0),)),
+        (_row(0),),
+    ],
+    ids=["empty", "oversized", "list", "not-a-row", "bool-generation", "negative", "bare-rows"],
 )
-def test_malformed_batches_are_invalid(rows: object) -> None:
+def test_malformed_batches_are_invalid(batch: object) -> None:
     with pytest.raises(ArchiveRefusal) as refusal:
-        split_batch(None, 0, rows)  # type: ignore[arg-type]
+        check_partition(batch)  # type: ignore[arg-type]
     assert _category(refusal) == "invalid"
+
+
+# --- gaps on rows --------------------------------------------------------------------------
+
+
+def test_a_gap_is_hashed_as_part_of_its_row() -> None:
+    plain = _row(6)
+    gapped = _row(6, gap_before=(4, 5))
+    assert voice_metadata(gapped) == {
+        "voice": {"gap_before": [4, 5], "gen": 0, "interrupted": False, "seq": 6}
+    }
+    assert canonical_row(expected_row_values(_CONVERSATION, plain)) != canonical_row(
+        expected_row_values(_CONVERSATION, gapped)
+    )
+    assert expected_after(genesis(EXPECTED_HEADER), _CONVERSATION, (plain,)) != expected_after(
+        genesis(EXPECTED_HEADER), _CONVERSATION, (gapped,)
+    )
+
+
+def test_only_a_user_row_may_carry_a_gap() -> None:
+    with pytest.raises(ValueError):
+        _row(6, role="assistant", gap_before=(4, 5))
+
+
+@pytest.mark.parametrize(
+    ("gap", "error"),
+    [
+        ([4, 5], TypeError),
+        ((4,), TypeError),
+        ((4, True), TypeError),
+        ((5, 4), ValueError),
+        ((-1, 4), ValueError),
+    ],
+    ids=["list", "short", "bool", "reversed", "negative"],
+)
+def test_a_gap_is_an_exact_ordered_pair(gap: object, error: type[Exception]) -> None:
+    with pytest.raises(error):
+        _row(6, gap_before=gap)  # type: ignore[arg-type]
 
 
 # --- archive planning ----------------------------------------------------------------------

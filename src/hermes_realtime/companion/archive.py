@@ -38,7 +38,7 @@ from hermes_realtime.companion.integrity import (
     ArchiveRefusal,
     Fingerprint,
     Projection,
-    VoiceRow,
+    VoiceBatch,
     expected_after,
     genesis,
     split_batch,
@@ -82,7 +82,7 @@ class ArchivePort(Protocol):
         session_id: str,
         holder: str,
         conversation_id: str,
-        rows: tuple[VoiceRow, ...],
+        batch: VoiceBatch,
         expected_committed: Fingerprint,
         expected_pending: Fingerprint,
         cap: int,
@@ -92,11 +92,19 @@ class ArchivePort(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ArchiveAck:
-    """A batch the archive provably holds: sent only after the commit is promoted."""
+    """The range the archive provably holds: sent only after the commit is promoted."""
 
     conversation_id: str
     generation: int
+    seq_from: int
     seq_through: int
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveResult:
+    """The acknowledgment, and how the commit reached it (content-free evidence)."""
+
+    ack: ArchiveAck
     inserted: int
     already_applied: bool
 
@@ -284,17 +292,16 @@ class VoiceArchive:
 
     # --- archiving -------------------------------------------------------------------------
 
-    async def archive(
-        self, conversation_id: str, generation: int, rows: tuple[VoiceRow, ...]
-    ) -> ArchiveAck:
-        """Commit one generation's batch, or refuse it; see the module docstring."""
+    async def archive(self, conversation_id: str, batch: VoiceBatch) -> ArchiveResult:
+        """Commit one batch, or refuse it whole; see the module docstring."""
 
         validate_conversation_id(conversation_id)
+        rows = batch.rows if type(batch) is VoiceBatch else ()
         count = len(rows) if type(rows) is tuple else 0
         evidence: dict[str, str | int] | None = None
         try:
             async with self._lock(conversation_id):
-                return await self._archive(conversation_id, generation, rows)
+                return await self._archive(conversation_id, batch)
         except ArchiveRefusal as refusal:
             evidence = {"refusal": refusal.category, "rows": count, "version": 1}
             raise
@@ -305,9 +312,7 @@ class VoiceArchive:
             if evidence is not None:
                 _marker(_ARCHIVE_MARKER, evidence)
 
-    async def _archive(
-        self, conversation_id: str, generation: int, rows: tuple[VoiceRow, ...]
-    ) -> ArchiveAck:
+    async def _archive(self, conversation_id: str, batch: VoiceBatch) -> ArchiveResult:
         if self._fenced:
             raise ArchiveRefusal("fenced")
         live = self._live.get(conversation_id)
@@ -317,7 +322,7 @@ class VoiceArchive:
         if record is None or record.committed is None:
             raise ArchiveRefusal("unbound")
         committed = record.committed
-        split = split_batch(committed.cursor, generation, rows)
+        split = split_batch(committed.cursor, batch)
         pending = Progress(
             expected_after(committed.fingerprint, conversation_id, split.new),
             split.new[-1].identity if split.new else committed.cursor,
@@ -329,7 +334,7 @@ class VoiceArchive:
                 live.session_id,
                 live.holder,
                 conversation_id,
-                rows,
+                batch,
                 committed.fingerprint,
                 pending.fingerprint,
                 self._cap,
@@ -354,10 +359,13 @@ class VoiceArchive:
         except BaseException:
             live.ready = False
             raise
-        return ArchiveAck(
-            conversation_id=conversation_id,
-            generation=generation,
-            seq_through=rows[-1].identity.seq,
+        return ArchiveResult(
+            ack=ArchiveAck(
+                conversation_id=conversation_id,
+                generation=batch.generation,
+                seq_from=batch.seq_from,
+                seq_through=batch.seq_through,
+            ),
             inserted=len(plan.inserts),
             already_applied=plan.already_applied,
         )

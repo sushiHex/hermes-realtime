@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_realtime.companion.archive import ArchiveAck, OpenReport, VoiceArchive
+from hermes_realtime.companion.archive import ArchiveAck, ArchiveResult, OpenReport, VoiceArchive
 from hermes_realtime.companion.integrity import (
     EXPECTED_HEADER,
     VOICE_SOURCE,
@@ -20,7 +20,9 @@ from hermes_realtime.companion.integrity import (
     Fingerprint,
     Identity,
     Projection,
+    VoiceBatch,
     VoiceRow,
+    check_partition,
     expected_row_values,
     genesis,
     plan_archive,
@@ -96,13 +98,14 @@ class FakeHermes:
         session_id: str,
         holder: str,
         conversation_id: str,
-        rows: tuple[VoiceRow, ...],
+        batch: VoiceBatch,
         expected_committed: Fingerprint,
         expected_pending: Fingerprint,
         cap: int,
         lease_ttl_seconds: float,
     ) -> ArchivePlan:
         self.calls.append("archive_rows")
+        check_partition(batch)
         if self.lease.get(session_id) != holder:
             raise ArchiveRefusal("lease_lost")
         header = self.sessions.get(session_id)
@@ -111,7 +114,7 @@ class FakeHermes:
         plan = plan_archive(
             self._project(session_id, cap),
             conversation_id,
-            rows,
+            batch.rows,
             expected_committed,
             expected_pending,
             cap,
@@ -139,6 +142,10 @@ def _rows(start: int, stop: int, *, generation: int = 0, text: str = "row") -> t
         )
         for seq in range(start, stop)
     )
+
+
+def _batch(start: int, stop: int, *, text: str = "row") -> VoiceBatch:
+    return VoiceBatch(0, start, stop - 1, _rows(start, stop, text=text))
 
 
 @pytest.fixture
@@ -322,8 +329,12 @@ async def test_a_batch_is_written_ahead_committed_and_acknowledged(store: Compan
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        ack = await archive.archive(_CONVERSATION, 0, _rows(0, 4))
-        assert ack == ArchiveAck(_CONVERSATION, 0, 3, inserted=4, already_applied=False)
+        result = await archive.archive(_CONVERSATION, _batch(0, 4))
+        assert result == ArchiveResult(
+            ack=ArchiveAck(_CONVERSATION, generation=0, seq_from=0, seq_through=3),
+            inserted=4,
+            already_applied=False,
+        )
         committed, pending, _ = _stored(store)
         projection = hermes._project(hermes.only(), 4096)
         assert projection is not None
@@ -338,9 +349,9 @@ async def test_sequential_retries_verify_and_never_append(store: CompanionStore)
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         for _ in range(3):
-            ack = await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+            ack = await archive.archive(_CONVERSATION, _batch(0, 4))
             assert ack.inserted == 0 and ack.already_applied is True
         assert len(hermes.rows[hermes.only()]) == 4
     finally:
@@ -353,7 +364,7 @@ async def test_concurrent_retries_leave_one_record_per_identity(store: Companion
     archive = await _open(store, hermes)
     try:
         acks = await asyncio.gather(
-            *(archive.archive(_CONVERSATION, 0, _rows(0, 4)) for _ in range(4))
+            *(archive.archive(_CONVERSATION, _batch(0, 4)) for _ in range(4))
         )
         assert sorted(ack.inserted for ack in acks) == [0, 0, 0, 4]
         identities = [row["platform_message_id"] for row in hermes.rows[hermes.only()]]
@@ -367,9 +378,9 @@ async def test_an_overlapping_batch_appends_only_its_new_rows(store: CompanionSt
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
-        ack = await archive.archive(_CONVERSATION, 0, _rows(2, 6))
-        assert ack.inserted == 2 and ack.seq_through == 5
+        await archive.archive(_CONVERSATION, _batch(0, 4))
+        ack = await archive.archive(_CONVERSATION, _batch(2, 6))
+        assert ack.inserted == 2 and (ack.ack.seq_from, ack.ack.seq_through) == (2, 5)
         assert len(hermes.rows[hermes.only()]) == 6
     finally:
         await archive.close()
@@ -382,19 +393,19 @@ async def test_a_conflicting_payload_is_refused_without_mutation(
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         before = list(hermes.rows[hermes.only()])
         stored = _stored(store)
         capsys.readouterr()
-        conflicting = _rows(0, 4, text="other")
-        assert await _refused(archive.archive(_CONVERSATION, 0, conflicting)) == "conflict"
+        conflicting = _batch(0, 4, text="other")
+        assert await _refused(archive.archive(_CONVERSATION, conflicting)) == "conflict"
         assert hermes.rows[hermes.only()] == before
         assert _stored(store) == stored
         assert _markers(capsys.readouterr().out, "[voice-archive] ") == [
             {"refusal": "conflict", "rows": 4, "version": 1}
         ]
         # A refused payload does not fence the conversation.
-        assert (await archive.archive(_CONVERSATION, 0, _rows(4, 6))).inserted == 2
+        assert (await archive.archive(_CONVERSATION, _batch(4, 6))).inserted == 2
     finally:
         await archive.close()
 
@@ -406,12 +417,56 @@ async def test_a_batch_with_a_gap_is_refused_before_anything_is_written(
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         stored = _stored(store)
         hermes.calls.clear()
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(5, 6))) == "identity"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(5, 6))) == "identity"
         assert hermes.calls == []
         assert _stored(store) == stored
+    finally:
+        await archive.close()
+
+
+@pytest.mark.asyncio
+async def test_an_overflow_gap_is_archived_on_its_user_row(store: CompanionStore) -> None:
+    hermes = FakeHermes()
+    archive = await _open(store, hermes)
+    try:
+        await archive.archive(_CONVERSATION, _batch(0, 4))
+        after_gap = VoiceRow(Identity(0, 6), "user", "after the gap", False, 1_700_000_006.0,
+                             gap_before=(4, 5))
+        gapped = VoiceBatch(0, 4, 7, (after_gap, _rows(7, 8)[0]))
+        result = await archive.archive(_CONVERSATION, gapped)
+        assert result.ack == ArchiveAck(_CONVERSATION, generation=0, seq_from=4, seq_through=7)
+        assert result.inserted == 2
+        stored = json.loads(str(hermes.rows[hermes.only()][4]["display_metadata"]))
+        assert stored["voice"]["gap_before"] == [4, 5]
+        committed = _stored(store)[0]
+        assert committed is not None and committed.cursor == Identity(0, 7)
+        again = await archive.archive(_CONVERSATION, gapped)
+        assert again.inserted == 0 and again.already_applied is True
+    finally:
+        await archive.close()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_that_does_not_partition_its_range_is_refused_whole(
+    store: CompanionStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hermes = FakeHermes()
+    archive = await _open(store, hermes)
+    try:
+        await archive.archive(_CONVERSATION, _batch(0, 4))
+        stored = _stored(store)
+        hermes.calls.clear()
+        capsys.readouterr()
+        holed = VoiceBatch(0, 4, 6, (_rows(4, 5)[0], _rows(6, 7)[0]))
+        assert await _refused(archive.archive(_CONVERSATION, holed)) == "partition"
+        assert hermes.calls == []
+        assert _stored(store) == stored
+        assert _markers(capsys.readouterr().out, "[voice-archive] ") == [
+            {"refusal": "partition", "rows": 2, "version": 1}
+        ]
     finally:
         await archive.close()
 
@@ -423,9 +478,9 @@ async def test_a_batch_past_the_cap_is_refused_and_the_conversation_stays_ready(
     hermes = FakeHermes()
     archive = await _open(store, hermes, cap=5)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         stored = _stored(store)
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "capacity"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "capacity"
         assert _stored(store) == stored
         assert len(hermes.rows[hermes.only()]) == 4
         assert archive.ready(_CONVERSATION) is True
@@ -441,7 +496,7 @@ async def test_a_vanished_store_record_is_refused(store: CompanionStore, tmp_pat
         with contextlib.closing(sqlite3.connect(tmp_path / "companion.db")) as raw:
             raw.execute("DELETE FROM voice_archive")
             raw.commit()
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(0, 1))) == "unbound"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(0, 1))) == "unbound"
         assert hermes.rows[hermes.only()] == []
     finally:
         await archive.close()
@@ -450,7 +505,7 @@ async def test_a_vanished_store_record_is_refused(store: CompanionStore, tmp_pat
 @pytest.mark.asyncio
 async def test_archiving_requires_an_open_conversation(store: CompanionStore) -> None:
     archive = _archive(store, FakeHermes())
-    assert await _refused(archive.archive(_CONVERSATION, 0, _rows(0, 1))) == "not_ready"
+    assert await _refused(archive.archive(_CONVERSATION, _batch(0, 1))) == "not_ready"
 
 
 # --- foreign mutation and quarantine -------------------------------------------------------
@@ -501,15 +556,15 @@ async def test_a_foreign_mutation_is_quarantined_durably_before_the_refusal(
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         tamper(hermes)
         snapshot = {key: list(value) for key, value in hermes.rows.items()}
         capsys.readouterr()
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == category
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == category
         assert hermes.rows == snapshot
         assert _stored(store)[2] == category
         assert archive.ready(_CONVERSATION) is False
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "not_ready"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "not_ready"
         assert _markers(capsys.readouterr().out, "[voice-archive] ") == [
             {"refusal": category, "rows": 2, "version": 1},
             {"refusal": "not_ready", "rows": 2, "version": 1},
@@ -525,7 +580,7 @@ async def test_an_unpersistable_quarantine_fences_the_whole_companion(
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         _tamper_content(hermes)
 
         def fail(conversation_id: str, category: str) -> None:
@@ -534,10 +589,10 @@ async def test_an_unpersistable_quarantine_fences_the_whole_companion(
         monkeypatch.setattr(store, "quarantine", fail)
         capsys.readouterr()
         with pytest.raises(RuntimeError):
-            await archive.archive(_CONVERSATION, 0, _rows(4, 6))
+            await archive.archive(_CONVERSATION, _batch(4, 6))
         assert archive.ready(_CONVERSATION) is False
         assert await _refused(archive.open("another")) == "fenced"
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "fenced"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "fenced"
         markers = _markers(capsys.readouterr().out, "[voice-archive] ")
         assert markers[0] == {"failure": "RuntimeError", "rows": 2, "version": 1}
     finally:
@@ -549,10 +604,10 @@ async def test_a_lost_lease_refuses_clears_pending_and_fences(store: CompanionSt
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         stored = _stored(store)
         hermes.lease[hermes.only()] = "pid=1:foreign"
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "lease_lost"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "lease_lost"
         assert _stored(store) == stored
         assert archive.ready(_CONVERSATION) is False
         assert len(hermes.rows[hermes.only()]) == 4
@@ -567,10 +622,10 @@ async def test_storage_that_drifts_from_the_prediction_is_refused_and_fences(
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         stored = _stored(store)
         hermes.drift = {"display_kind": "voice"}
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "drift"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "drift"
         assert _stored(store) == stored
         assert len(hermes.rows[hermes.only()]) == 4
         assert archive.ready(_CONVERSATION) is False
@@ -591,14 +646,14 @@ async def test_an_unknown_outcome_keeps_pending_and_fences(store: CompanionStore
     hermes = FakeHermes()
     archive = await _open(store, hermes)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
 
         def crash() -> None:
             raise RuntimeError("connection reset after commit")
 
         hermes.after_insert = crash
         with pytest.raises(RuntimeError):
-            await archive.archive(_CONVERSATION, 0, _rows(4, 6))
+            await archive.archive(_CONVERSATION, _batch(4, 6))
         _, pending, _ = _stored(store)
         assert pending is not None and pending.cursor == Identity(0, 5)
         assert archive.ready(_CONVERSATION) is False
@@ -608,7 +663,7 @@ async def test_an_unknown_outcome_keeps_pending_and_fences(store: CompanionStore
 
 async def _crash_with_pending(store: CompanionStore, hermes: FakeHermes, applied: bool) -> None:
     archive = await _open(store, hermes)
-    await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
 
     def crash() -> None:
         if not applied:
@@ -617,7 +672,7 @@ async def _crash_with_pending(store: CompanionStore, hermes: FakeHermes, applied
 
     hermes.after_insert = crash
     with pytest.raises(RuntimeError):
-        await archive.archive(_CONVERSATION, 0, _rows(4, 6))
+        await archive.archive(_CONVERSATION, _batch(4, 6))
     hermes.after_insert = None
     await archive.close()
     _restart(hermes)
@@ -632,7 +687,7 @@ async def test_recovery_clears_pending_the_archive_never_reached(store: Companio
         assert await archive.open(_CONVERSATION) == OpenReport(recovery="cleared")
         committed, pending, _ = _stored(store)
         assert pending is None and committed is not None and committed.cursor == Identity(0, 3)
-        assert (await archive.archive(_CONVERSATION, 0, _rows(4, 6))).inserted == 2
+        assert (await archive.archive(_CONVERSATION, _batch(4, 6))).inserted == 2
         assert len(hermes.rows[hermes.only()]) == 6
     finally:
         await archive.close()
@@ -647,7 +702,7 @@ async def test_recovery_promotes_pending_the_archive_already_holds(store: Compan
         assert await archive.open(_CONVERSATION) == OpenReport(recovery="promoted")
         committed, pending, _ = _stored(store)
         assert pending is None and committed is not None and committed.cursor == Identity(0, 5)
-        ack = await archive.archive(_CONVERSATION, 0, _rows(4, 6))
+        ack = await archive.archive(_CONVERSATION, _batch(4, 6))
         assert ack.inserted == 0 and ack.already_applied is True
         assert len(hermes.rows[hermes.only()]) == 6
     finally:
@@ -674,7 +729,7 @@ async def test_startup_verifies_against_committed_and_never_recreates(
 ) -> None:
     hermes = FakeHermes()
     archive = await _open(store, hermes)
-    await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
     await archive.close()
     tamper(hermes)
     hermes.calls.clear()
@@ -691,7 +746,7 @@ async def test_startup_verifies_against_committed_and_never_recreates(
 async def test_startup_quarantines_an_archive_over_the_cap(store: CompanionStore) -> None:
     hermes = FakeHermes()
     archive = await _open(store, hermes, cap=4)
-    await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
     await archive.close()
     _append_foreign(hermes)
     assert await _refused(_archive(store, hermes, cap=4).open(_CONVERSATION)) == "over_cap"
@@ -773,10 +828,10 @@ async def test_a_failed_refresh_fences_all_work(
     clock = _Clock()
     archive = await _open(store, hermes, sleep=clock)
     try:
-        await archive.archive(_CONVERSATION, 0, _rows(0, 4))
+        await archive.archive(_CONVERSATION, _batch(0, 4))
         hermes.refresh_result = result
         await _until(lambda: not archive.ready(_CONVERSATION))
-        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(4, 6))) == "not_ready"
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "not_ready"
         assert len(hermes.rows[hermes.only()]) == 4
         assert _markers(capsys.readouterr().out, "[voice-archive-lease] ") == [
             {"fence": cause, "version": 1}
@@ -792,7 +847,7 @@ async def test_closing_releases_the_lease_and_stops_work(store: CompanionStore) 
     await archive.close()
     assert hermes.lease == {}
     assert archive.ready(_CONVERSATION) is False
-    assert await _refused(archive.archive(_CONVERSATION, 0, _rows(0, 1))) == "not_ready"
+    assert await _refused(archive.archive(_CONVERSATION, _batch(0, 1))) == "not_ready"
 
 
 def test_archive_options_are_exact_and_bounded(store: CompanionStore) -> None:

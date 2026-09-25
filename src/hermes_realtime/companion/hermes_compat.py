@@ -28,7 +28,8 @@ from hermes_realtime.companion.integrity import (
     ArchiveRefusal,
     Fingerprint,
     Projection,
-    VoiceRow,
+    VoiceBatch,
+    check_partition,
     plan_archive,
     platform_message_id,
     project,
@@ -206,7 +207,7 @@ def archive_voice_rows(
     db: Any,
     session_id: str,
     holder: str,
-    rows: tuple[VoiceRow, ...],
+    batch: VoiceBatch,
     expected_committed: Fingerprint,
     expected_pending: Fingerprint,
     *,
@@ -216,14 +217,16 @@ def archive_voice_rows(
 ) -> ArchivePlan:
     """Verify the whole archive and append only the missing rows, in one write transaction.
 
-    Inside Hermes's ``BEGIN IMMEDIATE``: the lease guard with this holder; a projection of
-    every row, which must equal ``expected_committed`` (or ``expected_pending``: already
-    applied); an identity and full-content check of the batch; the insert of only the
-    missing rows; the ``message_count`` update Hermes's own append makes; and a re-read that
-    must equal ``expected_pending``. Any refusal raises inside the transaction, which rolls
-    it back, so a refused batch never mutates the archive.
+    A batch whose rows and gaps do not partition its range is refused whole, before any
+    transaction. Inside Hermes's ``BEGIN IMMEDIATE``: the lease guard with this holder; a
+    projection of every row, which must equal ``expected_committed`` (or ``expected_pending``:
+    already applied); an identity and full-content check of the batch; the insert of only
+    the missing rows; the ``message_count`` update Hermes's own append makes; and a re-read
+    that must equal ``expected_pending``. Any refusal raises inside the transaction, which
+    rolls it back, so a refused batch never mutates the archive.
     """
 
+    rows = check_partition(batch).rows
     db = _session_db(db)
     execute_write = _method(db, "SessionDB._execute_write")
     guard = _method(db, "SessionDB._check_transcript_write_guards")
@@ -303,7 +306,7 @@ class HermesArchivePort:
         session_id: str,
         holder: str,
         conversation_id: str,
-        rows: tuple[VoiceRow, ...],
+        batch: VoiceBatch,
         expected_committed: Fingerprint,
         expected_pending: Fingerprint,
         cap: int,
@@ -313,7 +316,7 @@ class HermesArchivePort:
             self._db,
             session_id,
             holder,
-            rows,
+            batch,
             expected_committed,
             expected_pending,
             conversation_id=conversation_id,
