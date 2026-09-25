@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import socket
 import sqlite3
@@ -129,6 +130,19 @@ def _pcm() -> bytes:
     return struct.pack("<480h", *([8_000] * 480))
 
 
+def _speech_pcm() -> bytes:
+    """Synthesized speech that survives the codec: 100 ms of a 1 kHz tone at full stimulus level.
+
+    Delivery is confirmed by the first decoded frame above the material threshold. A single
+    10 ms DC step, which Opus attenuates, can decode below it and stall confirmation past every
+    wait (#183). Every 10 ms frame of this tone peaks far above the threshold.
+    """
+    return struct.pack(
+        "<4800h",
+        *(round(8_000 * math.sin(2 * math.pi * 1_000 * index / 48_000)) for index in range(4_800)),
+    )
+
+
 class _Inference:
     def stream(self, snapshot: ConversationContextSnapshot, *, turn_id: str) -> AsyncIterator[str]:
         return self._stream(snapshot, turn_id)
@@ -155,7 +169,7 @@ class _Synthesizer:
             turn_id=turn_id,
             chunk_id=f"chunk-{turn_id}",
             text=text,
-            audio=AudioFrame(pcm=_pcm(), sample_rate_hz=48_000, channels=1),
+            audio=AudioFrame(pcm=_speech_pcm(), sample_rate_hz=48_000, channels=1),
         )
 
     async def cancel(self, turn_id: str) -> None:
@@ -984,7 +998,7 @@ class _CapacitySynthesizer:
                 turn_id=turn_id,
                 chunk_id="capacity-preflight",
                 text=text,
-                audio=AudioFrame(pcm=_pcm(), sample_rate_hz=48_000, channels=1),
+                audio=AudioFrame(pcm=_speech_pcm(), sample_rate_hz=48_000, channels=1),
             )
             return
         del text, turn_id
