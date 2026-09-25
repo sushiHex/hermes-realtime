@@ -76,6 +76,9 @@ REFUSAL_CATEGORIES = frozenset(
         "recovery",
         # Hermes did something other than what the compatibility surface qualified.
         "drift",
+        # Hermes is not the Hermes the surface was qualified against, or it is not durable.
+        "incompatible",
+        "durability",
         # Ownership and lifecycle.
         "lease_lost",
         "lease_held",
