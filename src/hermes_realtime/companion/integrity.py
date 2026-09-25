@@ -96,13 +96,20 @@ _CHAIN = re.compile(r"[0-9a-f]{64}")
 
 
 class ArchiveRefusal(Exception):
-    """A definitive, content-free refusal. ``category`` is one of ``REFUSAL_CATEGORIES``."""
+    """A definitive, content-free refusal. ``category`` is one of ``REFUSAL_CATEGORIES``.
 
-    def __init__(self, category: str) -> None:
+    ``at_pending`` is True when the refusal was decided against an archive that already
+    holds the pending state, so the caller must keep that state rather than clear it.
+    """
+
+    def __init__(self, category: str, *, at_pending: bool = False) -> None:
         if type(category) is not str or category not in REFUSAL_CATEGORIES:
             raise ValueError("archive refusal category is not recognized")
+        if type(at_pending) is not bool:
+            raise TypeError("at_pending must be an exact bool")
         super().__init__(category)
         self.category = category
+        self.at_pending = at_pending
 
 
 def validate_conversation_id(conversation_id: str) -> str:
@@ -164,6 +171,9 @@ class VoiceRow:
             raise ValueError("only assistant rows may be interrupted")
         if not self.text.strip() or len(self.text) > MAX_TEXT_CHARS:
             raise ValueError("voice row text must be non-blank and bounded")
+        # Hermes decodes text starting "\x00json:" as structured content; no NUL is speech.
+        if "\x00" in self.text:
+            raise ValueError("voice row text must not contain NUL")
         try:
             self.text.encode("utf-8")
         except UnicodeEncodeError:
@@ -490,7 +500,10 @@ def plan_archive(
 
     The archive must match the committed fingerprint (nothing applied yet) or the pending
     one (already applied). Every batch row already stored must be byte-identical to it, and
-    the rows to insert must all follow every stored row.
+    the rows to insert must all follow every stored row. The inserts must extend the archive
+    to exactly the pending fingerprint: a row that is merely missing (an old generation's
+    replay, a row resent into a recorded gap) is refused, never inserted. Every refusal after
+    the comparison says whether the archive already holds pending (``at_pending``).
     """
 
     if projection is None:
@@ -510,11 +523,13 @@ def plan_archive(
             inserts.append(row)
             continue
         if inserts:
-            raise ArchiveRefusal("identity")
+            raise ArchiveRefusal("identity", at_pending=applied)
         if existing != canonical_row(expected_row_values(conversation_id, row)):
-            raise ArchiveRefusal("conflict")
+            raise ArchiveRefusal("conflict", at_pending=applied)
     if applied and inserts:
-        raise ArchiveRefusal("identity")
+        raise ArchiveRefusal("identity", at_pending=True)
     if len(projection.rows) + len(inserts) > cap:
-        raise ArchiveRefusal("capacity")
+        raise ArchiveRefusal("capacity", at_pending=applied)
+    if not applied and expected_after(current, conversation_id, inserts) != expected_pending:
+        raise ArchiveRefusal("identity")
     return ArchivePlan(inserts=tuple(inserts), already_applied=not inserts)

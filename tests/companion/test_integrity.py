@@ -573,3 +573,62 @@ def test_refusal_categories_are_closed() -> None:
     with pytest.raises(ValueError):
         ArchiveRefusal("anything")
     assert ArchiveRefusal("conflict").category == "conflict"
+    assert ArchiveRefusal("conflict").at_pending is False
+    with pytest.raises(TypeError):
+        ArchiveRefusal("conflict", at_pending=1)  # type: ignore[arg-type]
+
+
+# --- only an exact extension is ever inserted ----------------------------------------------
+
+
+def test_an_old_generation_replay_is_refused_not_inserted() -> None:
+    # Generation 0 stopped at seq 3 when generation 1 began; its later seqs were never sent.
+    stored = (*_batch(0, 4), *_batch(0, 2, generation=1))
+    committed = expected_after(genesis(EXPECTED_HEADER), _CONVERSATION, stored)
+    replay = VoiceBatch(0, 4, 5, _batch(4, 6))
+    split = split_batch(Identity(1, 1), replay)
+    assert split.new == ()  # Every replayed identity is at or before the cursor.
+    with pytest.raises(ArchiveRefusal) as refusal:
+        plan_archive(_projection(stored), _CONVERSATION, replay.rows, committed, committed,
+                     MAX_ARCHIVE_ROWS)
+    assert _category(refusal) == "identity"
+    assert refusal.value.at_pending is False
+
+
+def test_a_row_resent_into_a_recorded_gap_is_refused_not_inserted() -> None:
+    stored = (*_batch(0, 4), _row(6, gap_before=(4, 5)), _row(7, role="assistant"))
+    committed = expected_after(genesis(EXPECTED_HEADER), _CONVERSATION, stored)
+    resent = VoiceBatch(0, 4, 4, (_row(4),))
+    assert split_batch(Identity(0, 7), resent).new == ()
+    with pytest.raises(ArchiveRefusal) as refusal:
+        plan_archive(_projection(stored), _CONVERSATION, resent.rows, committed, committed,
+                     MAX_ARCHIVE_ROWS)
+    assert _category(refusal) == "identity"
+
+
+def test_a_refusal_on_the_already_applied_branch_says_the_archive_holds_pending() -> None:
+    committed, pending = _fingerprints(_batch(0, 4), _batch(4, 6))
+    with pytest.raises(ArchiveRefusal) as refusal:
+        plan_archive(_projection(_batch(0, 6)), _CONVERSATION, _batch(4, 7), committed, pending,
+                     MAX_ARCHIVE_ROWS)
+    assert _category(refusal) == "identity" and refusal.value.at_pending is True
+    conflicting = (_row(5, role="assistant", text="other"),)
+    with pytest.raises(ArchiveRefusal) as refusal:
+        plan_archive(_projection(_batch(0, 6)), _CONVERSATION, conflicting, committed, pending,
+                     MAX_ARCHIVE_ROWS)
+    assert _category(refusal) == "conflict" and refusal.value.at_pending is True
+    with pytest.raises(ArchiveRefusal) as refusal:
+        plan_archive(_projection(_batch(0, 4)), _CONVERSATION, conflicting, committed, pending,
+                     MAX_ARCHIVE_ROWS)
+    assert refusal.value.at_pending is False
+
+
+# --- text Hermes would not store as text ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text", ["a\x00b", "\x00json:[1]", "\x00"], ids=["nul", "json-prefix", "bare-nul"]
+)
+def test_text_hermes_would_decode_as_something_else_is_rejected(text: str) -> None:
+    with pytest.raises(ValueError):
+        _row(0, text=text)
