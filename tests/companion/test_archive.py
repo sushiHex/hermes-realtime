@@ -434,6 +434,20 @@ async def test_a_batch_past_the_cap_is_refused_and_the_conversation_stays_ready(
 
 
 @pytest.mark.asyncio
+async def test_a_vanished_store_record_is_refused(store: CompanionStore, tmp_path: Path) -> None:
+    hermes = FakeHermes()
+    archive = await _open(store, hermes)
+    try:
+        with contextlib.closing(sqlite3.connect(tmp_path / "companion.db")) as raw:
+            raw.execute("DELETE FROM voice_archive")
+            raw.commit()
+        assert await _refused(archive.archive(_CONVERSATION, 0, _rows(0, 1))) == "unbound"
+        assert hermes.rows[hermes.only()] == []
+    finally:
+        await archive.close()
+
+
+@pytest.mark.asyncio
 async def test_archiving_requires_an_open_conversation(store: CompanionStore) -> None:
     archive = _archive(store, FakeHermes())
     assert await _refused(archive.archive(_CONVERSATION, 0, _rows(0, 1))) == "not_ready"

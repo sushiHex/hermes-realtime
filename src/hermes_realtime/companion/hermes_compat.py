@@ -267,12 +267,10 @@ def archive_voice_rows(
                 }
                 for row in plan.inserts
             ]
-            inserted, _ = insert(conn, session_id, messages)
-            if inserted != len(messages):
-                raise ArchiveRefusal("drift")
+            insert(conn, session_id, messages)
             conn.execute(
                 "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
-                (inserted, session_id),
+                (len(messages), session_id),
             )
         after = _read_projection(conn, session_id, cap)
         if after is None or after.fingerprint() != expected_pending:

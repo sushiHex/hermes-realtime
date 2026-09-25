@@ -264,8 +264,8 @@ class VoiceArchive:
                 self._store.promote(conversation_id, pending)
                 return "created" if created else "promoted"
             raise ArchiveRefusal("missing" if projection is None else "recovery")
-        if committed is None:
-            raise ArchiveRefusal("recovery")
+        # The store's CHECK constraint: a record without committed state always has pending.
+        assert committed is not None
         if current != committed.fingerprint:
             raise ArchiveRefusal("missing" if projection is None else "mismatch")
         return "none"
