@@ -3071,6 +3071,7 @@ def _record_text(**fields: object) -> str:
             _record_text(pending=[_VALID_PENDING | {"objective": "Inspect"}]), id="entry-extra"
         ),
         pytest.param('{"admitted": [], "admitted": [], "pending": [], "version": 1}', id="dup"),
+        pytest.param("[" * 5_000 + "]" * 5_000, id="nested-past-the-recursion-limit"),
         pytest.param(_record_text() + " " * api_module._MAX_RUN_RECORD_BYTES, id="over-size"),
     ],
 )
@@ -3279,3 +3280,113 @@ def test_an_interrupted_run_record_write_never_leaves_a_partial_file(
 
     assert record.read_bytes() == b'{"first":1}'
     assert [path.name for path in tmp_path.iterdir()] == [record.name]
+
+
+def _orphan(path: Path) -> Path:
+    """Leave exactly what a kill between mkstemp and os.replace leaves behind."""
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(b"orphaned plaintext")
+    return Path(temporary)
+
+
+def test_removing_orphans_takes_only_this_paths_interrupted_temporaries(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    write_run_record(record, b'{"kept":1}')
+    orphans = [_orphan(record), _orphan(record)]
+    kept = [
+        tmp_path / ".hermes-runs-v1.json.bak.abcd1234.tmp",
+        tmp_path / ".hermes-runs-v1.json.ABCD1234.tmp",
+        tmp_path / ".hermes-runs-v1.json.abcd123.tmp",
+        tmp_path / ".hermes-runs-v1.json.abcd1234.tmp.keep",
+        tmp_path / "hermes-runs-v1.json.lock",
+        tmp_path / ".other.json.abcd1234.tmp",
+    ]
+    for path in kept:
+        path.write_bytes(b"unrelated")
+    _orphan(tmp_path / "other.json")
+
+    assert run_record_module.remove_orphaned_temporaries(record) == len(orphans)
+
+    assert not any(orphan.exists() for orphan in orphans)
+    assert all(path.exists() for path in kept)
+    assert record.read_bytes() == b'{"kept":1}'
+    assert len(list(tmp_path.glob(".other.json.*.tmp"))) == 2
+    assert run_record_module.remove_orphaned_temporaries(tmp_path / "absent" / "x.json") == 0
+
+
+@pytest.mark.asyncio
+async def test_start_removes_orphaned_run_record_temporaries_after_taking_the_lock(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record)
+    orphan = _orphan(record)
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert not orphan.exists()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_scanner_held_run_record_orphan_never_fails_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    _write_record(record)
+    held = _orphan(record)
+    removable = _orphan(record)
+    real_unlink = Path.unlink
+
+    def scanner_held(self: Path, missing_ok: bool = False) -> None:
+        if self == held:
+            raise PermissionError(13, "sharing violation")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", scanner_held)
+    hermes = _IdempotentHermes("answer")
+    runner, port = await hermes.serve()
+    session = _record_session(port, record)
+    try:
+        await session.start()
+
+        assert session.restart_settlement == HermesRestartSettlement(stopped=0, unknown=0)
+        assert held.exists()
+        assert not removable.exists()
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_second_host_leaves_the_owners_temporaries_alone(tmp_path: Path) -> None:
+    record = tmp_path / "hermes-runs-v1.json"
+    release = asyncio.Event()
+    hermes = _IdempotentHermes("answer", release_events=release)
+    runner, port = await hermes.serve()
+    first = _record_session(port, record)
+    second = _record_session(port, record)
+    try:
+        await first.start()
+        in_flight = _orphan(record)
+
+        with pytest.raises(RuntimeError, match="another host holds the Hermes run record"):
+            await second.start()
+
+        assert in_flight.exists()
+    finally:
+        release.set()
+        await first.close()
+        await second.close()
+        await runner.cleanup()

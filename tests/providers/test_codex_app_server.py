@@ -1820,6 +1820,9 @@ def test_codex_prompt_explains_the_heard_only_context_and_interrupted_field() ->
 
     assert "Earlier assistant messages represent only speech confirmed delivered." in prompt
     assert 'An assistant message with "interrupted": true was cut off' in prompt
+    # A restored flag can be conservative, so the prompt never claims more than "may not".
+    assert "the user may not have heard the rest." in prompt
+    assert "did not hear" not in prompt
 
 
 def test_codex_snapshot_adds_interrupted_field_only_to_interrupted_rows() -> None:

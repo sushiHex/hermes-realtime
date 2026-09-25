@@ -283,7 +283,8 @@ launcher terminal to settle the browser runtime, worker, verifier, and providers
 
 This profile is deliberately conversation-only: background task dispatch and approval authority
 fail closed, and it does not compose Codex public-RSS retrieval, natural work tools, or the `natural_v1`
-profile. Those belong to `hermes-realtime-host`. It is not the full human-test launcher described
+profile. Those belong to `hermes-realtime-host`. It keeps no durable voice tail, so its
+conversation ends with the process. It is not the full human-test launcher described
 below and must not be used for LAN/iPhone exposure. The automated real-boundary gate is:
 
 ```bash
@@ -304,6 +305,13 @@ same authoritative start/cancel surface; without that flag, ordinary speech and 
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,
 provider, or unauthenticated fallback.
+
+The full host keeps its recent delivery-confirmed voice conversation in a durable voice tail,
+`HermesRealtime/state/voice-tail-v1.json` beside the Hermes run record (override with
+`--voice-tail`), and restores it before the first turn on every start, after a crash or a
+clean shutdown. Work from before the restart is ended history, never resumed. The file is
+plaintext user data outside evidence purge. One host holds it at a time. A malformed tail starts
+a fresh conversation. To forget the conversation, delete the file while the host is stopped.
 
 Codex may receive a separate bounded public-RSS foreground-evidence path for routed source-sensitive
 turns. It is default-off, requires `--enable-public-search`, and remains closed until the active

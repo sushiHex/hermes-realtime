@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -13,6 +13,7 @@ from hermes_realtime.conversation import (
     ConversationContextStore,
     ConversationMessage,
     ConversationRole,
+    DurableConversation,
 )
 from hermes_realtime.speech import (
     AudioFrame,
@@ -858,6 +859,7 @@ def test_interruption_marker_requires_the_exact_open_heard_row() -> None:
     _confirm_assistant_text(context, "Heard reply.", chunk_id="chunk_001", segment=segment)
     with pytest.raises(KeyError, match="open heard"):
         context.mark_assistant_segment_interrupted(AssistantSegmentKey())
+    context.close_assistant_segment(segment)
     context.record_user_transcript(Transcript(text="Next question", final=True))
     with pytest.raises(KeyError, match="open heard"):
         context.mark_assistant_segment_interrupted(segment)
@@ -904,3 +906,353 @@ def test_interrupted_flag_is_an_exact_boolean_on_assistant_rows_only() -> None:
     )
     assert snapshot.messages[0].interrupted is True
 
+
+def _durable_rows(context: ConversationContextStore) -> list[tuple[str, str, bool]]:
+    return [
+        (message.role, message.text, message.interrupted)
+        for message in context.durable_view().messages
+    ]
+
+
+def _view(
+    *messages: ConversationMessage,
+    prior_work: bool = False,
+) -> DurableConversation:
+    return DurableConversation(messages=messages, prior_work=prior_work)
+
+
+def test_closing_a_completed_segment_ends_its_open_heard_row() -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Whole reply.", chunk_id="chunk_001", segment=segment)
+    assert _durable_rows(context) == [("assistant", "Whole reply.", True)]
+
+    context.close_assistant_segment(segment)
+
+    assert _durable_rows(context) == [("assistant", "Whole reply.", False)]
+    assert context.snapshot().messages == (ConversationMessage("assistant", "Whole reply."),)
+    with pytest.raises(KeyError, match="open heard"):
+        context.mark_assistant_segment_interrupted(segment)
+    with pytest.raises(TypeError, match="segment"):
+        context.close_assistant_segment(cast(AssistantSegmentKey, object()))
+
+
+def test_closing_a_segment_that_is_not_open_is_a_no_op() -> None:
+    # A displaced or already-closed row is final, so the success path never raises.
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_messages=4, max_item_chars=64, on_change=changes.append)
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Open reply.", chunk_id="chunk_001", segment=segment)
+    notified = len(changes)
+
+    context.close_assistant_segment(AssistantSegmentKey())
+
+    assert _durable_rows(context) == [("assistant", "Open reply.", True)]
+    assert len(changes) == notified
+    context.close_assistant_segment(segment)
+    context.close_assistant_segment(segment)
+    assert _durable_rows(context) == [("assistant", "Open reply.", False)]
+    assert len(changes) == notified + 1
+
+
+def test_durable_view_flags_only_the_still_open_assistant_row() -> None:
+    context = ConversationContextStore(max_messages=8, max_item_chars=64)
+    context.record_user_transcript(Transcript(text="First question", final=True))
+    first = AssistantSegmentKey()
+    _confirm_assistant_text(context, "First answer.", chunk_id="chunk_001", segment=first)
+    context.close_assistant_segment(first)
+    second = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Second", chunk_id="chunk_002", segment=second)
+
+    assert _durable_rows(context) == [
+        ("user", "First question", False),
+        ("assistant", "First answer.", False),
+        ("assistant", "Second", True),
+    ]
+    # Live context stays heard-first: the open row is not interrupted yet.
+    assert [message.interrupted for message in context.snapshot().messages] == [
+        False,
+        False,
+        False,
+    ]
+    view = context.durable_view()
+    assert type(view) is DurableConversation
+    assert type(view.messages) is tuple
+    assert view.prior_work is False
+
+
+def test_durable_conversation_is_an_exact_frozen_value() -> None:
+    view = _view(ConversationMessage("user", "Question"), prior_work=True)
+
+    with pytest.raises(AttributeError):
+        view.prior_work = False  # type: ignore[misc]
+    with pytest.raises(TypeError, match="prior_work"):
+        DurableConversation(messages=(), prior_work=cast(bool, 1))
+    with pytest.raises(TypeError, match="messages"):
+        DurableConversation(
+            messages=cast(tuple[ConversationMessage, ...], [ConversationMessage("user", "x")]),
+            prior_work=False,
+        )
+    with pytest.raises(TypeError, match="messages"):
+        DurableConversation(
+            messages=cast(tuple[ConversationMessage, ...], (("user", "x", False),)),
+            prior_work=False,
+        )
+
+
+def test_restore_replaces_a_pristine_store_with_the_exact_tail() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(
+        max_messages=4,
+        max_item_chars=64,
+        on_change=changes.append,
+    )
+    tail = _view(
+        ConversationMessage("user", "Earlier question"),
+        ConversationMessage("assistant", "Earlier answer", interrupted=True),
+    )
+
+    context.restore(tail)
+
+    assert context.snapshot().messages == tail.messages
+    assert context.snapshot().revision == 1
+    assert context.snapshot().terminal_task_count == 0
+    assert context.durable_view() == tail
+    assert changes == [tail]
+    with pytest.raises(RuntimeError, match="pristine"):
+        context.restore(tail)
+
+
+def test_restoring_prior_work_renders_inactive_history_and_never_active_work() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(on_change=changes.append)
+    tail = _view(ConversationMessage("user", "Start the report"), prior_work=True)
+
+    context.restore(tail)
+
+    snapshot = context.snapshot()
+    assert snapshot.terminal_task_count == 1
+    assert snapshot.active_tasks == ()
+    assert snapshot.revision == 1
+    assert context.durable_view() == tail
+    assert changes == [tail]
+
+
+def test_restore_accepts_a_tail_at_the_exact_bounds() -> None:
+    context = ConversationContextStore(max_messages=2, max_item_chars=8)
+    tail = _view(ConversationMessage("user", "x" * 8), ConversationMessage("assistant", "y" * 8))
+
+    context.restore(tail)
+
+    assert context.snapshot().messages == tail.messages
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param(
+            _view(
+                ConversationMessage("user", "one"),
+                ConversationMessage("assistant", "two"),
+                ConversationMessage("user", "three"),
+            ),
+            id="more-rows-than-max-messages",
+        ),
+        pytest.param(_view(ConversationMessage("user", "x" * 9)), id="row-over-max-item-chars"),
+    ],
+)
+def test_restore_refuses_a_tail_outside_this_stores_bounds(tail: DurableConversation) -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_messages=2, max_item_chars=8, on_change=changes.append)
+
+    with pytest.raises(ValueError):
+        context.restore(tail)
+
+    assert context.snapshot().messages == ()
+    assert context.snapshot().revision == 0
+    assert changes == []
+
+
+def _forged(role: str, text: str, interrupted: bool = False) -> ConversationMessage:
+    message = ConversationMessage("assistant", "placeholder")
+    object.__setattr__(message, "role", role)
+    object.__setattr__(message, "text", text)
+    object.__setattr__(message, "interrupted", interrupted)
+    return message
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param(_forged("system", "hello"), id="unknown-role"),
+        pytest.param(_forged("user", "hello", True), id="interrupted-user"),
+        pytest.param(_forged("assistant", "   "), id="blank-text"),
+        pytest.param(_forged("assistant", "said deleg_private"), id="private-run-token"),
+        pytest.param(_forged("assistant", cast(str, b"bytes")), id="non-string-text"),
+        pytest.param(_forged("assistant", "lone \ud800 surrogate"), id="not-utf8-encodable"),
+    ],
+)
+def test_restore_refuses_the_whole_tail_on_any_invalid_row(row: ConversationMessage) -> None:
+    context = ConversationContextStore(max_messages=4, max_item_chars=64)
+    tail = _view(ConversationMessage("user", "valid first row"))
+    object.__setattr__(tail, "messages", (*tail.messages, row))
+
+    with pytest.raises(ValueError):
+        context.restore(tail)
+
+    assert context.snapshot().messages == ()
+    assert context.snapshot().revision == 0
+
+
+def test_restore_is_refused_once_the_store_has_any_state() -> None:
+    tail = _view(ConversationMessage("user", "Earlier question"))
+    with_row = ConversationContextStore()
+    with_row.record_user_transcript(Transcript(text="live", final=True))
+    with_admission = ConversationContextStore()
+    _prepare(with_admission, "pending speech")
+    with_task_admission = ConversationContextStore()
+    with_task_admission.prepare_task("task_pending", "Pending objective")
+    with_task = ConversationContextStore()
+    with_task.record_task_accepted(task_id="task_live", run_id="deleg_live", objective="Live")
+
+    for context in (with_row, with_admission, with_task_admission, with_task):
+        with pytest.raises(RuntimeError, match="pristine"):
+            context.restore(tail)
+    with pytest.raises(TypeError):
+        ConversationContextStore().restore(cast(DurableConversation, tail.messages))
+
+
+def test_on_change_receives_the_durable_view_after_every_row_mutation() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_messages=8, max_item_chars=64, on_change=changes.append)
+
+    context.record_user_transcript(Transcript(text="Question", final=True))
+    assert changes[-1] == _view(ConversationMessage("user", "Question"))
+
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Partial", chunk_id="chunk_001", segment=segment)
+    assert changes[-1].messages[-1] == ConversationMessage("assistant", "Partial", interrupted=True)
+
+    context.close_assistant_segment(segment)
+    assert changes[-1].messages[-1] == ConversationMessage("assistant", "Partial")
+
+    interrupted = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Cut", chunk_id="chunk_002", segment=interrupted)
+    context.mark_assistant_segment_interrupted(interrupted)
+    assert changes[-1].messages[-1] == ConversationMessage("assistant", "Cut", interrupted=True)
+    assert len(changes) == 5
+    assert changes[-1] == context.durable_view()
+
+
+def test_on_change_fires_when_prior_work_flips_and_never_otherwise_for_tasks() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_messages=8, max_item_chars=64, on_change=changes.append)
+
+    admission = context.prepare_task("task_b", "Other objective")
+    context.discard_task(admission)
+    assert changes == []
+
+    # Active work is prior work too: a restart never resumes it.
+    context.record_task_accepted(task_id="task_a", run_id="deleg_a", objective="Objective")
+    assert changes == [_view(prior_work=True)]
+    context.record_task_completed(task_id="task_a", run_id="deleg_a")
+    context.mark_prior_work_ended()
+    assert changes == [_view(prior_work=True)]
+
+    reserved = ConversationContextStore(on_change=changes.append)
+    task = reserved.prepare_task("task_c", "Reserved objective")
+    reserved.record_reserved_task_accepted(admission=task, run_id="deleg_c")
+    assert changes[-1] == _view(prior_work=True)
+    assert len(changes) == 2
+
+
+def test_on_change_ignores_unrecorded_speech() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_messages=8, max_item_chars=64, on_change=changes.append)
+    ledger = DeliveredSpeechLedger()
+    chunk = SpeechChunk(
+        turn_id="turn_context",
+        chunk_id="chunk_001",
+        text="unlocated speech",
+        audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+    )
+    admission = context.prepare_assistant_text(
+        chunk.text,
+        segment=AssistantSegmentKey(),
+        heard_text=None,
+    )
+    ledger.queue(chunk, admission=admission)
+    confirmation = ledger.mark_delivered_confirmed(
+        ledger.mark_started(chunk.turn_id, chunk.chunk_id)
+    )
+    context.record_assistant_delivery(
+        admission=admission,
+        ledger=ledger,
+        confirmation=confirmation,
+    )
+    discarded = _prepare(context, "never played")
+    context.discard_assistant_text(discarded)
+
+    assert changes == []
+
+
+def test_on_change_must_be_callable_and_its_failure_propagates() -> None:
+    with pytest.raises(TypeError, match="on_change"):
+        ConversationContextStore(on_change=cast(Any, "not callable"))
+
+    def failing(_view: DurableConversation) -> None:
+        raise RuntimeError("tail mirror bug")
+
+    context = ConversationContextStore(on_change=failing)
+    with pytest.raises(RuntimeError, match="tail mirror bug"):
+        context.record_user_transcript(Transcript(text="Question", final=True))
+
+
+def test_marking_prior_work_ended_is_idempotent_inactive_history() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(on_change=changes.append)
+    context.restore(_view(ConversationMessage("user", "Earlier question")))
+
+    context.mark_prior_work_ended()
+    context.mark_prior_work_ended()
+
+    snapshot = context.snapshot()
+    assert snapshot.terminal_task_count == 1
+    assert snapshot.active_tasks == ()
+    assert snapshot.revision == 2
+    assert context.durable_view().prior_work is True
+    assert [change.prior_work for change in changes] == [False, True]
+
+
+def test_marking_prior_work_keeps_real_terminal_history() -> None:
+    context = ConversationContextStore()
+    for index in range(2):
+        context.record_task_accepted(
+            task_id=f"task_{index}", run_id=f"deleg_{index}", objective="Objective"
+        )
+        context.record_task_completed(task_id=f"task_{index}", run_id=f"deleg_{index}")
+    revision = context.snapshot().revision
+
+    context.mark_prior_work_ended()
+
+    assert context.snapshot().terminal_task_count == 2
+    assert context.snapshot().revision == revision
+
+
+def test_validating_user_text_is_pure_and_matches_what_the_store_records() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(max_item_chars=8, on_change=changes.append)
+
+    context.validate_user_text("task: x")
+    for text in ("x" * 9, "   ", "bad \ud800"):
+        with pytest.raises(ValueError):
+            context.validate_user_text(text)
+        with pytest.raises(ValueError):
+            context.record_user_transcript(Transcript(text=text or "x", final=True))
+    with pytest.raises(ActiveTaskIdentityError, match="private run"):
+        context.validate_user_text("deleg_ab")
+    with pytest.raises(TypeError):
+        context.validate_user_text(cast(str, b"bytes"))
+
+    assert context.snapshot().revision == 0
+    assert changes == []

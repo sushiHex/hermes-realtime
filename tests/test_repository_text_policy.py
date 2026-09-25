@@ -308,6 +308,27 @@ def test_evidence_capture_source_has_no_forbidden_import_path() -> None:
     assert not violations, "forbidden evidence import paths:\n" + "\n".join(violations)
 
 
+def test_evidence_capture_doc_places_plaintext_host_state_outside_purge() -> None:
+    normalized_policy = " ".join(_read_evidence_policy().split())
+
+    assert "Host state is outside evidence capture and purge." in normalized_policy
+    assert "`HermesRealtime/state/`" in normalized_policy
+    assert "No evidence recorder receives voice tail content." in normalized_policy
+
+
+def test_voice_tail_content_has_no_path_into_evidence_capture() -> None:
+    # The tail and the store it mirrors never import an evidence recorder, so restored
+    # or mirrored rows cannot reach capture except as ordinary delivered speech.
+    evidence_target = re.compile(r"(?:^|\.)evidence(?:\.|$)")
+    for relative in (
+        "src/hermes_realtime/integration/voice_tail.py",
+        "src/hermes_realtime/integration/run_record.py",
+        "src/hermes_realtime/conversation/context.py",
+    ):
+        targets = _python_import_targets(_ROOT / relative)
+        assert not any(evidence_target.search(target) for target in targets), relative
+
+
 def test_web_build_inputs_and_generated_text_assets_are_forced_to_lf() -> None:
     root = _ROOT
     required_rules = {

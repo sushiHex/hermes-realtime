@@ -510,3 +510,210 @@ async def test_post_ack_projection_failure_rolls_back_new_task() -> None:
     assert controller.cancellations == [
         ("task_release_check", "task state projection failed")
     ]
+
+
+class _OrderedControllerProbe(TaskControllerProbe):
+    order: list[str]
+
+    async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome:
+        self.order.append("dispatch")
+        return await super().dispatch(objective=objective, utterance_id=utterance_id)
+
+    async def request_cancel(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+    ) -> TaskCancelOutcome:
+        self.order.append("cancel")
+        return await super().request_cancel(task_id, reason=reason)
+
+
+def _ordered_probe(order: list[str]) -> _OrderedControllerProbe:
+    probe = _OrderedControllerProbe(
+        dispatch_outcome=TaskDispatchOutcome(task_id="task_release_check", accepted=True),
+        cancel_outcome=TaskCancelOutcome(task_id="task_release_check", accepted=True),
+    )
+    probe.order = order
+    return probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "action"),
+    [
+        pytest.param("task: Inspect the release evidence", "dispatch", id="task"),
+        pytest.param("  Task: padded utterance  ", "dispatch", id="exact-utterance"),
+        pytest.param("cancel task: task_release_check", "cancel", id="cancel"),
+        pytest.param("task:", None, id="invalid-task"),
+        pytest.param("cancel task: release_check", None, id="invalid-cancel"),
+    ],
+)
+async def test_every_command_becomes_one_user_row_before_the_router_acts(
+    text: str,
+    action: str | None,
+) -> None:
+    order: list[str] = []
+
+    async def record_user_input(recorded: str) -> None:
+        order.append(f"record:{recorded}")
+
+    router = ConversationTaskCommandRouter(
+        controller=_ordered_probe(order),
+        observer=lambda _kind, _data: None,
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "command_1",
+        validate_user_input=lambda checked: order.append(f"validate:{checked}"),
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route("Please inspect the release evidence") is False
+    assert order == []
+    assert await router.route(text) is True
+
+    assert order == [
+        f"validate:{text}",
+        f"record:{text}",
+        *([action] if action is not None else []),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> None:
+    order: list[str] = []
+
+    class SurfaceProbe:
+        max_objective_chars = 1024
+
+        async def start_work(self, *, objective: str, invocation_id: str) -> object:
+            del objective, invocation_id
+            order.append("start")
+            from hermes_realtime.conversation.work_tools import WorkStartResult
+
+            return WorkStartResult(accepted=False, state="rejected", reason="probe")
+
+        async def cancel_work(self, **_kwargs: object) -> object:
+            order.append("cancel")
+            from hermes_realtime.conversation.work_tools import WorkCancelResult
+
+            return WorkCancelResult(accepted=False, state="rejected", reason="probe")
+
+    async def record_user_input(recorded: str) -> None:
+        order.append(f"record:{recorded}")
+
+    router = ConversationTaskCommandRouter(
+        surface=SurfaceProbe(),  # type: ignore[arg-type]
+        observer=lambda _kind, _data: None,
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "command_1",
+        validate_user_input=lambda _text: None,
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route("task: Inspect it") is True
+    assert await router.route("cancel task: task_release_check") is True
+
+    assert order == [
+        "record:task: Inspect it",
+        "start",
+        "record:cancel task: task_release_check",
+        "cancel",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("task: " + "x" * 12, id="over-the-context-item-bound"),
+        pytest.param("cancel task: task_deleg_private", id="private-run-token"),
+        pytest.param("task: lone \ud800", id="not-utf8-encodable"),
+    ],
+)
+async def test_a_command_the_context_cannot_hold_is_invalid_before_transport(text: str) -> None:
+    context = ConversationContextStore(max_item_chars=16)
+    controller = _probe()
+    events: list[tuple[str, dict[str, str | int | bool | None]]] = []
+    recorded: list[str] = []
+
+    async def record_user_input(text: str) -> None:
+        recorded.append(text)
+
+    router = ConversationTaskCommandRouter(
+        controller=controller,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "unused",
+        validate_user_input=context.validate_user_text,
+        record_user_input=record_user_input,
+    )
+
+    assert await router.route(text) is True
+
+    assert recorded == []
+    assert controller.dispatches == []
+    assert controller.cancellations == []
+    assert events == [
+        (
+            "task_state",
+            {"reason": "invalid explicit task command", "status": "rejected", "taskId": None},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(RuntimeError("prior turn cleanup failed"), id="cleanup-failure"),
+        pytest.param(ValueError("not a validation refusal"), id="value-error"),
+    ],
+)
+async def test_a_recording_failure_propagates_and_is_never_reported_invalid(
+    failure: Exception,
+) -> None:
+    controller = _probe()
+    events: list[tuple[str, dict[str, str | int | bool | None]]] = []
+
+    async def record_user_input(_text: str) -> None:
+        raise failure
+
+    router = ConversationTaskCommandRouter(
+        controller=controller,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+        utterance_id_factory=lambda: "unused",
+        validate_user_input=ConversationContextStore().validate_user_text,
+        record_user_input=record_user_input,
+    )
+
+    with pytest.raises(type(failure), match=str(failure)):
+        await router.route("task: Inspect it")
+
+    assert controller.dispatches == []
+    assert events == []
+
+
+def test_the_user_input_hooks_must_be_callable_and_paired() -> None:
+    async def record(_text: str) -> None:
+        return None
+
+    for kwargs in (
+        {"record_user_input": "not callable", "validate_user_input": lambda _text: None},
+        {"record_user_input": record, "validate_user_input": "not callable"},
+    ):
+        with pytest.raises(TypeError, match="user_input"):
+            ConversationTaskCommandRouter(
+                controller=_probe(),
+                observer=lambda _kind, _data: None,
+                reserve_observer_capacity=lambda: None,
+                **kwargs,  # type: ignore[arg-type]
+            )
+    for kwargs in ({"record_user_input": record}, {"validate_user_input": lambda _text: None}):
+        with pytest.raises(ValueError, match="together"):
+            ConversationTaskCommandRouter(
+                controller=_probe(),
+                observer=lambda _kind, _data: None,
+                reserve_observer_capacity=lambda: None,
+                **kwargs,  # type: ignore[arg-type]
+            )

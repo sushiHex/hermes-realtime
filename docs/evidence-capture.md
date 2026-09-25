@@ -138,6 +138,12 @@ and temporary database names under the already validated parent. It preserves ad
 files plus the owned root marker and stable sentinel. Only a later accepted consent may
 create a new installation identity.
 
+Host state is outside evidence capture and purge. `HermesRealtime/state/` under
+`%LOCALAPPDATA%` (else `$XDG_STATE_HOME`, else `~/.local/state`) holds plaintext user data: the
+Hermes run record and the voice tail, which keeps the recent delivery-confirmed voice
+conversation so a restarted host can resume it. No evidence recorder receives voice tail content.
+Until a forget operation exists, delete the voice tail file while the host is stopped.
+
 VACUUM and byte-absence checks are not SSD forensic erasure, and Python strings are not securely zeroized.
 Restart is required for stronger clearing of process memory. Process-crash and SQLite
 atomicity tests do not establish physical power-loss durability.

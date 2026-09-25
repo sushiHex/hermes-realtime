@@ -319,6 +319,8 @@ class HermesApiTaskSession:
                         flush=True,
                     )
                     raise RuntimeError("another host holds the Hermes run record")
+                # A crashed write can leave its plaintext temporary behind.
+                run_record.remove_orphaned_temporaries(self._run_record_path)
             status, payload = await self._request_json("GET", "/v1/capabilities")
             if status != 200:
                 raise RuntimeError("Hermes API capability discovery failed")

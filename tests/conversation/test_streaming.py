@@ -4287,3 +4287,302 @@ async def test_nonreturning_iterator_close_fails_closed_within_bound() -> None:
     inference.iterator.release_close.set()
     await asyncio.sleep(0)
     await loop.close()
+
+
+def _durable_rows(context: ConversationContextStore) -> list[tuple[str, str, bool]]:
+    return [
+        (message.role, message.text, message.interrupted)
+        for message in context.durable_view().messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_turn_closes_its_heard_row_so_a_restart_would_not_flag_it() -> None:
+    context = ConversationContextStore()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First answer.", "Second answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer.", False),
+        ("assistant", "Second answer.", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_still_open_heard_row_is_interrupted_in_the_durable_view_only() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", False),
+    ]
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+    ]
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+    assert _durable_rows(context) == _context_rows(context)
+
+
+@pytest.mark.asyncio
+async def test_recording_user_input_when_idle_adds_exactly_one_user_row() -> None:
+    context = ConversationContextStore()
+    inference = InferenceCallProbe()
+    playback = RecordingPlayback()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.record_user_input(Transcript(text="task: check the build", final=True))
+
+    assert _context_rows(context) == [("user", "task: check the build", False)]
+    assert inference.stream_called is False
+    assert playback.chunks == []
+    with pytest.raises(ValueError, match="final"):
+        await loop.record_user_input(Transcript(text="partial", final=False))
+    await loop.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await loop.record_user_input(Transcript(text="task: late", final=True))
+    assert _context_rows(context) == [("user", "task: check the build", False)]
+
+
+@pytest.mark.asyncio
+async def test_recording_user_input_settles_live_speech_before_its_row() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    with pytest.raises(ValueError, match="final"):
+        await loop.record_user_input(Transcript(text="partial", final=False))
+    assert loop.foreground_active is True
+
+    await loop.record_user_input(Transcript(text="task: check the build", final=True))
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(response, timeout=2)
+    assert loop.foreground_active is False
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+        ("user", "task: check the build", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recording_user_input_waits_for_a_revoked_turns_cleanup() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    # Another owner revoked the turn; its interruption marker has not landed yet.
+    cancelling = asyncio.create_task(loop.cancel())
+    await asyncio.sleep(0)
+    assert loop.foreground_active is False
+
+    await loop.record_user_input(Transcript(text="task: check the build", final=True))
+
+    await asyncio.wait_for(cancelling, timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(response, timeout=2)
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First part.", True),
+        ("user", "task: check the build", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_announce_speaks_fixed_text_as_heard_context_without_inference() -> None:
+    context = ConversationContextStore()
+    inference = InferenceCallProbe()
+    playback = RecordingPlayback()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    assert await loop.announce("restart_announcement", "I restarted.") is True
+
+    assert inference.stream_called is False
+    assert [chunk.text for chunk in playback.chunks] == ["I restarted."]
+    assert _context_rows(context) == [("assistant", "I restarted.", False)]
+    assert _durable_rows(context) == [("assistant", "I restarted.", False)]
+    for turn_id in ("", "   ", cast(str, None)):
+        with pytest.raises((TypeError, ValueError), match="turn_id"):
+            await loop.announce(turn_id, "Again.")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_never_takes_the_floor_from_live_speech() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Live answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop.foreground_active is True
+    assert [chunk.text for chunk in playback.chunks] == ["Live answer."]
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+
+@pytest.mark.asyncio
+async def test_announce_never_discards_resumable_interrupted_speech() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_1_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First part. Second part."),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(response, timeout=2)
+    resumable = loop._resumable_speech
+    assert resumable is not None
+    assert loop.foreground_active is False
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop._resumable_speech is resumable
+    assert [chunk.text for chunk in playback.chunks] == ["First part."]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_never_replaces_a_live_idle_mention() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("update_1", "chunk_1"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=InferenceCallProbe(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    decision = UpdateDecision(
+        sequence=1,
+        completion=TaskTerminalOutcome(
+            task_id="task_report",
+            status="completed",
+            summary="The report is ready.",
+        ),
+        kind=UpdateDecisionKind.MENTION_NEXT.value,
+        text="The report is ready.",
+    )
+    authority = loop._bind_update_executor(object())
+    operation = loop._begin_update_operation(authority, "update_1")
+    mention = asyncio.create_task(
+        loop._announce_idle_update(authority, operation, "update_1", decision)
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+
+    assert await loop.announce("restart_announcement", "I restarted.") is False
+
+    assert loop.active_turn_id == "update_1"
+    assert [chunk.text for chunk in playback.chunks] == ["The report is ready."]
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(mention, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_completion_never_flags_the_closed_row() -> None:
+    context = ConversationContextStore()
+
+    def observer(kind: str, _data: dict[str, str | int | bool | None]) -> None:
+        if kind == "assistant_turn_completed":
+            raise asyncio.CancelledError
+
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Whole answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        observer=observer,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "Whole answer.", False),
+    ]

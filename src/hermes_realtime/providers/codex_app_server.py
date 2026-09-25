@@ -2800,7 +2800,7 @@ class CodexAppServerStreamingInference:
             "Respond to the final user message in this authoritative JSON conversation "
             "snapshot. Earlier assistant messages represent only speech confirmed delivered. "
             'An assistant message with "interrupted": true was cut off after its text, and '
-            "the user did not hear the rest. "
+            "the user may not have heard the rest. "
             "The work_state field is authoritative lifecycle context. Only active_tasks establish "
             "active background work. inactive_with_history means prior work ended and cannot be "
             "continued as active; never claim it is still running. Interpret continuation wording "

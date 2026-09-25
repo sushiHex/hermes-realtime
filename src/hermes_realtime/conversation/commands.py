@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Protocol, overload
 
 from hermes_realtime.evidence import (
@@ -16,7 +16,7 @@ from hermes_realtime.evidence import (
 )
 from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
 
-from .context import ActiveTaskIdentityError
+from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 from .work_tools import WorkCancelResult, WorkStartResult
 
@@ -61,7 +61,14 @@ class _WorkControlSurface(Protocol):
 
 
 class ConversationTaskCommandRouter:
-    """Consume only explicit task commands before foreground inference."""
+    """Consume only explicit task commands before foreground inference.
+
+    A command starts no turn, so ``record_user_input`` records its exact text as
+    the user row before the command acts; every other final input becomes a
+    user row through the turn it starts. ``validate_user_input`` is the store's
+    pure check: only its refusal makes a command invalid. A recording failure
+    propagates exactly as it would for an ordinary turn.
+    """
 
     def __init__(
         self,
@@ -73,7 +80,15 @@ class ConversationTaskCommandRouter:
         surface: _WorkControlSurface | None = None,
         lifecycle_owner: EvidenceConversationAuthorityV1 | None = None,
         on_command_accepted: _CommandAcceptedHook | None = None,
+        validate_user_input: Callable[[str], None] | None = None,
+        record_user_input: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        if validate_user_input is not None and not callable(validate_user_input):
+            raise TypeError("validate_user_input must be callable or None")
+        if record_user_input is not None and not callable(record_user_input):
+            raise TypeError("record_user_input must be callable or None")
+        if (validate_user_input is None) is not (record_user_input is None):
+            raise ValueError("user input validation and recording are configured together")
         if surface is None and not callable(getattr(controller, "dispatch", None)):
             raise TypeError("controller must provide dispatch()")
         if surface is None and not callable(getattr(controller, "request_cancel", None)):
@@ -103,6 +118,21 @@ class ConversationTaskCommandRouter:
         self._surface = surface
         self._lifecycle_owner = lifecycle_owner
         self._on_command_accepted = on_command_accepted
+        self._validate_user_input = validate_user_input
+        self._record_user_input = record_user_input
+
+    async def _recorded(self, text: str) -> bool:
+        """Record one command's user row; False only when the text is refused as invalid."""
+
+        validate, record = self._validate_user_input, self._record_user_input
+        if validate is None or record is None:
+            return True
+        try:
+            validate(text)
+        except (ValueError, PrivateRunDisclosureError):
+            return False
+        await record(text)
+        return True
 
     @overload
     async def route(self, text: str) -> bool: ...
@@ -128,6 +158,9 @@ class ConversationTaskCommandRouter:
             raise TypeError("command text must be an exact built-in string")
         stripped = text.strip()
         folded = stripped.casefold()
+        if folded.startswith(("task:", "cancel task:")) and not await self._recorded(text):
+            self._publish_invalid()
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
         if folded.startswith("task:"):
             objective = stripped[len("task:") :].strip()
             if not self._valid_objective(objective):
