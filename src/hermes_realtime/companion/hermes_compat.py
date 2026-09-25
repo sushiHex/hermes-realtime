@@ -76,10 +76,29 @@ SURFACE: tuple[SurfaceName, ...] = (
     ),
     SurfaceName("SessionDB.release_session_turn_lease", ("self", "session_id", "holder")),
 )
-# The table shapes the projection relies on: every messages column (the fingerprint covers
-# them all), and the session columns the header reads.
+# The table shapes the projection relies on, bound by equality to the pin: every messages
+# column (the fingerprint covers them all), and every sessions column (a new one could carry
+# lineage or state the header does not bind).
 MESSAGE_TABLE_COLUMNS = frozenset({"id", "session_id", *MESSAGE_COLUMNS})
-SESSION_TABLE_COLUMNS = frozenset({"id", "message_count", *HEADER_COLUMNS})
+SESSION_TABLE_COLUMNS = frozenset(
+    {
+        "id", "source", "user_id", "session_key", "chat_id", "chat_type", "thread_id",
+        "display_name", "origin_json", "expiry_finalized", "model", "model_config",
+        "system_prompt", "system_prompt_hash", "parent_session_id", "started_at", "ended_at",
+        "end_reason", "message_count", "tool_call_count", "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "cwd", "git_branch",
+        "git_repo_root", "git_metadata_generation", "billing_provider", "billing_base_url",
+        "billing_mode", "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+        "pricing_version", "title", "title_source", "last_activity_at",
+        "last_activity_description", "last_activity_provenance", "api_call_count",
+        "handoff_state", "handoff_platform", "handoff_error",
+        "compression_failure_cooldown_until", "compression_failure_error",
+        "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+        "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+    }
+)
+if not {*HEADER_COLUMNS, "message_count"} <= SESSION_TABLE_COLUMNS:
+    raise RuntimeError("the pinned sessions shape must hold every column the header reads")
 
 _LISTED = frozenset(entry.name for entry in SURFACE)
 _ROW_SQL = (
@@ -154,9 +173,20 @@ def check_shapes(db: Any) -> tuple[str, ...]:
     failures: list[str] = []
     if messages != MESSAGE_TABLE_COLUMNS:
         failures.append("shape:messages")
-    if SESSION_TABLE_COLUMNS - sessions:
+    if sessions != SESSION_TABLE_COLUMNS:
         failures.append("shape:sessions")
     return tuple(failures)
+
+
+def durability_level(db: Any) -> int:
+    """``PRAGMA synchronous`` on the connection Hermes writes the archive through."""
+
+    level = _method(_session_db(db), "SessionDB._execute_write")(
+        lambda conn: conn.execute("PRAGMA synchronous").fetchone()[0]
+    )
+    if type(level) is not int:
+        raise TypeError("PRAGMA synchronous did not answer an integer")
+    return level
 
 
 def _read_projection(conn: Any, session_id: str, cap: int) -> Projection | None:
@@ -289,6 +319,13 @@ class HermesArchivePort:
 
     def __init__(self, db: Any) -> None:
         self._db = _session_db(db)
+
+    def check_compatibility(self) -> tuple[str, ...]:
+        """Surface names, signatures and table shapes that differ from the pin."""
+        return check_surface() + check_shapes(self._db)
+
+    def durability_level(self) -> int:
+        return durability_level(self._db)
 
     def create_session(self, session_id: str) -> None:
         create_voice_session(self._db, session_id)

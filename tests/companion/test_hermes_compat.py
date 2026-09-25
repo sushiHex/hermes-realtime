@@ -58,6 +58,75 @@ def test_every_hermes_attribute_the_module_uses_is_on_the_surface() -> None:
     assert used == {entry.name for entry in SURFACE}
 
 
+def _enclosing_functions(tree: ast.AST) -> dict[ast.AST, str]:
+    owners: dict[ast.AST, str] = {}
+    for function in ast.walk(tree):
+        if isinstance(function, ast.FunctionDef):
+            for node in ast.walk(function):
+                owners.setdefault(node, function.name)
+    return owners
+
+
+def hermes_access_violations(source: str) -> list[str]:
+    """Every way ``hermes_compat`` reaches into Hermes other than ``_method`` or ``resolve``.
+
+    Hermes objects are the ``SessionDB`` (named ``db``, or held as ``self._db``) and whatever
+    ``_lookup`` resolves. Only ``_lookup`` and ``_method`` may use ``getattr`` or import;
+    the only thing done to a Hermes-provided connection is ``conn.execute``.
+    """
+
+    tree = ast.parse(source)
+    owners = _enclosing_functions(tree)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "db":
+                violations.append(f"db.{node.attr}")
+            if isinstance(value, ast.Attribute) and value.attr == "_db":
+                violations.append(f"_db.{node.attr}")
+            if isinstance(value, ast.Name) and value.id == "conn" and node.attr != "execute":
+                violations.append(f"conn.{node.attr}")
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in {"_session_db", "resolve", "_lookup", "_method"}
+            ):
+                violations.append(f"{value.func.id}().{node.attr}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and (
+            node.func.id in {"getattr", "setattr", "hasattr", "vars", "__import__"}
+        ) and owners.get(node) not in {"_lookup", "_method"}:
+            violations.append(f"{node.func.id}()")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "import_module"
+            and owners.get(node) != "_lookup"
+        ):
+            violations.append("import_module")
+    return violations
+
+
+def test_hermes_is_reached_only_through_the_enumerated_surface() -> None:
+    assert hermes_access_violations(_SOURCE) == []
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "violation"),
+    [
+        ('_method(_session_db(db), "SessionDB.release_session_turn_lease")',
+         "_session_db(db).release_session_turn_lease",
+         "_session_db().release_session_turn_lease"),
+        ("def _session_db(db: Any) -> Any:\n",
+         "def _session_db(db: Any) -> Any:\n    db.anything\n", "db.anything"),
+        ("return durability_level(self._db)", "return self._db.durability", "_db.durability"),
+    ],
+    ids=["call-result", "db", "self-db"],
+)
+def test_the_access_rule_catches_a_direct_reach(before: str, after: str, violation: str) -> None:
+    assert before in _SOURCE
+    assert hermes_access_violations(_SOURCE.replace(before, after, 1)) == [violation]
+
+
 def _stand_in(**overrides: Any) -> types.ModuleType:
     """A module shaped like the pinned ``hermes_state`` surface, with nothing behind it."""
 
