@@ -346,3 +346,16 @@ Each step must prove its guarantees against a qualified exact target:
 
 Each guard follows the repository evidence rules: one bounded, content-free refusal marker, and
 one mutation per guard shown to fail alone.
+
+`scripts/qualify_hermes_continuity.py` qualifies the replay, crash and restart guarantees of
+steps 1–3 against the baseline, unattended and without credentials. It uses real processes and
+the pinned Hermes. Each scenario crashes a host, restarts it on the same record, and checks two
+independent witnesses:
+
+- Hermes's own durable admission store, which must show one admission per dispatch, ended by
+  the restart's stop, or by Hermes's own restart;
+- a stand-in model that never finishes, which must see the work start once and nothing left
+  running.
+
+The in-process resend and the unknown outcomes rely on the same Hermes replay contract. They are
+proven by unit tests, not against Hermes.
