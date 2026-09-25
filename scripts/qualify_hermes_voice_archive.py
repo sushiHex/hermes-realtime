@@ -187,6 +187,10 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
             ["archive:not_ready", "open:recovery"],
         ),
     ],
+    # A foreign session already holds the id a new conversation was bound to: never adopted.
+    "creation_occupied": [
+        _step({"open": "recovery", "quarantine": "recovery"}, ["open:recovery"]),
+    ],
     "lease_false": [
         _step(
             {"fenced": 1, "foreign_acquired": 1, "mutations": 0, "refusal": "not_ready"},
@@ -228,6 +232,7 @@ _PLAN: dict[str, list[tuple[str, ...]]] = {
     "compaction_at_restart": [("seed",), ("mutate", "compaction"), ("reopen",), ("reopen",)],
     **{f"crash_{point}": [("crash", point), ("recover",)] for point in _CRASH_POINTS},
     "crash_ambiguous": [("crash", "after_pending"), ("mutate", "unleased_append"), ("reopen",)],
+    "creation_occupied": [("occupied",)],
     "lease_false": [("lease", "false")],
     "lease_raise": [("lease", "raise")],
     "lease_stolen": [("lease", "stolen")],
@@ -633,6 +638,16 @@ async def _reopen(worker: _Worker) -> dict[str, object]:
     }
 
 
+async def _occupied(worker: _Worker) -> dict[str, object]:
+    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
+    from hermes_realtime.companion.store import Progress
+
+    worker.store.bind(_CONVERSATION, "voice_occupied", Progress(genesis(EXPECTED_HEADER), None))
+    worker.db.create_session("voice_occupied", source="cli")
+    opened = await _refusal(worker.archive().open(_CONVERSATION))
+    return {"open": opened, "quarantine": worker.fresh_record().quarantine}
+
+
 async def _seed(worker: _Worker) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
@@ -825,6 +840,8 @@ async def _run_worker(arguments: list[str], home: Path) -> None:
         result = await _reopen(worker)
     elif step == "seed":
         result = await _seed(worker)
+    elif step == "occupied":
+        result = await _occupied(worker)
     elif step == "mutate":
         _mutate(worker, options[0])
         result = {"mutated": 1}

@@ -44,7 +44,7 @@ def test_the_criteria_are_all_planned() -> None:
     assert {f"foreign_{kind}" for kind in _SCRIPT._FOREIGN_KINDS} <= set(plan)
     assert {f"crash_{point}" for point in _SCRIPT._CRASH_POINTS} <= set(plan)
     assert {"surface", "dedup", "compaction_at_restart", "crash_ambiguous", "lease_false",
-            "lease_raise", "lease_stolen", "cap"} <= set(plan)
+            "lease_raise", "lease_stolen", "cap", "creation_occupied"} <= set(plan)
     assert set(_SCRIPT._FOREIGN_KINDS) == {
         "compaction", "replace_content", "replace_reorder", "display_flag", "unleased_append",
         "delete", "rotation", "replace_archived",
