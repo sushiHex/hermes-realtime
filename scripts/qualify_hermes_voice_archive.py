@@ -136,6 +136,8 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
                 "equivalent_rows": 8,
                 "fingerprint_matches": 1,
                 "message_count_matches": 1,
+                "partition_mutations": 0,
+                "partition_refusal": "partition",
                 "surface_failures": 0,
                 "unlisted_refused": 1,
             },
@@ -328,8 +330,10 @@ def _qualify(python: Path) -> None:
 # --- worker side: runs inside the pinned Hermes environment --------------------------------
 
 
-def _fixture(start: int, stop: int, *, variant: str = "") -> tuple[Any, ...]:
-    """Synthetic rows only: never user content."""
+def _fixture(
+    start: int, stop: int, *, variant: str = "", gap: tuple[int, int] | None = None
+) -> tuple[Any, ...]:
+    """Synthetic rows only: never user content. ``gap`` goes on the first row."""
 
     from hermes_realtime.companion.integrity import Identity, VoiceRow
 
@@ -341,9 +345,26 @@ def _fixture(start: int, stop: int, *, variant: str = "") -> tuple[Any, ...]:
             text=texts[seq % 3].format(seq) + variant,
             interrupted=seq % 4 == 3,
             timestamp=1_700_000_000.0 + seq * 0.5,
+            gap_before=gap if seq == start else None,
         )
         for seq in range(start, stop)
     )
+
+
+def _batch(start: int, stop: int, *, variant: str = "") -> Any:
+    """A gapless batch covering seq ``start`` to ``stop - 1``."""
+
+    from hermes_realtime.companion.integrity import VoiceBatch
+
+    return VoiceBatch(0, start, stop - 1, _fixture(start, stop, variant=variant))
+
+
+def _gapped() -> Any:
+    """Rows 0-3, user row 6 carrying the overflow gap 4-5, then 7-9: covers 0-9 in 8 rows."""
+
+    from hermes_realtime.companion.integrity import VoiceBatch
+
+    return VoiceBatch(0, 0, 9, (*_fixture(0, 4), *_fixture(6, 10, gap=(4, 5))))
 
 
 class _Worker:
@@ -483,6 +504,7 @@ async def _surface(worker: _Worker) -> dict[str, object]:
     from hermes_realtime.companion.hermes_compat import (
         SURFACE,
         CompatError,
+        archive_voice_rows,
         check_shapes,
         check_surface,
         read_projection,
@@ -492,6 +514,8 @@ async def _surface(worker: _Worker) -> dict[str, object]:
         EXPECTED_HEADER,
         MAX_ARCHIVE_ROWS,
         VOICE_SOURCE,
+        ArchiveRefusal,
+        VoiceBatch,
         expected_after,
         genesis,
     )
@@ -499,8 +523,9 @@ async def _surface(worker: _Worker) -> dict[str, object]:
     failures = check_surface() + check_shapes(worker.db)
     archive = worker.archive()
     await archive.open(_CONVERSATION)
-    rows = _fixture(0, 8)
-    await archive.archive(_CONVERSATION, 0, rows)
+    # Eight rows covering seq 0-9: an overflow gap travels on user row 6.
+    rows = _gapped().rows
+    await archive.archive(_CONVERSATION, _gapped())
     session_id = worker.session_id()
     # The same fixture through Hermes's own public append, into a session with the same header.
     worker.db.create_session("reference", source=VOICE_SOURCE)
@@ -521,6 +546,26 @@ async def _surface(worker: _Worker) -> dict[str, object]:
         and record.committed is not None
         and projected.fingerprint() == precomputed == record.committed.fingerprint
     )
+    assert record is not None and record.committed is not None
+    # The private operation itself refuses, whole, a batch that leaves a hole in its range.
+    holed = VoiceBatch(0, 10, 12, (*_fixture(10, 11), *_fixture(12, 13)))
+    before = worker.snapshot(session_id)
+    try:
+        archive_voice_rows(
+            worker.db,
+            session_id,
+            archive.holder(_CONVERSATION),
+            holed,
+            record.committed.fingerprint,
+            record.committed.fingerprint,
+            conversation_id=_CONVERSATION,
+            cap=MAX_ARCHIVE_ROWS,
+            lease_ttl_seconds=300.0,
+        )
+        partition = "accepted"
+    except ArchiveRefusal as refusal:
+        partition = refusal.category
+    partition_mutations = int(worker.snapshot(session_id) != before)
     # A Hermes that stores anything but the prediction is refused, and nothing lands.
     original = worker.db._insert_message_rows
 
@@ -535,7 +580,7 @@ async def _surface(worker: _Worker) -> dict[str, object]:
 
     before = worker.snapshot(session_id)
     worker.db._insert_message_rows = drifting
-    drift = await _refusal(archive.archive(_CONVERSATION, 0, _fixture(8, 10)))
+    drift = await _refusal(archive.archive(_CONVERSATION, _batch(10, 12)))
     del worker.db._insert_message_rows
     after = worker.snapshot(session_id)
     try:
@@ -551,6 +596,8 @@ async def _surface(worker: _Worker) -> dict[str, object]:
         "equivalent_rows": len(ours),
         "fingerprint_matches": int(matches),
         "message_count_matches": int(counts == {len(rows)}),
+        "partition_mutations": partition_mutations,
+        "partition_refusal": partition,
         "surface_failures": len(failures),
         "unlisted_refused": unlisted,
         "measurements": {"hermes_version": hermes_cli.__version__, "surface_names": len(SURFACE)},
@@ -560,16 +607,16 @@ async def _surface(worker: _Worker) -> dict[str, object]:
 async def _dedup(worker: _Worker) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
-    first = _fixture(0, 4)
-    await archive.archive(_CONVERSATION, 0, first)
-    sequential = [await archive.archive(_CONVERSATION, 0, first) for _ in range(3)]
+    first = _batch(0, 4)
+    await archive.archive(_CONVERSATION, first)
+    sequential = [await archive.archive(_CONVERSATION, first) for _ in range(3)]
     concurrent = await asyncio.gather(
-        *(archive.archive(_CONVERSATION, 0, _fixture(4, 8)) for _ in range(4))
+        *(archive.archive(_CONVERSATION, _batch(4, 8)) for _ in range(4))
     )
-    overlap = await archive.archive(_CONVERSATION, 0, _fixture(6, 10))
+    overlap = await archive.archive(_CONVERSATION, _batch(6, 10))
     session_id = worker.session_id()
     before = worker.snapshot(session_id)
-    conflict = await _refusal(archive.archive(_CONVERSATION, 0, _fixture(8, 10, variant="!")))
+    conflict = await _refusal(archive.archive(_CONVERSATION, _batch(8, 10, variant="!")))
     conflict_mutations = int(worker.snapshot(session_id) != before)
     # A leased foreign agent turn: its flush and its acquisition both meet the companion's lease.
     foreign = f"pid={os.getpid()}:foreign=turn"
@@ -585,7 +632,7 @@ async def _dedup(worker: _Worker) -> dict[str, object]:
         flush = "refused"
     acquired = worker.db.try_acquire_session_turn_lease(session_id, foreign)
     added = len(worker.snapshot(session_id)) - len(before)
-    after_foreign = await archive.archive(_CONVERSATION, 0, _fixture(10, 12))
+    after_foreign = await archive.archive(_CONVERSATION, _batch(10, 12))
     identities = worker.identities(session_id)
     await archive.close()
     return {
@@ -607,11 +654,11 @@ async def _dedup(worker: _Worker) -> dict[str, object]:
 async def _foreign_step(worker: _Worker, kind: str) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
-    await archive.archive(_CONVERSATION, 0, _fixture(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
     _mutate(worker, kind)
     session_id = worker.session_id()
     before = worker.snapshot(session_id)
-    detected = await _refusal(archive.archive(_CONVERSATION, 0, _fixture(4, 6)))
+    detected = await _refusal(archive.archive(_CONVERSATION, _batch(4, 6)))
     after = worker.snapshot(session_id)
     await archive.close()
     record = worker.fresh_record()
@@ -627,7 +674,7 @@ async def _reopen(worker: _Worker) -> dict[str, object]:
     before = worker.snapshot(session_id)
     archive = worker.archive()
     opened = await _refusal(archive.open(_CONVERSATION))
-    archived = await _refusal(archive.archive(_CONVERSATION, 0, _fixture(4, 6)))
+    archived = await _refusal(archive.archive(_CONVERSATION, _batch(4, 6)))
     after = worker.snapshot(session_id)
     await archive.close()
     return {
@@ -651,7 +698,7 @@ async def _occupied(worker: _Worker) -> dict[str, object]:
 async def _seed(worker: _Worker) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
-    ack = await archive.archive(_CONVERSATION, 0, _fixture(0, 4))
+    ack = await archive.archive(_CONVERSATION, _batch(0, 4))
     await archive.close()
     return {"inserted": ack.inserted}
 
@@ -697,9 +744,9 @@ def _crash_at(worker: _Worker, point: str) -> None:
 async def _crash(worker: _Worker, point: str) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
-    await archive.archive(_CONVERSATION, 0, _fixture(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
     _crash_at(worker, point)
-    await archive.archive(_CONVERSATION, 0, _fixture(4, 8))
+    await archive.archive(_CONVERSATION, _batch(4, 8))
     raise RuntimeError("the crash point was never reached")
 
 
@@ -738,7 +785,7 @@ async def _recover(worker: _Worker) -> dict[str, object]:
         stale_write = "accepted"
     except worker.hermes_state.SessionTurnLeaseLostError:
         stale_write = "refused"
-    ack = await archive.archive(_CONVERSATION, 0, _fixture(4, 8))
+    ack = await archive.archive(_CONVERSATION, _batch(4, 8))
     advances += false_advance()
     identities = worker.identities(session_id)
     final = worker.store.read(_CONVERSATION)
@@ -762,7 +809,7 @@ async def _lease(worker: _Worker, mode: str) -> dict[str, object]:
     # "stolen" keeps the default TTL, so no refresh runs before the next archive.
     archive = worker.archive(lease_ttl_seconds=300.0 if mode == "stolen" else 1.5)
     await archive.open(_CONVERSATION)
-    await archive.archive(_CONVERSATION, 0, _fixture(0, 4))
+    await archive.archive(_CONVERSATION, _batch(0, 4))
     session_id = worker.session_id()
     acquired = False
     if mode in ("false", "stolen"):
@@ -782,7 +829,7 @@ async def _lease(worker: _Worker, mode: str) -> dict[str, object]:
             while archive.ready(_CONVERSATION):
                 await asyncio.sleep(0.05)
     before = worker.snapshot(session_id)
-    refusal = await _refusal(archive.archive(_CONVERSATION, 0, _fixture(4, 6)))
+    refusal = await _refusal(archive.archive(_CONVERSATION, _batch(4, 6)))
     after = worker.snapshot(session_id)
     fenced = int(not archive.ready(_CONVERSATION))
     with contextlib.suppress(Exception):
@@ -802,7 +849,7 @@ async def _cap(worker: _Worker) -> dict[str, object]:
     archive = worker.archive()
     await archive.open(_CONVERSATION)
     for start in range(0, MAX_ARCHIVE_ROWS, MAX_BATCH_ROWS):
-        await archive.archive(_CONVERSATION, 0, _fixture(start, start + MAX_BATCH_ROWS))
+        await archive.archive(_CONVERSATION, _batch(start, start + MAX_BATCH_ROWS))
     session_id = worker.session_id()
     timings = []
     for _ in range(5):
@@ -811,7 +858,7 @@ async def _cap(worker: _Worker) -> dict[str, object]:
         timings.append((time.perf_counter() - started) * 1000)
     before = worker.snapshot(session_id)
     capacity = await _refusal(
-        archive.archive(_CONVERSATION, 0, _fixture(MAX_ARCHIVE_ROWS, MAX_ARCHIVE_ROWS + 1))
+        archive.archive(_CONVERSATION, _batch(MAX_ARCHIVE_ROWS, MAX_ARCHIVE_ROWS + 1))
     )
     capacity_mutations = int(worker.snapshot(session_id) != before)
     await archive.close()
