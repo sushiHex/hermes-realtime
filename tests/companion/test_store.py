@@ -206,13 +206,54 @@ def test_the_store_commits_durably(store: CompanionStore) -> None:
     assert store.pragma("journal_mode") == "delete"
 
 
-def test_a_store_of_another_schema_version_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [1, 99])
+def test_a_store_of_another_schema_version_is_refused(tmp_path: Path, version: int) -> None:
+    # Version 1 is the draft schema without the tied CHECK constraints.
     path = tmp_path / "companion.db"
     with contextlib.closing(sqlite3.connect(path)) as raw:
-        raw.execute("PRAGMA user_version = 99")
+        raw.execute(f"PRAGMA user_version = {version}")
         raw.commit()
     with pytest.raises(RuntimeError):
         CompanionStore(path)
+
+
+def test_a_journal_mode_that_does_not_take_is_refused() -> None:
+    # SQLite answers "memory" to a DELETE request on an in-memory database: nothing durable.
+    with pytest.raises(RuntimeError):
+        CompanionStore(Path(":memory:"))
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE voice_archive SET committed_count = 0",
+        "UPDATE voice_archive SET committed_generation = NULL, committed_seq = NULL",
+        "UPDATE voice_archive SET quarantine = 'because'",
+        "UPDATE voice_archive SET committed_chain = 'short'",
+        "UPDATE voice_archive SET committed_seq = -1",
+    ],
+    ids=["count-without-rows", "rows-without-cursor", "quarantine", "chain", "negative"],
+)
+def test_the_schema_refuses_inconsistent_progress(tmp_path: Path, statement: str) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    try:
+        _committed(store)
+        store.begin_pending("conv", _GENESIS, _FIRST)
+        store.promote("conv", _FIRST)
+    finally:
+        store.close()
+    with (
+        contextlib.closing(sqlite3.connect(tmp_path / "companion.db")) as raw,
+        pytest.raises(sqlite3.IntegrityError),
+    ):
+        raw.execute(statement)
+
+
+def test_progress_ties_its_cursor_to_its_count() -> None:
+    with pytest.raises(ValueError):
+        Progress(Fingerprint(0, "0" * 64), Identity(0, 0))
+    with pytest.raises(ValueError):
+        Progress(Fingerprint(2, "0" * 64), None)
 
 
 def test_store_arguments_are_exact(tmp_path: Path, store: CompanionStore) -> None:

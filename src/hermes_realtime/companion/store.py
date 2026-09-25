@@ -25,7 +25,8 @@ from hermes_realtime.companion.integrity import (
     validate_conversation_id,
 )
 
-_SCHEMA_VERSION = 1
+# Version 1 was a draft without the tied progress and quarantine constraints.
+_SCHEMA_VERSION = 2
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
@@ -33,7 +34,27 @@ _MAX_HOLDER_CHARS = 256
 QUARANTINE_CATEGORIES = frozenset(
     {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage"}
 )
-_SCHEMA = """
+
+def _progress_checks(prefix: str) -> str:
+    """One progress state's constraints: all or nothing, bounded, and cursor tied to count.
+
+    A state covering no rows has no cursor; a state covering any row has one.
+    """
+
+    count, chain = f"{prefix}_count", f"{prefix}_chain"
+    generation, seq = f"{prefix}_generation", f"{prefix}_seq"
+    return (
+        f"CHECK (({count} IS NULL) = ({chain} IS NULL)),\n"
+        f"    CHECK (({generation} IS NULL) = ({seq} IS NULL)),\n"
+        f"    CHECK ({count} IS NULL OR ({count} = 0) = ({generation} IS NULL)),\n"
+        f"    CHECK ({count} IS NULL OR {count} >= 0),\n"
+        f"    CHECK ({generation} IS NULL OR ({generation} >= 0 AND {seq} >= 0)),\n"
+        f"    CHECK ({chain} IS NULL OR length({chain}) = 64)"
+    )
+
+
+_QUARANTINE_SQL = ", ".join(f"'{category}'" for category in sorted(QUARANTINE_CATEGORIES))
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS voice_archive (
     conversation_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL UNIQUE,
@@ -48,12 +69,11 @@ CREATE TABLE IF NOT EXISTS voice_archive (
     quarantine TEXT,
     tombstone INTEGER,
     holder TEXT,
-    review_ledger TEXT NOT NULL DEFAULT '{}',
-    CHECK ((committed_count IS NULL) = (committed_chain IS NULL)),
-    CHECK ((pending_count IS NULL) = (pending_chain IS NULL)),
-    CHECK ((committed_generation IS NULL) = (committed_seq IS NULL)),
-    CHECK ((pending_generation IS NULL) = (pending_seq IS NULL)),
-    CHECK (committed_count IS NOT NULL OR pending_count IS NOT NULL)
+    review_ledger TEXT NOT NULL DEFAULT '{{}}',
+    {_progress_checks("committed")},
+    {_progress_checks("pending")},
+    CHECK (committed_count IS NOT NULL OR pending_count IS NOT NULL),
+    CHECK (quarantine IS NULL OR quarantine IN ({_QUARANTINE_SQL}))
 ) STRICT
 """
 _COLUMNS = (
@@ -75,6 +95,9 @@ class Progress:
             raise TypeError("progress fingerprint must be an exact Fingerprint")
         if self.cursor is not None and type(self.cursor) is not Identity:
             raise TypeError("progress cursor must be an exact Identity or None")
+        # Every batch archives at least one row, so a cursor exists exactly when rows do.
+        if (self.fingerprint.count == 0) != (self.cursor is None):
+            raise ValueError("progress must have a cursor exactly when it covers rows")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +138,10 @@ class CompanionStore:
             raise TypeError("companion store path must be an exact pathlib Path")
         self._connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
         try:
-            self._connection.execute("PRAGMA journal_mode = DELETE")
+            # The pragma answers with the mode in force, which need not be the one requested.
+            mode = self._connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+            if mode != "delete":
+                raise RuntimeError("companion store could not use a rollback journal")
             self._connection.execute("PRAGMA synchronous = FULL")
             version = self._connection.execute("PRAGMA user_version").fetchone()[0]
             if version not in (0, _SCHEMA_VERSION):
