@@ -945,13 +945,14 @@ async def test_a_refusal_against_an_archive_at_pending_keeps_pending_and_fences(
     try:
         await archive.archive(_CONVERSATION, _gapped_start())
         # Row 7 has already landed when the batch is planned: the archive is at pending, and
-        # rows 4-5 fall inside the recorded gap, so the batch is refused on that branch.
+        # the batch's row 6 differs from the stored one (which carries the gap), so the batch
+        # is refused on that branch.
         session = hermes.only()
         hermes.before_plan = lambda: hermes.rows[session].append(
             expected_row_values(_CONVERSATION, _rows(7, 8)[0])
         )
         assert await _refused(archive.archive(_CONVERSATION, VoiceBatch(0, 4, 7, _rows(4, 8)))) \
-            == "identity"
+            == "conflict"
         _, pending, quarantine = _stored(store)
         assert pending is not None and pending.cursor == Identity(0, 7)
         assert quarantine is None

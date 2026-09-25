@@ -502,11 +502,11 @@ def plan_archive(
     """Decide, against a fresh projection, which batch rows to insert, or refuse.
 
     The archive must match the committed fingerprint (nothing applied yet) or the pending
-    one (already applied). Every batch row already stored must be byte-identical to it, and
-    the rows to insert must all follow every stored row. The inserts must extend the archive
-    to exactly the pending fingerprint: a row that is merely missing (an old generation's
-    replay, a row resent into a recorded gap) is refused, never inserted. Every refusal after
-    the comparison says whether the archive already holds pending (``at_pending``).
+    one (already applied). Every batch row already stored must be byte-identical to it. The
+    inserts must extend the archive to exactly the pending fingerprint, which also puts them
+    after every stored row: a row that is merely missing (an old generation's replay, a row
+    resent into a recorded gap) is refused, never inserted. Every refusal after the
+    comparison says whether the archive already holds pending (``at_pending``).
     """
 
     if projection is None:
@@ -525,8 +525,6 @@ def plan_archive(
         if existing is None:
             inserts.append(row)
             continue
-        if inserts:
-            raise ArchiveRefusal("identity", at_pending=applied)
         if existing != canonical_row(expected_row_values(conversation_id, row)):
             raise ArchiveRefusal("conflict", at_pending=applied)
     if applied and inserts:
