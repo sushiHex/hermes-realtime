@@ -530,6 +530,23 @@ def test_a_candidate_tree_over_its_byte_budget_is_refused(
         oracle.capture_candidate_source_archive(repository, identity, _pin())
 
 
+def test_blobs_over_their_aggregate_budget_are_refused_before_they_are_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, baseline = _repository(tmp_path, "ignored export-ignore\n")
+    identity = _identity(repository, baseline)
+    # An exhausted aggregate budget must refuse before any blob is read. The tree budget stays
+    # at its real ceiling, so only the aggregate-blob guard can refuse.
+    monkeypatch.setattr(oracle, "_MAX_AGGREGATE_BLOB_BYTES", 0)
+
+    with pytest.raises(
+        oracle.CandidateSourceArchiveError, match="candidate aggregate blob budget exceeded"
+    ):
+        oracle.capture_candidate_source_archive(repository, identity, _pin())
+
+
 def test_the_fast_track_extracts_under_the_oracles_tree_budget() -> None:
     from scripts import candidate_e2e_fast_track as fast_track
     from scripts import candidate_source_archive_oracle as oracle
