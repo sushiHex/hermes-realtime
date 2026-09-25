@@ -1018,6 +1018,30 @@ async def test_every_open_takes_a_fresh_holder(store: CompanionStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reopening_a_fenced_conversation_retires_its_old_refresher(
+    store: CompanionStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hermes = FakeHermes()
+    clock = _Clock()
+    archive = await _open(store, hermes, sleep=clock)
+    try:
+        await archive.archive(_CONVERSATION, _batch(0, 4))
+        hermes.drift = {"display_kind": "voice"}
+        assert await _refused(archive.archive(_CONVERSATION, _batch(4, 6))) == "drift"
+        hermes.drift = {}
+        stale = archive.holder(_CONVERSATION)
+        await archive.open(_CONVERSATION)
+        assert archive.holder(_CONVERSATION) != stale
+        refreshed = hermes.calls.count("refresh_lease")
+        await _until(lambda: hermes.calls.count("refresh_lease") >= refreshed + 5)
+        # Only the new holder refreshes: no refresher under the stale holder fences anything.
+        assert _markers(capsys.readouterr().out, "[voice-archive-lease] ") == []
+        assert archive.ready(_CONVERSATION) is True
+    finally:
+        await archive.close()
+
+
+@pytest.mark.asyncio
 async def test_opening_releases_the_previous_holder_first(store: CompanionStore) -> None:
     hermes = FakeHermes()
     archive = await _open(store, hermes)
