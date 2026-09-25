@@ -70,6 +70,7 @@ def _projection(rows: tuple[VoiceRow, ...], header: Header = EXPECTED_HEADER) ->
         },
         values,
         MAX_ARCHIVE_ROWS,
+        has_children=False,
     )
 
 
@@ -191,9 +192,9 @@ def test_any_column_change_in_any_row_changes_the_fingerprint(column: str, value
     values = [expected_row_values(_CONVERSATION, row) for row in rows]
     header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
               "end_reason": None}
-    baseline = project(header, values, MAX_ARCHIVE_ROWS).fingerprint()
+    baseline = project(header, values, MAX_ARCHIVE_ROWS, has_children=False).fingerprint()
     values[3] = values[3] | {column: value}
-    assert project(header, values, MAX_ARCHIVE_ROWS).fingerprint() != baseline
+    assert project(header, values, MAX_ARCHIVE_ROWS, has_children=False).fingerprint() != baseline
 
 
 def test_fingerprints_are_exact_and_bounded() -> None:
@@ -217,10 +218,25 @@ def test_a_projection_over_the_cap_is_refused_never_truncated() -> None:
     values = [expected_row_values(_CONVERSATION, row) for row in rows]
     header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
               "end_reason": None}
-    assert len(project(header, values, 5).rows) == 5
+    assert len(project(header, values, 5, has_children=False).rows) == 5
     with pytest.raises(ArchiveRefusal) as refusal:
-        project(header, values, 4)
+        project(header, values, 4, has_children=False)
     assert refusal.value.category == "over_cap"
+
+
+def test_a_session_that_has_become_a_parent_is_a_lineage_refusal() -> None:
+    values = [expected_row_values(_CONVERSATION, row) for row in _batch(0, 2)]
+    header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
+              "end_reason": None}
+    # A child leaves the archive's own rows and header untouched: the chain cannot see it.
+    with pytest.raises(ArchiveRefusal) as refusal:
+        project(header, values, MAX_ARCHIVE_ROWS, has_children=True)
+    assert refusal.value.category == "lineage"
+    with pytest.raises(ArchiveRefusal) as refusal:
+        project(header, [], MAX_ARCHIVE_ROWS, has_children=True)
+    assert refusal.value.category == "lineage"
+    with pytest.raises(TypeError):
+        project(header, values, MAX_ARCHIVE_ROWS, has_children=0)  # type: ignore[arg-type]
 
 
 def test_a_projection_keeps_each_rows_platform_message_id() -> None:

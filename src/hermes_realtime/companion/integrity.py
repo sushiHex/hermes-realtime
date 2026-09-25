@@ -72,6 +72,7 @@ REFUSAL_CATEGORIES = frozenset(
         "missing",
         "over_cap",
         "rotated",
+        "lineage",
         "recovery",
         # Hermes did something other than what the compatibility surface qualified.
         "drift",
@@ -361,13 +362,24 @@ def project(
     header_values: Mapping[str, object],
     row_values: Sequence[Mapping[str, object]],
     cap: int,
+    *,
+    has_children: bool,
 ) -> Projection:
     """Build a projection from a bounded read of at most ``cap + 1`` rows.
 
     More than ``cap`` rows can never be a legitimate archive, and a truncated chain would
     verify nothing, so an over-cap read is refused rather than cut short.
+
+    ``has_children`` says whether any session names this one as its ``parent_session_id``
+    (a branch, an import, a rotation child). The archive never has lineage, and a child
+    leaves the archive's own rows and header untouched, so the chain cannot see one: it is
+    refused here, in the same read, as ``lineage``.
     """
 
+    if type(has_children) is not bool:
+        raise TypeError("has_children must be an exact bool")
+    if has_children:
+        raise ArchiveRefusal("lineage")
     if len(row_values) > cap:
         raise ArchiveRefusal("over_cap")
     return Projection(

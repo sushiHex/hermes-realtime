@@ -21,6 +21,8 @@ Criteria, from the consensus design:
   refresh that returns False or raises fences work;
 - 5 (foreign compaction): detected through the hash chain, both while the companion runs
   and at restart readiness; zero physical foreign compactions is not claimed;
+- lineage: a branch or import child naming the archive as its parent, which leaves the
+  chain untouched, is refused as ``lineage`` live and at restart, and quarantined;
 - 12 (compatibility): every surface name and signature matches the pin, and the private
   operation stores byte-identical rows to Hermes's own ``append_messages_batch``, with an
   identical fingerprint.
@@ -67,8 +69,9 @@ _FOREIGN_KINDS = (
     "delete",
     "rotation",
     "replace_archived",
+    "lineage",
 )
-_FOREIGN_CATEGORY = {"delete": "missing", "rotation": "rotated"}
+_FOREIGN_CATEGORY = {"delete": "missing", "rotation": "rotated", "lineage": "lineage"}
 _CRASH_POINTS = ("before_pending", "after_pending", "in_state", "after_state", "after_promote")
 _ENVIRONMENT = (
     "PATH",
@@ -176,6 +179,16 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
         ),
         _reopened("mismatch"),
     ],
+    # A child appears while the companion is down: restart readiness refuses it.
+    "lineage_at_restart": [
+        _step({"inserted": 4}, []),
+        _step({"mutated": 1}, []),
+        _step(
+            {"archive": "not_ready", "mutations": 0, "open": "lineage", "quarantine": "lineage"},
+            ["archive:not_ready", "open:lineage"],
+        ),
+        _reopened("lineage"),
+    ],
     "crash_before_pending": _crash("before_pending", 0, "none", 4),
     "crash_after_pending": _crash("after_pending", 1, "cleared", 4),
     "crash_in_state": _crash("in_state", 1, "cleared", 4),
@@ -232,6 +245,7 @@ _PLAN: dict[str, list[tuple[str, ...]]] = {
     "dedup": [("dedup",)],
     **{f"foreign_{kind}": [("foreign", kind), ("reopen",)] for kind in _FOREIGN_KINDS},
     "compaction_at_restart": [("seed",), ("mutate", "compaction"), ("reopen",), ("reopen",)],
+    "lineage_at_restart": [("seed",), ("mutate", "lineage"), ("reopen",), ("reopen",)],
     **{f"crash_{point}": [("crash", point), ("recover",)] for point in _CRASH_POINTS},
     "crash_ambiguous": [("crash", "after_pending"), ("mutate", "unleased_append"), ("reopen",)],
     "creation_occupied": [("occupied",)],
@@ -491,6 +505,10 @@ def _mutate(worker: _Worker, kind: str) -> None:
         # Soft-archives every row and re-inserts identical copies: the live rows alone are
         # unchanged, so only a projection that includes inactive rows can see it.
         db.replace_messages(session_id, db.get_messages(session_id), archive_dropped=True)
+    elif kind == "lineage":
+        # A branch or import child naming the archive as its parent. Hermes changes nothing
+        # in the archive itself, so only the lineage check can see it.
+        db.create_session("foreign_branch", source="cli", parent_session_id=session_id)
     elif kind == "rotation":
         # What a hygiene rotation stamps on the parent it rotates away from.
         db.end_session(session_id, "compression")
