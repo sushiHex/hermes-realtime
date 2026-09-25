@@ -279,9 +279,12 @@ atomic-write rules:
 - **Frozen batches.** A batch is written to the tail before it is sent. While its outcome is
   unknown it is never rebatched, rewritten, or discarded, and it is resent unchanged.
 - **Bounded, with explicit gaps.** On overflow the outbox discards only rows it never sent,
-  through the next user row, and records one durable gap interval. A gap is sent and
-  acknowledged like rows, so archived rows and acknowledged gaps stay distinct.
-- **Cursor.** The cursor names the last `seq` covered by contiguous acknowledged rows and gaps.
+  up to the next user row, and records the discarded interval durably. The gap travels as data
+  on that next user row, `gap_before: [first, last]`, so it is archived, hashed, and
+  acknowledged with the row that follows it. Archived rows and recorded gaps stay distinct.
+- **Cursor.** The cursor names the last `seq` covered by acknowledged rows and the gaps they
+  carry. A trailing gap with no following row is recorded in the tail only; it needs no
+  acknowledgment, because nothing after it awaits archiving.
 
 An archive batch has three outcomes. *Present*: the companion acknowledged it after its commit
 and an exact identity and content check, and the cursor advances. *Unknown*: no acknowledgment
@@ -324,14 +327,19 @@ Realtime sends no voice event until the companion advertises the capability.
 
 #### The archive operation
 
-`voice_archive{conversation_id, generation, rows[{seq, role, text, interrupted, ts}]}` is
-answered by `voice_archive_ack{generation, seq_through}`.
+`voice_archive{conversation_id, generation, seq_from, seq_through, rows[{seq, role, text,
+interrupted, ts, gap_before}]}` is answered by
+`voice_archive_ack{generation, seq_from, seq_through}`.
 
 Each row's `platform_message_id` is `voice:<conversation>:<generation>:<seq>`, and its display
-metadata is `{"voice": {"gen", "seq", "interrupted"}}`. Before writing, the companion validates
-ordering, roles (`user` or `assistant` only), timestamps, and the flag. An identity already
-present with equal content is a duplicate. One with different content is a conflict, refused
-with no mutation.
+metadata is `{"voice": {"gen", "seq", "interrupted", "gap_before"}}`. Before writing, the
+companion validates the batch exactly. Its rows and their gaps must partition
+`[seq_from, seq_through]` with no hole and no overlap: each row's `seq` follows the previous
+row's, or, when the row carries `gap_before`, follows that gap's end. A gap may be carried only
+by a user row, and its interval must begin right after the previous row. It also validates roles
+(`user` or `assistant` only), timestamps, and the flag. An identity already present with equal
+content is a duplicate. One with different content is a conflict, refused with no mutation. A
+malformed batch is refused whole.
 
 One operation, `archive_voice_rows`, runs in a single `BEGIN IMMEDIATE` transaction through
 Hermes's own writer
@@ -707,7 +715,9 @@ Each step must prove its guarantees against a qualified exact target:
 The companion's milestones must meet these criteria:
 
 1. **Archive fidelity.** Archived rows equal the frozen eligible rows in identity, role, text,
-   interruption, and timestamp; gaps are accounted separately.
+   interruption, and timestamp. Every discarded interval appears exactly once as the
+   `gap_before` of the next archived user row, or remains a trailing gap in the tail; a batch
+   whose rows and gaps do not exactly partition its range is refused.
 2. **Exactly once, and ownership.** Sequential and concurrent resends leave exactly one row per
    identity. A conflicting payload is refused with no mutation. A leased foreign agent turn is
    refused with 0 rows. An unleased foreign row, a manual `/compress`, a `replace_messages` that
