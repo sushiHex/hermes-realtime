@@ -2074,18 +2074,16 @@ class EvidenceAdmissionControllerV1:
             raise ReservationError("drain item is stale")
         if type(disposition) is not DrainDisposition:
             raise TypeError("disposition must be an exact DrainDisposition")
-        with self._admission_lock, self._credit_lock:
+        # Revoke finalization publishes under its own lock without the admission
+        # lock, so holding it here keeps a finalization from racing this drain.
+        with self._admission_lock, self._revoke_finalize_lock, self._credit_lock:
             if self._drain_item is not item:
                 raise ReservationError("drain item is stale")
             ticket = self._drain_ticket
             if ticket is None:
                 raise ReservationError("drain ticket was lost")
             if self._sticky_fault is not None:
-                # A latched writer fault is authoritative for what the drain waits
-                # on: no live lease of a faulted owner can ever become durable, so
-                # each one retires unpublished instead of stranding the drain.
-                for live_lease, live_state in tuple(self._leases.items()):
-                    self._retire_lease_locked(live_lease, live_state)
+                self._terminalize_unreachable_obligations_locked()
             revoke_incomplete = (
                 self._revoke_ticket is not None and not self._revoke_ticket.terminal_event.is_set()
             )
@@ -3336,6 +3334,29 @@ class EvidenceAdmissionControllerV1:
         with self._credit_lock:
             self._retire_lease_locked(lease, state)
         return True
+
+    def _terminalize_unreachable_obligations_locked(self) -> None:
+        """End every drain prerequisite that a latched writer fault made unreachable.
+
+        A faulted owner can never make a pending obligation durable, so its fault
+        is authoritative for what the drain waits on.  Of the prerequisites:
+
+        * a live lease retires unpublished;
+        * a revoke whose finalization was never queued ends with its faulted
+          outcome, which its waiter observes; a revoke item still in flight keeps
+          its own writer completion;
+        * queued charges need nothing: the drain lane is served only after the
+          ordered and revoke lanes, and every completion, failed or not,
+          releases its charge.
+
+        The caller holds the admission, revoke-finalize and credit locks.
+        """
+
+        for live_lease, live_state in tuple(self._leases.items()):
+            self._retire_lease_locked(live_lease, live_state)
+        revoke = self._revoke_ticket
+        if revoke is not None and not revoke.terminal_event.is_set() and self._revoke_item is None:
+            self._fault_revoke_ticket_locked(revoke)
 
     def _retire_lease_locked(self, lease: EvidenceTurnLease, state: _LeaseState) -> None:
         """Release one live lease and its unused credits, publishing nothing.
@@ -5208,6 +5229,11 @@ class EvidenceAdmissionControllerV1:
         if self._revoke_ticket is not ticket or self._revoke_item is not item:
             raise ReservationError("revoke fault completion item is stale")
         self._revoke_item = None
+        self._fault_revoke_ticket_locked(ticket)
+
+    def _fault_revoke_ticket_locked(self, ticket: RevokeTicketV1) -> None:
+        """End one revoke with its faulted outcome and wake every waiter."""
+
         object.__setattr__(ticket, "disposition", RevokeDisposition.WRITER_FAULT)
         self._pending_revoke = False
         self._purge_required = True
