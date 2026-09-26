@@ -54,7 +54,7 @@ The `release-candidate` job runs, from that fresh candidate:
    package-static output. This snapshot is necessary because `web/build.mjs`
    writes directly to `src/hermes_realtime/client/static`; comparing only after
    that write could overwrite stale committed output and falsely pass;
-4. a fresh wheel and sdist build, a 15 MiB per-artifact ceiling, strict sdist allowlisting and
+4. a fresh wheel and sdist build, a 20 MiB per-artifact ceiling, strict sdist allowlisting and
    ambient/forbidden-path rejection, packaged Silero license/notice/model presence with an exact
    model checksum, plus an isolated installed-wheel import; and
 5. two secret scans that fail on credential files and common private key,
