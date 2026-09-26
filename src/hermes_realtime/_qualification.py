@@ -29,6 +29,48 @@ _CHECKPOINTS = (
 )
 _CHECKPOINT_TIMEOUT_SECONDS = 10.0
 _CHECKPOINT_MAX_FRAME_BYTES = 192
+# Fixed, content-free names for every guard that can refuse a checkpoint.
+_CHECKPOINT_REFUSAL_CATEGORIES = frozenset({
+    "ack_eof",
+    "ack_pipe_failed",
+    "duplicate_key",
+    "field_set_mismatch",
+    "malformed",
+    "noncanonical",
+    "out_of_order",
+    "oversized",
+    "trailing_bytes",
+    "wrong_nonce",
+    "wrong_ordinal",
+    "wrong_protocol_version",
+    "write_failed",
+})
+
+
+class _QualificationCheckpointRefusal(RuntimeError):
+    """A checkpoint guard's refusal, carrying only its fixed category."""
+
+    def __init__(self, category: str, message: str) -> None:
+        if type(category) is not str or category not in _CHECKPOINT_REFUSAL_CATEGORIES:
+            raise ValueError("qualification checkpoint refusal category is invalid")
+        super().__init__(message)
+        self.category = category
+
+
+class _QualificationCheckpointTimeout(TimeoutError):
+    """The acknowledgment deadline passed."""
+
+
+def _qualification_checkpoint_failure_category(error: BaseException) -> str:
+    """Name a terminal channel failure without retaining any of its content."""
+
+    if type(error) is _QualificationCheckpointRefusal:
+        return error.category
+    if type(error) is _QualificationCheckpointTimeout:
+        return "ack_timeout"
+    if type(error) is asyncio.CancelledError:
+        return "cancelled"
+    return "unclassified"
 
 
 def _canonical_checkpoint_frame(document: dict[str, object]) -> bytes:
@@ -53,12 +95,18 @@ async def _read_checkpoint_line(*, fd: int, handle: int) -> bytes:
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise TimeoutError("qualification checkpoint acknowledgment timed out")
+            raise _QualificationCheckpointTimeout(
+                "qualification checkpoint acknowledgment timed out"
+            )
         try:
             peek = cast(tuple[bytes, int, int], _winapi.PeekNamedPipe(handle, 1))
             available = peek[1]
         except OSError as error:
-            raise RuntimeError("qualification checkpoint acknowledgment pipe failed") from error
+            # A closed anonymous-pipe writer surfaces as ERROR_BROKEN_PIPE.
+            raise _QualificationCheckpointRefusal(
+                "ack_eof" if type(error) is BrokenPipeError else "ack_pipe_failed",
+                "qualification checkpoint acknowledgment pipe failed",
+            ) from error
         if not available:
             await asyncio.sleep(min(0.01, remaining))
             continue
@@ -67,16 +115,25 @@ async def _read_checkpoint_line(*, fd: int, handle: int) -> bytes:
             min(available, _CHECKPOINT_MAX_FRAME_BYTES + 1 - len(value)),
         )
         if not chunk:
-            raise RuntimeError("qualification checkpoint acknowledgment reached EOF")
+            raise _QualificationCheckpointRefusal(
+                "ack_eof", "qualification checkpoint acknowledgment reached EOF"
+            )
         if b"\r" in chunk:
-            raise RuntimeError("qualification checkpoint acknowledgment is noncanonical")
+            raise _QualificationCheckpointRefusal(
+                "noncanonical", "qualification checkpoint acknowledgment is noncanonical"
+            )
         value.extend(chunk)
         if len(value) > _CHECKPOINT_MAX_FRAME_BYTES:
-            raise RuntimeError("qualification checkpoint acknowledgment is oversized")
+            raise _QualificationCheckpointRefusal(
+                "oversized", "qualification checkpoint acknowledgment is oversized"
+            )
         newline = value.find(b"\n")
         if newline >= 0:
             if newline != len(value) - 1:
-                raise RuntimeError("qualification checkpoint acknowledgment has trailing bytes")
+                raise _QualificationCheckpointRefusal(
+                    "trailing_bytes",
+                    "qualification checkpoint acknowledgment has trailing bytes",
+                )
             return bytes(value)
 
 
@@ -88,15 +145,22 @@ def _load_checkpoint_document(value: bytes) -> dict[str, object]:
             result: dict[str, object] = {}
             for key, item in pairs:
                 if key in result:
-                    raise ValueError("duplicate key")
+                    raise _QualificationCheckpointRefusal(
+                        "duplicate_key",
+                        "qualification checkpoint acknowledgment has a duplicate key",
+                    )
                 result[key] = item
             return result
 
         document = json.loads(text, object_pairs_hook=reject_duplicate)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise RuntimeError("qualification checkpoint acknowledgment is malformed") from error
+        raise _QualificationCheckpointRefusal(
+            "malformed", "qualification checkpoint acknowledgment is malformed"
+        ) from error
     if type(document) is not dict or _canonical_checkpoint_frame(document) != value:
-        raise RuntimeError("qualification checkpoint acknowledgment is noncanonical")
+        raise _QualificationCheckpointRefusal(
+            "noncanonical", "qualification checkpoint acknowledgment is noncanonical"
+        )
     return document
 
 
@@ -188,7 +252,9 @@ class _QualificationCheckpointChannelV1:
                 raise RuntimeError("qualification checkpoint channel is unavailable")
             ordinal = self._next_ordinal
             if ordinal > len(_CHECKPOINTS) or checkpoint != _CHECKPOINTS[ordinal - 1]:
-                error = RuntimeError("qualification checkpoint is duplicate or out of order")
+                error = _QualificationCheckpointRefusal(
+                    "out_of_order", "qualification checkpoint is duplicate or out of order"
+                )
                 self._fail(error)
                 raise error
             frame = _canonical_checkpoint_frame(
@@ -206,16 +272,25 @@ class _QualificationCheckpointChannelV1:
                     handle=self._resume_handle,
                 )
                 document = _load_checkpoint_document(acknowledgment)
-                if (
-                    set(document) != {"nonce", "protocolVersion", "resumeOrdinal"}
-                    or type(document["nonce"]) is not str
-                    or document["nonce"] != self._nonce
-                    or type(document["protocolVersion"]) is not int
+                mismatch: str | None = None
+                if set(document) != {"nonce", "protocolVersion", "resumeOrdinal"}:
+                    mismatch = "field_set_mismatch"
+                elif type(document["nonce"]) is not str or document["nonce"] != self._nonce:
+                    mismatch = "wrong_nonce"
+                elif (
+                    type(document["protocolVersion"]) is not int
                     or document["protocolVersion"] != 1
-                    or type(document["resumeOrdinal"]) is not int
+                ):
+                    mismatch = "wrong_protocol_version"
+                elif (
+                    type(document["resumeOrdinal"]) is not int
                     or document["resumeOrdinal"] != ordinal
                 ):
-                    raise RuntimeError("qualification checkpoint acknowledgment does not match")
+                    mismatch = "wrong_ordinal"
+                if mismatch is not None:
+                    raise _QualificationCheckpointRefusal(
+                        mismatch, "qualification checkpoint acknowledgment does not match"
+                    )
             except BaseException as error:
                 self._fail(error)
                 raise
@@ -245,9 +320,16 @@ class _QualificationCheckpointChannelV1:
     def _write_all(self, value: bytes) -> None:
         offset = 0
         while offset < len(value):
-            written = os.write(self._write_fd, value[offset:])
+            try:
+                written = os.write(self._write_fd, value[offset:])
+            except OSError as error:
+                raise _QualificationCheckpointRefusal(
+                    "write_failed", "qualification checkpoint write failed"
+                ) from error
             if written <= 0:
-                raise RuntimeError("qualification checkpoint write did not progress")
+                raise _QualificationCheckpointRefusal(
+                    "write_failed", "qualification checkpoint write did not progress"
+                )
             offset += written
 
     def close(self) -> None:

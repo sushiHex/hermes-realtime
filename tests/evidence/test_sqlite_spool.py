@@ -2291,6 +2291,51 @@ def test_store_database_declares_the_exact_identity_and_pragmas(tmp_path: Path) 
         connection.close()
 
 
+def test_store_database_creation_commits_exactly_one_transaction(tmp_path: Path) -> None:
+    """Schema, identity, and version become durable together in one commit.
+
+    SQLite increments the header's file change counter (offset 24) once per
+    committed write transaction in rollback-journal mode. Each commit is a full
+    journal-create/sync/delete cycle under ``synchronous=EXTRA``, and store
+    creation runs inside the two-second consent-activation bound.
+    """
+
+    from hermes_realtime.evidence import sqlite_spool
+
+    database = tmp_path / "capture-v1.sqlite3"
+    sqlite_spool.create_store_database(database).close()
+
+    header = database.read_bytes()[:100]
+    assert int.from_bytes(header[24:28], "big") == 1
+
+
+def test_store_database_creation_failure_leaves_no_partial_schema(tmp_path: Path) -> None:
+    from hermes_realtime.evidence import sqlite_spool
+
+    # Refuse only the schema's final statement, after every table and trigger.
+    class RefusesFinalIndex(sqlite3.Connection):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            self.set_authorizer(
+                lambda action, name, *_: (
+                    sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_CREATE_INDEX and name == "erasure_requests_by_state"
+                    else sqlite3.SQLITE_OK
+                )
+            )
+
+    database = tmp_path / "capture-v1.sqlite3"
+    with pytest.raises(sqlite3.DatabaseError):
+        sqlite_spool.create_store_database(database, factory=RefusesFinalIndex)
+
+    assert not sqlite_spool.hot_journal_present(database)
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
 def test_normalized_ddl_digest_is_pinned_and_matches_the_applied_schema(tmp_path: Path) -> None:
     from hermes_realtime.evidence import sqlite_spool
 

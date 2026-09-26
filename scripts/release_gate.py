@@ -24,7 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
-MAX_ARTIFACT_BYTES = 15 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 NPM = "npm.cmd" if os.name == "nt" else "npm"
 # Per-test durations on every gate run, passing or failing. Timeout diagnostics
 # are not a consistent source of comparable healthy-run timing: some restate

@@ -38,7 +38,8 @@ except ModuleNotFoundError:
 
 _MAX_MEMBER_COUNT = 4096
 _MAX_FILE_BYTES = 4 * 1024 * 1024
-_MAX_TREE_BYTES = 12 * 1024 * 1024
+# Extraction admits exactly the tree the oracle already bounded; one budget, not two.
+_MAX_TREE_BYTES = candidate_source_archive_oracle._MAX_CANDIDATE_TREE_BYTES
 
 
 def _measure_git_pin(executable: Path) -> GitExecutablePinV1:
