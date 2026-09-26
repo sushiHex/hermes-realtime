@@ -1733,6 +1733,13 @@ _QUALIFICATION_NO_TASK_COMPOSITION: ContextVar[bool] = ContextVar(
     "hermes_realtime_qualification_no_task_composition",
     default=False,
 )
+_QUALIFICATION_CHECKPOINT_FAILED_DOCUMENT = (
+    '{"error":"qualification_checkpoint_failed","version":1}'
+)
+
+
+class _QualificationCheckpointFailure(RuntimeError):
+    """Terminal checkpoint failure that the CLI reports without a traceback."""
 
 
 @contextmanager
@@ -2829,7 +2836,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         if qualification_no_hermes_tasks:
             await shutdown_requested.wait()
             if checkpoint_failures:
-                raise RuntimeError(
+                raise _QualificationCheckpointFailure(
                     "qualification checkpoint channel failed"
                 ) from checkpoint_failures[0]
         else:
@@ -3235,6 +3242,11 @@ def main() -> int:
         asyncio.run(_run_host_cli(args))
     except KeyboardInterrupt:
         return 130
+    except _QualificationCheckpointFailure:
+        # A rendered traceback reads every frame's source file from disk, and the
+        # qualification parent bounds this exit; report a fixed fact with no file I/O.
+        print(_QUALIFICATION_CHECKPOINT_FAILED_DOCUMENT, file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

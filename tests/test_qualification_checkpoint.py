@@ -167,6 +167,36 @@ async def test_external_cli_checkpoint_failures_exit_nonzero_and_reap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_case",
+    (
+        "ack_eof",
+        "duplicate_key",
+        "trailing_bytes",
+        "oversized",
+        "wrong_nonce",
+        "unknown_field",
+    ),
+)
+async def test_external_cli_checkpoint_failure_exit_opens_no_files_after_host_settles(
+    failure_case: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A rendered traceback reads each frame's source file after the host has settled.
+    # On hosted runners the first read of such a file has outlasted the bounded exit.
+    await _assert_external_cli_checkpoint_failure(
+        failure_case, tmp_path, stall_opens_after_host_settled=True,
+    )
+    observation = _checkpoint_observation(capsys)
+    assert observation["completed"] is True
+    assert observation["killed"] is False
+    assert observation["child_events"] == [
+        "launcher_close_entered", "launcher_close_returned", "host_main_settled", "atexit_entered",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_external_cli_checkpoint_failure_reaps_with_stderr_backpressure(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -550,6 +580,7 @@ async def _assert_external_cli_checkpoint_failure(
     hold_close: bool = False,
     hold_atexit: bool = False,
     close_stall: Literal["none", "after_marker", "before_marker"] = "none",
+    stall_opens_after_host_settled: bool = False,
 ) -> None:
     import msvcrt
 
@@ -580,9 +611,21 @@ async def _assert_external_cli_checkpoint_failure(
     )
     if close_stall == "after_marker":
         close_body += "; time.sleep(30)"
+    # Hosted runners have stalled for over five seconds on the first read of a file,
+    # so every file open after host settlement is made to stall in the same way.
+    open_stall = (
+        "opens_armed=[]\n"
+        "sys.addaudithook(lambda e,a: e=='open' and opens_armed and time.sleep(30))\n"
+        if stall_opens_after_host_settled
+        else ""
+    )
+    settled = "os.write(progress,b'H')" + (
+        "; opens_armed.append(1)" if stall_opens_after_host_settled else ""
+    )
     child = (
         "import asyncio,sys,os,msvcrt,atexit,threading,time\n"
-        "os.set_handle_inheritable(int(sys.argv[4]),False)\n"
+        + open_stall
+        + "os.set_handle_inheritable(int(sys.argv[4]),False)\n"
         "progress=msvcrt.open_osfhandle(int(sys.argv[4]),os.O_WRONLY|os.O_BINARY)\n"
         "import hermes_realtime.host_launcher as h\n"
         "from hermes_realtime._qualification import _current_qualification_checkpoint_channel\n"
@@ -607,7 +650,7 @@ async def _assert_external_cli_checkpoint_failure(
         + (" threading.Event().wait()\n" if hold_atexit else "")
         + "atexit.register(at_exit)\n"
         "try: raise SystemExit(h.main())\n"
-        "finally: os.write(progress,b'H')\n"
+        f"finally: {settled}\n"
     )
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
@@ -699,7 +742,9 @@ async def _assert_external_cli_checkpoint_failure(
         assert process.poll() is not None
         assert await asyncio.to_thread(_read_line, checkpoint_read_fd) == b""
         assert stderr.startswith(b"x" * stderr_bytes)
-        assert b"qualification checkpoint channel failed" in stderr
+        # The failure is a fixed document, never a traceback that reads source files.
+        assert stderr.endswith(b'{"error":"qualification_checkpoint_failed","version":1}\r\n')
+        assert b"Traceback" not in stderr
         completed = True
     finally:
         mark("cleanup_entered")
