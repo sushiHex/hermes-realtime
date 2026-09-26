@@ -3027,6 +3027,7 @@ async def test_retention_owner_retries_live_lease_drain_before_durable_expiry(
     from types import SimpleNamespace
 
     from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.admission import ExpiryTicketV1
     from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
 
     runtime = HostEvidenceRuntimeV1(
@@ -3058,9 +3059,12 @@ async def test_retention_owner_retries_live_lease_drain_before_durable_expiry(
                 owner_state=m.OwnerState.STOPPED,
             )
 
-        def begin_expiry(self, authority: object) -> m.ExpiryDisposition:
+        def begin_expiry(self, authority: object) -> ExpiryTicketV1:
             began.append(authority)
-            return m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+            return ExpiryTicketV1(
+                m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED,
+                self.expiry_terminal_event,
+            )
 
     class TransportProbe:
         def active_session_expiry(self, logical_session_id: str) -> str:
@@ -3115,6 +3119,7 @@ def _retention_probe_runtime(tmp_path: Path, owner_state: object):  # type: igno
     from types import SimpleNamespace
 
     from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.admission import ExpiryTicketV1
     from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
 
     runtime = HostEvidenceRuntimeV1(
@@ -3138,9 +3143,12 @@ def _retention_probe_runtime(tmp_path: Path, owner_state: object):  # type: igno
         def diagnostics(self) -> object:
             return SimpleNamespace(active_lease_count=0, owner_state=self.owner_state)
 
-        def begin_expiry(self, _authority: object) -> m.ExpiryDisposition:
+        def begin_expiry(self, _authority: object) -> ExpiryTicketV1:
             self.began.set()
-            return m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+            return ExpiryTicketV1(
+                m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED,
+                self.expiry_terminal_event,
+            )
 
     class TransportProbe:
         def active_session_expiry(self, _logical_session_id: str) -> str:
@@ -3375,4 +3383,81 @@ async def test_host_evidence_close_honours_its_close_timeout(
         assert runtime._closed is True
     finally:
         release.set()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_each_epoch_retention_waits_for_its_own_slow_erasure(tmp_path: Path) -> None:
+    """A reused admission owner cannot hand a later expiry an earlier outcome."""
+
+    from datetime import UTC, datetime
+    from queue import Empty
+
+    from test_admission import _activate_next_epoch, _active_admission, _admission
+
+    from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+
+    admission, _operations, writer, first = _active_admission(
+        _admission(), m, owner_generation=53
+    )
+    runtime = HostEvidenceRuntimeV1(
+        database=tmp_path / "capture-v1.sqlite3",
+        owner_generation=53,
+        retention_hours=24,
+    )
+
+    class TransportProbe:
+        def active_session_expiry(self, _logical_session_id: str) -> str:
+            return "2026-08-12T00:00:00.000000Z"
+
+    async def no_wait(_seconds: float = 0.0) -> None:
+        return None
+
+    runtime._admission = admission
+    runtime._transport = TransportProbe()  # type: ignore[assignment]
+    runtime._retention_cancel = no_wait
+    runtime._retention_wall_clock = lambda: datetime(2026, 8, 12, tzinfo=UTC)
+    runtime._retention_sleep = no_wait
+    try:
+        for epoch, seed in enumerate((None, 610)):
+            command = first if seed is None else _activate_next_epoch(
+                m, admission, writer, seed=seed
+            )
+            runtime._pending_create = command
+            runtime._capture_state = m.CaptureState.ACTIVE
+            task = asyncio.create_task(runtime._run_retention_owner())
+            try:
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while True:
+                    try:
+                        item = writer.get_nowait()
+                        break
+                    except Empty:
+                        assert not task.done(), (epoch, task)
+                        assert asyncio.get_running_loop().time() < deadline
+                        await asyncio.sleep(0.001)
+                assert type(item.payload) is m.ExpireSessionV1
+                # The erasure is slow: this epoch's owner must still be waiting.
+                for _ in range(200):
+                    await asyncio.sleep(0)
+                assert not task.done(), (epoch, task)
+                assert runtime.capture_status(disclosure_digest="a" * 64).capture_state is (
+                    m.CaptureState.ACTIVE
+                )
+
+                admission.complete_ordered_item(item)
+
+                assert await asyncio.wait_for(task, 5.0) is (
+                    m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+                )
+                assert runtime.capture_status(disclosure_digest="a" * 64).capture_state is (
+                    m.CaptureState.IDLE
+                )
+                assert admission.diagnostics().owner_state is m.OwnerState.STOPPED
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    finally:
+        runtime._admission = None
         await runtime.close()

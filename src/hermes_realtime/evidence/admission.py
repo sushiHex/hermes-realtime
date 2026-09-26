@@ -504,6 +504,34 @@ class RevokeTicketV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpiryTicketV1:
+    """One expiry decision and, for a scheduled erasure, its own terminal milestone.
+
+    The milestone is created with the erasure it signals, so an observer can
+    never see an earlier expiry's outcome.
+    """
+
+    disposition: ExpiryDisposition
+    terminal_event: Event | None
+
+    def __post_init__(self) -> None:
+        if type(self.disposition) is not ExpiryDisposition:
+            raise TypeError("disposition must be an exact ExpiryDisposition")
+        if self.terminal_event is not None and type(self.terminal_event) is not Event:
+            raise TypeError("terminal_event must be an exact threading.Event or None")
+        if (
+            self.disposition is ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+            and self.terminal_event is None
+        ):
+            raise ValueError("a scheduled erasure must carry its terminal milestone")
+        if (
+            self.disposition in (ExpiryDisposition.WRITER_FAULT, ExpiryDisposition.ROLLOVER_QUEUED)
+            and self.terminal_event is not None
+        ):
+            raise ValueError("only an erasure carries a terminal milestone")
+
+
+@dataclass(frozen=True, slots=True)
 class DrainTicketV1:
     owner_generation: int
     disposition: DrainDisposition
@@ -663,7 +691,7 @@ class EvidenceLifecycleControlV1(Protocol):
         command: RolloverSessionV1,
     ) -> RolloverDisposition: ...
 
-    def begin_expiry(self, authority: SessionExpiryAuthorityV1) -> ExpiryDisposition: ...
+    def begin_expiry(self, authority: SessionExpiryAuthorityV1) -> ExpiryTicketV1: ...
 
     def request_seal(
         self,
@@ -1657,7 +1685,7 @@ class EvidenceAdmissionControllerV1:
         self._drain_item: EvidenceWriterQueueItemV1 | None = None
         self._rollover_preparation: _AdmissionRolloverPreparationV1 | None = None
         self._rollover_ticket: _RolloverCompletionTicketV1 | None = None
-        self._expiry_terminal_event = Event()
+        self._expiry_terminal_event: Event | None = None
 
     @property
     def _queued_charges(self) -> _IdentityQueuedChargesV1:
@@ -1725,16 +1753,12 @@ class EvidenceAdmissionControllerV1:
     def operation_scheduler(self) -> ConversationOperationScheduler:
         return self._operation_scheduler
 
-    @property
-    def expiry_terminal_event(self) -> Event:
-        """Set once the owner reaches a terminal state an expiry can end in.
+    def _signal_expiry_terminal_locked(self) -> None:
+        """Publish the scheduled erasure's own terminal milestone, if one exists."""
 
-        The writer's durable expiry completion stops the owner; any writer fault
-        latches it faulted.  Scheduling an expiry sets nothing, so an observer
-        never mistakes an admitted erasure for a finished one.
-        """
-
-        return self._expiry_terminal_event
+        event = self._expiry_terminal_event
+        if event is not None:
+            _set_ticket_signal(event)
 
     @property
     def final_admission_ordinal(self) -> int:
@@ -2296,31 +2320,36 @@ class EvidenceAdmissionControllerV1:
                 return
             raise ReservationError("retention expiry cannot close the current phase")
 
-    def begin_expiry(self, authority: SessionExpiryAuthorityV1) -> ExpiryDisposition:
+    def begin_expiry(self, authority: SessionExpiryAuthorityV1) -> ExpiryTicketV1:
+        fault = ExpiryTicketV1(ExpiryDisposition.WRITER_FAULT, None)
         try:
             with self._admission_lock:
                 if type(authority) is not SessionExpiryAuthorityV1:
-                    return ExpiryDisposition.WRITER_FAULT
+                    return fault
                 authority._validate()
                 if (
                     authority.owner_generation != self._owner_generation
                     or authority.consent_epoch_id != self._consent_epoch_id
                     or authority.logical_session_id != self._logical_session_id
                 ):
-                    return ExpiryDisposition.WRITER_FAULT
+                    return fault
                 if self._phase is RuntimeSessionPhase.EXPIRING:
                     if self._expiry_authority is not None:
                         if self._expiry_authority is authority:
-                            return ExpiryDisposition.ALREADY_EXPIRING
-                        return ExpiryDisposition.WRITER_FAULT
+                            return ExpiryTicketV1(
+                                ExpiryDisposition.ALREADY_EXPIRING,
+                                self._expiry_terminal_event,
+                            )
+                        return fault
                 elif self._phase is not RuntimeSessionPhase.OPEN:
-                    return ExpiryDisposition.WRITER_FAULT
+                    return fault
                 if authority.deadline_admission_ordinal != self._next_admission_ordinal - 1:
-                    return ExpiryDisposition.WRITER_FAULT
+                    return fault
                 self._phase = RuntimeSessionPhase.EXPIRING
                 if authority.mode is ExpiryMode.ROLLOVER:
                     self._expiry_authority = authority
-                    return ExpiryDisposition.ROLLOVER_QUEUED
+                    self._expiry_terminal_event = None
+                    return ExpiryTicketV1(ExpiryDisposition.ROLLOVER_QUEUED, None)
                 command = ExpireSessionV1(
                     protocol_version=1,
                     owner_generation=authority.owner_generation,
@@ -2331,17 +2360,24 @@ class EvidenceAdmissionControllerV1:
                     erasure_request_id=str(uuid4()),
                     mode=authority.mode,
                 )
+                # This erasure's own milestone exists before its item can be
+                # completed; an owner that has already faulted cannot finish it.
+                terminal_event = Event()
+                if self._owner_state is OwnerState.FAULTED:
+                    _set_ticket_signal(terminal_event)
+                self._expiry_terminal_event = terminal_event
                 if not self._try_enqueue_zero_record_control_locked(command, "expiry"):
                     self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
-                    return ExpiryDisposition.WRITER_FAULT
+                    self._expiry_terminal_event = None
+                    return fault
                 self._expiry_authority = authority
-                return ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+                return ExpiryTicketV1(ExpiryDisposition.ERASURE_DURABLY_SCHEDULED, terminal_event)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
             with self._admission_lock:
                 self._latch_writer_fault_locked(WriterFault.SQLITE_FAULT)
-            return ExpiryDisposition.WRITER_FAULT
+            return fault
 
     def try_rollover(
         self,
@@ -3945,7 +3981,7 @@ class EvidenceAdmissionControllerV1:
                 self._phase = RuntimeSessionPhase.STOPPED
                 self._capture_state = CaptureState.IDLE
                 self._owner_state = OwnerState.STOPPED
-                _set_ticket_signal(self._expiry_terminal_event)
+                self._signal_expiry_terminal_locked()
         self._advance_revoke_finalization_if_ready()
 
     def try_reserve_create_epoch(
@@ -4178,6 +4214,7 @@ class EvidenceAdmissionControllerV1:
         self._binding_close_admitted = False
         self._seal_ticket_disposition = None
         self._expiry_authority = None
+        self._expiry_terminal_event = None
         self._replayable_turn_count = 0
         self._revoke_authority = None
         self._revoke_ticket = None
@@ -5270,7 +5307,7 @@ class EvidenceAdmissionControllerV1:
             self._sticky_fault = fault
         self._owner_state = OwnerState.FAULTED
         self._capture_state = CaptureState.FAULTED
-        _set_ticket_signal(self._expiry_terminal_event)
+        self._signal_expiry_terminal_locked()
 
 
 class EvidenceAdmissionViewV1:

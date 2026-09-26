@@ -2081,13 +2081,17 @@ class HostEvidenceRuntimeV1:
         }.items():
             object.__setattr__(authority, name, value)
         authority._validate()
-        disposition = admission.begin_expiry(authority)
+        ticket = admission.begin_expiry(authority)
+        disposition = ticket.disposition
         if disposition is not ExpiryDisposition.ERASURE_DURABLY_SCHEDULED:
             return disposition
-        # Capture state follows the store's own terminal outcome, however long
-        # the erasure takes.  The wait has no deadline of its own: close cancels
-        # this owner task and applies its own bounds.
-        await _wait_for_thread_signal(admission.expiry_terminal_event, timeout_seconds=None)
+        terminal_event = ticket.terminal_event
+        if terminal_event is None:
+            raise RuntimeError("a scheduled erasure has no terminal milestone")
+        # Capture state follows this erasure's own terminal outcome, however long
+        # it takes.  The wait has no deadline of its own: close cancels this
+        # owner task and applies its own bounds.
+        await _wait_for_thread_signal(terminal_event, timeout_seconds=None)
         owner_state = admission.diagnostics().owner_state
         if owner_state is OwnerState.STOPPED:
             self._capture_state = CaptureState.IDLE

@@ -848,13 +848,15 @@ def test_complete_create_epoch_recreates_cleanly_after_expiry_and_successful_pur
         deadline_admission_ordinal=admission.final_admission_ordinal,
         mode=m.ExpiryMode.ERASE_STUCK,
     )
-    assert admission.begin_expiry(old_expiry) is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    assert admission.begin_expiry(old_expiry).disposition is (
+        m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    )
     admission.complete_ordered_item(writer.get_nowait())
     assert admission.diagnostics().owner_state is m.OwnerState.STOPPED
 
     second = _activate_next_epoch(m, admission, writer, seed=600)
     assert admission._expiry_authority is None
-    assert admission.begin_expiry(old_expiry) is m.ExpiryDisposition.WRITER_FAULT
+    assert admission.begin_expiry(old_expiry).disposition is m.ExpiryDisposition.WRITER_FAULT
     assert admission.diagnostics().capture_state is m.CaptureState.ACTIVE
 
     tainted_authority = _turn_authority(
@@ -4046,15 +4048,15 @@ def test_expiry_revalidates_its_watermark_and_releases_erased_session_credits() 
         )
 
     wrong_watermark = authority(watermark + 1, m.ExpiryMode.ERASE_STUCK)
-    assert admission.begin_expiry(wrong_watermark) is m.ExpiryDisposition.WRITER_FAULT
+    assert admission.begin_expiry(wrong_watermark).disposition is m.ExpiryDisposition.WRITER_FAULT
     assert writer.ordered_count == 0
 
     exact = authority(watermark, m.ExpiryMode.ERASE_STUCK)
     assert (
-        admission.begin_expiry(exact)
+        admission.begin_expiry(exact).disposition
         is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
     )
-    assert admission.begin_expiry(exact) is m.ExpiryDisposition.ALREADY_EXPIRING
+    assert admission.begin_expiry(exact).disposition is m.ExpiryDisposition.ALREADY_EXPIRING
     item = writer.get_nowait()
     assert type(item.payload) is m.ExpireSessionV1
     assert item.payload.last_admission_ordinal == watermark
@@ -4084,11 +4086,11 @@ def test_expiry_revalidates_its_watermark_and_releases_erased_session_credits() 
         mode=m.ExpiryMode.ROLLOVER,
     )
     assert (
-        rollover_admission.begin_expiry(rollover_authority)
+        rollover_admission.begin_expiry(rollover_authority).disposition
         is m.ExpiryDisposition.ROLLOVER_QUEUED
     )
     assert (
-        rollover_admission.begin_expiry(rollover_authority)
+        rollover_admission.begin_expiry(rollover_authority).disposition
         is m.ExpiryDisposition.ALREADY_EXPIRING
     )
     assert rollover_writer.ordered_count == 0
@@ -4126,21 +4128,20 @@ def test_retention_owner_closes_admission_before_terminal_settlement_and_erasure
         deadline_admission_ordinal=admission.final_admission_ordinal,
         mode=m.ExpiryMode.ERASE_STUCK,
     )
-    assert admission.begin_expiry(expiry) is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    assert admission.begin_expiry(expiry).disposition is (
+        m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    )
     assert type(writer.get_nowait().payload) is m.ExpireSessionV1
 
 
 @pytest.mark.parametrize("writer_succeeded", (True, False), ids=("stopped", "faulted"))
-def test_expiry_terminal_event_publishes_the_durable_expiry_outcome(
+def test_expiry_ticket_publishes_its_own_durable_expiry_outcome(
     writer_succeeded: bool,
 ) -> None:
     a = _admission()
     from hermes_realtime.evidence import models as m
 
     admission, _, writer, create = _active_admission(a, m, owner_generation=317)
-    event = admission.expiry_terminal_event
-    assert type(event) is Event
-    assert admission.expiry_terminal_event is event
     expiry = _capability(
         m.SessionExpiryAuthorityV1,
         protocol_version=1,
@@ -4151,10 +4152,17 @@ def test_expiry_terminal_event_publishes_the_durable_expiry_outcome(
         deadline_admission_ordinal=admission.final_admission_ordinal,
         mode=m.ExpiryMode.ERASE_STUCK,
     )
-    assert admission.begin_expiry(expiry) is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    ticket = admission.begin_expiry(expiry)
+    assert type(ticket) is a.ExpiryTicketV1
+    assert ticket.disposition is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    event = ticket.terminal_event
+    assert type(event) is Event
     # Scheduling is not the store's outcome; only the writer's completion is.
     assert not event.is_set()
     assert admission.diagnostics().owner_state is m.OwnerState.RUNNING
+    repeated = admission.begin_expiry(expiry)
+    assert repeated.disposition is m.ExpiryDisposition.ALREADY_EXPIRING
+    assert repeated.terminal_event is event
 
     admission.complete_ordered_item(writer.get_nowait(), writer_succeeded=writer_succeeded)
 
@@ -4162,6 +4170,19 @@ def test_expiry_terminal_event_publishes_the_durable_expiry_outcome(
     assert admission.diagnostics().owner_state is (
         m.OwnerState.STOPPED if writer_succeeded else m.OwnerState.FAULTED
     )
+
+
+def test_expiry_ticket_rejects_a_milestone_that_does_not_match_its_disposition() -> None:
+    a = _admission()
+    from hermes_realtime.evidence import models as m
+
+    with pytest.raises(ValueError, match="terminal milestone"):
+        a.ExpiryTicketV1(m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED, None)
+    for disposition in (m.ExpiryDisposition.WRITER_FAULT, m.ExpiryDisposition.ROLLOVER_QUEUED):
+        with pytest.raises(ValueError, match="only an erasure"):
+            a.ExpiryTicketV1(disposition, Event())
+    with pytest.raises(TypeError):
+        a.ExpiryTicketV1("erasure_durably_scheduled", Event())
 
 
 def test_rollover_temporarily_holds_seven_credits_then_transfers_exactly_three() -> None:
@@ -4454,7 +4475,7 @@ def test_expiry_completion_cannot_race_a_terminal_append_into_stopped_session() 
         mode=m.ExpiryMode.ERASE_STUCK,
     )
     assert (
-        admission.begin_expiry(expiry_authority)
+        admission.begin_expiry(expiry_authority).disposition
         is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
     )
     ordinary_item = writer.get_nowait()
