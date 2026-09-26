@@ -4214,7 +4214,6 @@ class EvidenceAdmissionControllerV1:
         self._binding_close_admitted = False
         self._seal_ticket_disposition = None
         self._expiry_authority = None
-        self._expiry_terminal_event = None
         self._replayable_turn_count = 0
         self._revoke_authority = None
         self._revoke_ticket = None
