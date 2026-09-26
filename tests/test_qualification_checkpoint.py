@@ -18,6 +18,29 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Win32 handle co
 _CHECKPOINT_STARTUP_TIMEOUT_SECONDS = 10.0
 # Fixed token the test-owned child writes as the last action of its host close().
 _HOST_CLOSED_MARKER = b"[host-closed]\n"
+# The guard each failure case reaches in the channel. `{}{}` is complete JSON with
+# extra data, and an extra field fails the exact field set.
+_EXPECTED_REFUSALS = {
+    "ack_eof": "ack_eof",
+    "duplicate_key": "duplicate_key",
+    "trailing_bytes": "malformed",
+    "oversized": "oversized",
+    "wrong_nonce": "wrong_nonce",
+    "unknown_field": "field_set_mismatch",
+}
+
+
+def _refusal_marker(evidence: dict[str, object]) -> bytes:
+    # The child's text-mode stderr translates the newline on Windows.
+    return (
+        b"[qualification-checkpoint] "
+        + json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("ascii")
+        + b"\r\n"
+    )
+
+
+def _refused_marker(refusal: str) -> bytes:
+    return _refusal_marker({"phase": "refused", "refusal": refusal, "version": 1})
 
 
 def _read_line(fd: int) -> bytes:
@@ -193,6 +216,114 @@ async def test_external_cli_checkpoint_failure_exit_opens_no_files_after_host_se
     assert observation["killed"] is False
     assert observation["child_events"] == [
         "launcher_close_entered", "launcher_close_returned", "host_main_settled", "atexit_entered",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_external_cli_checkpoint_refusal_survives_cleanup_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The fixture requires both markers and no traceback; a cleanup exception that
+    # replaced the refusal would render one and stall on the post-settlement opens.
+    await _assert_external_cli_checkpoint_failure(
+        "duplicate_key", tmp_path, close_raises=True, stall_opens_after_host_settled=True,
+    )
+    observation = _checkpoint_observation(capsys)
+    assert observation["completed"] is True
+    assert observation["killed"] is False
+    assert observation["exit_code"] == 1
+    assert observation["host_closed"] is True
+    assert observation["child_events"] == [
+        "launcher_close_entered", "host_main_settled", "atexit_entered",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_refusal_records_every_cleanup_failure_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import msvcrt
+    import signal
+
+    import hermes_realtime.host_launcher as host_launcher
+    from hermes_realtime._qualification import _current_qualification_checkpoint_channel
+
+    checkpoint_read_fd, checkpoint_write_fd = os.pipe()
+    resume_read_fd, resume_write_fd = os.pipe()
+    args = host_launcher._build_argument_parser().parse_args(
+        [
+            "--qualification-no-hermes-tasks",
+            "--qualification-checkpoint-write-handle",
+            str(msvcrt.get_osfhandle(checkpoint_write_fd)),
+            "--qualification-checkpoint-resume-handle",
+            str(msvcrt.get_osfhandle(resume_read_fd)),
+            "--qualification-checkpoint-nonce",
+            "2" * 64,
+        ]
+    )
+    signal_calls: list[object] = []
+    real_signal = signal.signal
+
+    def install_then_refuse_restore(signum: Any, handler: Any) -> object:
+        if signum != signal.SIGBREAK:
+            # The event loop runner restores its own SIGINT handler at teardown.
+            return real_signal(signum, handler)
+        signal_calls.append(handler)
+        if len(signal_calls) > 1:
+            raise OSError("simulated signal restoration failure")
+        return signal.SIG_DFL
+
+    class Launcher:
+        def __init__(self) -> None:
+            channel = _current_qualification_checkpoint_channel()
+            assert channel is not None
+            self.channel = channel
+
+        async def start(self) -> str:
+            emission = asyncio.create_task(
+                self.channel.emit("host_response_completed_before_shutdown"),
+            )
+            emission.add_done_callback(lambda task: task.exception())
+            await asyncio.sleep(0)
+            return "https://127.0.0.1:8443/"
+
+        async def close(self) -> None:
+            raise OSError("simulated launcher close failure")
+
+    monkeypatch.setattr(signal, "signal", install_then_refuse_restore)
+    monkeypatch.setattr(host_launcher, "build_local_host_launcher", lambda **_kw: Launcher())
+    monkeypatch.setattr(
+        host_launcher,
+        "_load_livekit_credentials",
+        lambda **_kwargs: ("devkey", "local-" + "x" * 32),
+    )
+    monkeypatch.setenv("HERMES_REALTIME_QUALIFICATION_CHILD", "1")
+    try:
+        run = host_launcher._run_host_cli(args)
+        checkpoint_write_fd = -1
+        resume_read_fd = -1
+        with pytest.raises(host_launcher._QualificationCheckpointFailure):
+            await asyncio.wait_for(run, timeout=1.0)
+    finally:
+        for fd in (checkpoint_read_fd, resume_write_fd, checkpoint_write_fd, resume_read_fd):
+            if fd >= 0:
+                os.close(fd)
+    assert len(signal_calls) == 2
+    markers = [
+        line for line in capsys.readouterr().err.splitlines()
+        if line.startswith("[qualification-checkpoint] ")
+    ]
+    assert [json.loads(line.removeprefix("[qualification-checkpoint] ")) for line in markers] == [
+        {"phase": "refused", "refusal": "out_of_order", "version": 1},
+        {
+            "cleanup": ["launcher_close", "signal_restore"],
+            "host_exit": "returned",
+            "phase": "settled",
+            "refusal": "out_of_order",
+            "version": 1,
+        },
     ]
 
 
@@ -404,14 +535,16 @@ async def test_external_cli_checkpoint_interruption_settles_communication(
     assert observation["reaped"] is True
     assert child.drained_stderr is not None
     assert observation["stderr_bytes"] == len(child.drained_stderr)
+    refused = len(_refused_marker("ack_eof"))
     if expect_timeout:
-        assert observation["stderr_bytes"] == 17
+        # The refusal is reported before cleanup, so it precedes close()'s bytes.
+        assert observation["stderr_bytes"] == refused + 17
         assert observation["child_events"] == ["launcher_close_entered"]
         # close() is parked before its last action, so the marker must never appear.
         assert observation["host_closed"] is False
     else:
         # Cancellation may win before the child enters close or writes anything.
-        assert observation["stderr_bytes"] in {0, 17}
+        assert observation["stderr_bytes"] in {0, refused, refused + 17}
         assert observation["child_events"] in ([], ["launcher_close_entered"])
         if observation["child_events"]:
             assert observation["host_closed"] is False
@@ -581,6 +714,7 @@ async def _assert_external_cli_checkpoint_failure(
     hold_atexit: bool = False,
     close_stall: Literal["none", "after_marker", "before_marker"] = "none",
     stall_opens_after_host_settled: bool = False,
+    close_raises: bool = False,
 ) -> None:
     import msvcrt
 
@@ -611,6 +745,8 @@ async def _assert_external_cli_checkpoint_failure(
     )
     if close_stall == "after_marker":
         close_body += "; time.sleep(30)"
+    if close_raises:
+        close_body += "; raise OSError('simulated launcher close failure')"
     # Hosted runners have stalled for over five seconds on the first read of a file,
     # so every file open after host settlement is made to stall in the same way.
     open_stall = (
@@ -741,10 +877,22 @@ async def _assert_external_cli_checkpoint_failure(
         assert process.returncode != 0
         assert process.poll() is not None
         assert await asyncio.to_thread(_read_line, checkpoint_read_fd) == b""
-        assert stderr.startswith(b"x" * stderr_bytes)
-        # The failure is a fixed document, never a traceback that reads source files.
-        assert stderr.endswith(b'{"error":"qualification_checkpoint_failed","version":1}\r\n')
-        assert b"Traceback" not in stderr
+        # The refusal is reported before cleanup and again with the cleanup outcome,
+        # as fixed markers and never as a traceback that reads source files.
+        refusal = _EXPECTED_REFUSALS[failure_case]
+        assert stderr == (
+            _refused_marker(refusal)
+            + b"x" * stderr_bytes
+            + _HOST_CLOSED_MARKER
+            + _refusal_marker({
+                "cleanup": ["launcher_close"] if close_raises else [],
+                "host_exit": "returned",
+                "phase": "settled",
+                "refusal": refusal,
+                "version": 1,
+            })
+        )
+        assert process.returncode == 1
         completed = True
     finally:
         mark("cleanup_entered")
