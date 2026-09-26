@@ -41,9 +41,9 @@ security hardening.
 
 ## Architecture
 
-![Hermes Realtime architecture. The browser's microphone audio travels through a LiveKit room to the hermes-realtime host, which listens, converses with its own low-latency model, and speaks back through the room. Your speech interrupts playback without cancelling background work. Only speech confirmed delivered enters the conversation's memory. Real work is delegated to a separate Hermes Agent process, whose results and approvals come back as bounded updates.](docs/assets/architecture.svg)
+![Hermes Realtime architecture. The browser's microphone audio travels through a LiveKit room to the hermes-realtime host, which listens, converses with its own low-latency model, and speaks back through the room. Your speech interrupts playback without cancelling background work. The conversation remembers your final words, but only the replies confirmed delivered. Real work is delegated to a separate Hermes Agent process, whose results and approvals come back as bounded updates.](docs/assets/architecture.svg)
 
-The realtime host converses with its own low-latency model and hands real work to Hermes Agent, which runs it as a separate process. The conversation model receives compact context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events. See [ADR 0003](docs/adr/0003-hermes-owned-conversation-continuity.md) for how conversation and learning continue in Hermes.
+The realtime host converses with its own low-latency model and hands real work to Hermes Agent, which runs it as a separate process. The conversation model receives compact context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events. [ADR 0003](docs/adr/0003-hermes-owned-conversation-continuity.md) describes the planned design for archiving voice conversations in Hermes and learning from them; today the conversation survives a restart through a local file.
 
 ## Requirements
 

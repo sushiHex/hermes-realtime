@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="title desc">
   <title id="title">Hermes Realtime architecture</title>
-  <desc id="desc">The browser sends microphone audio through a LiveKit room to the hermes-realtime host. The host listens, converses with its own foreground model, and speaks back through the room. Only speech confirmed delivered enters the conversation. Real work is delegated to a separate Hermes Agent process, whose acknowledged results and approvals come back as bounded updates.</desc>
+  <desc id="desc">The browser sends microphone audio through a LiveKit room to the hermes-realtime host. The host listens, converses with its own foreground model, and speaks back through the room. The conversation remembers your final words, but only the replies confirmed delivered. Real work is delegated to a separate Hermes Agent process, whose acknowledged results and approvals come back as bounded updates.</desc>
   <style>
     svg { --text: #1f2328; --muted: #59636e; --box: #f6f8fa; --line: #d0d7de; --host: #f6f8fa;
           --audio: #0969da; --work: #9a6700; --truth: #1a7f37; --warn: #cf222e; }
@@ -71,7 +71,7 @@
   <rect class="box" x="355" y="410" width="520" height="54" rx="10"/>
   <rect class="band-truth" x="355" y="410" width="6" height="54" rx="3"/>
   <text class="label" x="375" y="433">Heard-first memory</text>
-  <text class="body" x="375" y="452">only speech confirmed delivered enters the conversation · survives a crash</text>
+  <text class="body" x="375" y="452">your final words, and only replies confirmed delivered · survives a crash</text>
 
   <!-- Hermes -->
   <rect class="box" x="960" y="40" width="220" height="440" rx="16"/>
