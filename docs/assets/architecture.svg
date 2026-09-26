@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-labelledby="title desc">
+  <title id="title">Hermes Realtime architecture</title>
+  <desc id="desc">The browser sends microphone audio through a LiveKit room to the hermes-realtime host. The host listens, converses with its own foreground model, and speaks back through the room. The conversation remembers your final words, but only the replies confirmed delivered. Real work is delegated to a separate Hermes Agent process, whose acknowledged results and approvals come back as bounded updates.</desc>
+  <style>
+    svg { --text: #1f2328; --muted: #59636e; --box: #f6f8fa; --line: #d0d7de; --host: #f6f8fa;
+          --audio: #0969da; --work: #9a6700; --truth: #1a7f37; --warn: #cf222e; }
+    @media (prefers-color-scheme: dark) {
+      svg { --text: #e6edf3; --muted: #9198a1; --box: #161b22; --line: #3d444d; --host: #0d1117;
+            --audio: #4493f8; --work: #d29922; --truth: #3fb950; --warn: #f85149; }
+    }
+    text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--text); }
+    .title { font-size: 19px; font-weight: 600; }
+    .label { font-size: 15px; font-weight: 600; }
+    .body { font-size: 13px; fill: var(--muted); }
+    .edge { font-size: 12.5px; fill: var(--muted); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.5; }
+    .host { fill: var(--host); stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 6 5; }
+    .audio { stroke: var(--audio); } .work { stroke: var(--work); } .truth { stroke: var(--truth); }
+    .warn { stroke: var(--warn); }
+    .arrow { fill: none; stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }
+    .dash { stroke-dasharray: 5 5; }
+    .tip-audio { fill: var(--audio); } .tip-work { fill: var(--work); } .tip-truth { fill: var(--truth); }
+    .tip-warn { fill: var(--warn); }
+    .band-audio { fill: var(--audio); } .band-work { fill: var(--work); } .band-truth { fill: var(--truth); }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="tip-audio" d="M0 0L10 5L0 10z"/></marker>
+    <marker id="w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="tip-work" d="M0 0L10 5L0 10z"/></marker>
+    <marker id="t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="tip-truth" d="M0 0L10 5L0 10z"/></marker>
+    <marker id="x" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="tip-warn" d="M0 0L10 5L0 10z"/></marker>
+  </defs>
+
+  <!-- Browser -->
+  <rect class="box" x="20" y="80" width="150" height="320" rx="12"/>
+  <text class="title" x="95" y="112" text-anchor="middle">Browser</text>
+  <text class="body" x="95" y="132" text-anchor="middle">captions · approvals</text>
+  <text class="body" x="95" y="150" text-anchor="middle">stop</text>
+  <text class="label" x="95" y="190" text-anchor="middle">Microphone</text>
+  <text class="label" x="95" y="366" text-anchor="middle">Speaker</text>
+
+  <!-- LiveKit -->
+  <rect class="box" x="210" y="80" width="90" height="320" rx="12"/>
+  <text class="label" x="255" y="228" text-anchor="middle">LiveKit</text>
+  <text class="label" x="255" y="248" text-anchor="middle">room</text>
+  <text class="body" x="255" y="270" text-anchor="middle">WebRTC</text>
+
+  <!-- Host -->
+  <rect class="host" x="330" y="40" width="570" height="440" rx="16"/>
+  <text class="title" x="350" y="68">hermes-realtime host</text>
+
+  <rect class="box" x="355" y="100" width="200" height="90" rx="10"/>
+  <rect class="band-audio" x="355" y="100" width="6" height="90" rx="3"/>
+  <text class="label" x="375" y="130">Listen</text>
+  <text class="body" x="375" y="152">voice activity detection</text>
+  <text class="body" x="375" y="170">streaming speech-to-text</text>
+
+  <rect class="box" x="615" y="100" width="260" height="130" rx="10"/>
+  <rect class="band-audio" x="615" y="100" width="6" height="130" rx="3"/>
+  <text class="label" x="635" y="130">Converse</text>
+  <text class="body" x="635" y="152">deterministic turn states</text>
+  <text class="body" x="635" y="170">own low-latency model</text>
+  <text class="body" x="635" y="188">(Codex or Ollama)</text>
+  <text class="body" x="635" y="206">compact context, no tool schema</text>
+
+  <rect class="box" x="615" y="290" width="220" height="90" rx="10"/>
+  <rect class="band-audio" x="615" y="290" width="6" height="90" rx="3"/>
+  <text class="label" x="635" y="320">Speak</text>
+  <text class="body" x="635" y="342">streaming text-to-speech</text>
+  <text class="body" x="635" y="360">playback with delivery receipts</text>
+
+  <rect class="box" x="355" y="410" width="520" height="54" rx="10"/>
+  <rect class="band-truth" x="355" y="410" width="6" height="54" rx="3"/>
+  <text class="label" x="375" y="433">Heard-first memory</text>
+  <text class="body" x="375" y="452">your final words, and only replies confirmed delivered · survives a crash</text>
+
+  <!-- Hermes -->
+  <rect class="box" x="960" y="40" width="220" height="440" rx="16"/>
+  <rect class="band-work" x="960" y="40" width="6" height="440" rx="3"/>
+  <text class="title" x="985" y="72">Hermes Agent</text>
+  <text class="body" x="985" y="92">separate process</text>
+  <text class="label" x="985" y="150">Runs and tools</text>
+  <text class="body" x="985" y="170">long-running work</text>
+  <text class="label" x="985" y="222">Approvals</text>
+  <text class="body" x="985" y="242">decided in the browser</text>
+  <text class="label" x="985" y="294">Sessions</text>
+  <text class="body" x="985" y="314">history and search</text>
+  <text class="label" x="985" y="366">Memory and skills</text>
+  <text class="body" x="985" y="386">Hermes keeps learning</text>
+
+  <!-- Audio in -->
+  <path class="arrow audio" marker-end="url(#a)" d="M150 185H206"/>
+  <path class="arrow audio" marker-end="url(#a)" d="M300 150H351"/>
+  <text class="edge" x="303" y="140">audio in</text>
+  <path class="arrow audio" marker-end="url(#a)" d="M555 145H611"/>
+  <text class="edge" x="560" y="137">words</text>
+  <!-- Reply -->
+  <path class="arrow audio" marker-end="url(#a)" d="M725 230V286"/>
+  <text class="edge" x="732" y="263">reply</text>
+  <!-- Audio out -->
+  <path class="arrow audio" marker-end="url(#a)" d="M615 350H304"/>
+  <text class="edge" x="470" y="342" text-anchor="middle">audio out</text>
+  <path class="arrow audio" marker-end="url(#a)" d="M210 360H154"/>
+  <!-- Barge-in -->
+  <path class="arrow warn dash" marker-end="url(#x)" d="M455 190V310H611"/>
+  <text class="edge" x="465" y="250">you speak:</text>
+  <text class="edge" x="465" y="266">speech stops,</text>
+  <text class="edge" x="465" y="282">work continues</text>
+  <!-- Delivery truth -->
+  <path class="arrow truth" marker-end="url(#t)" d="M725 380V406"/>
+  <path class="arrow truth" marker-end="url(#t)" d="M855 410V234"/>
+  <text class="edge" x="872" y="322" transform="rotate(-90 872 322)" text-anchor="middle">heard text</text>
+  <!-- Delegation -->
+  <path class="arrow work" marker-end="url(#w)" d="M875 140H956"/>
+  <text class="edge" x="880" y="130">delegate</text>
+  <path class="arrow work" marker-end="url(#w)" d="M956 200H879"/>
+  <text class="edge" x="880" y="220">results</text>
+
+  <text class="body" x="600" y="520" text-anchor="middle">Interrupting speech never cancels background work. Task state is claimed only from acknowledged Hermes events, and results re-enter the conversation as bounded updates.</text>
+</svg>
