@@ -26,7 +26,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +37,7 @@ from hermes_realtime._qualification import (
     _current_qualification_full_host_dependencies,
     _new_qualification_checkpoint_channel,
     _qualification_checkpoint_channel_scope,
+    _qualification_checkpoint_failure_category,
     _QualificationCheckpointChannelV1,
 )
 from hermes_realtime.client import (
@@ -1733,6 +1734,31 @@ _QUALIFICATION_NO_TASK_COMPOSITION: ContextVar[bool] = ContextVar(
     "hermes_realtime_qualification_no_task_composition",
     default=False,
 )
+_QUALIFICATION_CHECKPOINT_MARKER_PREFIX = "[qualification-checkpoint] "
+
+
+class _QualificationCheckpointFailure(RuntimeError):
+    """Terminal checkpoint refusal, already reported by marker; never rendered."""
+
+
+def _qualification_checkpoint_marker(evidence: dict[str, object]) -> None:
+    # A rendered traceback would read source files inside the parent's exit bound,
+    # so refusals leave only as fixed markers. A broken stderr cannot stop cleanup.
+    with suppress(OSError, ValueError):
+        print(
+            _QUALIFICATION_CHECKPOINT_MARKER_PREFIX
+            + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _host_exit_category(error: BaseException | None) -> str:
+    if error is None:
+        return "returned"
+    if type(error) is asyncio.CancelledError:
+        return "cancelled"
+    return "error"
 
 
 @contextmanager
@@ -2787,6 +2813,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             checkpoint_channel.close()
         raise
     previous_sigbreak_handler: object | None = None
+    host_error: BaseException | None = None
     try:
         if qualification_no_hermes_tasks:
             loop = asyncio.get_running_loop()
@@ -2828,25 +2855,66 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         print(launch_url, flush=True)
         if qualification_no_hermes_tasks:
             await shutdown_requested.wait()
-            if checkpoint_failures:
-                raise RuntimeError(
-                    "qualification checkpoint channel failed"
-                ) from checkpoint_failures[0]
         else:
             await asyncio.Event().wait()
+    except BaseException as error:
+        host_error = error
+        raise
     finally:
+        # A refusal is reported before cleanup can stall or fail, and its terminal
+        # outcome is decided after cleanup, so neither can replace the other.
+        refusal = (
+            _qualification_checkpoint_failure_category(checkpoint_failures[0])
+            if checkpoint_failures
+            else None
+        )
+        if refusal is not None:
+            _qualification_checkpoint_marker(
+                {"phase": "refused", "refusal": refusal, "version": 1}
+            )
+        cleanup_failures: list[tuple[str, BaseException]] = []
         try:
             await launcher.close()
-        finally:
-            try:
-                if previous_sigbreak_handler is not None:
-                    signal.signal(
-                        signal.SIGBREAK,
-                        cast(signal.Handlers, previous_sigbreak_handler),
-                    )
-            finally:
-                if checkpoint_channel is not None:
-                    checkpoint_channel.close()
+        except BaseException as error:
+            cleanup_failures.append(("launcher_close", error))
+        try:
+            if previous_sigbreak_handler is not None:
+                signal.signal(
+                    signal.SIGBREAK,
+                    cast(signal.Handlers, previous_sigbreak_handler),
+                )
+        except BaseException as error:
+            cleanup_failures.append(("signal_restore", error))
+        try:
+            if checkpoint_channel is not None:
+                checkpoint_channel.close()
+        except BaseException as error:
+            cleanup_failures.append(("channel_close", error))
+        if checkpoint_failures:
+            if refusal is None:
+                # The channel failed during cleanup; report it as it settles.
+                refusal = _qualification_checkpoint_failure_category(checkpoint_failures[0])
+                _qualification_checkpoint_marker(
+                    {"phase": "refused", "refusal": refusal, "version": 1}
+                )
+            _qualification_checkpoint_marker(
+                {
+                    "cleanup": [stage for stage, _ in cleanup_failures],
+                    "host_exit": _host_exit_category(host_error),
+                    "phase": "settled",
+                    "refusal": refusal,
+                    "version": 1,
+                }
+            )
+            raise _QualificationCheckpointFailure(
+                "qualification checkpoint channel failed"
+            ) from checkpoint_failures[0]
+        if len(cleanup_failures) == 1:
+            raise cleanup_failures[0][1]
+        if cleanup_failures:
+            raise BaseExceptionGroup(
+                "host cleanup failed", [error for _, error in cleanup_failures]
+            )
 
 
 def _compact_json(document: Mapping[str, object]) -> str:
@@ -3235,6 +3303,10 @@ def main() -> int:
         asyncio.run(_run_host_cli(args))
     except KeyboardInterrupt:
         return 130
+    except _QualificationCheckpointFailure:
+        # Its markers are already written; rendering a traceback would read every
+        # frame's source file from disk inside the qualification parent's exit bound.
+        return 1
     return 0
 
 
