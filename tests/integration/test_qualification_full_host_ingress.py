@@ -214,11 +214,10 @@ _INGRESS_EVENT_FETCH_TIMEOUT_SECONDS = 1.0
 def _evidence_observation(database: Path) -> dict[str, object]:
     """Summarise what the writer has durably accepted, without any of its content.
 
-    The acceptance wait below collapses to a bare ``TimeoutError``, which names neither
-    the source that failed to arrive nor how far the evidence path got. Both are already
-    recorded in the database the wait is polling, so read them once and keep them: the
-    event kinds present bound the milestone reached, and the accepted sources say whether
-    the missing final is the typed one, the microphone one, or both.
+    Call it only after the host has closed.  The evidence store has one owner that
+    never waits for a lock, so a reader while the host runs can fault its writer.
+    The event kinds present bound the milestone reached, and the accepted sources say
+    whether a missing final is the typed one, the microphone one, or both.
 
     Only kinds, counts and the ``typed``/``microphone`` category are reported. Transcript
     text, identities and paths stay in the database.
@@ -445,45 +444,54 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
         async with asyncio.timeout(10):
             while transcriber._armed:
                 await asyncio.sleep(0.05)
-        observation: dict[str, object] = {}
+        # The host owns the evidence store until close.  Any reader here takes a
+        # shared lock that the sole writer's commit cannot wait for (busy_timeout
+        # 0), which latches a sqlite_fault, so observe the microphone turn on the
+        # public event stream instead.
         try:
-            async with asyncio.timeout(_ACCEPTANCE_BOUND_SECONDS):
-                while True:
-                    observation = _evidence_observation(database)
-                    if len(cast(list[str], observation["accepted_sources"])) >= 2:
-                        break
-                    await asyncio.sleep(0.1)
-        finally:
-            event_observation: dict[str, object] = {"available": False}
-            try:
-                event_observation = await _best_effort_ingress_event_observation(
-                    port=port,
-                    origin=origin,
-                    token=token,
-                    after=event_cursor,
-                )
-            finally:
-                print(
-                    _INGRESS_OBSERVATION_PREFIX
-                    + json.dumps(
-                        {
-                            **observation,
-                            "bound_seconds": _ACCEPTANCE_BOUND_SECONDS,
-                            "public_event_window": event_observation,
-                            "transcriber": {
-                                "finals_returned": transcriber.finals_returned,
-                                "finish_calls": transcriber.finish_calls,
-                            },
-                        },
-                        sort_keys=True,
-                    )
-                )
-        assert set(cast(list[str], observation["accepted_sources"])) == {"typed", "microphone"}
+            await _wait_event(
+                port=port,
+                origin=origin,
+                token=token,
+                kind="assistant_turn_completed",
+                after=event_cursor,
+                timeout=_ACCEPTANCE_BOUND_SECONDS,
+            )
+            microphone_turn_completed = True
+        except TimeoutError:
+            microphone_turn_completed = False
+        event_observation = await _best_effort_ingress_event_observation(
+            port=port,
+            origin=origin,
+            token=token,
+            after=event_cursor,
+        )
     finally:
         await room.disconnect()
         if running is not None:
             await composition.close_host(running)  # type: ignore[arg-type]
     assert composition.trace.status().trace_complete
+    # Close drained every admitted record and released the store; only now may the
+    # test read it to prove both finals durable.
+    observation = _evidence_observation(database)
+    print(
+        _INGRESS_OBSERVATION_PREFIX
+        + json.dumps(
+            {
+                **observation,
+                "bound_seconds": _ACCEPTANCE_BOUND_SECONDS,
+                "microphone_turn_completed": microphone_turn_completed,
+                "public_event_window": event_observation,
+                "transcriber": {
+                    "finals_returned": transcriber.finals_returned,
+                    "finish_calls": transcriber.finish_calls,
+                },
+            },
+            sort_keys=True,
+        )
+    )
+    assert microphone_turn_completed
+    assert set(cast(list[str], observation["accepted_sources"])) == {"typed", "microphone"}
 
 
 class _FaultAtWriterCompletionTransport:
