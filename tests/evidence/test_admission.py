@@ -4130,6 +4130,40 @@ def test_retention_owner_closes_admission_before_terminal_settlement_and_erasure
     assert type(writer.get_nowait().payload) is m.ExpireSessionV1
 
 
+@pytest.mark.parametrize("writer_succeeded", (True, False), ids=("stopped", "faulted"))
+def test_expiry_terminal_event_publishes_the_durable_expiry_outcome(
+    writer_succeeded: bool,
+) -> None:
+    a = _admission()
+    from hermes_realtime.evidence import models as m
+
+    admission, _, writer, create = _active_admission(a, m, owner_generation=317)
+    event = admission.expiry_terminal_event
+    assert type(event) is Event
+    assert admission.expiry_terminal_event is event
+    expiry = _capability(
+        m.SessionExpiryAuthorityV1,
+        protocol_version=1,
+        owner_generation=317,
+        consent_epoch_id=create.consent_epoch_id,
+        logical_session_id=create.logical_session_id,
+        expires_at_utc="2030-01-02T03:04:05.000000Z",
+        deadline_admission_ordinal=admission.final_admission_ordinal,
+        mode=m.ExpiryMode.ERASE_STUCK,
+    )
+    assert admission.begin_expiry(expiry) is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
+    # Scheduling is not the store's outcome; only the writer's completion is.
+    assert not event.is_set()
+    assert admission.diagnostics().owner_state is m.OwnerState.RUNNING
+
+    admission.complete_ordered_item(writer.get_nowait(), writer_succeeded=writer_succeeded)
+
+    assert event.is_set()
+    assert admission.diagnostics().owner_state is (
+        m.OwnerState.STOPPED if writer_succeeded else m.OwnerState.FAULTED
+    )
+
+
 def test_rollover_temporarily_holds_seven_credits_then_transfers_exactly_three() -> None:
     a = _admission()
     from hermes_realtime.evidence import models as m

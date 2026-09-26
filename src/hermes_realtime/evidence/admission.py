@@ -1657,6 +1657,7 @@ class EvidenceAdmissionControllerV1:
         self._drain_item: EvidenceWriterQueueItemV1 | None = None
         self._rollover_preparation: _AdmissionRolloverPreparationV1 | None = None
         self._rollover_ticket: _RolloverCompletionTicketV1 | None = None
+        self._expiry_terminal_event = Event()
 
     @property
     def _queued_charges(self) -> _IdentityQueuedChargesV1:
@@ -1723,6 +1724,17 @@ class EvidenceAdmissionControllerV1:
     @property
     def operation_scheduler(self) -> ConversationOperationScheduler:
         return self._operation_scheduler
+
+    @property
+    def expiry_terminal_event(self) -> Event:
+        """Set once the owner reaches a terminal state an expiry can end in.
+
+        The writer's durable expiry completion stops the owner; any writer fault
+        latches it faulted.  Scheduling an expiry sets nothing, so an observer
+        never mistakes an admitted erasure for a finished one.
+        """
+
+        return self._expiry_terminal_event
 
     @property
     def final_admission_ordinal(self) -> int:
@@ -3933,6 +3945,7 @@ class EvidenceAdmissionControllerV1:
                 self._phase = RuntimeSessionPhase.STOPPED
                 self._capture_state = CaptureState.IDLE
                 self._owner_state = OwnerState.STOPPED
+                _set_ticket_signal(self._expiry_terminal_event)
         self._advance_revoke_finalization_if_ready()
 
     def try_reserve_create_epoch(
@@ -5257,6 +5270,7 @@ class EvidenceAdmissionControllerV1:
             self._sticky_fault = fault
         self._owner_state = OwnerState.FAULTED
         self._capture_state = CaptureState.FAULTED
+        _set_ticket_signal(self._expiry_terminal_event)
 
 
 class EvidenceAdmissionViewV1:
