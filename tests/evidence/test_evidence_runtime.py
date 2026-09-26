@@ -3461,3 +3461,252 @@ async def test_each_epoch_retention_waits_for_its_own_slow_erasure(tmp_path: Pat
     finally:
         runtime._admission = None
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_close_reports_a_latched_writer_fault_with_a_turn_lease_in_flight(
+    tmp_path: Path,
+) -> None:
+    """A faulted owner's drain ends as a fault, never as a dead writer or a timeout."""
+
+    from time import monotonic
+
+    from hermes_realtime.client import BrowserEventProjection
+    from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+
+    command = _create_epoch()
+    drains: list[str] = []
+
+    class Transport:
+        def create_epoch(self, received: m.CreateEpochV1) -> m.StoreDisposition:
+            assert received is command
+            return m.StoreDisposition.COMMITTED
+
+        def append_record(self, _item: m.QueuedEvidenceRecordV1) -> m.StoreDisposition:
+            # The store latches a fault on the in-flight turn's first record.
+            return m.StoreDisposition.FAULTED
+
+        def drain_and_close(self, _received: m.DrainAndStopV1) -> m.DrainDisposition:
+            drains.append("drain")
+            return m.DrainDisposition.STOPPED
+
+        def __getattr__(self, name: str) -> object:
+            if name in {
+                "append_binding_close",
+                "rollover_session",
+                "expire_session",
+                "seal_epoch",
+                "commit_revoke_request",
+                "finalize_revoke",
+            }:
+                return lambda payload: (_ for _ in ()).throw(AssertionError(payload))
+            raise AttributeError(name)
+
+    runtime = HostEvidenceRuntimeV1(
+        database=tmp_path / "capture-v1.sqlite3",
+        owner_generation=59,
+        retention_hours=24,
+    )
+    projection = BrowserEventProjection()
+    authority = runtime.reserve_consent_authority(
+        command,
+        projection.reserve_capture_status(),
+        projection.validate_capture_status_reservation,
+    )
+    try:
+        assert await runtime.activate_consent(
+            authority,
+            transport=Transport(),
+            binding_is_current=lambda received: received is command,
+            timeout_seconds=1.0,
+        ) is m.ConsentDisposition.CONSENT_ACTIVATED
+        lifecycle, view = runtime.resolve_evidence_pair()
+        assert lifecycle is not None and view is not None
+        operation = runtime.operation_scheduler.try_reserve(
+            m.ConversationOperationKind.PROACTIVE
+        )
+        assert operation is not None
+        reserved = view.try_reserve_proactive_turn(
+            lifecycle.mint_proactive_turn(operation), operation
+        )
+        assert reserved.lease is not None
+        assert view.try_open_non_user_turn(reserved.lease) is m.AppendDisposition.ADMITTED
+        admission = runtime._admission
+        writer = runtime._writer
+        assert admission is not None and writer is not None
+        deadline = monotonic() + 5.0
+        while admission.diagnostics().sticky_fault is None:
+            assert monotonic() < deadline
+            await asyncio.sleep(0.005)
+        assert admission.diagnostics().sticky_fault is m.WriterFault.SQLITE_FAULT
+        # The turn's lease is still live: its settlement can no longer publish.
+        assert admission.diagnostics().active_lease_count == 1
+
+        started = monotonic()
+        # Like every other faulted owner, it drains and closes at once: the
+        # stranded lease can never become durable, so it cannot hold the drain.
+        await runtime.close()
+        assert monotonic() - started < 1.0
+        assert runtime._closed is True
+        assert drains == ["drain"]
+        # The writer stopped normally rather than dying on its dispatch thread.
+        assert writer.failure is None
+        assert not writer.is_running
+        diagnostics = admission.diagnostics()
+        assert diagnostics.sticky_fault is m.WriterFault.SQLITE_FAULT
+        assert diagnostics.capture_state is m.CaptureState.FAULTED
+        assert diagnostics.active_lease_count == 0
+    finally:
+        runtime.operation_scheduler.release(operation) if "operation" in locals() else None
+        writer_owner = runtime._writer
+        if writer_owner is not None:
+            await asyncio.to_thread(writer_owner.close, 2.0)
+
+
+@pytest.mark.asyncio
+async def test_close_faults_a_pending_revoke_stranded_by_a_latched_writer_fault(
+    tmp_path: Path,
+) -> None:
+    """A revoke scheduled behind a live lease ends as the fault, not as a hung drain."""
+
+    import threading
+    from time import monotonic
+
+    from hermes_realtime.client import BrowserEventProjection
+    from hermes_realtime.evidence import InputSource
+    from hermes_realtime.evidence import models as m
+    from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
+
+    command = _create_epoch()
+    hold_first_record = threading.Event()
+    first_record_entered = threading.Event()
+    calls: list[str] = []
+
+    class Transport:
+        def create_epoch(self, received: m.CreateEpochV1) -> m.StoreDisposition:
+            assert received is command
+            return m.StoreDisposition.COMMITTED
+
+        def append_record(self, item: m.QueuedEvidenceRecordV1) -> m.StoreDisposition:
+            kind = item.snapshot.event_kind
+            calls.append(kind.value)
+            if kind is m.EventKind.TURN_OPENED:
+                first_record_entered.set()
+                assert hold_first_record.wait(5.0)
+                return m.StoreDisposition.COMMITTED
+            # The turn's later record latches the writer fault.
+            return m.StoreDisposition.FAULTED
+
+        def commit_revoke_request(self, _received: m.RevokeRequestV1) -> m.RevokeDisposition:
+            calls.append("revoke_request")
+            return m.RevokeDisposition.REVOKE_DURABLY_SCHEDULED
+
+        def finalize_revoke(self, _received: m.RevokeFinalizeV1) -> m.RevokeDisposition:
+            calls.append("revoke_finalize")
+            return m.RevokeDisposition.PURGE_COMPLETED
+
+        def drain_and_close(self, _received: m.DrainAndStopV1) -> m.DrainDisposition:
+            calls.append("drain")
+            return m.DrainDisposition.STOPPED
+
+        def __getattr__(self, name: str) -> object:
+            if name in {
+                "append_binding_close",
+                "rollover_session",
+                "expire_session",
+                "seal_epoch",
+            }:
+                return lambda payload: (_ for _ in ()).throw(AssertionError(payload))
+            raise AttributeError(name)
+
+    runtime = HostEvidenceRuntimeV1(
+        database=tmp_path / "capture-v1.sqlite3",
+        owner_generation=61,
+        retention_hours=24,
+    )
+    projection = BrowserEventProjection()
+    authority = runtime.reserve_consent_authority(
+        command,
+        projection.reserve_capture_status(),
+        projection.validate_capture_status_reservation,
+    )
+    revoke_waiter: asyncio.Task[m.RevokeDisposition] | None = None
+    try:
+        assert await runtime.activate_consent(
+            authority,
+            transport=Transport(),
+            binding_is_current=lambda received: received is command,
+            timeout_seconds=1.0,
+        ) is m.ConsentDisposition.CONSENT_ACTIVATED
+        lifecycle, view = runtime.resolve_evidence_pair()
+        assert lifecycle is not None and view is not None
+        turn_authority = lifecycle.decline_to_user(
+            lifecycle.mint_final_input(
+                source=InputSource.TYPED,
+                input_incarnation=1,
+                media_incarnation=None,
+                typed_sequence=1,
+            )
+        )
+        operation = runtime.operation_scheduler.try_reserve(
+            m.ConversationOperationKind.RESPONSE
+        )
+        assert operation is not None
+        reserved = view.try_reserve_user_turn(turn_authority, operation)
+        assert reserved.lease is not None
+        # The final queues turn_opened, held on the writer, then user_final_accepted.
+        assert (
+            view.try_admit_user_final(reserved.lease, turn_authority, "synthetic final")
+            is m.AppendDisposition.ADMITTED
+        )
+        assert await asyncio.to_thread(first_record_entered.wait, 5.0)
+        revoke_projection = BrowserEventProjection()
+        revoke = runtime.reserve_browser_revoke(
+            binding_generation=command.binding_generation,
+            request=m.EvidenceRevokeRequestV1(sequence=2),
+            projection_reservation=revoke_projection.reserve_capture_status(),
+            validate_projection_reservation=revoke_projection.validate_capture_status_reservation,
+        )
+        revoke_waiter = asyncio.create_task(runtime.activate_revoke(revoke, timeout_seconds=5.0))
+        hold_first_record.set()
+        admission = runtime._admission
+        writer = runtime._writer
+        assert admission is not None and writer is not None
+        deadline = monotonic() + 5.0
+        while admission.diagnostics().sticky_fault is None:
+            assert monotonic() < deadline
+            await asyncio.sleep(0.005)
+        # The revoke was durably scheduled, but its finalization waited on the
+        # live lease, which the fault then made permanent.
+        assert await asyncio.wait_for(revoke_waiter, 5.0) is (
+            m.RevokeDisposition.REVOKE_DURABLY_SCHEDULED
+        )
+        assert calls[:2] == ["turn_opened", "revoke_request"]
+        assert admission.diagnostics().pending_revoke is True
+        assert admission.diagnostics().active_lease_count == 1
+        terminal_waiter = asyncio.create_task(runtime.wait_revoke_terminal(timeout_seconds=2.0))
+        await asyncio.sleep(0)
+
+        started = monotonic()
+        await runtime.close()
+        assert monotonic() - started < 1.0
+        # The terminal waiter learns the truthful faulted outcome, never success.
+        assert await asyncio.wait_for(terminal_waiter, 1.0) is m.RevokeDisposition.WRITER_FAULT
+        assert "revoke_finalize" not in calls
+        assert calls[-1] == "drain"
+        assert writer.failure is None
+        assert not writer.is_running
+        diagnostics = admission.diagnostics()
+        assert diagnostics.sticky_fault is m.WriterFault.SQLITE_FAULT
+        assert diagnostics.pending_revoke is False
+        assert diagnostics.purge_required is True
+        assert diagnostics.active_lease_count == 0
+    finally:
+        hold_first_record.set()
+        if revoke_waiter is not None and not revoke_waiter.done():
+            revoke_waiter.cancel()
+            await asyncio.gather(revoke_waiter, return_exceptions=True)
+        writer_owner = runtime._writer
+        if writer_owner is not None:
+            await asyncio.to_thread(writer_owner.close, 2.0)

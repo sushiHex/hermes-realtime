@@ -4096,6 +4096,49 @@ def test_expiry_revalidates_its_watermark_and_releases_erased_session_credits() 
     assert rollover_writer.ordered_count == 0
 
 
+@pytest.mark.parametrize("writer_succeeded", (True, False), ids=("healthy", "faulted"))
+def test_only_a_latched_writer_fault_lets_the_drain_retire_a_live_lease(
+    writer_succeeded: bool,
+) -> None:
+    a = _admission()
+    from hermes_realtime.evidence import models as m
+
+    admission, operations, writer, create = _active_admission(a, m, owner_generation=331)
+    authority = _turn_authority(m, "UserTurnAuthorityV1", create, owner_generation=331)
+    operation = operations.try_reserve(m.ConversationOperationKind.RESPONSE)
+    assert operation is not None
+    result = admission.try_reserve_user_turn(authority, operation)
+    assert result.lease is not None
+    assert (
+        admission.try_admit_user_final(result.lease, authority, "synthetic final")
+        is m.AppendDisposition.ADMITTED
+    )
+    for _ in range(2):
+        admission.complete_ordered_item(writer.get_nowait(), writer_succeeded=writer_succeeded)
+    assert admission.diagnostics().active_lease_count == 1
+
+    drain_ticket = admission.request_drain(
+        _owner_drain_authority(m, create, admission, owner_generation=331)
+    )
+    drain_item = writer.get_nowait()
+    assert type(drain_item.payload) is m.DrainAndStopV1
+    if writer_succeeded:
+        # A healthy owner's live lease can still become durable: the drain waits.
+        with pytest.raises(a.ReservationError, match="drain prerequisites"):
+            admission.complete_drain(drain_item, m.DrainDisposition.STOPPED)
+        assert admission.diagnostics().active_lease_count == 1
+        assert not drain_ticket.terminal_event.is_set()
+        return
+    # A faulted owner's lease never can, so the drain retires it and completes.
+    admission.complete_drain(drain_item, m.DrainDisposition.STOPPED)
+    assert drain_ticket.terminal_event.is_set()
+    assert drain_ticket.disposition is m.DrainDisposition.STOPPED
+    diagnostics = admission.diagnostics()
+    assert diagnostics.active_lease_count == 0
+    assert diagnostics.queue_record_count == 0
+    assert diagnostics.sticky_fault is m.WriterFault.SQLITE_FAULT
+
+
 def test_retention_owner_closes_admission_before_terminal_settlement_and_erasure() -> None:
     a = _admission()
     from hermes_realtime.evidence import models as m
