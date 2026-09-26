@@ -41,20 +41,9 @@ security hardening.
 
 ## Architecture
 
-```text
-Browser microphone
-       │
-       ▼
-   LiveKit room ──► conversation worker ──► STT ──► inference
-       ▲                    │                           │
-       │                    └──── state/events ─────────┘
-       │
-       └──────── streaming TTS / interruption control
+![Hermes Realtime architecture. The browser's microphone audio travels through a LiveKit room to the hermes-realtime host, which listens, converses with its own low-latency model, and speaks back through the room. Your speech interrupts playback without cancelling background work. Only speech confirmed delivered enters the conversation's memory. Real work is delegated to a separate Hermes Agent process, whose results and approvals come back as bounded updates.](docs/assets/architecture.svg)
 
-Hermes Agent runs, approvals, tools, and long work remain separately owned.
-```
-
-The realtime coordinator receives compact context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events.
+The realtime host converses with its own low-latency model and hands real work to Hermes Agent, which runs it as a separate process. The conversation model receives compact context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events. See [ADR 0003](docs/adr/0003-hermes-owned-conversation-continuity.md) for how conversation and learning continue in Hermes.
 
 ## Requirements
 
