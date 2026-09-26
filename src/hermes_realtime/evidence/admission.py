@@ -2080,6 +2080,12 @@ class EvidenceAdmissionControllerV1:
             ticket = self._drain_ticket
             if ticket is None:
                 raise ReservationError("drain ticket was lost")
+            if self._sticky_fault is not None:
+                # A latched writer fault is authoritative for what the drain waits
+                # on: no live lease of a faulted owner can ever become durable, so
+                # each one retires unpublished instead of stranding the drain.
+                for live_lease, live_state in tuple(self._leases.items()):
+                    self._retire_lease_locked(live_lease, live_state)
             revoke_incomplete = (
                 self._revoke_ticket is not None and not self._revoke_ticket.terminal_event.is_set()
             )
@@ -3327,6 +3333,17 @@ class EvidenceAdmissionControllerV1:
 
         if not self._session_tainted:
             return False
+        with self._credit_lock:
+            self._retire_lease_locked(lease, state)
+        return True
+
+    def _retire_lease_locked(self, lease: EvidenceTurnLease, state: _LeaseState) -> None:
+        """Release one live lease and its unused credits, publishing nothing.
+
+        The caller holds ``_admission_lock`` then ``_credit_lock``.  The cause
+        lock is a leaf, so freezing it here cannot invert any lock order.
+        """
+
         cause_state = self._cause_states.pop(lease.terminal_cause, None)
         if cause_state is not None:
             # Reports that already retained this state must also fail closed.
@@ -3334,9 +3351,7 @@ class EvidenceAdmissionControllerV1:
                 cause_state.frozen = True
         state.settlement_attempted = True
         self._leases.pop(lease, None)
-        with self._credit_lock:
-            self._release_unused_terminal_credits_locked(state.terminal_reservation)
-        return True
+        self._release_unused_terminal_credits_locked(state.terminal_reservation)
 
     def try_admit_generated(
         self,
