@@ -75,6 +75,7 @@ from .models import (
     ExpiryDisposition,
     ExpiryMode,
     LifecycleDrainAuthorityV1,
+    OwnerState,
     ProjectionReservation,
     PurgeDisposition,
     QueuedEvidenceRecordV1,
@@ -91,8 +92,10 @@ from .models import (
     validate_authority_composition,
 )
 
-_CLOSE_DRAIN_TIMEOUT_SECONDS = 2.0
-_CLOSE_WRITER_TIMEOUT_SECONDS = 2.0
+_CLOSE_STAGE_TIMEOUT_SECONDS = 2.0
+# A close stage or owner observation that outlasts five minutes is a hang on any
+# storage, so a caller may lengthen a bound only up to this ceiling.
+_MAX_OWNER_WAIT_SECONDS = 300.0
 _THREAD_SIGNAL_INITIAL_POLL_SECONDS = 0.001
 _THREAD_SIGNAL_MAX_POLL_SECONDS = 0.05
 _CONSENT_ACTIVATION_OBSERVATION_PREFIX = "[consent-activation] "
@@ -612,6 +615,7 @@ class HostEvidenceRuntimeV1:
         retention_hours: int,
         production_observations: ProductionObservationViewV1 | None = None,
         production_observation_recorder: _ProductionObservationRecorderV1 | None = None,
+        close_timeout_seconds: float = _CLOSE_STAGE_TIMEOUT_SECONDS,
     ) -> None:
         if not isinstance(database, Path):
             raise TypeError("database must be a pathlib Path")
@@ -619,6 +623,11 @@ class HostEvidenceRuntimeV1:
             raise ValueError("owner_generation must be an exact positive 63-bit integer")
         if type(retention_hours) is not int or not 1 <= retention_hours <= 168:
             raise ValueError("retention_hours must be an exact integer from 1 through 168")
+        if (
+            type(close_timeout_seconds) not in (int, float)
+            or not 0 < float(close_timeout_seconds) <= _MAX_OWNER_WAIT_SECONDS
+        ):
+            raise ValueError("close_timeout_seconds must be positive and at most 300")
         if (
             production_observations is not None
             and type(production_observations) is not ProductionObservationViewV1
@@ -639,6 +648,9 @@ class HostEvidenceRuntimeV1:
                 raise ValueError("production observation view and recorder must share one owner")
         assert production_observation_recorder is not None
         self._database = database
+        # Bounds each stage that stops the owned writer: rollover handoff, drain,
+        # and writer join.
+        self._close_timeout_seconds = float(close_timeout_seconds)
         self._qualification_checkpoint_channel = _current_qualification_checkpoint_channel()
         self._qualification_drain_checkpoint_emitted = False
         self._qualification_capacity_probe = _current_qualification_capacity_probe()
@@ -822,7 +834,7 @@ class HostEvidenceRuntimeV1:
         writer = self._writer
         if writer is not None:
             await self._drain_before_writer_stop()
-            stopped = await asyncio.to_thread(writer.close, 2.0)
+            stopped = await asyncio.to_thread(writer.close, self._close_timeout_seconds)
             if not stopped:
                 raise RuntimeError("evidence writer did not stop before close timeout")
             self._writer = None
@@ -2069,26 +2081,43 @@ class HostEvidenceRuntimeV1:
         }.items():
             object.__setattr__(authority, name, value)
         authority._validate()
-        disposition = admission.begin_expiry(authority)
-        if disposition is ExpiryDisposition.ERASURE_DURABLY_SCHEDULED:
-            for _ in range(200):
-                if admission.diagnostics().owner_state.value == "stopped":
-                    self._capture_state = CaptureState.IDLE
-                    self._published = False
-                    break
-                await asyncio.sleep(0.01)
-        return disposition
+        ticket = admission.begin_expiry(authority)
+        disposition = ticket.disposition
+        if disposition is not ExpiryDisposition.ERASURE_DURABLY_SCHEDULED:
+            return disposition
+        terminal_event = ticket.terminal_event
+        if terminal_event is None:
+            raise RuntimeError("a scheduled erasure has no terminal milestone")
+        # Capture state follows this erasure's own terminal outcome, however long
+        # it takes.  The wait has no deadline of its own: close cancels this
+        # owner task and applies its own bounds.
+        await _wait_for_thread_signal(terminal_event, timeout_seconds=None)
+        owner_state = admission.diagnostics().owner_state
+        if owner_state is OwnerState.STOPPED:
+            self._capture_state = CaptureState.IDLE
+            self._published = False
+            return disposition
+        if owner_state is OwnerState.FAULTED:
+            self._capture_state = CaptureState.FAULTED
+            self._published = False
+            return ExpiryDisposition.WRITER_FAULT
+        raise RuntimeError("expiry settled without a terminal owner state")
 
     async def wait_retention_terminal(self, *, timeout_seconds: float) -> ExpiryDisposition:
-        if type(timeout_seconds) not in (int, float) or not 0 < float(timeout_seconds) <= 2:
-            raise ValueError("timeout_seconds must be positive and at most two")
+        """Observe the retention owner's outcome; a timeout raises ``TimeoutError``.
+
+        A timeout is its own outcome and never masquerades as a writer fault.
+        """
+
+        if (
+            type(timeout_seconds) not in (int, float)
+            or not 0 < float(timeout_seconds) <= _MAX_OWNER_WAIT_SECONDS
+        ):
+            raise ValueError("timeout_seconds must be positive and at most 300")
         task = self._retention_task
         if task is None:
             raise RuntimeError("retention owner is not running")
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), float(timeout_seconds))
-        except TimeoutError:
-            return ExpiryDisposition.WRITER_FAULT
+        return await asyncio.wait_for(asyncio.shield(task), float(timeout_seconds))
 
     async def close(self) -> None:
         async with self._state_lock:
@@ -2100,7 +2129,7 @@ class HostEvidenceRuntimeV1:
                 rollover_handoffs = tuple(self._rollover_handoffs)
         if rollover_handoffs:
             try:
-                async with asyncio.timeout(_CLOSE_DRAIN_TIMEOUT_SECONDS):
+                async with asyncio.timeout(self._close_timeout_seconds):
                     await asyncio.shield(
                         asyncio.gather(
                             *(asyncio.wrap_future(handoff) for handoff in rollover_handoffs),
@@ -2139,7 +2168,7 @@ class HostEvidenceRuntimeV1:
         if active_rollover is not None:
             settled = await _wait_for_thread_signal(
                 active_rollover[0].ticket.event,
-                timeout_seconds=_CLOSE_DRAIN_TIMEOUT_SECONDS,
+                timeout_seconds=self._close_timeout_seconds,
             )
             if not settled:
                 raise RuntimeError("capacity rollover did not settle before close timeout")
@@ -2297,7 +2326,9 @@ class HostEvidenceRuntimeV1:
             else:
                 self._observe_close_stage(CloseStageV1.WRITER_DRAIN, CloseResultV1.SUCCEEDED)
                 try:
-                    stopped = await asyncio.to_thread(writer.close, _CLOSE_WRITER_TIMEOUT_SECONDS)
+                    stopped = await asyncio.to_thread(
+                        writer.close, self._close_timeout_seconds
+                    )
                 except BaseException as error:
                     errors.append(error)
                     self._observe_close_stage(
@@ -2541,7 +2572,7 @@ class HostEvidenceRuntimeV1:
                 self._close_drain_ticket = ticket
         terminal = await _wait_for_thread_signal(
             ticket.terminal_event,
-            timeout_seconds=_CLOSE_DRAIN_TIMEOUT_SECONDS,
+            timeout_seconds=self._close_timeout_seconds,
         )
         if not terminal:
             raise RuntimeError("evidence drain did not stop before close timeout")
