@@ -1485,6 +1485,42 @@ async def test_host_evidence_close_retains_owned_drain_after_writer_join_failure
     assert runtime._closed is True
 
 
+# Bounds a hung real SQLite daemon, not latency.  These tests assert correctness
+# through the real daemon on runner disks they do not control: a healthy run
+# finishes each step in milliseconds, yet hosted Windows runners have stalled a
+# single first file open for more than 3.5 s (#73, #13).  Sixty seconds is an
+# order of magnitude past that, so expiry means the daemon stopped making
+# progress.  The product's two-second consent control bound stays in force and
+# is still passed; its timeout is settled through the runtime's retained
+# settlement, and the bound itself is covered deterministically by
+# test_consent_control_timeout_names_its_reached_durability_milestone.
+_REAL_DAEMON_HANG_BOUND_SECONDS = 60.0
+
+
+async def _activate_real_consent(runtime, authority, *, binding_is_current):  # type: ignore[no-untyped-def]
+    """Activate through the real daemon under the product's two-second bound.
+
+    A control timeout is a lawful product outcome: the runtime keeps owning the
+    in-flight create, so the durable result is its retained settlement.
+    """
+
+    from hermes_realtime.evidence import models as m
+
+    disposition = await runtime.activate_consent(
+        authority,
+        transport=runtime.create_sqlite_transport(),
+        binding_is_current=binding_is_current,
+        timeout_seconds=2.0,
+    )
+    if disposition is m.ConsentDisposition.CONTROL_TIMED_OUT:
+        settlement = runtime.claim_consent_settlement_task(authority)
+        disposition = await asyncio.wait_for(
+            asyncio.shield(settlement),
+            _REAL_DAEMON_HANG_BOUND_SECONDS,
+        )
+    return disposition
+
+
 _SQLITE_CONSENT_OPEN_PHASES = (
     "root_validation",
     "root_occupancy",
@@ -1696,6 +1732,7 @@ async def test_host_evidence_runtime_activates_consent_through_real_sqlite_daemo
         database=database,
         owner_generation=17,
         retention_hours=24,
+        close_timeout_seconds=_REAL_DAEMON_HANG_BOUND_SECONDS,
     )
     try:
         request = m.parse_evidence_consent_request(
@@ -1714,11 +1751,10 @@ async def test_host_evidence_runtime_activates_consent_through_real_sqlite_daemo
             typed_available=True,
         )
 
-        disposition = await runtime.activate_consent(
+        disposition = await _activate_real_consent(
+            runtime,
             authority,
-            transport=runtime.create_sqlite_transport(),
             binding_is_current=lambda command: command.binding_generation == 3,
-            timeout_seconds=2.0,
         )
 
         assert disposition is m.ConsentDisposition.CONSENT_ACTIVATED
@@ -1733,7 +1769,10 @@ async def test_host_evidence_runtime_activates_consent_through_real_sqlite_daemo
             projection_reservation=revoke_projection.reserve_capture_status(),
             validate_projection_reservation=revoke_projection.validate_capture_status_reservation,
         )
-        revoke_disposition = await runtime.activate_revoke(revoke, timeout_seconds=2.0)
+        revoke_disposition = await runtime.activate_revoke(
+            revoke,
+            timeout_seconds=_REAL_DAEMON_HANG_BOUND_SECONDS,
+        )
         assert revoke_disposition in {
             m.RevokeDisposition.REVOKE_DURABLY_SCHEDULED,
             m.RevokeDisposition.PURGE_COMPLETED,
@@ -1752,7 +1791,10 @@ async def test_host_evidence_runtime_activates_consent_through_real_sqlite_daemo
         )
         ticket = runtime._pending_revoke_ticket
         assert ticket is not None
-        await asyncio.wait_for(terminal_published.wait(), timeout=2.0)
+        await asyncio.wait_for(
+            terminal_published.wait(),
+            timeout=_REAL_DAEMON_HANG_BOUND_SECONDS,
+        )
         assert terminal == [m.RevokeDisposition.PURGE_COMPLETED], (
             ticket.disposition if ticket is not None else None,
             ticket.durability_event.is_set() if ticket is not None else None,
@@ -1875,6 +1917,7 @@ async def test_host_retention_owner_cancels_then_expires_real_sqlite_session(
         database=database,
         owner_generation=19,
         retention_hours=24,
+        close_timeout_seconds=_REAL_DAEMON_HANG_BOUND_SECONDS,
     )
     try:
         cancelled: list[str] = []
@@ -1906,16 +1949,15 @@ async def test_host_retention_owner_cancels_then_expires_real_sqlite_session(
             microphone_available=True,
             typed_available=True,
         )
-        assert await runtime.activate_consent(
+        assert await _activate_real_consent(
+            runtime,
             authority,
-            transport=runtime.create_sqlite_transport(),
             binding_is_current=lambda _command: True,
-            timeout_seconds=2.0,
         ) is m.ConsentDisposition.CONSENT_ACTIVATED
 
-        assert await runtime.wait_retention_terminal(timeout_seconds=2.0) is (
-            m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
-        )
+        assert await runtime.wait_retention_terminal(
+            timeout_seconds=_REAL_DAEMON_HANG_BOUND_SECONDS,
+        ) is m.ExpiryDisposition.ERASURE_DURABLY_SCHEDULED
         assert cancelled == ["retention_expired"]
         assert runtime.capture_status(disclosure_digest="a" * 64).capture_state is (
             m.CaptureState.IDLE
@@ -1933,7 +1975,7 @@ async def test_host_retention_owner_cancels_then_expires_real_sqlite_session(
     ],
     ids=["consent", "retention"],
 )
-@pytest.mark.parametrize("failure", ["timeout_disposition", "exception", "pending_timeout"])
+@pytest.mark.parametrize("failure", ["failed_disposition", "exception", "pending_timeout"])
 async def test_consent_scenarios_close_their_real_writer_after_activation_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, scenario, failure: str,
 ) -> None:
@@ -1969,12 +2011,18 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
             result = await original(runtime, *args, **kwargs)
         finally:
             release.set()
-        expected_result = (
-            m.ConsentDisposition.CONTROL_TIMED_OUT if failure == "pending_timeout"
-            else m.ConsentDisposition.CONSENT_ACTIVATED
-        )
-        assert result is expected_result
-        assert failure != "pending_timeout" or entered.is_set()
+        if failure == "pending_timeout":
+            assert result is m.ConsentDisposition.CONTROL_TIMED_OUT
+            assert entered.is_set()
+        else:
+            if result is m.ConsentDisposition.CONTROL_TIMED_OUT:
+                # A slow runner disk may reach the real bound; the runtime's
+                # retained settlement still owns the in-flight create.
+                result = await asyncio.wait_for(
+                    asyncio.shield(runtime.claim_consent_settlement_task(args[0])),
+                    _REAL_DAEMON_HANG_BOUND_SECONDS,
+                )
+            assert result is m.ConsentDisposition.CONSENT_ACTIVATED
         assert runtime._writer is not None and runtime._transport is not None
         owned_threads.update((runtime._writer._thread, runtime._transport._thread))
         assert runtime.writer_running and len(owned_threads) == 2
@@ -1982,13 +2030,22 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
         injected = True
         if failure == "exception":
             raise InjectedActivationFailure("synthetic activation failure after writer startup")
-        return m.ConsentDisposition.CONTROL_TIMED_OUT
+        if failure == "failed_disposition":
+            return m.ConsentDisposition.CREATE_FAILED
+        return result
 
     monkeypatch.setattr(HostEvidenceRuntimeV1, "activate_consent", activate)
-    expected = InjectedActivationFailure if failure == "exception" else AssertionError
     try:
-        with pytest.raises(expected):
+        if failure == "pending_timeout":
+            # A real control timeout is not a failure: the scenario claims the
+            # runtime's retained settlement, completes, and still closes.
             await scenario(tmp_path)
+        elif failure == "exception":
+            with pytest.raises(InjectedActivationFailure):
+                await scenario(tmp_path)
+        else:
+            with pytest.raises(AssertionError):
+                await scenario(tmp_path)
         assert injected and len(runtimes) == 1
         assert runtimes[0]._closed
         assert not runtimes[0].writer_running
@@ -2010,30 +2067,34 @@ async def test_consent_scenarios_close_their_real_writer_after_activation_failur
                 _expected_fresh_sqlite_open_phase_counts()
             )
             assert observation["store"] == "committed"
-            assert observation["activation"] == (
-                None if failure == "exception" else "control_timed_out"
-            )
+            assert observation["activation"] == {
+                "exception": None,
+                "failed_disposition": "create_failed",
+                "pending_timeout": "control_timed_out",
+            }[failure]
             assert "synthetic activation failure" not in lines[0]
             assert str(tmp_path) not in lines[0]
-            # Only the held create reaches the real control bound, so only that
-            # case may name a milestone it never reached.
+            # The held create always reaches the real control bound without a
+            # durable milestone.  Other cases reach it only on a slow disk, and
+            # then report the same content-free observation.
             timeout_lines = [
                 line
                 for line in output.splitlines()
                 if line.startswith("[consent-activation] ")
             ]
-            if failure == "pending_timeout":
-                assert len(timeout_lines) == 1
-                timed_out = json.loads(
-                    timeout_lines[0].removeprefix("[consent-activation] ")
-                )
+            assert len(timeout_lines) == 1 if failure == "pending_timeout" else (
+                len(timeout_lines) <= 1
+            )
+            for timeout_line in timeout_lines:
+                timed_out = json.loads(timeout_line.removeprefix("[consent-activation] "))
                 assert timed_out["version"] == 1
                 assert timed_out["operation"] == "consent"
                 assert timed_out["bound_seconds"] == 2.0
+                assert set(timed_out["offset_ms"]) == {"create_durable"}
+                assert str(tmp_path) not in timeout_line
+            if failure == "pending_timeout":
+                timed_out = json.loads(timeout_lines[0].removeprefix("[consent-activation] "))
                 assert timed_out["offset_ms"] == {"create_durable": None}
-                assert str(tmp_path) not in timeout_lines[0]
-            else:
-                assert timeout_lines == []
     finally:
         # A RED regression must not itself contaminate the remaining test process.
         for runtime in runtimes:
@@ -2360,10 +2421,9 @@ async def test_sqlite_consent_observer_locates_an_injected_root_validation_delay
     monkeypatch.setattr(SQLiteEvidenceSpool, "_ensure_root", delayed_ensure_root)
     releaser = asyncio.create_task(release_after_control_timeout())
     try:
-        with pytest.raises(AssertionError):
-            await test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(
-                tmp_path
-            )
+        # A store step that outlives the two-second control bound times out the
+        # control and is still settled to a correct activation, revoke and close.
+        await test_host_evidence_runtime_activates_consent_through_real_sqlite_daemon(tmp_path)
     finally:
         release.set()
         await releaser

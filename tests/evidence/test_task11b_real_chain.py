@@ -77,6 +77,9 @@ def _create_epoch():  # type: ignore[no-untyped-def]
     )
 
 
+# Bounds a hung real SQLite daemon, not latency: hosted Windows runners have
+# stalled one first file open for more than 3.5 s (#73, #13), and a healthy step
+# takes milliseconds.  The product two-second control bound is still passed.
 _REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS = 30.0
 
 
@@ -740,7 +743,12 @@ async def test_conflicting_real_terminal_owners_cannot_split_rollover_lineage(
         validate_projection_reservation=projection.validate_capture_status_reservation,
     )
 
-    revoke = asyncio.create_task(runtime.activate_revoke(revoke_authority, timeout_seconds=2.0))
+    revoke = asyncio.create_task(
+        runtime.activate_revoke(
+            revoke_authority,
+            timeout_seconds=_REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS,
+        )
+    )
     lifecycle_retirement = asyncio.create_task(
         runtime.invalidate_active_binding(m.BindingCloseReason.CLIENT_CLOSED)
     )
@@ -1449,12 +1457,18 @@ def _crash_child_source(database: Path, marker: Path, release: Path, *, after_co
                     owner_generation=41,
                 )
             )
-            assert await runtime.activate_consent(
+            disposition = await runtime.activate_consent(
                 authority,
                 transport=transport,
                 binding_is_current=lambda candidate: candidate is command,
                 timeout_seconds=2.0,
-            ) is m.ConsentDisposition.CONSENT_ACTIVATED
+            )
+            if disposition is m.ConsentDisposition.CONTROL_TIMED_OUT:
+                disposition = await asyncio.wait_for(
+                    asyncio.shield(runtime.claim_consent_settlement_task(authority)),
+                    {_REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS!r},
+                )
+            assert disposition is m.ConsentDisposition.CONSENT_ACTIVATED
             settle(runtime)
             settle(runtime)
             while True: await asyncio.sleep(1)
@@ -1487,7 +1501,8 @@ def test_process_crash_rollover_is_purged_before_fresh_availability(
         cwd=Path.cwd(),
     )
     try:
-        deadline = time.monotonic() + 15.0
+        # The child may settle a timed-out activation for the full hang bound.
+        deadline = time.monotonic() + 15.0 + _REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS
         while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         assert marker.exists(), f"child exited before checkpoint: {child.poll()}"

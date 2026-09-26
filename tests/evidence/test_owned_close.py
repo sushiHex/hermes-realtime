@@ -8,7 +8,11 @@ import threading
 from pathlib import Path
 
 import pytest
-from test_task11b_real_chain import _activate, _create_epoch
+from test_task11b_real_chain import (
+    _REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS,
+    _activate,
+    _create_epoch,
+)
 
 from hermes_realtime.evidence import models as m
 from hermes_realtime.evidence.runtime import HostEvidenceRuntimeV1
@@ -126,9 +130,10 @@ def test_public_close_observes_completed_real_consent_from_a_stopped_loop(tmp_pa
             ) is m.ConsentDisposition.CONTROL_TIMED_OUT
             settlement = runtime.claim_consent_settlement_task(authority)
             release.set()
-            assert await asyncio.wait_for(asyncio.shield(settlement), 5) is (
-                m.ConsentDisposition.CONSENT_ACTIVATED
-            )
+            assert await asyncio.wait_for(
+                asyncio.shield(settlement),
+                _REAL_SQLITE_ACTIVATION_SETTLEMENT_TIMEOUT_SECONDS,
+            ) is m.ConsentDisposition.CONSENT_ACTIVATED
             assert settlement.done() and settlement.get_loop() is owner
         finally:
             release.set()
