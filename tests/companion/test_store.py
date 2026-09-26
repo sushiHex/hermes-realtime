@@ -206,9 +206,9 @@ def test_the_store_commits_durably(store: CompanionStore) -> None:
     assert store.pragma("journal_mode") == "delete"
 
 
-@pytest.mark.parametrize("version", [1, 99])
+@pytest.mark.parametrize("version", [1, 2, 99])
 def test_a_store_of_another_schema_version_is_refused(tmp_path: Path, version: int) -> None:
-    # Version 1 is the draft schema without the tied CHECK constraints.
+    # Version 1 lacks the tied CHECK constraints; version 2 cannot record "count".
     path = tmp_path / "companion.db"
     with contextlib.closing(sqlite3.connect(path)) as raw:
         raw.execute(f"PRAGMA user_version = {version}")

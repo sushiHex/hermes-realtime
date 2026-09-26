@@ -23,6 +23,8 @@ Criteria, from the consensus design:
   and at restart readiness; zero physical foreign compactions is not claimed;
 - lineage: a branch or import child naming the archive as its parent, which leaves the
   chain untouched, is refused as ``lineage`` live and at restart, and quarantined;
+- count: a foreign UPDATE of ``sessions.message_count`` alone, which Hermes keeps equal to
+  the active rows, is refused as ``count`` live and at restart, and quarantined;
 - 12 (compatibility): every surface name and signature matches the pin, and the private
   operation stores byte-identical rows to Hermes's own ``append_messages_batch``, with an
   identical fingerprint.
@@ -70,8 +72,14 @@ _FOREIGN_KINDS = (
     "rotation",
     "replace_archived",
     "lineage",
+    "count",
 )
-_FOREIGN_CATEGORY = {"delete": "missing", "rotation": "rotated", "lineage": "lineage"}
+_FOREIGN_CATEGORY = {
+    "delete": "missing",
+    "rotation": "rotated",
+    "lineage": "lineage",
+    "count": "count",
+}
 _CRASH_POINTS = ("before_pending", "after_pending", "in_state", "after_state", "after_promote")
 _ENVIRONMENT = (
     "PATH",
@@ -191,6 +199,16 @@ _EXPECTED: dict[str, list[dict[str, object]]] = {
         ),
         _reopened("lineage"),
     ],
+    # The counter goes stale while the companion is down: restart readiness refuses it.
+    "count_at_restart": [
+        _step({"inserted": 4}, []),
+        _step({"mutated": 1}, []),
+        _step(
+            {"archive": "not_ready", "mutations": 0, "open": "count", "quarantine": "count"},
+            ["archive:not_ready", "open:count"],
+        ),
+        _reopened("count"),
+    ],
     "crash_before_pending": _crash("before_pending", 0, "none", 4),
     "crash_after_pending": _crash("after_pending", 1, "cleared", 4),
     "crash_in_state": _crash("in_state", 1, "cleared", 4),
@@ -273,6 +291,7 @@ _PLAN: dict[str, list[tuple[str, ...]]] = {
     **{f"foreign_{kind}": [("foreign", kind), ("reopen",)] for kind in _FOREIGN_KINDS},
     "compaction_at_restart": [("seed",), ("mutate", "compaction"), ("reopen",), ("reopen",)],
     "lineage_at_restart": [("seed",), ("mutate", "lineage"), ("reopen",), ("reopen",)],
+    "count_at_restart": [("seed",), ("mutate", "count"), ("reopen",), ("reopen",)],
     **{f"crash_{point}": [("crash", point), ("recover",)] for point in _CRASH_POINTS},
     "crash_ambiguous": [("crash", "after_pending"), ("mutate", "unleased_append"), ("reopen",)],
     "creation_occupied": [("occupied",)],
@@ -535,6 +554,14 @@ def _mutate(worker: _Worker, kind: str) -> None:
         # Soft-archives every row and re-inserts identical copies: the live rows alone are
         # unchanged, so only a projection that includes inactive rows can see it.
         db.replace_messages(session_id, db.get_messages(session_id), archive_dropped=True)
+    elif kind == "count":
+        # A foreign UPDATE of the session counter alone; every row stays as archived.
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                (session_id,),
+            )
+        )
     elif kind == "lineage":
         # A branch or import child naming the archive as its parent. Hermes changes nothing
         # in the archive itself, so only the lineage check can see it.

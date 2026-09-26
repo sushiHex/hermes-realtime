@@ -71,7 +71,13 @@ def _projection(rows: tuple[VoiceRow, ...], header: Header = EXPECTED_HEADER) ->
         values,
         MAX_ARCHIVE_ROWS,
         has_children=False,
+        message_count=_active(values),
     )
+
+
+def _active(values: list[dict[str, object]]) -> int:
+    """Hermes's message_count: the session's active rows."""
+    return sum(1 for row in values if row["active"] == 1)
 
 
 # --- canonical serialization ---------------------------------------------------------------
@@ -192,9 +198,14 @@ def test_any_column_change_in_any_row_changes_the_fingerprint(column: str, value
     values = [expected_row_values(_CONVERSATION, row) for row in rows]
     header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
               "end_reason": None}
-    baseline = project(header, values, MAX_ARCHIVE_ROWS, has_children=False).fingerprint()
+    baseline = project(
+        header, values, MAX_ARCHIVE_ROWS, has_children=False, message_count=4
+    ).fingerprint()
     values[3] = values[3] | {column: value}
-    assert project(header, values, MAX_ARCHIVE_ROWS, has_children=False).fingerprint() != baseline
+    changed = project(
+        header, values, MAX_ARCHIVE_ROWS, has_children=False, message_count=_active(values)
+    )
+    assert changed.fingerprint() != baseline
 
 
 def test_fingerprints_are_exact_and_bounded() -> None:
@@ -218,10 +229,36 @@ def test_a_projection_over_the_cap_is_refused_never_truncated() -> None:
     values = [expected_row_values(_CONVERSATION, row) for row in rows]
     header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
               "end_reason": None}
-    assert len(project(header, values, 5, has_children=False).rows) == 5
+    assert len(project(header, values, 5, has_children=False, message_count=5).rows) == 5
     with pytest.raises(ArchiveRefusal) as refusal:
-        project(header, values, 4, has_children=False)
+        project(header, values, 4, has_children=False, message_count=5)
     assert refusal.value.category == "over_cap"
+
+
+def test_a_stale_message_count_is_a_count_refusal() -> None:
+    values = [expected_row_values(_CONVERSATION, row) for row in _batch(0, 3)]
+    header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
+              "end_reason": None}
+    assert len(project(header, values, MAX_ARCHIVE_ROWS, has_children=False,
+                       message_count=3).rows) == 3
+    for stale in (2, 4, None, "3", 3.0):
+        with pytest.raises(ArchiveRefusal) as refusal:
+            project(header, values, MAX_ARCHIVE_ROWS, has_children=False,
+                    message_count=stale)  # type: ignore[arg-type]
+        assert refusal.value.category == "count"
+
+
+def test_the_message_count_counts_active_rows_only() -> None:
+    # Hermes keeps message_count at the active count (appends, replace, compaction, rewind).
+    values = [expected_row_values(_CONVERSATION, row) for row in _batch(0, 3)]
+    values[0] = values[0] | {"active": 0}
+    header = {"parent_session_id": None, "source": VOICE_SOURCE, "ended_at": None,
+              "end_reason": None}
+    assert len(project(header, values, MAX_ARCHIVE_ROWS, has_children=False,
+                       message_count=2).rows) == 3
+    with pytest.raises(ArchiveRefusal) as refusal:
+        project(header, values, MAX_ARCHIVE_ROWS, has_children=False, message_count=3)
+    assert refusal.value.category == "count"
 
 
 def test_a_session_that_has_become_a_parent_is_a_lineage_refusal() -> None:
@@ -230,13 +267,14 @@ def test_a_session_that_has_become_a_parent_is_a_lineage_refusal() -> None:
               "end_reason": None}
     # A child leaves the archive's own rows and header untouched: the chain cannot see it.
     with pytest.raises(ArchiveRefusal) as refusal:
-        project(header, values, MAX_ARCHIVE_ROWS, has_children=True)
+        project(header, values, MAX_ARCHIVE_ROWS, has_children=True, message_count=2)
     assert refusal.value.category == "lineage"
     with pytest.raises(ArchiveRefusal) as refusal:
-        project(header, [], MAX_ARCHIVE_ROWS, has_children=True)
+        project(header, [], MAX_ARCHIVE_ROWS, has_children=True, message_count=0)
     assert refusal.value.category == "lineage"
     with pytest.raises(TypeError):
-        project(header, values, MAX_ARCHIVE_ROWS, has_children=0)  # type: ignore[arg-type]
+        project(header, values, MAX_ARCHIVE_ROWS, has_children=0,  # type: ignore[arg-type]
+                message_count=2)
 
 
 def test_a_projection_keeps_each_rows_platform_message_id() -> None:

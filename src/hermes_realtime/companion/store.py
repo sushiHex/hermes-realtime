@@ -25,14 +25,15 @@ from hermes_realtime.companion.integrity import (
     validate_conversation_id,
 )
 
-# Version 1 was a draft without the tied progress and quarantine constraints.
-_SCHEMA_VERSION = 2
+# Version 1 was a draft without the tied progress and quarantine constraints; version 2
+# could not record a "count" quarantine.
+_SCHEMA_VERSION = 3
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
 # Categories a durable quarantine may record: the archive no longer matches its evidence.
 QUARANTINE_CATEGORIES = frozenset(
-    {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage"}
+    {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage", "count"}
 )
 
 def _progress_checks(prefix: str) -> str:

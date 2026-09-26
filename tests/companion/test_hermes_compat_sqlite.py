@@ -190,6 +190,37 @@ async def test_a_lost_lease_and_a_child_session_are_refused(
 
 
 @pytest.mark.asyncio
+async def test_a_stale_message_count_is_quarantined_before_any_write(
+    store: CompanionStore, hermes: Any, tmp_path: Path
+) -> None:
+    archive = await _open(store, hermes)
+    try:
+        await archive.archive(_CONVERSATION, _batch(0, 2))
+        record = store.read(_CONVERSATION)
+        assert record is not None
+        # A foreign UPDATE of the counter alone: every row stays exactly as archived.
+        hermes._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+            (record.session_id,),
+        ))
+        before = _raw(tmp_path, "SELECT * FROM messages ORDER BY id")
+        with pytest.raises(ArchiveRefusal) as refusal:
+            await archive.archive(_CONVERSATION, _batch(2, 4))
+        assert refusal.value.category == "count"
+        assert _raw(tmp_path, "SELECT * FROM messages ORDER BY id") == before
+        assert _raw(tmp_path, "SELECT message_count FROM sessions WHERE id = ?",
+                    record.session_id) == [(3,)]
+    finally:
+        await archive.close()
+    record = store.read(_CONVERSATION)
+    assert record is not None and record.quarantine == "count"
+    reopened = VoiceArchive(store, HermesArchivePort(hermes))
+    with pytest.raises(ArchiveRefusal) as refusal:
+        await reopened.open(_CONVERSATION)
+    assert refusal.value.category == "quarantined"
+
+
+@pytest.mark.asyncio
 async def test_a_hermes_below_full_synchronous_is_not_made_ready(
     store: CompanionStore, hermes: Any
 ) -> None:

@@ -44,6 +44,8 @@ class FakeHermes:
         self.rows: dict[str, list[dict[str, object]]] = {}
         # Sessions some other session names as its parent_session_id.
         self.parents: set[str] = set()
+        # A stored message_count that differs from the active rows (a foreign UPDATE).
+        self.counts: dict[str, int] = {}
         self.lease: dict[str, str] = {}
         self.calls: list[str] = []
         self.refresh_result: bool | Exception = True
@@ -115,6 +117,10 @@ class FakeHermes:
             self.rows[session_id][: cap + 1],
             cap,
             has_children=session_id in self.parents,
+            message_count=self.counts.get(
+                session_id,
+                sum(1 for row in self.rows[session_id] if row["active"] == 1),
+            ),
         )
 
     def read_projection(self, session_id: str, cap: int) -> Projection | None:
@@ -575,6 +581,12 @@ def _branch(hermes: FakeHermes) -> None:
     hermes.parents.add(hermes.only())
 
 
+def _stale_count(hermes: FakeHermes) -> None:
+    """A foreign UPDATE of message_count; every row is unchanged."""
+    session = hermes.only()
+    hermes.counts[session] = len(hermes.rows[session]) + 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tamper", "category"),
@@ -585,8 +597,9 @@ def _branch(hermes: FakeHermes) -> None:
         (_delete, "missing"),
         (_rotate, "rotated"),
         (_branch, "lineage"),
+        (_stale_count, "count"),
     ],
-    ids=["content", "order", "append", "delete", "rotate", "lineage"],
+    ids=["content", "order", "append", "delete", "rotate", "lineage", "count"],
 )
 async def test_a_foreign_mutation_is_quarantined_durably_before_the_refusal(
     store: CompanionStore,
@@ -762,8 +775,9 @@ async def test_recovery_quarantines_an_archive_matching_neither(store: Companion
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tamper", "category"),
-    [(_tamper_content, "mismatch"), (_delete, "missing"), (_branch, "lineage")],
-    ids=["content", "delete", "lineage"],
+    [(_tamper_content, "mismatch"), (_delete, "missing"), (_branch, "lineage"),
+     (_stale_count, "count")],
+    ids=["content", "delete", "lineage", "count"],
 )
 async def test_startup_verifies_against_committed_and_never_recreates(
     store: CompanionStore, tamper: Callable[[FakeHermes], None], category: str

@@ -73,6 +73,7 @@ REFUSAL_CATEGORIES = frozenset(
         "over_cap",
         "rotated",
         "lineage",
+        "count",
         "recovery",
         # Hermes did something other than what the compatibility surface qualified.
         "drift",
@@ -377,6 +378,7 @@ def project(
     cap: int,
     *,
     has_children: bool,
+    message_count: int,
 ) -> Projection:
     """Build a projection from a bounded read of at most ``cap + 1`` rows.
 
@@ -387,6 +389,11 @@ def project(
     (a branch, an import, a rotation child). The archive never has lineage, and a child
     leaves the archive's own rows and header untouched, so the chain cannot see one: it is
     refused here, in the same read, as ``lineage``.
+
+    ``message_count`` is the session's stored counter, which Hermes keeps equal to its active
+    rows (appends add each active row; replacement, compaction and rewind recount the active
+    set). It is not hashed, so a foreign change to it alone is refused here as ``count``;
+    left alone, the next append would increment a stale value.
     """
 
     if type(has_children) is not bool:
@@ -395,6 +402,9 @@ def project(
         raise ArchiveRefusal("lineage")
     if len(row_values) > cap:
         raise ArchiveRefusal("over_cap")
+    active = sum(1 for values in row_values if values["active"] == 1)
+    if type(message_count) is not int or message_count != active:
+        raise ArchiveRefusal("count")
     return Projection(
         header=Header.from_values(header_values),
         rows=tuple(

@@ -47,8 +47,10 @@ def test_the_criteria_are_all_planned() -> None:
             "lease_raise", "lease_stolen", "cap", "creation_occupied"} <= set(plan)
     assert set(_SCRIPT._FOREIGN_KINDS) == {
         "compaction", "replace_content", "replace_reorder", "display_flag", "unleased_append",
-        "delete", "rotation", "replace_archived", "lineage",
+        "delete", "rotation", "replace_archived", "lineage", "count",
     }
+    assert _SCRIPT._FOREIGN_CATEGORY["count"] == "count"
+    assert "count_at_restart" in plan
     assert {"compaction_at_restart", "lineage_at_restart", "noop_replace",
             "holder_same_process", "durability_normal"} <= set(plan)
     assert _SCRIPT._FOREIGN_CATEGORY["lineage"] == "lineage"

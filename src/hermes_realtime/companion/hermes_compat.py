@@ -108,6 +108,8 @@ _ROW_SQL = (
 _HEADER_SQL = f"SELECT {', '.join(HEADER_COLUMNS)} FROM sessions WHERE id = ?"
 # Lineage: any session, of any source, naming the archive as its parent.
 _CHILD_SQL = "SELECT 1 FROM sessions WHERE parent_session_id = ? LIMIT 1"
+# The counter Hermes keeps equal to the active rows; checked against the rows just read.
+_COUNT_SQL = "SELECT message_count FROM sessions WHERE id = ?"
 
 
 class CompatError(LookupError):
@@ -196,11 +198,13 @@ def _read_projection(conn: Any, session_id: str, cap: int) -> Projection | None:
     # At most cap + 1 rows, inactive and compacted included, in Hermes's own read order.
     rows = conn.execute(_ROW_SQL, (session_id, cap + 1)).fetchall()
     child = conn.execute(_CHILD_SQL, (session_id,)).fetchone()
+    (message_count,) = conn.execute(_COUNT_SQL, (session_id,)).fetchone()
     return project(
         dict(zip(HEADER_COLUMNS, tuple(header), strict=True)),
         [dict(zip(MESSAGE_COLUMNS, tuple(row), strict=True)) for row in rows],
         cap,
         has_children=child is not None,
+        message_count=message_count,
     )
 
 
