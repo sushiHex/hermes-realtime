@@ -724,13 +724,18 @@ def create_store_database(
     *,
     factory: type[sqlite3.Connection] = sqlite3.Connection,
 ) -> sqlite3.Connection:
-    """Create the V1 store at ``path`` and return its single owning connection."""
+    """Create the V1 store at ``path`` and return its single owning connection.
+
+    Schema, identity, and version commit as one transaction. ``BEGIN`` opens
+    inside the script because ``executescript`` first COMMITs any transaction
+    already open, which would make every DDL statement its own durable commit
+    inside the consent-activation bound.
+    """
 
     connection = sqlite3.connect(path, isolation_level=None, factory=factory)
     try:
         _apply_required_pragmas(connection)
-        connection.execute("BEGIN IMMEDIATE")
-        connection.executescript(SCHEMA_DDL_V1)
+        connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_DDL_V1)
         connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version={USER_VERSION}")
         connection.commit()
