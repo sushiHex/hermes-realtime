@@ -211,6 +211,15 @@ _ACCEPTANCE_BOUND_SECONDS = 30.0
 _INGRESS_EVENT_FETCH_TIMEOUT_SECONDS = 1.0
 
 
+def _print_ingress_observation(observation: dict[str, object]) -> None:
+    """Emit one bounded, content-free ingress marker line."""
+
+    print(
+        _INGRESS_OBSERVATION_PREFIX + json.dumps({**observation, "version": 2}, sort_keys=True),
+        flush=True,
+    )
+
+
 def _evidence_observation(database: Path) -> dict[str, object]:
     """Summarise what the writer has durably accepted, without any of its content.
 
@@ -448,6 +457,7 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
         # shared lock that the sole writer's commit cannot wait for (busy_timeout
         # 0), which latches a sqlite_fault, so observe the microphone turn on the
         # public event stream instead.
+        microphone_turn_completed = False
         try:
             await _wait_event(
                 port=port,
@@ -459,13 +469,27 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
             )
             microphone_turn_completed = True
         except TimeoutError:
-            microphone_turn_completed = False
-        event_observation = await _best_effort_ingress_event_observation(
-            port=port,
-            origin=origin,
-            token=token,
-            after=event_cursor,
-        )
+            pass
+        finally:
+            # Record what is known at the guard now, so a later cleanup failure
+            # cannot lose it.
+            _print_ingress_observation(
+                {
+                    "phase": "wait",
+                    "bound_seconds": _ACCEPTANCE_BOUND_SECONDS,
+                    "microphone_turn_completed": microphone_turn_completed,
+                    "public_event_window": await _best_effort_ingress_event_observation(
+                        port=port,
+                        origin=origin,
+                        token=token,
+                        after=event_cursor,
+                    ),
+                    "transcriber": {
+                        "finals_returned": transcriber.finals_returned,
+                        "finish_calls": transcriber.finish_calls,
+                    },
+                }
+            )
     finally:
         await room.disconnect()
         if running is not None:
@@ -474,22 +498,7 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
     # Close drained every admitted record and released the store; only now may the
     # test read it to prove both finals durable.
     observation = _evidence_observation(database)
-    print(
-        _INGRESS_OBSERVATION_PREFIX
-        + json.dumps(
-            {
-                **observation,
-                "bound_seconds": _ACCEPTANCE_BOUND_SECONDS,
-                "microphone_turn_completed": microphone_turn_completed,
-                "public_event_window": event_observation,
-                "transcriber": {
-                    "finals_returned": transcriber.finals_returned,
-                    "finish_calls": transcriber.finish_calls,
-                },
-            },
-            sort_keys=True,
-        )
-    )
+    _print_ingress_observation({**observation, "phase": "post_close"})
     assert microphone_turn_completed
     assert set(cast(list[str], observation["accepted_sources"])) == {"typed", "microphone"}
 
