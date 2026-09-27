@@ -43,6 +43,7 @@ _MAX_LINE_BYTES = 64 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _HELLO_FIELDS = frozenset({"token", "participant_id", "protocol_version", "capabilities"})
 _WELCOME_FIELDS = frozenset({"ok", "protocol_version", "capabilities"})
+_HELLO_MARKER = "[hermes-bridge-hello] "
 logger = logging.getLogger(__name__)
 
 
@@ -616,31 +617,46 @@ class LocalHermesBridgeServer:
     ) -> tuple[str, frozenset[str]]:
         """Check the 0.2 hello; answer with the capabilities both sides hold."""
 
-        raw = await reader.readline()
+        refusal: str | None = None
         try:
-            hello = json.loads(raw)
-            if type(hello) is not dict or set(hello) != _HELLO_FIELDS:
-                raise TypeError("the hello must carry exactly the 0.2 fields")
-            token = hello["token"]
-            participant_id = hello["participant_id"]
-        except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:
-            await self._send_json(connection, {"ok": False})
-            raise BridgeAuthenticationError("invalid bridge handshake") from exc
-        requested = _capabilities(hello["capabilities"])
-        if (
-            not isinstance(token, str)
-            or not hmac.compare_digest(
+            raw = await reader.readline()
+            try:
+                hello = json.loads(raw)
+                if type(hello) is not dict or set(hello) != _HELLO_FIELDS:
+                    raise TypeError("the hello must carry exactly the 0.2 fields")
+                token = hello["token"]
+                participant_id = hello["participant_id"]
+            except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:
+                refusal = "shape"
+                await self._send_json(connection, {"ok": False})
+                raise BridgeAuthenticationError("invalid bridge handshake") from exc
+            requested = _capabilities(hello["capabilities"])
+            if not isinstance(token, str) or not hmac.compare_digest(
                 token.encode("utf-8", errors="surrogatepass"),
                 self._token.encode("utf-8", errors="surrogatepass"),
-            )
-            or not isinstance(participant_id, str)
-            or _IDENTIFIER_PATTERN.fullmatch(participant_id) is None
-            or hello["protocol_version"] != BRIDGE_PROTOCOL_VERSION
-            or type(hello["protocol_version"]) is not str
-            or requested is None
-        ):
-            await self._send_json(connection, {"ok": False})
-            raise BridgeAuthenticationError("bridge authentication failed")
+            ):
+                refusal = "token"
+            elif (
+                not isinstance(participant_id, str)
+                or _IDENTIFIER_PATTERN.fullmatch(participant_id) is None
+            ):
+                refusal = "participant"
+            elif (
+                type(hello["protocol_version"]) is not str
+                or hello["protocol_version"] != BRIDGE_PROTOCOL_VERSION
+            ):
+                refusal = "version"
+            elif requested is None:
+                refusal = "capability"
+            if refusal is not None:
+                await self._send_json(connection, {"ok": False})
+                raise BridgeAuthenticationError("bridge authentication failed")
+        finally:
+            # The rejection category only: never the token, the participant or the hello.
+            if refusal is not None:
+                evidence = json.dumps({"refusal": refusal, "version": 1}, separators=(",", ":"))
+                print(_HELLO_MARKER + evidence, flush=True)
+        assert requested is not None  # Refused above otherwise.
         negotiated = requested & self._offered
         await self._send_json(
             connection,

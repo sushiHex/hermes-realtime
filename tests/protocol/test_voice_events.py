@@ -141,7 +141,14 @@ def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
         pytest.param(_archive(rows=[_row(extra=1)]), id="extra-row-field"),
         pytest.param(_range("voice_archive_ack", category="x"), id="ack-with-category"),
         pytest.param(_range("voice_archive_refused"), id="refusal-without-category"),
-        pytest.param(_range("voice_archive_refused", category="unknown"), id="unknown-category"),
+        pytest.param(_range("voice_archive_refused", category=""), id="empty-category"),
+        pytest.param(_range("voice_archive_refused", category="x" * 33), id="long-category"),
+        pytest.param(_range("voice_archive_refused", category="Not_Ready"), id="upper-category"),
+        pytest.param(_range("voice_archive_refused", category=7), id="integer-category"),
+        pytest.param(
+            {k: v for k, v in _range("voice_archive_ack").items() if k != "protocol_version"},
+            id="no-protocol-version",
+        ),
         pytest.param(_range("voice_archive_ack", seq_from=5), id="reversed-ack"),
         pytest.param(_range("voice_forget"), id="unknown-type"),
     ],
@@ -149,6 +156,23 @@ def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
 def test_every_malformed_voice_event_is_refused(event: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         parse_voice_event(json.dumps(event))
+
+
+def test_a_refusal_category_is_a_bounded_string_on_the_wire_not_a_closed_list() -> None:
+    # A newer companion may add a category: it still parses, and the sender classifies it.
+    refused = parse_voice_event(json.dumps(_range("voice_archive_refused", category="novel")))
+
+    assert type(refused) is VoiceArchiveRefusedEvent
+    assert refused.category == "novel"
+    assert "novel" not in VOICE_TRANSIENT_REFUSALS | VOICE_INTEGRITY_REFUSALS
+
+
+def test_a_voice_event_names_its_protocol_version_explicitly() -> None:
+    with pytest.raises(ValidationError):
+        VoiceArchiveAckEvent(  # type: ignore[call-arg]
+            type="voice_archive_ack", conversation_id="c", generation=0, seq_from=0,
+            seq_through=0,
+        )
 
 
 def test_a_non_finite_timestamp_is_refused() -> None:

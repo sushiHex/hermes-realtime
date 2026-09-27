@@ -315,11 +315,12 @@ VOICE_REFUSAL_CATEGORIES = frozenset(
 )
 
 # The categories split into two closed sets whose union is exactly the set above. A
-# transient refusal says the companion cannot take the batch now (not ready, lease, capacity,
-# configuration, an unsettled commit) and never that the archive or the batch is wrong:
-# realtime keeps the frozen batch and retries it unchanged. Every other category says the
-# batch, the archive or its fences are wrong, or the generation is retired: archiving is
-# fenced. A category in neither set is treated as an integrity refusal.
+# transient refusal says the companion cannot take the batch now (not ready, a lease, the
+# bound on live or stored conversations, its configuration, an unsettled commit) and never
+# that the archive or the batch is wrong: realtime keeps the frozen batch and retries it
+# unchanged. Every other category says the batch, the archive or its fences are wrong, or
+# the generation is retired: archiving is fenced. On the wire the category is a bounded
+# string, so a category a newer companion adds still parses; one in neither set fences.
 VOICE_TRANSIENT_REFUSALS = frozenset(
     {
         "not_ready", "lease_held", "lease_lost", "conversations", "pending", "stale",
@@ -338,11 +339,8 @@ VoiceConversationId = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 ]
 VoiceIdentity = Annotated[int, Field(ge=0, le=_VOICE_MAX_IDENTITY)]
-VoiceRefusalCategory = Literal[
-    "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
-    "over_cap", "rotated", "lineage", "count", "recovery", "drift", "incompatible",
-    "durability", "lease_lost", "lease_held", "not_ready", "fenced", "quarantined",
-    "tombstoned", "pending", "stale", "unbound", "bound", "conversations",
+VoiceRefusalCategory = Annotated[
+    str, StringConstraints(min_length=1, max_length=32, pattern=r"^[a-z_]+$")
 ]
 
 
@@ -378,7 +376,8 @@ class VoiceArchiveRow(StrictModel):
 
 
 class _VoiceRange(StrictModel):
-    protocol_version: Literal["0.2"] = "0.2"
+    # Explicit on every voice event: the work events stay at "0.1".
+    protocol_version: Literal["0.2"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
     seq_from: VoiceIdentity

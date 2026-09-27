@@ -67,6 +67,7 @@ def archive_event(batch: ArchiveBatch) -> VoiceArchiveEvent:
     """The wire form of a frozen batch: the same rows, byte for byte, every time."""
 
     return VoiceArchiveEvent(
+        protocol_version="0.2",
         type="voice_archive",
         conversation_id=batch.conversation_id,
         generation=batch.generation,
@@ -134,6 +135,7 @@ class VoiceArchiveSender:
         self._link: VoiceArchiveLink | None = None
         self._fence: str | None = None
         self._transient = False
+        self._unavailable = False
         self.sent = 0
         self.resent = 0
 
@@ -193,8 +195,12 @@ class VoiceArchiveSender:
                     async with asyncio.timeout(self._timeout):
                         link = await self._connect()
                 except Exception as error:  # Any failure leaves the outcome unknown.
-                    evidence = {"outcome": "unavailable", "cause": type(error).__name__}
+                    # One marker per outage; the next connection ends the episode.
+                    if not self._unavailable:
+                        evidence = {"outcome": "unavailable", "cause": type(error).__name__}
+                    self._unavailable = True
                     return "unknown"
+                self._unavailable = False
                 if VOICE_ARCHIVE_CAPABILITY not in link.capabilities:
                     with contextlib.suppress(Exception):
                         await link.close()
@@ -218,9 +224,11 @@ class VoiceArchiveSender:
                         evidence = {"transient": reply.category}
                     self._transient = True
                     return "transient"
-                # Integrity, or a category neither set lists: fail closed to a fence.
+                # Integrity, or a category neither set lists: fail closed to a fence. The
+                # connection is dropped too: nothing more is sent on it.
                 self._fence = reply.category
                 evidence = {"fence": reply.category}
+                await self._drop()
                 return "refused"
             if type(reply) is VoiceArchiveAckEvent and self._writer.acknowledge(
                 reply.conversation_id, reply.generation, reply.seq_from, reply.seq_through

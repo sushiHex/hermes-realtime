@@ -620,7 +620,7 @@ async def _realtime(home: Path, step: str, port: int, audit: _Audit) -> None:
                     for row in state.rows[: state.frozen]
                 ],
             }
-            frozen = VoiceArchiveEvent(type="voice_archive", **batch)
+            frozen = VoiceArchiveEvent(protocol_version="0.2", type="voice_archive", **batch)
             (home / "frozen.json").write_text(frozen.model_dump_json(), encoding="utf-8")
             truth_path.write_text(json.dumps(truth), encoding="utf-8")
             os._exit(_CRASHED)  # A crash: no close, no final write.
@@ -641,6 +641,7 @@ async def _realtime(home: Path, step: str, port: int, audit: _Audit) -> None:
             )
             try:
                 hole = VoiceArchiveEvent(
+                    protocol_version="0.2",
                     type="voice_archive",
                     conversation_id=_CONVERSATION,
                     generation=0,

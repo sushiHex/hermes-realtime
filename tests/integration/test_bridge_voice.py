@@ -59,6 +59,7 @@ def _server(voice: Any = None) -> LocalHermesBridgeServer:
 
 def _batch(seq_through: int = 1) -> VoiceArchiveEvent:
     return VoiceArchiveEvent(
+        protocol_version="0.2",
         type="voice_archive",
         conversation_id="conv",
         generation=0,
@@ -82,7 +83,8 @@ class _Voice:
         self, event: VoiceArchiveEvent
     ) -> VoiceArchiveAckEvent | VoiceArchiveRefusedEvent | None:
         self.events.append(event)
-        fields = {
+        fields: dict[str, Any] = {
+            "protocol_version": "0.2",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
             "seq_from": event.seq_from,
@@ -160,6 +162,40 @@ async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers
 async def test_every_malformed_hello_is_refused(hello: dict[str, object]) -> None:
     async with _server(voice=_Voice()) as server:
         assert await _hello(server, hello) == {"ok": False}
+
+
+_BRIDGE_MARKER = "[hermes-bridge-hello] "
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hello", "category"),
+    [
+        pytest.param(_valid_hello(protocol_version="0.1"), "version", id="version"),
+        pytest.param(_valid_hello(capabilities=["voice_forget"]), "capability", id="unknown"),
+        pytest.param(
+            _valid_hello(capabilities=["voice_archive", "voice_archive"]), "capability",
+            id="repeated",
+        ),
+        pytest.param({"token": _TOKEN, "participant_id": "p1"}, "shape", id="shape"),
+        pytest.param(_valid_hello(token="wrong-token-wrong-token-wrong"), "token", id="token"),
+    ],
+)
+async def test_a_refused_hello_leaves_one_marker_with_its_category_only(
+    hello: dict[str, object], category: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async with _server(voice=_Voice()) as server:
+        assert await _hello(server, hello) == {"ok": False}
+        await asyncio.sleep(0.05)
+
+    output = capsys.readouterr().out
+    markers = [
+        json.loads(line.removeprefix(_BRIDGE_MARKER))
+        for line in output.splitlines()
+        if line.startswith(_BRIDGE_MARKER)
+    ]
+    assert markers == [{"refusal": category, "version": 1}]
+    assert _TOKEN not in output and "voice-archive" not in output and "p1" not in output
 
 
 @pytest.mark.asyncio

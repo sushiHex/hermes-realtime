@@ -98,6 +98,7 @@ def _refused(event: VoiceArchiveEvent, category: str) -> VoiceArchiveRefusedEven
     """A refusal of exactly this batch's range; the category set is the protocol's."""
     return VoiceArchiveRefusedEvent.model_validate(
         {
+            "protocol_version": "0.2",
             "type": "voice_archive_refused",
             "conversation_id": event.conversation_id,
             "generation": event.generation,

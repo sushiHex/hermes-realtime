@@ -18,6 +18,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    parse_voice_event,
 )
 from hermes_realtime.speech import Transcript
 
@@ -57,7 +58,8 @@ class _Companion:
     async def answer(self, event: VoiceArchiveEvent) -> Any:
         self.sent.append(event)
         action = self.script.pop(0) if self.script else "ack"
-        fields = {
+        fields: dict[str, Any] = {
+            "protocol_version": "0.2",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
             "seq_from": event.seq_from,
@@ -76,10 +78,9 @@ class _Companion:
         if action in ("not_ready", "lease_held", "conversations"):
             return VoiceArchiveRefusedEvent(type="voice_archive_refused", category=action, **fields)
         if action == "novel":
-            # A category neither set lists (a newer companion): built past validation.
-            return VoiceArchiveRefusedEvent.model_construct(
-                protocol_version="0.2", type="voice_archive_refused", category="novel", **fields
-            )
+            # A category neither set lists (a newer companion), exactly as the wire carries it.
+            raw = json.dumps(fields | {"type": "voice_archive_refused", "category": "novel"})
+            return parse_voice_event(raw.encode("utf-8"))
         if action == "drop":
             raise BridgeProtocolError("the companion closed before answering")
         if action == "hang":
@@ -207,6 +208,8 @@ async def test_a_refusal_fences_archiving_with_one_marker_and_keeps_the_outbox(
         assert _cursor(tmp_path) is None
         output = capsys.readouterr().out
         assert _markers(output) == [{"fence": "quarantined", "version": 1}]
+        # The fence drops the connection: nothing more is sent on it.
+        assert companion.links[-1].closed
         assert "One" not in output
     finally:
         await sender.close()
@@ -325,7 +328,9 @@ async def test_close_stops_the_sender_even_mid_exchange(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_connection_failures_back_off_within_a_bound(tmp_path: Path) -> None:
+async def test_connection_failures_back_off_within_a_bound(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     delays: list[float] = []
 
     async def recording(delay: float) -> None:
@@ -350,6 +355,10 @@ async def test_connection_failures_back_off_within_a_bound(tmp_path: Path) -> No
         _say(store, "One")
         await _until(lambda: attempts >= 5)
         assert delays[:5] == [0.5, 1.0, 2.0, 2.0, 2.0]
+        # One unavailable marker for the whole outage, not one per attempt.
+        assert _markers(capsys.readouterr().out) == [
+            {"cause": "ConnectionRefusedError", "outcome": "unavailable", "version": 1}
+        ]
     finally:
         await sender.close()
         await writer.close()
