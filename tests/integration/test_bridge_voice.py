@@ -1,0 +1,280 @@
+"""Bridge protocol 0.2: the capability hello and voice archive routing."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+
+from hermes_realtime.integration import (
+    BridgeAuthenticationError,
+    BridgeProtocolError,
+    EventSequencer,
+    HermesCompletionRouter,
+    HermesIntegrationService,
+    LocalHermesBridgeClient,
+    LocalHermesBridgeServer,
+    SessionBindings,
+)
+from hermes_realtime.protocol import (
+    VoiceArchiveAckEvent,
+    VoiceArchiveEvent,
+    VoiceArchiveRefusedEvent,
+    VoiceArchiveRow,
+)
+
+_TOKEN = "correct-test-token-with-sufficient-entropy"
+
+
+class _Dispatcher:
+    async def dispatch(self, command: object) -> str:
+        raise AssertionError("no work is dispatched here")
+
+    async def cancel(self, run_id: str) -> bool:
+        raise AssertionError("no work is cancelled here")
+
+
+def _server(voice: Any = None) -> LocalHermesBridgeServer:
+    from datetime import UTC, datetime
+
+    sequencer = EventSequencer()
+    now = lambda: datetime(2026, 9, 26, tzinfo=UTC)  # noqa: E731
+    service = HermesIntegrationService(
+        bindings=SessionBindings(),
+        dispatcher=_Dispatcher(),  # type: ignore[arg-type]
+        canceller=_Dispatcher(),  # type: ignore[arg-type]
+        event_id_factory=lambda: "evt_1",
+        clock=now,
+        sequencer=sequencer,
+    )
+    completions = HermesCompletionRouter(
+        sequencer=sequencer, event_id_factory=lambda: "evt_2", clock=now
+    )
+    return LocalHermesBridgeServer(
+        service=service, completions=completions, token=_TOKEN, voice=voice
+    )
+
+
+def _batch(seq_through: int = 1) -> VoiceArchiveEvent:
+    return VoiceArchiveEvent(
+        type="voice_archive",
+        conversation_id="conv",
+        generation=0,
+        seq_from=0,
+        seq_through=seq_through,
+        rows=[
+            VoiceArchiveRow(seq=0, role="user", text="Hi", interrupted=False, ts=1.0,
+                            gap_before=None),
+            VoiceArchiveRow(seq=1, role="assistant", text="Hello", interrupted=True, ts=2.0,
+                            gap_before=None),
+        ],
+    )
+
+
+class _Voice:
+    def __init__(self, reply: str = "ack") -> None:
+        self.reply = reply
+        self.events: list[VoiceArchiveEvent] = []
+
+    async def archive(
+        self, event: VoiceArchiveEvent
+    ) -> VoiceArchiveAckEvent | VoiceArchiveRefusedEvent | None:
+        self.events.append(event)
+        fields = {
+            "conversation_id": event.conversation_id,
+            "generation": event.generation,
+            "seq_from": event.seq_from,
+            "seq_through": event.seq_through,
+        }
+        if self.reply == "ack":
+            return VoiceArchiveAckEvent(type="voice_archive_ack", **fields)
+        if self.reply == "refuse":
+            return VoiceArchiveRefusedEvent(
+                type="voice_archive_refused", category="partition", **fields
+            )
+        return None
+
+
+async def _hello(server: LocalHermesBridgeServer, hello: dict[str, object]) -> object:
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    try:
+        writer.write(json.dumps(hello).encode("utf-8") + b"\n")
+        await writer.drain()
+        return json.loads(await reader.readline())
+    finally:
+        writer.close()
+
+
+def _valid_hello(**overrides: object) -> dict[str, object]:
+    hello: dict[str, object] = {
+        "token": _TOKEN,
+        "participant_id": "voice-archive",
+        "protocol_version": "0.2",
+        "capabilities": ["voice_archive"],
+    }
+    hello.update(overrides)
+    return hello
+
+
+@pytest.mark.asyncio
+async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers_it() -> None:
+    async with _server(voice=_Voice()) as offering, _server() as plain:
+        offered = await LocalHermesBridgeClient.connect(
+            host=offering.host, port=offering.port, token=_TOKEN,
+            participant_id="voice-archive", capabilities=("voice_archive",),
+        )
+        withheld = await LocalHermesBridgeClient.connect(
+            host=plain.host, port=plain.port, token=_TOKEN,
+            participant_id="voice-archive", capabilities=("voice_archive",),
+        )
+        unasked = await LocalHermesBridgeClient.connect(
+            host=offering.host, port=offering.port, token=_TOKEN,
+            participant_id="participant_001",
+        )
+        try:
+            assert offered.capabilities == frozenset({"voice_archive"})
+            assert withheld.capabilities == frozenset()
+            assert unasked.capabilities == frozenset()
+        finally:
+            for client in (offered, withheld, unasked):
+                await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hello",
+    [
+        pytest.param({"token": _TOKEN, "participant_id": "p1"}, id="a-0.1-hello"),
+        pytest.param(_valid_hello(protocol_version="0.1"), id="wrong-version"),
+        pytest.param(_valid_hello(capabilities=["voice_forget"]), id="unknown-capability"),
+        pytest.param(
+            _valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"
+        ),
+        pytest.param(_valid_hello(capabilities="voice_archive"), id="capabilities-not-a-list"),
+        pytest.param(_valid_hello(extra=1), id="extra-key"),
+        pytest.param(_valid_hello(token="wrong-token-wrong-token-wrong"), id="wrong-token"),
+    ],
+)
+async def test_every_malformed_hello_is_refused(hello: dict[str, object]) -> None:
+    async with _server(voice=_Voice()) as server:
+        assert await _hello(server, hello) == {"ok": False}
+
+
+@pytest.mark.asyncio
+async def test_the_welcome_names_the_version_and_the_offered_capabilities() -> None:
+    async with _server(voice=_Voice()) as server:
+        assert await _hello(server, _valid_hello()) == {
+            "ok": True,
+            "protocol_version": "0.2",
+            "capabilities": ["voice_archive"],
+        }
+        assert await _hello(server, _valid_hello(capabilities=[])) == {
+            "ok": True,
+            "protocol_version": "0.2",
+            "capabilities": [],
+        }
+
+
+@pytest.mark.asyncio
+async def test_voice_archive_is_answered_by_the_companion_without_a_participant_binding() -> None:
+    voice = _Voice()
+    async with _server(voice=voice) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token=_TOKEN,
+            participant_id="voice-archive", capabilities=("voice_archive",),
+        )
+        try:
+            reply = await client.archive(_batch())
+            assert type(reply) is VoiceArchiveAckEvent
+            assert (reply.seq_from, reply.seq_through) == (0, 1)
+            voice.reply = "refuse"
+            refused = await client.archive(_batch())
+            assert type(refused) is VoiceArchiveRefusedEvent
+            assert refused.category == "partition"
+        finally:
+            await client.close()
+    assert voice.events == [_batch(), _batch()]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_closes_the_connection_without_a_reply() -> None:
+    async with _server(voice=_Voice(reply="unknown")) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token=_TOKEN,
+            participant_id="voice-archive", capabilities=("voice_archive",),
+        )
+        try:
+            with pytest.raises(BridgeProtocolError):
+                await asyncio.wait_for(client.archive(_batch()), timeout=2)
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_a_voice_event_without_the_negotiated_capability_closes_the_connection() -> None:
+    voice = _Voice()
+    async with _server(voice=voice) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(json.dumps(_valid_hello(capabilities=[])).encode("utf-8") + b"\n")
+        await writer.drain()
+        assert json.loads(await reader.readline())["ok"] is True
+        writer.write(_batch().model_dump_json().encode("utf-8") + b"\n")
+        await writer.drain()
+        assert await reader.readline() == b""
+        writer.close()
+    assert voice.events == []
+
+
+@pytest.mark.asyncio
+async def test_the_client_never_sends_a_voice_event_the_companion_did_not_offer() -> None:
+    async with _server() as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token=_TOKEN,
+            participant_id="voice-archive", capabilities=("voice_archive",),
+        )
+        try:
+            with pytest.raises(BridgeProtocolError, match="capability"):
+                await client.archive(_batch())
+        finally:
+            await client.close()
+
+
+async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        writer.write(json.dumps(welcome).encode("utf-8") + b"\n")
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "welcome",
+    [
+        pytest.param({"ok": True}, id="a-0.1-welcome"),
+        pytest.param(
+            {"ok": True, "protocol_version": "0.3", "capabilities": []}, id="wrong-version"
+        ),
+        pytest.param(
+            {"ok": True, "protocol_version": "0.2", "capabilities": ["voice_archive"]},
+            id="unrequested-capability",
+        ),
+        pytest.param(
+            {"ok": True, "protocol_version": "0.2", "capabilities": [], "x": 1}, id="extra-key"
+        ),
+        pytest.param({"ok": False}, id="refused"),
+    ],
+)
+async def test_the_client_refuses_a_welcome_it_did_not_ask_for(welcome: object) -> None:
+    server, port = await _fake_companion(welcome)
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await LocalHermesBridgeClient.connect(
+                host="127.0.0.1", port=port, token=_TOKEN, participant_id="p1"
+            )
