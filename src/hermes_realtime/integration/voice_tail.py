@@ -19,7 +19,8 @@ Version 2 adds the archive outbox to the same file, under the same lock and atom
 - the cursor is the last seq the acknowledged rows and their gaps cover.
 
 A version-1 tail migrates on the first write: its rows restore, then close, and so get
-identities like any other row. Nothing is refused for being version 1.
+identities like any other row, with the restart's time as their close time (version 1 never
+recorded one). Nothing is refused for being version 1.
 """
 
 from __future__ import annotations
