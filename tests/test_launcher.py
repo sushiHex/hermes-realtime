@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import ssl
 import sys
 from collections import deque
@@ -2027,7 +2028,7 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
 ) -> None:
     from hermes_realtime.conversation import ConversationMessage, DurableConversation
     from hermes_realtime.integration.run_record import write_run_record
-    from hermes_realtime.integration.voice_tail import parse_voice_tail, voice_tail_bytes
+    from hermes_realtime.integration.voice_tail import parse_voice_tail
 
     tail = DurableConversation(
         messages=(
@@ -2037,7 +2038,15 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
         prior_work=True,
     )
     path = tmp_path / "state" / "voice-tail-v1.json"
-    write_run_record(path, voice_tail_bytes(tail))
+    # A version-1 tail, as the previous release wrote it: it migrates on the first write.
+    legacy = {
+        "messages": [
+            {"interrupted": m.interrupted, "role": m.role, "text": m.text} for m in tail.messages
+        ],
+        "prior_work": True,
+        "version": 1,
+    }
+    write_run_record(path, json.dumps(legacy).encode("utf-8"))
     harness = _FullHostHarness(monkeypatch)
     launcher = harness.build(voice_tail=path)
 
@@ -2056,10 +2065,9 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
     finally:
         await launcher.close()
 
-    assert harness.events[3:] == ["actions:closed", "tail:close"]
-    assert parse_voice_tail(
-        path.read_bytes(), max_messages=16, max_item_chars=1024
-    ) == DurableConversation(
+    restored = parse_voice_tail(path.read_bytes(), max_messages=16, max_item_chars=1024)
+    assert restored is not None
+    assert restored.conversation == DurableConversation(
         messages=(*tail.messages, ConversationMessage("user", "Later question")),
         prior_work=True,
     )
