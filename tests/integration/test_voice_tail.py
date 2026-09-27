@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -1080,7 +1081,9 @@ async def test_overflow_discards_unsent_rows_up_to_the_next_user_row_as_its_gap(
         assert archive.frozen == 2
         assert await asyncio.wait_for(writer.next_batch(), timeout=2) == frozen
         output = capsys.readouterr().out
-        assert _markers(output, _OUTBOX_MARKER) == [_OUTBOX_MARKER + '{"discarded":2,"version":1}']
+        assert _markers(output, _OUTBOX_MARKER) == [
+            _OUTBOX_MARKER + '{"cause":"overflow","version":1}'
+        ]
         assert "Q2" not in output and "A3" not in output
     finally:
         await writer.close()
@@ -1274,3 +1277,124 @@ async def test_open_refuses_a_store_whose_rows_cannot_fit_one_batch(tmp_path: Pa
 
     with pytest.raises(ValueError, match="batch"):
         await writer.open(store)
+
+
+@pytest.mark.asyncio
+async def test_a_row_the_companion_would_refuse_becomes_a_gap_before_it_is_eligible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8)
+    try:
+        _say(store, "Q0")
+        _say(store, "has a \x00 NUL")  # The store holds it; the archive never would.
+        _reply(store, "A2")
+        _say(store, "Q3")
+        archive = await _written(path, writer)
+        # The refused row and the reply that depended on it are one gap on the next user row.
+        assert _shape(archive.rows) == [
+            (0, "user", "Q0", False, None),
+            (3, "user", "Q3", False, (1, 2)),
+        ]
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        assert all("\x00" not in row.text for row in batch.rows)
+        output = capsys.readouterr().out
+        assert _markers(output, _OUTBOX_MARKER) == [
+            _OUTBOX_MARKER + '{"cause":"invalid","version":1}'
+        ]
+        assert "NUL" not in output
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_close_time_the_companion_would_refuse_becomes_a_gap(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    times = iter([float("inf"), 5.0, 6.0])
+    writer, store = await _opened(path, max_outbox_rows=8, clock=lambda: next(times))
+    try:
+        _say(store, "Q0")
+        _say(store, "Q1")
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [(1, "user", "Q1", False, (0, 0))]
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_the_discard_marker_is_once_per_episode_and_an_ack_ends_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=3, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        for index in range(2, 8):  # Overflows repeatedly while the batch is in flight.
+            _say(store, f"Q{index}")
+        assert len(_markers(capsys.readouterr().out, _OUTBOX_MARKER)) == 1
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        await _written(path, writer)
+        await asyncio.wait_for(writer.next_batch(), timeout=2)
+        for index in range(8, 12):
+            _say(store, f"Q{index}")
+        assert len(_markers(capsys.readouterr().out, _OUTBOX_MARKER)) == 1
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_marker_that_cannot_print_never_raises_into_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=3, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        await asyncio.wait_for(writer.next_batch(), timeout=2)
+        closed = io.StringIO()
+        closed.close()
+        monkeypatch.setattr(sys, "stdout", closed)
+        for index in range(2, 6):
+            _say(store, f"Q{index}")  # Overflow: the marker's print raises; speech does not.
+        monkeypatch.undo()
+        assert len(store.snapshot().messages) == 6
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_restart_restores_the_frozen_batch_exactly_under_other_bounds(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8, max_batch_rows=3)
+    try:
+        for index in range(4):
+            _say(store, f"Q{index}")
+        frozen = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        assert len(frozen.rows) == 3
+    finally:
+        await writer.close()
+
+    # A smaller batch bound after the restart: the frozen batch is resent whole, as frozen.
+    successor, restored = await _opened(path, max_outbox_rows=4, max_batch_rows=2)
+    try:
+        assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
+        # Overflow after the restart discards only unsent rows, never the frozen batch.
+        for index in range(4, 9):
+            _say(restored, f"Q{index}")
+        archive = await _written(path, successor)
+        assert archive.rows[:3] == frozen.rows
+        assert archive.frozen == 3
+        assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
+    finally:
+        await successor.close()

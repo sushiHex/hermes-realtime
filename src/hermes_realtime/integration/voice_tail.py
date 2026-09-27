@@ -25,6 +25,7 @@ identities like any other row. Nothing is refused for being version 1.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -35,6 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from hermes_realtime.companion.integrity import validate_voice_row
 from hermes_realtime.conversation import (
     ConversationContextStore,
     ConversationMessage,
@@ -231,11 +233,12 @@ def _parse_outbox_row(row: object, max_item_chars: int) -> OutboxRow | None:
         return None
     if not _identity(seq):
         return None
-    if type(ts) is not float or not math.isfinite(ts) or ts < 0:
-        return None
     if not _text(row["role"], row["text"], row["interrupted"], max_item_chars):
         return None
-    if gap is not None and row["role"] != "user":
+    try:
+        # The companion's own row rules: a row it would refuse never sits in the outbox.
+        validate_voice_row(row["role"], row["text"], row["interrupted"], ts, gap)
+    except (TypeError, ValueError):
         return None
     return OutboxRow(seq, row["role"], row["text"], row["interrupted"], ts, gap)
 
@@ -412,6 +415,7 @@ class VoiceTailWriter:
         self._frozen_version = 0
         self._written_version = 0
         self._tick = asyncio.Event()
+        self._discard_episode = False
 
     # --- the store's callback ----------------------------------------------------------------
 
@@ -430,20 +434,26 @@ class VoiceTailWriter:
         start = self._next_seq - self._seq_base
         if closed_end <= start:
             return
-        now = float(self._clock())
+        now = self._clock()
         for ordinal in range(start, closed_end):
             seq = self._seq_base + ordinal
             if ordinal < view.first:
                 # Evicted before this writer saw it close: it cannot be archived.
-                self._discard(seq, overflow=False)
+                self._discard(seq, "evicted")
                 continue
             message = view.messages[ordinal - view.first]
+            try:
+                # The companion's own row rules, before the row can become eligible.
+                validate_voice_row(message.role, message.text, message.interrupted, now)
+            except (TypeError, ValueError):
+                self._discard(seq, "invalid")
+                continue
             self._admit(OutboxRow(seq, message.role, message.text, message.interrupted, now))
         self._next_seq = self._seq_base + closed_end
 
     def _admit(self, row: OutboxRow) -> None:
         if len(self._outbox) >= self._max_outbox and not self._overflow():
-            self._discard(row.seq, overflow=True)
+            self._discard(row.seq, "overflow")
             return
         if self._gap is not None:
             if row.role != "user":
@@ -454,38 +464,43 @@ class VoiceTailWriter:
             self._gap = None
         self._outbox.append(row)
 
-    def _discard(self, seq: int, *, overflow: bool) -> None:
-        opened = self._gap is None
+    def _discard(self, seq: int, cause: str) -> None:
         self._gap = (seq if self._gap is None else self._gap[0], seq)
-        if overflow and opened:
-            _marker(_OUTBOX_MARKER_PREFIX, {"discarded": 1, "version": 1})
+        self._discarding(cause)
+
+    def _discarding(self, cause: str) -> None:
+        """One marker per discard episode, which the next acknowledgment ends.
+
+        It runs inside the store's callback, so it never raises: speech outranks evidence.
+        """
+
+        if self._discard_episode:
+            return
+        self._discard_episode = True
+        with contextlib.suppress(Exception):
+            _marker(_OUTBOX_MARKER_PREFIX, {"cause": cause, "version": 1})
 
     def _overflow(self) -> bool:
         """Discard the oldest unsent rows up to the next user row; False if none is unsent."""
 
-        evidence: dict[str, str | int] | None = None
-        try:
-            unsent = self._outbox[self._frozen :]
-            if not unsent:
-                return False
-            count = 1
-            while count < len(unsent) and unsent[count].role != "user":
-                count += 1
-            dropped, kept = unsent[:count], unsent[count:]
-            head = dropped[0]
-            start = head.seq if head.gap_before is None else head.gap_before[0]
-            if kept:
-                kept[0] = replace(kept[0], gap_before=(start, kept[0].seq - 1))
-            elif self._gap is None:
-                self._gap = (start, dropped[-1].seq)
-            else:
-                self._gap = (start, self._gap[1])
-            self._outbox[self._frozen :] = kept
-            evidence = {"discarded": count, "version": 1}
-            return True
-        finally:
-            if evidence is not None:
-                _marker(_OUTBOX_MARKER_PREFIX, evidence)
+        unsent = self._outbox[self._frozen :]
+        if not unsent:
+            return False
+        count = 1
+        while count < len(unsent) and unsent[count].role != "user":
+            count += 1
+        dropped, kept = unsent[:count], unsent[count:]
+        head = dropped[0]
+        start = head.seq if head.gap_before is None else head.gap_before[0]
+        if kept:
+            kept[0] = replace(kept[0], gap_before=(start, kept[0].seq - 1))
+        elif self._gap is None:
+            self._gap = (start, dropped[-1].seq)
+        else:
+            self._gap = (start, self._gap[1])
+        self._outbox[self._frozen :] = kept
+        self._discarding("overflow")
+        return True
 
     def _changed(self) -> None:
         self._version += 1
@@ -572,6 +587,7 @@ class VoiceTailWriter:
         del self._outbox[: self._frozen]
         self._frozen = 0
         self._cursor = seq_through
+        self._discard_episode = False
         self._changed()
         return True
 
