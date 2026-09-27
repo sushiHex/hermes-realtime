@@ -180,10 +180,17 @@ class DurableConversation:
 
     ``prior_work`` is True once any task was active or ended: a restart never
     resumes tasks, so afterwards all of it is ended history.
+
+    ``first`` numbers ``messages[0]`` among every row this store has held, so a row keeps
+    its number while older rows are evicted. ``unsettled`` counts the trailing rows that
+    are not final yet: the row whose speech is still in progress and everything after it.
+    Every earlier row is closed and never changes again.
     """
 
     messages: tuple[ConversationMessage, ...]
     prior_work: bool
+    first: int = 0
+    unsettled: int = 0
 
     def __post_init__(self) -> None:
         if type(self.messages) is not tuple or any(
@@ -192,6 +199,12 @@ class DurableConversation:
             raise TypeError("durable messages must be an exact tuple of ConversationMessage")
         if type(self.prior_work) is not bool:
             raise TypeError("durable prior_work must be an exact boolean")
+        if type(self.first) is not int or type(self.unsettled) is not int:
+            raise TypeError("durable row positions must be exact integers")
+        if not 0 <= self.first <= _MAX_REVISION_LIMIT:
+            raise ValueError("durable first row is out of range")
+        if not 0 <= self.unsettled <= len(self.messages):
+            raise ValueError("durable unsettled rows must be a suffix of the messages")
 
 
 class ConversationContextStore:
@@ -259,6 +272,8 @@ class ConversationContextStore:
         self._open_assistant_segment: tuple[AssistantSegmentKey, ConversationMessage] | None = (
             None
         )
+        # Rows evicted from the front: the number of the oldest retained row.
+        self._evicted = 0
         self._revision = 0
 
     @property
@@ -362,7 +377,7 @@ class ConversationContextStore:
             if replaces_open_row:
                 self._messages[-1] = message
             else:
-                self._messages.append(message)
+                self._push(message)
             self._open_assistant_segment = (segment, message)
             self._revision += 1
             self._notify_change()
@@ -406,6 +421,11 @@ class ConversationContextStore:
 
         open_segment = self._open_assistant_segment
         open_row = None if open_segment is None else open_segment[1]
+        unsettled = 0
+        for index, message in enumerate(self._messages):
+            if message is open_row:
+                unsettled = len(self._messages) - index
+                break
         return DurableConversation(
             messages=tuple(
                 ConversationMessage(
@@ -416,6 +436,8 @@ class ConversationContextStore:
                 for message in self._messages
             ),
             prior_work=self._has_prior_work(),
+            first=self._evicted,
+            unsettled=unsettled,
         )
 
     def validate_user_text(self, text: str) -> None:
@@ -632,9 +654,14 @@ class ConversationContextStore:
     def _append(self, role: ConversationRole, text: str) -> None:
         self._validate_text(text)
         self._validate_model_visible_text(text)
-        self._messages.append(ConversationMessage(role=role.value, text=text))
+        self._push(ConversationMessage(role=role.value, text=text))
         self._revision += 1
         self._notify_change()
+
+    def _push(self, message: ConversationMessage) -> None:
+        if len(self._messages) == self._max_messages:
+            self._evicted += 1
+        self._messages.append(message)
 
     def _notify_change(self) -> None:
         on_change = self._on_change
