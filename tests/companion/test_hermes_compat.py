@@ -163,6 +163,8 @@ def _stand_in(**overrides: Any) -> types.ModuleType:
 
         def release_session_turn_lease(self, session_id: Any, holder: Any) -> None: ...
 
+        def close(self) -> None: ...
+
     for name, value in overrides.items():
         if value is None:
             delattr(SessionDB, name)
@@ -193,6 +195,15 @@ def test_a_changed_signature_fails_the_surface_check(monkeypatch: pytest.MonkeyP
         sys.modules, HERMES_MODULE, _stand_in(refresh_session_turn_lease=refresh)
     )
     assert check_surface() == ("signature:SessionDB.refresh_session_turn_lease",)
+
+
+def test_the_close_the_companion_relies_on_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    def close(self: Any, wait: bool = True) -> None: ...
+
+    monkeypatch.setitem(sys.modules, HERMES_MODULE, _stand_in(close=close))
+    assert check_surface() == ("signature:SessionDB.close",)
+    monkeypatch.setitem(sys.modules, HERMES_MODULE, _stand_in(close=None))
+    assert check_surface() == ("missing:SessionDB.close",)
 
 
 def test_an_unlisted_hermes_name_is_refused_before_any_import(

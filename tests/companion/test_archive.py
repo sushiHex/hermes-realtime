@@ -108,6 +108,9 @@ class FakeHermes:
         if self.lease.get(session_id) == holder:
             del self.lease[session_id]
 
+    def close(self) -> None:
+        self.calls.append("close")
+
     def _project(self, session_id: str, cap: int) -> Projection | None:
         header = self.sessions.get(session_id)
         if header is None:

@@ -299,18 +299,22 @@ class VoiceCompanionHost:
         evidence: dict[str, str | int] | None = None
         try:
             port = await asyncio.to_thread(self._open_port)
-            store = CompanionStore(self._store_path)
             try:
-                archive = VoiceArchive(store, port, lease_ttl_seconds=self._ttl)
-                service = VoiceCompanionService(archive, store, port)
+                store = CompanionStore(self._store_path)
                 try:
-                    await service.start()
-                    if not stop.is_set():
-                        await self._serve(service, stop)
+                    archive = VoiceArchive(store, port, lease_ttl_seconds=self._ttl)
+                    service = VoiceCompanionService(archive, store, port)
+                    try:
+                        await service.start()
+                        if not stop.is_set():
+                            await self._serve(service, stop)
+                    finally:
+                        await service.close()
                 finally:
-                    await service.close()
+                    store.close()
             finally:
-                store.close()
+                # Last: every lease was released through this database above.
+                await asyncio.to_thread(port.close)
         except ArchiveRefusal as refusal:
             evidence = {"refusal": refusal.category, "version": 1}
             raise

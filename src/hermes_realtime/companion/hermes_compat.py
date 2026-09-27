@@ -75,6 +75,7 @@ SURFACE: tuple[SurfaceName, ...] = (
         "SessionDB.refresh_session_turn_lease", ("self", "session_id", "holder", "ttl_seconds")
     ),
     SurfaceName("SessionDB.release_session_turn_lease", ("self", "session_id", "holder")),
+    SurfaceName("SessionDB.close", ("self",)),
 )
 # The table shapes the projection relies on, bound by equality to the pin: every messages
 # column (the fingerprint covers them all), and every sessions column (a new one could carry
@@ -225,6 +226,12 @@ def open_session_db() -> Any:
     return resolve("SessionDB")()
 
 
+def close_session_db(db: Any) -> None:
+    """Close the database the companion opened; called once, at unload."""
+
+    _method(_session_db(db), "SessionDB.close")()
+
+
 def create_voice_session(db: Any, session_id: str) -> None:
     """Create the voice session.
 
@@ -351,6 +358,9 @@ class HermesArchivePort:
 
     def release_lease(self, session_id: str, holder: str) -> None:
         release_lease(self._db, session_id, holder)
+
+    def close(self) -> None:
+        close_session_db(self._db)
 
     def read_projection(self, session_id: str, cap: int) -> Projection | None:
         return read_projection(self._db, session_id, cap)

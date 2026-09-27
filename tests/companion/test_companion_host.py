@@ -284,6 +284,7 @@ def test_a_failed_start_never_starts_the_bridge_and_leaves_one_marker(
     host.close()
 
     assert log == []
+    assert hermes.calls[-1] == "close"
     assert _markers(capsys.readouterr().out, _HOST_MARKER) == [
         {"refusal": "incompatible", "version": 1}
     ]
@@ -327,6 +328,10 @@ def test_close_releases_every_lease_and_stops_the_loop_thread(tmp_path: Path) ->
     host.close()
 
     assert hermes.lease == {}
+    # The database closes once, last, after the lease it held was released.
+    assert hermes.calls.count("close") == 1
+    assert hermes.calls[-1] == "close"
+    assert "release_lease" in hermes.calls[: hermes.calls.index("close")]
     assert not any(thread.name == "voice-companion" for thread in threading.enumerate())
 
 
