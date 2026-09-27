@@ -73,6 +73,13 @@ class _Companion:
             return VoiceArchiveRefusedEvent(
                 type="voice_archive_refused", category="quarantined", **fields
             )
+        if action in ("not_ready", "lease_held", "conversations"):
+            return VoiceArchiveRefusedEvent(type="voice_archive_refused", category=action, **fields)
+        if action == "novel":
+            # A category neither set lists (a newer companion): built past validation.
+            return VoiceArchiveRefusedEvent.model_construct(
+                protocol_version="0.2", type="voice_archive_refused", category="novel", **fields
+            )
         if action == "drop":
             raise BridgeProtocolError("the companion closed before answering")
         if action == "hang":
@@ -116,7 +123,8 @@ def _say(store: ConversationContextStore, *texts: str) -> None:
 
 def _cursor(tmp_path: Path) -> object:
     raw = read_run_record(tmp_path / "tail.json", 1 << 20)
-    assert raw is not None
+    if raw is None:
+        return "no tail yet"
     tail = parse_voice_tail(raw, max_messages=16, max_item_chars=64, max_outbox_rows=16)
     assert tail is not None and tail.archive is not None
     return tail.archive.cursor
@@ -200,6 +208,58 @@ async def test_a_refusal_fences_archiving_with_one_marker_and_keeps_the_outbox(
         output = capsys.readouterr().out
         assert _markers(output) == [{"fence": "quarantined", "version": 1}]
         assert "One" not in output
+    finally:
+        await sender.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_refusal_retries_the_frozen_batch_unchanged_with_one_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    delays: list[float] = []
+
+    async def recording(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    companion = _Companion()
+    companion.script = ["not_ready", "lease_held", "conversations", "ack", "not_ready", "ack"]
+    writer, store, sender = await _setup(tmp_path, companion, sleep=recording)
+    try:
+        _say(store, "One")
+        await _until(lambda: _cursor(tmp_path) == 0)
+        assert companion.sent[:4] == [companion.sent[0]] * 4
+        assert sender.fence is None
+        _say(store, "Two")
+        await _until(lambda: _cursor(tmp_path) == 1)
+        assert sender.fence is None
+        # Bounded backoff between retries, reset by the acknowledgment.
+        assert delays == [0.5, 1.0, 2.0, 0.5]
+        # One marker per episode: the first refusal of each run of transient refusals.
+        assert _markers(capsys.readouterr().out) == [
+            {"transient": "not_ready", "version": 1},
+            {"transient": "not_ready", "version": 1},
+        ]
+    finally:
+        await sender.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_category_in_neither_set_fails_closed_to_a_fence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    companion = _Companion()
+    companion.script = ["novel"]
+    writer, store, sender = await _setup(tmp_path, companion)
+    try:
+        _say(store, "One")
+        await _until(lambda: sender.fence is not None)
+        await asyncio.sleep(0.05)
+        assert sender.fence == "novel"
+        assert len(companion.sent) == 1
+        assert _markers(capsys.readouterr().out) == [{"fence": "novel", "version": 1}]
     finally:
         await sender.close()
         await writer.close()

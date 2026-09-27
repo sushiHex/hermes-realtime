@@ -11,7 +11,9 @@ from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
     VOICE_ARCHIVE_CAPABILITY,
+    VOICE_INTEGRITY_REFUSALS,
     VOICE_REFUSAL_CATEGORIES,
+    VOICE_TRANSIENT_REFUSALS,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -92,6 +94,21 @@ def test_acknowledgment_and_refusal_round_trip() -> None:
 
 def test_the_refusal_categories_are_exactly_the_companions() -> None:
     assert VOICE_REFUSAL_CATEGORIES == REFUSAL_CATEGORIES
+
+
+def test_transient_and_integrity_refusals_partition_the_companions_categories() -> None:
+    assert VOICE_TRANSIENT_REFUSALS | VOICE_INTEGRITY_REFUSALS == REFUSAL_CATEGORIES
+    assert not VOICE_TRANSIENT_REFUSALS & VOICE_INTEGRITY_REFUSALS
+
+
+def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
+    # The batch, the archive's evidence, the quarantine and the retired generation.
+    assert {
+        "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
+        "over_cap", "rotated", "lineage", "count", "recovery", "drift", "quarantined",
+        "tombstoned",
+    } <= VOICE_INTEGRITY_REFUSALS
+    assert {"not_ready", "lease_held", "conversations"} <= VOICE_TRANSIENT_REFUSALS
 
 
 @pytest.mark.parametrize(

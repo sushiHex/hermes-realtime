@@ -101,6 +101,17 @@ _TRAILING = (("user", False),) + (("assistant", False),) * 7
 # --- the verdict (pure; unit-tested) ---------------------------------------------------------
 
 
+def _may_resend_after(outcome: str) -> bool:
+    """An unknown outcome, or a transient refusal (never a read, never a verdict on it)."""
+
+    from hermes_realtime.protocol import VOICE_TRANSIENT_REFUSALS  # This interpreter only.
+
+    kind, _, category = outcome.partition(":")
+    return outcome in ("lost", "unknown") or (
+        kind == "voice_archive_refused" and category in VOICE_TRANSIENT_REFUSALS
+    )
+
+
 def _sends(sent: list[dict[str, Any]]) -> dict[str, int]:
     """Criterion 4's resend census: a resend must repeat a frozen batch after an unknown."""
 
@@ -114,7 +125,7 @@ def _sends(sent: list[dict[str, Any]]) -> dict[str, int]:
         if previous is not None:
             resends += 1
             changed += previous[0] != body
-            keyed_otherwise += previous[1] not in ("lost", "unknown")
+            keyed_otherwise += not _may_resend_after(previous[1])
         outcomes[key] = (body, outcome)
     return {"resends": resends, "resends_changed": changed, "resends_not_after_unknown":
             keyed_otherwise}
@@ -487,7 +498,8 @@ class _RecordingLink:
         if self._lose_next and self._lose_next.pop():
             record["outcome"] = "lost"
             raise ConnectionResetError("the acknowledgment was lost on purpose")
-        record["outcome"] = reply.type
+        category = getattr(reply, "category", None)
+        record["outcome"] = reply.type if category is None else f"{reply.type}:{category}"
         return reply
 
     async def close(self) -> None:

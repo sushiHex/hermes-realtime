@@ -7,8 +7,12 @@ on a connection whose hello advertised ``voice_archive``, and then:
 - **unknown** (no connection, no answer in time, a dropped connection, or an answer that
   names another range): the connection is dropped, so no late answer can be misread, and
   the same frozen batch is resent after a bounded backoff;
-- **refused**: archiving for this conversation is fenced, with one content-free marker,
-  until this process restarts; the outbox keeps its rows under its own bound.
+- **refused, transient** (``VOICE_TRANSIENT_REFUSALS``: the companion cannot take it now,
+  and the batch is not wrong): the same frozen batch is retried unchanged after the bounded
+  backoff, with one marker per episode, which the next acknowledgment ends;
+- **refused, integrity** (every other category, including one neither set lists): archiving
+  for this conversation is fenced, with one content-free marker, until this process
+  restarts; the outbox keeps its rows under its own bound.
 
 Realtime never reads the voice session, so no resend is ever keyed on a negative read:
 the only answer that removes a batch is the companion's acknowledgment of it. Nothing here
@@ -29,6 +33,7 @@ from hermes_realtime.integration.bridge import LocalHermesBridgeClient
 from hermes_realtime.integration.voice_tail import ArchiveBatch, VoiceTailWriter
 from hermes_realtime.protocol import (
     VOICE_ARCHIVE_CAPABILITY,
+    VOICE_TRANSIENT_REFUSALS,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -128,6 +133,7 @@ class VoiceArchiveSender:
         self._task: asyncio.Task[None] | None = None
         self._link: VoiceArchiveLink | None = None
         self._fence: str | None = None
+        self._transient = False
         self.sent = 0
         self.resent = 0
 
@@ -174,7 +180,11 @@ class VoiceArchiveSender:
             backoff = min(backoff * 2, self._max_backoff)
 
     async def _exchange(self, event: VoiceArchiveEvent, *, resend: bool) -> str:
-        """Send one batch; return acknowledged, refused, or unknown."""
+        """Send one batch; return acknowledged, transient, refused, or unknown.
+
+        Transient and unknown both keep the frozen batch for an unchanged retry after the
+        bounded backoff; only refused (an integrity category) stops archiving.
+        """
 
         evidence: dict[str, str | int] | None = None
         try:
@@ -201,12 +211,21 @@ class VoiceArchiveSender:
                 evidence = {"outcome": "unknown", "cause": type(error).__name__}
                 return "unknown"
             if type(reply) is VoiceArchiveRefusedEvent and _names(reply, event):
+                if reply.category in VOICE_TRANSIENT_REFUSALS:
+                    # The companion cannot take it now; the batch is not wrong. One marker
+                    # per episode, which the next acknowledgment ends.
+                    if not self._transient:
+                        evidence = {"transient": reply.category}
+                    self._transient = True
+                    return "transient"
+                # Integrity, or a category neither set lists: fail closed to a fence.
                 self._fence = reply.category
                 evidence = {"fence": reply.category}
                 return "refused"
             if type(reply) is VoiceArchiveAckEvent and self._writer.acknowledge(
                 reply.conversation_id, reply.generation, reply.seq_from, reply.seq_through
             ):
+                self._transient = False
                 return "acknowledged"
             # An answer about another range settles nothing about this one.
             await self._drop()

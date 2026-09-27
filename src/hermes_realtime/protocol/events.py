@@ -314,6 +314,26 @@ VOICE_REFUSAL_CATEGORIES = frozenset(
     }
 )
 
+# The categories split into two closed sets whose union is exactly the set above. A
+# transient refusal says the companion cannot take the batch now (not ready, lease, capacity,
+# configuration, an unsettled commit) and never that the archive or the batch is wrong:
+# realtime keeps the frozen batch and retries it unchanged. Every other category says the
+# batch, the archive or its fences are wrong, or the generation is retired: archiving is
+# fenced. A category in neither set is treated as an integrity refusal.
+VOICE_TRANSIENT_REFUSALS = frozenset(
+    {
+        "not_ready", "lease_held", "lease_lost", "conversations", "pending", "stale",
+        "fenced", "incompatible", "durability", "unbound", "bound",
+    }
+)
+VOICE_INTEGRITY_REFUSALS = frozenset(
+    {
+        "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
+        "over_cap", "rotated", "lineage", "count", "recovery", "drift", "quarantined",
+        "tombstoned",
+    }
+)
+
 VoiceConversationId = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 ]

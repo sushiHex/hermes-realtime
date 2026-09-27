@@ -101,6 +101,17 @@ def test_a_changed_or_unprompted_resend_is_counted() -> None:
     assert _SCRIPT._sends(after_ack)["resends_not_after_unknown"] == 1
 
 
+def test_a_resend_after_a_transient_refusal_is_allowed_but_not_after_an_integrity_one() -> None:
+    sent, _, _ = _scenario()
+    transient = copy.deepcopy(sent)
+    transient[0]["outcome"] = "voice_archive_refused:not_ready"
+    integrity = copy.deepcopy(sent)
+    integrity[0]["outcome"] = "voice_archive_refused:partition"
+
+    assert _SCRIPT._sends(transient)["resends_not_after_unknown"] == 0
+    assert _SCRIPT._sends(integrity)["resends_not_after_unknown"] == 1
+
+
 def _evidence() -> dict[str, Any]:
     sent, archived, tail = _scenario()
     fidelity = _SCRIPT._fidelity(_TRUTH, sent, archived, tail) | {"gaps": 2}

@@ -98,6 +98,13 @@ gap, only an assistant row is interrupted) belong to the companion, which refuse
 that breaks them as `invalid` or `partition`. When the outcome is unknown, the companion
 closes the connection without answering; realtime then resends the same frozen batch.
 
+Refusal categories split into two closed sets whose union is the companion's set. A
+transient refusal (`not_ready`, `lease_held`, `lease_lost`, `conversations`, `pending`,
+`stale`, `fenced`, `incompatible`, `durability`, `unbound`, `bound`) never means the archive
+or the batch is wrong: realtime retries the same frozen batch with bounded backoff, with one
+marker per episode. Every other category is an integrity refusal and fences that
+conversation's archiving until realtime restarts; so does a category neither set lists.
+
 ## Voice companion hosting
 
 Registration builds the companion when the environment the gateway runs in names both
