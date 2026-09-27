@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +32,12 @@ from hermes_realtime.protocol import (
 )
 
 _HOST_MARKER = "[voice-companion] "
+_PROBE = Path(__file__).resolve().parents[1] / "support" / "companion_lock_probe.py"
+_FLAGS = (
+    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    if os.name == "nt"
+    else 0
+)
 _TOKEN = "t" * 32
 
 
@@ -92,7 +102,9 @@ async def test_start_checks_compatibility_and_durability_before_any_conversation
 
 
 @pytest.mark.asyncio
-async def test_start_opens_every_known_conversation_in_the_open_order(tmp_path: Path) -> None:
+async def test_start_opens_no_conversation_and_first_contact_runs_the_open_order(
+    tmp_path: Path,
+) -> None:
     hermes = FakeHermes()
     first, store = _service(tmp_path, hermes)
     await first.start()
@@ -104,11 +116,12 @@ async def test_start_opens_every_known_conversation_in_the_open_order(tmp_path: 
     second, store = _service(tmp_path, hermes)
     try:
         await second.start()
-        # The profile's compatibility and durability, then M0's open of the known
-        # conversation: compatibility and durability again, the lease, then verification.
-        assert hermes.calls[:7] == [
-            "check_compatibility",
-            "durability_level",
+        assert hermes.calls == ["check_compatibility", "durability_level"]
+        assert hermes.lease == {}
+        assert type(await second.archive(_event([_row(0)]))) is VoiceArchiveAckEvent
+        # M0's open on first contact: compatibility and durability, the lease (the previous
+        # holder released first), then verification, then the archive itself.
+        assert hermes.calls[2:7] == [
             "check_compatibility",
             "durability_level",
             "release_lease",
@@ -118,6 +131,91 @@ async def test_start_opens_every_known_conversation_in_the_open_order(tmp_path: 
         assert hermes.lease
     finally:
         await second.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_never_refuses_over_the_number_of_bound_conversations(
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
+    from hermes_realtime.companion.store import Progress
+
+    hermes = FakeHermes()
+    service, store = _service(tmp_path, hermes)
+    for index in range(40):
+        store.bind(f"old{index}", f"voice_old{index}", Progress(genesis(EXPECTED_HEADER), None))
+    try:
+        await service.start()
+        assert type(await service.archive(_event([_row(0)]))) is VoiceArchiveAckEvent
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_recovers_in_the_same_process(tmp_path: Path) -> None:
+    hermes = FakeHermes()
+    service, store = _service(tmp_path, hermes)
+    await service.start()
+    try:
+        failures = [OSError("the commit's outcome is unknown")]
+
+        def crash_once() -> None:
+            if failures:
+                raise failures.pop()
+
+        hermes.after_insert = crash_once
+        event = _event([_row(0)])
+        assert await service.archive(event) is None
+        # The resend re-opens the conversation, which settles the pending state first.
+        assert type(await service.archive(event)) is VoiceArchiveAckEvent
+        assert len(hermes.rows[hermes.only()]) == 1
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_lease_recovers_in_the_same_process(tmp_path: Path) -> None:
+    hermes = FakeHermes()
+    service, store = _service(tmp_path, hermes)
+    await service.start()
+    try:
+        assert type(await service.archive(_event([_row(0)]))) is VoiceArchiveAckEvent
+        session_id = hermes.only()
+        hermes.lease[session_id] = "a foreign holder that took the lease"
+        refused = await service.archive(_event([_row(1)], seq_from=1))
+        assert type(refused) is VoiceArchiveRefusedEvent
+        assert refused.category == "lease_lost"
+        del hermes.lease[session_id]
+        assert type(await service.archive(_event([_row(1)], seq_from=1))) is VoiceArchiveAckEvent
+    finally:
+        await service.close()
+        store.close()
+
+
+def test_binding_is_bounded_and_fails_closed_at_the_limit(tmp_path: Path) -> None:
+    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
+    from hermes_realtime.companion.store import MAX_BOUND_CONVERSATIONS, Progress
+
+    assert MAX_BOUND_CONVERSATIONS >= 1024
+    store = CompanionStore(tmp_path / "companion.db")
+    try:
+        creation = Progress(genesis(EXPECTED_HEADER), None)
+        store._connection.executemany(  # Fill to the limit without one call per row.
+            "INSERT INTO voice_archive (conversation_id, session_id, pending_count, "
+            "pending_chain) VALUES (?, ?, 0, ?)",
+            [
+                (f"c{index}", f"voice_c{index}", creation.fingerprint.chain)
+                for index in range(MAX_BOUND_CONVERSATIONS - 1)
+            ],
+        )
+        store.bind("last", "voice_last", creation)
+        with pytest.raises(ArchiveRefusal, match="conversations"):
+            store.bind("over", "voice_over", creation)
+        assert store.read("over") is None
+    finally:
         store.close()
 
 
@@ -165,7 +263,11 @@ async def test_an_archive_is_committed_then_acknowledged_with_its_exact_range(
     ],
 )
 async def test_a_batch_that_does_not_partition_its_range_is_refused_whole(
-    tmp_path: Path, rows: list[VoiceArchiveRow], seq_from: int, category: str
+    tmp_path: Path,
+    rows: list[VoiceArchiveRow],
+    seq_from: int,
+    category: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     hermes = FakeHermes()
     service, store = _service(tmp_path, hermes)
@@ -175,6 +277,11 @@ async def test_a_batch_that_does_not_partition_its_range_is_refused_whole(
         assert type(reply) is VoiceArchiveRefusedEvent
         assert reply.category == category
         assert all(not rows for rows in hermes.rows.values())
+        # A row M0's types refuse leaves one bounded marker: category and count only.
+        expected = [{"refusal": "invalid", "rows": len(rows), "version": 1}]
+        output = capsys.readouterr().out
+        assert _markers(output, _HOST_MARKER) == (expected if category == "invalid" else [])
+        assert "row " not in output
     finally:
         await service.close()
         store.close()
@@ -209,21 +316,6 @@ async def test_an_unknown_outcome_is_answered_with_nothing(tmp_path: Path) -> No
         assert await service.archive(_event([_row(0)])) is None
     finally:
         await service.close()
-        store.close()
-
-
-def test_the_known_conversations_are_listed_whole_or_refused(tmp_path: Path) -> None:
-    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
-    from hermes_realtime.companion.store import Progress
-
-    store = CompanionStore(tmp_path / "companion.db")
-    try:
-        for name in ("b", "a"):
-            store.bind(name, f"voice_{name}", Progress(genesis(EXPECTED_HEADER), None))
-        assert store.conversation_ids(2) == ("a", "b")
-        with pytest.raises(ArchiveRefusal, match="conversations"):
-            store.conversation_ids(1)
-    finally:
         store.close()
 
 
@@ -313,6 +405,74 @@ def test_multiplexing_is_refused_while_a_companion_is_owned(
         assert third.wait_ready(5.0) is True
     finally:
         third.close()
+
+
+def _probe(mode: str, data_dir: Path, control: Path, port: int) -> subprocess.Popen[bytes]:
+    environment = dict(os.environ) | {
+        "HERMES_REALTIME_COMPANION_PORT": str(port),
+        "HERMES_REALTIME_COMPANION_TOKEN": _TOKEN,
+    }
+    return subprocess.Popen(
+        (sys.executable, str(_PROBE), mode, str(data_dir), str(control)),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+        creationflags=_FLAGS,
+    )
+
+
+def test_a_second_process_finding_the_profile_owned_stands_down(tmp_path: Path) -> None:
+    import socket
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = int(listener.getsockname()[1])
+    data_dir, control = tmp_path / "plugin-data", tmp_path / "control"
+    data_dir.mkdir()
+    control.mkdir()
+    holder = _probe("hold", data_dir, control, port)
+    try:
+        deadline = time.monotonic() + 30
+        while not (control / "ready").exists():
+            assert holder.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        contender = _probe("contend", data_dir, control, port)
+        output = contender.communicate(timeout=60)[0].decode("utf-8", "replace")
+    finally:
+        (control / "stop").write_text("stop", encoding="utf-8")
+        holder.wait(timeout=60)
+
+    # The contender touched no lease, row, store or port, and left nothing to unload.
+    assert _markers(output, "[probe] ") == [
+        {"owned": False, "open_port": 0, "hermes_calls": 0, "unload_callbacks": 0}
+    ]
+    assert _markers(output, _HOST_MARKER) == [{"refusal": "held", "version": 1}]
+    assert holder.returncode == 0
+    # Once the owner unloads, the profile can be owned again.
+    successor = _probe("contend", data_dir, control, port)
+    later = successor.communicate(timeout=60)[0].decode("utf-8", "replace")
+    assert _markers(later, "[probe] ") == [
+        {"owned": True, "open_port": 1, "hermes_calls": 2, "unload_callbacks": 1}
+    ]
+
+
+def test_the_profile_lock_is_taken_before_anything_and_held_until_close(
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    host = _host(tmp_path, FakeHermes(), [])
+    store_path = tmp_path / "companion.db"
+    assert host.start() is True
+    try:
+        assert host.wait_ready(5.0)
+        assert lock_run_record(store_path) is None
+    finally:
+        host.close()
+    descriptor = lock_run_record(store_path)
+    assert descriptor is not None
+    unlock_run_record(descriptor)
 
 
 def test_close_releases_every_lease_and_stops_the_loop_thread(tmp_path: Path) -> None:

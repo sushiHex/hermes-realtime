@@ -181,6 +181,32 @@ def test_a_second_registration_while_one_is_owned_refuses_to_multiplex(
     assert _markers(capsys.readouterr().out) == [{"refusal": "multiplexed", "version": 1}]
 
 
+def test_a_failed_close_keeps_the_companion_owned_for_a_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Stuck:
+        def __init__(self) -> None:
+            self.failures = 1
+            self.closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("the companion did not stop before the close timeout")
+
+    stuck = Stuck()
+    monkeypatch.setattr(hermes_plugin, "_companion", stuck)
+
+    with pytest.raises(RuntimeError, match="close timeout"):
+        hermes_plugin._close_companion()
+    assert hermes_plugin._companion is stuck
+
+    hermes_plugin._close_companion()
+    assert hermes_plugin._companion is None
+    assert stuck.closes == 2
+
+
 def test_the_companion_bridge_refuses_the_wrong_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hermes: FakeHermes
 ) -> None:

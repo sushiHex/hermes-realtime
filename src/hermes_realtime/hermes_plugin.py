@@ -80,9 +80,11 @@ def register(context: object) -> None:
             bridge_factory=lambda service: _companion_bridge(endpoint, service),
         )
         try:
-            companion.start()
+            started = companion.start()
         except RuntimeError:
             return  # Multiplexing: the refusal marker is already printed.
+        if not started:
+            return  # Another process owns this profile's companion; the marker is printed.
         _companion = companion
         on_unload(_close_companion)
 
@@ -99,11 +101,20 @@ def _companion_bridge(
 
 
 def _close_companion() -> None:
+    """Close the owned companion; forget it only once its close has returned.
+
+    A close that times out or raises leaves the host owned (its bridge and leases may still
+    be live), so the reference is kept for a later unload to retry.
+    """
+
     global _companion
     with _lock:
-        companion, _companion = _companion, None
-    if companion is not None:
+        companion = _companion
+        if companion is None:
+            return
         companion.close()
+        if _companion is companion:
+            _companion = None
 
 
 def get_dispatcher() -> HermesPluginDispatcher:

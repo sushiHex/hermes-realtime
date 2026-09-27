@@ -31,6 +31,8 @@ _SCHEMA_VERSION = 3
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
+# A generous bound on stored conversations: each is one row of fences and progress.
+MAX_BOUND_CONVERSATIONS = 4096
 # Categories a durable quarantine may record: the archive no longer matches its evidence.
 QUARANTINE_CATEGORIES = frozenset(
     {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage", "count"}
@@ -191,19 +193,6 @@ class CompanionStore:
             holder=row[12],
         )
 
-    def conversation_ids(self, limit: int) -> tuple[str, ...]:
-        """Every bound conversation, refusing more than ``limit`` rather than truncating."""
-
-        if type(limit) is not int or limit < 1:
-            raise ValueError("limit must be a positive exact int")
-        rows = self._connection.execute(
-            "SELECT conversation_id FROM voice_archive ORDER BY conversation_id LIMIT ?",
-            (limit + 1,),
-        ).fetchall()
-        if len(rows) > limit:
-            raise ArchiveRefusal("conversations")
-        return tuple(row[0] for row in rows)
-
     def read(self, conversation_id: str) -> ConversationRecord | None:
         return self._step(  # type: ignore[no-any-return]
             conversation_id, lambda row: None if row is None else self._record(row)
@@ -227,6 +216,10 @@ class CompanionStore:
                 "SELECT 1 FROM voice_archive WHERE session_id = ?", (session_id,)
             ).fetchone():
                 raise ArchiveRefusal("bound")
+            (bound,) = self._connection.execute("SELECT COUNT(*) FROM voice_archive").fetchone()
+            if bound >= MAX_BOUND_CONVERSATIONS:
+                # Fails closed on binding, never at start; forget (M3) prunes.
+                raise ArchiveRefusal("conversations")
             self._connection.execute(
                 "INSERT INTO voice_archive (conversation_id, session_id, pending_count, "
                 "pending_chain, pending_generation, pending_seq) VALUES (?, ?, ?, ?, ?, ?)",
