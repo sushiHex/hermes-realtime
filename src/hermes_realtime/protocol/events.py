@@ -287,3 +287,121 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
     if isinstance(data, (str, bytes)):
         return _EVENT_ADAPTER.validate_json(data)
     return _EVENT_ADAPTER.validate_python(data)
+
+
+# --- bridge protocol 0.2: capability negotiation and the voice archive ---------------------
+#
+# The bridge hello names protocol "0.2" and the capabilities each side offers; realtime sends
+# a voice event only on a connection whose hello advertised ``voice_archive``. Voice events
+# carry no Hermes session, event id or sequence: one batch is in flight per conversation, so
+# its exact range correlates the reply. Semantic batch rules (the partition of the range by
+# rows and gaps, which role may carry a gap or a flag) are the companion's, which answers
+# them with a category refusal rather than a dropped connection.
+
+BRIDGE_PROTOCOL_VERSION = "0.2"
+VOICE_ARCHIVE_CAPABILITY = "voice_archive"
+BRIDGE_CAPABILITIES = frozenset({VOICE_ARCHIVE_CAPABILITY})
+VOICE_MAX_BATCH_ROWS = 256
+VOICE_MAX_TEXT_CHARS = 65_536
+_VOICE_MAX_IDENTITY = 2**53 - 1
+# Every category the companion may refuse with; a test binds this to the companion's set.
+VOICE_REFUSAL_CATEGORIES = frozenset(
+    {
+        "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
+        "over_cap", "rotated", "lineage", "count", "recovery", "drift", "incompatible",
+        "durability", "lease_lost", "lease_held", "not_ready", "fenced", "quarantined",
+        "tombstoned", "pending", "stale", "unbound", "bound", "conversations",
+    }
+)
+
+VoiceConversationId = Annotated[
+    str, StringConstraints(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+]
+VoiceIdentity = Annotated[int, Field(ge=0, le=_VOICE_MAX_IDENTITY)]
+VoiceRefusalCategory = Literal[
+    "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
+    "over_cap", "rotated", "lineage", "count", "recovery", "drift", "incompatible",
+    "durability", "lease_lost", "lease_held", "not_ready", "fenced", "quarantined",
+    "tombstoned", "pending", "stale", "unbound", "bound", "conversations",
+]
+
+
+def _parse_wire_timestamp(value: object) -> object:
+    # Hermes stores a float; an integer would be a different stored value.
+    if type(value) is not float:
+        raise ValueError("ts must be an exact float")
+    return value
+
+
+def _parse_wire_gap(value: object) -> object:
+    # A JSON-style dict carries the interval as a list; strict mode wants the tuple.
+    return tuple(value) if type(value) is list else value
+
+
+WireVoiceGap = Annotated[
+    tuple[VoiceIdentity, VoiceIdentity] | None, BeforeValidator(_parse_wire_gap)
+]
+WireVoiceTimestamp = Annotated[
+    float, BeforeValidator(_parse_wire_timestamp), Field(ge=0, allow_inf_nan=False)
+]
+
+
+class VoiceArchiveRow(StrictModel):
+    """One closed voice row: its seq, role, exact heard text, flag, close time and gap."""
+
+    seq: VoiceIdentity
+    role: Literal["user", "assistant"]
+    text: Annotated[str, StringConstraints(min_length=1, max_length=VOICE_MAX_TEXT_CHARS)]
+    interrupted: bool
+    ts: WireVoiceTimestamp
+    gap_before: WireVoiceGap
+
+
+class _VoiceRange(StrictModel):
+    protocol_version: Literal["0.2"] = "0.2"
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+    seq_from: VoiceIdentity
+    seq_through: VoiceIdentity
+
+    @model_validator(mode="after")
+    def require_ordered_range(self) -> _VoiceRange:
+        if self.seq_from > self.seq_through:
+            raise ValueError("seq_from must not follow seq_through")
+        return self
+
+
+class VoiceArchiveEvent(_VoiceRange):
+    """Archive these rows, which with their gaps cover exactly ``[seq_from, seq_through]``."""
+
+    type: Literal["voice_archive"]
+    rows: list[VoiceArchiveRow] = Field(min_length=1, max_length=VOICE_MAX_BATCH_ROWS)
+
+
+class VoiceArchiveAckEvent(_VoiceRange):
+    """The archive provably holds exactly this range: sent only after the commit."""
+
+    type: Literal["voice_archive_ack"]
+
+
+class VoiceArchiveRefusedEvent(_VoiceRange):
+    """A definitive refusal of exactly this batch, by category; never a negative read."""
+
+    type: Literal["voice_archive_refused"]
+    category: VoiceRefusalCategory
+
+
+VoiceEvent: TypeAlias = Annotated[
+    VoiceArchiveEvent | VoiceArchiveAckEvent | VoiceArchiveRefusedEvent,
+    Field(discriminator="type"),
+]
+_VOICE_ADAPTER: TypeAdapter[VoiceEvent] = TypeAdapter(VoiceEvent)
+VOICE_EVENT_TYPES = frozenset({"voice_archive", "voice_archive_ack", "voice_archive_refused"})
+
+
+def parse_voice_event(data: str | bytes | dict[str, Any]) -> VoiceEvent:
+    """Parse a voice event and fail closed on unknown versions, types, or fields."""
+
+    if isinstance(data, (str, bytes)):
+        return _VOICE_ADAPTER.validate_json(data)
+    return _VOICE_ADAPTER.validate_python(data)
