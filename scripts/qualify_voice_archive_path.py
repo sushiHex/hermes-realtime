@@ -7,9 +7,13 @@ One unattended command:
 It provisions the baseline Hermes, then runs two kinds of real process against one
 throwaway Hermes home, with this repository's ``src`` on ``sys.path``:
 
-- the **companion**: Hermes's own interpreter calls this plugin's real ``register`` with a
-  stand-in plugin context; registration builds the companion, whose owned start binds the
-  profile's real ``state.db`` and serves the bridge on a loopback port;
+- the **companion**: Hermes's own interpreter runs Hermes's real ``PluginManager``, which
+  discovers the plugin's entry point, finds it enabled in the home's ``config.yaml`` and
+  registers it with a real ``PluginContext``; registration builds the companion, whose owned
+  start takes the profile lock, keeps its store in Hermes's plugin data directory, binds the
+  profile's real ``state.db`` and serves the bridge on a loopback port. A second companion
+  process, registered the same way while the first owns the profile, must stand down; the
+  manager's unload closes the owner;
 - **realtime**: this repository's interpreter drives a real context store, voice tail and
   archive sender through synthetic speech, in steps that stop, crash and restart it.
 
@@ -26,8 +30,9 @@ the malformed batch is refused with no mutation.
 
 Criterion 4 (no negative reads): realtime opens no connection but the companion's bridge
 (so 0 reads of the messages route, and no HTTP at all), and every resend is the unchanged
-frozen batch, sent only after an unknown outcome. The connection witness is positive
-controlled: it must observe realtime's bridge connections.
+frozen batch, sent only after an unknown outcome. Both witnesses are positive controlled:
+the connection witness must observe realtime's bridge connections (the crashing step's
+included), and the messages-route witness must count one deliberate read in a control step.
 
 The output is one content-free evidence line: counts and categories only.
 """
@@ -211,6 +216,9 @@ def _passed(evidence: dict[str, Any], hermes: dict[str, object]) -> bool:
         and reads["foreign_connections"] == 0
         and reads["http_requests"] == 0
         and reads["messages_route_reads"] == 0
+        and evidence["control"]["messages_route_reads"] == 1
+        and evidence["control"]["http_requests"] >= 1
+        and evidence["stood_down"] == {"held_markers": 1, "owned": 0}
         and evidence["steps"] == _EXPECTED_STEPS
     )
 
@@ -218,12 +226,14 @@ def _passed(evidence: dict[str, Any], hermes: dict[str, object]) -> bool:
 _EXPECTED_STEPS = {
     "fill": _CRASHED,
     "companion_ready": 1,
+    "second_process": 0,
     "drain": 0,
     "companion_unloaded": 0,
     "trailing": 0,
     "companion_ready_again": 1,
     "settle": 0,
     "companion_unloaded_again": 0,
+    "control": 0,
 }
 
 
@@ -261,13 +271,15 @@ def _run(python: Path, home: Path, port: int, token: str, *arguments: str) -> in
 class _Companion:
     """The companion process: detached, its output logged, stopped through a file."""
 
-    def __init__(self, python: Path, home: Path, port: int, token: str) -> None:
+    def __init__(
+        self, python: Path, home: Path, port: int, token: str, mode: str = "own"
+    ) -> None:
         self.home = home
         (home / "ready").unlink(missing_ok=True)
         (home / "stop").unlink(missing_ok=True)
         log = (home / "companion-output.log").open("ab")
         self.process = subprocess.Popen(
-            (str(python), __file__, "--step", "companion", "--home", str(home)),
+            (str(python), __file__, "--step", "companion", mode, "--home", str(home)),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
@@ -297,7 +309,8 @@ class _Companion:
 
 
 def _archived(hermes_home: Path) -> list[dict[str, Any]]:
-    uri = (hermes_home / "plugin-data" / "voice-companion.db").as_uri()
+    (store_path,) = (hermes_home / "plugin-data").rglob("voice-companion.db")
+    uri = store_path.as_uri()
     with contextlib.closing(sqlite3.connect(f"{uri}?mode=ro", uri=True)) as store:
         (session_id,) = store.execute(
             "SELECT session_id FROM voice_archive WHERE conversation_id = ?", (_CONVERSATION,)
@@ -338,11 +351,16 @@ def _qualify(hermes_python: Path) -> None:
         realtime.mkdir()
         port, token = available_port(), secrets.token_urlsafe(32)
         python = Path(sys.executable)
+        _install_plugin(hermes_home)
         companion: _Companion | None = None
         try:
             steps["fill"] = _run(python, realtime, port, token, "fill", str(port))
             companion = _Companion(hermes_python, hermes_home, port, token)
             steps["companion_ready"] = companion.ready()
+            # Hermes discovers plugins in every process: a second one must stand down.
+            steps["second_process"] = _Companion(
+                hermes_python, hermes_home, port, token, "contend"
+            ).process.wait(timeout=_STEP_TIMEOUT_SECONDS)
             steps["drain"] = _run(python, realtime, port, token, "drain", str(port))
             steps["companion_unloaded"] = companion.stop()
             steps["trailing"] = _run(python, realtime, port, token, "trailing", str(port))
@@ -352,6 +370,7 @@ def _qualify(hermes_python: Path) -> None:
             steps["settle"] = _run(python, realtime, port, token, "settle", str(port))
             steps["companion_unloaded_again"] = companion.stop()
             companion = None
+            steps["control"] = _run(python, realtime, port, token, "control", str(port))
             archived = _archived(hermes_home)
             truth = json.loads((realtime / "truth.json").read_text(encoding="utf-8"))
             sent = [
@@ -369,6 +388,12 @@ def _qualify(hermes_python: Path) -> None:
                 "mutations": len(archived) - before,
             }
             evidence["reads"] = _reads(realtime)
+            evidence["control"] = json.loads(
+                (realtime / "control.json").read_text(encoding="utf-8")
+            )
+            evidence["stood_down"] = json.loads(
+                (hermes_home / "contend.json").read_text(encoding="utf-8")
+            )
             evidence["steps"] = steps
             version = (hermes_home / "hermes-version.txt").read_text(encoding="utf-8").strip()
             identity = installed_hermes_identity(version, PINNED_HERMES / "source")
@@ -403,46 +428,70 @@ def _reads(realtime: Path) -> dict[str, int]:
 # --- the companion process (Hermes's interpreter) --------------------------------------------
 
 
-class _State:
-    def __init__(self, data_dir: Path) -> None:
-        self.data_dir = data_dir
+_DISTRIBUTION = "hermes_realtime_qualify-0.0.0.dist-info"
 
 
-class _Context:
-    """The part of Hermes's PluginContext the plugin uses; everything else is Hermes's own."""
+def _install_plugin(hermes_home: Path) -> None:
+    """Enable the plugin in Hermes's config and name its entry point in a distribution that
+    only the companion processes put on their path: nothing is installed into the pinned
+    environment."""
 
-    def __init__(self, data_dir: Path) -> None:
-        self.state = _State(data_dir)
-        self.unload: list[Any] = []
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hermes-realtime\n", encoding="utf-8"
+    )
+    dist = hermes_home / "dist" / _DISTRIBUTION
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hermes-realtime-qualify\nVersion: 0.0.0\n",
+        encoding="utf-8",
+    )
+    (dist / "entry_points.txt").write_text(
+        "[hermes_agent.plugins]\nhermes-realtime = hermes_realtime.hermes_plugin\n",
+        encoding="utf-8",
+    )
 
-    @property
-    def subagent_lifecycle(self) -> object:
-        return object()
 
-    def on_unload(self, callback: Any) -> object:
-        self.unload.append(callback)
-        return object()
+def _companion(home: Path, mode: str) -> None:
+    """Hermes's own PluginManager discovers, enables and registers the plugin, which puts the
+    companion's store in Hermes's plugin data directory; unload runs its on_unload."""
 
-
-def _companion(home: Path) -> None:
     sys.path.insert(0, str(_SRC))
+    sys.path.insert(0, str(home / "dist"))
+    import contextlib as _contextlib
+    import io
 
     import hermes_cli  # type: ignore[import-not-found]
-
-    from hermes_realtime import hermes_plugin
+    from hermes_cli.plugins import (  # type: ignore[import-not-found]
+        discover_plugins,
+        get_plugin_manager,
+    )
 
     (home / "hermes-version.txt").write_text(hermes_cli.__version__, encoding="utf-8")
-    context = _Context(home / "plugin-data")
-    hermes_plugin.register(context)
+    captured = io.StringIO()
+    with _contextlib.redirect_stdout(captured):
+        discover_plugins()
+    sys.stdout.write(captured.getvalue())
+    from hermes_realtime import hermes_plugin
+
     companion = hermes_plugin._companion
+    if mode == "contend":
+        held = sum(
+            line == '[voice-companion] {"refusal":"held","version":1}'
+            for line in captured.getvalue().splitlines()
+        )
+        result = {"held_markers": held, "owned": int(companion is not None)}
+        (home / "contend.json").write_text(json.dumps(result), encoding="utf-8")
+        get_plugin_manager().unload()
+        return
     if companion is None or not companion.wait_ready(_READY_TIMEOUT_SECONDS):
         raise SystemExit(2)
     (home / "ready").write_text("ready", encoding="utf-8")
     deadline = time.monotonic() + 900
     while not (home / "stop").exists() and time.monotonic() < deadline:
         time.sleep(0.1)
-    for callback in context.unload:
-        callback()
+    get_plugin_manager().unload()
+    if hermes_plugin._companion is not None:
+        raise SystemExit(3)
     (home / "ready").unlink(missing_ok=True)
 
 
@@ -623,6 +672,8 @@ async def _realtime(home: Path, step: str, port: int, audit: _Audit) -> None:
             frozen = VoiceArchiveEvent(protocol_version="0.2", type="voice_archive", **batch)
             (home / "frozen.json").write_text(frozen.model_dump_json(), encoding="utf-8")
             truth_path.write_text(json.dumps(truth), encoding="utf-8")
+            with (home / "audit.jsonl").open("a", encoding="utf-8") as record:
+                record.write(json.dumps(audit.counts) + "\n")
             os._exit(_CRASHED)  # A crash: no close, no final write.
         sender.start()
         if step == "drain":
@@ -681,6 +732,38 @@ def _realtime_step(home: Path, step: str, port: int) -> None:
             record.write(json.dumps(audit.counts) + "\n")
 
 
+def _control(home: Path) -> None:
+    """The witness's positive control: one deliberate read of a messages route, counted."""
+
+    import http.client
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - the standard library's name
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_arguments: object) -> None:
+            return None
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    audit = _Audit(-1)
+    sys.addaudithook(audit)
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        connection.request("GET", "/api/sessions/voice/messages")
+        connection.getresponse().read()
+        connection.close()
+    finally:
+        server.shutdown()
+        (home / "control.json").write_text(json.dumps(audit.counts), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--step", nargs="+", help=argparse.SUPPRESS)
@@ -689,7 +772,9 @@ def main() -> None:
     if args.step is None:
         _qualify(provision_pinned_hermes())
     elif args.step[0] == "companion":
-        _companion(args.home)
+        _companion(args.home, args.step[1])
+    elif args.step[0] == "control":
+        _control(args.home)
     else:
         step, port = args.step
         _realtime_step(args.home, step, int(port))

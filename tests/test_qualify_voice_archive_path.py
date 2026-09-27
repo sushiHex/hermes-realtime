@@ -123,6 +123,9 @@ def _evidence() -> dict[str, Any]:
         "reads": {"bridge_connections": 3, "foreign_connections": 0, "http_requests": 0,
                   "messages_route_reads": 0},
         "steps": dict(_SCRIPT._EXPECTED_STEPS),
+        "control": {"bridge_connections": 0, "foreign_connections": 1, "http_requests": 1,
+                    "messages_route_reads": 1},
+        "stood_down": {"held_markers": 1, "owned": 0},
     }
 
 
@@ -155,6 +158,11 @@ def test_the_expected_evidence_passes_only_on_the_baseline() -> None:
         ("partition", "mutations", 1),
         ("partition", "category", "accepted"),
         ("steps", "drain", 1),
+        ("steps", "second_process", 1),
+        ("control", "messages_route_reads", 0),
+        ("control", "http_requests", 0),
+        ("stood_down", "held_markers", 0),
+        ("stood_down", "owned", 1),
     ],
 )
 def test_every_guard_can_fail_the_qualification(section: str, key: str, value: object) -> None:
