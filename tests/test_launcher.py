@@ -2073,6 +2073,115 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
     )
 
 
+def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> list[object]:
+    from hermes_realtime.integration.voice_archive import VoiceArchiveSender
+
+    connectors: list[object] = []
+
+    class RecordingSender(VoiceArchiveSender):
+        def start(self) -> None:
+            events.append("archive:start")
+            super().start()
+
+        async def close(self) -> None:
+            events.append("archive:close")
+            await super().close()
+
+    def connector(*, host: str, port: int, token: str) -> object:
+        connectors.append((host, port, token))
+
+        async def unreachable() -> object:
+            raise ConnectionRefusedError("no companion in this test")
+
+        return unreachable
+
+    from hermes_realtime.integration import voice_archive as voice_archive_module
+
+    # The harness records on a tail subclass; the sender checks the exact type it gets.
+    monkeypatch.setattr(
+        voice_archive_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
+    )
+    monkeypatch.setattr(host_launcher_module, "VoiceArchiveSender", RecordingSender)
+    monkeypatch.setattr(host_launcher_module, "bridge_connector", connector)
+    return connectors
+
+
+@pytest.mark.asyncio
+async def test_full_host_archives_through_the_companion_after_the_tail_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    connectors = _recording_sender(monkeypatch, harness.events)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+
+    await launcher.start()
+    try:
+        assert harness.events == ["tail:open", "archive:start", "preflight", "runtime:start"]
+        assert connectors == [("127.0.0.1", 8766, "companion-token-with-enough-entropy")]
+    finally:
+        await launcher.close()
+
+    # The sender stops before the tail's final write.
+    assert harness.events[4:] == ["actions:closed", "archive:close", "tail:close"]
+
+
+def test_full_host_refuses_a_companion_without_a_voice_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+
+    with pytest.raises(ValueError, match="voice tail"):
+        harness.build(voice_companion=endpoint)
+    with pytest.raises(TypeError, match="voice_companion"):
+        harness.build(voice_tail=Path("tail.json"), voice_companion=("port", "token"))
+
+
+@pytest.mark.parametrize(
+    ("lines", "environ", "expected"),
+    [
+        ([], {}, None),
+        (
+            ["HERMES_REALTIME_COMPANION_PORT=8766",
+             "HERMES_REALTIME_COMPANION_TOKEN='companion-token-with-enough-entropy'"],
+            {},
+            (8766, "companion-token-with-enough-entropy"),
+        ),
+        (
+            None,
+            {"HERMES_REALTIME_COMPANION_PORT": "8767",
+             "HERMES_REALTIME_COMPANION_TOKEN": "companion-token-with-enough-entropy"},
+            (8767, "companion-token-with-enough-entropy"),
+        ),
+    ],
+)
+def test_the_companion_endpoint_comes_from_the_hermes_env_file_or_environment(
+    tmp_path: Path, lines: list[str] | None, environ: dict[str, str], expected: object
+) -> None:
+    env_file = None
+    if lines is not None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("\n".join(["API_SERVER_KEY=x", *lines]) + "\n", encoding="utf-8")
+
+    endpoint = host_launcher_module._load_voice_companion(env_file, environ)
+
+    assert (None if endpoint is None else (endpoint.port, endpoint.token)) == expected
+
+
+def test_a_partial_companion_endpoint_fails_start_closed(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("HERMES_REALTIME_COMPANION_PORT=8766\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="companion"):
+        host_launcher_module._load_voice_companion(env_file, {})
+
+
 @pytest.mark.asyncio
 async def test_full_host_start_failure_after_the_tail_opened_releases_it(
     monkeypatch: pytest.MonkeyPatch,

@@ -55,6 +55,7 @@ from hermes_realtime.client import (
     TailnetPeerAuthorizer,
     TailscaleCliWhoIsResolver,
 )
+from hermes_realtime.companion.host import CompanionEndpoint, companion_endpoint
 from hermes_realtime.conversation import (
     DEFAULT_MAX_RESPONSE_SEGMENTS,
     ConversationContextStore,
@@ -100,6 +101,7 @@ from hermes_realtime.integration import (
     HermesApiTaskSession,
     HermesRestartSettlement,
 )
+from hermes_realtime.integration.voice_archive import VoiceArchiveSender, bridge_connector
 from hermes_realtime.integration.voice_tail import VoiceTailWriter
 from hermes_realtime.launcher import (
     ConversationOnlyTaskSession,
@@ -1500,6 +1502,25 @@ def _load_api_bearer(env_file: Path | None) -> str:
     return matches[0]
 
 
+def _load_voice_companion(
+    env_file: Path | None, environment: Mapping[str, str]
+) -> CompanionEndpoint | None:
+    """The companion endpoint from the Hermes env file the gateway also reads, or the
+    environment; None when unconfigured. A partial or malformed one fails closed."""
+
+    if env_file is None:
+        return companion_endpoint(environment)
+    values: dict[str, str] = {}
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        for name in ("HERMES_REALTIME_COMPANION_PORT", "HERMES_REALTIME_COMPANION_TOKEN"):
+            if line.startswith(name + "="):
+                if name in values:
+                    raise ValueError("the companion endpoint is set twice")
+                values[name] = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return companion_endpoint(values)
+
+
 def _load_hermes_context(context_file: Path | None) -> HermesRepresentativeContext | None:
     if context_file is None:
         return None
@@ -1837,10 +1858,13 @@ def build_local_host_launcher(
     evidence_database: Path | None = None,
     hermes_run_record: Path | None = None,
     voice_tail: Path | None = None,
+    voice_companion: CompanionEndpoint | None = None,
 ) -> LocalBrowserLauncher:
     """Compose the explicit full host without provider fallback.
 
     ``voice_tail`` names the durable heard-context file; None disables it.
+    ``voice_companion`` names the Hermes companion that archives the tail's outbox;
+    None archives nothing. Archiving needs the tail, whose outbox it drains.
     """
 
     qualification_dependencies = _current_qualification_full_host_dependencies()
@@ -1855,6 +1879,11 @@ def build_local_host_launcher(
         raise TypeError("hermes_run_record must be a pathlib Path or None")
     if voice_tail is not None and not isinstance(voice_tail, Path):
         raise TypeError("voice_tail must be a pathlib Path or None")
+    if voice_companion is not None:
+        if type(voice_companion) is not CompanionEndpoint:
+            raise TypeError("voice_companion must be an exact CompanionEndpoint or None")
+        if voice_tail is None:
+            raise ValueError("archiving through the companion needs a voice tail")
     if qualification_no_hermes_tasks:
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
@@ -2060,6 +2089,17 @@ def build_local_host_launcher(
 
     # The store owns the heard conversation; the tail only mirrors its durable view.
     voice_tail_writer = VoiceTailWriter(voice_tail) if voice_tail is not None else None
+    # Off the voice path: it only waits on the tail's frozen batches and the companion.
+    voice_archive_sender = (
+        VoiceArchiveSender(
+            voice_tail_writer,
+            bridge_connector(
+                host="127.0.0.1", port=voice_companion.port, token=voice_companion.token
+            ),
+        )
+        if voice_tail_writer is not None and voice_companion is not None
+        else None
+    )
     context = ConversationContextStore(
         on_change=voice_tail_writer.update if voice_tail_writer is not None else None,
     )
@@ -2583,6 +2623,8 @@ def build_local_host_launcher(
         if voice_tail_writer is not None:
             # Before preflight and so before any turn: the conversation resumes heard-first.
             await voice_tail_writer.open(context)
+        if voice_archive_sender is not None:
+            voice_archive_sender.start()
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2689,6 +2731,8 @@ def build_local_host_launcher(
             readiness_cue_tasks,
             work_close_owner,
             # After the runtime closed actions and speech, so the final flag is written.
+            # Before the tail, so no acknowledgment races its final write.
+            *((voice_archive_sender,) if voice_archive_sender is not None else ()),
             *((voice_tail_writer,) if voice_tail_writer is not None else ()),
             *((knowledge_coordinator,) if knowledge_coordinator is not None else ()),
             synthesizer,
@@ -2736,6 +2780,9 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         None
         if qualification_no_hermes_tasks
         else _resolve_voice_tail_path(args.voice_tail, os.environ)
+    )
+    voice_companion = (
+        None if qualification_no_hermes_tasks else _load_voice_companion(env_file, os.environ)
     )
     shutdown_requested = asyncio.Event()
     checkpoint_failures: list[BaseException] = []
@@ -2806,6 +2853,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             evidence_database=evidence_database,
             hermes_run_record=hermes_run_record,
             voice_tail=voice_tail,
+            voice_companion=voice_companion,
             ),
         )
     except BaseException:
