@@ -216,6 +216,15 @@ def read_projection(db: Any, session_id: str, cap: int) -> Projection | None:
     )
 
 
+def open_session_db() -> Any:
+    """The active profile's ``state.db``, exactly as Hermes itself resolves it.
+
+    Called once per owned start, so the companion binds one profile's database for its life.
+    """
+
+    return resolve("SessionDB")()
+
+
 def create_voice_session(db: Any, session_id: str) -> None:
     """Create the voice session.
 

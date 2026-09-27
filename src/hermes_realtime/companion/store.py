@@ -191,6 +191,19 @@ class CompanionStore:
             holder=row[12],
         )
 
+    def conversation_ids(self, limit: int) -> tuple[str, ...]:
+        """Every bound conversation, refusing more than ``limit`` rather than truncating."""
+
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive exact int")
+        rows = self._connection.execute(
+            "SELECT conversation_id FROM voice_archive ORDER BY conversation_id LIMIT ?",
+            (limit + 1,),
+        ).fetchall()
+        if len(rows) > limit:
+            raise ArchiveRefusal("conversations")
+        return tuple(row[0] for row in rows)
+
     def read(self, conversation_id: str) -> ConversationRecord | None:
         return self._step(  # type: ignore[no-any-return]
             conversation_id, lambda row: None if row is None else self._record(row)
