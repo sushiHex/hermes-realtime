@@ -1,6 +1,14 @@
 """Public conversation-event protocol."""
 
 from .events import (
+    BRIDGE_CAPABILITIES,
+    BRIDGE_PROTOCOL_VERSION,
+    VOICE_ARCHIVE_CAPABILITY,
+    VOICE_EVENT_TYPES,
+    VOICE_INTEGRITY_REFUSALS,
+    VOICE_MAX_BATCH_ROWS,
+    VOICE_REFUSAL_CATEGORIES,
+    VOICE_TRANSIENT_REFUSALS,
     CancelScope,
     ControlCancelAcknowledgedEvent,
     ControlCancelAcknowledgedPayload,
@@ -8,6 +16,11 @@ from .events import (
     ControlCancelPayload,
     Durability,
     ProtocolEvent,
+    VoiceArchiveAckEvent,
+    VoiceArchiveEvent,
+    VoiceArchiveRefusedEvent,
+    VoiceArchiveRow,
+    VoiceEvent,
     WorkCompletedEvent,
     WorkCompletedPayload,
     WorkDispatchAcknowledgedEvent,
@@ -16,9 +29,18 @@ from .events import (
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
     parse_event,
+    parse_voice_event,
 )
 
 __all__ = [
+    "BRIDGE_CAPABILITIES",
+    "BRIDGE_PROTOCOL_VERSION",
+    "VOICE_ARCHIVE_CAPABILITY",
+    "VOICE_EVENT_TYPES",
+    "VOICE_MAX_BATCH_ROWS",
+    "VOICE_INTEGRITY_REFUSALS",
+    "VOICE_REFUSAL_CATEGORIES",
+    "VOICE_TRANSIENT_REFUSALS",
     "CancelScope",
     "ControlCancelAcknowledgedEvent",
     "ControlCancelAcknowledgedPayload",
@@ -26,6 +48,11 @@ __all__ = [
     "ControlCancelPayload",
     "Durability",
     "ProtocolEvent",
+    "VoiceArchiveAckEvent",
+    "VoiceArchiveEvent",
+    "VoiceArchiveRefusedEvent",
+    "VoiceArchiveRow",
+    "VoiceEvent",
     "WorkCompletedEvent",
     "WorkCompletedPayload",
     "WorkDispatchAcknowledgedEvent",
@@ -34,4 +61,5 @@ __all__ = [
     "WorkDispatchRequestedPayload",
     "WorkTerminalStatus",
     "parse_event",
+    "parse_voice_event",
 ]

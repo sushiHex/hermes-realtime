@@ -77,6 +77,81 @@ commit describes that code. Paths that differ only in case are exempt on a case-
 checkout only while their one file on disk matches one of their committed versions:
 `29112bef` tracks such paths, and Windows can hold only one of each.
 
+## Protocol 0.2: the hello and the voice archive
+
+The hello is exactly
+`{"token", "participant_id", "protocol_version": "0.2", "capabilities": [...]}`. The server
+answers `{"ok": true, "protocol_version": "0.2", "capabilities": [...]}` with the requested
+capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
+repeated capability, or with any other key, is refused. The only capability is
+`voice_archive`, offered only by a bridge that a ready voice companion started. Realtime
+sends no voice event on a connection whose welcome did not list it, and the server closes a
+connection that sends one anyway. A voice connection carries voice events only. A refused
+hello leaves one `[hermes-bridge-hello]` marker with its rejection category (`shape`,
+`token`, `participant`, `version` or `capability`), never the token or the participant.
+
+Versions are mixed on purpose: the hello and every voice event name `protocol_version`
+`"0.2"` explicitly (a voice event without it is refused), while the work events
+(`work.*`, `control.*`) keep `"0.1"`. The two event families parse separately, and
+neither parser accepts the other's events.
+
+`voice_archive{conversation_id, generation, seq_from, seq_through, rows[{seq, role, text,
+interrupted, ts, gap_before}]}` is answered on the same connection by
+`voice_archive_ack{conversation_id, generation, seq_from, seq_through}` after the commit, or
+by `voice_archive_refused{..., category}`. The category is a bounded string (1 to 32
+characters of `[a-z_]`), not a closed list, so one a newer companion adds still parses.
+The models are strict: exact types, `ts` an exact
+finite non-negative float, identities in `[0, 2^53 - 1]`, 1 to 256 rows, text of 1 to 65,536
+characters. Semantic rules (rows and gaps partition the range, only a user row carries a
+gap, only an assistant row is interrupted) belong to the companion, which refuses a batch
+that breaks them as `invalid` or `partition`. When the outcome is unknown, the companion
+closes the connection without answering; realtime then resends the same frozen batch.
+
+Refusal categories split into two closed sets whose union is the companion's set. A
+transient refusal (`not_ready`, `lease_held`, `lease_lost`, `conversations`, `pending`,
+`stale`, `fenced`, `incompatible`, `durability`, `unbound`, `bound`) never means the archive
+or the batch is wrong: realtime retries the same frozen batch with bounded backoff, with one
+marker per episode. Every other category is an integrity refusal and fences that
+conversation's archiving until realtime restarts, and drops its connection; so does a
+category neither set lists.
+
+Realtime's tail holds a closed row to the companion's own row rules (one shared, pure
+validator) before the row can be archived: a row the companion would refuse, such as one
+with a NUL, becomes a gap instead of entering a frozen batch. A version-1 tail migrates on
+the first write; its restored rows get identities then, so their `ts` is the time of that
+restart, not the time their speech settled, which a version-1 tail never recorded.
+
+## Voice companion hosting
+
+Registration builds the companion when the environment the gateway runs in names both
+`HERMES_REALTIME_COMPANION_PORT` (a loopback port, 1 to 65535) and
+`HERMES_REALTIME_COMPANION_TOKEN` (24 to 512 characters). A partial or malformed endpoint, or
+a plugin context without `on_unload` and a `state.data_dir`, is refused with one
+`[voice-companion]` marker; dispatch still registers.
+
+Hermes discovers plugins in every process (the gateway, the CLI, cron), so the owned start
+first takes an exclusive OS lock beside the plugin store and holds it until unload. A
+process that finds it held stands down: it touches no lease, row or store, and prints one
+`{"refusal":"held"}` marker. The owner then runs on its own event-loop thread. It binds
+the profile's `state.db`, as Hermes resolves it, and the plugin store `voice-companion.db`
+in the plugin's data directory, checks compatibility and durability, and only then starts
+the bridge on the configured port. Start opens no conversation: each opens on contact
+whenever it is not ready (M0's order: fences, compatibility and durability, lease,
+verification), so an unknown outcome or a lost lease recovers in the same process, while a
+quarantined or tombstoned one stays refused. At most 16 are live at once; the store binds
+at most 4,096 and refuses a new one past that (`conversations`), which M3's forget will
+prune. Unload closes the bridge, releases every lease, closes the store and `state.db`, and
+releases the lock; a close that fails keeps the companion owned for a later retry. A
+second owned start in one process is refused as `multiplexed`.
+
+The full host (`hermes-realtime-host`) reads the same two variables from `--hermes-env-file`,
+or from its environment. With both present and a voice tail enabled, it drains the tail's
+outbox to the companion. With neither, it archives nothing.
+
+Known limit: the token sits in the Hermes env file the gateway also reads. Any process of
+the same user can read that file anyway, so keeping the token out of it would not change
+who can reach the bridge; it is deferred.
+
 ## Worker
 
 ```python

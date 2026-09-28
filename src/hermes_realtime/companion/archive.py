@@ -91,6 +91,10 @@ class ArchivePort(Protocol):
 
     def release_lease(self, session_id: str, holder: str) -> None: ...
 
+    def close(self) -> None:
+        """Close the Hermes database; only the host calls it, after every lease is released."""
+        ...
+
     def read_projection(self, session_id: str, cap: int) -> Projection | None: ...
 
     def archive_rows(

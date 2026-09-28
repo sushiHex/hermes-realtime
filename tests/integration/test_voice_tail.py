@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -18,6 +19,10 @@ from hermes_realtime.conversation import (
 from hermes_realtime.integration import run_record as run_record_module
 from hermes_realtime.integration import voice_tail as voice_tail_module
 from hermes_realtime.integration.voice_tail import (
+    ArchiveBatch,
+    ArchiveOutbox,
+    OutboxRow,
+    VoiceTail,
     VoiceTailWriter,
     max_voice_tail_bytes,
     parse_voice_tail,
@@ -46,8 +51,48 @@ def _writer(path: Path, **kwargs: float) -> VoiceTailWriter:
     return VoiceTailWriter(path, **kwargs)
 
 
-def _parse(raw: bytes) -> DurableConversation | None:
+def _parse(raw: bytes) -> VoiceTail | None:
     return parse_voice_tail(raw, max_messages=16, max_item_chars=64)
+
+
+def _conversation(raw: bytes) -> DurableConversation:
+    tail = _parse(raw)
+    assert tail is not None
+    return tail.conversation
+
+
+def _outbox(raw: bytes) -> ArchiveOutbox:
+    tail = _parse(raw)
+    assert tail is not None and tail.archive is not None
+    return tail.archive
+
+
+def _legacy(view: DurableConversation) -> bytes:
+    """A version-1 tail, as the previous release wrote it."""
+    document = {
+        "messages": [
+            {"interrupted": message.interrupted, "role": message.role, "text": message.text}
+            for message in view.messages
+        ],
+        "prior_work": view.prior_work,
+        "version": 1,
+    }
+    return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _archive(**overrides: object) -> ArchiveOutbox:
+    fields: dict[str, object] = {
+        "conversation_id": "conv",
+        "generation": 0,
+        "next_seq": 0,
+        "settled": 0,
+        "cursor": None,
+        "rows": (),
+        "frozen": 0,
+        "gap": None,
+    }
+    fields.update(overrides)
+    return ArchiveOutbox(**fields)  # type: ignore[arg-type]
 
 
 def _orphan(path: Path) -> Path:
@@ -62,13 +107,30 @@ def _orphan(path: Path) -> Path:
 
 def test_the_tail_is_sorted_compact_versioned_json() -> None:
     tail = _rows(("user", "Hi é", False), ("assistant", "Cut", True), prior_work=True)
-
-    assert voice_tail_bytes(tail) == (
-        b'{"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
-        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":1}'
+    archive = _archive(
+        next_seq=4,
+        settled=1,
+        cursor=0,
+        rows=(OutboxRow(2, "user", "Hi é", False, 1.5, (1, 1)),),
+        frozen=1,
+        gap=(3, 3),
     )
-    assert _parse(voice_tail_bytes(tail)) == tail
-    assert _parse(voice_tail_bytes(_rows())) == _rows()
+
+    assert voice_tail_bytes(tail, archive) == (
+        b'{"archive":{"conversation_id":"conv","cursor":0,"frozen":1,"gap":[3,3],'
+        b'"generation":0,"next_seq":4,"outbox":[{"gap_before":[1,1],"interrupted":false,'
+        b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],"settled":1},'
+        b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
+        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":2}'
+    )
+    assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
+    assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())
+
+
+def test_a_version_one_tail_parses_without_an_archive_so_it_migrates() -> None:
+    tail = _rows(("user", "Hi", False), prior_work=True)
+
+    assert _parse(_legacy(tail)) == VoiceTail(tail, None)
 
 
 def test_the_byte_bound_admits_a_worst_case_tail_at_the_stores_bounds() -> None:
@@ -79,17 +141,31 @@ def test_the_byte_bound_admits_a_worst_case_tail_at_the_stores_bounds() -> None:
         ),
         prior_work=False,
     )
-    raw = voice_tail_bytes(tail)
-    bound = max_voice_tail_bytes(3, 8)
+    rows = tuple(
+        OutboxRow(seq, "user", "\U0001f600" * 8, False, 1.0e18, (0, 0) if seq == 1 else None)
+        for seq in range(1, 5)
+    )
+    archive = _archive(
+        conversation_id="c" * 64,
+        generation=2**53 - 1,
+        next_seq=2**53 - 1,
+        settled=3,
+        cursor=None,
+        rows=rows,
+        frozen=4,
+        gap=(5, 2**53 - 2),
+    )
+    raw = voice_tail_bytes(tail, archive)
+    bound = max_voice_tail_bytes(3, 8, 4)
 
-    def parse(data: bytes) -> DurableConversation | None:
-        return parse_voice_tail(data, max_messages=3, max_item_chars=8)
+    def parse(data: bytes) -> VoiceTail | None:
+        return parse_voice_tail(data, max_messages=3, max_item_chars=8, max_outbox_rows=4)
 
     assert len(raw) <= bound
-    assert parse(raw) == tail
+    assert parse(raw) == VoiceTail(tail, archive)
     assert parse(b" " * (bound + 1)) is None
     assert parse(raw + b" " * (bound + 1 - len(raw))) is None
-    assert parse(raw + b" " * (bound - len(raw))) == tail
+    assert parse(raw + b" " * (bound - len(raw))) == VoiceTail(tail, archive)
 
 
 def _document(**overrides: object) -> bytes:
@@ -135,7 +211,8 @@ def _row_document(**overrides: object) -> bytes:
             json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"
         ),
         pytest.param(_document(prior_work=0), id="prior-work-not-a-boolean"),
-        pytest.param(_document(version=2), id="unknown-version"),
+        pytest.param(_document(version=2), id="version-two-without-an-archive"),
+        pytest.param(_document(version=3), id="unknown-version"),
         pytest.param(_document(version="1"), id="string-version"),
         pytest.param(_document(version=1.0), id="float-version"),
         pytest.param(_document(version=True), id="boolean-version"),
@@ -164,6 +241,96 @@ def test_every_malformed_class_is_refused(raw: bytes) -> None:
     assert _parse(raw) is None
 
 
+def _v2(archive: dict[str, object] | None = None, **overrides: object) -> bytes:
+    fields: dict[str, object] = {
+        "conversation_id": "conv",
+        "cursor": 0,
+        "frozen": 1,
+        "gap": None,
+        "generation": 0,
+        "next_seq": 3,
+        "outbox": [
+            {"gap_before": None, "interrupted": False, "role": "user", "seq": 1,
+             "text": "Hi", "ts": 1.0},
+            {"gap_before": None, "interrupted": True, "role": "assistant", "seq": 2,
+             "text": "Cut", "ts": 2.0},
+        ],
+        "settled": 1,
+    }
+    fields.update(overrides)
+    document = {
+        "archive": fields if archive is None else archive,
+        "messages": [{"interrupted": False, "role": "user", "text": "Hi"}],
+        "prior_work": False,
+        "version": 2,
+    }
+    return json.dumps(document).encode("utf-8")
+
+
+def _outbox_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "gap_before": None, "interrupted": False, "role": "user", "seq": 1, "text": "Hi",
+        "ts": 1.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_a_well_formed_version_two_archive_parses() -> None:
+    archive = _outbox(_v2())
+    assert (archive.cursor, archive.next_seq, archive.frozen, len(archive.rows)) == (0, 3, 1, 2)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(_v2(archive=[]), id="archive-not-an-object"),
+        pytest.param(_v2(extra=1), id="extra-archive-key"),
+        pytest.param(_v2(conversation_id="has space"), id="bad-conversation-id"),
+        pytest.param(_v2(conversation_id="c" * 65), id="long-conversation-id"),
+        pytest.param(_v2(generation=-1), id="negative-generation"),
+        pytest.param(_v2(generation=True), id="boolean-generation"),
+        pytest.param(_v2(next_seq=2**53), id="seq-past-the-identity-bound"),
+        pytest.param(_v2(settled=2), id="settled-past-the-messages"),
+        pytest.param(_v2(cursor=1.0), id="float-cursor"),
+        pytest.param(_v2(frozen=3), id="frozen-past-the-outbox"),
+        pytest.param(_v2(frozen=-1), id="negative-frozen"),
+        pytest.param(_v2(outbox={}), id="outbox-not-a-list"),
+        pytest.param(_v2(outbox=[_outbox_row(extra=1)]), id="extra-outbox-row-key"),
+        pytest.param(_v2(outbox=[_outbox_row(ts=1)]), id="integer-timestamp"),
+        pytest.param(_v2(outbox=[_outbox_row(ts=-1.0)]), id="negative-timestamp"),
+        pytest.param(_v2(outbox=[_outbox_row(text="x" * 65)]), id="outbox-text-past-the-bound"),
+        pytest.param(_v2(outbox=[_outbox_row(text=" ")]), id="blank-outbox-text"),
+        pytest.param(_v2(outbox=[_outbox_row(interrupted=True)]), id="interrupted-user-row"),
+        pytest.param(
+            _v2(outbox=[_outbox_row(role="assistant", gap_before=[1, 1], seq=2)], cursor=0),
+            id="gap-on-an-assistant-row",
+        ),
+        pytest.param(_v2(outbox=[_outbox_row(gap_before=[1, 0], seq=2)]), id="reversed-gap"),
+        pytest.param(_v2(outbox=[_outbox_row(gap_before=[1], seq=2)]), id="short-gap"),
+        pytest.param(_v2(outbox=[_outbox_row(seq=2)], frozen=0), id="hole-after-the-cursor"),
+        pytest.param(
+            _v2(outbox=[_outbox_row(seq=1), _outbox_row(seq=1)], frozen=0, next_seq=2),
+            id="repeated-seq",
+        ),
+        pytest.param(
+            _v2(outbox=[_outbox_row(gap_before=[1, 1], seq=3)], frozen=0, next_seq=4),
+            id="gap-that-does-not-reach-its-row",
+        ),
+        pytest.param(_v2(next_seq=4), id="seq-assigned-but-unaccounted"),
+        pytest.param(_v2(next_seq=2), id="outbox-row-past-next-seq"),
+        pytest.param(_v2(gap=[4, 4], next_seq=5), id="trailing-gap-after-a-hole"),
+        pytest.param(_v2(gap=[3, 3], next_seq=5), id="trailing-gap-short-of-next-seq"),
+        pytest.param(
+            _v2(outbox=[_outbox_row(seq=n) for n in range(1, 131)], frozen=0, next_seq=131),
+            id="more-outbox-rows-than-the-bound",
+        ),
+    ],
+)
+def test_every_malformed_archive_class_is_refused(raw: bytes) -> None:
+    assert _parse(raw) is None
+
+
 @pytest.mark.asyncio
 async def test_open_restores_the_tail_before_anything_else_and_reports_only_a_count(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -174,7 +341,7 @@ async def test_open_restores_the_tail_before_anything_else_and_reports_only_a_co
         ("assistant", "Earlier answer", True),
         prior_work=True,
     )
-    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+    run_record_module.write_run_record(path, _legacy(tail))
     writer = _writer(path)
     store = ConversationContextStore(on_change=writer.update)
 
@@ -185,7 +352,9 @@ async def test_open_restores_the_tail_before_anything_else_and_reports_only_a_co
         assert store.snapshot().terminal_task_count == 1
         assert store.snapshot().active_tasks == ()
         output = capsys.readouterr().out
-        assert _markers(output, _MARKER) == [_MARKER + '{"restored":2,"version":1}']
+        assert _markers(output, _MARKER) == [
+            _MARKER + '{"outbox":2,"restored":2,"tail_version":1,"version":1}'
+        ]
         assert "Earlier" not in output
     finally:
         await writer.close()
@@ -214,7 +383,7 @@ async def test_open_without_a_tail_starts_empty_and_silent(
     [
         pytest.param(b"{not json", id="unparseable"),
         pytest.param(
-            voice_tail_bytes(_rows(("user", "x" * 65, False))),
+            _legacy(_rows(("user", "x" * 65, False))),
             id="outside-the-stores-bounds",
         ),
     ],
@@ -240,7 +409,7 @@ async def test_a_refused_tail_starts_a_fresh_conversation_with_one_marker(
     finally:
         await writer.close()
 
-    assert _parse(path.read_bytes()) == _rows(("user", "Fresh start", False))
+    assert _conversation(path.read_bytes()) == _rows(("user", "Fresh start", False))
     assert _markers(capsys.readouterr().out, _MARKER) == []
 
 
@@ -265,7 +434,7 @@ async def test_a_scanner_held_orphan_never_fails_open(
 ) -> None:
     path = tmp_path / "voice-tail-v1.json"
     tail = _rows(("user", "Kept", False))
-    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+    run_record_module.write_run_record(path, _legacy(tail))
     held = _orphan(path)
     real_unlink = Path.unlink
 
@@ -294,7 +463,7 @@ async def test_an_unreadable_tail_fails_start_and_releases_the_lock(
 ) -> None:
     path = tmp_path / "voice-tail-v1.json"
     tail = _rows(("user", "Kept", False))
-    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+    run_record_module.write_run_record(path, _legacy(tail))
 
     def sharing_violation(_path: Path, _max_bytes: int) -> bytes | None:
         raise PermissionError(13, "sharing violation")
@@ -322,7 +491,7 @@ async def test_a_second_host_cannot_open_a_live_hosts_tail(
 ) -> None:
     path = tmp_path / "voice-tail-v1.json"
     tail = _rows(("user", "Owned", False))
-    run_record_module.write_run_record(path, voice_tail_bytes(tail))
+    run_record_module.write_run_record(path, _legacy(tail))
     first = _writer(path)
     await first.open(ConversationContextStore(on_change=first.update))
     in_flight = _orphan(path)
@@ -340,7 +509,7 @@ async def test_a_second_host_cannot_open_a_live_hosts_tail(
         assert _markers(output, _LOCK_MARKER) == [_LOCK_MARKER + '{"cause":"held","version":1}']
         assert _markers(output, _MARKER) == []
         await second.close()
-        assert _parse(path.read_bytes()) == tail
+        assert _conversation(path.read_bytes()) == tail
     finally:
         await first.close()
     in_flight.unlink()
@@ -399,11 +568,11 @@ async def test_updates_coalesce_and_the_latest_snapshot_always_wins(
     await _until(lambda: len(writes.written) == 2)
     await asyncio.sleep(0.05)
 
-    latest = voice_tail_bytes(_rows(("user", "four", False)))
-    assert writes.written == [voice_tail_bytes(first), latest]
+    latest = _rows(("user", "four", False))
+    assert [_conversation(data) for data in writes.written] == [first, latest]
     await writer.close()
     assert len(writes.written) == 2
-    assert path.read_bytes() == latest
+    assert _conversation(path.read_bytes()) == latest
 
 
 def test_update_only_stores_the_latest_snapshot_synchronously(tmp_path: Path) -> None:
@@ -434,15 +603,15 @@ async def test_a_sharing_violation_backs_off_and_retries_with_the_latest_snapsho
         await _until(lambda: len(writes.written) >= 1)
         await asyncio.sleep(0.05)
 
-    assert writes.written[-1] == voice_tail_bytes(_rows(("user", "newer words", False)))
-    stale = voice_tail_bytes(_rows(("user", "private words", False)))
-    assert all(data != stale for data in writes.written[1:])
+    assert _conversation(writes.written[-1]) == _rows(("user", "newer words", False))
+    stale = _rows(("user", "private words", False))
+    assert all(_conversation(data) != stale for data in writes.written[1:])
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 2
     assert all("words" not in record.getMessage() for record in warnings)
     assert all(str(tmp_path) not in record.getMessage() for record in warnings)
     await writer.close()
-    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "newer words", False)))
+    assert _conversation(path.read_bytes()) == _rows(("user", "newer words", False))
 
 
 @pytest.mark.asyncio
@@ -462,7 +631,7 @@ async def test_a_non_os_write_failure_is_retried_and_never_kills_the_writer(
     await _until(lambda: len(writes.written) == 2)
     await writer.close()
 
-    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "two", False)))
+    assert _conversation(path.read_bytes()) == _rows(("user", "two", False))
     assert [record.getMessage() for record in caplog.records] == [
         "voice tail write failed (ValueError); retrying in 0.01 s"
     ]
@@ -511,8 +680,8 @@ async def test_close_flushes_the_final_dirty_snapshot_and_releases_the_lock(
     writes.release.set()
     await asyncio.wait_for(closing, timeout=2)
 
-    assert writes.written[-1] == voice_tail_bytes(_rows(("assistant", "Cut", True)))
-    assert path.read_bytes() == voice_tail_bytes(_rows(("assistant", "Cut", True)))
+    assert _conversation(writes.written[-1]) == _rows(("assistant", "Cut", True))
+    assert _conversation(path.read_bytes()) == _rows(("assistant", "Cut", True))
     next_owner = _writer(path)
     await next_owner.open(ConversationContextStore(on_change=next_owner.update))
     await next_owner.close()
@@ -540,12 +709,14 @@ async def test_a_failed_final_write_backs_off_fully_and_retries_before_close_ret
     writer.update(_rows(("assistant", "Final", True)))
 
     await asyncio.wait_for(writer.close(), timeout=2)
-
-    assert writes.written == [voice_tail_bytes(_rows(("assistant", "Final", True)))]
+    assert [_conversation(data) for data in writes.written] == [
+        _rows(("assistant", "Final", True))
+    ]
+    assert [_conversation(data) for data in writes.written] == [_rows(("assistant", "Final", True))]
     assert delays[0] == 0.05
     # Close never cuts the backoff short.
     assert delays[1] >= 0.04
-    assert path.read_bytes() == voice_tail_bytes(_rows(("assistant", "Final", True)))
+    assert _conversation(path.read_bytes()) == _rows(("assistant", "Final", True))
 
 
 @pytest.mark.asyncio
@@ -569,7 +740,7 @@ async def test_a_close_timeout_keeps_the_tail_owned_and_a_retried_close_finishes
     writes.release.set()
     await writer.close()
 
-    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "slow", False)))
+    assert _conversation(path.read_bytes()) == _rows(("user", "slow", False))
     successor = _writer(path)
     await successor.open(ConversationContextStore(on_change=successor.update))
     await successor.close()
@@ -609,8 +780,8 @@ async def test_close_waits_for_an_in_flight_write_so_the_newest_lands_last(
     # Every write has landed before the assertions, whichever order they took.
     assert await asyncio.to_thread(first_finished.wait, 2)
 
-    assert written[-1] == voice_tail_bytes(_rows(("user", "newest", False)))
-    assert path.read_bytes() == voice_tail_bytes(_rows(("user", "newest", False)))
+    assert _conversation(written[-1]) == _rows(("user", "newest", False))
+    assert _conversation(path.read_bytes()) == _rows(("user", "newest", False))
 
 
 @pytest.mark.asyncio
@@ -672,3 +843,558 @@ def test_the_tail_path_must_be_an_exact_path(path: object) -> None:
 def test_the_close_timeout_is_finite_and_positive(kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError, match="close timeout"):
         VoiceTailWriter(Path("voice-tail-v1.json"), **kwargs)
+
+
+# --- the archive outbox (tail version 2) -----------------------------------------------------
+
+_OUTBOX_MARKER = "[voice-tail-outbox] "
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1_700_000_000.0
+
+    def __call__(self) -> float:
+        self.now += 1.0
+        return self.now
+
+
+def _archiver(path: Path, **kwargs: object) -> VoiceTailWriter:
+    ids = iter(f"conv{index}" for index in range(100))
+    options: dict[str, object] = {
+        "clock": _Clock(),
+        "conversation_ids": lambda: next(ids),
+        "max_outbox_rows": 4,
+        "max_batch_rows": 2,
+    }
+    options.update(kwargs)
+    return VoiceTailWriter(path, **options)  # type: ignore[arg-type]
+
+
+async def _opened(
+    path: Path, **kwargs: object
+) -> tuple[VoiceTailWriter, ConversationContextStore]:
+    writer = _archiver(path, **kwargs)
+    store = ConversationContextStore(max_messages=16, max_item_chars=64, on_change=writer.update)
+    await writer.open(store)
+    return writer, store
+
+
+def _say(store: ConversationContextStore, text: str) -> None:
+    store.record_user_transcript(Transcript(text=text, final=True))
+
+
+def _reply(store: ConversationContextStore, text: str, *, interrupted: bool = False) -> None:
+    from hermes_realtime.conversation import AssistantSegmentKey
+    from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
+
+    segment = AssistantSegmentKey()
+    ledger = DeliveredSpeechLedger()
+    chunk = SpeechChunk(
+        turn_id="turn_tail",
+        chunk_id="chunk_tail",
+        text=text,
+        audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+    )
+    admission = store.prepare_assistant_text(text, segment=segment, heard_text=text)
+    ledger.queue(chunk, admission=admission)
+    confirmation = ledger.mark_delivered_confirmed(ledger.mark_started("turn_tail", "chunk_tail"))
+    store.record_assistant_delivery(admission=admission, ledger=ledger, confirmation=confirmation)
+    if interrupted:
+        store.mark_assistant_segment_interrupted(segment)
+    else:
+        store.close_assistant_segment(segment)
+
+
+def _shape(rows: tuple[OutboxRow, ...]) -> list[tuple[int, str, str, bool, object]]:
+    return [(row.seq, row.role, row.text, row.interrupted, row.gap_before) for row in rows]
+
+
+async def _written(path: Path, writer: VoiceTailWriter) -> ArchiveOutbox:
+    """The archive the file holds once the writer has nothing left to write."""
+    await _until(lambda: not writer._dirty and path.exists())
+    await asyncio.sleep(0.02)
+    return _outbox(path.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_closed_rows_get_identities_and_close_times_but_an_open_row_never_does(
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.conversation import AssistantSegmentKey
+
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8)
+    try:
+        _say(store, "Question")
+        segment = AssistantSegmentKey()
+        ledger_text = "Answer in progress"
+        from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
+
+        ledger = DeliveredSpeechLedger()
+        chunk = SpeechChunk(
+            turn_id="turn_open",
+            chunk_id="chunk_open",
+            text=ledger_text,
+            audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+        )
+        admission = store.prepare_assistant_text(
+            ledger_text, segment=segment, heard_text=ledger_text
+        )
+        ledger.queue(chunk, admission=admission)
+        store.record_assistant_delivery(
+            admission=admission,
+            ledger=ledger,
+            confirmation=ledger.mark_delivered_confirmed(
+                ledger.mark_started("turn_open", "chunk_open")
+            ),
+        )
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [(0, "user", "Question", False, None)]
+        assert archive.rows[0].ts == 1_700_000_001.0
+        assert (archive.next_seq, archive.settled) == (1, 1)
+
+        store.mark_assistant_segment_interrupted(segment)
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [
+            (0, "user", "Question", False, None),
+            (1, "assistant", ledger_text, True, None),
+        ]
+        assert archive.rows[1].ts == 1_700_000_002.0
+        assert (archive.conversation_id, archive.generation) == ("conv0", 0)
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_row_is_eligible_only_after_a_completed_write_holds_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        writes.release.clear()
+        _say(store, "Durable first")
+        batch = asyncio.create_task(writer.next_batch())
+        await asyncio.sleep(0.05)
+        assert not batch.done()
+        writes.release.set()
+        result = await asyncio.wait_for(batch, timeout=2)
+        assert _shape(result.rows) == [(0, "user", "Durable first", False, None)]
+        assert any(
+            _outbox(data).rows and _outbox(data).frozen == 0 for data in writes.written
+        )
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_is_frozen_in_the_tail_before_it_is_returned_and_resent_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8, max_batch_rows=2)
+    try:
+        _say(store, "One")
+        _reply(store, "Two")
+        _say(store, "Three")
+        await _written(path, writer)
+        first = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        # The write that froze it had completed before it was returned.
+        frozen = _outbox(writes.written[-1])
+        assert frozen.frozen == 2
+        assert frozen.rows[:2] == first.rows
+        assert (first.conversation_id, first.generation, first.seq_from, first.seq_through) == (
+            "conv0",
+            0,
+            0,
+            1,
+        )
+        _reply(store, "Four")
+        await _written(path, writer)
+        assert await asyncio.wait_for(writer.next_batch(), timeout=2) == first
+    finally:
+        await writer.close()
+
+    # A restart resends exactly the frozen batch, close times included.
+    successor, _ = await _opened(path, max_outbox_rows=8, max_batch_rows=2)
+    try:
+        assert await asyncio.wait_for(successor.next_batch(), timeout=2) == first
+        assert successor.conversation_id == "conv0"
+    finally:
+        await successor.close()
+
+
+@pytest.mark.asyncio
+async def test_the_cursor_advances_only_on_an_exact_acknowledgment(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8, max_batch_rows=2)
+    try:
+        for text in ("One", "Two", "Three"):
+            _say(store, text)
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        for wrong in (
+            ("conv1", 0, 0, 1),
+            ("conv0", 1, 0, 1),
+            ("conv0", 0, 1, 1),
+            ("conv0", 0, 0, 0),
+            ("conv0", 0, 0, 2),
+            ("conv0", False, 0, 1),
+        ):
+            assert writer.acknowledge(*wrong) is False  # type: ignore[arg-type]
+        assert await asyncio.wait_for(writer.next_batch(), timeout=2) == batch
+
+        assert writer.acknowledge("conv0", 0, 0, 1) is True
+        assert writer.acknowledge("conv0", 0, 0, 1) is False
+        archive = await _written(path, writer)
+        assert (archive.cursor, archive.frozen) == (1, 0)
+        assert _shape(archive.rows) == [(2, "user", "Three", False, None)]
+        after = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        assert (after.seq_from, after.seq_through) == (2, 2)
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_overflow_discards_unsent_rows_up_to_the_next_user_row_as_its_gap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        frozen = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        _say(store, "Q2")
+        _reply(store, "A3")
+        # Full: the oldest unsent row (Q2) and the reply after it go; Q4 carries the gap.
+        _say(store, "Q4")
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [
+            (0, "user", "Q0", False, None),
+            (1, "assistant", "A1", False, None),
+            (4, "user", "Q4", False, (2, 3)),
+        ]
+        assert archive.frozen == 2
+        assert await asyncio.wait_for(writer.next_batch(), timeout=2) == frozen
+        output = capsys.readouterr().out
+        assert _markers(output, _OUTBOX_MARKER) == [
+            _OUTBOX_MARKER + '{"cause":"overflow","version":1}'
+        ]
+        assert "Q2" not in output and "A3" not in output
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_trailing_gap_waits_in_the_tail_until_a_user_row_carries_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=3, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        await asyncio.wait_for(writer.next_batch(), timeout=2)
+        _reply(store, "A2")
+        # Full, and no user row follows the unsent A2: it becomes a trailing gap, and
+        # replies after it join the gap rather than reach the archive without a question.
+        _reply(store, "A3")
+        _reply(store, "A4")
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [
+            (0, "user", "Q0", False, None),
+            (1, "assistant", "A1", False, None),
+        ]
+        assert (archive.gap, archive.next_seq) == ((2, 4), 5)
+
+        _say(store, "Q5")
+        archive = await _written(path, writer)
+        assert archive.gap is None
+        assert _shape(archive.rows)[-1] == (5, "user", "Q5", False, (2, 4))
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_row_evicted_before_it_was_seen_closed_becomes_a_gap(tmp_path: Path) -> None:
+    from hermes_realtime.conversation import AssistantSegmentKey
+    from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
+
+    path = tmp_path / "tail.json"
+    writer = _archiver(path, max_outbox_rows=4)
+    store = ConversationContextStore(max_messages=1, max_item_chars=64, on_change=writer.update)
+    await writer.open(store)
+    try:
+        ledger = DeliveredSpeechLedger()
+        chunk = SpeechChunk(
+            turn_id="turn_evict",
+            chunk_id="chunk_evict",
+            text="Open",
+            audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+        )
+        admission = store.prepare_assistant_text(
+            "Open", segment=AssistantSegmentKey(), heard_text="Open"
+        )
+        ledger.queue(chunk, admission=admission)
+        store.record_assistant_delivery(
+            admission=admission,
+            ledger=ledger,
+            confirmation=ledger.mark_delivered_confirmed(
+                ledger.mark_started("turn_evict", "chunk_evict")
+            ),
+        )
+        _say(store, "Pushes it out")
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [(1, "user", "Pushes it out", False, (0, 0))]
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_is_bounded_by_its_wire_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer = _archiver(path, max_outbox_rows=16, max_batch_rows=8)
+    store = ConversationContextStore(max_messages=16, max_item_chars=4096, on_change=writer.update)
+    await writer.open(store)
+    try:
+        for index in range(3):
+            _say(store, f"{index}" + "x" * 4000)
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        # 6 bytes a character at worst: two 4 KB rows fit 48 KiB, three do not.
+        assert len(batch.rows) == 1 + (2 * (160 + 6 * 4001) <= 48 * 1024)
+        assert type(batch) is ArchiveBatch
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_version_one_tail_migrates_to_version_two_on_the_first_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    tail = _rows(("user", "Old question", False), ("assistant", "Old answer", True))
+    path.write_bytes(_legacy(tail))
+    writer, store = await _opened(path, max_outbox_rows=8)
+    try:
+        archive = await _written(path, writer)
+        assert _conversation(path.read_bytes()) == tail
+        assert archive.conversation_id == "conv0"
+        assert _shape(archive.rows) == [
+            (0, "user", "Old question", False, None),
+            (1, "assistant", "Old answer", True, None),
+        ]
+        assert (archive.next_seq, archive.settled) == (2, 2)
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_restart_continues_the_identities_of_a_version_two_tail(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8)
+    try:
+        _say(store, "Before")
+        from hermes_realtime.conversation import AssistantSegmentKey
+        from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
+
+        ledger = DeliveredSpeechLedger()
+        chunk = SpeechChunk(
+            turn_id="turn_cut",
+            chunk_id="chunk_cut",
+            text="Cut off",
+            audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+        )
+        admission = store.prepare_assistant_text(
+            "Cut off", segment=AssistantSegmentKey(), heard_text="Cut off"
+        )
+        ledger.queue(chunk, admission=admission)
+        store.record_assistant_delivery(
+            admission=admission,
+            ledger=ledger,
+            confirmation=ledger.mark_delivered_confirmed(
+                ledger.mark_started("turn_cut", "chunk_cut")
+            ),
+        )
+        await _written(path, writer)
+    finally:
+        await writer.close()
+    # The crash cut the open row off: restored, it is final (and flagged), so it closes now.
+    successor, restored = await _opened(path, max_outbox_rows=8)
+    try:
+        _say(restored, "After")
+        archive = await _written(path, successor)
+        assert archive.conversation_id == "conv0"
+        assert _shape(archive.rows) == [
+            (0, "user", "Before", False, None),
+            (1, "assistant", "Cut off", True, None),
+            (2, "user", "After", False, None),
+        ]
+    finally:
+        await successor.close()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_tail_starts_a_fresh_conversation_and_outbox(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    path.write_bytes(_v2(conversation_id="bad id"))
+    writer, store = await _opened(path)
+    try:
+        _say(store, "Fresh")
+        archive = await _written(path, writer)
+        assert archive.conversation_id == "conv0"
+        assert _shape(archive.rows) == [(0, "user", "Fresh", False, None)]
+    finally:
+        await writer.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"max_outbox_rows": 2, "max_batch_rows": 2}, ValueError),
+        ({"max_outbox_rows": 4097, "max_batch_rows": 2}, ValueError),
+        ({"max_outbox_rows": 512, "max_batch_rows": 257}, ValueError),
+        ({"max_outbox_rows": 4, "max_batch_rows": 0}, ValueError),
+        ({"max_outbox_rows": 4.0, "max_batch_rows": 2}, TypeError),
+        ({"clock": 1}, TypeError),
+    ],
+)
+def test_the_outbox_bounds_are_exact_and_leave_room_for_overflow(
+    kwargs: dict[str, object], error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        VoiceTailWriter(Path("tail.json"), **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_open_refuses_a_store_whose_rows_cannot_fit_one_batch(tmp_path: Path) -> None:
+    writer = _archiver(tmp_path / "tail.json")
+    store = ConversationContextStore(max_item_chars=65_536, on_change=writer.update)
+
+    with pytest.raises(ValueError, match="batch"):
+        await writer.open(store)
+
+
+@pytest.mark.asyncio
+async def test_a_row_the_companion_would_refuse_becomes_a_gap_before_it_is_eligible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8)
+    try:
+        _say(store, "Q0")
+        _say(store, "has a \x00 NUL")  # The store holds it; the archive never would.
+        _reply(store, "A2")
+        _say(store, "Q3")
+        archive = await _written(path, writer)
+        # The refused row and the reply that depended on it are one gap on the next user row.
+        assert _shape(archive.rows) == [
+            (0, "user", "Q0", False, None),
+            (3, "user", "Q3", False, (1, 2)),
+        ]
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        assert all("\x00" not in row.text for row in batch.rows)
+        output = capsys.readouterr().out
+        assert _markers(output, _OUTBOX_MARKER) == [
+            _OUTBOX_MARKER + '{"cause":"invalid","version":1}'
+        ]
+        assert "NUL" not in output
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_close_time_the_companion_would_refuse_becomes_a_gap(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    times = iter([float("inf"), 5.0, 6.0])
+    writer, store = await _opened(path, max_outbox_rows=8, clock=lambda: next(times))
+    try:
+        _say(store, "Q0")
+        _say(store, "Q1")
+        archive = await _written(path, writer)
+        assert _shape(archive.rows) == [(1, "user", "Q1", False, (0, 0))]
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_the_discard_marker_is_once_per_episode_and_an_ack_ends_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=3, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        batch = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        for index in range(2, 8):  # Overflows repeatedly while the batch is in flight.
+            _say(store, f"Q{index}")
+        assert len(_markers(capsys.readouterr().out, _OUTBOX_MARKER)) == 1
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        await _written(path, writer)
+        await asyncio.wait_for(writer.next_batch(), timeout=2)
+        for index in range(8, 12):
+            _say(store, f"Q{index}")
+        assert len(_markers(capsys.readouterr().out, _OUTBOX_MARKER)) == 1
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_marker_that_cannot_print_never_raises_into_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=3, max_batch_rows=2)
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        await _written(path, writer)
+        await asyncio.wait_for(writer.next_batch(), timeout=2)
+        closed = io.StringIO()
+        closed.close()
+        monkeypatch.setattr(sys, "stdout", closed)
+        for index in range(2, 6):
+            _say(store, f"Q{index}")  # Overflow: the marker's print raises; speech does not.
+        monkeypatch.undo()
+        assert len(store.snapshot().messages) == 6
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_restart_restores_the_frozen_batch_exactly_under_other_bounds(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=8, max_batch_rows=3)
+    try:
+        for index in range(4):
+            _say(store, f"Q{index}")
+        frozen = await asyncio.wait_for(writer.next_batch(), timeout=2)
+        assert len(frozen.rows) == 3
+    finally:
+        await writer.close()
+
+    # A smaller batch bound after the restart: the frozen batch is resent whole, as frozen.
+    successor, restored = await _opened(path, max_outbox_rows=4, max_batch_rows=2)
+    try:
+        assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
+        # Overflow after the restart discards only unsent rows, never the frozen batch.
+        for index in range(4, 9):
+            _say(restored, f"Q{index}")
+        archive = await _written(path, successor)
+        assert archive.rows[:3] == frozen.rows
+        assert archive.frozen == 3
+        assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
+    finally:
+        await successor.close()

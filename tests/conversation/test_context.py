@@ -981,6 +981,75 @@ def test_durable_view_flags_only_the_still_open_assistant_row() -> None:
     assert view.prior_work is False
 
 
+def test_durable_view_counts_the_unsettled_suffix_from_the_open_row() -> None:
+    context = ConversationContextStore(max_messages=8, max_item_chars=64)
+    context.record_user_transcript(Transcript(text="Question", final=True))
+    assert context.durable_view().unsettled == 0
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Part", chunk_id="chunk_001", segment=segment)
+    assert context.durable_view().unsettled == 1
+    _confirm_assistant_text(
+        context, " two", chunk_id="chunk_002", segment=segment, heard_text="Part two"
+    )
+    # A replaced open row keeps its position: still one unsettled row.
+    assert context.durable_view().unsettled == 1
+    # A row appended while the segment is still open waits behind it.
+    context.record_user_transcript(Transcript(text="Barge in", final=True))
+    assert context.durable_view().unsettled == 2
+    context.close_assistant_segment(segment)
+    assert context.durable_view().unsettled == 0
+
+
+def test_an_interrupted_or_displaced_open_row_settles() -> None:
+    context = ConversationContextStore(max_messages=8, max_item_chars=64)
+    first = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Cut", chunk_id="chunk_001", segment=first)
+    context.mark_assistant_segment_interrupted(first)
+    assert context.durable_view().unsettled == 0
+    second = AssistantSegmentKey()
+    _confirm_assistant_text(context, "One", chunk_id="chunk_002", segment=second)
+    _confirm_assistant_text(context, "Two", chunk_id="chunk_003", segment=AssistantSegmentKey())
+    # The newer segment's row displaces the older open row, which is final.
+    view = context.durable_view()
+    assert view.unsettled == 1
+    assert [message.interrupted for message in view.messages] == [True, False, True]
+
+
+def test_durable_view_numbers_rows_across_eviction() -> None:
+    context = ConversationContextStore(max_messages=2, max_item_chars=64)
+    for index in range(2):
+        context.record_user_transcript(Transcript(text=f"Row {index}", final=True))
+    assert context.durable_view().first == 0
+    context.record_user_transcript(Transcript(text="Row 2", final=True))
+    assert context.durable_view().first == 1
+    _confirm_assistant_text(context, "Row 3", chunk_id="chunk_001")
+    view = context.durable_view()
+    assert (view.first, view.unsettled) == (2, 1)
+    assert [message.text for message in view.messages] == ["Row 2", "Row 3"]
+
+
+@pytest.mark.parametrize(
+    ("first", "unsettled", "error"),
+    [
+        (cast(int, True), 0, TypeError),
+        (0, cast(int, 1.0), TypeError),
+        (-1, 0, ValueError),
+        (0, -1, ValueError),
+        (0, 2, ValueError),
+    ],
+)
+def test_durable_row_positions_are_exact_and_bounded(
+    first: int, unsettled: int, error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        DurableConversation(
+            messages=(ConversationMessage("user", "x"),),
+            prior_work=False,
+            first=first,
+            unsettled=unsettled,
+        )
+
+
 def test_durable_conversation_is_an_exact_frozen_value() -> None:
     view = _view(ConversationMessage("user", "Question"), prior_work=True)
 

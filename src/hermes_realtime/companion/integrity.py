@@ -144,6 +144,50 @@ class Identity:
         _bounded_int(self.seq, "seq")
 
 
+def validate_voice_row(
+    role: object,
+    text: object,
+    interrupted: object,
+    timestamp: object,
+    gap_before: object = None,
+) -> None:
+    """Every rule a voice row's content must meet, pure; raises TypeError or ValueError.
+
+    ``VoiceRow`` applies it, and realtime's tail applies it before a row can be archived,
+    so a row the companion would refuse becomes a gap rather than a frozen batch.
+    """
+
+    if type(role) is not str or type(text) is not str:
+        raise TypeError("voice row role and text must be exact str")
+    if type(interrupted) is not bool:
+        raise TypeError("voice row interruption must be an exact bool")
+    if type(timestamp) is not float:
+        raise TypeError("voice row timestamp must be an exact float")
+    if role not in ROLES:
+        raise ValueError("voice row role is not supported")
+    if interrupted and role != "assistant":
+        raise ValueError("only assistant rows may be interrupted")
+    if not text.strip() or len(text) > MAX_TEXT_CHARS:
+        raise ValueError("voice row text must be non-blank and bounded")
+    # Hermes decodes text starting "\x00json:" as structured content; no NUL is speech.
+    if "\x00" in text:
+        raise ValueError("voice row text must not contain NUL")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("voice row text must be encodable text") from None
+    if not math.isfinite(timestamp) or timestamp < 0:
+        raise ValueError("voice row timestamp must be finite and non-negative")
+    if gap_before is not None:
+        if type(gap_before) is not tuple or len(gap_before) != 2:
+            raise TypeError("a gap must be an exact (first, last) tuple")
+        first, last = (_bounded_int(end, "gap bound") for end in gap_before)
+        if first > last:
+            raise ValueError("a gap must not be reversed")
+        if role != "user":
+            raise ValueError("only a user row may carry a gap")
+
+
 @dataclass(frozen=True, slots=True)
 class VoiceRow:
     """One closed conversation row, exactly as it was delivered.
@@ -163,35 +207,9 @@ class VoiceRow:
     def __post_init__(self) -> None:
         if type(self.identity) is not Identity:
             raise TypeError("voice row identity must be an exact Identity")
-        if type(self.role) is not str or type(self.text) is not str:
-            raise TypeError("voice row role and text must be exact str")
-        if type(self.interrupted) is not bool:
-            raise TypeError("voice row interruption must be an exact bool")
-        if type(self.timestamp) is not float:
-            raise TypeError("voice row timestamp must be an exact float")
-        if self.role not in ROLES:
-            raise ValueError("voice row role is not supported")
-        if self.interrupted and self.role != "assistant":
-            raise ValueError("only assistant rows may be interrupted")
-        if not self.text.strip() or len(self.text) > MAX_TEXT_CHARS:
-            raise ValueError("voice row text must be non-blank and bounded")
-        # Hermes decodes text starting "\x00json:" as structured content; no NUL is speech.
-        if "\x00" in self.text:
-            raise ValueError("voice row text must not contain NUL")
-        try:
-            self.text.encode("utf-8")
-        except UnicodeEncodeError:
-            raise ValueError("voice row text must be encodable text") from None
-        if not math.isfinite(self.timestamp) or self.timestamp < 0:
-            raise ValueError("voice row timestamp must be finite and non-negative")
-        if self.gap_before is not None:
-            if type(self.gap_before) is not tuple or len(self.gap_before) != 2:
-                raise TypeError("a gap must be an exact (first, last) tuple")
-            first, last = (_bounded_int(end, "gap bound") for end in self.gap_before)
-            if first > last:
-                raise ValueError("a gap must not be reversed")
-            if self.role != "user":
-                raise ValueError("only a user row may carry a gap")
+        validate_voice_row(
+            self.role, self.text, self.interrupted, self.timestamp, self.gap_before
+        )
 
 
 @dataclass(frozen=True, slots=True)

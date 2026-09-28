@@ -97,6 +97,19 @@ async def _open(store: CompanionStore, hermes: Any) -> VoiceArchive:
     return archive
 
 
+def test_the_port_closes_its_database_through_the_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, HERMES_MODULE, hermes_state_stand_in)
+    port = HermesArchivePort(hermes_state_stand_in.SessionDB(tmp_path / "closed.db"))
+    assert port.durability_level() >= 0
+
+    port.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        port.durability_level()
+
+
 def test_the_stand_in_matches_the_enumerated_surface_and_shapes(hermes: Any) -> None:
     assert check_surface() == ()
     assert check_shapes(hermes) == ()

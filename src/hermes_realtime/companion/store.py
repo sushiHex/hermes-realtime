@@ -31,6 +31,8 @@ _SCHEMA_VERSION = 3
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
+# A generous bound on stored conversations: each is one row of fences and progress.
+MAX_BOUND_CONVERSATIONS = 4096
 # Categories a durable quarantine may record: the archive no longer matches its evidence.
 QUARANTINE_CATEGORIES = frozenset(
     {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage", "count"}
@@ -214,6 +216,10 @@ class CompanionStore:
                 "SELECT 1 FROM voice_archive WHERE session_id = ?", (session_id,)
             ).fetchone():
                 raise ArchiveRefusal("bound")
+            (bound,) = self._connection.execute("SELECT COUNT(*) FROM voice_archive").fetchone()
+            if bound >= MAX_BOUND_CONVERSATIONS:
+                # Fails closed on binding, never at start; forget (M3) prunes.
+                raise ArchiveRefusal("conversations")
             self._connection.execute(
                 "INSERT INTO voice_archive (conversation_id, session_id, pending_count, "
                 "pending_chain, pending_generation, pending_seq) VALUES (?, ?, ?, ?, ?, ?)",
