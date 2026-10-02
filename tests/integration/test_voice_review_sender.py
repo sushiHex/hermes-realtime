@@ -281,9 +281,24 @@ async def test_capacity_refusal_blocks_retries_and_retains_exact_range(tmp_path:
         await writer.close()
 
 
-@pytest.mark.parametrize("category", ["lease_lost", "lease_held"])
+@pytest.mark.parametrize(
+    "category",
+    [
+        "not_ready",
+        "lease_held",
+        "lease_lost",
+        "conversations",
+        "pending",
+        "stale",
+        "fenced",
+        "incompatible",
+        "durability",
+        "unbound",
+        "bound",
+    ],
+)
 @pytest.mark.asyncio
-async def test_review_retries_the_frozen_range_after_a_recoverable_lease_refusal(
+async def test_review_retries_the_frozen_range_after_a_transient_refusal(
     tmp_path: Path, category: str
 ) -> None:
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")

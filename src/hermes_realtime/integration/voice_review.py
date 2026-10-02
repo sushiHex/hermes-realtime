@@ -13,6 +13,7 @@ from hermes_realtime.integration.bridge import LocalHermesBridgeClient
 from hermes_realtime.integration.voice_tail import ReviewRange, VoiceTailWriter
 from hermes_realtime.protocol import (
     VOICE_REVIEW_CAPABILITY,
+    VOICE_TRANSIENT_REFUSALS,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
@@ -211,13 +212,7 @@ class VoiceReviewSender:
                             }
                         )
                     self._last_refusal = reply.category
-                    if reply.category not in {
-                        "busy",
-                        "not_ready",
-                        "unbound",
-                        "lease_lost",
-                        "lease_held",
-                    }:
+                    if reply.category != "busy" and reply.category not in VOICE_TRANSIENT_REFUSALS:
                         await self._drop()
                         self._blocked = True
                         break
