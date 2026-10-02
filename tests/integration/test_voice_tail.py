@@ -1290,14 +1290,23 @@ async def test_dropped_close_target_after_periodic_review_restarts_without_claim
 
 
 @pytest.mark.asyncio
-async def test_dropped_first_close_target_keeps_an_empty_review_window_durable(
-    tmp_path: Path,
+async def test_dropped_first_close_target_is_skipped_without_blocking_later_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = tmp_path / "tail.json"
     writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
     try:
         _say(store, "Q0")
         writer.request_review_close()
+        before_archive = asyncio.create_task(writer.next_review(10))
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert writer._review.close_targets == (0,)
+            assert writer._review.pending is None
+        finally:
+            before_archive.cancel()
+            await asyncio.gather(before_archive, return_exceptions=True)
         for index in range(1, 5):
             _say(store, f"Q{index}")
         batch = await asyncio.wait_for(writer.next_batch(), 2)
@@ -1305,24 +1314,149 @@ async def test_dropped_first_close_target_keeps_an_empty_review_window_durable(
         assert writer.acknowledge(
             batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
         )
+        planning = asyncio.create_task(writer.next_review(10))
+        try:
+            await _until(lambda: writer._review.close_targets == ())
+        finally:
+            planning.cancel()
+            await asyncio.gather(planning, return_exceptions=True)
+        assert writer._review.pending is None
+        assert writer._review.cursor is None
+        assert writer._review.reviewed_users == 0
+        assert not writer._review.close_reviewed
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.close_targets == ()
+        assert archive.review.pending is None
+        assert [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[voice-review-close] ")
+        ] == ['[voice-review-close] {"refusal":"empty_window","version":1}']
+
+        writer.request_review_close()
+        assert writer._review.close_targets == (4,)
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
         closing = await asyncio.wait_for(writer.next_review(10), 2)
         assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
-            0,
-            0,
-            0,
+            1,
+            4,
+            4,
             True,
         )
-        archive = await _written(path, writer)
-        assert archive.review is not None and archive.review.pending == closing
+        assert writer.acknowledge_review(closing)
     finally:
         await writer.close()
 
-    restored = _archiver(path, max_outbox_rows=4, max_batch_rows=3)
-    await restored.open(ConversationContextStore(on_change=restored.update))
+
+@pytest.mark.asyncio
+async def test_restored_empty_closing_pending_is_reconciled_without_losing_later_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    conversation = _rows(*(("user", f"Q{index}", False) for index in range(5)))
+    stale = ReviewRange("conv", 0, 0, 0, 0, True)
+    archive = _archive(
+        next_seq=5,
+        settled=5,
+        cursor=3,
+        rows=(OutboxRow(4, "user", "Q4", False, 1.0),),
+        review=ReviewProgress(
+            users=3,
+            pending=stale,
+            close_targets=(0,),
+            rows=((1, True), (2, True), (3, True)),
+        ),
+    )
+    raw = voice_tail_bytes(conversation, archive)
+    assert _parse(raw) == VoiceTail(conversation, archive)
+    run_record_module.write_run_record(path, raw)
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
     try:
-        assert await asyncio.wait_for(restored.next_review(10), 2) == closing
+        assert writer.conversation_id == "conv"
+        assert len(store.durable_view().messages) == 5
+        planning = asyncio.create_task(writer.next_review(10))
+        try:
+            await _until(lambda: writer._review.close_targets == ())
+        finally:
+            planning.cancel()
+            await asyncio.gather(planning, return_exceptions=True)
+        assert writer._review.pending is None
+        assert writer._review.reviewed_users == 0
+        assert not writer._review.close_reviewed
+        assert (await _written(path, writer)).review is not None
+
+        writer.request_review_close()
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            1,
+            4,
+            4,
+            True,
+        )
     finally:
-        await restored.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_trailing_gap_closes_replay_the_last_actual_archived_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert writer.acknowledge_review(periodic)
+        assert writer._review.cursor == 0
+
+        for index in range(1, 101):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        for index in range(101, 201):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        assert writer._review.close_targets == (100, 200)
+        for index in range(201, 205):
+            _say(store, f"Q{index}")
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 200)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+
+        for target in (100, 200):
+            closing = await asyncio.wait_for(writer.next_review(1), 2)
+            assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+                0,
+                target,
+                1,
+                True,
+            )
+            assert (await _written(path, writer)).review is not None
+            assert writer.acknowledge_review(closing)
+            assert writer._review.cursor == 0
+        assert writer._review.close_targets == ()
+        later_periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (later_periodic.seq_from, later_periodic.seq_through, later_periodic.users) == (
+            201,
+            201,
+            2,
+        )
+    finally:
+        await writer.close()
 
 
 @pytest.mark.asyncio

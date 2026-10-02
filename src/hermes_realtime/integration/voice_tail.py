@@ -848,11 +848,36 @@ class VoiceTailWriter:
             raise ValueError("review interval must be an exact integer from 1 to 1000")
         while True:
             if self._owner is not None:
-                pending = self._review.pending
+                progress = self._review
+                cursor = self._cursor
+                if (
+                    progress.close_targets
+                    and progress.cursor is None
+                    and cursor is not None
+                    and cursor >= progress.close_targets[0]
+                    and not any(seq <= progress.close_targets[0] for seq, _ in progress.rows)
+                    and (
+                        progress.pending is None
+                        or (
+                            progress.pending.closing
+                            and progress.pending.seq_through == progress.close_targets[0]
+                        )
+                    )
+                ):
+                    try:
+                        self._review = replace(
+                            progress, pending=None, close_targets=progress.close_targets[1:]
+                        )
+                        self._changed()
+                    finally:
+                        _marker(
+                            _REVIEW_CLOSE_MARKER_PREFIX,
+                            {"refusal": "empty_window", "version": 1},
+                        )
+                    continue
+                pending = progress.pending
                 if pending is not None and self._written_version >= self._review_frozen_version:
                     return pending
-                cursor = self._cursor
-                progress = self._review
                 close_due = (
                     bool(progress.close_targets)
                     and not progress.close_reviewed
@@ -932,9 +957,12 @@ class VoiceTailWriter:
         if progress.overflow:
             _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "review_capacity", "version": 1})
             return False
+        covered = [
+            seq for seq, _ in progress.rows if request.seq_from <= seq <= request.seq_through
+        ]
         self._review = replace(
             progress,
-            cursor=max(progress.cursor if progress.cursor is not None else 0, request.seq_through),
+            cursor=covered[-1] if covered else progress.cursor,
             reviewed_users=request.users,
             pending=None,
             close_targets=progress.close_targets[1:] if request.closing else progress.close_targets,
