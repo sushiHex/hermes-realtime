@@ -166,9 +166,13 @@ class VoiceCompanionService:
     ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None:
         if type(event) is not VoiceReviewEvent:
             raise TypeError("event must be an exact VoiceReviewEvent")
+        evidence: dict[str, str | int] | None = None
         try:
             if self._review is None:
                 raise ArchiveRefusal("not_ready")
+            if self._store.read(event.conversation_id) is None:
+                evidence = {"refusal": "unbound", "version": 1}
+                raise ArchiveRefusal("unbound")
             await self._ensure_open(event.conversation_id)
             result = await self._review.review(
                 ReviewRequest(
@@ -185,6 +189,9 @@ class VoiceCompanionService:
             )
         except Exception:
             return None
+        finally:
+            if evidence is not None:
+                _marker(evidence)
         return VoiceReviewAckEvent(
             protocol_version="0.3", type="voice_review_ack",
             conversation_id=event.conversation_id, generation=event.generation,

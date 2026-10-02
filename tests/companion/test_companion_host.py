@@ -23,12 +23,16 @@ from hermes_realtime.companion.host import (
     companion_endpoint,
 )
 from hermes_realtime.companion.integrity import ArchiveRefusal
+from hermes_realtime.companion.review import ReviewAdmission, ReviewRequest
 from hermes_realtime.companion.store import CompanionStore
 from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
     VoiceArchiveRow,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    VoiceReviewRefusedEvent,
 )
 
 _HOST_MARKER = "[voice-companion] "
@@ -72,6 +76,32 @@ def _service(tmp_path: Path, hermes: FakeHermes) -> tuple[VoiceCompanionService,
     return VoiceCompanionService(archive, store, hermes), store
 
 
+class _AcceptingReview:
+    def __init__(self) -> None:
+        self.requests: list[ReviewRequest] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+    async def review(self, request: ReviewRequest) -> ReviewAdmission:
+        self.requests.append(request)
+        return ReviewAdmission(
+            "vr_synthetic", "accepted", request.conversation_id, request.generation,
+            request.seq_from, request.seq_through, request.closing,
+        )
+
+
+def _review_event(conversation_id: str) -> VoiceReviewEvent:
+    return VoiceReviewEvent(
+        protocol_version="0.3", type="voice_review", conversation_id=conversation_id,
+        generation=0, seq_from=0, seq_through=0, memory=True, skills=True,
+        closing=False,
+    )
+
+
 def _markers(output: str, prefix: str) -> list[dict[str, object]]:
     return [
         json.loads(line.removeprefix(prefix))
@@ -81,6 +111,67 @@ def _markers(output: str, prefix: str) -> list[dict[str, object]]:
 
 
 # --- the service ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_review_ids_do_not_bind_or_consume_archive_capacity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    hermes = FakeHermes()
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, hermes, lease_ttl_seconds=30.0)
+    review = _AcceptingReview()
+    service = VoiceCompanionService(archive, store, hermes, review)  # type: ignore[arg-type]
+    await service.start()
+    try:
+        replies = [await service.review(_review_event(f"unknown{index}")) for index in range(17)]
+        assert all(type(reply) is VoiceReviewRefusedEvent for reply in replies)
+        assert all(reply.category == "unbound" for reply in replies)
+        assert review.requests == []
+        assert hermes.sessions == {}
+        assert hermes.lease == {}
+        assert archive._live == {}
+        assert all(store.read(f"unknown{index}") is None for index in range(17))
+        archived = await service.archive(_event([_row(0)], conversation="real"))
+        assert type(archived) is VoiceArchiveAckEvent
+        output = capsys.readouterr().out
+        assert _markers(output, _HOST_MARKER) == [
+            {"refusal": "unbound", "version": 1} for _ in range(17)
+        ]
+        assert all(f"unknown{index}" not in output for index in range(17))
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_known_bound_review_reopens_after_lease_loss(tmp_path: Path) -> None:
+    hermes = FakeHermes()
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, hermes, lease_ttl_seconds=30.0)
+    review = _AcceptingReview()
+    service = VoiceCompanionService(archive, store, hermes, review)  # type: ignore[arg-type]
+    await service.start()
+    try:
+        assert type(await service.archive(_event([_row(0)]))) is VoiceArchiveAckEvent
+        session_id = hermes.only()
+        bound = store.read("conv")
+        assert bound is not None
+        hermes.lease[session_id] = "foreign holder"
+        refused = await service.archive(_event([_row(1)], seq_from=1))
+        assert type(refused) is VoiceArchiveRefusedEvent
+        assert refused.category == "lease_lost"
+        del hermes.lease[session_id]
+        assert type(await service.review(_review_event("conv"))) is VoiceReviewAckEvent
+        assert review.requests == [ReviewRequest("conv", 0, 0, 0, True, True, False)]
+        recovered = store.read("conv")
+        assert recovered is not None
+        assert recovered.session_id == bound.session_id
+        assert hermes.lease[session_id] == recovered.holder
+        assert hermes.calls.count("acquire_lease") == 2
+    finally:
+        await service.close()
+        store.close()
 
 
 @pytest.mark.asyncio
