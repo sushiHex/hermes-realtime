@@ -138,6 +138,7 @@ class VoiceReviewCoordinator:
         self._parent_factory = parent_factory
         self._parents: dict[tuple[str, int], Any] = {}
         self._parent_builds: dict[tuple[str, int], asyncio.Task[Any]] = {}
+        self._requests: set[asyncio.Task[Any]] = set()
         self._active: dict[str, _Running] = {}
         self._interval: int | None = None
         self._closed = False
@@ -186,6 +187,9 @@ class VoiceReviewCoordinator:
 
     async def review(self, request: ReviewRequest) -> ReviewAdmission:
         evidence: dict[str, str | int] | None = None
+        caller = asyncio.current_task()
+        if caller is not None:
+            self._requests.add(caller)
         try:
             if type(request) is not ReviewRequest:
                 raise TypeError("review request must be exact")
@@ -200,6 +204,8 @@ class VoiceReviewCoordinator:
             evidence = {"failure": type(error).__name__, "version": 1}
             raise
         finally:
+            if caller is not None:
+                self._requests.discard(caller)
             if evidence is not None:
                 _marker(evidence)
 
@@ -418,7 +424,7 @@ class VoiceReviewCoordinator:
         running.cancelled = True
         deadline = asyncio.get_running_loop().time() + timeout
         work = self._cancel_tasks.get(running.review_id)
-        if work is None:
+        if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
             work = asyncio.create_task(
                 asyncio.to_thread(self._port.cancel, running.parent, running.token)
             )
@@ -454,6 +460,18 @@ class VoiceReviewCoordinator:
 
     async def close(self) -> None:
         self._closed = True
+        if asyncio.current_task() in self._requests:
+            raise ReviewQuiescenceError("review request has not quiesced")
+        requests = tuple(self._requests)
+        for caller in requests:
+            caller.cancel()
+        if requests:
+            try:
+                _, pending = await asyncio.wait(requests, timeout=_CLOSE_JOIN_SECONDS)
+            except asyncio.CancelledError:
+                raise ReviewQuiescenceError("review request has not quiesced") from None
+            if pending:
+                raise ReviewQuiescenceError("review request has not quiesced")
         for conversation_id in tuple(self._active):
             if not await self.cancel_and_join(conversation_id, _CLOSE_JOIN_SECONDS):
                 raise ReviewQuiescenceError("review thread has not quiesced")

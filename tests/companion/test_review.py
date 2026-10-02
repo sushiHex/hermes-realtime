@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from pathlib import Path
@@ -39,6 +40,12 @@ class FakeReviewPort:
         self.admit_entered = threading.Event()
         self.admit_release = threading.Event()
         self.block_admit = False
+        self.block_verify = False
+        self.verify_entered = threading.Event()
+        self.verify_release = threading.Event()
+        self.block_settings = False
+        self.settings_entered = threading.Event()
+        self.settings_release = threading.Event()
         self.finish_calls = 0
         self.interval = 10
         self.enabled = True
@@ -48,9 +55,12 @@ class FakeReviewPort:
         self.cancel_entered = threading.Event()
         self.cancel_release = threading.Event()
         self.block_cancel = False
+        self.cancel_calls = 0
 
     def verify_parent_binding(self, parent: Any) -> None:
-        pass
+        if self.block_verify:
+            self.verify_entered.set()
+            self.verify_release.wait(5)
 
     def bind_parent_callbacks(self, parent: Any, failed: Any) -> None:
         parent._safe_print = lambda *args, **kwargs: None
@@ -67,6 +77,9 @@ class FakeReviewPort:
 
     def settings(self) -> tuple[int, dict[str, object]]:
         self.settings_calls += 1
+        if self.block_settings:
+            self.settings_entered.set()
+            self.settings_release.wait(5)
         return self.interval, {"enabled": self.enabled, "extra_tools": self.extra_tools}
 
     def admit(
@@ -99,6 +112,7 @@ class FakeReviewPort:
         self.finish_calls += 1
 
     def cancel(self, parent: Any, token: Any) -> None:
+        self.cancel_calls += 1
         if self.block_cancel:
             self.cancel_entered.set()
             self.cancel_release.wait(5)
@@ -178,7 +192,7 @@ async def test_close_retains_profile_until_parent_build_quiesces(
             await review.close()
         assert closed == []
         release.set()
-        with pytest.raises(ArchiveRefusal, match="not_ready"):
+        with pytest.raises(asyncio.CancelledError):
             await pending
         assert port.admissions == []
         await review.close()
@@ -221,12 +235,101 @@ async def test_cancelled_close_retains_constructing_parent(tmp_path: Path) -> No
             await closing
         assert closed == []
         release.set()
-        with pytest.raises(ArchiveRefusal, match="not_ready"):
+        with pytest.raises(asyncio.CancelledError):
             await pending
         await review.close()
         assert closed == [True]
     finally:
         release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["settings", "verify", "admit"])
+async def test_close_owns_inflight_review_request_at_every_native_await(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from hermes_realtime.companion import review as review_module
+
+    monkeypatch.setattr(review_module, "_CLOSE_JOIN_SECONDS", 0.05)
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    await review.start()
+    await archive.open("conv")
+    await archive.archive("conv", _batch())
+    if stage == "settings":
+        port.block_settings = True
+        entered, release = port.settings_entered, port.settings_release
+    elif stage == "verify":
+        port.block_verify = True
+        entered, release = port.verify_entered, port.verify_release
+    else:
+        port.block_admit = True
+        entered, release = port.admit_entered, port.admit_release
+    pending = asyncio.create_task(
+        review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        if stage != "verify":
+            pending.cancel()  # The bridge has stopped waiting for this request.
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert closed == []
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert port.finish_calls == (1 if stage == "admit" else 0)
+        await review.close()
+        assert closed == ([] if stage == "settings" else [True])
+    finally:
+        release.set()
+        pending.cancel()
+        with contextlib.suppress(BaseException):
+            await pending
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_retains_inflight_admission(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.block_admit = True
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    await review.start()
+    await archive.open("conv")
+    await archive.archive("conv", _batch())
+    pending = asyncio.create_task(
+        review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+    )
+    try:
+        assert await asyncio.to_thread(port.admit_entered.wait, 5)
+        closing = asyncio.create_task(review.close())
+        await asyncio.sleep(0)
+        closing.cancel()
+        with pytest.raises(ReviewQuiescenceError):
+            await closing
+        assert closed == []
+        port.admit_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert port.finish_calls == 1
+        await review.close()
+        assert closed == [True]
+    finally:
+        port.admit_release.set()
+        pending.cancel()
+        with contextlib.suppress(BaseException):
+            await pending
         await archive.close()
         store.close()
 
@@ -349,6 +452,36 @@ async def test_cancel_failure_retains_live_review_and_archive(
 
 
 @pytest.mark.asyncio
+async def test_completed_failed_cancel_helper_is_retried_while_review_runs(
+    tmp_path: Path,
+) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.cancel_error = True
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: type("Parent", (), {})())
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        admitted = await review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        await asyncio.wait_for(port.started.wait(), 5)
+        assert not await review.cancel_and_join("conv", 0.05)
+        assert port.cancel_calls == 1
+        assert review.active("conv") == admitted.review_id
+        port.cancel_error = False
+        assert not await review.cancel_and_join("conv", 0.05)
+        assert port.cancel_calls == 2
+        assert review.active("conv") == admitted.review_id
+    finally:
+        port.release.set()
+        await review.close()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_native_cancel_helper_retains_parent_after_worker_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -378,6 +511,7 @@ async def test_native_cancel_helper_retains_parent_after_worker_exits(
         with pytest.raises(ReviewQuiescenceError):
             await review.close()
         assert review.active("conv") == admitted.review_id
+        assert port.cancel_calls == 1
         port.cancel_release.set()
         await review.close()
         assert closed == [True]
