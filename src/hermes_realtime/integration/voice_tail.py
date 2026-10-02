@@ -443,12 +443,7 @@ def _parse_archive(
                     or pending_users != reviewed_users + sum(is_user for _, is_user in window)
                 ):
                     return None
-            elif (
-                not closing
-                or pending_users != reviewed_users
-                or review_cursor is None
-                or end > review_cursor
-            ):
+            elif not closing or pending_users != reviewed_users:
                 return None
             pending = ReviewRange(conversation_id, generation, start, end, pending_users, closing)
         review = ReviewProgress(
@@ -905,10 +900,12 @@ class VoiceTailWriter:
                         if final:
                             through = progress.close_targets[0]
                     elif closing and progress.close_targets:
-                        # At an exact cadence boundary, a distinct final review
-                        # replays the last <=24 sequence positions.
+                        # Replay up to 24 positions near prior coverage, then span
+                        # the empty gap to the exact close checkpoint.
                         through = progress.close_targets[0]
-                        start = max(0, through - 23)
+                        start = max(
+                            0, (progress.cursor if progress.cursor is not None else through) - 23
+                        )
                         final = True
                     else:
                         await self._tick.wait()
@@ -920,7 +917,7 @@ class VoiceTailWriter:
                         through,
                         progress.reviewed_users + sum(is_user for _, is_user in window)
                         if eligible
-                        else progress.users,
+                        else progress.reviewed_users,
                         final,
                     )
                     self._review = replace(progress, pending=pending)

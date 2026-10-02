@@ -1228,6 +1228,103 @@ async def test_closing_review_ends_at_checkpoint_even_when_its_outbox_row_was_dr
         await writer.close()
 
 
+@pytest.mark.parametrize("target", [1, 30], ids=["short-gap", "long-gap"])
+@pytest.mark.asyncio
+async def test_dropped_close_target_after_periodic_review_restarts_without_claiming_later_users(
+    tmp_path: Path, target: int
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (periodic.seq_from, periodic.seq_through, periodic.users, periodic.closing) == (
+            0,
+            0,
+            1,
+            False,
+        )
+        assert writer.acknowledge_review(periodic)
+
+        for index in range(1, target + 1):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        for index in range(target + 1, target + 5):
+            _say(store, f"Q{index}")
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, target)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            0,
+            target,
+            1,
+            True,
+        )
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == closing
+    finally:
+        await writer.close()
+
+    restored = _archiver(path, max_outbox_rows=4, max_batch_rows=3)
+    await restored.open(ConversationContextStore(on_change=restored.update))
+    try:
+        assert await asyncio.wait_for(restored.next_review(1), 2) == closing
+        assert restored.acknowledge_review(closing)
+        assert restored._review.close_targets == ()
+        next_periodic = await asyncio.wait_for(restored.next_review(1), 2)
+        assert (next_periodic.seq_from, next_periodic.seq_through, next_periodic.users) == (
+            target + 1,
+            target + 1,
+            2,
+        )
+        assert not next_periodic.closing
+    finally:
+        await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_dropped_first_close_target_keeps_an_empty_review_window_durable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        writer.request_review_close()
+        for index in range(1, 5):
+            _say(store, f"Q{index}")
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert batch.rows[0].gap_before == (0, 0)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            0,
+            0,
+            0,
+            True,
+        )
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == closing
+    finally:
+        await writer.close()
+
+    restored = _archiver(path, max_outbox_rows=4, max_batch_rows=3)
+    await restored.open(ConversationContextStore(on_change=restored.update))
+    try:
+        assert await asyncio.wait_for(restored.next_review(10), 2) == closing
+    finally:
+        await restored.close()
+
+
 @pytest.mark.asyncio
 async def test_a_trailing_gap_waits_in_the_tail_until_a_user_row_carries_it(
     tmp_path: Path,
