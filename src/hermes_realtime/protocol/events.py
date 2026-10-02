@@ -289,7 +289,7 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
     return _EVENT_ADAPTER.validate_python(data)
 
 
-# --- bridge protocol 0.2: capability negotiation and the voice archive ---------------------
+# --- bridge protocol 0.3: capability negotiation, voice archive and review ------------------
 #
 # The bridge hello names protocol "0.2" and the capabilities each side offers; realtime sends
 # a voice event only on a connection whose hello advertised ``voice_archive``. Voice events
@@ -298,19 +298,48 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
 # rows and gaps, which role may carry a gap or a flag) are the companion's, which answers
 # them with a category refusal rather than a dropped connection.
 
-BRIDGE_PROTOCOL_VERSION = "0.2"
+BRIDGE_PROTOCOL_VERSION = "0.3"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
-BRIDGE_CAPABILITIES = frozenset({VOICE_ARCHIVE_CAPABILITY})
+VOICE_REVIEW_CAPABILITY = "voice_review"
+BRIDGE_CAPABILITIES = frozenset({VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY})
 VOICE_MAX_BATCH_ROWS = 256
 VOICE_MAX_TEXT_CHARS = 65_536
 _VOICE_MAX_IDENTITY = 2**53 - 1
 # Every category the companion may refuse with; a test binds this to the companion's set.
 VOICE_REFUSAL_CATEGORIES = frozenset(
     {
-        "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
-        "over_cap", "rotated", "lineage", "count", "recovery", "drift", "incompatible",
-        "durability", "lease_lost", "lease_held", "not_ready", "fenced", "quarantined",
-        "tombstoned", "pending", "stale", "unbound", "bound", "conversations",
+        "invalid",
+        "partition",
+        "identity",
+        "conflict",
+        "capacity",
+        "mismatch",
+        "missing",
+        "over_cap",
+        "rotated",
+        "lineage",
+        "count",
+        "recovery",
+        "drift",
+        "incompatible",
+        "durability",
+        "lease_lost",
+        "lease_held",
+        "not_ready",
+        "fenced",
+        "quarantined",
+        "tombstoned",
+        "pending",
+        "stale",
+        "unbound",
+        "bound",
+        "conversations",
+        "busy",
+        "unknown",
+        "failed",
+        "disabled",
+        "configuration",
+        "window",
     }
 )
 
@@ -323,15 +352,43 @@ VOICE_REFUSAL_CATEGORIES = frozenset(
 # string, so a category a newer companion adds still parses; one in neither set fences.
 VOICE_TRANSIENT_REFUSALS = frozenset(
     {
-        "not_ready", "lease_held", "lease_lost", "conversations", "pending", "stale",
-        "fenced", "incompatible", "durability", "unbound", "bound",
+        "not_ready",
+        "lease_held",
+        "lease_lost",
+        "conversations",
+        "pending",
+        "stale",
+        "fenced",
+        "incompatible",
+        "durability",
+        "unbound",
+        "bound",
     }
 )
 VOICE_INTEGRITY_REFUSALS = frozenset(
     {
-        "invalid", "partition", "identity", "conflict", "capacity", "mismatch", "missing",
-        "over_cap", "rotated", "lineage", "count", "recovery", "drift", "quarantined",
+        "invalid",
+        "partition",
+        "identity",
+        "conflict",
+        "capacity",
+        "mismatch",
+        "missing",
+        "over_cap",
+        "rotated",
+        "lineage",
+        "count",
+        "recovery",
+        "drift",
+        "quarantined",
         "tombstoned",
+        # Review-only categories must never make an archive refusal transient.
+        "busy",
+        "unknown",
+        "failed",
+        "disabled",
+        "configuration",
+        "window",
     }
 )
 
@@ -377,7 +434,7 @@ class VoiceArchiveRow(StrictModel):
 
 class _VoiceRange(StrictModel):
     # Explicit on every voice event: the work events stay at "0.1".
-    protocol_version: Literal["0.2"]
+    protocol_version: Literal["0.3"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
     seq_from: VoiceIdentity
@@ -410,12 +467,58 @@ class VoiceArchiveRefusedEvent(_VoiceRange):
     category: VoiceRefusalCategory
 
 
+def _require_true(value: object) -> object:
+    if type(value) is not bool or value is not True:
+        raise ValueError("review flags must be exact true booleans")
+    return value
+
+
+class VoiceReviewEvent(_VoiceRange):
+    """Request native review of one acknowledged archive range."""
+
+    type: Literal["voice_review"]
+    memory: Annotated[Literal[True], BeforeValidator(_require_true)]
+    skills: Annotated[Literal[True], BeforeValidator(_require_true)]
+    closing: bool
+
+
+class VoiceReviewAckEvent(_VoiceRange):
+    """An owned Hermes review thread was admitted for this exact request."""
+
+    type: Literal["voice_review_ack"]
+    closing: bool
+    review_id: VoiceConversationId
+    status: Literal["accepted"]
+
+
+class VoiceReviewRefusedEvent(_VoiceRange):
+    """The review was not admitted; coverage stays pending."""
+
+    type: Literal["voice_review_refused"]
+    closing: bool
+    category: VoiceRefusalCategory
+
+
 VoiceEvent: TypeAlias = Annotated[
-    VoiceArchiveEvent | VoiceArchiveAckEvent | VoiceArchiveRefusedEvent,
+    VoiceArchiveEvent
+    | VoiceArchiveAckEvent
+    | VoiceArchiveRefusedEvent
+    | VoiceReviewEvent
+    | VoiceReviewAckEvent
+    | VoiceReviewRefusedEvent,
     Field(discriminator="type"),
 ]
 _VOICE_ADAPTER: TypeAdapter[VoiceEvent] = TypeAdapter(VoiceEvent)
-VOICE_EVENT_TYPES = frozenset({"voice_archive", "voice_archive_ack", "voice_archive_refused"})
+VOICE_EVENT_TYPES = frozenset(
+    {
+        "voice_archive",
+        "voice_archive_ack",
+        "voice_archive_refused",
+        "voice_review",
+        "voice_review_ack",
+        "voice_review_refused",
+    }
+)
 
 
 def parse_voice_event(data: str | bytes | dict[str, Any]) -> VoiceEvent:

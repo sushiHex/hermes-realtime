@@ -92,6 +92,13 @@ REFUSAL_CATEGORIES = frozenset(
         "unbound",
         "bound",
         "conversations",
+        # Review admission and its retained outcome; never implies learning.
+        "busy",
+        "unknown",
+        "failed",
+        "disabled",
+        "configuration",
+        "window",
     }
 )
 

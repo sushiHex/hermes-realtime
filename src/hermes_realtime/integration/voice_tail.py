@@ -52,11 +52,13 @@ from hermes_realtime.integration.run_record import (
     write_run_record,
 )
 
-_VERSION = 2
+_VERSION = 3
+_ARCHIVE_VERSION = 2
 _LEGACY_VERSION = 1
 _MARKER_PREFIX = "[voice-tail] "
 _LOCK_MARKER_PREFIX = "[voice-tail-lock] "
 _OUTBOX_MARKER_PREFIX = "[voice-tail-outbox] "
+_REVIEW_CLOSE_MARKER_PREFIX = "[voice-review-close] "
 # ASCII-escaped JSON spends at most twelve bytes on one str character (an astral
 # character becomes a surrogate-pair escape), plus a fixed per-row and envelope cost.
 _MAX_BYTES_PER_CHAR = 12
@@ -70,6 +72,20 @@ _ROW_FIELDS = frozenset({"interrupted", "role", "text"})
 _ARCHIVE_FIELDS = frozenset(
     {"conversation_id", "cursor", "frozen", "gap", "generation", "next_seq", "outbox", "settled"}
 )
+_REVIEW_FIELDS = frozenset(
+    {
+        "cursor",
+        "users",
+        "reviewed_users",
+        "pending",
+        "close_targets",
+        "close_reviewed",
+        "rows",
+        "overflow",
+    }
+)
+_MAX_REVIEW_ROWS = 4096
+_REVIEW_PENDING_FIELDS = frozenset({"seq_from", "seq_through", "users", "closing"})
 _OUTBOX_FIELDS = frozenset({"gap_before", "interrupted", "role", "seq", "text", "ts"})
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MAX_IDENTITY = 2**53 - 1
@@ -128,6 +144,29 @@ class ArchiveOutbox:
     rows: tuple[OutboxRow, ...]
     frozen: int
     gap: tuple[int, int] | None
+    review: ReviewProgress | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewProgress:
+    cursor: int | None = None
+    users: int = 0
+    reviewed_users: int = 0
+    pending: ReviewRange | None = None
+    close_targets: tuple[int, ...] = ()
+    close_reviewed: bool = False
+    rows: tuple[tuple[int, bool], ...] = ()
+    overflow: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewRange:
+    conversation_id: str
+    generation: int
+    seq_from: int
+    seq_through: int
+    users: int
+    closing: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +186,9 @@ def max_voice_tail_bytes(
     return (
         max_messages * (_ROW_OVERHEAD_BYTES + _MAX_BYTES_PER_CHAR * max_item_chars)
         + max_outbox_rows * (_OUTBOX_ROW_OVERHEAD_BYTES + _MAX_BYTES_PER_CHAR * max_item_chars)
+        # One identity can need 16 decimal digits. Each retained row has a role
+        # bit; an idle checkpoint has its own identity, both with JSON punctuation.
+        + _MAX_REVIEW_ROWS * (25 + 18)
         + _ENVELOPE_OVERHEAD_BYTES
         + _ARCHIVE_OVERHEAD_BYTES
     )
@@ -178,6 +220,23 @@ def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes
                 for row in archive.rows
             ],
             "settled": archive.settled,
+            "review": {
+                "cursor": (archive.review or ReviewProgress()).cursor,
+                "users": (archive.review or ReviewProgress()).users,
+                "reviewed_users": (archive.review or ReviewProgress()).reviewed_users,
+                "pending": None
+                if archive.review is None or archive.review.pending is None
+                else {
+                    "seq_from": archive.review.pending.seq_from,
+                    "seq_through": archive.review.pending.seq_through,
+                    "users": archive.review.pending.users,
+                    "closing": archive.review.pending.closing,
+                },
+                "close_targets": list((archive.review or ReviewProgress()).close_targets),
+                "close_reviewed": (archive.review or ReviewProgress()).close_reviewed,
+                "rows": [list(row) for row in (archive.review or ReviewProgress()).rows],
+                "overflow": (archive.review or ReviewProgress()).overflow,
+            },
         },
         "messages": [
             {"interrupted": message.interrupted, "role": message.role, "text": message.text}
@@ -247,7 +306,10 @@ def _parse_outbox_row(row: object, max_item_chars: int) -> OutboxRow | None:
 def _parse_archive(
     archive: object, messages: int, max_item_chars: int, max_outbox_rows: int
 ) -> ArchiveOutbox | None:
-    if type(archive) is not dict or set(archive) != _ARCHIVE_FIELDS:
+    if type(archive) is not dict or set(archive) not in (
+        _ARCHIVE_FIELDS,
+        _ARCHIVE_FIELDS | {"review"},
+    ):
         return None
     conversation_id = archive["conversation_id"]
     generation, next_seq, settled = archive["generation"], archive["next_seq"], archive["settled"]
@@ -289,8 +351,116 @@ def _parse_archive(
         expected = gap[1] + 1
     if expected != next_seq:
         return None
+    review = None
+    if "review" in archive:
+        raw_review = archive["review"]
+        if type(raw_review) is not dict or set(raw_review) != _REVIEW_FIELDS:
+            return None
+        review_cursor = raw_review["cursor"]
+        users, reviewed_users = raw_review["users"], raw_review["reviewed_users"]
+        if review_cursor is not None and (
+            not _identity(review_cursor) or cursor is None or review_cursor > cursor
+        ):
+            return None
+        if not _identity(users) or not _identity(reviewed_users) or reviewed_users > users:
+            return None
+        if (
+            (review_cursor is None and reviewed_users != 0)
+            or (cursor is None and users != 0)
+            or (cursor is not None and users > cursor + 1)
+        ):
+            return None
+        close_targets = raw_review["close_targets"]
+        if type(close_targets) is not list or len(close_targets) > _MAX_REVIEW_ROWS:
+            return None
+        if any(not _identity(target) or target >= next_seq for target in close_targets):
+            return None
+        if any(
+            left >= right for left, right in zip(close_targets, close_targets[1:], strict=False)
+        ):
+            return None
+        if type(raw_review["close_reviewed"]) is not bool:
+            return None
+        if raw_review["close_reviewed"] and close_targets:
+            return None
+        raw_review_rows = raw_review["rows"]
+        if type(raw_review_rows) is not list or len(raw_review_rows) > _MAX_REVIEW_ROWS:
+            return None
+        review_rows: list[tuple[int, bool]] = []
+        prior = review_cursor if review_cursor is not None else -1
+        for item in raw_review_rows:
+            if (
+                type(item) is not list
+                or len(item) != 2
+                or not _identity(item[0])
+                or type(item[1]) is not bool
+                or item[0] <= prior
+                or cursor is None
+                or item[0] > cursor
+            ):
+                return None
+            prior = item[0]
+            review_rows.append((item[0], item[1]))
+        overflow = raw_review["overflow"]
+        if type(overflow) is not bool:
+            return None
+        if overflow and len(review_rows) != _MAX_REVIEW_ROWS:
+            return None
+        if review_rows and review_rows[-1][0] != cursor and not overflow:
+            return None
+        if not overflow and users - reviewed_users != sum(is_user for _, is_user in review_rows):
+            return None
+        pending = None
+        raw_pending = raw_review["pending"]
+        if raw_pending is not None:
+            if type(raw_pending) is not dict or set(raw_pending) != _REVIEW_PENDING_FIELDS:
+                return None
+            start, end, pending_users = (
+                raw_pending["seq_from"],
+                raw_pending["seq_through"],
+                raw_pending["users"],
+            )
+            closing = raw_pending["closing"]
+            if not (
+                _identity(start)
+                and _identity(end)
+                and _identity(pending_users)
+                and type(closing) is bool
+                and start <= end
+                and cursor is not None
+                and end <= cursor
+                and reviewed_users <= pending_users <= users
+            ):
+                return None
+            window = [row for row in review_rows if start <= row[0] <= end]
+            if window:
+                if (
+                    window[0][0] != start
+                    or window[-1][0] != end
+                    or len(window) > 24
+                    or pending_users != reviewed_users + sum(is_user for _, is_user in window)
+                ):
+                    return None
+            elif (
+                not closing
+                or pending_users != reviewed_users
+                or review_cursor is None
+                or end > review_cursor
+            ):
+                return None
+            pending = ReviewRange(conversation_id, generation, start, end, pending_users, closing)
+        review = ReviewProgress(
+            review_cursor,
+            users,
+            reviewed_users,
+            pending,
+            tuple(close_targets),
+            raw_review["close_reviewed"],
+            tuple(review_rows),
+            overflow,
+        )
     return ArchiveOutbox(
-        conversation_id, generation, next_seq, settled, cursor, tuple(rows), frozen, gap
+        conversation_id, generation, next_seq, settled, cursor, tuple(rows), frozen, gap, review
     )
 
 
@@ -311,7 +481,7 @@ def parse_voice_tail(
     if type(document) is not dict:
         return None
     version = document.get("version")
-    if type(version) is not int or version not in (_LEGACY_VERSION, _VERSION):
+    if type(version) is not int or version not in (_LEGACY_VERSION, _ARCHIVE_VERSION, _VERSION):
         return None
     if set(document) != (_LEGACY_FIELDS if version == _LEGACY_VERSION else _DOCUMENT_FIELDS):
         return None
@@ -330,11 +500,13 @@ def parse_voice_tail(
             return None
         messages.append(ConversationMessage(role=role, text=text, interrupted=interrupted))
     archive = None
-    if version == _VERSION:
+    if version in (_ARCHIVE_VERSION, _VERSION):
         archive = _parse_archive(
             document["archive"], len(messages), max_item_chars, max_outbox_rows
         )
         if archive is None:
+            return None
+        if (version == _VERSION) != (archive.review is not None):
             return None
     return VoiceTail(DurableConversation(messages=tuple(messages), prior_work=prior_work), archive)
 
@@ -412,6 +584,9 @@ class VoiceTailWriter:
         self._outbox: list[OutboxRow] = []
         self._frozen = 0
         self._gap: tuple[int, int] | None = None
+        self._review = ReviewProgress()
+        self._review_frozen_version = 0
+        self._last_activity = time.monotonic()
         self._version = 0
         self._frozen_version = 0
         self._written_version = 0
@@ -423,6 +598,10 @@ class VoiceTailWriter:
     def update(self, view: DurableConversation) -> None:
         if type(view) is not DurableConversation:
             raise TypeError("voice tail updates must be an exact DurableConversation")
+        if view != self._latest:
+            self._last_activity = time.monotonic()
+            if self._review.close_reviewed:
+                self._review = replace(self._review, close_reviewed=False)
         self._latest = view
         if self._archiving:
             self._assign(view)
@@ -524,6 +703,7 @@ class VoiceTailWriter:
             rows=tuple(self._outbox),
             frozen=self._frozen,
             gap=self._gap,
+            review=self._review,
         )
 
     # --- the archive sender's interface ------------------------------------------------------
@@ -586,9 +766,184 @@ class VoiceTailWriter:
         ) or any(type(value) is not int for value in (generation, seq_from, seq_through)):
             return False
         del self._outbox[: self._frozen]
+        users = sum(row.role == "user" for row in batch.rows)
+        retained = self._review.rows + tuple((row.seq, row.role == "user") for row in batch.rows)
+        overflow = self._review.overflow or len(retained) > _MAX_REVIEW_ROWS
+        if len(retained) > _MAX_REVIEW_ROWS:
+            # Preserve the old unmet range. There is no bounded accurate plan for
+            # further windows until an operator reconciles this conversation.
+            retained = retained[:_MAX_REVIEW_ROWS]
+            _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "review_capacity", "version": 1})
+        self._review = replace(
+            self._review, users=self._review.users + users, rows=retained, overflow=overflow
+        )
         self._frozen = 0
         self._cursor = seq_through
         self._discard_episode = False
+        self._changed()
+        return True
+
+    def request_review_close(self) -> None:
+        """Mark a quiet conversation for a final review; safe to repeat."""
+        if self._latest.unsettled:
+            return
+        target = self._outbox[-1].seq if self._outbox else self._cursor
+        if target is None:
+            return
+        if self._review.close_targets and target <= self._review.close_targets[-1]:
+            return
+        if self._review.close_reviewed and self._review.cursor == target:
+            return
+        if not self._outbox and self._review.cursor == target and self._review.users == 0:
+            return
+        if len(self._review.close_targets) >= _MAX_REVIEW_ROWS:
+            _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "close_capacity", "version": 1})
+            return
+        self._review = replace(self._review, close_targets=self._review.close_targets + (target,))
+        self._changed()
+
+    def idle_for(self) -> float:
+        return time.monotonic() - self._last_activity
+
+    async def wait_review_close(self, *, timeout: float = 5.0) -> bool:
+        """Let live senders settle the final archive and review within one budget."""
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
+            raise ValueError("review close timeout must be finite and bounded")
+        evidence: dict[str, str | int] | None = None
+        try:
+            if self._owner is None:
+                evidence = {"refusal": "not_open", "version": 1}
+                return False
+            if self._latest.unsettled:
+                evidence = {"refusal": "unsettled", "version": 1}
+                return False
+            self.request_review_close()
+            if not self._review.close_targets:
+                return (
+                    self._cursor is None
+                    or self._review.close_reviewed
+                    or (self._review.cursor == self._cursor and self._review.users == 0)
+                )
+            async with asyncio.timeout(timeout):
+                while self._review.close_targets:
+                    await self._tick.wait()
+            return True
+        except TimeoutError:
+            evidence = {
+                "refusal": "deadline",
+                "outbox": len(self._outbox),
+                "pending": int(self._review.pending is not None),
+                "ends": len(self._review.close_targets),
+                "version": 1,
+            }
+            return False
+        finally:
+            if evidence is not None:
+                _marker(_REVIEW_CLOSE_MARKER_PREFIX, evidence)
+
+    @property
+    def has_unsettled_rows(self) -> bool:
+        return self._latest.unsettled != 0
+
+    async def next_review(self, interval: int) -> ReviewRange:
+        """Freeze one admitted-coverage range before returning it to the sender."""
+        if type(interval) is not int or not 1 <= interval <= 1000:
+            raise ValueError("review interval must be an exact integer from 1 to 1000")
+        while True:
+            if self._owner is not None:
+                pending = self._review.pending
+                if pending is not None and self._written_version >= self._review_frozen_version:
+                    return pending
+                cursor = self._cursor
+                progress = self._review
+                close_due = (
+                    bool(progress.close_targets)
+                    and not progress.close_reviewed
+                    and cursor is not None
+                    and cursor >= progress.close_targets[0]
+                )
+                periodic = progress.users // interval > progress.reviewed_users // interval
+                if close_due:
+                    next_threshold = (progress.reviewed_users // interval + 1) * interval
+                    available = progress.reviewed_users + sum(
+                        is_user
+                        for seq, is_user in progress.rows
+                        if seq <= progress.close_targets[0]
+                    )
+                    periodic = periodic and available >= next_threshold
+                closing = close_due and not periodic
+                if pending is None and cursor is not None and (close_due or periodic):
+                    if progress.overflow:
+                        await self._tick.wait()
+                        continue
+                    eligible = [
+                        row
+                        for row in progress.rows
+                        if (not progress.close_targets or row[0] <= progress.close_targets[0])
+                    ]
+                    if eligible:
+                        window = eligible[:24]
+                        if not closing:
+                            needed = interval - (progress.reviewed_users % interval)
+                            users_in_window = 0
+                            for index, (_, is_user) in enumerate(window):
+                                if is_user:
+                                    users_in_window += 1
+                                if (
+                                    users_in_window >= needed
+                                    and index + 1 < len(window)
+                                    and window[index + 1][1]
+                                ):
+                                    window = window[: index + 1]
+                                    break
+                        start = window[0][0]
+                        through = window[-1][0]
+                        # Only the final window carries the closing identity.
+                        final = closing and len(eligible) <= 24
+                    elif closing and progress.close_targets:
+                        # At an exact cadence boundary, a distinct final review
+                        # replays the last <=24 sequence positions.
+                        through = progress.close_targets[0]
+                        start = max(0, through - 23)
+                        final = True
+                    else:
+                        await self._tick.wait()
+                        continue
+                    pending = ReviewRange(
+                        self._conversation_id,
+                        self._generation,
+                        start,
+                        through,
+                        progress.reviewed_users + sum(is_user for _, is_user in window)
+                        if eligible
+                        else progress.users,
+                        final,
+                    )
+                    self._review = replace(progress, pending=pending)
+                    self._changed()
+                    self._review_frozen_version = self._version
+            await self._tick.wait()
+
+    def acknowledge_review(self, request: ReviewRange) -> bool:
+        if type(request) is not ReviewRange or request != self._review.pending:
+            return False
+        progress = self._review
+        if progress.overflow:
+            _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "review_capacity", "version": 1})
+            return False
+        self._review = replace(
+            progress,
+            cursor=max(progress.cursor if progress.cursor is not None else 0, request.seq_through),
+            reviewed_users=request.users,
+            pending=None,
+            close_targets=progress.close_targets[1:] if request.closing else progress.close_targets,
+            close_reviewed=(
+                request.closing
+                and len(progress.close_targets) == 1
+                and self._next_seq - 1 <= request.seq_through
+            ),
+            rows=tuple(row for row in progress.rows if row[0] > request.seq_through),
+        )
         self._changed()
         return True
 
@@ -642,6 +997,7 @@ class VoiceTailWriter:
         self._cursor = self._gap = None
         self._outbox = []
         self._frozen = 0
+        self._review = ReviewProgress()
 
     def _load(self, archive: ArchiveOutbox) -> None:
         self._conversation_id = archive.conversation_id
@@ -652,6 +1008,9 @@ class VoiceTailWriter:
         self._outbox = list(archive.rows)
         self._frozen = archive.frozen
         self._gap = archive.gap
+        # v2 has no trustworthy review row metadata. Its cursor is the baseline;
+        # only new acknowledgments enter M2's review coverage.
+        self._review = archive.review or ReviewProgress(cursor=archive.cursor)
         self._frozen_version = self._written_version
 
     def _restore(self, store: ConversationContextStore, raw: bytes) -> None:

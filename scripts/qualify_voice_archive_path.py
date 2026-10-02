@@ -669,7 +669,7 @@ async def _realtime(home: Path, step: str, port: int, audit: _Audit) -> None:
                     for row in state.rows[: state.frozen]
                 ],
             }
-            frozen = VoiceArchiveEvent(protocol_version="0.2", type="voice_archive", **batch)
+            frozen = VoiceArchiveEvent(protocol_version="0.3", type="voice_archive", **batch)
             (home / "frozen.json").write_text(frozen.model_dump_json(), encoding="utf-8")
             truth_path.write_text(json.dumps(truth), encoding="utf-8")
             with (home / "audit.jsonl").open("a", encoding="utf-8") as record:
@@ -692,7 +692,7 @@ async def _realtime(home: Path, step: str, port: int, audit: _Audit) -> None:
             )
             try:
                 hole = VoiceArchiveEvent(
-                    protocol_version="0.2",
+                    protocol_version="0.3",
                     type="voice_archive",
                     conversation_id=_CONVERSATION,
                     generation=0,

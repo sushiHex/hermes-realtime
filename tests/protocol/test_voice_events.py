@@ -13,6 +13,7 @@ from hermes_realtime.protocol import (
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_INTEGRITY_REFUSALS,
     VOICE_REFUSAL_CATEGORIES,
+    VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
@@ -38,7 +39,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
 
 def _archive(**overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.2",
+        "protocol_version": "0.3",
         "type": "voice_archive",
         "conversation_id": "conv_1-a",
         "generation": 0,
@@ -52,7 +53,7 @@ def _archive(**overrides: Any) -> dict[str, Any]:
 
 def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.2",
+        "protocol_version": "0.3",
         "type": kind,
         "conversation_id": "conv",
         "generation": 0,
@@ -63,10 +64,11 @@ def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     return event
 
 
-def test_the_bridge_is_version_0_2_and_offers_only_voice_archive() -> None:
-    assert BRIDGE_PROTOCOL_VERSION == "0.2"
+def test_the_bridge_is_version_0_3_and_offers_archive_and_review() -> None:
+    assert BRIDGE_PROTOCOL_VERSION == "0.3"
     assert VOICE_ARCHIVE_CAPABILITY == "voice_archive"
-    assert frozenset({"voice_archive"}) == BRIDGE_CAPABILITIES
+    assert VOICE_REVIEW_CAPABILITY == "voice_review"
+    assert frozenset({"voice_archive", "voice_review"}) == BRIDGE_CAPABILITIES
 
 
 def test_a_voice_archive_round_trips_exactly_and_never_normalizes_text() -> None:

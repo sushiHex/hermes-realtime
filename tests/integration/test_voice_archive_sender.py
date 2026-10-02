@@ -59,7 +59,7 @@ class _Companion:
         self.sent.append(event)
         action = self.script.pop(0) if self.script else "ack"
         fields: dict[str, Any] = {
-            "protocol_version": "0.2",
+            "protocol_version": "0.3",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
             "seq_from": event.seq_from,

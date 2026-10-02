@@ -22,6 +22,7 @@ from hermes_realtime.integration.voice_tail import (
     ArchiveBatch,
     ArchiveOutbox,
     OutboxRow,
+    ReviewProgress,
     VoiceTail,
     VoiceTailWriter,
     max_voice_tail_bytes,
@@ -90,6 +91,7 @@ def _archive(**overrides: object) -> ArchiveOutbox:
         "rows": (),
         "frozen": 0,
         "gap": None,
+        "review": ReviewProgress(),
     }
     fields.update(overrides)
     return ArchiveOutbox(**fields)  # type: ignore[arg-type]
@@ -119,9 +121,12 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
     assert voice_tail_bytes(tail, archive) == (
         b'{"archive":{"conversation_id":"conv","cursor":0,"frozen":1,"gap":[3,3],'
         b'"generation":0,"next_seq":4,"outbox":[{"gap_before":[1,1],"interrupted":false,'
-        b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],"settled":1},'
+        b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],'
+        b'"review":{"close_reviewed":false,"close_targets":[],"cursor":null,'
+        b'"overflow":false,"pending":null,"reviewed_users":0,"rows":[],"users":0},'
+        b'"settled":1},'
         b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
-        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":2}'
+        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":3}'
     )
     assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
     assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())
@@ -207,9 +212,7 @@ def _row_document(**overrides: object) -> bytes:
         pytest.param(
             json.dumps({"messages": [], "prior_work": False}).encode(), id="missing-version"
         ),
-        pytest.param(
-            json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"
-        ),
+        pytest.param(json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"),
         pytest.param(_document(prior_work=0), id="prior-work-not-a-boolean"),
         pytest.param(_document(version=2), id="version-two-without-an-archive"),
         pytest.param(_document(version=3), id="unknown-version"),
@@ -250,10 +253,22 @@ def _v2(archive: dict[str, object] | None = None, **overrides: object) -> bytes:
         "generation": 0,
         "next_seq": 3,
         "outbox": [
-            {"gap_before": None, "interrupted": False, "role": "user", "seq": 1,
-             "text": "Hi", "ts": 1.0},
-            {"gap_before": None, "interrupted": True, "role": "assistant", "seq": 2,
-             "text": "Cut", "ts": 2.0},
+            {
+                "gap_before": None,
+                "interrupted": False,
+                "role": "user",
+                "seq": 1,
+                "text": "Hi",
+                "ts": 1.0,
+            },
+            {
+                "gap_before": None,
+                "interrupted": True,
+                "role": "assistant",
+                "seq": 2,
+                "text": "Cut",
+                "ts": 2.0,
+            },
         ],
         "settled": 1,
     }
@@ -269,7 +284,11 @@ def _v2(archive: dict[str, object] | None = None, **overrides: object) -> bytes:
 
 def _outbox_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
-        "gap_before": None, "interrupted": False, "role": "user", "seq": 1, "text": "Hi",
+        "gap_before": None,
+        "interrupted": False,
+        "role": "user",
+        "seq": 1,
+        "text": "Hi",
         "ts": 1.0,
     }
     row.update(overrides)
@@ -709,9 +728,7 @@ async def test_a_failed_final_write_backs_off_fully_and_retries_before_close_ret
     writer.update(_rows(("assistant", "Final", True)))
 
     await asyncio.wait_for(writer.close(), timeout=2)
-    assert [_conversation(data) for data in writes.written] == [
-        _rows(("assistant", "Final", True))
-    ]
+    assert [_conversation(data) for data in writes.written] == [_rows(("assistant", "Final", True))]
     assert [_conversation(data) for data in writes.written] == [_rows(("assistant", "Final", True))]
     assert delays[0] == 0.05
     # Close never cuts the backoff short.
@@ -871,9 +888,7 @@ def _archiver(path: Path, **kwargs: object) -> VoiceTailWriter:
     return VoiceTailWriter(path, **options)  # type: ignore[arg-type]
 
 
-async def _opened(
-    path: Path, **kwargs: object
-) -> tuple[VoiceTailWriter, ConversationContextStore]:
+async def _opened(path: Path, **kwargs: object) -> tuple[VoiceTailWriter, ConversationContextStore]:
     writer = _archiver(path, **kwargs)
     store = ConversationContextStore(max_messages=16, max_item_chars=64, on_change=writer.update)
     await writer.open(store)
@@ -911,10 +926,32 @@ def _shape(rows: tuple[OutboxRow, ...]) -> list[tuple[int, str, str, bool, objec
 
 
 async def _written(path: Path, writer: VoiceTailWriter) -> ArchiveOutbox:
-    """The archive the file holds once the writer has nothing left to write."""
-    await _until(lambda: not writer._dirty and path.exists())
-    await asyncio.sleep(0.02)
+    """The archive the file holds after this version's write completes."""
+    target = writer._version
+    await _until(lambda: writer._written_version >= target and path.exists())
     return _outbox(path.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_written_receipt_waits_for_held_atomic_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "seed")
+        assert (await _written(path, writer)).rows[0].text == "seed"
+        writes.release.clear()
+        _say(store, "one")
+        receipt = asyncio.create_task(_written(path, writer))
+        await asyncio.to_thread(writes.started.wait, 2)
+        assert not receipt.done()
+        writes.release.set()
+        assert (await asyncio.wait_for(receipt, 2)).rows[-1].text == "one"
+    finally:
+        writes.release.set()
+        await writer.close()
 
 
 @pytest.mark.asyncio
@@ -982,9 +1019,7 @@ async def test_a_row_is_eligible_only_after_a_completed_write_holds_it(
         writes.release.set()
         result = await asyncio.wait_for(batch, timeout=2)
         assert _shape(result.rows) == [(0, "user", "Durable first", False, None)]
-        assert any(
-            _outbox(data).rows and _outbox(data).frozen == 0 for data in writes.written
-        )
+        assert any(_outbox(data).rows and _outbox(data).frozen == 0 for data in writes.written)
     finally:
         await writer.close()
 

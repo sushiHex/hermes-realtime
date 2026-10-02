@@ -34,14 +34,22 @@ def test_importing_the_compat_module_does_not_import_hermes() -> None:
             imported.add((node.module or "").split(".")[0])
         else:
             imported.update(alias.name.split(".")[0] for alias in node.names)
-    assert imported == {"__future__", "importlib", "inspect", "typing", "hermes_realtime"}
+    assert imported == {
+        "__future__", "copy", "hashlib", "importlib", "inspect", "json", "pathlib",
+        "threading", "typing",
+        "hermes_realtime",
+    }
 
 
 def test_the_surface_names_each_hermes_name_once() -> None:
     names = [entry.name for entry in SURFACE]
     assert len(names) == len(set(names))
-    assert all(name.split(".")[0] in {"SessionDB", "SessionTurnLeaseLostError",
-                                      "CompressionSessionClosedError"} for name in names)
+    assert all(name.split(".")[0] in {
+        "SessionDB", "SessionTurnLeaseLostError", "CompressionSessionClosedError",
+        "agent", "hermes_cli", "run_agent", "model_tools", "gateway",
+        "hermes_constants",
+        "tools",
+    } for name in names)
 
 
 def test_every_hermes_attribute_the_module_uses_is_on_the_surface() -> None:
@@ -55,7 +63,12 @@ def test_every_hermes_attribute_the_module_uses_is_on_the_surface() -> None:
             argument = node.args[-1]
             assert isinstance(argument, ast.Constant), "surface names must be literals"
             used.add(argument.value)
-    assert used == {entry.name for entry in SURFACE}
+    pinned_parent_methods = {
+        "run_agent.AIAgent._safe_print", "run_agent.AIAgent._emit_auxiliary_failure"
+    }
+    assert used | hermes_compat.REVIEW_INSTANCE_FIELDS | pinned_parent_methods == {
+        entry.name for entry in SURFACE
+    }
 
 
 def _enclosing_functions(tree: ast.AST) -> dict[ast.AST, str]:

@@ -56,7 +56,7 @@ def _row(seq: int, role: str = "user", **overrides: Any) -> VoiceArchiveRow:
 
 def _event(rows: list[VoiceArchiveRow], seq_from: int = 0, conversation: str = "conv") -> Any:
     return VoiceArchiveEvent(
-        protocol_version="0.2",
+        protocol_version="0.3",
         type="voice_archive",
         conversation_id=conversation,
         generation=0,
@@ -233,7 +233,7 @@ async def test_an_archive_is_committed_then_acknowledged_with_its_exact_range(
         )
         reply = await service.archive(event)
         assert reply == VoiceArchiveAckEvent(
-            protocol_version="0.2",
+            protocol_version="0.3",
             type="voice_archive_ack", conversation_id="conv", generation=0, seq_from=0,
             seq_through=4,
         )
@@ -495,6 +495,48 @@ def test_close_releases_every_lease_and_stops_the_loop_thread(tmp_path: Path) ->
     assert hermes.calls[-1] == "close"
     assert "release_lease" in hermes.calls[: hermes.calls.index("close")]
     assert not any(thread.name == "voice-companion" for thread in threading.enumerate())
+
+
+def test_host_keeps_profile_lock_while_review_close_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_realtime.companion import hermes_compat
+    from hermes_realtime.companion import host as host_module
+    from hermes_realtime.companion.review import ReviewQuiescenceError
+    from hermes_realtime.integration.run_record import lock_run_record
+
+    released = threading.Event()
+
+    class HeldReview:
+        async def start(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            if not released.is_set():
+                raise ReviewQuiescenceError("held native cancel")
+
+    monkeypatch.setattr(hermes_compat, "HermesArchivePort", FakeHermes)
+    monkeypatch.setattr(host_module, "VoiceReviewCoordinator", lambda *args: HeldReview())
+    monkeypatch.setattr(
+        FakeHermes, "make_review_parent", lambda self, session_id: object(), raising=False
+    )
+    hermes = FakeHermes()
+    host = _host(tmp_path, hermes, [])
+    host._close_timeout = 0.1
+    assert host.start()
+    try:
+        assert host.wait_ready(5)
+        assert type(host.submit(host.service.archive(_event([_row(0)])))) is VoiceArchiveAckEvent
+        with pytest.raises(RuntimeError, match="close timeout"):
+            host.close()
+        assert lock_run_record(tmp_path / "companion.db") is None
+        assert hermes.lease
+        assert hermes.calls.count("close") == 0
+    finally:
+        released.set()
+        host._close_timeout = 5
+        host.close()
+    assert hermes.lease == {}
 
 
 @pytest.mark.parametrize(
