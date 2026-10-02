@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import aiohttp
@@ -89,6 +90,30 @@ def test_only_complete_baseline_passes() -> None:
 def test_numeric_evidence_requires_exact_integers(value: object) -> None:
     observation = _good()
     observation["boundary"]["refused"] = value  # type: ignore[index]
+    assert _SCRIPT._passed(observation, _BASELINE) is False
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "coverage_missing_count", "coverage_missing_field",
+        "confinement_extra_route", "attribution_extra_route",
+    ],
+)
+def test_nested_shape_is_exact(shape: str) -> None:
+    observation = _good()
+    if shape == "coverage_missing_count":
+        del observation["coverage"]["0"]  # type: ignore[index]
+    elif shape == "coverage_missing_field":
+        del observation["coverage"]["1"]["users"]  # type: ignore[index]
+    elif shape == "confinement_extra_route":
+        observation["confinement"]["extra"] = deepcopy(  # type: ignore[index]
+            observation["confinement"]["main_serial"]  # type: ignore[index]
+        )
+    else:
+        observation["attribution"]["extra"] = deepcopy(  # type: ignore[index]
+            observation["attribution"]["main"]  # type: ignore[index]
+        )
     assert _SCRIPT._passed(observation, _BASELINE) is False
 
 

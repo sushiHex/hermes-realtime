@@ -124,8 +124,6 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
             return False
     for name in ("busy_close", "disconnect", "restart"):
         item = observed[name]
-        if type(item) is not dict or set(item) != {"admitted", "retained", "lost"}:
-            return False
         if item != {"admitted": 1, "retained": 1, "lost": 0}:
             return False
     confinement = observed["confinement"]
@@ -134,11 +132,6 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     }:
         return False
     for item in confinement.values():
-        if type(item) is not dict or set(item) != {
-            "attempted", "outside_executed", "denied", "whitelist_equal",
-            "extras_empty", "schema_restricted",
-        }:
-            return False
         if item != {
             "attempted": 2, "outside_executed": 0, "denied": 2,
             "whitelist_equal": 1, "extras_empty": 1, "schema_restricted": 1,
@@ -152,10 +145,6 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     if type(attribution) is not dict or set(attribution) != set(_ROUTES):
         return False
     for item in attribution.values():
-        if type(item) is not dict or set(item) != {
-            "cases", "errors", "digest", "oversized_split_or_refused",
-        }:
-            return False
         if item != {"cases": 6, "errors": 0, "digest": 0, "oversized_split_or_refused": 1}:
             return False
     if observed["corrections"] != {
