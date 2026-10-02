@@ -245,6 +245,100 @@ async def test_busy_close_retains_exact_range_until_accepted(tmp_path: Path) -> 
         await writer.close()
 
 
+@pytest.mark.parametrize("category", ["lease_lost", "lease_held"])
+@pytest.mark.asyncio
+async def test_review_retries_the_frozen_range_after_a_recoverable_lease_refusal(
+    tmp_path: Path, category: str
+) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    link = _Link()
+    connects = 0
+
+    async def connect() -> _Link:
+        nonlocal connects
+        connects += 1
+        link.permanent_refusal = category if connects == 1 else None
+        return link
+
+    sender = VoiceReviewSender(
+        writer,
+        connect,
+        idle_allowed=lambda: False,
+        initial_backoff_seconds=0.001,
+        max_backoff_seconds=0.002,
+    )
+    sender.start()
+    try:
+        store.record_user_transcript(Transcript(text="one", final=True))
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        writer.request_review_close()
+        await _until(lambda: writer._review.close_reviewed)
+        assert connects >= 2
+        assert len(link.requests) == 2
+        assert link.requests[0] == link.requests[1]
+    finally:
+        await sender.close()
+        await writer.close()
+
+
+@pytest.mark.parametrize("invalid_field", ["capability", "interval"])
+@pytest.mark.asyncio
+async def test_invalid_review_handshake_closes_with_a_bound_before_reconnect(
+    tmp_path: Path, invalid_field: str
+) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    release = asyncio.Event()
+    close_started = asyncio.Event()
+
+    class HungInvalidLink:
+        capabilities = frozenset() if invalid_field == "capability" else frozenset({"voice_review"})
+        review_interval = None if invalid_field == "interval" else 2
+
+        async def close(self) -> None:
+            close_started.set()
+            await release.wait()
+
+    valid = _Link()
+    connects = 0
+
+    async def connect() -> object:
+        nonlocal connects
+        connects += 1
+        return HungInvalidLink() if connects == 1 else valid
+
+    sender = VoiceReviewSender(
+        writer,
+        connect,  # type: ignore[arg-type]
+        idle_allowed=lambda: False,
+        close_timeout=0.01,
+        initial_backoff_seconds=0.001,
+        max_backoff_seconds=0.002,
+    )
+    sender.start()
+    try:
+        store.record_user_transcript(Transcript(text="one", final=True))
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        writer.request_review_close()
+        await _until(lambda: writer._review.close_reviewed)
+        assert close_started.is_set()
+        assert connects >= 2
+        assert len(valid.requests) == 1
+    finally:
+        release.set()
+        await sender.close()
+        await writer.close()
+
+
 @pytest.mark.asyncio
 async def test_wrong_review_identity_retries_the_frozen_range(tmp_path: Path) -> None:
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")

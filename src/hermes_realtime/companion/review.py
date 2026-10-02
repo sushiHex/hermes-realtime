@@ -137,6 +137,7 @@ class VoiceReviewCoordinator:
         self._port = port
         self._parent_factory = parent_factory
         self._parents: dict[tuple[str, int], Any] = {}
+        self._parent_builds: dict[tuple[str, int], asyncio.Task[Any]] = {}
         self._active: dict[str, _Running] = {}
         self._interval: int | None = None
         self._closed = False
@@ -235,11 +236,14 @@ class VoiceReviewCoordinator:
         ):
             raise ArchiveRefusal("busy")
         _, task_cfg = await self._settings()
+        if self._closed:
+            raise ArchiveRefusal("not_ready")
         key = request.conversation_id, request.generation
         parent = self._parents.get(key)
         if parent is None:
-            parent = await self._archive._call(self._parent_factory, record.session_id)
-            self._parents[key] = parent
+            parent = await self._build_parent_owned(key, record.session_id)
+        if self._closed:
+            raise ArchiveRefusal("not_ready")
         await self._archive._call(self._port.verify_parent_binding, parent)
         try:
             admitted = await self._admit_owned(parent, record, request)
@@ -324,6 +328,31 @@ class VoiceReviewCoordinator:
         outcome = "cancelled" if running.cancelled else "failed" if running.failure else "finished"
         self._store.finish_review(conversation_id, review_id, outcome)
         _marker({"outcome": outcome, "version": 1})
+
+    async def _build_parent_owned(self, key: tuple[str, int], session_id: str) -> Any:
+        """Register a constructed parent before propagating caller cancellation."""
+
+        async def construct() -> Any:
+            parent = await asyncio.to_thread(self._parent_factory, session_id)
+            self._parents[key] = parent
+            return parent
+
+        work = asyncio.create_task(construct())
+        self._parent_builds[key] = work
+        cancelled = False
+        try:
+            while not work.done():
+                try:
+                    await asyncio.wait({work})
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                work.exception()
+                raise asyncio.CancelledError
+            return work.result()
+        finally:
+            if work.done() and self._parent_builds.get(key) is work:
+                del self._parent_builds[key]
 
     async def _admit_owned(
         self, parent: Any, record: ConversationRecord, request: ReviewRequest
@@ -428,12 +457,22 @@ class VoiceReviewCoordinator:
         for conversation_id in tuple(self._active):
             if not await self.cancel_and_join(conversation_id, _CLOSE_JOIN_SECONDS):
                 raise ReviewQuiescenceError("review thread has not quiesced")
+        for build_work in tuple(self._parent_builds.values()):
+            try:
+                await asyncio.wait_for(asyncio.shield(build_work), _CLOSE_JOIN_SECONDS)
+            except TimeoutError:
+                raise ReviewQuiescenceError("review parent has not been constructed") from None
+            except asyncio.CancelledError:
+                raise ReviewQuiescenceError("review parent has not been constructed") from None
+            except Exception:
+                # The factory owns cleanup of a failed construction.
+                pass
         if not await asyncio.to_thread(self._port.drain_failed_parents, _CLOSE_JOIN_SECONDS):
             raise ReviewQuiescenceError("failed review parent has not closed")
         for parent in self._parents.values():
             key = id(parent)
             work = self._parent_closes.get(key)
-            if work is None:
+            if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
                 work = asyncio.create_task(
                     asyncio.to_thread(self._port.close_parent, parent)
                 )

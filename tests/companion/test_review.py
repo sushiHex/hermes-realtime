@@ -107,6 +107,216 @@ class FakeReviewPort:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_parent_construction_is_owned_and_closed(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    entered = threading.Event()
+    release = threading.Event()
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+
+    def factory(session_id: str) -> Any:
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("parent construction did not release")
+        return parent
+
+    review = VoiceReviewCoordinator(archive, store, port, factory)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        request = ReviewRequest("conv", 0, 0, 0, True, True, False)
+        pending = asyncio.create_task(review.review(request))
+        assert await asyncio.to_thread(entered.wait, 5)
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert port.admissions == []
+        assert closed == []
+        await review.close()
+        assert closed == [True]
+    finally:
+        release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_retains_profile_until_parent_build_quiesces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_realtime.companion import review as review_module
+
+    monkeypatch.setattr(review_module, "_CLOSE_JOIN_SECONDS", 0.05)
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    entered = threading.Event()
+    release = threading.Event()
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+
+    def factory(session_id: str) -> Any:
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("parent construction did not release")
+        return parent
+
+    review = VoiceReviewCoordinator(archive, store, port, factory)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        pending = asyncio.create_task(
+            review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert closed == []
+        release.set()
+        with pytest.raises(ArchiveRefusal, match="not_ready"):
+            await pending
+        assert port.admissions == []
+        await review.close()
+        assert closed == [True]
+    finally:
+        release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_retains_constructing_parent(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    entered = threading.Event()
+    release = threading.Event()
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+
+    def factory(session_id: str) -> Any:
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("parent construction did not release")
+        return parent
+
+    review = VoiceReviewCoordinator(archive, store, port, factory)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        pending = asyncio.create_task(
+            review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        closing = asyncio.create_task(review.close())
+        await asyncio.sleep(0)
+        closing.cancel()
+        with pytest.raises(ReviewQuiescenceError):
+            await closing
+        assert closed == []
+        release.set()
+        with pytest.raises(ArchiveRefusal, match="not_ready"):
+            await pending
+        await review.close()
+        assert closed == [True]
+    finally:
+        release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_parent_close_is_retried(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    attempts: list[bool] = []
+    parent = type("Parent", (), {})()
+
+    def close_parent(value: Any) -> None:
+        assert value is parent
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("transient close failure")
+
+    port.close_parent = close_parent  # type: ignore[method-assign]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        await review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        await asyncio.wait_for(port.started.wait(), 5)
+        port.release.set()
+        assert await review.join("conv", 5)
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert attempts == [True]
+        await review.close()
+        assert attempts == [True, True]
+    finally:
+        port.release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_parent_close_is_not_started_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_realtime.companion import review as review_module
+
+    monkeypatch.setattr(review_module, "_CLOSE_JOIN_SECONDS", 0.05)
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    entered = threading.Event()
+    release = threading.Event()
+    attempts: list[bool] = []
+    parent = type("Parent", (), {})()
+
+    def close_parent(value: Any) -> None:
+        assert value is parent
+        attempts.append(True)
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("parent close did not release")
+
+    port.close_parent = close_parent  # type: ignore[method-assign]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        await review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        await asyncio.wait_for(port.started.wait(), 5)
+        port.release.set()
+        assert await review.join("conv", 5)
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert entered.is_set()
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert attempts == [True]
+        release.set()
+        await review.close()
+        assert attempts == [True]
+    finally:
+        port.release.set()
+        release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_cancel_failure_retains_live_review_and_archive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

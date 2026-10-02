@@ -161,13 +161,12 @@ class VoiceReviewSender:
                     continue
                 async with asyncio.timeout(self._timeout):
                     link = await self._connect()
+                self._link = link
                 if (
                     VOICE_REVIEW_CAPABILITY not in link.capabilities
                     or type(link.review_interval) is not int
                 ):
-                    await link.close()
                     raise RuntimeError("review capability or interval unavailable")
-                self._link = link
                 interval = link.review_interval
                 assert interval is not None
                 while True:
@@ -212,7 +211,14 @@ class VoiceReviewSender:
                             }
                         )
                     self._last_refusal = reply.category
-                    if reply.category not in {"busy", "not_ready", "capacity", "unbound"}:
+                    if reply.category not in {
+                        "busy",
+                        "not_ready",
+                        "capacity",
+                        "unbound",
+                        "lease_lost",
+                        "lease_held",
+                    }:
                         await self._drop()
                         self._blocked = True
                         break
