@@ -176,6 +176,60 @@ async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
     assert _parse(json.dumps(malformed).encode()) is None
 
 
+@pytest.mark.parametrize("closing", [False, True], ids=["nonempty", "empty-closing"])
+def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> None:
+    if closing:
+        conversation = _rows(*(("user", f"Q{index}", False) for index in range(4)))
+        pending = ReviewRange("conv", 0, 0, 2, 2, True)
+        archive = _archive(
+            next_seq=4,
+            settled=4,
+            cursor=3,
+            review=ReviewProgress(
+                users=3,
+                pending=pending,
+                close_targets=(2,),
+                rows=((0, True), (1, True), (3, True)),
+            ),
+        )
+        malformed_start, malformed_users = 2, 0
+    else:
+        conversation = _rows(*(("user", f"Q{index}", False) for index in range(3)))
+        pending = ReviewRange("conv", 0, 0, 1, 2, False)
+        archive = _archive(
+            next_seq=3,
+            settled=3,
+            cursor=2,
+            review=ReviewProgress(
+                users=3,
+                pending=pending,
+                rows=((0, True), (1, True), (2, True)),
+            ),
+        )
+        malformed_start, malformed_users = 1, 1
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["pending"]["seq_from"] = malformed_start
+    malformed["archive"]["review"]["pending"]["users"] = malformed_users
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+def test_a_close_checkpoint_cannot_precede_the_review_cursor() -> None:
+    conversation = _rows(("user", "Q100", False))
+    archive = _archive(
+        next_seq=101,
+        settled=1,
+        cursor=100,
+        review=ReviewProgress(cursor=100, users=1, reviewed_users=1, close_targets=(100,)),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["close_targets"] = [1]
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
 @pytest.mark.asyncio
 async def test_restored_completed_close_survives_until_new_live_activity(tmp_path: Path) -> None:
     conversation = _rows(("user", "Earlier", False))
@@ -969,7 +1023,13 @@ def _say(store: ConversationContextStore, text: str) -> None:
     store.record_user_transcript(Transcript(text=text, final=True))
 
 
-def _reply(store: ConversationContextStore, text: str, *, interrupted: bool = False) -> None:
+def _reply(
+    store: ConversationContextStore,
+    text: str,
+    *,
+    interrupted: bool = False,
+    unsettled: bool = False,
+) -> None:
     from hermes_realtime.conversation import AssistantSegmentKey
     from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
 
@@ -985,6 +1045,8 @@ def _reply(store: ConversationContextStore, text: str, *, interrupted: bool = Fa
     ledger.queue(chunk, admission=admission)
     confirmation = ledger.mark_delivered_confirmed(ledger.mark_started("turn_tail", "chunk_tail"))
     store.record_assistant_delivery(admission=admission, ledger=ledger, confirmation=confirmation)
+    if unsettled:
+        return
     if interrupted:
         store.mark_assistant_segment_interrupted(segment)
     else:
@@ -1457,6 +1519,133 @@ async def test_repeated_trailing_gap_closes_replay_the_last_actual_archived_row(
         )
     finally:
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_trailing_unarchivable_gap_does_not_requeue_a_completed_close(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    timestamps = iter((5.0, float("inf")))
+    writer, store = await _opened(path, clock=lambda: next(timestamps))
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        assert writer._next_seq == 2 and writer._cursor == 0
+        assert writer._gap == (1, 1)
+        writer.request_review_close()
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.closing) == (0, 0, True)
+        assert writer.acknowledge_review(closing)
+        assert writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+    restored = _archiver(path)
+    restored_store = ConversationContextStore(on_change=restored.update)
+    await restored.open(restored_store)
+    try:
+        assert restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == ()
+        _say(restored_store, "Q2")
+        assert not restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == (2,)
+        later = await asyncio.wait_for(restored.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 1)
+        assert restored.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        final = await asyncio.wait_for(restored.next_review(10), 2)
+        assert (final.seq_from, final.seq_through, final.users, final.closing) == (
+            2, 2, 2, True
+        )
+        assert restored.acknowledge_review(final)
+        assert restored._review.close_reviewed
+    finally:
+        await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_new_archivable_row_before_close_ack_requires_a_later_close(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        writer.request_review_close()
+        first_close = await asyncio.wait_for(writer.next_review(10), 2)
+        assert first_close.seq_through == 0 and first_close.closing
+
+        _say(store, "Q1")
+        assert writer.acknowledge_review(first_close)
+        assert not writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        second_close = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (second_close.seq_from, second_close.seq_through, second_close.users) == (
+            1, 1, 2
+        )
+        assert second_close.closing
+        assert writer.acknowledge_review(second_close)
+        assert writer._review.close_reviewed
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_unsettled_row_before_close_ack_is_reviewed_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        writer.request_review_close()
+        first_close = await asyncio.wait_for(writer.next_review(10), 2)
+        _reply(store, "A1", unsettled=True)
+        assert writer._latest.unsettled == 1
+        assert writer.acknowledge_review(first_close)
+        assert not writer._review.close_reviewed
+    finally:
+        await writer.close()
+
+    restored = _archiver(path)
+    restored_store = ConversationContextStore(on_change=restored.update)
+    await restored.open(restored_store)
+    try:
+        assert restored._outbox[-1].seq == 1
+        assert not restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == (1,)
+        later = await asyncio.wait_for(restored.next_batch(), 2)
+        assert restored.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        second_close = await asyncio.wait_for(restored.next_review(10), 2)
+        assert (second_close.seq_from, second_close.seq_through, second_close.closing) == (
+            1, 1, True
+        )
+        assert restored.acknowledge_review(second_close)
+        assert restored._review.close_reviewed
+    finally:
+        await restored.close()
 
 
 @pytest.mark.asyncio

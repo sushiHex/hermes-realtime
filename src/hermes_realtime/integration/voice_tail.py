@@ -379,6 +379,8 @@ def _parse_archive(
             left >= right for left, right in zip(close_targets, close_targets[1:], strict=False)
         ):
             return None
+        if review_cursor is not None and close_targets and close_targets[0] < review_cursor:
+            return None
         if type(raw_review["close_reviewed"]) is not bool:
             return None
         if raw_review["close_reviewed"] and close_targets:
@@ -433,6 +435,8 @@ def _parse_archive(
             ):
                 return None
             if closing and (not close_targets or end != close_targets[0]):
+                return None
+            if review_rows and review_rows[0][0] < start:
                 return None
             window = [row for row in review_rows if start <= row[0] <= end]
             if window:
@@ -780,11 +784,14 @@ class VoiceTailWriter:
         self._changed()
         return True
 
+    def _close_target(self) -> int | None:
+        return self._outbox[-1].seq if self._outbox else self._cursor
+
     def request_review_close(self) -> None:
         """Mark a quiet conversation for a final review; safe to repeat."""
         if self._latest.unsettled:
             return
-        target = self._outbox[-1].seq if self._outbox else self._cursor
+        target = self._close_target()
         if target is None:
             return
         if self._review.close_targets and target <= self._review.close_targets[-1]:
@@ -969,7 +976,8 @@ class VoiceTailWriter:
             close_reviewed=(
                 request.closing
                 and len(progress.close_targets) == 1
-                and self._next_seq - 1 <= request.seq_through
+                and self._close_target() == request.seq_through
+                and not self._latest.unsettled
             ),
             rows=tuple(row for row in progress.rows if row[0] > request.seq_through),
         )
