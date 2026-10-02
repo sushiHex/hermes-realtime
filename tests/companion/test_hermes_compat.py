@@ -81,11 +81,9 @@ def test_review_parent_shape_refuses_db_or_json_persistence(
         port._verify_review_parent_shape(parent)
 
 
-def test_failed_constructed_parent_is_closed_before_port_drain(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    closed = threading.Event()
-
+def _partial_parent_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, close: Any
+) -> HermesArchivePort:
     class MemoryStore:
         def load_from_disk(self) -> None:
             raise RuntimeError("synthetic load failure")
@@ -107,7 +105,7 @@ def test_failed_constructed_parent_is_closed_before_port_drain(
             self._session_json_enabled = True
 
         def close(self) -> None:
-            closed.set()
+            close()
 
     config = {"model": {"default": "main"}}
 
@@ -128,14 +126,92 @@ def test_failed_constructed_parent_is_closed_before_port_drain(
     port = object.__new__(HermesArchivePort)
     port._review_bindings = {}
     port._failed_parent_closes = []
-    port._failed_parent_error = False
     port._parent_creation_failed = False
     port._review_home = lambda: tmp_path  # type: ignore[method-assign]
     port._config_signature = lambda: (None, None)  # type: ignore[method-assign]
     port._review_scope = contextlib.nullcontext  # type: ignore[method-assign]
+    return port
+
+
+def test_failed_constructed_parent_is_closed_before_port_drain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    closed = threading.Event()
+    port = _partial_parent_port(monkeypatch, tmp_path, closed.set)
     with pytest.raises(ArchiveRefusal, match="configuration"):
         port._make_review_parent_scoped("voice")
     assert port._parent_creation_failed
+    assert port.drain_failed_parents(2)
+    assert closed.is_set()
+
+
+def test_partial_parent_close_failure_retries_on_next_drain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attempts: list[bool] = []
+
+    def close() -> None:
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("synthetic transient close failure")
+
+    port = _partial_parent_port(monkeypatch, tmp_path, close)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port._make_review_parent_scoped("voice")
+    assert port._parent_creation_failed
+    assert not port.drain_failed_parents(2)
+    assert port.drain_failed_parents(2)
+    assert attempts == [True, True]
+
+
+def test_partial_parent_live_close_is_not_duplicated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    attempts: list[bool] = []
+
+    def close() -> None:
+        attempts.append(True)
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("synthetic close did not release")
+
+    port = _partial_parent_port(monkeypatch, tmp_path, close)
+    try:
+        with pytest.raises(ArchiveRefusal, match="configuration"):
+            port._make_review_parent_scoped("voice")
+        assert entered.wait(2)
+        assert not port.drain_failed_parents(0.05)
+        assert not port.drain_failed_parents(0.05)
+        assert attempts == [True]
+        release.set()
+        assert port.drain_failed_parents(2)
+        assert attempts == [True]
+    finally:
+        release.set()
+
+
+def test_partial_parent_close_start_failure_retains_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    closed = threading.Event()
+    original_start = threading.Thread.start
+    starts: list[bool] = []
+
+    def fail_once(worker: threading.Thread) -> None:
+        if worker.name == "voice-review-parent-cleanup" and not starts:
+            starts.append(True)
+            raise RuntimeError("synthetic thread start failure")
+        original_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_once)
+    port = _partial_parent_port(monkeypatch, tmp_path, closed.set)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port._make_review_parent_scoped("voice")
+    assert starts == [True]
+    assert port._parent_creation_failed
+    assert not port.drain_failed_parents(2)
     assert port.drain_failed_parents(2)
     assert closed.is_set()
 

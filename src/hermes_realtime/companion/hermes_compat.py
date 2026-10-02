@@ -448,19 +448,44 @@ class HermesArchivePort:
     def __init__(self, db: Any) -> None:
         self._db = _session_db(db)
         self._review_bindings: dict[int, tuple[Any, str]] = {}
-        self._failed_parent_closes: list[threading.Thread] = []
-        self._failed_parent_error = False
+        self._failed_parent_closes: list[tuple[Any, threading.Thread, threading.Event]] = []
         self._parent_creation_failed = False
 
     def drain_failed_parents(self, timeout: float) -> bool:
         if type(timeout) not in {float, int} or not 0 <= timeout <= 300:
             raise ValueError("invalid parent drain timeout")
-        for worker in self._failed_parent_closes:
-            worker.join(timeout)
-        if any(worker.is_alive() for worker in self._failed_parent_closes):
+        for _, worker, _ in self._failed_parent_closes:
+            if worker.ident is not None:
+                worker.join(timeout)
+        if any(worker.is_alive() for _, worker, _ in self._failed_parent_closes):
             return False
+        failed = [parent for parent, _, succeeded in self._failed_parent_closes
+                  if not succeeded.is_set()]
         self._failed_parent_closes.clear()
-        return not self._failed_parent_error
+        for parent in failed:
+            self._schedule_failed_parent_close(parent)
+        return not failed
+
+    def _schedule_failed_parent_close(self, parent: Any) -> None:
+        succeeded = threading.Event()
+
+        def cleanup() -> None:
+            try:
+                self.close_parent(parent)
+            except BaseException:
+                return
+            succeeded.set()
+
+        worker = threading.Thread(
+            target=cleanup,
+            name="voice-review-parent-cleanup", daemon=True,
+        )
+        self._failed_parent_closes.append((parent, worker, succeeded))
+        try:
+            worker.start()
+        except Exception:
+            # The unstarted worker still records ownership for the next drain.
+            return
 
     def _runtime_identity(self, runtime: dict[str, Any]) -> list[Any]:
         pool = runtime.get("credential_pool")
@@ -834,18 +859,7 @@ class HermesArchivePort:
                 parent._end_session_on_close = False
                 parent._persist_disabled = True
                 parent._session_json_enabled = False
-                def cleanup() -> None:
-                    try:
-                        self.close_parent(parent)
-                    except BaseException:
-                        self._failed_parent_error = True
-
-                worker = threading.Thread(
-                    target=cleanup,
-                    name="voice-review-parent-cleanup", daemon=True,
-                )
-                self._failed_parent_closes.append(worker)
-                worker.start()
+                self._schedule_failed_parent_close(parent)
             raise ArchiveRefusal("configuration") from None
 
     def admit(
