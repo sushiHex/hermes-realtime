@@ -370,6 +370,7 @@ def _parse_archive(
             return None
         if (
             (review_cursor is None and reviewed_users != 0)
+            or (review_cursor is not None and reviewed_users > review_cursor + 1)
             or (cursor is None and users != 0)
             or (cursor is not None and users > cursor + 1)
         ):

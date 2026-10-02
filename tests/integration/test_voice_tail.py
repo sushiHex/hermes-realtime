@@ -281,6 +281,29 @@ def test_a_close_checkpoint_cannot_precede_the_review_cursor() -> None:
     assert _parse(json.dumps(malformed).encode()) is None
 
 
+def test_reviewed_user_count_cannot_exceed_review_cursor_span() -> None:
+    conversation = _rows()
+    archive = _archive(
+        next_seq=100,
+        cursor=99,
+        review=ReviewProgress(cursor=0, users=1, reviewed_users=1),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    at_boundary = _archive(
+        next_seq=100,
+        cursor=99,
+        review=ReviewProgress(cursor=99, users=100, reviewed_users=100),
+    )
+    assert _parse(voice_tail_bytes(conversation, at_boundary)) == VoiceTail(
+        conversation, at_boundary
+    )
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["users"] = 100
+    malformed["archive"]["review"]["reviewed_users"] = 100
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
 @pytest.mark.asyncio
 async def test_restored_completed_close_survives_until_new_live_activity(tmp_path: Path) -> None:
     conversation = _rows(("user", "Earlier", False))
