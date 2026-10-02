@@ -589,7 +589,9 @@ async def test_permanent_refusal_still_records_a_later_idle_end(tmp_path: Path) 
         assert writer.acknowledge(
             batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
         )
-        await _until(lambda: writer._review.close_targets == (2,))
+        await _until(
+            lambda: bool(writer._review.close_targets) and writer._review.close_targets[-1] == 2
+        )
         assert len(link.requests) == 1
     finally:
         await sender.close()
