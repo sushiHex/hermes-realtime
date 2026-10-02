@@ -214,7 +214,6 @@ class VoiceReviewSender:
                     if reply.category not in {
                         "busy",
                         "not_ready",
-                        "capacity",
                         "unbound",
                         "lease_lost",
                         "lease_held",

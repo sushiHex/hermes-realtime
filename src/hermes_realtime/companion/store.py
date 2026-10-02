@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_realtime.companion.integrity import (
+    MAX_ARCHIVE_ROWS,
     MAX_IDENTITY,
     ArchiveRefusal,
     Fingerprint,
@@ -35,7 +36,9 @@ _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
 # A generous bound on stored conversations: each is one row of fences and progress.
 MAX_BOUND_CONVERSATIONS = 4096
-MAX_REVIEW_LEDGER_ENTRIES = 4096
+# One periodic and one closing identity per archived row fit without eviction.
+# Gap-heavy close histories can exceed this bound and are refused fail-closed.
+MAX_REVIEW_LEDGER_ENTRIES = 2 * MAX_ARCHIVE_ROWS
 _REVIEW_OUTCOMES = frozenset(
     {"reserved", "accepted", "finished", "failed", "cancelled", "unknown"}
 )

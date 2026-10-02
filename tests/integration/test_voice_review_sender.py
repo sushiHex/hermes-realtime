@@ -245,6 +245,42 @@ async def test_busy_close_retains_exact_range_until_accepted(tmp_path: Path) -> 
         await writer.close()
 
 
+@pytest.mark.asyncio
+async def test_capacity_refusal_blocks_retries_and_retains_exact_range(tmp_path: Path) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    link = _Link()
+    link.permanent_refusal = "capacity"
+
+    async def connect() -> _Link:
+        return link
+
+    sender = VoiceReviewSender(
+        writer,
+        connect,
+        idle_allowed=lambda: False,
+        initial_backoff_seconds=0.001,
+        max_backoff_seconds=0.002,
+    )
+    sender.start()
+    try:
+        store.record_user_transcript(Transcript(text="one", final=True))
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        writer.request_review_close()
+        await _until(lambda: sender._blocked)
+        assert len(link.requests) == 1
+        assert writer._review.close_targets == (0,)
+        assert writer._review.pending is not None
+        assert writer._review.pending.closing
+    finally:
+        await sender.close()
+        await writer.close()
+
+
 @pytest.mark.parametrize("category", ["lease_lost", "lease_held"])
 @pytest.mark.asyncio
 async def test_review_retries_the_frozen_range_after_a_recoverable_lease_refusal(

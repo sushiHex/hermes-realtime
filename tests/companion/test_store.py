@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -9,11 +10,13 @@ import pytest
 
 from hermes_realtime.companion.integrity import (
     EXPECTED_HEADER,
+    MAX_ARCHIVE_ROWS,
     ArchiveRefusal,
     Fingerprint,
     Identity,
     genesis,
 )
+from hermes_realtime.companion.review import ReviewRequest
 from hermes_realtime.companion.store import CompanionStore, ConversationRecord, Progress
 
 _GENESIS = Progress(genesis(EXPECTED_HEADER), None)
@@ -38,6 +41,48 @@ def _committed(store: CompanionStore) -> CompanionStore:
 
 def _category(error: pytest.ExceptionInfo[ArchiveRefusal]) -> str:
     return error.value.category
+
+
+def test_dense_archive_review_ledger_admits_final_close_then_refuses_excess(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "companion.db"
+    store = CompanionStore(path)
+    try:
+        _committed(store)
+        ledger = {
+            f"0:{row}:{row}:{closing}": {
+                "id": f"vr_{2 * row + closing:032x}",
+                "outcome": "finished",
+            }
+            for row in range(MAX_ARCHIVE_ROWS)
+            for closing in ((0, 1) if row < MAX_ARCHIVE_ROWS - 1 else (0,))
+        }
+        assert len(ledger) == 2 * MAX_ARCHIVE_ROWS - 1
+        store._connection.execute(
+            "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = 'conv'",
+            (json.dumps(ledger, sort_keys=True, separators=(",", ":")),),
+        )
+        final = ReviewRequest("conv", 0, MAX_ARCHIVE_ROWS - 1, MAX_ARCHIVE_ROWS - 1,
+                              True, True, True)
+        final_id = f"vr_{2 * MAX_ARCHIVE_ROWS - 1:032x}"
+        store.reserve_review(final, final_id)
+        store.accept_review(final, final_id)
+        store.finish_review("conv", final_id, "finished")
+        assert store.find_review(final) == (final_id, "finished")
+        excess = ReviewRequest("conv", 0, 0, 1, True, True, True)
+        with pytest.raises(ArchiveRefusal, match="capacity"):
+            store.reserve_review(excess, f"vr_{2 * MAX_ARCHIVE_ROWS:032x}")
+        assert store.find_review(excess) is None
+    finally:
+        store.close()
+    reopened = CompanionStore(path)
+    try:
+        assert reopened.find_review(final) == (final_id, "finished")
+        first = ReviewRequest("conv", 0, 0, 0, True, True, False)
+        assert reopened.find_review(first) == ("vr_" + "0" * 32, "finished")
+    finally:
+        reopened.close()
 
 
 def test_a_bound_conversation_records_creation_as_pending(store: CompanionStore) -> None:
