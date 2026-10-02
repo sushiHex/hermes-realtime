@@ -47,6 +47,13 @@ class FakeReviewPort:
         self.settings_entered = threading.Event()
         self.settings_release = threading.Event()
         self.finish_calls = 0
+        self.finish_failures = 0
+        self.block_finish_on_call = 0
+        self.finish_entered = threading.Event()
+        self.finish_release = threading.Event()
+        self.enforce_token_busy = False
+        self.active_token: Any = None
+        self.spawn_error = False
         self.interval = 10
         self.enabled = True
         self.extra_tools: list[str] = []
@@ -93,10 +100,17 @@ class FakeReviewPort:
             raise ArchiveRefusal("mismatch")
         if self.busy:
             return None
+        if self.enforce_token_busy and self.active_token is not None:
+            return None
         self.admissions.append((request.seq_from, request.seq_through, request.closing))
-        return ([{"role": "user", "content": "review me"}] * self.snapshot_rows, object())
+        token = object()
+        if self.enforce_token_busy:
+            self.active_token = token
+        return ([{"role": "user", "content": "review me"}] * self.snapshot_rows, token)
 
     def spawn(self, parent: Any, snapshot: Any, token: Any, task_cfg: Any) -> Any:
+        if self.spawn_error:
+            raise RuntimeError("synthetic spawn failure")
         def target() -> None:
             self.started._loop.call_soon_threadsafe(self.started.set)  # type: ignore[attr-defined]
             asyncio.run_coroutine_threadsafe(self.release.wait(), self.started._loop).result(5)
@@ -110,6 +124,14 @@ class FakeReviewPort:
 
     def finish(self, parent: Any, token: Any) -> None:
         self.finish_calls += 1
+        if self.finish_calls == self.block_finish_on_call:
+            self.finish_entered.set()
+            self.finish_release.wait(5)
+        if self.finish_failures:
+            self.finish_failures -= 1
+            raise RuntimeError("synthetic finish failure")
+        if self.enforce_token_busy and self.active_token is token:
+            self.active_token = None
 
     def cancel(self, parent: Any, token: Any) -> None:
         self.cancel_calls += 1
@@ -765,6 +787,159 @@ async def test_cancelled_admission_releases_a_late_token_before_any_ack(tmp_path
     finally:
         port.admit_release.set()
         await review.close()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["late", "window", "spawn", "worker"])
+async def test_failed_token_release_keeps_parent_until_close_retries(
+    tmp_path: Path, stage: str
+) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.finish_failures = 2
+    port.enforce_token_busy = True
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    request = ReviewRequest("conv", 0, 0, 0, True, True, False)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        if stage == "late":
+            port.block_admit = True
+            pending = asyncio.create_task(review.review(request))
+            assert await asyncio.to_thread(port.admit_entered.wait, 5)
+            pending.cancel()
+            port.admit_release.set()
+            with pytest.raises(RuntimeError, match="synthetic finish failure"):
+                await pending
+        elif stage == "window":
+            port.snapshot_rows = 0
+            with pytest.raises(RuntimeError, match="synthetic finish failure"):
+                await review.review(request)
+        elif stage == "spawn":
+            port.spawn_error = True
+            with pytest.raises(RuntimeError, match="synthetic finish failure"):
+                await review.review(request)
+        else:
+            await review.review(request)
+            await asyncio.wait_for(port.started.wait(), 5)
+            port.release.set()
+            assert await review.join("conv", 5)
+        assert port.finish_calls == 1
+        assert port.active_token is not None
+        with pytest.raises(ReviewQuiescenceError):
+            await review.close()
+        assert port.finish_calls == 2
+        assert closed == []
+        assert port.active_token is not None
+        await review.close()
+        assert port.finish_calls == 3
+        assert port.active_token is None
+        assert closed == [True]
+    finally:
+        port.admit_release.set()
+        port.release.set()
+        port.finish_release.set()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_late_token_release_recovers_before_next_admission(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.enforce_token_busy = True
+    port.finish_failures = 1
+    port.block_admit = True
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: type("Parent", (), {})())
+    request = ReviewRequest("conv", 0, 0, 0, True, True, False)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        pending = asyncio.create_task(review.review(request))
+        assert await asyncio.to_thread(port.admit_entered.wait, 5)
+        pending.cancel()
+        port.admit_release.set()
+        with pytest.raises(RuntimeError, match="synthetic finish failure"):
+            await pending
+        assert port.active_token is not None
+        port.block_admit = False
+        admitted = await review.review(request)
+        assert admitted.status == "accepted"
+        assert port.finish_calls == 2
+        await asyncio.wait_for(port.started.wait(), 5)
+        port.release.set()
+        assert await review.join("conv", 5)
+        assert port.active_token is None
+    finally:
+        port.admit_release.set()
+        port.release.set()
+        await review.close()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_mode", ["timeout", "cancel"])
+async def test_live_token_release_retry_is_not_started_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, close_mode: str
+) -> None:
+    from hermes_realtime.companion import review as review_module
+
+    monkeypatch.setattr(review_module, "_CLOSE_JOIN_SECONDS", 0.05)
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.finish_failures = 1
+    port.block_finish_on_call = 2
+    port.block_admit = True
+    closed: list[bool] = []
+    parent = type("Parent", (), {"close": lambda self: closed.append(True)})()
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: parent)
+    request = ReviewRequest("conv", 0, 0, 0, True, True, False)
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        pending = asyncio.create_task(review.review(request))
+        assert await asyncio.to_thread(port.admit_entered.wait, 5)
+        pending.cancel()
+        port.admit_release.set()
+        with pytest.raises(RuntimeError, match="synthetic finish failure"):
+            await pending
+        port.block_admit = False
+        with pytest.raises(ArchiveRefusal, match="busy"):
+            await review.review(request)
+        assert port.finish_entered.is_set()
+        if close_mode == "cancel":
+            closing = asyncio.create_task(review.close())
+            await asyncio.sleep(0)
+            closing.cancel()
+            with pytest.raises(ReviewQuiescenceError):
+                await closing
+        else:
+            with pytest.raises(ReviewQuiescenceError):
+                await review.close()
+        assert port.finish_calls == 2
+        assert closed == []
+        port.finish_release.set()
+        await review.close()
+        assert port.finish_calls == 2
+        assert closed == [True]
+    finally:
+        port.admit_release.set()
+        port.finish_release.set()
+        with contextlib.suppress(BaseException):
+            await review.close()
         await archive.close()
         store.close()
 

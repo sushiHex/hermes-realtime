@@ -145,6 +145,8 @@ class VoiceReviewCoordinator:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._parent_closes: dict[int, asyncio.Task[None]] = {}
         self._cancel_tasks: dict[str, asyncio.Task[None]] = {}
+        self._owned_releases: dict[int, tuple[Any, Any]] = {}
+        self._release_tasks: dict[int, asyncio.Task[None]] = {}
         self._store.recover_reviews()
 
     @property
@@ -251,6 +253,8 @@ class VoiceReviewCoordinator:
         if self._closed:
             raise ArchiveRefusal("not_ready")
         await self._archive._call(self._port.verify_parent_binding, parent)
+        if not await self._drain_owned_releases(parent, _CLOSE_JOIN_SECONDS):
+            raise ArchiveRefusal("busy")
         try:
             admitted = await self._admit_owned(parent, record, request)
         except ArchiveRefusal as refusal:
@@ -261,7 +265,7 @@ class VoiceReviewCoordinator:
             raise ArchiveRefusal("busy")
         snapshot, token = admitted
         if type(snapshot) is not list or not 1 <= len(snapshot) <= MAX_REVIEW_ROWS:
-            self._port.finish(parent, token)
+            self._finish_owned(parent, token)
             raise ArchiveRefusal("window")
         review_id = f"vr_{uuid.uuid4().hex}"
         try:
@@ -290,7 +294,7 @@ class VoiceReviewCoordinator:
                 await self.cancel_and_join(request.conversation_id, _CLOSE_JOIN_SECONDS)
             else:
                 self._active.pop(request.conversation_id, None)
-                self._port.finish(parent, token)
+                self._finish_owned(parent, token)
             if self._store.review_outcome(request.conversation_id, review_id) == "reserved":
                 self._store.finish_review(request.conversation_id, review_id, "failed")
             raise
@@ -318,7 +322,7 @@ class VoiceReviewCoordinator:
         finally:
             review_logger.removeFilter(own_filter)
             try:
-                self._port.finish(parent, running.token)
+                self._finish_owned(parent, running.token)
             except BaseException:
                 running.failure = True
             loop = self._loop
@@ -380,9 +384,35 @@ class VoiceReviewCoordinator:
         admitted = work.result()
         if cancelled:
             if admitted is not None:
-                self._port.finish(parent, admitted[1])
+                self._finish_owned(parent, admitted[1])
             raise asyncio.CancelledError
         return admitted
+
+    def _finish_owned(self, parent: Any, token: Any) -> None:
+        """Keep a strong token owner until Hermes confirms its release."""
+
+        key = id(token)
+        self._owned_releases[key] = parent, token
+        self._port.finish(parent, token)
+        self._owned_releases.pop(key, None)
+
+    async def _drain_owned_releases(self, parent: Any | None, timeout: float) -> bool:
+        for key, (owner, token) in tuple(self._owned_releases.items()):
+            if parent is not None and owner is not parent:
+                continue
+            work = self._release_tasks.get(key)
+            if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
+                work = asyncio.create_task(asyncio.to_thread(self._port.finish, owner, token))
+                self._release_tasks[key] = work
+            try:
+                await asyncio.wait_for(asyncio.shield(work), timeout)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                return False
+            self._owned_releases.pop(key, None)
+            self._release_tasks.pop(key, None)
+        return True
 
     async def _expire(self, conversation_id: str, review_id: str) -> None:
         active = self._active.get(conversation_id)
@@ -485,6 +515,12 @@ class VoiceReviewCoordinator:
             except Exception:
                 # The factory owns cleanup of a failed construction.
                 pass
+        try:
+            released = await self._drain_owned_releases(None, _CLOSE_JOIN_SECONDS)
+        except asyncio.CancelledError:
+            raise ReviewQuiescenceError("review token has not been released") from None
+        if not released:
+            raise ReviewQuiescenceError("review token has not been released")
         if not await asyncio.to_thread(self._port.drain_failed_parents, _CLOSE_JOIN_SECONDS):
             raise ReviewQuiescenceError("failed review parent has not closed")
         for parent in self._parents.values():
