@@ -23,6 +23,7 @@ from hermes_realtime.integration.voice_tail import (
     ArchiveOutbox,
     OutboxRow,
     ReviewProgress,
+    ReviewRange,
     VoiceTail,
     VoiceTailWriter,
     max_voice_tail_bytes,
@@ -130,6 +131,49 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
     )
     assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
     assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())
+
+
+@pytest.mark.parametrize(
+    ("pending_end", "targets"),
+    [
+        pytest.param(0, [1], id="pending-stops-short-of-checkpoint"),
+        pytest.param(1, [0], id="pending-runs-past-checkpoint"),
+        pytest.param(1, [], id="checkpoint-missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
+    tmp_path: Path, pending_end: int, targets: list[int]
+) -> None:
+    conversation = _rows(("user", "Hi", False), ("assistant", "Hello", False))
+    pending = ReviewRange("conv", 0, 0, 1, 1, True)
+    archive = _archive(
+        next_seq=2,
+        settled=2,
+        cursor=1,
+        review=ReviewProgress(
+            users=1,
+            pending=pending,
+            close_targets=(1,),
+            rows=((0, True), (1, False)),
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+
+    path = tmp_path / "voice-tail.json"
+    run_record_module.write_run_record(path, valid)
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    try:
+        assert await asyncio.wait_for(writer.next_review(10), 1) == pending
+    finally:
+        await writer.close()
+
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["pending"]["seq_through"] = pending_end
+    malformed["archive"]["review"]["close_targets"] = targets
+    assert _parse(json.dumps(malformed).encode()) is None
 
 
 def test_a_version_one_tail_parses_without_an_archive_so_it_migrates() -> None:

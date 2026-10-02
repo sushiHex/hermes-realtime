@@ -432,6 +432,8 @@ def _parse_archive(
                 and reviewed_users <= pending_users <= users
             ):
                 return None
+            if closing and (not close_targets or end != close_targets[0]):
+                return None
             window = [row for row in review_rows if start <= row[0] <= end]
             if window:
                 if (
