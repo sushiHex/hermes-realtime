@@ -215,6 +215,57 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
     assert _parse(json.dumps(malformed).encode()) is None
 
 
+@pytest.mark.parametrize(
+    ("review_cursor", "target", "canonical"),
+    [
+        pytest.param(50, 74, 27, id="prior-actual-row"),
+        pytest.param(None, 24, 1, id="no-prior-row"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_empty_closing_replay_start_is_exact(
+    tmp_path: Path, review_cursor: int | None, target: int, canonical: int
+) -> None:
+    conversation = _rows(("user", "Later", False))
+    pending = ReviewRange("conv", 0, canonical, target, int(review_cursor is not None), True)
+    archive = _archive(
+        next_seq=target + 2,
+        settled=1,
+        cursor=target + 1,
+        review=ReviewProgress(
+            cursor=review_cursor,
+            users=1 + int(review_cursor is not None),
+            reviewed_users=int(review_cursor is not None),
+            pending=pending,
+            close_targets=(target,),
+            rows=((target + 1, True),),
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    for wrong_start in (canonical - 1, canonical + 1):
+        malformed = json.loads(valid)
+        malformed["archive"]["review"]["pending"]["seq_from"] = wrong_start
+        assert _parse(json.dumps(malformed).encode()) is None
+    if review_cursor is None:
+        path = tmp_path / "tail.json"
+        run_record_module.write_run_record(path, valid)
+        writer = _writer(path)
+        await writer.open(ConversationContextStore(on_change=writer.update))
+        try:
+            planning = asyncio.create_task(writer.next_review(10))
+            try:
+                await _until(lambda: writer._review.close_targets == ())
+            finally:
+                planning.cancel()
+                await asyncio.gather(planning, return_exceptions=True)
+            assert writer._review.pending is None
+            assert not writer._review.close_reviewed
+            assert writer._review.rows == ((target + 1, True),)
+        finally:
+            await writer.close()
+
+
 def test_a_close_checkpoint_cannot_precede_the_review_cursor() -> None:
     conversation = _rows(("user", "Q100", False))
     archive = _archive(

@@ -252,6 +252,10 @@ def _identity(value: object) -> bool:
     return type(value) is int and 0 <= value <= MAX_IDENTITY
 
 
+def _empty_close_replay_start(review_cursor: int | None, target: int) -> int:
+    return max(0, (review_cursor if review_cursor is not None else target) - 23)
+
+
 def _text(role: object, text: object, interrupted: object, max_item_chars: int) -> bool:
     if type(role) is not str or type(text) is not str or type(interrupted) is not bool:
         return False
@@ -447,7 +451,11 @@ def _parse_archive(
                     or pending_users != reviewed_users + sum(is_user for _, is_user in window)
                 ):
                     return None
-            elif not closing or pending_users != reviewed_users:
+            elif (
+                not closing
+                or pending_users != reviewed_users
+                or start != _empty_close_replay_start(review_cursor, end)
+            ):
                 return None
             pending = ReviewRange(conversation_id, generation, start, end, pending_users, closing)
         review = ReviewProgress(
@@ -935,9 +943,7 @@ class VoiceTailWriter:
                         # Replay up to 24 positions near prior coverage, then span
                         # the empty gap to the exact close checkpoint.
                         through = progress.close_targets[0]
-                        start = max(
-                            0, (progress.cursor if progress.cursor is not None else through) - 23
-                        )
+                        start = _empty_close_replay_start(progress.cursor, through)
                         final = True
                     else:
                         await self._tick.wait()
