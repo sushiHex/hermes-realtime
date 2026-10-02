@@ -176,6 +176,32 @@ async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
     assert _parse(json.dumps(malformed).encode()) is None
 
 
+@pytest.mark.asyncio
+async def test_restored_completed_close_survives_until_new_live_activity(tmp_path: Path) -> None:
+    conversation = _rows(("user", "Earlier", False))
+    archive = _archive(
+        next_seq=1,
+        settled=1,
+        cursor=0,
+        review=ReviewProgress(cursor=0, users=1, reviewed_users=1, close_reviewed=True),
+    )
+    path = tmp_path / "tail.json"
+    run_record_module.write_run_record(path, voice_tail_bytes(conversation, archive))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        assert writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == ()
+        store.record_user_transcript(Transcript(text="Later", final=True))
+        assert not writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+    finally:
+        await writer.close()
+
+
 def test_a_version_one_tail_parses_without_an_archive_so_it_migrates() -> None:
     tail = _rows(("user", "Hi", False), prior_work=True)
 
@@ -1164,6 +1190,40 @@ async def test_overflow_discards_unsent_rows_up_to_the_next_user_row_as_its_gap(
             _OUTBOX_MARKER + '{"cause":"overflow","version":1}'
         ]
         assert "Q2" not in output and "A3" not in output
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_review_ends_at_checkpoint_even_when_its_outbox_row_was_dropped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        _say(store, "Q1")
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+        for index in range(2, 6):
+            _say(store, f"Q{index}")
+        assert [row.seq for row in writer._outbox] == [2, 3, 4, 5]
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 1)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+
+        request = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (request.seq_from, request.seq_through, request.closing) == (0, 1, True)
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == request
+        assert writer.acknowledge_review(request)
+        assert writer._review.close_targets == ()
     finally:
         await writer.close()
 

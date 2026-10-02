@@ -438,7 +438,7 @@ def _parse_archive(
             if window:
                 if (
                     window[0][0] != start
-                    or window[-1][0] != end
+                    or (window[-1][0] != end and not closing)
                     or len(window) > 24
                     or pending_users != reviewed_users + sum(is_user for _, is_user in window)
                 ):
@@ -602,7 +602,7 @@ class VoiceTailWriter:
             raise TypeError("voice tail updates must be an exact DurableConversation")
         if view != self._latest:
             self._last_activity = time.monotonic()
-            if self._review.close_reviewed:
+            if self._review.close_reviewed and self._owner is not None:
                 self._review = replace(self._review, close_reviewed=False)
         self._latest = view
         if self._archiving:
@@ -902,6 +902,8 @@ class VoiceTailWriter:
                         through = window[-1][0]
                         # Only the final window carries the closing identity.
                         final = closing and len(eligible) <= 24
+                        if final:
+                            through = progress.close_targets[0]
                     elif closing and progress.close_targets:
                         # At an exact cadence boundary, a distinct final review
                         # replays the last <=24 sequence positions.
