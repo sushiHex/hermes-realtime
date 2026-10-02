@@ -189,7 +189,8 @@ does not erase earlier closing ranges or create a second history. A final review
 distinct identity even when a periodic review just covered the same ending range.
 Changing the profile's nudge interval requires restarting the companion; a mismatch with
 the negotiated interval refuses review. The enabled switch and empty extra-tools policy
-are checked again for every spawn.
+are checked again for every spawn. A cached parent also refuses changed profile configuration,
+model routing or credential authority; restart the companion to bind the new configuration.
 
 Tail version 3 retains bounded acknowledged-row identities, frozen review requests and
 ordered closing checkpoints. Pending coverage survives busy replies, disconnection and

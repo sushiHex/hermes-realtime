@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -17,8 +19,125 @@ from hermes_realtime.companion.hermes_compat import (
     check_surface,
     resolve,
 )
+from hermes_realtime.companion.integrity import ArchiveRefusal
 
 _SOURCE = Path(hermes_compat.__file__).read_text(encoding="utf-8")
+
+
+def test_routed_credential_change_changes_parent_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    port = object.__new__(HermesArchivePort)
+    routed = {"provider": "custom", "model": "other", "api_key": "first"}
+
+    def review_resolve(name: str) -> Any:
+        assert name == "hermes_cli.runtime_provider.resolve_runtime_provider"
+        return lambda **kwargs: routed
+
+    monkeypatch.setattr(hermes_compat, "resolve", review_resolve)
+    config = {"auxiliary": {"background_review": {"provider": "custom", "model": "other"}}}
+    main = {"provider": "custom", "model": "main", "api_key": "main-key"}
+    baseline = port._binding(config, "main", main)
+    routed["api_key"] = "second"
+    assert port._binding(config, "main", main) != baseline
+
+
+@pytest.mark.parametrize(("attribute", "value"), [("_session_db", object()),
+                                              ("_session_json_enabled", True)])
+def test_review_parent_shape_refuses_db_or_json_persistence(
+    monkeypatch: pytest.MonkeyPatch, attribute: str, value: object
+) -> None:
+    class MemoryStore:
+        pass
+
+    class Parent:
+        pass
+
+    parent = Parent()
+    parent.session_id = "voice"
+    parent.enabled_toolsets = ["memory", "skills"]
+    parent.disabled_toolsets = None
+    parent.tools = []
+    parent._memory_enabled = True
+    parent._memory_store = MemoryStore()
+    parent._memory_manager = None
+    parent.background_review_callback = None
+    parent._session_db = None
+    parent._owns_session_db = False
+    parent._end_session_on_close = False
+    parent._persist_disabled = True
+    parent._session_json_enabled = False
+
+    def review_resolve(name: str) -> Any:
+        return {
+            "run_agent.AIAgent": Parent,
+            "tools.memory_tool.MemoryStore": MemoryStore,
+            "model_tools.get_tool_definitions": lambda **kwargs: [],
+        }[name]
+
+    monkeypatch.setattr(hermes_compat, "resolve", review_resolve)
+    port = object.__new__(HermesArchivePort)
+    port._verify_review_parent_shape(parent)
+    setattr(parent, attribute, value)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port._verify_review_parent_shape(parent)
+
+
+def test_failed_constructed_parent_is_closed_before_port_drain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    closed = threading.Event()
+
+    class MemoryStore:
+        def load_from_disk(self) -> None:
+            raise RuntimeError("synthetic load failure")
+
+    class Parent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.session_id = kwargs["session_id"]
+            self.enabled_toolsets = ["memory", "skills"]
+            self.disabled_toolsets = None
+            self.tools = []
+            self._memory_enabled = True
+            self._memory_store = MemoryStore()
+            self._memory_manager = None
+            self.background_review_callback = None
+            self._session_db = kwargs["session_db"]
+            self._owns_session_db = False
+            self._end_session_on_close = True
+            self._persist_disabled = False
+            self._session_json_enabled = True
+
+        def close(self) -> None:
+            closed.set()
+
+    config = {"model": {"default": "main"}}
+
+    def review_resolve(name: str) -> Any:
+        return {
+            "hermes_constants.get_hermes_home": lambda: tmp_path,
+            "hermes_cli.config.load_config_readonly": lambda: config,
+            "hermes_cli.runtime_provider.resolve_runtime_provider":
+                lambda **kwargs: {"provider": "custom", "api_key": "synthetic"},
+            "run_agent.AIAgent": Parent,
+            "run_agent.AIAgent.close": Parent.close,
+            "tools.memory_tool.MemoryStore": MemoryStore,
+            "tools.memory_tool.MemoryStore.load_from_disk": MemoryStore.load_from_disk,
+            "model_tools.get_tool_definitions": lambda **kwargs: [],
+        }[name]
+
+    monkeypatch.setattr(hermes_compat, "resolve", review_resolve)
+    port = object.__new__(HermesArchivePort)
+    port._review_bindings = {}
+    port._failed_parent_closes = []
+    port._failed_parent_error = False
+    port._parent_creation_failed = False
+    port._review_home = lambda: tmp_path  # type: ignore[method-assign]
+    port._config_signature = lambda: (None, None)  # type: ignore[method-assign]
+    port._review_scope = contextlib.nullcontext  # type: ignore[method-assign]
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port._make_review_parent_scoped("voice")
+    assert port._parent_creation_failed
+    assert port.drain_failed_parents(2)
+    assert closed.is_set()
 
 
 def test_importing_the_compat_module_does_not_import_hermes() -> None:

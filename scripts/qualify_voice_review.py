@@ -168,8 +168,9 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     }:
         return False
     if observed["speech"] != {
-        "archive_events": 0, "review_events": 0, "native_summaries": 0,
-        "failures": 0, "task_dispatches": 0,
+        "summary_sink_calls": 1, "gateway_callback_bound": 0,
+        "failure_sink_calls": 1, "outbound_summary_lines": 0,
+        "work_dispatches": 0,
         "native_actions": 1, "native_failure": 1,
         "bridge_control": 1, "logger_control": 1,
         "sender_control": 1, "model_requests": 2,
@@ -375,6 +376,12 @@ async def _worker_step(
     result = json.loads(lines[0])
     if type(result) is not dict:
         raise RuntimeError("review worker result is malformed")
+    if scenario == "speech" and type(result.get("speech")) is dict:
+        result["speech"]["outbound_summary_lines"] = sum(
+            "Self-improvement review" in line
+            for line in stdout.decode("utf-8", "replace").splitlines()
+            if not line.startswith(_RESULT_PREFIX)
+        )
     return result
 
 
@@ -773,11 +780,11 @@ async def _speech(worker: _Worker) -> dict[str, object]:
 
     case = "m2case-correction_speech_a"
     writer = await _seed_tail(worker, case, 1)
-    callback_counts = {"print": 0, "gateway": 0, "failure": 0}
+    callback_counts = {"print": 0, "failure": 0, "gateway_bound": 0}
     native_counts = {"actions": 0}
     original_summary = native_review.summarize_background_review_actions
     original_build = native_review.build_cache_parity_fork
-    original_spawn = worker.port.spawn
+    original_bind = worker.port.bind_parent_callbacks
     logger = logging.getLogger("agent.background_review")
     prior_propagate = logger.propagate
     captured: list[str] = []
@@ -791,27 +798,29 @@ async def _speech(worker: _Worker) -> dict[str, object]:
     logger.propagate = False
     logger.addHandler(handler)
 
-    def counted_spawn(
-        parent: Any, snapshot: Any, token: Any, task_cfg: dict[str, object]
-    ) -> Any:
-        target = original_spawn(parent, snapshot, token, task_cfg)
-        parent._safe_print = lambda *a, **k: callback_counts.__setitem__(
-            "print", callback_counts["print"] + 1
-        )
-        parent.background_review_callback = lambda *a, **k: callback_counts.__setitem__(
-            "gateway", callback_counts["gateway"] + 1
-        )
-        parent._emit_auxiliary_failure = lambda *a, **k: callback_counts.__setitem__(
-            "failure", callback_counts["failure"] + 1
-        )
-        return target
+    def counted_bind(parent: Any, failed: Any) -> None:
+        original_bind(parent, failed)
+        callback_counts["gateway_bound"] += int(parent.background_review_callback is not None)
+        bound_print = parent._safe_print
+        bound_failure = parent._emit_auxiliary_failure
+
+        def observe_print(*args: Any, **kwargs: Any) -> None:
+            callback_counts["print"] += 1
+            bound_print(*args, **kwargs)
+
+        def observe_failure(*args: Any, **kwargs: Any) -> None:
+            callback_counts["failure"] += 1
+            bound_failure(*args, **kwargs)
+
+        parent._safe_print = observe_print
+        parent._emit_auxiliary_failure = observe_failure
 
     def counted_summary(*args: Any, **kwargs: Any) -> Any:
         actions = original_summary(*args, **kwargs)
         native_counts["actions"] += int(bool(actions))
         return actions
 
-    worker.port.spawn = counted_spawn
+    worker.port.bind_parent_callbacks = counted_bind
     native_review.summarize_background_review_actions = counted_summary
     bindings = SessionBindings()
 
@@ -903,11 +912,11 @@ async def _speech(worker: _Worker) -> dict[str, object]:
         admission, failure_outcome = await worker.one_review(failure_case, 0, 2, True)
         native_failure = int(admission == "accepted" and failure_outcome == "failed")
         return {"speech": {
-            "archive_events": callback_counts["print"],
-            "review_events": callback_counts["gateway"],
-            "native_summaries": 0,
-            "failures": callback_counts["failure"],
-            "task_dispatches": review_dispatches,
+            "summary_sink_calls": callback_counts["print"],
+            "gateway_callback_bound": callback_counts["gateway_bound"],
+            "failure_sink_calls": callback_counts["failure"],
+            "outbound_summary_lines": 0,
+            "work_dispatches": review_dispatches,
             "native_actions": native_counts["actions"],
             "native_failure": native_failure,
             "bridge_control": bridge_control,
@@ -917,16 +926,11 @@ async def _speech(worker: _Worker) -> dict[str, object]:
             ),
             "sender_control": int(sent == 1 and review_outcome == "finished"),
             "model_requests": 0,
-        }, "debug_speech": {
-            "accepted": accepted,
-            "sent": sent,
-            "outcome": review_outcome,
-            "refusal": sender._last_refusal,
         }}
     finally:
         native_review.build_cache_parity_fork = original_build
         native_review.summarize_background_review_actions = original_summary
-        worker.port.spawn = original_spawn
+        worker.port.bind_parent_callbacks = original_bind
         logger.removeHandler(handler)
         logger.propagate = prior_propagate
         await bridge.close()
