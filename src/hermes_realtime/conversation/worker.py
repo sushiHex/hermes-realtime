@@ -947,6 +947,7 @@ class ConversationSessionWorker:
         self._active_utterance_ticket = None
         if not self._closed:
             self._closed = True
+            self._set_voice_activity(False)
             for operation in tuple(self._response_operations):
                 operation.cancel()
                 self._response_cleanup_tasks.add(operation)
