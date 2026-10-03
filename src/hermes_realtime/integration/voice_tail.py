@@ -441,6 +441,8 @@ def _parse_archive(
                 return None
             if closing and (not close_targets or end != close_targets[0]):
                 return None
+            if close_targets and end > close_targets[0]:
+                return None
             if review_rows and review_rows[0][0] < start:
                 return None
             window = [row for row in review_rows if start <= row[0] <= end]

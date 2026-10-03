@@ -215,6 +215,48 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
     assert _parse(json.dumps(malformed).encode()) is None
 
 
+@pytest.mark.asyncio
+async def test_periodic_pending_cannot_cross_the_first_close_checkpoint(tmp_path: Path) -> None:
+    conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(58, 74)))
+    retained = tuple((seq, True) for seq in range(50, 74))
+    archive = _archive(
+        next_seq=74,
+        settled=16,
+        cursor=73,
+        review=ReviewProgress(
+            users=24,
+            pending=ReviewRange("conv", 0, 50, 73, 24, False),
+            close_targets=(73,),
+            rows=retained,
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    before = json.loads(valid)
+    before["archive"]["review"]["pending"]["seq_through"] = 72
+    before["archive"]["review"]["pending"]["users"] = 23
+    assert _parse(json.dumps(before).encode()) is not None
+    path = tmp_path / "tail.json"
+    run_record_module.write_run_record(path, valid)
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    try:
+        periodic = await asyncio.wait_for(writer.next_review(10), 2)
+        assert periodic == archive.review.pending
+        assert writer.acknowledge_review(periodic)
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.closing) == (50, 73, True)
+        assert writer.acknowledge_review(closing)
+    finally:
+        await writer.close()
+
+    # A restored periodic ACK crossing target 60 would move the actual review
+    # cursor to 73, leaving an older close checkpoint without a forward range.
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["close_targets"] = [60]
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
 @pytest.mark.parametrize(
     ("review_cursor", "target", "canonical"),
     [
