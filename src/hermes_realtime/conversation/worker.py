@@ -345,6 +345,7 @@ class ConversationSessionWorker:
             if self._closed:
                 raise RuntimeError("conversation session worker is closed")
             self._raise_terminal_error()
+            utterance_ended = False
             try:
                 self._audio_ready_countdown -= 1
                 if not self._audio_ready_confirmed or self._audio_ready_countdown <= 0:
@@ -361,7 +362,6 @@ class ConversationSessionWorker:
                 activity = VoiceActivity(raw_activity.value)
 
                 frames_to_push: tuple[AudioFrame, ...] = ()
-                utterance_ended = False
                 if activity is VoiceActivity.SILENCE:
                     if self._utterance_active:
                         raise RuntimeError("vad emitted silence before ending the active utterance")
@@ -468,7 +468,6 @@ class ConversationSessionWorker:
                                 self._interruption_foreground_turn_id is not None
                             )
                             self._set_voice_activity(True)
-                            self._set_voice_activity(False)
                             frames_to_push = retained
                             utterance_ended = True
                         self._reset_echo_suppression()
@@ -479,7 +478,6 @@ class ConversationSessionWorker:
                     else:
                         frames_to_push = (frame,)
                         self._utterance_active = False
-                        self._set_voice_activity(False)
                         utterance_ended = True
 
                 transcripts: tuple[Transcript, ...] = ()
@@ -597,6 +595,9 @@ class ConversationSessionWorker:
                 if not self._closed and not caller_cancelled and self._terminal_error is None:
                     self._terminal_error = error
                 raise
+            finally:
+                if utterance_ended:
+                    self._set_voice_activity(False)
 
     async def _speech_candidate_admitted(self, frames: tuple[AudioFrame, ...]) -> bool:
         verifier = self._speech_presence_verifier

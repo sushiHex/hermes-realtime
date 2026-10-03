@@ -2112,7 +2112,9 @@ def build_local_host_launcher(
                 host="127.0.0.1", port=voice_companion.port, token=voice_companion.token
             ),
             idle_allowed=lambda: review_idle_allowed(
-                speech_active=actions.foreground_active,
+                speech_active=(
+                    not completion_floor_available() or actions.reserved_operation_count > 0
+                ),
                 foreground_tasks=foreground.active_task_count,
             ),
         )

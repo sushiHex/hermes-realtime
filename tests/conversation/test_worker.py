@@ -565,6 +565,52 @@ async def test_session_worker_routes_endpointed_audio_to_foreground_response() -
 
 
 @pytest.mark.asyncio
+async def test_voice_activity_remains_active_until_endpoint_final_is_routed() -> None:
+    executor, _, responses = action_executor_probe()
+    final_started = asyncio.Event()
+    release_final = asyncio.Event()
+    events: list[str] = []
+
+    class PausedFinalTranscriber(NoSpeechTranscriber):
+        async def finish_utterance(self) -> Transcript:
+            final_started.set()
+            await release_final.wait()
+            return Transcript(text="Endpoint final", final=True)
+
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=7,
+        vad=ScriptedVad(),
+        stt=PausedFinalTranscriber(),
+        actions=executor,
+        observer=lambda kind, _data: events.append(kind),
+        on_voice_activity=lambda active: events.append(
+            "voice_active" if active else "voice_idle"
+        ),
+    )
+    worker.start()
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+
+    try:
+        await worker.receive_audio("browser_user", 7, frame)
+        endpoint = asyncio.create_task(worker.receive_audio("browser_user", 7, frame))
+        await asyncio.wait_for(final_started.wait(), timeout=1)
+        assert "voice_idle" not in events
+
+        release_final.set()
+        await endpoint
+        assert events[-1] == "voice_idle"
+        await worker.wait_for_responses()
+        assert events.index("transcript_final") < events.index("voice_idle")
+        assert responses == [
+            ("session_7_turn_1", Transcript(text="Endpoint final", final=True))
+        ]
+    finally:
+        release_final.set()
+        await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_only_endpoint_final_authorizes_one_response() -> None:
     executor, _, responses = action_executor_probe()
     worker = ConversationSessionWorker(

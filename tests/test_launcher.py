@@ -2159,6 +2159,55 @@ async def test_full_host_archives_through_the_companion_after_the_tail_opens(
     ]
 
 
+@pytest.mark.asyncio
+async def test_full_host_review_idle_waits_for_inbound_voice_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+    from hermes_realtime.integration.voice_review import VoiceReviewSender
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    idle_checks: list[Any] = []
+
+    class CapturingReviewSender(VoiceReviewSender):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            idle_checks.append(kwargs["idle_allowed"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(host_launcher_module, "VoiceReviewSender", CapturingReviewSender)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+
+    await launcher.start()
+    try:
+        assert len(idle_checks) == 1
+        idle_allowed = idle_checks[0]
+        assert idle_allowed()
+
+        await harness.browser["activate_media"]("browser_0123456789abcdef", 1, 1)
+        harness.conversation["binding_factory"](
+            "browser_0123456789abcdef", 1, harness.conversation["actions"]
+        )
+        inbound_activity = harness.bindings[-1]["on_voice_activity"]
+        inbound_activity(True)
+        assert not idle_allowed()
+        inbound_activity(False)
+        assert idle_allowed()
+
+        actions = harness.conversation["actions"]
+        actions.start()
+        reservation = actions.reserve_response()
+        try:
+            assert not idle_allowed()
+        finally:
+            actions.release_response(reservation)
+        assert idle_allowed()
+    finally:
+        await launcher.close()
+
+
 def test_full_host_refuses_a_companion_without_a_voice_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
