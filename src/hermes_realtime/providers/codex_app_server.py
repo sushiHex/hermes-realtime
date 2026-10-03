@@ -47,6 +47,7 @@ _MAX_PROTOCOL_LINE_BYTES = 1_048_576
 # A Codex process never serves a turn on a login this close to expiry: it cannot refresh.
 _MIN_SESSION_ACCESS_SECONDS = 3600
 _SESSION_AUTH_REFUSAL_PREFIX = "[codex-session-auth] "
+_TOOL_REFUSAL_PREFIX = "[codex-tool-refusal] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -1639,12 +1640,7 @@ class CodexAppServerStreamingInference:
         for call in self._dynamic_calls.values():
             if call.identity[:2] != (active.thread_id, active.server_id):
                 continue
-            if call.response is None:
-                call.response = self._tool_response(
-                    _NONCOMMITTAL_TOOL_RESULT,
-                    success=False,
-                )
-                call.response_ready.set()
+            self._settle_noncommittal(call, "turn_ended")
             tasks.update(call.response_tasks)
         if tasks:
             await asyncio.gather(
@@ -1841,103 +1837,102 @@ class CodexAppServerStreamingInference:
         reader = self._reader_task
         if reader is None:
             raise RuntimeError("Codex app-server reader is unavailable")
-        while True:
-            routing = (
-                self._turn_routing.setdefault(
-                    (thread_id, turn_id),
-                    _TurnRouting(),
-                )
-                if thread_id is not None and turn_id is not None
-                else None
-            )
-            if routing is not None and routing.failure.is_set():
-                raise RuntimeError("Codex app-server reader failed") from routing.error
-            if routing is not None:
-                routing.dynamic_registered.clear()
-            now = asyncio.get_running_loop().time()
-            live_calls = tuple(
-                call
-                for call in self._dynamic_calls.values()
-                if call.identity[:2] == (thread_id, turn_id)
-                and not call.completed
-                and call.deadline > now
-            )
-            timeout = (
-                min(call.deadline for call in live_calls) - now
-                if live_calls
-                else self._request_timeout
-            )
-            event = asyncio.create_task(events.get(), name="codex-app-server-next-event")
-            routing_failure = (
-                asyncio.create_task(
-                    routing.failure.wait(),
-                    name="codex-app-server-routing-failure",
-                )
-                if routing is not None
-                else None
-            )
-            dynamic_registered = (
-                asyncio.create_task(
-                    routing.dynamic_registered.wait(),
-                    name="codex-app-server-dynamic-registered",
-                )
-                if routing is not None
-                else None
-            )
-            try:
-                waiters: tuple[asyncio.Future[object] | asyncio.Task[object], ...]
-                if routing_failure is None or dynamic_registered is None:
-                    waiters = (event, reader)
-                else:
-                    waiters = (event, reader, routing_failure, dynamic_registered)
-                done, _pending = await asyncio.wait(
-                    waiters,
-                    timeout=max(0.0, timeout),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if reader in done:
-                    try:
-                        reader_error = reader.exception()
-                    except asyncio.CancelledError as exc:
-                        raise RuntimeError("Codex app-server reader stopped") from exc
-                    self._reader_failure_observed = True
-                    raise RuntimeError("Codex app-server reader failed") from reader_error
-                if routing_failure is not None and routing_failure in done:
-                    assert routing is not None
-                    raise RuntimeError("Codex app-server reader failed") from routing.error
-                if event in done:
-                    return event.result()
-                if dynamic_registered is not None and dynamic_registered in done:
-                    continue
-                if not live_calls:
-                    raise TimeoutError("Codex app-server event stream timed out")
-                tasks: set[asyncio.Task[None]] = set()
-                for call in live_calls:
-                    if call.response is None:
-                        call.response = self._tool_response(
-                            _NONCOMMITTAL_TOOL_RESULT,
-                            success=False,
-                        )
-                        call.response_ready.set()
-                    tasks.update(call.response_tasks)
-                if tasks:
-                    await asyncio.gather(
-                        *(asyncio.shield(task) for task in tasks),
-                        return_exceptions=True,
+        # One queue read spans every wait round, so an event that arrives while an expired
+        # tool call is being settled is returned on the next round instead of discarded.
+        event = asyncio.create_task(events.get(), name="codex-app-server-next-event")
+        try:
+            while True:
+                routing = (
+                    self._turn_routing.setdefault(
+                        (thread_id, turn_id),
+                        _TurnRouting(),
                     )
-            finally:
-                if not event.done():
-                    event.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await event
-                if routing_failure is not None and not routing_failure.done():
-                    routing_failure.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await routing_failure
-                if dynamic_registered is not None and not dynamic_registered.done():
-                    dynamic_registered.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await dynamic_registered
+                    if thread_id is not None and turn_id is not None
+                    else None
+                )
+                if routing is not None and routing.failure.is_set():
+                    raise RuntimeError("Codex app-server reader failed") from routing.error
+                if routing is not None:
+                    routing.dynamic_registered.clear()
+                now = asyncio.get_running_loop().time()
+                live_calls = tuple(
+                    call
+                    for call in self._dynamic_calls.values()
+                    if call.identity[:2] == (thread_id, turn_id)
+                    and not call.completed
+                    and call.deadline > now
+                )
+                timeout = (
+                    min(call.deadline for call in live_calls) - now
+                    if live_calls
+                    else self._request_timeout
+                )
+                routing_failure = (
+                    asyncio.create_task(
+                        routing.failure.wait(),
+                        name="codex-app-server-routing-failure",
+                    )
+                    if routing is not None
+                    else None
+                )
+                dynamic_registered = (
+                    asyncio.create_task(
+                        routing.dynamic_registered.wait(),
+                        name="codex-app-server-dynamic-registered",
+                    )
+                    if routing is not None
+                    else None
+                )
+                try:
+                    waiters: tuple[asyncio.Future[object] | asyncio.Task[object], ...]
+                    if routing_failure is None or dynamic_registered is None:
+                        waiters = (event, reader)
+                    else:
+                        waiters = (event, reader, routing_failure, dynamic_registered)
+                    done, _pending = await asyncio.wait(
+                        waiters,
+                        timeout=max(0.0, timeout),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if reader in done:
+                        try:
+                            reader_error = reader.exception()
+                        except asyncio.CancelledError as exc:
+                            raise RuntimeError("Codex app-server reader stopped") from exc
+                        self._reader_failure_observed = True
+                        raise RuntimeError("Codex app-server reader failed") from reader_error
+                    if routing_failure is not None and routing_failure in done:
+                        assert routing is not None
+                        raise RuntimeError("Codex app-server reader failed") from routing.error
+                    if event in done:
+                        return event.result()
+                    if dynamic_registered is not None and dynamic_registered in done:
+                        continue
+                    if not live_calls:
+                        raise TimeoutError("Codex app-server event stream timed out")
+                    tasks: set[asyncio.Task[None]] = set()
+                    for call in live_calls:
+                        self._settle_noncommittal(call, "deadline")
+                        tasks.update(call.response_tasks)
+                    if tasks:
+                        await asyncio.gather(
+                            *(asyncio.shield(task) for task in tasks),
+                            return_exceptions=True,
+                        )
+                finally:
+                    if routing_failure is not None and not routing_failure.done():
+                        routing_failure.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await routing_failure
+                    if dynamic_registered is not None and not dynamic_registered.done():
+                        dynamic_registered.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await dynamic_registered
+        finally:
+            if not event.done():
+                event.cancel()
+                with suppress(asyncio.CancelledError):
+                    await event
 
     async def _send(self, message: Mapping[str, object]) -> None:
         transport = self._transport
@@ -2460,12 +2455,7 @@ class CodexAppServerStreamingInference:
                         timeout=max(0.0, remaining),
                     )
                 except TimeoutError:
-                    if call.response is None:
-                        call.response = self._tool_response(
-                            _NONCOMMITTAL_TOOL_RESULT,
-                            success=False,
-                        )
-                        call.response_ready.set()
+                    self._settle_noncommittal(call, "deadline")
                     await self._send({"id": request_id, "result": call.response})
                     return
             if (
@@ -2532,11 +2522,7 @@ class CodexAppServerStreamingInference:
                                 )
                         call.response_ready.set()
                     else:
-                        call.response = self._tool_response(
-                            _NONCOMMITTAL_TOOL_RESULT,
-                            success=False,
-                        )
-                        call.response_ready.set()
+                        self._settle_noncommittal(call, "deadline")
                 finally:
                     if not response_ready.done():
                         response_ready.cancel()
@@ -2651,6 +2637,25 @@ class CodexAppServerStreamingInference:
         if copied.reason is not None:
             value["reason"] = copied.reason
         return cls._tool_response(value, success=True)
+
+    def _settle_noncommittal(self, call: _DynamicCall, cause: str) -> None:
+        """Answer an unsettled call as pending, recording the refusal exactly once.
+
+        Only the first settlement assigns a response, so competing deadline and turn-end
+        paths cannot answer or record a call twice.
+        """
+        if call.response is not None:
+            return
+        call.response = self._tool_response(_NONCOMMITTAL_TOOL_RESULT, success=False)
+        call.response_ready.set()
+        print(
+            _TOOL_REFUSAL_PREFIX
+            + json.dumps(
+                {"refusal": cause, "tool": call.tool, "version": 1},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
     @staticmethod
     def _tool_response(value: Mapping[str, object], *, success: bool) -> dict[str, object]:

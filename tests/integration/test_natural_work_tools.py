@@ -471,6 +471,7 @@ class NaturalWorkRuntime:
     browser_events: list[tuple[str, dict[str, str | int | bool | None]]]
     cancel_attempts: list[tuple[str, str | None]]
     runtime_name: str
+    work_tool_timeout_seconds: float = 0.75
     inferences: list[CodexAppServerStreamingInference] = field(default_factory=list)
     _transport_counter: Any = field(default_factory=lambda: count(1))
 
@@ -506,7 +507,7 @@ class NaturalWorkRuntime:
             effort="low",
             transport_factory=lambda: transport,
             request_timeout_seconds=1,
-            work_tool_timeout_seconds=0.75,
+            work_tool_timeout_seconds=self.work_tool_timeout_seconds,
         )
         inference.bind_work_tools(self.surface if handler is None else handler)
         self.inferences.append(inference)
@@ -686,6 +687,7 @@ async def _runtime(
     request_timeout_seconds: float = 1,
     runtime_name: str = "cross",
     start_projection_gate: Any = None,
+    work_tool_timeout_seconds: float = 0.75,
 ) -> NaturalWorkRuntime:
     port = _available_port()
     stub = HermesApiStub(mode=mode)
@@ -767,6 +769,7 @@ async def _runtime(
         browser_events=browser_events,
         cancel_attempts=cancel_attempts,
         runtime_name=runtime_name,
+        work_tool_timeout_seconds=work_tool_timeout_seconds,
     )
 
 
@@ -1232,7 +1235,9 @@ class _StartProjectionGate:
 @pytest.mark.asyncio
 async def test_completion_before_projection_rolls_back_without_stale_active_state() -> None:
     gate = _StartProjectionGate()
-    runtime = await _runtime(start_projection_gate=gate)
+    # The gate, not the work-tool deadline, orders this test: the deadline outlasts the three
+    # one-second waits bounding the gated phase, so it cannot settle the call first.
+    runtime = await _runtime(start_projection_gate=gate, work_tool_timeout_seconds=5)
     invocation = asyncio.create_task(runtime.invoke("Inspect the release evidence."))
     try:
         await asyncio.wait_for(gate.entered.wait(), timeout=1)

@@ -4276,3 +4276,60 @@ async def test_codex_event_wait_cancellation_does_not_orphan_queue_reader() -> N
         if task.get_name() == "codex-app-server-next-event" and not task.done()
     ] == []
     await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_event_arriving_while_expired_tool_settles_is_delivered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+        request_timeout_seconds=0.2,
+    )
+    await inference._ensure_started()
+    events: asyncio.Queue[Mapping[str, object]] = asyncio.Queue()
+    identity = ("thread_settle", "turn_settle", "call_settle")
+    call = codex_app_server_module._DynamicCall(
+        identity=identity,
+        tool="start_work",
+        namespace=None,
+        arguments={"objective": "Inspect the release evidence"},
+        canonical_arguments='{"objective":"Inspect the release evidence"}',
+        deadline=asyncio.get_running_loop().time() + 0.05,
+    )
+    delta: Mapping[str, object] = {
+        "method": "item/agentMessage/delta",
+        "params": {"threadId": "thread_settle", "turnId": "turn_settle"},
+    }
+
+    async def respond_then_receive_assistant_text() -> None:
+        # The tool response goes out only once the deadline settles it; the assistant
+        # text it provokes therefore lands while the expired call is being settled.
+        await call.response_ready.wait()
+        events.put_nowait(delta)
+
+    responder = asyncio.create_task(respond_then_receive_assistant_text())
+    call.response_tasks.add(responder)
+    inference._dynamic_calls[identity] = call
+    try:
+        event = await asyncio.wait_for(
+            inference._next_event(events, thread_id="thread_settle", turn_id="turn_settle"),
+            timeout=1,
+        )
+        assert event is delta
+        # A competing turn-end settlement neither answers nor records the call again.
+        inference._settle_noncommittal(call, "turn_ended")
+        prefix = "[codex-tool-refusal] "
+        markers = [
+            json.loads(line.removeprefix(prefix))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith(prefix)
+        ]
+        assert markers == [{"refusal": "deadline", "tool": "start_work", "version": 1}]
+    finally:
+        await responder
+        inference._dynamic_calls.pop(identity, None)
+        await inference.close()
