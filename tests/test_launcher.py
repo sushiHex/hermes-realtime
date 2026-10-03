@@ -2075,6 +2075,7 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
 
 def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> list[object]:
     from hermes_realtime.integration.voice_archive import VoiceArchiveSender
+    from hermes_realtime.integration.voice_review import VoiceReviewSender
 
     connectors: list[object] = []
 
@@ -2087,6 +2088,15 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
             events.append("archive:close")
             await super().close()
 
+    class RecordingReviewSender(VoiceReviewSender):
+        def start(self) -> None:
+            events.append("review:start")
+            super().start()
+
+        async def close(self) -> None:
+            events.append("review:close")
+            await super().close()
+
     def connector(*, host: str, port: int, token: str) -> object:
         connectors.append((host, port, token))
 
@@ -2096,13 +2106,19 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
         return unreachable
 
     from hermes_realtime.integration import voice_archive as voice_archive_module
+    from hermes_realtime.integration import voice_review as voice_review_module
 
     # The harness records on a tail subclass; the sender checks the exact type it gets.
     monkeypatch.setattr(
         voice_archive_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
     )
+    monkeypatch.setattr(
+        voice_review_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
+    )
     monkeypatch.setattr(host_launcher_module, "VoiceArchiveSender", RecordingSender)
+    monkeypatch.setattr(host_launcher_module, "VoiceReviewSender", RecordingReviewSender)
     monkeypatch.setattr(host_launcher_module, "bridge_connector", connector)
+    monkeypatch.setattr(host_launcher_module, "review_connector", connector)
     return connectors
 
 
@@ -2120,13 +2136,76 @@ async def test_full_host_archives_through_the_companion_after_the_tail_opens(
 
     await launcher.start()
     try:
-        assert harness.events == ["tail:open", "archive:start", "preflight", "runtime:start"]
-        assert connectors == [("127.0.0.1", 8766, "companion-token-with-enough-entropy")]
+        assert harness.events == [
+            "tail:open",
+            "archive:start",
+            "review:start",
+            "preflight",
+            "runtime:start",
+        ]
+        assert connectors == [
+            ("127.0.0.1", 8766, "companion-token-with-enough-entropy"),
+            ("127.0.0.1", 8766, "companion-token-with-enough-entropy"),
+        ]
     finally:
         await launcher.close()
 
     # The sender stops before the tail's final write.
-    assert harness.events[4:] == ["actions:closed", "archive:close", "tail:close"]
+    assert harness.events[5:] == [
+        "actions:closed",
+        "archive:close",
+        "review:close",
+        "tail:close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_full_host_review_idle_waits_for_inbound_voice_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+    from hermes_realtime.integration.voice_review import VoiceReviewSender
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    idle_checks: list[Any] = []
+
+    class CapturingReviewSender(VoiceReviewSender):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            idle_checks.append(kwargs["idle_allowed"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(host_launcher_module, "VoiceReviewSender", CapturingReviewSender)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+
+    await launcher.start()
+    try:
+        assert len(idle_checks) == 1
+        idle_allowed = idle_checks[0]
+        assert idle_allowed()
+
+        await harness.browser["activate_media"]("browser_0123456789abcdef", 1, 1)
+        harness.conversation["binding_factory"](
+            "browser_0123456789abcdef", 1, harness.conversation["actions"]
+        )
+        inbound_activity = harness.bindings[-1]["on_voice_activity"]
+        inbound_activity(True)
+        assert not idle_allowed()
+        inbound_activity(False)
+        assert idle_allowed()
+
+        actions = harness.conversation["actions"]
+        actions.start()
+        reservation = actions.reserve_response()
+        try:
+            assert not idle_allowed()
+        finally:
+            actions.release_response(reservation)
+        assert idle_allowed()
+    finally:
+        await launcher.close()
 
 
 def test_full_host_refuses_a_companion_without_a_voice_tail(

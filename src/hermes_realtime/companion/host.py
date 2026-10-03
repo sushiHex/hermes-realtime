@@ -44,12 +44,20 @@ from hermes_realtime.companion.integrity import (
     VoiceBatch,
     VoiceRow,
 )
+from hermes_realtime.companion.review import (
+    ReviewQuiescenceError,
+    ReviewRequest,
+    VoiceReviewCoordinator,
+)
 from hermes_realtime.companion.store import CompanionStore
 from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
 from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    VoiceReviewRefusedEvent,
 )
 
 PORT_VARIABLE = "HERMES_REALTIME_COMPANION_PORT"
@@ -98,7 +106,7 @@ def _refused(event: VoiceArchiveEvent, category: str) -> VoiceArchiveRefusedEven
     """A refusal of exactly this batch's range; the category set is the protocol's."""
     return VoiceArchiveRefusedEvent.model_validate(
         {
-            "protocol_version": "0.2",
+            "protocol_version": "0.3",
             "type": "voice_archive_refused",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
@@ -117,12 +125,14 @@ class VoiceCompanionService:
         archive: VoiceArchive,
         store: CompanionStore,
         port: ArchivePort,
+        review: VoiceReviewCoordinator | None = None,
     ) -> None:
         if type(archive) is not VoiceArchive or type(store) is not CompanionStore:
             raise TypeError("the service needs an exact VoiceArchive and CompanionStore")
         self._archive = archive
         self._store = store
         self._port = port
+        self._review = review
         self._open_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -136,6 +146,58 @@ class VoiceCompanionService:
             raise ArchiveRefusal("incompatible")
         if await asyncio.to_thread(self._port.durability_level) < DURABLE_SYNCHRONOUS:
             raise ArchiveRefusal("durability")
+        if self._review is not None:
+            try:
+                await self._review.start()
+            except ArchiveRefusal as refusal:
+                _marker({"refusal": refusal.category, "version": 1})
+
+    @property
+    def review_interval(self) -> int | None:
+        if self._review is None:
+            return None
+        try:
+            return self._review.review_interval
+        except RuntimeError:
+            return None
+
+    async def review(
+        self, event: VoiceReviewEvent
+    ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None:
+        if type(event) is not VoiceReviewEvent:
+            raise TypeError("event must be an exact VoiceReviewEvent")
+        evidence: dict[str, str | int] | None = None
+        try:
+            if self._review is None:
+                raise ArchiveRefusal("not_ready")
+            if self._store.read(event.conversation_id) is None:
+                evidence = {"refusal": "unbound", "version": 1}
+                raise ArchiveRefusal("unbound")
+            await self._ensure_open(event.conversation_id)
+            result = await self._review.review(
+                ReviewRequest(
+                    event.conversation_id, event.generation, event.seq_from,
+                    event.seq_through, event.memory, event.skills, event.closing,
+                )
+            )
+        except ArchiveRefusal as refusal:
+            return VoiceReviewRefusedEvent(
+                protocol_version="0.3", type="voice_review_refused",
+                conversation_id=event.conversation_id, generation=event.generation,
+                seq_from=event.seq_from, seq_through=event.seq_through,
+                closing=event.closing, category=refusal.category,
+            )
+        except Exception:
+            return None
+        finally:
+            if evidence is not None:
+                _marker(evidence)
+        return VoiceReviewAckEvent(
+            protocol_version="0.3", type="voice_review_ack",
+            conversation_id=event.conversation_id, generation=event.generation,
+            seq_from=event.seq_from, seq_through=event.seq_through,
+            closing=event.closing, review_id=result.review_id, status="accepted",
+        )
 
     async def archive(
         self, event: VoiceArchiveEvent
@@ -155,7 +217,7 @@ class VoiceCompanionService:
             return None
         ack = result.ack
         return VoiceArchiveAckEvent(
-            protocol_version="0.2",
+            protocol_version="0.3",
             type="voice_archive_ack",
             conversation_id=ack.conversation_id,
             generation=ack.generation,
@@ -205,6 +267,8 @@ class VoiceCompanionService:
                 await self._archive.open(conversation_id)
 
     async def close(self) -> None:
+        if self._review is not None:
+            await self._review.close()
         await self._archive.close()
 
 
@@ -330,13 +394,28 @@ class VoiceCompanionHost:
                 store = CompanionStore(self._store_path)
                 try:
                     archive = VoiceArchive(store, port, lease_ttl_seconds=self._ttl)
-                    service = VoiceCompanionService(archive, store, port)
+                    from hermes_realtime.companion.hermes_compat import HermesArchivePort
+
+                    review = (
+                        VoiceReviewCoordinator(archive, store, port, port.make_review_parent)
+                        if type(port) is HermesArchivePort else None
+                    )
+                    service = VoiceCompanionService(archive, store, port, review)
                     try:
                         await service.start()
                         if not stop.is_set():
                             await self._serve(service, stop)
                     finally:
-                        await service.close()
+                        while True:
+                            try:
+                                await service.close()
+                                break
+                            except ReviewQuiescenceError:
+                                # An owned review or parent cleanup has not quiesced.
+                                # Keep the profile lock, Hermes DB, store and lease alive
+                                # until it has; host.close() reports its own timeout.
+                                _marker({"refusal": "review_close_pending", "version": 1})
+                                await asyncio.sleep(1)
                 finally:
                     store.close()
             finally:

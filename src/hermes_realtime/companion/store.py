@@ -12,6 +12,7 @@ transaction ever spans the two files.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from hermes_realtime.companion.integrity import (
+    MAX_ARCHIVE_ROWS,
+    MAX_IDENTITY,
     ArchiveRefusal,
     Fingerprint,
     Identity,
@@ -33,6 +36,12 @@ _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
 # A generous bound on stored conversations: each is one row of fences and progress.
 MAX_BOUND_CONVERSATIONS = 4096
+# One periodic and one closing identity per archived row fit without eviction.
+# Gap-heavy close histories can exceed this bound and are refused fail-closed.
+MAX_REVIEW_LEDGER_ENTRIES = 2 * MAX_ARCHIVE_ROWS
+_REVIEW_OUTCOMES = frozenset(
+    {"reserved", "accepted", "finished", "failed", "cancelled", "unknown"}
+)
 # Categories a durable quarantine may record: the archive no longer matches its evidence.
 QUARANTINE_CATEGORIES = frozenset(
     {"mismatch", "missing", "over_cap", "rotated", "recovery", "lineage", "count"}
@@ -197,6 +206,183 @@ class CompanionStore:
         return self._step(  # type: ignore[no-any-return]
             conversation_id, lambda row: None if row is None else self._record(row)
         )
+
+    @staticmethod
+    def _review_key(request: Any) -> str:
+        return (
+            f"{request.generation}:{request.seq_from}:"
+            f"{request.seq_through}:{int(request.closing)}"
+        )
+
+    @staticmethod
+    def _decode_review_ledger(raw: object) -> dict[str, dict[str, str]]:
+        if type(raw) is not str or len(raw) > 1_048_576:
+            raise RuntimeError("review ledger is invalid")
+        def distinct(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate review ledger key")
+                result[key] = value
+            return result
+        try:
+            ledger = json.loads(raw, object_pairs_hook=distinct)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("review ledger is invalid") from error
+        if type(ledger) is not dict or len(ledger) > MAX_REVIEW_LEDGER_ENTRIES:
+            raise RuntimeError("review ledger is invalid")
+        ids: set[str] = set()
+        for key, value in ledger.items():
+            parts = key.split(":") if type(key) is str else []
+            valid_key = (
+                len(parts) == 4
+                and len(key) <= 80
+                and all(1 <= len(part) <= 16 for part in parts)
+                and all(part.isascii() and part.isdecimal() for part in parts)
+                and all(str(int(part)) == part for part in parts)
+                and all(0 <= int(part) <= MAX_IDENTITY for part in parts[:3])
+                and int(parts[1]) <= int(parts[2])
+                and parts[3] in {"0", "1"}
+            )
+            if (
+                not valid_key or type(value) is not dict
+                or set(value) != {"id", "outcome"}
+                or type(value["id"]) is not str
+                or not re.fullmatch(r"vr_[0-9a-f]{32}", value["id"])
+                or value["id"] in ids
+                or type(value["outcome"]) is not str
+                or value["outcome"] not in _REVIEW_OUTCOMES
+            ):
+                raise RuntimeError("review ledger is invalid")
+            ids.add(value["id"])
+        return ledger
+
+    @staticmethod
+    def _admission_fences(row: Any) -> None:
+        if row is None or row[2] is None:
+            raise ArchiveRefusal("unbound")
+        if row[10] is not None:
+            raise ArchiveRefusal("quarantined")
+        if row[11] is not None:
+            raise ArchiveRefusal("tombstoned")
+        if row[6] is not None:
+            raise ArchiveRefusal("pending")
+
+    def _review_ledger(self, conversation_id: str, row: Any) -> dict[str, dict[str, str]]:
+        if row is None:
+            raise ArchiveRefusal("unbound")
+        raw = self._connection.execute(
+            "SELECT review_ledger FROM voice_archive WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()[0]
+        return self._decode_review_ledger(raw)
+
+    def find_review(self, request: Any) -> tuple[str, str] | None:
+        key = self._review_key(request)
+        def action(row: Any) -> tuple[str, str] | None:
+            entry = self._review_ledger(request.conversation_id, row).get(key)
+            return None if entry is None else (entry["id"], entry["outcome"])
+        return self._step(request.conversation_id, action)  # type: ignore[no-any-return]
+
+    def reserve_review(self, request: Any, review_id: str) -> None:
+        if type(review_id) is not str or not re.fullmatch(r"vr_[0-9a-f]{32}", review_id):
+            raise ValueError("review ID is invalid")
+        key = self._review_key(request)
+
+        def action(row: Any) -> None:
+            self._admission_fences(row)
+            ledger = self._review_ledger(request.conversation_id, row)
+            if key in ledger:
+                raise ArchiveRefusal("busy")
+            if len(ledger) >= MAX_REVIEW_LEDGER_ENTRIES:
+                raise ArchiveRefusal("capacity")
+            ledger[key] = {"id": review_id, "outcome": "reserved"}
+            self._connection.execute(
+                "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
+                (
+                    json.dumps(ledger, sort_keys=True, separators=(",", ":")),
+                    request.conversation_id,
+                ),
+            )
+
+        self._step(request.conversation_id, action)
+
+    def accept_review(self, request: Any, review_id: str) -> None:
+        key = self._review_key(request)
+
+        def action(row: Any) -> None:
+            self._admission_fences(row)
+            ledger = self._review_ledger(request.conversation_id, row)
+            entry = ledger.get(key)
+            if entry != {"id": review_id, "outcome": "reserved"}:
+                raise RuntimeError("review reservation changed")
+            entry["outcome"] = "accepted"
+            self._connection.execute(
+                "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
+                (
+                    json.dumps(ledger, sort_keys=True, separators=(",", ":")),
+                    request.conversation_id,
+                ),
+            )
+
+        self._step(request.conversation_id, action)
+
+    def finish_review(self, conversation_id: str, review_id: str, outcome: str) -> None:
+        if outcome not in _REVIEW_OUTCOMES or outcome == "accepted":
+            raise ValueError("review outcome is invalid")
+        def action(row: Any) -> None:
+            ledger = self._review_ledger(conversation_id, row)
+            for entry in ledger.values():
+                if entry["id"] == review_id:
+                    entry["outcome"] = outcome
+                    self._connection.execute(
+                        "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
+                        (
+                            json.dumps(ledger, sort_keys=True, separators=(",", ":")),
+                            conversation_id,
+                        ),
+                    )
+                    return
+            raise RuntimeError("review identity is absent")
+        self._step(conversation_id, action)
+
+    def review_outcome(self, conversation_id: str, review_id: str) -> str | None:
+        def action(row: Any) -> str | None:
+            ledger = self._review_ledger(conversation_id, row)
+            for entry in ledger.values():
+                if entry["id"] == review_id:
+                    return entry["outcome"]
+            return None
+        return self._step(conversation_id, action)  # type: ignore[no-any-return]
+
+    def recover_reviews(self) -> None:
+        """A prior process's admitted thread cannot be observed; retain unknown evidence."""
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = connection.execute(
+                "SELECT conversation_id, review_ledger FROM voice_archive"
+            )
+            for count, (conversation_id, raw) in enumerate(cursor, start=1):
+                if count > MAX_BOUND_CONVERSATIONS:
+                    raise RuntimeError("review ledger conversation bound exceeded")
+                ledger = self._decode_review_ledger(raw)
+                if any(entry["outcome"] in {"reserved", "accepted"} for entry in ledger.values()):
+                    for entry in ledger.values():
+                        if entry["outcome"] in {"reserved", "accepted"}:
+                            entry["outcome"] = "unknown"
+                    connection.execute(
+                        "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
+                        (
+                            json.dumps(ledger, sort_keys=True, separators=(",", ":")),
+                            conversation_id,
+                        ),
+                    )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
 
     def bind(
         self, conversation_id: str, session_id: str, creation: Progress

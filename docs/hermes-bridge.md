@@ -77,21 +77,22 @@ commit describes that code. Paths that differ only in case are exempt on a case-
 checkout only while their one file on disk matches one of their committed versions:
 `29112bef` tracks such paths, and Windows can hold only one of each.
 
-## Protocol 0.2: the hello and the voice archive
+## Protocol 0.3: the hello, voice archive and review
 
 The hello is exactly
-`{"token", "participant_id", "protocol_version": "0.2", "capabilities": [...]}`. The server
-answers `{"ok": true, "protocol_version": "0.2", "capabilities": [...]}` with the requested
+`{"token", "participant_id", "protocol_version": "0.3", "capabilities": [...]}`. The server
+answers `{"ok": true, "protocol_version": "0.3", "capabilities": [...]}` with the requested
 capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
-repeated capability, or with any other key, is refused. The only capability is
-`voice_archive`, offered only by a bridge that a ready voice companion started. Realtime
+repeated capability, or with any other key, is refused. The voice capabilities are
+`voice_archive` and `voice_review`, offered by the ready companion. A welcome that
+negotiates review also carries its profile's bounded `review_interval`. Realtime
 sends no voice event on a connection whose welcome did not list it, and the server closes a
 connection that sends one anyway. A voice connection carries voice events only. A refused
 hello leaves one `[hermes-bridge-hello]` marker with its rejection category (`shape`,
 `token`, `participant`, `version` or `capability`), never the token or the participant.
 
 Versions are mixed on purpose: the hello and every voice event name `protocol_version`
-`"0.2"` explicitly (a voice event without it is refused), while the work events
+`"0.3"` explicitly (a voice event without it is refused), while the work events
 (`work.*`, `control.*`) keep `"0.1"`. The two event families parse separately, and
 neither parser accepts the other's events.
 
@@ -151,6 +152,59 @@ outbox to the companion. With neither, it archives nothing.
 Known limit: the token sits in the Hermes env file the gateway also reads. Any process of
 the same user can read that file anyway, so keeping the token out of it would not change
 who can reach the bridge; it is deferred.
+
+## Voice review
+
+`voice_review{conversation_id, generation, seq_from, seq_through, memory, skills, closing}`
+requests Hermes's combined memory and skills review. Both review flags must be exact
+`true` booleans. The companion answers with `voice_review_ack`, naming the same range,
+closing flag and a review identity, only after it owns a started review thread. A
+`voice_review_refused` retains the range for retry or investigation. Admission is not
+completion: the companion's durable ledger records `finished`, `failed`, `cancelled`
+or `unknown`. Completion also emits a content-free `[voice-review]` outcome marker.
+None of those is a receipt that something was learned.
+
+The companion verifies the archive chain and captures the snapshot while taking the
+Hermes admission token under the same database write transaction. A mismatch quarantines
+the conversation. Review text comes exclusively from archived rows; realtime sends
+identities and flags, not a second copy of the conversation. Each request is bounded to
+24 archived messages and the companion also bounds snapshot size. An oversized snapshot
+is refused rather than passed to Hermes's routed-history digest.
+
+The parent belongs to the archive's profile, never runs a foreground turn, and uses
+`skip_memory=True` with the built-in memory and skills toolsets. Each spawn checks the
+profile's review switch, empty `extra_tools`, and the qualified tool whitelist. The native
+parent and fork have no session database or session persistence, so closing the parent cannot
+end the archive. The companion owns cancellation and joining; a timeout
+does not prove that the thread stopped. Native summaries and failures are not forwarded
+to speech or task dispatch.
+
+Realtime schedules review from acknowledged user-row counts using the negotiated profile
+interval, and retains a final boundary after 300 seconds without conversation activity or
+at shutdown. Shutdown gives the live archive and review senders one five-second budget
+to acknowledge the final range; an expired budget retains the checkpoint and emits a
+content-free refusal marker. Active foreground work and unsettled speech defer idle closure.
+Each idle boundary ends a conversation period within the same Hermes voice session; resuming speech
+does not erase earlier closing ranges or create a second history. A final review has a
+distinct identity even when a periodic review just covered the same ending range.
+Changing the profile's nudge interval requires restarting the companion; a mismatch with
+the negotiated interval refuses review. The enabled switch and empty extra-tools policy
+are checked again for every spawn. A cached parent also refuses changed profile configuration,
+model routing or credential authority; restart the companion to bind the new configuration.
+
+Tail version 3 retains bounded acknowledged-row identities, frozen review requests and
+ordered closing checkpoints. Pending coverage survives busy replies, disconnection and
+restart. The archive remains the history authority; review bookkeeping contains only
+identities, counts and outcomes. Migrating a version-2 tail preserves its outbox and begins
+counting new acknowledgments at its existing cursor; it does not claim to have reviewed
+older archived history. Older bridge versions are refused, so the two sides must be
+upgraded together.
+
+The installed qualification is `uv run python scripts/qualify_voice_review.py`, against
+the pinned Hermes with a stand-in model and synthetic fixtures. Its attribution and
+correction checks establish the integration's behavior with that declared model; they
+do not establish the reasoning quality of a production model. Memory readback into the
+realtime foreground remains M4, and forgetting remains M3.
 
 ## Worker
 

@@ -17,7 +17,7 @@ on a connection whose hello advertised ``voice_archive``, and then:
 Realtime never reads the voice session, so no resend is ever keyed on a negative read:
 the only answer that removes a batch is the companion's acknowledgment of it. Nothing here
 is on the voice path: the store's callback only records rows, and this task only waits.
-Review and forget are not wired here (milestones M2 and M3).
+Review uses a separate sender and never enters the voice path.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def archive_event(batch: ArchiveBatch) -> VoiceArchiveEvent:
     """The wire form of a frozen batch: the same rows, byte for byte, every time."""
 
     return VoiceArchiveEvent(
-        protocol_version="0.2",
+        protocol_version="0.3",
         type="voice_archive",
         conversation_id=batch.conversation_id,
         generation=batch.generation,

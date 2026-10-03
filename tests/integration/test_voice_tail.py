@@ -22,6 +22,8 @@ from hermes_realtime.integration.voice_tail import (
     ArchiveBatch,
     ArchiveOutbox,
     OutboxRow,
+    ReviewProgress,
+    ReviewRange,
     VoiceTail,
     VoiceTailWriter,
     max_voice_tail_bytes,
@@ -90,6 +92,7 @@ def _archive(**overrides: object) -> ArchiveOutbox:
         "rows": (),
         "frozen": 0,
         "gap": None,
+        "review": ReviewProgress(),
     }
     fields.update(overrides)
     return ArchiveOutbox(**fields)  # type: ignore[arg-type]
@@ -119,12 +122,254 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
     assert voice_tail_bytes(tail, archive) == (
         b'{"archive":{"conversation_id":"conv","cursor":0,"frozen":1,"gap":[3,3],'
         b'"generation":0,"next_seq":4,"outbox":[{"gap_before":[1,1],"interrupted":false,'
-        b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],"settled":1},'
+        b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],'
+        b'"review":{"close_reviewed":false,"close_targets":[],"cursor":null,'
+        b'"overflow":false,"pending":null,"reviewed_users":0,"rows":[],"users":0},'
+        b'"settled":1},'
         b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
-        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":2}'
+        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":3}'
     )
     assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
     assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())
+
+
+@pytest.mark.parametrize(
+    ("pending_end", "targets"),
+    [
+        pytest.param(0, [1], id="pending-stops-short-of-checkpoint"),
+        pytest.param(1, [0], id="pending-runs-past-checkpoint"),
+        pytest.param(1, [], id="checkpoint-missing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
+    tmp_path: Path, pending_end: int, targets: list[int]
+) -> None:
+    conversation = _rows(("user", "Hi", False), ("assistant", "Hello", False))
+    pending = ReviewRange("conv", 0, 0, 1, 1, True)
+    archive = _archive(
+        next_seq=2,
+        settled=2,
+        cursor=1,
+        review=ReviewProgress(
+            users=1,
+            pending=pending,
+            close_targets=(1,),
+            rows=((0, True), (1, False)),
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+
+    path = tmp_path / "voice-tail.json"
+    run_record_module.write_run_record(path, valid)
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    try:
+        assert await asyncio.wait_for(writer.next_review(10), 1) == pending
+    finally:
+        await writer.close()
+
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["pending"]["seq_through"] = pending_end
+    malformed["archive"]["review"]["close_targets"] = targets
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+@pytest.mark.parametrize("closing", [False, True], ids=["nonempty", "empty-closing"])
+def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> None:
+    if closing:
+        conversation = _rows(*(("user", f"Q{index}", False) for index in range(4)))
+        pending = ReviewRange("conv", 0, 0, 2, 2, True)
+        archive = _archive(
+            next_seq=4,
+            settled=4,
+            cursor=3,
+            review=ReviewProgress(
+                users=3,
+                pending=pending,
+                close_targets=(2,),
+                rows=((0, True), (1, True), (3, True)),
+            ),
+        )
+        malformed_start, malformed_users = 2, 0
+    else:
+        conversation = _rows(*(("user", f"Q{index}", False) for index in range(3)))
+        pending = ReviewRange("conv", 0, 0, 1, 2, False)
+        archive = _archive(
+            next_seq=3,
+            settled=3,
+            cursor=2,
+            review=ReviewProgress(
+                users=3,
+                pending=pending,
+                rows=((0, True), (1, True), (2, True)),
+            ),
+        )
+        malformed_start, malformed_users = 1, 1
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["pending"]["seq_from"] = malformed_start
+    malformed["archive"]["review"]["pending"]["users"] = malformed_users
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+@pytest.mark.asyncio
+async def test_periodic_pending_cannot_cross_the_first_close_checkpoint(tmp_path: Path) -> None:
+    conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(58, 74)))
+    retained = tuple((seq, True) for seq in range(50, 74))
+    archive = _archive(
+        next_seq=74,
+        settled=16,
+        cursor=73,
+        review=ReviewProgress(
+            users=24,
+            pending=ReviewRange("conv", 0, 50, 73, 24, False),
+            close_targets=(73,),
+            rows=retained,
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    before = json.loads(valid)
+    before["archive"]["review"]["pending"]["seq_through"] = 72
+    before["archive"]["review"]["pending"]["users"] = 23
+    assert _parse(json.dumps(before).encode()) is not None
+    path = tmp_path / "tail.json"
+    run_record_module.write_run_record(path, valid)
+    writer = _writer(path)
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    try:
+        periodic = await asyncio.wait_for(writer.next_review(10), 2)
+        assert periodic == archive.review.pending
+        assert writer.acknowledge_review(periodic)
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.closing) == (50, 73, True)
+        assert writer.acknowledge_review(closing)
+    finally:
+        await writer.close()
+
+    # A restored periodic ACK crossing target 60 would move the actual review
+    # cursor to 73, leaving an older close checkpoint without a forward range.
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["close_targets"] = [60]
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+@pytest.mark.parametrize(
+    ("review_cursor", "target", "canonical"),
+    [
+        pytest.param(50, 74, 27, id="prior-actual-row"),
+        pytest.param(None, 24, 1, id="no-prior-row"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_empty_closing_replay_start_is_exact(
+    tmp_path: Path, review_cursor: int | None, target: int, canonical: int
+) -> None:
+    conversation = _rows(("user", "Later", False))
+    pending = ReviewRange("conv", 0, canonical, target, int(review_cursor is not None), True)
+    archive = _archive(
+        next_seq=target + 2,
+        settled=1,
+        cursor=target + 1,
+        review=ReviewProgress(
+            cursor=review_cursor,
+            users=1 + int(review_cursor is not None),
+            reviewed_users=int(review_cursor is not None),
+            pending=pending,
+            close_targets=(target,),
+            rows=((target + 1, True),),
+        ),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    for wrong_start in (canonical - 1, canonical + 1):
+        malformed = json.loads(valid)
+        malformed["archive"]["review"]["pending"]["seq_from"] = wrong_start
+        assert _parse(json.dumps(malformed).encode()) is None
+    if review_cursor is None:
+        path = tmp_path / "tail.json"
+        run_record_module.write_run_record(path, valid)
+        writer = _writer(path)
+        await writer.open(ConversationContextStore(on_change=writer.update))
+        try:
+            planning = asyncio.create_task(writer.next_review(10))
+            try:
+                await _until(lambda: writer._review.close_targets == ())
+            finally:
+                planning.cancel()
+                await asyncio.gather(planning, return_exceptions=True)
+            assert writer._review.pending is None
+            assert not writer._review.close_reviewed
+            assert writer._review.rows == ((target + 1, True),)
+        finally:
+            await writer.close()
+
+
+def test_a_close_checkpoint_cannot_precede_the_review_cursor() -> None:
+    conversation = _rows(("user", "Q100", False))
+    archive = _archive(
+        next_seq=101,
+        settled=1,
+        cursor=100,
+        review=ReviewProgress(cursor=100, users=1, reviewed_users=1, close_targets=(100,)),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["close_targets"] = [1]
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+def test_reviewed_user_count_cannot_exceed_review_cursor_span() -> None:
+    conversation = _rows()
+    archive = _archive(
+        next_seq=100,
+        cursor=99,
+        review=ReviewProgress(cursor=0, users=1, reviewed_users=1),
+    )
+    valid = voice_tail_bytes(conversation, archive)
+    assert _parse(valid) == VoiceTail(conversation, archive)
+    at_boundary = _archive(
+        next_seq=100,
+        cursor=99,
+        review=ReviewProgress(cursor=99, users=100, reviewed_users=100),
+    )
+    assert _parse(voice_tail_bytes(conversation, at_boundary)) == VoiceTail(
+        conversation, at_boundary
+    )
+    malformed = json.loads(valid)
+    malformed["archive"]["review"]["users"] = 100
+    malformed["archive"]["review"]["reviewed_users"] = 100
+    assert _parse(json.dumps(malformed).encode()) is None
+
+
+@pytest.mark.asyncio
+async def test_restored_completed_close_survives_until_new_live_activity(tmp_path: Path) -> None:
+    conversation = _rows(("user", "Earlier", False))
+    archive = _archive(
+        next_seq=1,
+        settled=1,
+        cursor=0,
+        review=ReviewProgress(cursor=0, users=1, reviewed_users=1, close_reviewed=True),
+    )
+    path = tmp_path / "tail.json"
+    run_record_module.write_run_record(path, voice_tail_bytes(conversation, archive))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        assert writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == ()
+        store.record_user_transcript(Transcript(text="Later", final=True))
+        assert not writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+    finally:
+        await writer.close()
 
 
 def test_a_version_one_tail_parses_without_an_archive_so_it_migrates() -> None:
@@ -207,9 +452,7 @@ def _row_document(**overrides: object) -> bytes:
         pytest.param(
             json.dumps({"messages": [], "prior_work": False}).encode(), id="missing-version"
         ),
-        pytest.param(
-            json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"
-        ),
+        pytest.param(json.dumps({"messages": [], "version": 1}).encode(), id="missing-prior-work"),
         pytest.param(_document(prior_work=0), id="prior-work-not-a-boolean"),
         pytest.param(_document(version=2), id="version-two-without-an-archive"),
         pytest.param(_document(version=3), id="unknown-version"),
@@ -250,10 +493,22 @@ def _v2(archive: dict[str, object] | None = None, **overrides: object) -> bytes:
         "generation": 0,
         "next_seq": 3,
         "outbox": [
-            {"gap_before": None, "interrupted": False, "role": "user", "seq": 1,
-             "text": "Hi", "ts": 1.0},
-            {"gap_before": None, "interrupted": True, "role": "assistant", "seq": 2,
-             "text": "Cut", "ts": 2.0},
+            {
+                "gap_before": None,
+                "interrupted": False,
+                "role": "user",
+                "seq": 1,
+                "text": "Hi",
+                "ts": 1.0,
+            },
+            {
+                "gap_before": None,
+                "interrupted": True,
+                "role": "assistant",
+                "seq": 2,
+                "text": "Cut",
+                "ts": 2.0,
+            },
         ],
         "settled": 1,
     }
@@ -269,7 +524,11 @@ def _v2(archive: dict[str, object] | None = None, **overrides: object) -> bytes:
 
 def _outbox_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
-        "gap_before": None, "interrupted": False, "role": "user", "seq": 1, "text": "Hi",
+        "gap_before": None,
+        "interrupted": False,
+        "role": "user",
+        "seq": 1,
+        "text": "Hi",
         "ts": 1.0,
     }
     row.update(overrides)
@@ -709,9 +968,7 @@ async def test_a_failed_final_write_backs_off_fully_and_retries_before_close_ret
     writer.update(_rows(("assistant", "Final", True)))
 
     await asyncio.wait_for(writer.close(), timeout=2)
-    assert [_conversation(data) for data in writes.written] == [
-        _rows(("assistant", "Final", True))
-    ]
+    assert [_conversation(data) for data in writes.written] == [_rows(("assistant", "Final", True))]
     assert [_conversation(data) for data in writes.written] == [_rows(("assistant", "Final", True))]
     assert delays[0] == 0.05
     # Close never cuts the backoff short.
@@ -871,9 +1128,7 @@ def _archiver(path: Path, **kwargs: object) -> VoiceTailWriter:
     return VoiceTailWriter(path, **options)  # type: ignore[arg-type]
 
 
-async def _opened(
-    path: Path, **kwargs: object
-) -> tuple[VoiceTailWriter, ConversationContextStore]:
+async def _opened(path: Path, **kwargs: object) -> tuple[VoiceTailWriter, ConversationContextStore]:
     writer = _archiver(path, **kwargs)
     store = ConversationContextStore(max_messages=16, max_item_chars=64, on_change=writer.update)
     await writer.open(store)
@@ -884,7 +1139,13 @@ def _say(store: ConversationContextStore, text: str) -> None:
     store.record_user_transcript(Transcript(text=text, final=True))
 
 
-def _reply(store: ConversationContextStore, text: str, *, interrupted: bool = False) -> None:
+def _reply(
+    store: ConversationContextStore,
+    text: str,
+    *,
+    interrupted: bool = False,
+    unsettled: bool = False,
+) -> None:
     from hermes_realtime.conversation import AssistantSegmentKey
     from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk
 
@@ -900,6 +1161,8 @@ def _reply(store: ConversationContextStore, text: str, *, interrupted: bool = Fa
     ledger.queue(chunk, admission=admission)
     confirmation = ledger.mark_delivered_confirmed(ledger.mark_started("turn_tail", "chunk_tail"))
     store.record_assistant_delivery(admission=admission, ledger=ledger, confirmation=confirmation)
+    if unsettled:
+        return
     if interrupted:
         store.mark_assistant_segment_interrupted(segment)
     else:
@@ -911,10 +1174,32 @@ def _shape(rows: tuple[OutboxRow, ...]) -> list[tuple[int, str, str, bool, objec
 
 
 async def _written(path: Path, writer: VoiceTailWriter) -> ArchiveOutbox:
-    """The archive the file holds once the writer has nothing left to write."""
-    await _until(lambda: not writer._dirty and path.exists())
-    await asyncio.sleep(0.02)
+    """The archive the file holds after this version's write completes."""
+    target = writer._version
+    await _until(lambda: writer._written_version >= target and path.exists())
     return _outbox(path.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_written_receipt_waits_for_held_atomic_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = _GatedWrites(monkeypatch)
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "seed")
+        assert (await _written(path, writer)).rows[0].text == "seed"
+        writes.release.clear()
+        _say(store, "one")
+        receipt = asyncio.create_task(_written(path, writer))
+        await asyncio.to_thread(writes.started.wait, 2)
+        assert not receipt.done()
+        writes.release.set()
+        assert (await asyncio.wait_for(receipt, 2)).rows[-1].text == "one"
+    finally:
+        writes.release.set()
+        await writer.close()
 
 
 @pytest.mark.asyncio
@@ -982,9 +1267,7 @@ async def test_a_row_is_eligible_only_after_a_completed_write_holds_it(
         writes.release.set()
         result = await asyncio.wait_for(batch, timeout=2)
         assert _shape(result.rows) == [(0, "user", "Durable first", False, None)]
-        assert any(
-            _outbox(data).rows and _outbox(data).frozen == 0 for data in writes.written
-        )
+        assert any(_outbox(data).rows and _outbox(data).frozen == 0 for data in writes.written)
     finally:
         await writer.close()
 
@@ -1087,6 +1370,398 @@ async def test_overflow_discards_unsent_rows_up_to_the_next_user_row_as_its_gap(
         assert "Q2" not in output and "A3" not in output
     finally:
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_review_ends_at_checkpoint_even_when_its_outbox_row_was_dropped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        _say(store, "Q1")
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+        for index in range(2, 6):
+            _say(store, f"Q{index}")
+        assert [row.seq for row in writer._outbox] == [2, 3, 4, 5]
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 1)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+
+        request = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (request.seq_from, request.seq_through, request.closing) == (0, 1, True)
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == request
+        assert writer.acknowledge_review(request)
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+
+@pytest.mark.parametrize("target", [1, 30], ids=["short-gap", "long-gap"])
+@pytest.mark.asyncio
+async def test_dropped_close_target_after_periodic_review_restarts_without_claiming_later_users(
+    tmp_path: Path, target: int
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (periodic.seq_from, periodic.seq_through, periodic.users, periodic.closing) == (
+            0,
+            0,
+            1,
+            False,
+        )
+        assert writer.acknowledge_review(periodic)
+
+        for index in range(1, target + 1):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        for index in range(target + 1, target + 5):
+            _say(store, f"Q{index}")
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, target)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            0,
+            target,
+            1,
+            True,
+        )
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == closing
+    finally:
+        await writer.close()
+
+    restored = _archiver(path, max_outbox_rows=4, max_batch_rows=3)
+    await restored.open(ConversationContextStore(on_change=restored.update))
+    try:
+        assert await asyncio.wait_for(restored.next_review(1), 2) == closing
+        assert restored.acknowledge_review(closing)
+        assert restored._review.close_targets == ()
+        next_periodic = await asyncio.wait_for(restored.next_review(1), 2)
+        assert (next_periodic.seq_from, next_periodic.seq_through, next_periodic.users) == (
+            target + 1,
+            target + 1,
+            2,
+        )
+        assert not next_periodic.closing
+    finally:
+        await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_dropped_first_close_target_is_skipped_without_blocking_later_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        writer.request_review_close()
+        before_archive = asyncio.create_task(writer.next_review(10))
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert writer._review.close_targets == (0,)
+            assert writer._review.pending is None
+        finally:
+            before_archive.cancel()
+            await asyncio.gather(before_archive, return_exceptions=True)
+        for index in range(1, 5):
+            _say(store, f"Q{index}")
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert batch.rows[0].gap_before == (0, 0)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        planning = asyncio.create_task(writer.next_review(10))
+        try:
+            await _until(lambda: writer._review.close_targets == ())
+        finally:
+            planning.cancel()
+            await asyncio.gather(planning, return_exceptions=True)
+        assert writer._review.pending is None
+        assert writer._review.cursor is None
+        assert writer._review.reviewed_users == 0
+        assert not writer._review.close_reviewed
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.close_targets == ()
+        assert archive.review.pending is None
+        assert [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[voice-review-close] ")
+        ] == ['[voice-review-close] {"refusal":"empty_window","version":1}']
+
+        writer.request_review_close()
+        assert writer._review.close_targets == (4,)
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            1,
+            4,
+            4,
+            True,
+        )
+        assert writer.acknowledge_review(closing)
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_restored_empty_closing_pending_is_reconciled_without_losing_later_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    conversation = _rows(*(("user", f"Q{index}", False) for index in range(5)))
+    stale = ReviewRange("conv", 0, 0, 0, 0, True)
+    archive = _archive(
+        next_seq=5,
+        settled=5,
+        cursor=3,
+        rows=(OutboxRow(4, "user", "Q4", False, 1.0),),
+        review=ReviewProgress(
+            users=3,
+            pending=stale,
+            close_targets=(0,),
+            rows=((1, True), (2, True), (3, True)),
+        ),
+    )
+    raw = voice_tail_bytes(conversation, archive)
+    assert _parse(raw) == VoiceTail(conversation, archive)
+    run_record_module.write_run_record(path, raw)
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        assert writer.conversation_id == "conv"
+        assert len(store.durable_view().messages) == 5
+        planning = asyncio.create_task(writer.next_review(10))
+        try:
+            await _until(lambda: writer._review.close_targets == ())
+        finally:
+            planning.cancel()
+            await asyncio.gather(planning, return_exceptions=True)
+        assert writer._review.pending is None
+        assert writer._review.reviewed_users == 0
+        assert not writer._review.close_reviewed
+        assert (await _written(path, writer)).review is not None
+
+        writer.request_review_close()
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+            1,
+            4,
+            4,
+            True,
+        )
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_trailing_gap_closes_replay_the_last_actual_archived_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=4, max_batch_rows=3)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert writer.acknowledge_review(periodic)
+        assert writer._review.cursor == 0
+
+        for index in range(1, 101):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        for index in range(101, 201):
+            _say(store, f"Q{index}")
+        writer.request_review_close()
+        assert writer._review.close_targets == (100, 200)
+        for index in range(201, 205):
+            _say(store, f"Q{index}")
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 200)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+
+        for target in (100, 200):
+            closing = await asyncio.wait_for(writer.next_review(1), 2)
+            assert (closing.seq_from, closing.seq_through, closing.users, closing.closing) == (
+                0,
+                target,
+                1,
+                True,
+            )
+            assert (await _written(path, writer)).review is not None
+            assert writer.acknowledge_review(closing)
+            assert writer._review.cursor == 0
+        assert writer._review.close_targets == ()
+        later_periodic = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (later_periodic.seq_from, later_periodic.seq_through, later_periodic.users) == (
+            201,
+            201,
+            2,
+        )
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_trailing_unarchivable_gap_does_not_requeue_a_completed_close(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    timestamps = iter((5.0, float("inf")))
+    writer, store = await _opened(path, clock=lambda: next(timestamps))
+    try:
+        _say(store, "Q0")
+        _reply(store, "A1")
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        assert writer._next_seq == 2 and writer._cursor == 0
+        assert writer._gap == (1, 1)
+        writer.request_review_close()
+        closing = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (closing.seq_from, closing.seq_through, closing.closing) == (0, 0, True)
+        assert writer.acknowledge_review(closing)
+        assert writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+    restored = _archiver(path)
+    restored_store = ConversationContextStore(on_change=restored.update)
+    await restored.open(restored_store)
+    try:
+        assert restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == ()
+        _say(restored_store, "Q2")
+        assert not restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == (2,)
+        later = await asyncio.wait_for(restored.next_batch(), 2)
+        assert later.rows[0].gap_before == (1, 1)
+        assert restored.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        final = await asyncio.wait_for(restored.next_review(10), 2)
+        assert (final.seq_from, final.seq_through, final.users, final.closing) == (
+            2, 2, 2, True
+        )
+        assert restored.acknowledge_review(final)
+        assert restored._review.close_reviewed
+    finally:
+        await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_new_archivable_row_before_close_ack_requires_a_later_close(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        writer.request_review_close()
+        first_close = await asyncio.wait_for(writer.next_review(10), 2)
+        assert first_close.seq_through == 0 and first_close.closing
+
+        _say(store, "Q1")
+        assert writer.acknowledge_review(first_close)
+        assert not writer._review.close_reviewed
+        writer.request_review_close()
+        assert writer._review.close_targets == (1,)
+        later = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        second_close = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (second_close.seq_from, second_close.seq_through, second_close.users) == (
+            1, 1, 2
+        )
+        assert second_close.closing
+        assert writer.acknowledge_review(second_close)
+        assert writer._review.close_reviewed
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_unsettled_row_before_close_ack_is_reviewed_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path)
+    try:
+        _say(store, "Q0")
+        first = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            first.conversation_id, first.generation, first.seq_from, first.seq_through
+        )
+        writer.request_review_close()
+        first_close = await asyncio.wait_for(writer.next_review(10), 2)
+        _reply(store, "A1", unsettled=True)
+        assert writer._latest.unsettled == 1
+        assert writer.acknowledge_review(first_close)
+        assert not writer._review.close_reviewed
+    finally:
+        await writer.close()
+
+    restored = _archiver(path)
+    restored_store = ConversationContextStore(on_change=restored.update)
+    await restored.open(restored_store)
+    try:
+        assert restored._outbox[-1].seq == 1
+        assert not restored._review.close_reviewed
+        restored.request_review_close()
+        assert restored._review.close_targets == (1,)
+        later = await asyncio.wait_for(restored.next_batch(), 2)
+        assert restored.acknowledge(
+            later.conversation_id, later.generation, later.seq_from, later.seq_through
+        )
+        second_close = await asyncio.wait_for(restored.next_review(10), 2)
+        assert (second_close.seq_from, second_close.seq_through, second_close.closing) == (
+            1, 1, True
+        )
+        assert restored.acknowledge_review(second_close)
+        assert restored._review.close_reviewed
+    finally:
+        await restored.close()
 
 
 @pytest.mark.asyncio

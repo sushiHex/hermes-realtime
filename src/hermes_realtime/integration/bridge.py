@@ -20,12 +20,16 @@ from hermes_realtime.protocol import (
     BRIDGE_PROTOCOL_VERSION,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
+    VOICE_REVIEW_CAPABILITY,
     ControlCancelAcknowledgedEvent,
     ControlCancelEvent,
     ProtocolEvent,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    VoiceReviewRefusedEvent,
     WorkCompletedEvent,
     WorkDispatchAcknowledgedEvent,
     WorkDispatchRequestedEvent,
@@ -43,6 +47,7 @@ _MAX_LINE_BYTES = 64 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _HELLO_FIELDS = frozenset({"token", "participant_id", "protocol_version", "capabilities"})
 _WELCOME_FIELDS = frozenset({"ok", "protocol_version", "capabilities"})
+_REVIEW_WELCOME_FIELDS = _WELCOME_FIELDS | {"review_interval"}
 _HELLO_MARKER = "[hermes-bridge-hello] "
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,13 @@ class VoiceArchiveHandler(Protocol):
     async def archive(
         self, event: VoiceArchiveEvent
     ) -> VoiceArchiveAckEvent | VoiceArchiveRefusedEvent | None: ...
+
+    @property
+    def review_interval(self) -> int | None: ...
+
+    async def review(
+        self, event: VoiceReviewEvent
+    ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None: ...
 
 
 def _capabilities(value: object) -> frozenset[str] | None:
@@ -144,8 +156,18 @@ class LocalHermesBridgeServer:
         self._shutdown_timeout = shutdown_timeout
         # The bridge starts only once its companion is ready, so it offers what it holds.
         self._voice = voice
+        interval = getattr(voice, "review_interval", None)
+        if interval is not None and (type(interval) is not int or not 1 <= interval <= 1000):
+            raise ValueError("review interval must be an exact integer from 1 to 1000")
+        self._review_interval: int | None = interval
         self._offered = (
-            frozenset({VOICE_ARCHIVE_CAPABILITY}) if voice is not None else frozenset()
+            frozenset({VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY})
+            if voice is not None
+            and interval is not None
+            and callable(getattr(voice, "review", None))
+            else frozenset({VOICE_ARCHIVE_CAPABILITY})
+            if voice is not None
+            else frozenset()
         )
         self._server: asyncio.Server | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -157,9 +179,9 @@ class LocalHermesBridgeServer:
         self._routes: dict[str, _Route] = {}
         self._connections: set[_Connection] = set()
         self._handler_tasks: set[asyncio.Task[None]] = set()
-        self._pending: OrderedDict[
-            str, tuple[WorkTerminalStatus | str, str | None, str | None]
-        ] = OrderedDict()
+        self._pending: OrderedDict[str, tuple[WorkTerminalStatus | str, str | None, str | None]] = (
+            OrderedDict()
+        )
         self._terminal_runs: OrderedDict[str, None] = OrderedDict()
         self._completing_runs: set[str] = set()
         self._state_lock = asyncio.Lock()
@@ -305,8 +327,7 @@ class LocalHermesBridgeServer:
                     self._authoritative_ingress.discard(unrelated_run_id)
             elif (
                 sum(
-                    run_id not in active_run_ids
-                    and run_id not in self._authoritative_ingress
+                    run_id not in active_run_ids and run_id not in self._authoritative_ingress
                     for run_id in self._completion_ingress
                 )
                 >= self._max_pending_completions
@@ -432,8 +453,7 @@ class LocalHermesBridgeServer:
                     self._pending.move_to_end(run_id)
                     while (
                         sum(
-                            pending_run_id not in active_run_ids
-                            for pending_run_id in self._pending
+                            pending_run_id not in active_run_ids for pending_run_id in self._pending
                         )
                         > self._max_pending_completions
                     ):
@@ -528,7 +548,7 @@ class LocalHermesBridgeServer:
             )
             while raw := await reader.readline():
                 if _event_type(raw) in VOICE_EVENT_TYPES:
-                    await self._archive_voice(connection, negotiated, raw)
+                    await self._route_voice(connection, negotiated, raw)
                     continue
                 event = parse_event(raw)
                 pending = None
@@ -658,31 +678,38 @@ class LocalHermesBridgeServer:
                 print(_HELLO_MARKER + evidence, flush=True)
         assert requested is not None  # Refused above otherwise.
         negotiated = requested & self._offered
-        await self._send_json(
-            connection,
-            {
-                "ok": True,
-                "protocol_version": BRIDGE_PROTOCOL_VERSION,
-                "capabilities": sorted(negotiated),
-            },
-        )
+        welcome: dict[str, object] = {
+            "ok": True,
+            "protocol_version": BRIDGE_PROTOCOL_VERSION,
+            "capabilities": sorted(negotiated),
+        }
+        if VOICE_REVIEW_CAPABILITY in negotiated:
+            welcome["review_interval"] = self._review_interval
+        await self._send_json(connection, welcome)
         return participant_id, negotiated
 
-    async def _archive_voice(
+    async def _route_voice(
         self, connection: _Connection, negotiated: frozenset[str], raw: bytes
     ) -> None:
-        """Answer one voice batch; an unknown outcome closes the connection unanswered."""
+        """Answer private voice traffic without routing it to work or speech."""
 
         voice = self._voice
-        if voice is None or VOICE_ARCHIVE_CAPABILITY not in negotiated:
-            raise BridgeProtocolError("voice_archive was not negotiated on this connection")
         event = parse_voice_event(raw)
-        if type(event) is not VoiceArchiveEvent:
-            raise BridgeProtocolError("the companion accepts only voice_archive requests")
+        if voice is None:
+            raise BridgeProtocolError("voice capability was not negotiated")
         async with connection.event_lock:
-            reply = await voice.archive(event)
+            reply: (
+                VoiceArchiveAckEvent | VoiceArchiveRefusedEvent
+                | VoiceReviewAckEvent | VoiceReviewRefusedEvent | None
+            )
+            if type(event) is VoiceArchiveEvent and VOICE_ARCHIVE_CAPABILITY in negotiated:
+                reply = await voice.archive(event)
+            elif type(event) is VoiceReviewEvent and VOICE_REVIEW_CAPABILITY in negotiated:
+                reply = await voice.review(event)
+            else:
+                raise BridgeProtocolError("voice request was not negotiated")
             if reply is None:
-                raise BridgeProtocolError("the archive outcome is unknown")
+                raise BridgeProtocolError("the voice outcome is unknown")
             await self._send_bytes(connection, reply.model_dump_json().encode("utf-8") + b"\n")
 
     async def _send_bound(self, route: _Route, event: ProtocolEvent) -> bool:
@@ -746,11 +773,16 @@ class LocalHermesBridgeClient:
         self._writer = writer
         self._write_lock = asyncio.Lock()
         self._capabilities: frozenset[str] = frozenset()
+        self._review_interval: int | None = None
 
     @property
     def capabilities(self) -> frozenset[str]:
         """The capabilities the companion advertised to this connection."""
         return self._capabilities
+
+    @property
+    def review_interval(self) -> int | None:
+        return self._review_interval
 
     @classmethod
     async def connect(
@@ -783,19 +815,27 @@ class LocalHermesBridgeClient:
                 }
             )
             response = json.loads(await reader.readline())
+            fields = set(response) if type(response) is dict else set()
             offered = (
                 _capabilities(response["capabilities"])
-                if type(response) is dict and set(response) == _WELCOME_FIELDS
+                if fields in (_WELCOME_FIELDS, _REVIEW_WELCOME_FIELDS)
                 else None
             )
+            interval = response.get("review_interval") if type(response) is dict else None
             if (
                 offered is None
                 or response["ok"] is not True
                 or response["protocol_version"] != BRIDGE_PROTOCOL_VERSION
                 or not offered <= requested
+                or (VOICE_REVIEW_CAPABILITY in offered) != (fields == _REVIEW_WELCOME_FIELDS)
+                or (
+                    VOICE_REVIEW_CAPABILITY in offered
+                    and (type(interval) is not int or not 1 <= interval <= 1000)
+                )
             ):
                 raise BridgeAuthenticationError("bridge authentication failed")
             client._capabilities = offered
+            client._review_interval = interval
             return client
         except Exception:
             await client.close()
@@ -825,6 +865,27 @@ class LocalHermesBridgeClient:
         reply = parse_voice_event(raw)
         if not isinstance(reply, (VoiceArchiveAckEvent, VoiceArchiveRefusedEvent)):
             raise BridgeProtocolError("the companion answered with a request")
+        return reply
+
+    async def review(
+        self, event: VoiceReviewEvent
+    ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent:
+        if VOICE_REVIEW_CAPABILITY not in self._capabilities:
+            raise BridgeProtocolError("the companion did not advertise voice review")
+        if type(event) is not VoiceReviewEvent:
+            raise TypeError("event must be an exact VoiceReviewEvent")
+        payload = event.model_dump_json().encode("utf-8") + b"\n"
+        if len(payload) > _MAX_LINE_BYTES:
+            raise BridgeProtocolError("Hermes bridge event exceeds the line limit")
+        async with self._write_lock:
+            self._writer.write(payload)
+            await self._writer.drain()
+        raw = await self._reader.readline()
+        if not raw:
+            raise BridgeProtocolError("the companion closed before answering")
+        reply = parse_voice_event(raw)
+        if not isinstance(reply, (VoiceReviewAckEvent, VoiceReviewRefusedEvent)):
+            raise BridgeProtocolError("the companion answered with another voice event")
         return reply
 
     async def __aenter__(self) -> Self:
@@ -871,7 +932,5 @@ class LocalHermesBridgeClient:
 
     async def _send_json(self, value: object) -> None:
         async with self._write_lock:
-            self._writer.write(
-                json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n"
-            )
+            self._writer.write(json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n")
             await self._writer.drain()

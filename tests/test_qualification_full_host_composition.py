@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -198,3 +200,83 @@ class _Collector:
 
     def record_foreground_cleanup(self, *, succeeded: bool) -> None:
         del succeeded
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_awaits_review_before_closing_voice_senders(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from hermes_realtime import host_launcher
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    events: list[str] = []
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeWriter:
+        def __init__(self, path: Path) -> None:
+            assert path == tmp_path / "voice-tail.json"
+
+        def update(self, view: object) -> None:
+            del view
+
+        async def wait_review_close(self, *, timeout: float) -> bool:
+            assert timeout == 5.0
+            events.append("review settle started")
+            waiting.set()
+            await release.wait()
+            events.append("review settle finished")
+            return True
+
+        async def close(self) -> None:
+            events.append("tail closed")
+
+    class FakeArchiveSender:
+        def __init__(self, writer: object, connect: object) -> None:
+            del writer, connect
+
+        async def close(self) -> None:
+            events.append("archive sender closed")
+
+    class FakeReviewSender:
+        def __init__(self, writer: object, connect: object, *, idle_allowed: object) -> None:
+            del writer, connect, idle_allowed
+
+        async def close(self) -> None:
+            events.append("review sender closed")
+
+    class Provider:
+        async def close(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(host_launcher, "VoiceTailWriter", FakeWriter)
+    monkeypatch.setattr(host_launcher, "VoiceArchiveSender", FakeArchiveSender)
+    monkeypatch.setattr(host_launcher, "VoiceReviewSender", FakeReviewSender)
+
+    monkeypatch.setattr(host_launcher, "_build_streaming_inference", lambda **_: Provider())
+    monkeypatch.setattr(host_launcher, "_build_synthesizer", lambda **_: Provider())
+    monkeypatch.setattr(host_launcher, "_build_streaming_transcriber", lambda **_: Provider())
+    monkeypatch.setattr(host_launcher, "SileroSpeechPresenceVerifier", Provider)
+    monkeypatch.setattr(host_launcher, "WebRtcVoiceActivityDetector", Provider)
+    launcher = host_launcher.build_local_host_launcher(
+        hermes_api_bearer="x" * 32,
+        allow_unsandboxed_tasks=True,
+        voice_tail=tmp_path / "voice-tail.json",
+        voice_companion=CompanionEndpoint(port=7000, token="x" * 24),
+    )
+    launcher._start_attempted = True
+    closing = asyncio.create_task(launcher.close())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        assert "archive sender closed" not in events
+        assert "review sender closed" not in events
+        assert "tail closed" not in events
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 2)
+    assert events.index("review settle finished") < events.index("archive sender closed")
+    assert events.index("archive sender closed") < events.index("review sender closed")
+    assert events.index("review sender closed") < events.index("tail closed")

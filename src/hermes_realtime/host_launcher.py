@@ -102,6 +102,11 @@ from hermes_realtime.integration import (
     HermesRestartSettlement,
 )
 from hermes_realtime.integration.voice_archive import VoiceArchiveSender, bridge_connector
+from hermes_realtime.integration.voice_review import (
+    VoiceReviewSender,
+    review_connector,
+    review_idle_allowed,
+)
 from hermes_realtime.integration.voice_tail import VoiceTailWriter
 from hermes_realtime.launcher import (
     ConversationOnlyTaskSession,
@@ -2100,6 +2105,22 @@ def build_local_host_launcher(
         if voice_tail_writer is not None and voice_companion is not None
         else None
     )
+    voice_review_sender = (
+        VoiceReviewSender(
+            voice_tail_writer,
+            review_connector(
+                host="127.0.0.1", port=voice_companion.port, token=voice_companion.token
+            ),
+            idle_allowed=lambda: review_idle_allowed(
+                speech_active=(
+                    not completion_floor_available() or actions.reserved_operation_count > 0
+                ),
+                foreground_tasks=foreground.active_task_count,
+            ),
+        )
+        if voice_tail_writer is not None and voice_companion is not None
+        else None
+    )
     context = ConversationContextStore(
         on_change=voice_tail_writer.update if voice_tail_writer is not None else None,
     )
@@ -2625,6 +2646,8 @@ def build_local_host_launcher(
             await voice_tail_writer.open(context)
         if voice_archive_sender is not None:
             voice_archive_sender.start()
+        if voice_review_sender is not None:
+            voice_review_sender.start()
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2717,6 +2740,11 @@ def build_local_host_launcher(
                 await runtime.close()
             except BaseException as error:
                 errors.append(error)
+            if voice_review_sender is not None and voice_tail_writer is not None:
+                try:
+                    await voice_tail_writer.wait_review_close(timeout=5.0)
+                except BaseException as error:
+                    errors.append(error)
             if len(errors) == 1:
                 raise errors[0]
             if errors:
@@ -2733,6 +2761,7 @@ def build_local_host_launcher(
             # After the runtime closed actions and speech, so the final flag is written.
             # Before the tail, so no acknowledgment races its final write.
             *((voice_archive_sender,) if voice_archive_sender is not None else ()),
+            *((voice_review_sender,) if voice_review_sender is not None else ()),
             *((voice_tail_writer,) if voice_tail_writer is not None else ()),
             *((knowledge_coordinator,) if knowledge_coordinator is not None else ()),
             synthesizer,

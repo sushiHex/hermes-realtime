@@ -564,6 +564,115 @@ async def test_session_worker_routes_endpointed_audio_to_foreground_response() -
     assert transcriber.cancel_calls == 1
 
 
+@pytest.mark.parametrize("ending", ["endpoint", "binding_close"])
+@pytest.mark.asyncio
+async def test_voice_activity_ends_on_endpoint_or_binding_teardown(ending: str) -> None:
+    executor, _, _ = action_executor_probe()
+    activity: list[bool] = []
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=1,
+        vad=ScriptedVad(VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED),
+        stt=NoSpeechTranscriber(),
+        actions=executor,
+        on_voice_activity=activity.append,
+    )
+    worker.start()
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    await worker.receive_audio("browser_user", 1, frame)
+    assert activity == [True]
+    if ending == "endpoint":
+        await worker.receive_audio("browser_user", 1, frame)
+    await worker.close_binding()
+    await worker.close_binding()
+    assert activity == [True, False]
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_binding_cannot_clear_successor_voice_activity() -> None:
+    executor, _, _ = action_executor_probe()
+    activity: list[bool] = []
+    bindings: list[ConversationSessionWorker] = []
+
+    def binding_factory(
+        participant_identity: str,
+        generation: int,
+        actions: ConversationUpdateExecutor,
+    ) -> ConversationSessionWorker:
+        binding = ConversationSessionWorker(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            vad=ScriptedVad(VoiceActivity.SPEECH_STARTED),
+            stt=NoSpeechTranscriber(),
+            actions=actions,
+            on_voice_activity=activity.append,
+        )
+        bindings.append(binding)
+        return binding
+
+    worker = ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    first = await worker.bind("browser_user")
+    await worker.receive_audio("browser_user", first, frame)
+    assert activity == [True]
+    second = await worker.bind("browser_user")
+    assert activity == [True, False]
+    await worker.receive_audio("browser_user", second, frame)
+    assert activity == [True, False, True]
+    bindings[0]._set_voice_activity(False)
+    assert activity == [True, False, True]
+    await worker.close_binding()
+    assert activity == [True, False, True, False]
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_voice_activity_remains_active_until_endpoint_final_is_routed() -> None:
+    executor, _, responses = action_executor_probe()
+    final_started = asyncio.Event()
+    release_final = asyncio.Event()
+    events: list[str] = []
+
+    class PausedFinalTranscriber(NoSpeechTranscriber):
+        async def finish_utterance(self) -> Transcript:
+            final_started.set()
+            await release_final.wait()
+            return Transcript(text="Endpoint final", final=True)
+
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=7,
+        vad=ScriptedVad(),
+        stt=PausedFinalTranscriber(),
+        actions=executor,
+        observer=lambda kind, _data: events.append(kind),
+        on_voice_activity=lambda active: events.append(
+            "voice_active" if active else "voice_idle"
+        ),
+    )
+    worker.start()
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+
+    try:
+        await worker.receive_audio("browser_user", 7, frame)
+        endpoint = asyncio.create_task(worker.receive_audio("browser_user", 7, frame))
+        await asyncio.wait_for(final_started.wait(), timeout=1)
+        assert "voice_idle" not in events
+
+        release_final.set()
+        await endpoint
+        assert events[-1] == "voice_idle"
+        await worker.wait_for_responses()
+        assert events.index("transcript_final") < events.index("voice_idle")
+        assert responses == [
+            ("session_7_turn_1", Transcript(text="Endpoint final", final=True))
+        ]
+    finally:
+        release_final.set()
+        await worker.close()
+
+
 @pytest.mark.asyncio
 async def test_only_endpoint_final_authorizes_one_response() -> None:
     executor, _, responses = action_executor_probe()

@@ -1,4 +1,4 @@
-"""Bridge protocol 0.2: the capability hello and voice archive routing."""
+"""Bridge protocol 0.3: the capability hello and voice archive routing."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ from hermes_realtime.protocol import (
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
     VoiceArchiveRow,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    VoiceReviewRefusedEvent,
 )
 
 _TOKEN = "correct-test-token-with-sufficient-entropy"
@@ -59,17 +62,19 @@ def _server(voice: Any = None) -> LocalHermesBridgeServer:
 
 def _batch(seq_through: int = 1) -> VoiceArchiveEvent:
     return VoiceArchiveEvent(
-        protocol_version="0.2",
+        protocol_version="0.3",
         type="voice_archive",
         conversation_id="conv",
         generation=0,
         seq_from=0,
         seq_through=seq_through,
         rows=[
-            VoiceArchiveRow(seq=0, role="user", text="Hi", interrupted=False, ts=1.0,
-                            gap_before=None),
-            VoiceArchiveRow(seq=1, role="assistant", text="Hello", interrupted=True, ts=2.0,
-                            gap_before=None),
+            VoiceArchiveRow(
+                seq=0, role="user", text="Hi", interrupted=False, ts=1.0, gap_before=None
+            ),
+            VoiceArchiveRow(
+                seq=1, role="assistant", text="Hello", interrupted=True, ts=2.0, gap_before=None
+            ),
         ],
     )
 
@@ -84,7 +89,7 @@ class _Voice:
     ) -> VoiceArchiveAckEvent | VoiceArchiveRefusedEvent | None:
         self.events.append(event)
         fields: dict[str, Any] = {
-            "protocol_version": "0.2",
+            "protocol_version": "0.3",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
             "seq_from": event.seq_from,
@@ -97,6 +102,30 @@ class _Voice:
                 type="voice_archive_refused", category="partition", **fields
             )
         return None
+
+
+class _ReviewVoice(_Voice):
+    review_interval = 10
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reviews: list[VoiceReviewEvent] = []
+
+    async def review(
+        self, event: VoiceReviewEvent
+    ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None:
+        self.reviews.append(event)
+        return VoiceReviewAckEvent(
+            protocol_version="0.3",
+            type="voice_review_ack",
+            conversation_id=event.conversation_id,
+            generation=event.generation,
+            seq_from=event.seq_from,
+            seq_through=event.seq_through,
+            closing=event.closing,
+            review_id="vr_0123456789abcdef0123456789abcdef",
+            status="accepted",
+        )
 
 
 async def _hello(server: LocalHermesBridgeServer, hello: dict[str, object]) -> object:
@@ -113,7 +142,7 @@ def _valid_hello(**overrides: object) -> dict[str, object]:
     hello: dict[str, object] = {
         "token": _TOKEN,
         "participant_id": "voice-archive",
-        "protocol_version": "0.2",
+        "protocol_version": "0.3",
         "capabilities": ["voice_archive"],
     }
     hello.update(overrides)
@@ -124,15 +153,23 @@ def _valid_hello(**overrides: object) -> dict[str, object]:
 async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers_it() -> None:
     async with _server(voice=_Voice()) as offering, _server() as plain:
         offered = await LocalHermesBridgeClient.connect(
-            host=offering.host, port=offering.port, token=_TOKEN,
-            participant_id="voice-archive", capabilities=("voice_archive",),
+            host=offering.host,
+            port=offering.port,
+            token=_TOKEN,
+            participant_id="voice-archive",
+            capabilities=("voice_archive",),
         )
         withheld = await LocalHermesBridgeClient.connect(
-            host=plain.host, port=plain.port, token=_TOKEN,
-            participant_id="voice-archive", capabilities=("voice_archive",),
+            host=plain.host,
+            port=plain.port,
+            token=_TOKEN,
+            participant_id="voice-archive",
+            capabilities=("voice_archive",),
         )
         unasked = await LocalHermesBridgeClient.connect(
-            host=offering.host, port=offering.port, token=_TOKEN,
+            host=offering.host,
+            port=offering.port,
+            token=_TOKEN,
             participant_id="participant_001",
         )
         try:
@@ -151,9 +188,7 @@ async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers
         pytest.param({"token": _TOKEN, "participant_id": "p1"}, id="a-0.1-hello"),
         pytest.param(_valid_hello(protocol_version="0.1"), id="wrong-version"),
         pytest.param(_valid_hello(capabilities=["voice_forget"]), id="unknown-capability"),
-        pytest.param(
-            _valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"
-        ),
+        pytest.param(_valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"),
         pytest.param(_valid_hello(capabilities="voice_archive"), id="capabilities-not-a-list"),
         pytest.param(_valid_hello(extra=1), id="extra-key"),
         pytest.param(_valid_hello(token="wrong-token-wrong-token-wrong"), id="wrong-token"),
@@ -174,7 +209,8 @@ _BRIDGE_MARKER = "[hermes-bridge-hello] "
         pytest.param(_valid_hello(protocol_version="0.1"), "version", id="version"),
         pytest.param(_valid_hello(capabilities=["voice_forget"]), "capability", id="unknown"),
         pytest.param(
-            _valid_hello(capabilities=["voice_archive", "voice_archive"]), "capability",
+            _valid_hello(capabilities=["voice_archive", "voice_archive"]),
+            "capability",
             id="repeated",
         ),
         pytest.param({"token": _TOKEN, "participant_id": "p1"}, "shape", id="shape"),
@@ -203,12 +239,12 @@ async def test_the_welcome_names_the_version_and_the_offered_capabilities() -> N
     async with _server(voice=_Voice()) as server:
         assert await _hello(server, _valid_hello()) == {
             "ok": True,
-            "protocol_version": "0.2",
+            "protocol_version": "0.3",
             "capabilities": ["voice_archive"],
         }
         assert await _hello(server, _valid_hello(capabilities=[])) == {
             "ok": True,
-            "protocol_version": "0.2",
+            "protocol_version": "0.3",
             "capabilities": [],
         }
 
@@ -218,8 +254,11 @@ async def test_voice_archive_is_answered_by_the_companion_without_a_participant_
     voice = _Voice()
     async with _server(voice=voice) as server:
         client = await LocalHermesBridgeClient.connect(
-            host=server.host, port=server.port, token=_TOKEN,
-            participant_id="voice-archive", capabilities=("voice_archive",),
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-archive",
+            capabilities=("voice_archive",),
         )
         try:
             reply = await client.archive(_batch())
@@ -235,11 +274,137 @@ async def test_voice_archive_is_answered_by_the_companion_without_a_participant_
 
 
 @pytest.mark.asyncio
+async def test_review_is_private_and_welcome_binds_verified_interval() -> None:
+    voice = _ReviewVoice()
+    async with _server(voice=voice) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-review",
+            capabilities=("voice_review",),
+        )
+        try:
+            assert client.capabilities == frozenset({"voice_review"})
+            assert client.review_interval == 10
+            event = VoiceReviewEvent(
+                protocol_version="0.3",
+                type="voice_review",
+                conversation_id="conv",
+                generation=0,
+                seq_from=0,
+                seq_through=1,
+                memory=True,
+                skills=True,
+                closing=True,
+            )
+            reply = await client.review(event)
+            assert type(reply) is VoiceReviewAckEvent
+            assert reply.closing
+            assert voice.reviews == [event]
+            assert voice.events == []
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_review_without_negotiated_capability_never_reaches_companion() -> None:
+    voice = _ReviewVoice()
+    async with _server(voice=voice) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-review",
+            capabilities=(),
+        )
+        try:
+            event = VoiceReviewEvent(
+                protocol_version="0.3",
+                type="voice_review",
+                conversation_id="conv",
+                generation=0,
+                seq_from=0,
+                seq_through=0,
+                memory=True,
+                skills=True,
+                closing=False,
+            )
+            with pytest.raises(BridgeProtocolError):
+                await client.review(event)
+            assert voice.reviews == []
+        finally:
+            await client.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_unnegotiated_review_is_rejected_before_service() -> None:
+    voice = _ReviewVoice()
+    async with _server(voice=voice) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(json.dumps(_valid_hello(capabilities=[])).encode() + b"\n")
+        await writer.drain()
+        assert json.loads(await reader.readline())["capabilities"] == []
+        event = VoiceReviewEvent(
+            protocol_version="0.3",
+            type="voice_review",
+            conversation_id="conv",
+            generation=0,
+            seq_from=0,
+            seq_through=0,
+            memory=True,
+            skills=True,
+            closing=False,
+        )
+        writer.write(event.model_dump_json().encode() + b"\n")
+        await writer.drain()
+        assert await reader.readline() == b""
+        writer.close()
+    assert voice.reviews == []
+
+
+@pytest.mark.asyncio
+async def test_client_guard_sends_zero_unnegotiated_review_bytes() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+
+    class Writer:
+        writes = 0
+
+        def write(self, payload: bytes) -> None:
+            del payload
+            self.writes += 1
+
+        async def drain(self) -> None:
+            pass
+
+    writer = Writer()
+    client = LocalHermesBridgeClient(reader, writer)  # type: ignore[arg-type]
+    event = VoiceReviewEvent(
+        protocol_version="0.3",
+        type="voice_review",
+        conversation_id="conv",
+        generation=0,
+        seq_from=0,
+        seq_through=0,
+        memory=True,
+        skills=True,
+        closing=False,
+    )
+    with pytest.raises(BridgeProtocolError):
+        await client.review(event)
+    assert writer.writes == 0
+
+
+@pytest.mark.asyncio
 async def test_an_unknown_outcome_closes_the_connection_without_a_reply() -> None:
     async with _server(voice=_Voice(reply="unknown")) as server:
         client = await LocalHermesBridgeClient.connect(
-            host=server.host, port=server.port, token=_TOKEN,
-            participant_id="voice-archive", capabilities=("voice_archive",),
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-archive",
+            capabilities=("voice_archive",),
         )
         try:
             with pytest.raises(BridgeProtocolError):
@@ -267,8 +432,11 @@ async def test_a_voice_event_without_the_negotiated_capability_closes_the_connec
 async def test_the_client_never_sends_a_voice_event_the_companion_did_not_offer() -> None:
     async with _server() as server:
         client = await LocalHermesBridgeClient.connect(
-            host=server.host, port=server.port, token=_TOKEN,
-            participant_id="voice-archive", capabilities=("voice_archive",),
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-archive",
+            capabilities=("voice_archive",),
         )
         try:
             with pytest.raises(BridgeProtocolError, match="capability"):
@@ -295,14 +463,14 @@ async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
     [
         pytest.param({"ok": True}, id="a-0.1-welcome"),
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": []}, id="wrong-version"
+            {"ok": True, "protocol_version": "0.2", "capabilities": []}, id="wrong-version"
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.2", "capabilities": ["voice_archive"]},
+            {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]},
             id="unrequested-capability",
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.2", "capabilities": [], "x": 1}, id="extra-key"
+            {"ok": True, "protocol_version": "0.3", "capabilities": [], "x": 1}, id="extra-key"
         ),
         pytest.param({"ok": False}, id="refused"),
     ],
@@ -313,4 +481,26 @@ async def test_the_client_refuses_a_welcome_it_did_not_ask_for(welcome: object) 
         with pytest.raises(BridgeAuthenticationError):
             await LocalHermesBridgeClient.connect(
                 host="127.0.0.1", port=port, token=_TOKEN, participant_id="p1"
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", [True, 0, 1.0, 1001])
+async def test_review_welcome_refuses_unverified_interval(interval: object) -> None:
+    server, port = await _fake_companion(
+        {
+            "ok": True,
+            "protocol_version": "0.3",
+            "capabilities": ["voice_review"],
+            "review_interval": interval,
+        }
+    )
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await LocalHermesBridgeClient.connect(
+                host="127.0.0.1",
+                port=port,
+                token=_TOKEN,
+                participant_id="voice-review",
+                capabilities=("voice_review",),
             )
