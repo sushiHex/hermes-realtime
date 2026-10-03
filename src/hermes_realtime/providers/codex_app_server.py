@@ -47,6 +47,7 @@ _MAX_PROTOCOL_LINE_BYTES = 1_048_576
 # A Codex process never serves a turn on a login this close to expiry: it cannot refresh.
 _MIN_SESSION_ACCESS_SECONDS = 3600
 _SESSION_AUTH_REFUSAL_PREFIX = "[codex-session-auth] "
+_TOOL_REFUSAL_PREFIX = "[codex-tool-refusal] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -1639,12 +1640,7 @@ class CodexAppServerStreamingInference:
         for call in self._dynamic_calls.values():
             if call.identity[:2] != (active.thread_id, active.server_id):
                 continue
-            if call.response is None:
-                call.response = self._tool_response(
-                    _NONCOMMITTAL_TOOL_RESULT,
-                    success=False,
-                )
-                call.response_ready.set()
+            self._settle_noncommittal(call, "turn_ended")
             tasks.update(call.response_tasks)
         if tasks:
             await asyncio.gather(
@@ -1916,12 +1912,7 @@ class CodexAppServerStreamingInference:
                         raise TimeoutError("Codex app-server event stream timed out")
                     tasks: set[asyncio.Task[None]] = set()
                     for call in live_calls:
-                        if call.response is None:
-                            call.response = self._tool_response(
-                                _NONCOMMITTAL_TOOL_RESULT,
-                                success=False,
-                            )
-                            call.response_ready.set()
+                        self._settle_noncommittal(call, "deadline")
                         tasks.update(call.response_tasks)
                     if tasks:
                         await asyncio.gather(
@@ -2464,12 +2455,7 @@ class CodexAppServerStreamingInference:
                         timeout=max(0.0, remaining),
                     )
                 except TimeoutError:
-                    if call.response is None:
-                        call.response = self._tool_response(
-                            _NONCOMMITTAL_TOOL_RESULT,
-                            success=False,
-                        )
-                        call.response_ready.set()
+                    self._settle_noncommittal(call, "deadline")
                     await self._send({"id": request_id, "result": call.response})
                     return
             if (
@@ -2536,11 +2522,7 @@ class CodexAppServerStreamingInference:
                                 )
                         call.response_ready.set()
                     else:
-                        call.response = self._tool_response(
-                            _NONCOMMITTAL_TOOL_RESULT,
-                            success=False,
-                        )
-                        call.response_ready.set()
+                        self._settle_noncommittal(call, "deadline")
                 finally:
                     if not response_ready.done():
                         response_ready.cancel()
@@ -2655,6 +2637,25 @@ class CodexAppServerStreamingInference:
         if copied.reason is not None:
             value["reason"] = copied.reason
         return cls._tool_response(value, success=True)
+
+    def _settle_noncommittal(self, call: _DynamicCall, cause: str) -> None:
+        """Answer an unsettled call as pending, recording the refusal exactly once.
+
+        Only the first settlement assigns a response, so competing deadline and turn-end
+        paths cannot answer or record a call twice.
+        """
+        if call.response is not None:
+            return
+        call.response = self._tool_response(_NONCOMMITTAL_TOOL_RESULT, success=False)
+        call.response_ready.set()
+        print(
+            _TOOL_REFUSAL_PREFIX
+            + json.dumps(
+                {"refusal": cause, "tool": call.tool, "version": 1},
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
     @staticmethod
     def _tool_response(value: Mapping[str, object], *, success: bool) -> dict[str, object]:

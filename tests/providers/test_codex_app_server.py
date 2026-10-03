@@ -4279,7 +4279,9 @@ async def test_codex_event_wait_cancellation_does_not_orphan_queue_reader() -> N
 
 
 @pytest.mark.asyncio
-async def test_codex_event_arriving_while_expired_tool_settles_is_delivered() -> None:
+async def test_codex_event_arriving_while_expired_tool_settles_is_delivered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     transport = FakeCodexTransport()
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
@@ -4318,6 +4320,15 @@ async def test_codex_event_arriving_while_expired_tool_settles_is_delivered() ->
             timeout=1,
         )
         assert event is delta
+        # A competing turn-end settlement neither answers nor records the call again.
+        inference._settle_noncommittal(call, "turn_ended")
+        prefix = "[codex-tool-refusal] "
+        markers = [
+            json.loads(line.removeprefix(prefix))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith(prefix)
+        ]
+        assert markers == [{"refusal": "deadline", "tool": "start_work", "version": 1}]
     finally:
         await responder
         inference._dynamic_calls.pop(identity, None)
