@@ -16,12 +16,14 @@ Hermes is imported lazily, inside functions, so importing this module needs no H
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import importlib
 import inspect
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -449,11 +451,17 @@ class HermesArchivePort:
         self._db = _session_db(db)
         self._review_bindings: dict[int, tuple[Any, str]] = {}
         self._failed_parent_closes: list[tuple[Any, threading.Thread, threading.Event]] = []
+        self._rollback_finishes: dict[
+            int, tuple[Any, Any, threading.Thread, threading.Event]
+        ] = {}
+        self._rollback_lock = threading.Lock()
         self._parent_creation_failed = False
 
     def drain_failed_parents(self, timeout: float) -> bool:
         if type(timeout) not in {float, int} or not 0 <= timeout <= 300:
             raise ValueError("invalid parent drain timeout")
+        if not self._drain_rollback_finishes(None, timeout):
+            return False
         for _, worker, _ in self._failed_parent_closes:
             if worker.ident is not None:
                 worker.join(timeout)
@@ -486,6 +494,66 @@ class HermesArchivePort:
         except Exception:
             # The unstarted worker still records ownership for the next drain.
             return
+
+    def _rollback_worker(
+        self, parent: Any, token: Any
+    ) -> tuple[Any, Any, threading.Thread, threading.Event]:
+        succeeded = threading.Event()
+
+        def cleanup() -> None:
+            try:
+                self.finish(parent, token)
+            except BaseException:
+                return
+            succeeded.set()
+
+        worker = threading.Thread(
+            target=cleanup, name="voice-review-rollback-finish", daemon=True,
+        )
+        return parent, token, worker, succeeded
+
+    def _remember_rollback_finish(self, parent: Any, token: Any) -> None:
+        pending = self._rollback_finishes
+        with self._rollback_lock:
+            operation = self._rollback_worker(parent, token)
+            pending[id(token)] = operation
+            # An unstarted worker still retains the token for the next drain.
+            with contextlib.suppress(Exception):
+                operation[2].start()
+
+    def _drain_rollback_finishes(self, parent: Any | None, timeout: float) -> bool:
+        pending = self._rollback_finishes
+        if not pending:
+            return True
+        deadline = time.monotonic() + timeout
+        with self._rollback_lock:
+            keys = tuple(pending)
+        for key in keys:
+            retries = 0
+            while True:
+                with self._rollback_lock:
+                    operation = pending.get(key)
+                if operation is None or (parent is not None and operation[0] is not parent):
+                    break
+                _, token, worker, succeeded = operation
+                if worker.ident is not None:
+                    worker.join(max(0.0, deadline - time.monotonic()))
+                with self._rollback_lock:
+                    if pending.get(key) is not operation:
+                        continue
+                    if worker.is_alive():
+                        return False
+                    if succeeded.is_set():
+                        del pending[key]
+                        break
+                    if retries:
+                        return False
+                    replacement = self._rollback_worker(operation[0], token)
+                    pending[key] = replacement
+                    with contextlib.suppress(Exception):
+                        replacement[2].start()
+                    retries += 1
+        return True
 
     def _runtime_identity(self, runtime: dict[str, Any]) -> list[Any]:
         pool = runtime.get("credential_pool")
@@ -619,6 +687,8 @@ class HermesArchivePort:
         parent._emit_auxiliary_failure = lambda *args, **kwargs: failed()
 
     def close_parent(self, parent: Any) -> None:
+        if not self._drain_rollback_finishes(parent, 5.0):
+            raise ArchiveRefusal("busy")
         if type(parent) is not resolve("run_agent.AIAgent"):
             raise ArchiveRefusal("configuration")
         with self._review_scope():
@@ -701,6 +771,8 @@ class HermesArchivePort:
         release_lease(self._db, session_id, holder)
 
     def close(self) -> None:
+        if not self._drain_rollback_finishes(None, 5.0):
+            raise ArchiveRefusal("busy")
         close_session_db(self._db)
 
     def read_projection(self, session_id: str, cap: int) -> Projection | None:
@@ -875,6 +947,8 @@ class HermesArchivePort:
             raise ArchiveRefusal("busy")
         if record.holder is None:
             raise ArchiveRefusal("lease_lost")
+        if not self._drain_rollback_finishes(parent, 5.0):
+            raise ArchiveRefusal("busy")
         prepare = resolve("agent.background_review.prepare_background_review_run")
         guard = _method(self._db, "SessionDB._check_transcript_write_guards")
         lease_lost = resolve("SessionTurnLeaseLostError")
@@ -939,9 +1013,10 @@ class HermesArchivePort:
             return _method(self._db, "SessionDB._execute_write")(owned_take)  # type: ignore[no-any-return]
         except BaseException:
             if prepared_token is not None:
-                resolve("agent.background_review.finish_background_review_run")(
-                    parent, prepared_token
-                )
+                try:
+                    self.finish(parent, prepared_token)
+                except BaseException:
+                    self._remember_rollback_finish(parent, prepared_token)
             raise
 
     def spawn(

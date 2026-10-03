@@ -994,6 +994,8 @@ async def test_native_commit_failure_returns_prepared_token(
         )
         port = object.__new__(hermes_compat.HermesArchivePort)
         port._db = object()
+        port._rollback_finishes = {}
+        port._rollback_lock = threading.Lock()
         with pytest.raises(OSError, match="commit failed"):
             port.admit(
                 object(), record, ReviewRequest("conv", 0, 0, 0, True, True, False),
@@ -1048,6 +1050,8 @@ async def test_native_admission_checks_the_current_lease_before_prepare(
         monkeypatch.setattr(hermes_compat, "resolve", resolve)
         port = object.__new__(hermes_compat.HermesArchivePort)
         port._db = object()
+        port._rollback_finishes = {}
+        port._rollback_lock = threading.Lock()
         with pytest.raises(ArchiveRefusal, match="lease_lost"):
             port.admit(
                 object(), record, ReviewRequest("conv", 0, 0, 0, True, True, False),
@@ -1096,6 +1100,8 @@ async def test_native_admission_compares_the_full_chain_before_prepare(
         monkeypatch.setattr(hermes_compat, "_read_projection", lambda *args: Changed())
         port = object.__new__(hermes_compat.HermesArchivePort)
         port._db = object()
+        port._rollback_finishes = {}
+        port._rollback_lock = threading.Lock()
         with pytest.raises(ArchiveRefusal, match="mismatch"):
             port.admit(
                 object(), record, ReviewRequest("conv", 0, 0, 0, True, True, False),

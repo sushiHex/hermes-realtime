@@ -19,9 +19,223 @@ from hermes_realtime.companion.hermes_compat import (
     check_surface,
     resolve,
 )
-from hermes_realtime.companion.integrity import ArchiveRefusal
+from hermes_realtime.companion.integrity import ArchiveRefusal, Fingerprint, Identity
+from hermes_realtime.companion.review import ReviewRequest
+from hermes_realtime.companion.store import ConversationRecord, Progress
 
 _SOURCE = Path(hermes_compat.__file__).read_text(encoding="utf-8")
+
+
+def _rollback_port(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+    fingerprint = Fingerprint(1, "0" * 64)
+    record = ConversationRecord(
+        "conv", "session", Progress(fingerprint, Identity(0, 0)),
+        None, None, None, "lease",
+    )
+    request = ReviewRequest("conv", 0, 0, 0, True, True, False)
+
+    class Parent:
+        def __init__(self) -> None:
+            self.active: object | None = None
+            self.closed = False
+
+        def close(self) -> None:
+            assert self.active is None
+            self.closed = True
+
+    class Native:
+        def __init__(self) -> None:
+            self.commit_fails = True
+            self.finish_failures = 0
+            self.finish_calls = 0
+            self.prepare_calls = 0
+            self.block_finish_call = 0
+            self.finish_entered = threading.Event()
+            self.finish_release = threading.Event()
+
+        def prepare(self, parent: Parent) -> object | None:
+            self.prepare_calls += 1
+            if parent.active is not None:
+                return None
+            token = object()
+            parent.active = token
+            return token
+
+        def finish(self, parent: Parent, token: object) -> None:
+            self.finish_calls += 1
+            if self.finish_calls == self.block_finish_call:
+                self.finish_entered.set()
+                if not self.finish_release.wait(5):
+                    raise RuntimeError("synthetic release did not arrive")
+            if self.finish_failures:
+                self.finish_failures -= 1
+                raise RuntimeError("synthetic transient finish failure")
+            assert parent.active is token
+            parent.active = None
+
+        def execute_write(self, callback: Any) -> Any:
+            admitted = callback(Connection())
+            if self.commit_fails:
+                raise OSError("synthetic commit failure")
+            return admitted
+
+    class Connection:
+        def execute(self, sql: str, params: Any) -> Any:
+            assert "SELECT role, content" in sql
+            return type("Rows", (), {"fetchall": lambda self: [
+                ("user", "review me", "voice:conv:0:0")
+            ]})()
+
+    native = Native()
+
+    def method(db: Any, name: str) -> Any:
+        return {
+            "SessionDB._execute_write": native.execute_write,
+            "SessionDB._check_transcript_write_guards": lambda *args, **kwargs: None,
+        }[name]
+
+    def review_resolve(name: str) -> Any:
+        return {
+            "agent.background_review.prepare_background_review_run": native.prepare,
+            "agent.background_review.finish_background_review_run": native.finish,
+            "SessionTurnLeaseLostError": RuntimeError,
+            "CompressionSessionClosedError": RuntimeError,
+            "run_agent.AIAgent": Parent,
+            "run_agent.AIAgent.close": Parent.close,
+        }[name]
+
+    monkeypatch.setattr(hermes_compat, "_method", method)
+    monkeypatch.setattr(hermes_compat, "resolve", review_resolve)
+    monkeypatch.setattr(
+        hermes_compat, "_read_projection",
+        lambda conn, session_id, cap: type(
+            "Projection", (), {"fingerprint": lambda self: fingerprint}
+        )(),
+    )
+    port = object.__new__(HermesArchivePort)
+    port._db = object()
+    port._review_bindings = {}
+    port._failed_parent_closes = []
+    port._rollback_finishes = {}
+    port._rollback_lock = threading.Lock()
+    port._review_scope = contextlib.nullcontext  # type: ignore[method-assign]
+    return port, native, Parent(), record, request
+
+
+def test_failed_transaction_rollback_finish_retries_before_next_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, native, parent, record, request = _rollback_port(monkeypatch)
+    native.finish_failures = 2
+    with pytest.raises(OSError, match="synthetic commit failure"):
+        port.admit(parent, record, request, 4096, 30.0)
+    assert native.prepare_calls == 1
+    assert parent.active is not None
+
+    native.commit_fails = False
+    admitted = port.admit(parent, record, request, 4096, 30.0)
+    assert admitted is not None
+    assert native.prepare_calls == 2
+    assert native.finish_calls == 3
+    port.finish(parent, admitted[1])
+    assert parent.active is None
+
+
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_failed_rollback_finish_is_drained_before_parent_close(
+    monkeypatch: pytest.MonkeyPatch, drain_first: bool,
+) -> None:
+    port, native, parent, record, request = _rollback_port(monkeypatch)
+    native.finish_failures = 2
+    with pytest.raises(OSError, match="synthetic commit failure"):
+        port.admit(parent, record, request, 4096, 30.0)
+    if drain_first:
+        assert port.drain_failed_parents(2)
+        assert parent.active is None
+    port.close_parent(parent)
+    assert parent.closed
+    assert native.finish_calls == 3
+
+
+def test_live_rollback_finish_is_not_duplicated_before_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, native, parent, record, request = _rollback_port(monkeypatch)
+    native.finish_failures = 1
+    native.block_finish_call = 2
+    try:
+        with pytest.raises(OSError, match="synthetic commit failure"):
+            port.admit(parent, record, request, 4096, 30.0)
+        assert native.finish_entered.wait(2)
+        assert not port.drain_failed_parents(0.05)
+        assert native.finish_calls == 2
+        assert not parent.closed
+        native.finish_release.set()
+        port.close_parent(parent)
+        assert parent.closed
+        assert native.finish_calls == 2
+    finally:
+        native.finish_release.set()
+
+
+def test_port_close_waits_for_live_rollback_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, native, parent, record, request = _rollback_port(monkeypatch)
+    native.finish_failures = 1
+    native.block_finish_call = 2
+    closed: list[object] = []
+    errors: list[BaseException] = []
+    monkeypatch.setattr(hermes_compat, "close_session_db", closed.append)
+    try:
+        with pytest.raises(OSError, match="synthetic commit failure"):
+            port.admit(parent, record, request, 4096, 30.0)
+        assert native.finish_entered.wait(2)
+
+        def close() -> None:
+            try:
+                port.close()
+            except BaseException as error:
+                errors.append(error)
+
+        closer = threading.Thread(target=close)
+        closer.start()
+        closer.join(0.05)
+        assert closer.is_alive()
+        assert closed == []
+        assert native.finish_calls == 2
+        native.finish_release.set()
+        closer.join(2)
+        assert not closer.is_alive()
+        assert errors == []
+        assert closed == [port._db]
+    finally:
+        native.finish_release.set()
+
+
+def test_rollback_finish_thread_start_failure_retains_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port, native, parent, record, request = _rollback_port(monkeypatch)
+    native.finish_failures = 1
+    original_start = threading.Thread.start
+    failures = 0
+
+    def fail_once(worker: threading.Thread) -> None:
+        nonlocal failures
+        if worker.name == "voice-review-rollback-finish" and failures == 0:
+            failures += 1
+            raise RuntimeError("synthetic thread start failure")
+        original_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_once)
+    with pytest.raises(OSError, match="synthetic commit failure"):
+        port.admit(parent, record, request, 4096, 30.0)
+    assert failures == 1
+    assert parent.active is not None
+    assert port.drain_failed_parents(2)
+    assert parent.active is None
+    assert native.finish_calls == 2
 
 
 def test_routed_credential_change_changes_parent_binding(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,6 +340,8 @@ def _partial_parent_port(
     port = object.__new__(HermesArchivePort)
     port._review_bindings = {}
     port._failed_parent_closes = []
+    port._rollback_finishes = {}
+    port._rollback_lock = threading.Lock()
     port._parent_creation_failed = False
     port._review_home = lambda: tmp_path  # type: ignore[method-assign]
     port._config_signature = lambda: (None, None)  # type: ignore[method-assign]
@@ -230,8 +446,8 @@ def test_importing_the_compat_module_does_not_import_hermes() -> None:
         else:
             imported.update(alias.name.split(".")[0] for alias in node.names)
     assert imported == {
-        "__future__", "copy", "hashlib", "importlib", "inspect", "json", "pathlib",
-        "threading", "typing",
+        "__future__", "contextlib", "copy", "hashlib", "importlib", "inspect",
+        "json", "pathlib", "threading", "time", "typing",
         "hermes_realtime",
     }
 
