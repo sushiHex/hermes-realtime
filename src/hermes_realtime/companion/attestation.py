@@ -10,14 +10,12 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
-import re
 import sysconfig
 from pathlib import Path
 
 import hermes_realtime
 from hermes_realtime.protocol import RuntimeAttestation
 
-_COMMIT = re.compile(rb"[0-9a-f]{40}\n?")
 _MAX_HEAD_BYTES = 256
 _MAX_RECORD_BYTES = 1024 * 1024
 
@@ -57,7 +55,8 @@ def _attest() -> RuntimeAttestation:
     return RuntimeAttestation(
         pid=os.getpid(),
         hermes_version=hermes_cli.__version__,
-        hermes_commit=head.decode("ascii").strip() if _COMMIT.fullmatch(head) else "unknown",
+        # The strict model admits only a detached commit: a branch HEAD names nothing.
+        hermes_commit=head.decode("ascii").strip(),
         realtime_version=hermes_realtime.__version__,
         realtime_install="wheel" if wheel else "elsewhere",
         realtime_record=_record(site) if wheel else "unknown",

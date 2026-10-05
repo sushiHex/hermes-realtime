@@ -440,29 +440,51 @@ async def test_the_gate_refuses_an_interpreter_whose_hermes_is_not_the_install(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "unnamed",
+    ("field_name", "unnamed"),
     [
-        pytest.param({"realtime_in_install": False}, id="hermes-realtime-elsewhere"),
-        pytest.param({"detached": False}, id="no-detached-commit"),
-        pytest.param({"record": False}, id="no-wheel-record"),
-        pytest.param({"version": "0.21.0 beta"}, id="no-attestable-hermes-version"),
+        ("hermes_version", "unknown"),
+        ("hermes_commit", "unknown"),
+        ("realtime_version", "unknown"),
+        ("realtime_install", "elsewhere"),
+        ("realtime_record", "unknown"),
     ],
 )
-async def test_the_gate_refuses_an_install_it_cannot_name_in_full(
-    unnamed: dict[str, object],
+async def test_the_gate_refuses_an_install_any_field_of_which_it_cannot_name(
+    field_name: str,
+    unnamed: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     gateway: _Gateway,
 ) -> None:
-    version = unnamed.pop("version", None)
-    install = _install(tmp_path, monkeypatch, **unnamed)  # type: ignore[arg-type]
-    if version is not None:
-        monkeypatch.setattr(sys.modules["hermes_cli"], "__version__", version)
+    install = _install(tmp_path, monkeypatch)
+    _write_env(install.home, companion_port=gateway.companion_port)
+    attestation = attest_runtime().model_copy(update={field_name: unnamed})
+    monkeypatch.setattr(_GATE, "attest_runtime", lambda: attestation)
 
     error, evidence = await _refused(install.home, gateway.api_url)
 
     assert _category(error) == "unnamed" and evidence["stage"] == "identity"
     assert gateway.companion.hellos == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param({"realtime_in_install": False}, id="hermes-realtime-elsewhere"),
+        pytest.param({"detached": False}, id="no-detached-commit"),
+        pytest.param({"record": False}, id="no-wheel-record"),
+    ],
+)
+async def test_the_gate_refuses_an_install_it_cannot_name_in_full(
+    layout: dict[str, bool], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
+) -> None:
+    install = _install(tmp_path, monkeypatch, **layout)
+    _write_env(install.home, companion_port=gateway.companion_port)
+
+    error, evidence = await _refused(install.home, gateway.api_url)
+
+    assert _category(error) == "unnamed" and evidence["stage"] == "identity"
 
 
 @pytest.mark.asyncio
