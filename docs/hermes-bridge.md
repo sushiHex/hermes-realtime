@@ -64,17 +64,43 @@ v0.19 exact-delegation APIs. Under v0.20, registration provides packaging compat
 bridge dispatch rejects with the full-host route. Registration fails when neither complete host
 surface is available. Do not apply the v0.19 companion patch to v0.20.
 
-The upgrade qualification gate is `scripts/real_hermes_api_gate.py`. With
-`HERMES_REALTIME_LIVEKIT_LOCAL=1`, it composes the actual full-host configuration used by Desktop:
-Codex natural-work tools, the `natural_v1` conversation profile, knowledge overlap/recovery,
-Moonshine v2 Medium, and Kokoro. It behaviorally exercises authenticated Hermes API work,
-actionable approval rejection, exact cancellation, proactive completion, LiveKit composition, and
-bounded startup/shutdown. Spoken-turn media remains covered by the LiveKit acceptance tests.
-Its passing record names the exact Hermes it ran against: the installed version, the checkout
-commit, and whether that pair is the qualification baseline (v0.21.0 at `29112bef`), which is a
-reference rather than a version ceiling. It refuses a checkout with tracked changes, because no
-commit describes that code. Paths that differ only in case are exempt on a case-insensitive
-checkout only while their one file on disk matches one of their committed versions:
+The upgrade qualification gate is `scripts/real_hermes_api_gate.py`. It observes the operator's
+installed runtime from the outside, the way the full host meets it, and simulates nothing: run it
+with the install's own interpreter while the installed `hermes gateway` is running.
+
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" scripts\real_hermes_api_gate.py
+```
+
+`--hermes-home` defaults to `HERMES_HOME`, else the installer's default home, and
+`--hermes-api-url` to the full host's default, `http://127.0.0.1:8642`; pass the same URL the host
+is given. The gate then:
+
+1. refuses unless this interpreter's `hermes_cli` is the installer's checkout,
+   `<home>/hermes-agent`, and its `hermes-realtime` distribution is installed in that
+   checkout's `venv`;
+2. reads `API_SERVER_KEY` and the companion endpoint from `<home>/.env` with the full host's own
+   loaders, and accepts only a literal loopback API URL;
+3. performs a real bridge hello with the companion and requires both `voice_archive` and
+   `voice_review`. Only a companion the running gateway discovered, loaded and started answers,
+   so the gate never discovers plugins in its own process;
+4. dispatches, rejects an actionable approval and exactly cancels real work through
+   `HermesApiTaskSession`, the class the host uses;
+5. after the session closes, reads every run Hermes admitted for it back through
+   `GET /v1/runs/{run_id}` and requires each to be terminal, so none is left running.
+
+It prints one JSON line naming the Hermes version, commit and whether that pair is the
+qualification baseline (v0.21.0 at `29112bef`, a reference rather than a version ceiling); the
+candidate's version and whether it is a wheel or an editable install; the negotiated
+capabilities; each behavior's terminal status; and the cleanup counts. A refusal prints one
+`[real-hermes-gate]` line with the stage and the failure's type only. With
+`HERMES_REALTIME_LIVEKIT_LOCAL=1`, it also starts and closes the actual full-host configuration
+used by Desktop against the same gateway: Codex natural-work tools, the `natural_v1` conversation
+profile, knowledge overlap/recovery, Moonshine v2 Medium, and Kokoro. Spoken-turn media remains
+covered by the LiveKit acceptance tests.
+
+The gate refuses a checkout with tracked changes, because no commit describes that code. Paths
+that differ only in case are exempt on a case-insensitive checkout only while their one file on disk matches one of their committed versions:
 `29112bef` tracks such paths, and Windows can hold only one of each.
 
 ## Protocol 0.3: the hello, voice archive and review

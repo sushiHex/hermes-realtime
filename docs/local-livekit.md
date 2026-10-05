@@ -350,6 +350,17 @@ curl --fail http://127.0.0.1:8642/health
 Do not continue unless the gateway is healthy and port 8642 is bound only to literal
 loopback. The full launcher performs authenticated capability discovery itself.
 
+To qualify that installed runtime, with `hermes-realtime` installed in the install's `venv` and
+the companion endpoint (`HERMES_REALTIME_COMPANION_PORT` and `HERMES_REALTIME_COMPANION_TOKEN`)
+in the same `.env`, run the gate with the install's own interpreter from the repository root:
+
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" scripts\real_hermes_api_gate.py
+```
+
+It dispatches real work, so the gateway's model is called. See
+[`hermes-bridge.md`](hermes-bridge.md) for what it checks and records.
+
 ### Launch
 
 1. In terminal A, start the pinned local LiveKit server and leave it running:
