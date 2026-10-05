@@ -768,9 +768,14 @@ The companion's milestones must meet these criteria:
     companion supplies no memory; loss or change of binding clears the prior snapshot.
 16. **Memory latency.** There are zero memory reads on the turn path. Record the p95
     turn-start delta against the baseline, with the measurement boundary and sample count.
-17. **Memory authority.** Instruction-shaped adversarial memory produces zero dispatches,
-    approvals, and cancellations. Memory is untrusted context data, never instruction or
-    execution authority; the conversation store remains I/O-free.
+17. **Memory adds no authority.** With identical forced model behavior, admitted dispatches,
+    cancellations, and approvals with memory present equal those without memory. A memory
+    refresh alone starts zero foreground turns and zero tool calls. The model never grants
+    approval. Memory reaches the prompt only in its labelled data section, not instructions;
+    the conversation store remains I/O-free. This qualifies the boundary added by memory,
+    not model obedience: existing model-initiated natural routing is unchanged. Retain the
+    forced-tool probe as evidence of that existing boundary's limit; a deterministic boundary
+    for model-initiated dispatch and cancellation requires a separate decision.
 18. **Memory bounds.** Read through Hermes's own memory-store API, with its limits and a hard
     cap. Oversized memory is truncated by a declared deterministic rule, never returned
     unbounded. No model call or external memory provider participates. Unknown or partial

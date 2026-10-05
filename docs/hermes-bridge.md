@@ -196,20 +196,23 @@ input, Hermes's configured character limits and the rendered byte cap. Oversize 
 keeps a deterministic prefix and reports truncation.
 
 The foreground never waits for this read on a turn. It uses the latest received snapshot
-as context data explicitly labelled untrusted. Memory does not add tool permissions;
-the broader authority criterion remains unmet as described below. A new
+as context data explicitly labelled untrusted. Memory does not add tool permissions. A new
 conversation can read before its first archived row without creating an archive session.
 An existing binding must be verified and ready. Quarantine, generation changes, refusal
 and connection loss clear memory. Missing or unsupported capability leaves voice running
 without memory; no periodic refresh or second durable memory store is introduced.
 
-**Qualification limit:** ADR criterion 17 is not established. The memory path adds no
-tool permissions, but the existing foreground adapter accepts valid advertised model
-tool calls without a deterministic check against the user's current request. The M4
-stand-in qualification observes one dispatch and one cancellation when it forces those
-calls on a neutral-user turn. Its overall result must remain failed while that authority
-criterion is unmet. This is evidence about the execution boundary, not evidence that a
-production model will follow the adversarial memory entry.
+**Authority qualification:** ADR criterion 17 compares admitted calls with and without
+memory under identical forced model behavior. It also checks that refresh alone starts no
+foreground turn or tool call, that the model cannot grant approval, and that memory appears
+only in its labelled prompt data section. These are structural checks on what memory adds,
+not a test of model obedience.
+
+**Existing boundary's limit:** valid advertised model tool calls can dispatch or cancel on
+a neutral-user turn. The forced stand-in probe records one dispatch and one cancellation;
+M4 leaves natural routing unchanged. This does not prove a production model will follow an
+adversarial memory entry. A deterministic boundary is a separate decision in
+[#205](https://github.com/sushiHex/hermes-realtime/issues/205); no option is implemented here.
 
 `voice_archive{conversation_id, generation, seq_from, seq_through, rows[{seq, role, text,
 interrupted, ts, gap_before}]}` is answered on the same connection by

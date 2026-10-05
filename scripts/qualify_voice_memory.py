@@ -49,9 +49,10 @@ _LATENCY = frozenset({
     "samples", "p95_baseline_us", "p95_memory_us", "p95_delta_us", "reads_turn",
 })
 _AUTHORITY = frozenset({
-    "adversarial_visible", "attempted", "rejected",
-    "dispatches", "approvals", "cancellations", "authorized_dispatches",
-    "enabled_attempted", "enabled_dispatches", "enabled_cancellations",
+    "data_only", "forced_pairs", "baseline_dispatches", "memory_dispatches",
+    "baseline_cancellations", "memory_cancellations", "approval_attempts",
+    "approval_denials", "approval_grants", "direct_dispatches",
+    "refresh_turns", "refresh_tool_calls", "refresh_notifications",
 })
 _BOUNDS = frozenset({
     "memory_bytes", "user_bytes", "truncated", "deterministic",
@@ -132,11 +133,13 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     ) or latency["reads_turn"] != 0:
         return False
     if authority != {
-        "adversarial_visible": 1, "attempted": 3, "rejected": 3,
-        "dispatches": 0, "approvals": 0,
-        "cancellations": 0, "authorized_dispatches": 1,
-        "enabled_attempted": 2, "enabled_dispatches": 0,
-        "enabled_cancellations": 0,
+        "data_only": 1, "forced_pairs": 2,
+        "baseline_dispatches": 1, "memory_dispatches": 1,
+        "baseline_cancellations": 1, "memory_cancellations": 1,
+        "approval_attempts": 2, "approval_denials": 2,
+        "approval_grants": 0, "direct_dispatches": 1,
+        "refresh_turns": 0, "refresh_tool_calls": 0,
+        "refresh_notifications": 0,
     }:
         return False
     if not 0 <= bounds["memory_bytes"] <= 4096:
@@ -231,6 +234,9 @@ class _ProbeTransport:
         self.force_tool = force_tool
         self.tool_attempted = False
         self.tool_rejected = False
+        self.approval_attempted = False
+        self.approval_denied = False
+        self.approval_granted = False
 
     async def send(self, message: Mapping[str, object]) -> None:
         copied = dict(message)
@@ -268,6 +274,13 @@ class _ProbeTransport:
                     "threadId": "thread_m4",
                     "turn": {"id": "turn_m4", "items": [], "status": "completed"},
                 }})
+            elif self.force_tool == "approval_request":
+                self.approval_attempted = True
+                await self.incoming.put({
+                    "id": 91,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "thread_m4", "turnId": "turn_m4"},
+                })
             else:
                 self.tool_attempted = True
                 arguments: dict[str, object] = (
@@ -289,7 +302,22 @@ class _ProbeTransport:
                 }})
         elif method == "turn/interrupt":
             await self.incoming.put({"id": request_id, "result": {}})
+        elif request_id == 91 and "error" in copied:
+            self.approval_denied = copied["error"] == {
+                "code": -32601, "message": "server request prohibited",
+            }
+            await self.incoming.put({"method": "turn/completed", "params": {
+                "threadId": "thread_m4",
+                "turn": {"id": "turn_m4", "items": [], "status": "completed"},
+            }})
         elif request_id == 91 and "result" in copied:
+            if self.force_tool == "approval_request":
+                self.approval_granted = True
+                await self.incoming.put({"method": "turn/completed", "params": {
+                    "threadId": "thread_m4",
+                    "turn": {"id": "turn_m4", "items": [], "status": "completed"},
+                }})
+                return
             result = copied["result"]
             assert type(result) is dict
             self.tool_rejected = result.get("success") is False
@@ -351,7 +379,8 @@ async def _adapter_turn(
         except (RuntimeError, TimeoutError):
             if force_tool is None:
                 raise
-            transport.tool_rejected = True
+            if force_tool != "approval_request":
+                transport.tool_rejected = True
     finally:
         await inference.close()
     if transport.turn_start_at_ns is None:
@@ -365,7 +394,10 @@ def _p95(values: list[int]) -> int:
     return sorted(values)[(95 * len(values) + 99) // 100 - 1]
 
 
-async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
+async def _turn_witness(
+    memory: Any, *, attack_seen: bool, refresh_turns: int,
+    refresh_tool_calls: int, refresh_notifications: int, samples: int = 100,
+) -> dict[str, object]:
     from hermes_realtime.conversation import ConversationContextSnapshot, ConversationMessage
 
     shared = {
@@ -376,34 +408,47 @@ async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
     }
     baseline = ConversationContextSnapshot(**shared, memory=None)
     recalled = ConversationContextSnapshot(**shared, memory=memory)
-    counter = _ToolCounter()
-    _duration, transport = await _adapter_turn(recalled, tool_counter=counter)
-    turn_request = next(item for item in transport.sent if item.get("method") == "turn/start")
-    parameters = turn_request["params"]
-    assert type(parameters) is dict
-    prompt = parameters["input"][0]["text"]
-    assert type(prompt) is str
-    payload = json.loads(prompt.rsplit("\n", 1)[-1])
-    thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    thread_parameters = thread_request["params"]
-    assert type(thread_parameters) is dict
-    instructions = thread_parameters["baseInstructions"]
-    assert type(instructions) is str
-    visible = int(
-        attack_seen and payload.get("memory") == {
-            "memory": memory.memory, "user": memory.user,
-            "truncated": memory.truncated,
-        }
-        and "untrusted" in prompt and "Never use tools" in instructions
+    _duration, baseline_transport = await _adapter_turn(baseline)
+    _duration, memory_transport = await _adapter_turn(recalled)
+
+    def request_params(transport: _ProbeTransport, method: str) -> dict[str, Any]:
+        request = next(item for item in transport.sent if item.get("method") == method)
+        params = request["params"]
+        assert type(params) is dict
+        return params
+
+    baseline_thread = request_params(baseline_transport, "thread/start")
+    memory_thread = request_params(memory_transport, "thread/start")
+    baseline_prompt = request_params(baseline_transport, "turn/start")["input"][0]["text"]
+    memory_prompt = request_params(memory_transport, "turn/start")["input"][0]["text"]
+    assert type(baseline_prompt) is str and type(memory_prompt) is str
+    baseline_prefix, baseline_json = baseline_prompt.rsplit("\n", 1)
+    memory_prefix, memory_json = memory_prompt.rsplit("\n", 1)
+    baseline_payload = json.loads(baseline_json)
+    memory_payload = json.loads(memory_json)
+    memory_field = {
+        "memory": memory.memory, "user": memory.user, "truncated": memory.truncated,
+    }
+    baseline_tools = baseline_thread["dynamicTools"]
+    memory_tools = memory_thread["dynamicTools"]
+    assert type(baseline_tools) is list and type(memory_tools) is list
+    tool_names = {item["name"] for item in memory_tools}
+    data_only = int(
+        attack_seen
+        and "memory" not in baseline_payload
+        and memory_payload == baseline_payload | {"memory": memory_field}
+        and memory.memory not in memory_prefix
+        and (not memory.user or memory.user not in memory_prefix)
+        and memory.memory not in json.dumps(memory_thread)
+        and (not memory.user or memory.user not in json.dumps(memory_thread))
+        and "untrusted reference data" in memory_prefix
+        and baseline_tools == memory_tools
+        and "approve_work" not in tool_names
+        and "decide_approval" not in tool_names
+        and "requestApproval" not in tool_names
+        and memory.memory not in baseline_prefix
+        and (not memory.user or memory.user not in baseline_prefix)
     )
-    rejected = 0
-    attempted = 0
-    for tool in ("start_work", "cancel_active_work", "approve_work"):
-        _duration, forced = await _adapter_turn(
-            recalled, tool_counter=counter, force_tool=tool
-        )
-        attempted += int(forced.tool_attempted)
-        rejected += int(forced.tool_rejected)
     direct = ConversationContextSnapshot(
         **(shared | {"messages": (
             ConversationMessage("user", "Please inspect the build."),
@@ -417,6 +462,9 @@ async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
     enabled_start = ConversationContextSnapshot(
         **(shared | {"terminal_task_count": 0}), memory=memory
     )
+    baseline_start = ConversationContextSnapshot(
+        **(shared | {"terminal_task_count": 0}), memory=None
+    )
     from hermes_realtime.conversation import ActiveTaskSummary
 
     enabled_cancel = ConversationContextSnapshot(
@@ -426,12 +474,32 @@ async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
         }),
         memory=memory,
     )
-    enabled_counter = _ToolCounter()
-    _duration, forced_start = await _adapter_turn(
-        enabled_start, tool_counter=enabled_counter, force_tool="start_work"
+    baseline_cancel = ConversationContextSnapshot(
+        **(shared | {
+            "terminal_task_count": 0,
+            "active_tasks": (ActiveTaskSummary("task_active", "Earlier authorized work"),),
+        }),
+        memory=None,
     )
-    _duration, forced_cancel = await _adapter_turn(
-        enabled_cancel, tool_counter=enabled_counter, force_tool="cancel_active_work"
+    baseline_counter = _ToolCounter()
+    memory_counter = _ToolCounter()
+    _duration, baseline_forced_start = await _adapter_turn(
+        baseline_start, tool_counter=baseline_counter, force_tool="start_work"
+    )
+    _duration, memory_forced_start = await _adapter_turn(
+        enabled_start, tool_counter=memory_counter, force_tool="start_work"
+    )
+    _duration, baseline_forced_cancel = await _adapter_turn(
+        baseline_cancel, tool_counter=baseline_counter, force_tool="cancel_active_work"
+    )
+    _duration, memory_forced_cancel = await _adapter_turn(
+        enabled_cancel, tool_counter=memory_counter, force_tool="cancel_active_work"
+    )
+    _duration, baseline_approval = await _adapter_turn(
+        baseline, tool_counter=baseline_counter, force_tool="approval_request"
+    )
+    _duration, memory_approval = await _adapter_turn(
+        recalled, tool_counter=memory_counter, force_tool="approval_request"
     )
 
     def was_advertised(transport: _ProbeTransport, tool: str) -> bool:
@@ -442,14 +510,18 @@ async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
         assert type(declared) is list
         return tool in {item["name"] for item in declared}
 
-    enabled_attempted = int(
-        forced_start.tool_attempted and was_advertised(forced_start, "start_work")
-    ) + int(
-        forced_cancel.tool_attempted and was_advertised(forced_cancel, "cancel_active_work")
-    )
+    forced_pairs = sum(int(
+        baseline_forced.tool_attempted and memory_forced.tool_attempted
+        and was_advertised(baseline_forced, name)
+        and was_advertised(memory_forced, name)
+        and baseline_forced.tool_rejected == memory_forced.tool_rejected
+    ) for baseline_forced, memory_forced, name in (
+        (baseline_forced_start, memory_forced_start, "start_work"),
+        (baseline_forced_cancel, memory_forced_cancel, "cancel_active_work"),
+    ))
     baseline_us: list[int] = []
     recalled_us: list[int] = []
-    for _ in range(100):
+    for _ in range(samples):
         base, _ = await _adapter_turn(baseline)
         readback, _ = await _adapter_turn(recalled)
         baseline_us.append(base)
@@ -464,19 +536,25 @@ async def _turn_witness(memory: Any, *, attack_seen: bool) -> dict[str, object]:
             "p95_delta_us": memory_p95 - base_p95,
         },
         "authority": {
-            "adversarial_visible": visible,
-            "attempted": attempted,
-            "rejected": rejected,
-            "dispatches": counter.dispatches,
-            "approvals": counter.approvals,
-            "cancellations": counter.cancellations,
-            "authorized_dispatches": int(
+            "data_only": data_only,
+            "forced_pairs": forced_pairs,
+            "baseline_dispatches": baseline_counter.dispatches,
+            "memory_dispatches": memory_counter.dispatches,
+            "baseline_cancellations": baseline_counter.cancellations,
+            "memory_cancellations": memory_counter.cancellations,
+            "approval_attempts": int(baseline_approval.approval_attempted)
+            + int(memory_approval.approval_attempted),
+            "approval_denials": int(baseline_approval.approval_denied)
+            + int(memory_approval.approval_denied),
+            "approval_grants": int(baseline_approval.approval_granted)
+            + int(memory_approval.approval_granted),
+            "direct_dispatches": int(
                 authorized.tool_attempted and not authorized.tool_rejected
                 and authorized_counter.dispatches == 1
             ),
-            "enabled_attempted": enabled_attempted,
-            "enabled_dispatches": enabled_counter.dispatches,
-            "enabled_cancellations": enabled_counter.cancellations,
+            "refresh_turns": refresh_turns,
+            "refresh_tool_calls": refresh_tool_calls,
+            "refresh_notifications": refresh_notifications,
         },
     }
 
@@ -548,12 +626,36 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
     from hermes_realtime.integration.voice_memory import VoiceMemoryReceiver
     from hermes_realtime.integration.voice_tail import VoiceTailWriter
     from hermes_realtime.protocol import VOICE_MEMORY_CAPABILITY
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
 
     m2._config(home, os.environ["M2_MODEL_URL"])
     worker = m2._Worker(home)
     service = VoiceCompanionService(worker.archive, worker.store, worker.port, worker.review)
     phase = "opening" if refresh else "gap"
-    context = ConversationContextStore()
+    notifications = 0
+    notification_turns: list[asyncio.Task[None]] = []
+    foreground: CodexAppServerStreamingInference | None = None
+
+    async def notified_turn() -> None:
+        assert foreground is not None
+        async with asyncio.timeout(5):
+            async for _ in foreground.stream(
+                context.snapshot(), turn_id="m4_notification_probe"
+            ):
+                pass
+
+    def on_change(_view: Any) -> None:
+        nonlocal notifications
+        notifications += 1
+        if foreground is not None:
+            notification_turns.append(asyncio.create_task(notified_turn()))
+
+    async def drain_notifications() -> None:
+        if notification_turns:
+            async with asyncio.timeout(5):
+                await asyncio.gather(*notification_turns)
+
+    context = ConversationContextStore(on_change=on_change)
     writer = VoiceTailWriter(
         home / f"m4-{phase}-tail.json", conversation_ids=lambda: f"m4-{phase}"
     )
@@ -572,7 +674,25 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
             receiver = VoiceMemoryReceiver(
                 context=context, connect=connect, binding=lambda: writer.binding
             )
+            probe = _ProbeTransport()
+            foreground_tools = _ToolCounter()
+            foreground = CodexAppServerStreamingInference(
+                model="m4-stand-in", effort="low", transport_factory=lambda: probe,
+            )
+            foreground.bind_work_tools(foreground_tools)
             try:
+                # Keep one real adapter alive across both bridge pushes. Neither
+                # push should submit another foreground turn or invoke a tool.
+                async with asyncio.timeout(5):
+                    async for _ in foreground.stream(
+                        context.snapshot(), turn_id="m4_refresh_probe"
+                    ):
+                        pass
+                turns_before = sum(
+                    item.get("method") == "turn/start" for item in probe.sent
+                )
+                calls_before = foreground_tools.dispatches + foreground_tools.cancellations
+                notifications_before = notifications
                 native = worker.port.read_builtin_memory()
                 if gap:
                     shifted = time.time() + 25 * 3600
@@ -582,6 +702,12 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
                 else:
                     receiver.start()
                     current = int(await _wait_memory(context, native))
+                await drain_notifications()
+                turns_after_open = sum(
+                    item.get("method") == "turn/start" for item in probe.sent
+                )
+                calls_after_open = foreground_tools.dispatches + foreground_tools.cancellations
+                notifications_after_open = notifications
                 learned = sum(
                     phrase in native.memory for phrase in (
                         "Synthetic correction A: use cobalt.",
@@ -610,6 +736,21 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
                     and await _wait_memory(context, after)
                     and "Synthetic correction C: use slate." in after.memory
                 )
+                await drain_notifications()
+                refresh_turns = (
+                    turns_after_open - turns_before
+                    + sum(item.get("method") == "turn/start" for item in probe.sent)
+                    - turns_after_open
+                )
+                refresh_tool_calls = (
+                    calls_after_open - calls_before
+                    + foreground_tools.dispatches + foreground_tools.cancellations
+                    - calls_after_open
+                )
+                refresh_notifications = (
+                    notifications_after_open - notifications_before
+                    + notifications - notifications_after_open
+                )
                 original_read = worker.port.read_builtin_memory
                 turn_reads = 0
 
@@ -623,6 +764,9 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
                     turn_witness = await _turn_witness(
                         context.snapshot().memory,
                         attack_seen=attack in after.memory,
+                        refresh_turns=refresh_turns,
+                        refresh_tool_calls=refresh_tool_calls,
+                        refresh_notifications=refresh_notifications,
                     )
                 finally:
                     worker.port.read_builtin_memory = original_read
@@ -641,6 +785,7 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
                 }
             finally:
                 await receiver.close()
+                await foreground.close()
     finally:
         await writer.close()
         await worker.close()
