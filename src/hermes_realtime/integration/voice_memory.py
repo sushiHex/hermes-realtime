@@ -168,7 +168,6 @@ class VoiceMemoryReceiver:
                         _marker({"refusal": "stream", "version": 1})
                         return
                     revision: int | None = None
-                    backoff = self._initial_backoff
                     async for event in stream:
                         if not self._same_binding(request) or (
                             type(event) not in (VoiceMemorySnapshotEvent, VoiceMemoryRefusedEvent)
@@ -192,6 +191,8 @@ class VoiceMemoryReceiver:
                                 truncated=event.truncated,
                             )
                         )
+                        if revision is None:
+                            backoff = self._initial_backoff
                         revision = event.revision
                 except asyncio.CancelledError:
                     raise

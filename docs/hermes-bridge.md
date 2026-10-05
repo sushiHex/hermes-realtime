@@ -193,6 +193,9 @@ snapshot. Revisions order snapshots within a connection, not across companion re
 The foreground keeps a per-connection revision high-watermark. A refusal clears the
 snapshot without lowering that mark; a later snapshot must have a revision at least as
 high, and an equal revision is accepted.
+Reconnect delays grow to a bounded maximum after connection or stream failures, including
+failures after a successful handshake. The delay resets only when the connection delivers
+its first valid snapshot.
 The companion reads its bound profile through Hermes's native memory parser, sanitizer
 and renderer at subscription open and after a review finishes. Reads use bounded file
 input, Hermes's configured character limits and the rendered byte cap. Oversize input

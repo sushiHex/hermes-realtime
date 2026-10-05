@@ -5,6 +5,7 @@ from typing import cast
 import pytest
 
 from hermes_realtime.conversation import ConversationContextStore
+from hermes_realtime.integration import voice_memory
 from hermes_realtime.integration.voice_memory import VoiceMemoryReceiver
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.protocol import (
@@ -38,6 +39,79 @@ class MemoryLink:
     async def close(self) -> None:
         self.closed = True
         self.closed_event.set()
+
+
+class FailedAfterHandshakeLink(MemoryLink):
+    def __init__(self, *, snapshot: bool) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+
+    async def memory(
+        self, request: VoiceMemoryEvent,
+    ) -> AsyncIterator[VoiceMemorySnapshotEvent | VoiceMemoryRefusedEvent]:
+        self.request = request
+        self.started.set()
+        if self.snapshot:
+            yield _snapshot(1, "Delivered preference.")
+        raise ConnectionError("synthetic post-handshake loss")
+
+
+async def _retry_delays(
+    monkeypatch: pytest.MonkeyPatch, *, snapshot_connection: int | None,
+) -> tuple[list[float], bool]:
+    context = ConversationContextStore()
+    changes = _observe(context)
+    delays: list[float] = []
+    reached = asyncio.Event()
+    hold = asyncio.Event()
+    original_sleep = asyncio.sleep
+    connections = 0
+
+    async def sleeping(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 4:
+            reached.set()
+            await hold.wait()
+        else:
+            await original_sleep(0)
+
+    async def connect() -> FailedAfterHandshakeLink:
+        nonlocal connections
+        connections += 1
+        return FailedAfterHandshakeLink(snapshot=connections == snapshot_connection)
+
+    monkeypatch.setattr(voice_memory.asyncio, "sleep", sleeping)
+    receiver = VoiceMemoryReceiver(
+        context, connect, binding=lambda: ("conversation_1", 0),
+        initial_backoff_seconds=0.01, max_backoff_seconds=0.04,
+    )
+    receiver.start()
+    try:
+        await asyncio.wait_for(reached.wait(), 1)
+    finally:
+        await receiver.close()
+    observed = []
+    while not changes.empty():
+        observed.append(changes.get_nowait())
+    return delays, BuiltinMemorySnapshot("Delivered preference.", "Ari") in observed
+
+
+@pytest.mark.asyncio
+async def test_post_handshake_failures_increase_backoff_to_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays, delivered = await _retry_delays(monkeypatch, snapshot_connection=None)
+    assert delays == [0.01, 0.02, 0.04, 0.04]
+    assert not delivered
+
+
+@pytest.mark.asyncio
+async def test_first_valid_snapshot_resets_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays, delivered = await _retry_delays(monkeypatch, snapshot_connection=3)
+    assert delivered
+    assert delays == [0.01, 0.02, 0.01, 0.02]
 
 
 def _observe(context: ConversationContextStore) -> asyncio.Queue[BuiltinMemorySnapshot | None]:
