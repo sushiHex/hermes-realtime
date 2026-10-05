@@ -7,90 +7,69 @@ is ``unknown`` (or ``elsewhere``), which a qualification refuses.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
-import importlib.metadata
-import json
 import os
 import re
 import sysconfig
 from pathlib import Path
-from typing import Literal
-from urllib.parse import urlsplit
-from urllib.request import url2pathname
-
-from pydantic import TypeAdapter, ValidationError
 
 import hermes_realtime
 from hermes_realtime.protocol import RuntimeAttestation
-from hermes_realtime.protocol.events import AttestedVersion
 
 _COMMIT = re.compile(rb"[0-9a-f]{40}\n?")
 _MAX_HEAD_BYTES = 256
-_VERSION: TypeAdapter[str] = TypeAdapter(AttestedVersion)
+_MAX_RECORD_BYTES = 1024 * 1024
 
 
 def attest_runtime() -> RuntimeAttestation:
-    """This process, the Hermes it imported, and where its ``hermes_realtime`` came from."""
+    """This process, the Hermes it imported, and the hermes-realtime wheel it imported.
+
+    It never raises: a process whose install cannot be read attests nothing but itself.
+    """
 
     try:
-        hermes_cli = importlib.import_module("hermes_cli")
-    except ImportError:
-        hermes_cli = None
-    origin = getattr(hermes_cli, "__file__", None)
+        return _attest()
+    except Exception:
+        return RuntimeAttestation(
+            pid=os.getpid(),
+            hermes_version="unknown",
+            hermes_commit="unknown",
+            realtime_version="unknown",
+            realtime_install="elsewhere",
+            realtime_record="unknown",
+        )
+
+
+def _attest() -> RuntimeAttestation:
+    hermes_cli = importlib.import_module("hermes_cli")
+    origin = hermes_cli.__file__
+    if origin is None:
+        raise ImportError("hermes_cli has no file")
     # hermes_cli sits at the root of the installer's checkout.
-    checkout = Path(origin).resolve().parents[1] if type(origin) is str else None
+    checkout = Path(origin).resolve().parents[1]
+    with (checkout / ".git" / "HEAD").open("rb") as head_file:
+        head = head_file.read(_MAX_HEAD_BYTES)
+    venv = str(checkout / "venv")
+    site = Path(sysconfig.get_path("purelib", vars={"base": venv, "platbase": venv})).resolve()
+    # Only the installed package's own file is the wheel; anything else is not what it built.
+    wheel = Path(hermes_realtime.__file__).resolve() == site / "hermes_realtime" / "__init__.py"
     return RuntimeAttestation(
         pid=os.getpid(),
-        hermes_version=_version(getattr(hermes_cli, "__version__", None)),
-        hermes_commit=_detached_commit(checkout),
-        realtime_version=_version(hermes_realtime.__version__),
-        realtime_install=_realtime_install(checkout),
+        hermes_version=hermes_cli.__version__,
+        hermes_commit=head.decode("ascii").strip() if _COMMIT.fullmatch(head) else "unknown",
+        realtime_version=hermes_realtime.__version__,
+        realtime_install="wheel" if wheel else "elsewhere",
+        realtime_record=_record(site) if wheel else "unknown",
     )
 
 
-def _version(value: object) -> str:
-    try:
-        return _VERSION.validate_python(value, strict=True)
-    except ValidationError:
+def _record(site: Path) -> str:
+    """The SHA-256 of the one installed wheel's ``RECORD``, which hashes every file it put down."""
+
+    records = list(site.glob("hermes_realtime-*.dist-info/RECORD"))
+    if len(records) != 1:
         return "unknown"
-
-
-def _detached_commit(checkout: Path | None) -> str:
-    """The commit a detached checkout's HEAD names, read without running git."""
-
-    if checkout is None:
-        return "unknown"
-    try:
-        with (checkout / ".git" / "HEAD").open("rb") as head:
-            content = head.read(_MAX_HEAD_BYTES)
-    except OSError:
-        return "unknown"
-    return content.decode("ascii").strip() if _COMMIT.fullmatch(content) else "unknown"
-
-
-def _realtime_install(checkout: Path | None) -> Literal["wheel", "editable", "elsewhere"]:
-    """Where the imported module's file is: the install's environment, its editable source,
-    or anywhere else."""
-
-    if checkout is None:
-        return "elsewhere"
-    module = Path(hermes_realtime.__file__).resolve()
-    venv = str(checkout / "venv")
-    site = Path(sysconfig.get_path("purelib", vars={"base": venv, "platbase": venv})).resolve()
-    if module == site / "hermes_realtime" / "__init__.py":
-        return "wheel"
-    try:
-        distribution = importlib.metadata.distribution("hermes-realtime")
-        direct_url = json.loads(distribution.read_text("direct_url.json") or "null")
-    except (importlib.metadata.PackageNotFoundError, ValueError):
-        return "elsewhere"
-    if Path(str(distribution.locate_file(""))).resolve() != site or type(direct_url) is not dict:
-        return "elsewhere"
-    url, dir_info = direct_url.get("url"), direct_url.get("dir_info")
-    if type(url) is not str or type(dir_info) is not dict or dir_info.get("editable") is not True:
-        return "elsewhere"
-    parts = urlsplit(url)
-    if parts.scheme != "file" or parts.netloc not in ("", "localhost"):
-        return "elsewhere"
-    source = Path(url2pathname(parts.path)).resolve()
-    return "editable" if module.is_relative_to(source) else "elsewhere"
+    with records[0].open("rb") as record_file:
+        content = record_file.read(_MAX_RECORD_BYTES + 1)
+    return hashlib.sha256(content).hexdigest() if len(content) <= _MAX_RECORD_BYTES else "unknown"

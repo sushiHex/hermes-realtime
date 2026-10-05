@@ -519,6 +519,7 @@ _ATTESTATION = RuntimeAttestation(
     hermes_commit="0123456789abcdef0123456789abcdef01234567",
     realtime_version="0.0.3",
     realtime_install="wheel",
+    realtime_record="0123456789abcdef" * 4,
 )
 
 

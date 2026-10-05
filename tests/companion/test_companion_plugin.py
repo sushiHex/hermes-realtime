@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -236,11 +237,14 @@ def test_the_companion_attests_the_runtime_captured_when_the_plugin_loaded(
         hermes_commit="unknown",
         realtime_version="0.0.3",
         realtime_install="wheel",
+        realtime_record="unknown",
     )
-    captures: list[RuntimeAttestation] = []
+    # The thread each capture ran on: register() runs on Hermes's loader thread, while the
+    # companion builds its bridge later, on its own thread.
+    captures: list[int] = []
 
     def attest() -> RuntimeAttestation:
-        captures.append(attestation)
+        captures.append(threading.get_ident())
         return attestation
 
     monkeypatch.setattr(hermes_plugin, "attest_runtime", attest)
@@ -260,4 +264,4 @@ def test_the_companion_attests_the_runtime_captured_when_the_plugin_loaded(
 
     assert asyncio.run(attested()) == attestation
     assert asyncio.run(attested()) == attestation
-    assert len(captures) == 1
+    assert captures == [threading.get_ident()]

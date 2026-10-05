@@ -84,21 +84,21 @@ def _attestation(**overrides: Any) -> dict[str, Any]:
         "hermes_commit": "0123456789abcdef0123456789abcdef01234567",
         "realtime_version": "0.0.3",
         "realtime_install": "wheel",
+        "realtime_record": "0123456789abcdef" * 4,
     }
     attestation.update(overrides)
     return attestation
 
 
-@pytest.mark.parametrize("install", ["wheel", "editable", "elsewhere"])
+@pytest.mark.parametrize("install", ["wheel", "elsewhere"])
 @pytest.mark.parametrize("commit", ["0123456789abcdef0123456789abcdef01234567", "unknown"])
-def test_a_runtime_attestation_round_trips_exactly(install: str, commit: str) -> None:
-    attestation = RuntimeAttestation.model_validate(
-        _attestation(realtime_install=install, hermes_commit=commit)
-    )
+@pytest.mark.parametrize("record", ["0123456789abcdef" * 4, "unknown"])
+def test_a_runtime_attestation_round_trips_exactly(install: str, commit: str, record: str) -> None:
+    fields = {"realtime_install": install, "hermes_commit": commit, "realtime_record": record}
 
-    assert attestation.model_dump(mode="json") == _attestation(
-        realtime_install=install, hermes_commit=commit
-    )
+    attestation = RuntimeAttestation.model_validate(_attestation(**fields))
+
+    assert attestation.model_dump(mode="json") == _attestation(**fields)
 
 
 @pytest.mark.parametrize(
@@ -114,6 +114,9 @@ def test_a_runtime_attestation_round_trips_exactly(install: str, commit: str) ->
         pytest.param({"hermes_version": "0.21.0 /home"}, id="spaced-version"),
         pytest.param({"realtime_version": "v" * 65}, id="long-version"),
         pytest.param({"realtime_install": "sdist"}, id="unknown-install"),
+        pytest.param({"realtime_install": "editable"}, id="editable-install"),
+        pytest.param({"realtime_record": "0123456789ABCDEF" * 4}, id="upper-record"),
+        pytest.param({"realtime_record": "0123456789abcdef" * 2}, id="short-record"),
         pytest.param({"path": "/install"}, id="extra-field"),
     ],
 )

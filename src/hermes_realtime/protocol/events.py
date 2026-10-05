@@ -503,7 +503,7 @@ class VoiceReviewRefusedEvent(_VoiceRange):
     category: VoiceRefusalCategory
 
 
-AttestedVersion = Annotated[
+_AttestedVersion = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[0-9A-Za-z.+_-]+$")
 ]
 
@@ -511,16 +511,18 @@ AttestedVersion = Annotated[
 class RuntimeAttestation(StrictModel):
     """What the process serving the companion loaded, captured once when it loaded the plugin.
 
-    ``hermes_commit`` is the checkout's detached commit, or ``unknown``. ``realtime_install``
-    says where the imported ``hermes_realtime`` came from: the Hermes install's environment
-    (``wheel``), an editable install in it (``editable``), or anywhere else (``elsewhere``).
+    ``hermes_commit`` is the checkout's detached commit, or ``unknown``. ``realtime_install`` is
+    ``wheel`` when the imported ``hermes_realtime`` is the one installed in the Hermes install's
+    environment, else ``elsewhere``; ``realtime_record`` is the SHA-256 of that installed wheel's
+    ``RECORD``, which names the hash of every file it installed, or ``unknown``.
     """
 
     pid: Annotated[int, Field(ge=1, le=_VOICE_MAX_IDENTITY)]
-    hermes_version: AttestedVersion
+    hermes_version: _AttestedVersion
     hermes_commit: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|unknown)$")]
-    realtime_version: AttestedVersion
-    realtime_install: Literal["wheel", "editable", "elsewhere"]
+    realtime_version: _AttestedVersion
+    realtime_install: Literal["wheel", "elsewhere"]
+    realtime_record: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{64}|unknown)$")]
 
 
 VoiceEvent: TypeAlias = Annotated[
