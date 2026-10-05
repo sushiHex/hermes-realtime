@@ -350,8 +350,8 @@ curl --fail http://127.0.0.1:8642/health
 Do not continue unless the gateway is healthy and port 8642 is bound only to literal
 loopback. The full launcher performs authenticated capability discovery itself.
 
-To qualify that installed runtime, with `hermes-realtime` installed in the install's `venv` and
-the companion endpoint (`HERMES_REALTIME_COMPANION_PORT` and `HERMES_REALTIME_COMPANION_TOKEN`)
+To qualify that installed runtime, with a built `hermes-realtime` wheel (not an editable install)
+installed in the install's `venv` and the companion endpoint (`HERMES_REALTIME_COMPANION_PORT` and `HERMES_REALTIME_COMPANION_TOKEN`)
 in the same `.env`, run the gate with the install's own interpreter from the repository root:
 
 ```powershell
