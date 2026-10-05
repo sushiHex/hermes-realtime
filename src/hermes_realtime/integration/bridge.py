@@ -789,8 +789,11 @@ class LocalHermesBridgeServer:
                     task.exception()
             if pending:
                 logger.warning(
-                    "Hermes memory subscription retained %d task(s) after shutdown deadline",
-                    len(pending),
+                    "[voice-memory-stream] %s",
+                    json.dumps(
+                        {"refusal": "shutdown_deadline", "tasks": len(pending), "version": 1},
+                        separators=(",", ":"), sort_keys=True,
+                    ),
                 )
                 raise BridgeProtocolError("memory subscription did not stop")
 

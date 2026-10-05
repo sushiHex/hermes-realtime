@@ -120,7 +120,10 @@ async def test_memory_disconnect_bounds_uncooperative_producer_but_keeps_ownersh
         await asyncio.wait_for(asyncio.shield(handler), 0.5)
         assert voice.producer in server._handler_tasks
         assert not voice.finished.is_set()
-        assert "memory subscription retained 1 task(s)" in caplog.text
+        assert (
+            '[voice-memory-stream] {"refusal":"shutdown_deadline","tasks":1,"version":1}'
+            in caplog.text
+        )
         voice.release.set()
         await asyncio.wait_for(voice.finished.wait(), 1)
         await stream.aclose()
