@@ -154,7 +154,7 @@ async def test_receiver_rejects_wrong_identity_and_nonmonotonic_revision() -> No
             conversation_id="other", generation=0, revision=2,
             memory="Other profile.", user="Ari", truncated=False,
         ),
-        _snapshot(1, "Replayed preference."),
+        _snapshot(0, "Regressed preference."),
     ):
         context = ConversationContextStore()
         changes = _observe(context)
@@ -174,6 +174,64 @@ async def test_receiver_rejects_wrong_identity_and_nonmonotonic_revision() -> No
             assert context.snapshot().memory is None
         finally:
             await receiver.close()
+
+
+@pytest.mark.asyncio
+async def test_refusal_does_not_lower_connection_revision_high_watermark() -> None:
+    context = ConversationContextStore()
+    changes = _observe(context)
+    link = MemoryLink()
+
+    async def connect() -> MemoryLink:
+        return link
+
+    receiver = VoiceMemoryReceiver(context, connect, binding=lambda: ("conversation_1", 0))
+    receiver.start()
+    try:
+        await asyncio.wait_for(link.started.wait(), 1)
+        await link.events.put(_snapshot(10, "Current preference."))
+        assert await asyncio.wait_for(changes.get(), 1) is not None
+        await link.events.put(VoiceMemoryRefusedEvent(
+            protocol_version="0.4", type="voice_memory_refused",
+            conversation_id="conversation_1", generation=0, category="not_ready",
+        ))
+        assert await asyncio.wait_for(changes.get(), 1) is None
+        await link.events.put(_snapshot(9, "Regressed preference."))
+        await asyncio.wait_for(link.closed_event.wait(), 1)
+        assert context.snapshot().memory is None
+    finally:
+        await receiver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", (False, True))
+async def test_equal_connection_revision_is_accepted(refuse: bool) -> None:
+    context = ConversationContextStore()
+    changes = _observe(context)
+    link = MemoryLink()
+
+    async def connect() -> MemoryLink:
+        return link
+
+    receiver = VoiceMemoryReceiver(context, connect, binding=lambda: ("conversation_1", 0))
+    receiver.start()
+    try:
+        await asyncio.wait_for(link.started.wait(), 1)
+        await link.events.put(_snapshot(10, "Current preference."))
+        assert await asyncio.wait_for(changes.get(), 1) is not None
+        if refuse:
+            await link.events.put(VoiceMemoryRefusedEvent(
+                protocol_version="0.4", type="voice_memory_refused",
+                conversation_id="conversation_1", generation=0, category="not_ready",
+            ))
+            assert await asyncio.wait_for(changes.get(), 1) is None
+        await link.events.put(_snapshot(10, "Recovered preference."))
+        assert await asyncio.wait_for(changes.get(), 1) == BuiltinMemorySnapshot(
+            memory="Recovered preference.", user="Ari"
+        )
+        assert not link.closed
+    finally:
+        await receiver.close()
 
 
 @pytest.mark.asyncio

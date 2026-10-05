@@ -190,6 +190,9 @@ Memory uses a dedicated subscription connection. One
 events. Each block is capped at 4,096 UTF-8 bytes. A
 `voice_memory_refused{conversation_id, generation, category}` event clears the foreground
 snapshot. Revisions order snapshots within a connection, not across companion restarts.
+The foreground keeps a per-connection revision high-watermark. A refusal clears the
+snapshot without lowering that mark; a later snapshot must have a revision at least as
+high, and an equal revision is accepted.
 The companion reads its bound profile through Hermes's native memory parser, sanitizer
 and renderer at subscription open and after a review finishes. Reads use bounded file
 input, Hermes's configured character limits and the rendered byte cap. Oversize input

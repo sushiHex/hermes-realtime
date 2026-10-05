@@ -179,11 +179,10 @@ class VoiceMemoryReceiver:
                             return
                         if type(event) is VoiceMemoryRefusedEvent:
                             self._context.set_memory(None)
-                            revision = None
                             _marker({"refusal": event.category, "version": 1})
                             continue
                         assert type(event) is VoiceMemorySnapshotEvent
-                        if revision is not None and event.revision <= revision:
+                        if revision is not None and event.revision < revision:
                             _marker({"refusal": "revision", "version": 1})
                             return
                         self._context.set_memory(
