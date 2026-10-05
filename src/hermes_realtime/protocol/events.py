@@ -503,7 +503,7 @@ class VoiceReviewRefusedEvent(_VoiceRange):
     category: VoiceRefusalCategory
 
 
-_AttestedVersion = Annotated[
+AttestedVersion = Annotated[
     str, StringConstraints(min_length=1, max_length=64, pattern=r"^[0-9A-Za-z.+_-]+$")
 ]
 
@@ -517,9 +517,9 @@ class RuntimeAttestation(StrictModel):
     """
 
     pid: Annotated[int, Field(ge=1, le=_VOICE_MAX_IDENTITY)]
-    hermes_version: _AttestedVersion
+    hermes_version: AttestedVersion
     hermes_commit: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|unknown)$")]
-    realtime_version: _AttestedVersion
+    realtime_version: AttestedVersion
     realtime_install: Literal["wheel", "editable", "elsewhere"]
 
 

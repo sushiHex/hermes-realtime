@@ -836,7 +836,7 @@ class LocalHermesBridgeClient:
                 }
             )
             response = json.loads(await reader.readline())
-            fields = set(response) if type(response) is dict else set()
+            fields = frozenset(response) if type(response) is dict else frozenset()
             offered = (
                 _capabilities(response["capabilities"]) if "capabilities" in fields else None
             )
