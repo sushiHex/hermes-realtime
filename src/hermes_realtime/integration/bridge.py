@@ -15,15 +15,19 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Self
 
+from pydantic import ValidationError
+
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
     VOICE_REVIEW_CAPABILITY,
     ControlCancelAcknowledgedEvent,
     ControlCancelEvent,
     ProtocolEvent,
+    RuntimeAttestation,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -47,7 +51,11 @@ _MAX_LINE_BYTES = 64 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _HELLO_FIELDS = frozenset({"token", "participant_id", "protocol_version", "capabilities"})
 _WELCOME_FIELDS = frozenset({"ok", "protocol_version", "capabilities"})
-_REVIEW_WELCOME_FIELDS = _WELCOME_FIELDS | {"review_interval"}
+# A welcome field that accompanies exactly one negotiated capability.
+_WELCOME_EXTRAS = {
+    "review_interval": VOICE_REVIEW_CAPABILITY,
+    "runtime": RUNTIME_ATTESTATION_CAPABILITY,
+}
 _HELLO_MARKER = "[hermes-bridge-hello] "
 logger = logging.getLogger(__name__)
 
@@ -129,6 +137,7 @@ class LocalHermesBridgeServer:
         max_connections: int = 32,
         shutdown_timeout: float = 5.0,
         voice: VoiceArchiveHandler | None = None,
+        runtime: RuntimeAttestation | None = None,
     ) -> None:
         if len(token) < 24:
             raise ValueError("bridge token must contain at least 24 characters")
@@ -160,6 +169,9 @@ class LocalHermesBridgeServer:
         if interval is not None and (type(interval) is not int or not 1 <= interval <= 1000):
             raise ValueError("review interval must be an exact integer from 1 to 1000")
         self._review_interval: int | None = interval
+        if runtime is not None and type(runtime) is not RuntimeAttestation:
+            raise TypeError("runtime must be an exact RuntimeAttestation or None")
+        self._runtime = runtime
         self._offered = (
             frozenset({VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY})
             if voice is not None
@@ -168,7 +180,7 @@ class LocalHermesBridgeServer:
             else frozenset({VOICE_ARCHIVE_CAPABILITY})
             if voice is not None
             else frozenset()
-        )
+        ) | (frozenset({RUNTIME_ATTESTATION_CAPABILITY}) if runtime is not None else frozenset())
         self._server: asyncio.Server | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe_completion: Callable[[], None] | None = None
@@ -685,6 +697,9 @@ class LocalHermesBridgeServer:
         }
         if VOICE_REVIEW_CAPABILITY in negotiated:
             welcome["review_interval"] = self._review_interval
+        if RUNTIME_ATTESTATION_CAPABILITY in negotiated:
+            assert self._runtime is not None  # Offered only with an attestation.
+            welcome["runtime"] = self._runtime.model_dump(mode="json")
         await self._send_json(connection, welcome)
         return participant_id, negotiated
 
@@ -774,11 +789,17 @@ class LocalHermesBridgeClient:
         self._write_lock = asyncio.Lock()
         self._capabilities: frozenset[str] = frozenset()
         self._review_interval: int | None = None
+        self._runtime: RuntimeAttestation | None = None
 
     @property
     def capabilities(self) -> frozenset[str]:
         """The capabilities the companion advertised to this connection."""
         return self._capabilities
+
+    @property
+    def runtime(self) -> RuntimeAttestation | None:
+        """What the companion's process attested it loaded, when negotiated."""
+        return self._runtime
 
     @property
     def review_interval(self) -> int | None:
@@ -817,25 +838,37 @@ class LocalHermesBridgeClient:
             response = json.loads(await reader.readline())
             fields = set(response) if type(response) is dict else set()
             offered = (
-                _capabilities(response["capabilities"])
-                if fields in (_WELCOME_FIELDS, _REVIEW_WELCOME_FIELDS)
-                else None
+                _capabilities(response["capabilities"]) if "capabilities" in fields else None
+            )
+            # Each extra is present exactly when its capability was negotiated.
+            expected = (
+                None
+                if offered is None
+                else _WELCOME_FIELDS
+                | {extra for extra, capability in _WELCOME_EXTRAS.items() if capability in offered}
             )
             interval = response.get("review_interval") if type(response) is dict else None
             if (
                 offered is None
+                or fields != expected
                 or response["ok"] is not True
                 or response["protocol_version"] != BRIDGE_PROTOCOL_VERSION
                 or not offered <= requested
-                or (VOICE_REVIEW_CAPABILITY in offered) != (fields == _REVIEW_WELCOME_FIELDS)
                 or (
                     VOICE_REVIEW_CAPABILITY in offered
                     and (type(interval) is not int or not 1 <= interval <= 1000)
                 )
             ):
                 raise BridgeAuthenticationError("bridge authentication failed")
+            runtime = None
+            if RUNTIME_ATTESTATION_CAPABILITY in offered:
+                try:
+                    runtime = RuntimeAttestation.model_validate(response["runtime"])
+                except ValidationError as error:
+                    raise BridgeAuthenticationError("bridge authentication failed") from error
             client._capabilities = offered
             client._review_interval = interval
+            client._runtime = runtime
             return client
         except Exception:
             await client.close()

@@ -19,6 +19,7 @@ from hermes_realtime.integration import (
     SessionBindings,
 )
 from hermes_realtime.protocol import (
+    RuntimeAttestation,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -39,7 +40,9 @@ class _Dispatcher:
         raise AssertionError("no work is cancelled here")
 
 
-def _server(voice: Any = None) -> LocalHermesBridgeServer:
+def _server(
+    voice: Any = None, runtime: RuntimeAttestation | None = None
+) -> LocalHermesBridgeServer:
     from datetime import UTC, datetime
 
     sequencer = EventSequencer()
@@ -56,7 +59,11 @@ def _server(voice: Any = None) -> LocalHermesBridgeServer:
         sequencer=sequencer, event_id_factory=lambda: "evt_2", clock=now
     )
     return LocalHermesBridgeServer(
-        service=service, completions=completions, token=_TOKEN, voice=voice
+        service=service,
+        completions=completions,
+        token=_TOKEN,
+        voice=voice,
+        runtime=runtime,
     )
 
 
@@ -503,4 +510,101 @@ async def test_review_welcome_refuses_unverified_interval(interval: object) -> N
                 token=_TOKEN,
                 participant_id="voice-review",
                 capabilities=("voice_review",),
+            )
+
+
+_ATTESTATION = RuntimeAttestation(
+    pid=1,
+    hermes_version="0.21.0",
+    hermes_commit="0123456789abcdef0123456789abcdef01234567",
+    realtime_version="0.0.3",
+    realtime_install="wheel",
+)
+
+
+@pytest.mark.asyncio
+async def test_the_welcome_attests_the_runtime_only_when_asked() -> None:
+    async with _server(voice=_ReviewVoice(), runtime=_ATTESTATION) as server:
+        asked = await _hello(server, _valid_hello(capabilities=["runtime_attestation"]))
+        unasked = await _hello(server, _valid_hello())
+
+    assert asked == {
+        "ok": True,
+        "protocol_version": "0.3",
+        "capabilities": ["runtime_attestation"],
+        "runtime": _ATTESTATION.model_dump(mode="json"),
+    }
+    assert unasked == {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]}
+
+
+@pytest.mark.asyncio
+async def test_a_bridge_without_an_attestation_never_offers_one() -> None:
+    async with _server(voice=_ReviewVoice()) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="voice-review",
+            capabilities=("voice_review", "runtime_attestation"),
+        )
+        async with client:
+            assert client.capabilities == frozenset({"voice_review"})
+            assert client.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_the_client_holds_the_attested_runtime() -> None:
+    async with _server(voice=_ReviewVoice(), runtime=_ATTESTATION) as server:
+        client = await LocalHermesBridgeClient.connect(
+            host=server.host,
+            port=server.port,
+            token=_TOKEN,
+            participant_id="real-hermes-gate",
+            capabilities=("voice_archive", "voice_review", "runtime_attestation"),
+        )
+        async with client:
+            assert client.capabilities == frozenset(
+                {"voice_archive", "voice_review", "runtime_attestation"}
+            )
+            assert client.runtime == _ATTESTATION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "welcome",
+    [
+        pytest.param(
+            {"ok": True, "protocol_version": "0.3", "capabilities": ["runtime_attestation"]},
+            id="negotiated-without-runtime",
+        ),
+        pytest.param(
+            {
+                "ok": True,
+                "protocol_version": "0.3",
+                "capabilities": [],
+                "runtime": _ATTESTATION.model_dump(mode="json"),
+            },
+            id="runtime-not-negotiated",
+        ),
+        pytest.param(
+            {
+                "ok": True,
+                "protocol_version": "0.3",
+                "capabilities": ["runtime_attestation"],
+                "runtime": _ATTESTATION.model_dump(mode="json") | {"pid": "1"},
+            },
+            id="malformed-runtime",
+        ),
+    ],
+)
+async def test_the_client_refuses_an_unverified_attestation(welcome: object) -> None:
+    server, port = await _fake_companion(welcome)
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await LocalHermesBridgeClient.connect(
+                host="127.0.0.1",
+                port=port,
+                token=_TOKEN,
+                participant_id="real-hermes-gate",
+                capabilities=("runtime_attestation",),
             )

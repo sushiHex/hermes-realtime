@@ -301,7 +301,11 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
 BRIDGE_PROTOCOL_VERSION = "0.3"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
-BRIDGE_CAPABILITIES = frozenset({VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY})
+# A welcome that negotiates it carries ``runtime``: what the serving process loaded.
+RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
+BRIDGE_CAPABILITIES = frozenset(
+    {VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, RUNTIME_ATTESTATION_CAPABILITY}
+)
 VOICE_MAX_BATCH_ROWS = 256
 VOICE_MAX_TEXT_CHARS = 65_536
 _VOICE_MAX_IDENTITY = 2**53 - 1
@@ -497,6 +501,26 @@ class VoiceReviewRefusedEvent(_VoiceRange):
     type: Literal["voice_review_refused"]
     closing: bool
     category: VoiceRefusalCategory
+
+
+_AttestedVersion = Annotated[
+    str, StringConstraints(min_length=1, max_length=64, pattern=r"^[0-9A-Za-z.+_-]+$")
+]
+
+
+class RuntimeAttestation(StrictModel):
+    """What the process serving the companion loaded, captured once when it loaded the plugin.
+
+    ``hermes_commit`` is the checkout's detached commit, or ``unknown``. ``realtime_install``
+    says where the imported ``hermes_realtime`` came from: the Hermes install's environment
+    (``wheel``), an editable install in it (``editable``), or anywhere else (``elsewhere``).
+    """
+
+    pid: Annotated[int, Field(ge=1, le=_VOICE_MAX_IDENTITY)]
+    hermes_version: _AttestedVersion
+    hermes_commit: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|unknown)$")]
+    realtime_version: _AttestedVersion
+    realtime_install: Literal["wheel", "editable", "elsewhere"]
 
 
 VoiceEvent: TypeAlias = Annotated[
