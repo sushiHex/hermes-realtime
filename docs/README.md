@@ -15,6 +15,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 
 | Area | Guide |
 | --- | --- |
+| Desktop MVP setup and diagnostic session | [Desktop MVP](desktop-mvp-diagnostic.md) |
 | Host, browser, and media composition | [Local LiveKit and full-host setup](local-livekit.md) |
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Dependency upgrades, security assessment, and serial landing | [Dependency maintenance](dependency-maintenance.md) |
