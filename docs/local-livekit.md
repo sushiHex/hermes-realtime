@@ -358,8 +358,10 @@ in the same `.env`, run the gate with the install's own interpreter from the rep
 & "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" scripts\real_hermes_api_gate.py
 ```
 
-It dispatches real work, so the gateway's model is called. See
-[`hermes-bridge.md`](hermes-bridge.md) for what it checks and records.
+It dispatches real work, so the gateway's model is called. Restart the gateway after installing
+or updating either Hermes or `hermes-realtime`: the gate refuses a gateway still running what it
+loaded before (`restart_gateway`). See [`hermes-bridge.md`](hermes-bridge.md) for what it checks,
+what it records and what it does not prove.
 
 ### Launch
 
