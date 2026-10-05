@@ -41,7 +41,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
 
 def _archive(**overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.3",
+        "protocol_version": "0.4",
         "type": "voice_archive",
         "conversation_id": "conv_1-a",
         "generation": 0,
@@ -55,7 +55,7 @@ def _archive(**overrides: Any) -> dict[str, Any]:
 
 def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.3",
+        "protocol_version": "0.4",
         "type": kind,
         "conversation_id": "conv",
         "generation": 0,
@@ -66,13 +66,13 @@ def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     return event
 
 
-def test_the_bridge_is_version_0_3_and_offers_archive_review_and_attestation() -> None:
-    assert BRIDGE_PROTOCOL_VERSION == "0.3"
+def test_the_bridge_is_version_0_4_and_offers_archive_review_memory_and_attestation() -> None:
+    assert BRIDGE_PROTOCOL_VERSION == "0.4"
     assert VOICE_ARCHIVE_CAPABILITY == "voice_archive"
     assert VOICE_REVIEW_CAPABILITY == "voice_review"
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
     assert (
-        frozenset({"voice_archive", "voice_review", "runtime_attestation"})
+        frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation"})
         == BRIDGE_CAPABILITIES
     )
 
@@ -123,6 +123,7 @@ def test_a_runtime_attestation_round_trips_exactly(install: str, commit: str, re
 def test_a_malformed_runtime_attestation_is_refused(overrides: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         RuntimeAttestation.model_validate(_attestation(**overrides))
+
 
 
 def test_a_voice_archive_round_trips_exactly_and_never_normalizes_text() -> None:

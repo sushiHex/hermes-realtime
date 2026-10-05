@@ -245,6 +245,7 @@ class ConversationInferenceRequest(ConversationContextSnapshot):
             messages=self.messages,
             active_tasks=self.active_tasks,
             terminal_task_count=self.terminal_task_count,
+            memory=self.memory,
         )
 
 
@@ -862,6 +863,7 @@ class StreamingSpeechLoop:
                         messages=source_snapshot.messages,
                         active_tasks=source_snapshot.active_tasks,
                         terminal_task_count=source_snapshot.terminal_task_count,
+                        memory=source_snapshot.memory,
                         updates=updates,
                     )
                     committed_conversation_context_snapshot = (

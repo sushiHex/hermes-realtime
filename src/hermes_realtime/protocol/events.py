@@ -298,14 +298,16 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
 # rows and gaps, which role may carry a gap or a flag) are the companion's, which answers
 # them with a category refusal rather than a dropped connection.
 
-BRIDGE_PROTOCOL_VERSION = "0.3"
+BRIDGE_PROTOCOL_VERSION = "0.4"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
+VOICE_MEMORY_CAPABILITY = "voice_memory"
 # A welcome that negotiates it carries ``runtime``: what the serving process loaded.
 RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
-BRIDGE_CAPABILITIES = frozenset(
-    {VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, RUNTIME_ATTESTATION_CAPABILITY}
-)
+BRIDGE_CAPABILITIES = frozenset({
+    VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, VOICE_MEMORY_CAPABILITY,
+    RUNTIME_ATTESTATION_CAPABILITY,
+})
 VOICE_MAX_BATCH_ROWS = 256
 VOICE_MAX_TEXT_CHARS = 65_536
 _VOICE_MAX_IDENTITY = 2**53 - 1
@@ -438,7 +440,7 @@ class VoiceArchiveRow(StrictModel):
 
 class _VoiceRange(StrictModel):
     # Explicit on every voice event: the work events stay at "0.1".
-    protocol_version: Literal["0.3"]
+    protocol_version: Literal["0.4"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
     seq_from: VoiceIdentity
@@ -525,13 +527,51 @@ class RuntimeAttestation(StrictModel):
     realtime_record: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{64}|unknown)$")]
 
 
+class VoiceMemoryEvent(StrictModel):
+    """Subscribe to fresh profile memory for one foreground conversation binding."""
+
+    protocol_version: Literal["0.4"]
+    type: Literal["voice_memory"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+
+
+class VoiceMemorySnapshotEvent(StrictModel):
+    protocol_version: Literal["0.4"]
+    type: Literal["voice_memory_snapshot"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+    revision: VoiceIdentity
+    memory: str
+    user: str
+    truncated: bool
+
+    @model_validator(mode="after")
+    def require_bounded_memory(self) -> VoiceMemorySnapshotEvent:
+        from hermes_realtime.memory import BuiltinMemorySnapshot
+
+        BuiltinMemorySnapshot(self.memory, self.user, self.truncated)
+        return self
+
+
+class VoiceMemoryRefusedEvent(StrictModel):
+    protocol_version: Literal["0.4"]
+    type: Literal["voice_memory_refused"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+    category: VoiceRefusalCategory
+
+
 VoiceEvent: TypeAlias = Annotated[
     VoiceArchiveEvent
     | VoiceArchiveAckEvent
     | VoiceArchiveRefusedEvent
     | VoiceReviewEvent
     | VoiceReviewAckEvent
-    | VoiceReviewRefusedEvent,
+    | VoiceReviewRefusedEvent
+    | VoiceMemoryEvent
+    | VoiceMemorySnapshotEvent
+    | VoiceMemoryRefusedEvent,
     Field(discriminator="type"),
 ]
 _VOICE_ADAPTER: TypeAdapter[VoiceEvent] = TypeAdapter(VoiceEvent)
@@ -543,6 +583,9 @@ VOICE_EVENT_TYPES = frozenset(
         "voice_review",
         "voice_review_ack",
         "voice_review_refused",
+        "voice_memory",
+        "voice_memory_snapshot",
+        "voice_memory_refused",
     }
 )
 

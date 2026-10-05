@@ -60,7 +60,7 @@ def _row(seq: int, role: str = "user", **overrides: Any) -> VoiceArchiveRow:
 
 def _event(rows: list[VoiceArchiveRow], seq_from: int = 0, conversation: str = "conv") -> Any:
     return VoiceArchiveEvent(
-        protocol_version="0.3",
+        protocol_version="0.4",
         type="voice_archive",
         conversation_id=conversation,
         generation=0,
@@ -96,7 +96,7 @@ class _AcceptingReview:
 
 def _review_event(conversation_id: str) -> VoiceReviewEvent:
     return VoiceReviewEvent(
-        protocol_version="0.3", type="voice_review", conversation_id=conversation_id,
+        protocol_version="0.4", type="voice_review", conversation_id=conversation_id,
         generation=0, seq_from=0, seq_through=0, memory=True, skills=True,
         closing=False,
     )
@@ -324,7 +324,7 @@ async def test_an_archive_is_committed_then_acknowledged_with_its_exact_range(
         )
         reply = await service.archive(event)
         assert reply == VoiceArchiveAckEvent(
-            protocol_version="0.3",
+            protocol_version="0.4",
             type="voice_archive_ack", conversation_id="conv", generation=0, seq_from=0,
             seq_through=4,
         )

@@ -1,4 +1,4 @@
-"""Bridge protocol 0.3: the capability hello and voice archive routing."""
+"""Bridge protocol 0.4: the capability hello and voice archive routing."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def _server(
 
 def _batch(seq_through: int = 1) -> VoiceArchiveEvent:
     return VoiceArchiveEvent(
-        protocol_version="0.3",
+        protocol_version="0.4",
         type="voice_archive",
         conversation_id="conv",
         generation=0,
@@ -96,7 +96,7 @@ class _Voice:
     ) -> VoiceArchiveAckEvent | VoiceArchiveRefusedEvent | None:
         self.events.append(event)
         fields: dict[str, Any] = {
-            "protocol_version": "0.3",
+            "protocol_version": "0.4",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
             "seq_from": event.seq_from,
@@ -123,7 +123,7 @@ class _ReviewVoice(_Voice):
     ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None:
         self.reviews.append(event)
         return VoiceReviewAckEvent(
-            protocol_version="0.3",
+            protocol_version="0.4",
             type="voice_review_ack",
             conversation_id=event.conversation_id,
             generation=event.generation,
@@ -149,7 +149,7 @@ def _valid_hello(**overrides: object) -> dict[str, object]:
     hello: dict[str, object] = {
         "token": _TOKEN,
         "participant_id": "voice-archive",
-        "protocol_version": "0.3",
+        "protocol_version": "0.4",
         "capabilities": ["voice_archive"],
     }
     hello.update(overrides)
@@ -246,12 +246,12 @@ async def test_the_welcome_names_the_version_and_the_offered_capabilities() -> N
     async with _server(voice=_Voice()) as server:
         assert await _hello(server, _valid_hello()) == {
             "ok": True,
-            "protocol_version": "0.3",
+            "protocol_version": "0.4",
             "capabilities": ["voice_archive"],
         }
         assert await _hello(server, _valid_hello(capabilities=[])) == {
             "ok": True,
-            "protocol_version": "0.3",
+            "protocol_version": "0.4",
             "capabilities": [],
         }
 
@@ -295,7 +295,7 @@ async def test_review_is_private_and_welcome_binds_verified_interval() -> None:
             assert client.capabilities == frozenset({"voice_review"})
             assert client.review_interval == 10
             event = VoiceReviewEvent(
-                protocol_version="0.3",
+                protocol_version="0.4",
                 type="voice_review",
                 conversation_id="conv",
                 generation=0,
@@ -327,7 +327,7 @@ async def test_review_without_negotiated_capability_never_reaches_companion() ->
         )
         try:
             event = VoiceReviewEvent(
-                protocol_version="0.3",
+                protocol_version="0.4",
                 type="voice_review",
                 conversation_id="conv",
                 generation=0,
@@ -353,7 +353,7 @@ async def test_raw_unnegotiated_review_is_rejected_before_service() -> None:
         await writer.drain()
         assert json.loads(await reader.readline())["capabilities"] == []
         event = VoiceReviewEvent(
-            protocol_version="0.3",
+            protocol_version="0.4",
             type="voice_review",
             conversation_id="conv",
             generation=0,
@@ -388,7 +388,7 @@ async def test_client_guard_sends_zero_unnegotiated_review_bytes() -> None:
     writer = Writer()
     client = LocalHermesBridgeClient(reader, writer)  # type: ignore[arg-type]
     event = VoiceReviewEvent(
-        protocol_version="0.3",
+        protocol_version="0.4",
         type="voice_review",
         conversation_id="conv",
         generation=0,
@@ -473,11 +473,11 @@ async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
             {"ok": True, "protocol_version": "0.2", "capabilities": []}, id="wrong-version"
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]},
+            {"ok": True, "protocol_version": "0.4", "capabilities": ["voice_archive"]},
             id="unrequested-capability",
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": [], "x": 1}, id="extra-key"
+            {"ok": True, "protocol_version": "0.4", "capabilities": [], "x": 1}, id="extra-key"
         ),
         pytest.param({"ok": False}, id="refused"),
     ],
@@ -497,7 +497,7 @@ async def test_review_welcome_refuses_unverified_interval(interval: object) -> N
     server, port = await _fake_companion(
         {
             "ok": True,
-            "protocol_version": "0.3",
+            "protocol_version": "0.4",
             "capabilities": ["voice_review"],
             "review_interval": interval,
         }
@@ -531,11 +531,11 @@ async def test_the_welcome_attests_the_runtime_only_when_asked() -> None:
 
     assert asked == {
         "ok": True,
-        "protocol_version": "0.3",
+        "protocol_version": "0.4",
         "capabilities": ["runtime_attestation"],
         "runtime": _ATTESTATION.model_dump(mode="json"),
     }
-    assert unasked == {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]}
+    assert unasked == {"ok": True, "protocol_version": "0.4", "capabilities": ["voice_archive"]}
 
 
 @pytest.mark.asyncio
@@ -575,13 +575,13 @@ async def test_the_client_holds_the_attested_runtime() -> None:
     "welcome",
     [
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": ["runtime_attestation"]},
+            {"ok": True, "protocol_version": "0.4", "capabilities": ["runtime_attestation"]},
             id="negotiated-without-runtime",
         ),
         pytest.param(
             {
                 "ok": True,
-                "protocol_version": "0.3",
+                "protocol_version": "0.4",
                 "capabilities": [],
                 "runtime": _ATTESTATION.model_dump(mode="json"),
             },
@@ -590,7 +590,7 @@ async def test_the_client_holds_the_attested_runtime() -> None:
         pytest.param(
             {
                 "ok": True,
-                "protocol_version": "0.3",
+                "protocol_version": "0.4",
                 "capabilities": ["runtime_attestation"],
                 "runtime": _ATTESTATION.model_dump(mode="json") | {"pid": "1"},
             },

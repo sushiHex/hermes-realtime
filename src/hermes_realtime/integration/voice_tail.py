@@ -724,6 +724,13 @@ class VoiceTailWriter:
     def conversation_id(self) -> str:
         return self._conversation_id
 
+    @property
+    def binding(self) -> tuple[str, int]:
+        """The exact conversation identity restored or created by an open tail."""
+        if self._owner is None:
+            raise RuntimeError("voice tail binding is available only while open")
+        return self._conversation_id, self._generation
+
     def _batch(self) -> ArchiveBatch:
         rows = tuple(self._outbox[: self._frozen])
         head = rows[0]

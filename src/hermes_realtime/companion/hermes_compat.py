@@ -22,6 +22,8 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -49,8 +51,11 @@ from hermes_realtime.companion.review import (
     ReviewRequest,
 )
 from hermes_realtime.companion.store import ConversationRecord
+from hermes_realtime.memory import MEMORY_MAX_BLOCK_BYTES, BuiltinMemorySnapshot
 
 HERMES_MODULE = "hermes_state"
+_MEMORY_FILE_BYTES = 16_384
+_MEMORY_TRUNCATED_MARKER = "[truncated]"
 
 
 class SurfaceName(NamedTuple):
@@ -144,6 +149,21 @@ REVIEW_SURFACE: tuple[SurfaceName, ...] = (
     SurfaceName("run_agent.AIAgent._session_json_enabled", None),
     SurfaceName("agent.credential_pool.CredentialPool.provider", None),
 )
+MEMORY_SURFACE: tuple[SurfaceName, ...] = (
+    SurfaceName("tools.memory_tool.get_memory_dir", ()),
+    SurfaceName("tools.memory_tool.get_builtin_memory_store_flags", ("config",)),
+    SurfaceName("tools.memory_tool.ENTRY_DELIMITER", None),
+    SurfaceName(
+        "tools.memory_tool.MemoryStore.__init__",
+        ("self", "memory_char_limit", "user_char_limit", "memory_enabled", "user_profile_enabled"),
+    ),
+    SurfaceName("tools.memory_tool.MemoryStore._parse_entries", ("raw",)),
+    SurfaceName(
+        "tools.memory_tool.MemoryStore._sanitize_entries_for_snapshot",
+        ("entries", "filename"),
+    ),
+    SurfaceName("tools.memory_tool.MemoryStore._render_block", ("self", "target", "entries")),
+)
 REVIEW_INSTANCE_FIELDS = frozenset({
     "run_agent.AIAgent.session_id", "run_agent.AIAgent.enabled_toolsets",
     "run_agent.AIAgent.disabled_toolsets", "run_agent.AIAgent.tools",
@@ -159,7 +179,7 @@ _REVIEW_MODULES = frozenset({
     "hermes_cli.managed_scope", "run_agent", "model_tools", "gateway.run", "hermes_constants",
     "tools.memory_tool", "agent.credential_pool",
 })
-SURFACE = ARCHIVE_SURFACE + REVIEW_SURFACE
+SURFACE = ARCHIVE_SURFACE + REVIEW_SURFACE + MEMORY_SURFACE
 # The table shapes the projection relies on, bound by equality to the pin: every messages
 # column (the fingerprint covers them all), and every sessions column (a new one could carry
 # lineage or state the header does not bind).
@@ -186,6 +206,7 @@ if not {*HEADER_COLUMNS, "message_count"} <= SESSION_TABLE_COLUMNS:
 
 _LISTED = frozenset(entry.name for entry in SURFACE)
 _REVIEW_LISTED = frozenset(entry.name for entry in REVIEW_SURFACE)
+_MEMORY_LISTED = frozenset(entry.name for entry in MEMORY_SURFACE)
 _ROW_SQL = (
     f"SELECT {', '.join(MESSAGE_COLUMNS)} FROM messages "
     "WHERE session_id = ? ORDER BY id ASC LIMIT ?"
@@ -202,7 +223,7 @@ class CompatError(LookupError):
 
 
 def _lookup(name: str) -> Any:
-    if name in _REVIEW_LISTED:
+    if name in _REVIEW_LISTED or name in _MEMORY_LISTED:
         for module_name in sorted(_REVIEW_MODULES, key=len, reverse=True):
             if name.startswith(module_name + "."):
                 review_target = importlib.import_module(module_name)
@@ -219,7 +240,7 @@ def _lookup(name: str) -> Any:
 def resolve(name: str) -> Any:
     """Look up one listed Hermes name; an unlisted one is refused before any import."""
 
-    if name not in _LISTED and name not in _REVIEW_LISTED:
+    if name not in _LISTED:
         raise CompatError("Hermes name is not on the enumerated surface")
     return _lookup(name)
 
@@ -269,6 +290,23 @@ def check_review_surface() -> tuple[str, ...]:
                 actual = tuple(inspect.signature(target).parameters)
                 if actual != entry.parameters:
                     failures.append(f"signature:{entry.name}")
+        except (ImportError, AttributeError, TypeError, ValueError):
+            failures.append(f"missing:{entry.name}")
+    return tuple(failures)
+
+
+def check_memory_surface() -> tuple[str, ...]:
+    """Refuse a changed pinned built-in memory reader."""
+
+    failures: list[str] = []
+    for entry in MEMORY_SURFACE:
+        try:
+            target = _lookup(entry.name)
+            if (
+                entry.parameters is not None
+                and tuple(inspect.signature(target).parameters) != entry.parameters
+            ):
+                failures.append(f"signature:{entry.name}")
         except (ImportError, AttributeError, TypeError, ValueError):
             failures.append(f"missing:{entry.name}")
     return tuple(failures)
@@ -849,6 +887,177 @@ class HermesArchivePort:
                 "enabled": memory.get("enabled", True) is True
                 and task_cfg.get("enabled", True) is True,
             })
+        except ArchiveRefusal:
+            raise
+        except Exception:
+            raise ArchiveRefusal("configuration") from None
+
+    @staticmethod
+    def _bounded_memory_source(
+        path: Path,
+    ) -> tuple[bytes, tuple[int, int, int, int]] | None:
+        """Read only a bounded prefix of one regular file and bind it to its identity."""
+
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode):
+            raise ArchiveRefusal("configuration")
+        with path.open("rb") as source:
+            opened = os.fstat(source.fileno())
+            raw = source.read(_MEMORY_FILE_BYTES + 1)
+        after = path.lstat()
+        def identity(value: os.stat_result) -> tuple[int, int, int, int]:
+            return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or identity(before) != identity(opened)
+            or identity(before) != identity(after)
+            or len(raw) != min(before.st_size, _MEMORY_FILE_BYTES + 1)
+        ):
+            raise ArchiveRefusal("configuration")
+        return raw, identity(after)
+
+    @staticmethod
+    def _memory_text(raw: bytes) -> tuple[str, bool]:
+        truncated = len(raw) > _MEMORY_FILE_BYTES
+        prefix = raw[:_MEMORY_FILE_BYTES]
+        try:
+            return prefix.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"), truncated
+        except UnicodeDecodeError as error:
+            if not (
+                truncated
+                and error.reason == "unexpected end of data"
+                and error.end == len(prefix)
+            ):
+                raise ArchiveRefusal("configuration") from None
+            return (
+                prefix[:error.start].decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"),
+                True,
+            )
+
+    @staticmethod
+    def _native_memory_block(
+        store: Any, target: str, filename: str, raw: bytes,
+        char_limit: int, delimiter: str,
+    ) -> tuple[str, bool]:
+        text, source_truncated = HermesArchivePort._memory_text(raw)
+        entries = resolve("tools.memory_tool.MemoryStore._parse_entries")(text)
+        if type(entries) is not list or any(type(entry) is not str for entry in entries):
+            raise ArchiveRefusal("incompatible")
+        unique = list(dict.fromkeys(entries))
+        sanitized = resolve("tools.memory_tool.MemoryStore._sanitize_entries_for_snapshot")(
+            unique, filename
+        )
+        if type(sanitized) is not list or any(type(entry) is not str for entry in sanitized):
+            raise ArchiveRefusal("incompatible")
+        render = resolve("tools.memory_tool.MemoryStore._render_block")
+        content = delimiter.join(sanitized)
+        truncated = source_truncated or len(content) > char_limit
+        if not truncated:
+            block = render(store, target, sanitized)
+            if type(block) is not str:
+                raise ArchiveRefusal("incompatible")
+            if len(block.encode("utf-8")) <= MEMORY_MAX_BLOCK_BYTES:
+                return block, False
+            truncated = True
+        if char_limit < len(_MEMORY_TRUNCATED_MARKER):
+            raise ArchiveRefusal("configuration")
+        high = min(len(content), char_limit - len(_MEMORY_TRUNCATED_MARKER))
+        best: str | None = None
+        low = 0
+        while low <= high:
+            middle = (low + high) // 2
+            block = render(store, target, [content[:middle] + _MEMORY_TRUNCATED_MARKER])
+            if type(block) is not str:
+                raise ArchiveRefusal("incompatible")
+            if len(block.encode("utf-8")) <= MEMORY_MAX_BLOCK_BYTES:
+                best = block
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is None:
+            raise ArchiveRefusal("configuration")
+        return best, True
+
+    def read_builtin_memory(self) -> BuiltinMemorySnapshot:
+        """Return fresh, bounded built-in memory under the bound Hermes profile."""
+
+        if check_memory_surface():
+            raise ArchiveRefusal("incompatible")
+        try:
+            with self._review_scope():
+                home = self._review_home()
+                if resolve("hermes_constants.get_hermes_home")().resolve() != home:
+                    raise ArchiveRefusal("configuration")
+                config_signature = self._config_signature()
+                config = resolve("hermes_cli.config.load_config_readonly")()
+                if type(config) is not dict:
+                    raise ArchiveRefusal("configuration")
+                memory_config = config.get("memory", {})
+                if type(memory_config) is not dict:
+                    raise ArchiveRefusal("configuration")
+                flags = resolve("tools.memory_tool.get_builtin_memory_store_flags")(
+                    config
+                )
+                if (
+                    type(flags) is not tuple or len(flags) != 2
+                    or any(type(flag) is not bool for flag in flags)
+                ):
+                    raise ArchiveRefusal("incompatible")
+                memory_limit = memory_config.get("memory_char_limit", 2200)
+                user_limit = memory_config.get("user_char_limit", 1375)
+                if any(
+                    type(limit) is not int or not 1 <= limit <= 1_000_000
+                    for limit in (memory_limit, user_limit)
+                ):
+                    raise ArchiveRefusal("configuration")
+                memory_dir = resolve("tools.memory_tool.get_memory_dir")()
+                expected_dir = home / "memories"
+                if (
+                    type(memory_dir) is not type(Path())
+                    or memory_dir != expected_dir
+                    or memory_dir.resolve() != expected_dir
+                ):
+                    raise ArchiveRefusal("configuration")
+                delimiter = resolve("tools.memory_tool.ENTRY_DELIMITER")
+                if type(delimiter) is not str or not delimiter:
+                    raise ArchiveRefusal("incompatible")
+                store = resolve("tools.memory_tool.MemoryStore")(
+                    memory_char_limit=memory_limit,
+                    user_char_limit=user_limit,
+                    memory_enabled=flags[0],
+                    user_profile_enabled=flags[1],
+                )
+                if type(store) is not resolve("tools.memory_tool.MemoryStore"):
+                    raise ArchiveRefusal("incompatible")
+                sources: list[tuple[Path, tuple[bytes, tuple[int, int, int, int]] | None]] = []
+                blocks: list[str] = []
+                truncated = False
+                for enabled, target, filename, limit in (
+                    (flags[0], "memory", "MEMORY.md", memory_limit),
+                    (flags[1], "user", "USER.md", user_limit),
+                ):
+                    if not enabled:
+                        blocks.append("")
+                        continue
+                    path = memory_dir / filename
+                    source = self._bounded_memory_source(path)
+                    sources.append((path, source))
+                    block, cut = self._native_memory_block(
+                        store, target, filename,
+                        b"" if source is None else source[0],
+                        limit, delimiter,
+                    )
+                    blocks.append(block)
+                    truncated = truncated or cut
+                for path, source in sources:
+                    if self._bounded_memory_source(path) != source:
+                        raise ArchiveRefusal("configuration")
+                if self._config_signature() != config_signature:
+                    raise ArchiveRefusal("configuration")
+                return BuiltinMemorySnapshot(blocks[0], blocks[1], truncated)
         except ArchiveRefusal:
             raise
         except Exception:

@@ -151,14 +151,14 @@ Paths that differ only in case are exempt from the tracked-changes refusal on a
 case-insensitive checkout only while their one file on disk matches one of their committed
 versions: `29112bef` tracks such paths, and Windows can hold only one of each.
 
-## Protocol 0.3: the hello, voice archive and review
+## Protocol 0.4: the hello, voice archive, review and memory
 
 The hello is exactly
-`{"token", "participant_id", "protocol_version": "0.3", "capabilities": [...]}`. The server
-answers `{"ok": true, "protocol_version": "0.3", "capabilities": [...]}` with the requested
+`{"token", "participant_id", "protocol_version": "0.4", "capabilities": [...]}`. The server
+answers `{"ok": true, "protocol_version": "0.4", "capabilities": [...]}` with the requested
 capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
 repeated capability, or with any other key, is refused. The voice capabilities are
-`voice_archive` and `voice_review`, offered by the ready companion. A welcome that
+`voice_archive`, `voice_review` and `voice_memory`, offered by the ready companion. A welcome that
 negotiates review also carries its profile's bounded `review_interval`. Realtime
 sends no voice event on a connection whose welcome did not list it, and the server closes a
 connection that sends one anyway. A voice connection carries voice events only. A refused
@@ -180,9 +180,36 @@ additive, so existing clients and servers are unchanged; a plugin that predates 
 hello, since the capability is unknown to it.
 
 Versions are mixed on purpose: the hello and every voice event name `protocol_version`
-`"0.3"` explicitly (a voice event without it is refused), while the work events
+`"0.4"` explicitly (a voice event without it is refused), while the work events
 (`work.*`, `control.*`) keep `"0.1"`. The two event families parse separately, and
 neither parser accepts the other's events.
+
+Memory uses a dedicated subscription connection. One
+`voice_memory{conversation_id, generation}` request receives ordered
+`voice_memory_snapshot{conversation_id, generation, revision, memory, user, truncated}`
+events. Each block is capped at 4,096 UTF-8 bytes. A
+`voice_memory_refused{conversation_id, generation, category}` event clears the foreground
+snapshot. Revisions order snapshots within a connection, not across companion restarts.
+The companion reads its bound profile through Hermes's native memory parser, sanitizer
+and renderer at subscription open and after a review finishes. Reads use bounded file
+input, Hermes's configured character limits and the rendered byte cap. Oversize input
+keeps a deterministic prefix and reports truncation.
+
+The foreground never waits for this read on a turn. It uses the latest received snapshot
+as context data explicitly labelled untrusted. Memory does not add tool permissions;
+the broader authority criterion remains unmet as described below. A new
+conversation can read before its first archived row without creating an archive session.
+An existing binding must be verified and ready. Quarantine, generation changes, refusal
+and connection loss clear memory. Missing or unsupported capability leaves voice running
+without memory; no periodic refresh or second durable memory store is introduced.
+
+**Qualification limit:** ADR criterion 17 is not established. The memory path adds no
+tool permissions, but the existing foreground adapter accepts valid advertised model
+tool calls without a deterministic check against the user's current request. The M4
+stand-in qualification observes one dispatch and one cancellation when it forces those
+calls on a neutral-user turn. Its overall result must remain failed while that authority
+criterion is unmet. This is evidence about the execution boundary, not evidence that a
+production model will follow the adversarial memory entry.
 
 `voice_archive{conversation_id, generation, seq_from, seq_through, rows[{seq, role, text,
 interrupted, ts, gap_before}]}` is answered on the same connection by

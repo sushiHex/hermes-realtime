@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.speech import (
     DeliveredSpeechConfirmation,
     DeliveredSpeechLedger,
@@ -134,6 +135,7 @@ class ConversationContextSnapshot:
     messages: tuple[ConversationMessage, ...]
     active_tasks: tuple[ActiveTaskSummary, ...]
     terminal_task_count: int = 0
+    memory: BuiltinMemorySnapshot | None = None
 
     def __post_init__(self) -> None:
         if type(self.revision) is not int:
@@ -158,6 +160,8 @@ class ConversationContextSnapshot:
             raise ValueError("snapshot message capacity exceeds supported maximum")
         if len(self.active_tasks) > _MAX_ACTIVE_TASKS_LIMIT:
             raise ValueError("snapshot task capacity exceeds supported maximum")
+        if self.memory is not None and type(self.memory) is not BuiltinMemorySnapshot:
+            raise TypeError("snapshot memory must be an exact BuiltinMemorySnapshot or None")
         messages = tuple(
             ConversationMessage(
                 role=message.role,
@@ -172,6 +176,16 @@ class ConversationContextSnapshot:
         )
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "active_tasks", active_tasks)
+        if self.memory is not None:
+            object.__setattr__(
+                self,
+                "memory",
+                BuiltinMemorySnapshot(
+                    memory=self.memory.memory,
+                    user=self.memory.user,
+                    truncated=self.memory.truncated,
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +274,7 @@ class ConversationContextStore:
         self._seen_task_ids: set[str] = set()
         self._seen_run_ids: set[str] = set()
         self._terminal_task_count = 0
+        self._memory: BuiltinMemorySnapshot | None = None
         self._pending_task_admissions_by_object_id: dict[
             int,
             tuple[TaskAdmission, str, str],
@@ -649,7 +664,25 @@ class ConversationContextStore:
                 for task in self._active_tasks.values()
             ),
             terminal_task_count=self._terminal_task_count,
+            memory=self._memory,
         )
+
+    def set_memory(self, memory: BuiltinMemorySnapshot | None) -> None:
+        """Replace model-visible reference data without changing heard history."""
+        if memory is not None and type(memory) is not BuiltinMemorySnapshot:
+            raise TypeError("memory must be an exact BuiltinMemorySnapshot or None")
+        copied = (
+            None
+            if memory is None
+            else BuiltinMemorySnapshot(
+                memory=memory.memory,
+                user=memory.user,
+                truncated=memory.truncated,
+            )
+        )
+        if copied != self._memory:
+            self._memory = copied
+            self._revision += 1
 
     def _append(self, role: ConversationRole, text: str) -> None:
         self._validate_text(text)

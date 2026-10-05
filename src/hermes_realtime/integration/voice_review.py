@@ -179,7 +179,7 @@ class VoiceReviewSender:
                     except TimeoutError:
                         continue
                     event = VoiceReviewEvent(
-                        protocol_version="0.3",
+                        protocol_version="0.4",
                         type="voice_review",
                         conversation_id=request.conversation_id,
                         generation=request.generation,

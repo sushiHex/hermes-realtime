@@ -19,6 +19,7 @@ from hermes_realtime.conversation import (
     UpdateDirective,
     UpdatePolicyInput,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.protocol import (
     ControlCancelAcknowledgedEvent,
     ControlCancelEvent,
@@ -29,6 +30,26 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkTerminalStatus,
 )
+
+
+def test_update_policy_snapshot_keeps_memory_separate_from_task_authority() -> None:
+    source = BuiltinMemorySnapshot(memory="A previous preference.", user="Ari")
+    policy_input = UpdatePolicyInput(
+        sequence=1,
+        completion=TaskTerminalOutcome(
+            task_id="task_report", status="completed", summary="The report is ready."
+        ),
+        context=ConversationContextSnapshot(
+            revision=1, messages=(), active_tasks=(), memory=source
+        ),
+    )
+
+    assert policy_input.context.memory == source
+    assert policy_input.context.active_tasks == ()
+    object.__setattr__(source, "memory", "forged")
+    assert policy_input.context.memory == BuiltinMemorySnapshot(
+        memory="A previous preference.", user="Ari"
+    )
 
 
 class QueuedCompletionSource:

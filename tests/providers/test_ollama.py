@@ -15,7 +15,37 @@ from hermes_realtime.conversation import (
     ConversationInferenceRequest,
     ConversationMessage,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import OllamaStreamingInference
+
+
+def test_ollama_renders_memory_as_separate_untrusted_context() -> None:
+    snapshot = ConversationInferenceRequest(
+        revision=1,
+        messages=(
+            ConversationMessage(role="user", text="Earlier question."),
+            ConversationMessage(role="assistant", text="Earlier answer."),
+            ConversationMessage(role="user", text="What do I prefer?"),
+        ),
+        active_tasks=(),
+        memory=BuiltinMemorySnapshot(memory="Prefers concise replies.", user="Ari"),
+    )
+
+    copied = OllamaStreamingInference._trusted_snapshot(snapshot)
+    messages = OllamaStreamingInference._messages(copied)
+
+    assert len(messages) == 4
+    assert messages[:2] == [
+        {"role": "user", "content": "Earlier question."},
+        {"role": "assistant", "content": "Earlier answer."},
+    ]
+    assert messages[2]["role"] == "user"
+    assert "Prefers concise replies." in messages[2]["content"]
+    assert "Ari" in messages[2]["content"]
+    assert "untrusted" in messages[2]["content"].lower()
+    assert "approval" in messages[2]["content"].lower()
+    assert "cancellation" in messages[2]["content"].lower()
+    assert messages[3] == {"role": "user", "content": "What do I prefer?"}
 
 
 class LineResponse:

@@ -1082,6 +1082,23 @@ async def test_open_is_one_shot_and_requires_an_exact_store(tmp_path: Path) -> N
         await writer.close()
 
 
+@pytest.mark.asyncio
+async def test_binding_is_available_only_while_tail_is_open(tmp_path: Path) -> None:
+    writer = VoiceTailWriter(
+        tmp_path / "voice-tail-v1.json", conversation_ids=lambda: "conversation_fixed"
+    )
+    with pytest.raises(RuntimeError, match="open"):
+        _ = writer.binding
+
+    await writer.open(ConversationContextStore(on_change=writer.update))
+    try:
+        assert writer.binding == ("conversation_fixed", 0)
+    finally:
+        await writer.close()
+    with pytest.raises(RuntimeError, match="open"):
+        _ = writer.binding
+
+
 @pytest.mark.parametrize("path", ["voice-tail-v1.json", b"voice-tail-v1.json", 1])
 def test_the_tail_path_must_be_an_exact_path(path: object) -> None:
     with pytest.raises(TypeError, match="path"):

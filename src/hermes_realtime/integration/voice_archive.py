@@ -67,7 +67,7 @@ def archive_event(batch: ArchiveBatch) -> VoiceArchiveEvent:
     """The wire form of a frozen batch: the same rows, byte for byte, every time."""
 
     return VoiceArchiveEvent(
-        protocol_version="0.3",
+        protocol_version="0.4",
         type="voice_archive",
         conversation_id=batch.conversation_id,
         generation=batch.generation,

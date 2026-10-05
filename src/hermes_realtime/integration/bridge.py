@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Self
@@ -23,6 +23,7 @@ from hermes_realtime.protocol import (
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
+    VOICE_MEMORY_CAPABILITY,
     VOICE_REVIEW_CAPABILITY,
     ControlCancelAcknowledgedEvent,
     ControlCancelEvent,
@@ -31,6 +32,9 @@ from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceMemoryEvent,
+    VoiceMemoryRefusedEvent,
+    VoiceMemorySnapshotEvent,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
@@ -77,6 +81,13 @@ class VoiceArchiveHandler(Protocol):
     async def review(
         self, event: VoiceReviewEvent
     ) -> VoiceReviewAckEvent | VoiceReviewRefusedEvent | None: ...
+
+    @property
+    def memory_available(self) -> bool: ...
+
+    def memory(
+        self, event: VoiceMemoryEvent,
+    ) -> AsyncIterator[VoiceMemorySnapshotEvent | VoiceMemoryRefusedEvent]: ...
 
 
 def _capabilities(value: object) -> frozenset[str] | None:
@@ -182,6 +193,9 @@ class LocalHermesBridgeServer:
             else frozenset()
         ) | (frozenset({RUNTIME_ATTESTATION_CAPABILITY}) if runtime is not None else frozenset())
         self._server: asyncio.Server | None = None
+        if (getattr(voice, "memory_available", False) is True
+                and callable(getattr(voice, "memory", None))):
+            self._offered |= frozenset({VOICE_MEMORY_CAPABILITY})
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe_completion: Callable[[], None] | None = None
         self._completion_tasks: set[asyncio.Task[WorkCompletedEvent | None]] = set()
@@ -559,6 +573,9 @@ class LocalHermesBridgeServer:
                 timeout=self._authentication_timeout,
             )
             while raw := await reader.readline():
+                if _event_type(raw) == "voice_memory":
+                    await self._route_memory(connection, negotiated, raw, reader)
+                    return
                 if _event_type(raw) in VOICE_EVENT_TYPES:
                     await self._route_voice(connection, negotiated, raw)
                     continue
@@ -726,6 +743,56 @@ class LocalHermesBridgeServer:
             if reply is None:
                 raise BridgeProtocolError("the voice outcome is unknown")
             await self._send_bytes(connection, reply.model_dump_json().encode("utf-8") + b"\n")
+
+    async def _route_memory(
+        self, connection: _Connection, negotiated: frozenset[str], raw: bytes,
+        reader: asyncio.StreamReader,
+    ) -> None:
+        event = parse_voice_event(raw)
+        voice = self._voice
+        if (VOICE_MEMORY_CAPABILITY not in negotiated or voice is None
+                or type(event) is not VoiceMemoryEvent):
+            raise BridgeProtocolError("memory capability was not negotiated")
+
+        async def publish() -> None:
+            async for reply in voice.memory(event):
+                if (type(reply) not in (VoiceMemorySnapshotEvent, VoiceMemoryRefusedEvent)
+                        or reply.conversation_id != event.conversation_id
+                        or reply.generation != event.generation):
+                    raise BridgeProtocolError("invalid memory response")
+                await self._send_bytes(connection, reply.model_dump_json().encode("utf-8") + b"\n")
+
+        producer = asyncio.create_task(publish())
+        self._handler_tasks.add(producer)
+
+        def forget_producer(task: asyncio.Task[None]) -> None:
+            self._handler_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        producer.add_done_callback(forget_producer)
+        disconnected = asyncio.create_task(reader.read(1))
+        try:
+            done, _ = await asyncio.wait(
+                (producer, disconnected), return_when=asyncio.FIRST_COMPLETED,
+            )
+            if producer in done:
+                producer.result()
+        finally:
+            producer.cancel()
+            disconnected.cancel()
+            joined, pending = await asyncio.wait(
+                (producer, disconnected), timeout=self._shutdown_timeout,
+            )
+            for task in joined:
+                if not task.cancelled():
+                    task.exception()
+            if pending:
+                logger.warning(
+                    "Hermes memory subscription retained %d task(s) after shutdown deadline",
+                    len(pending),
+                )
+                raise BridgeProtocolError("memory subscription did not stop")
 
     async def _send_bound(self, route: _Route, event: ProtocolEvent) -> bool:
         async with route.connection.write_lock:
@@ -920,6 +987,25 @@ class LocalHermesBridgeClient:
         if not isinstance(reply, (VoiceReviewAckEvent, VoiceReviewRefusedEvent)):
             raise BridgeProtocolError("the companion answered with another voice event")
         return reply
+
+    async def memory(
+        self, event: VoiceMemoryEvent,
+    ) -> AsyncIterator[VoiceMemorySnapshotEvent | VoiceMemoryRefusedEvent]:
+        """Subscribe on a dedicated connection; no foreground turn performs a read."""
+        if VOICE_MEMORY_CAPABILITY not in self._capabilities:
+            raise BridgeProtocolError("the companion did not advertise memory")
+        if type(event) is not VoiceMemoryEvent:
+            raise TypeError("memory request must be exact")
+        await self._send_json(event.model_dump(mode="json"))
+        while raw := await self._reader.readline():
+            reply = parse_voice_event(raw)
+            if (type(reply) not in (VoiceMemorySnapshotEvent, VoiceMemoryRefusedEvent)
+                    or reply.conversation_id != event.conversation_id
+                    or reply.generation != event.generation):
+                raise BridgeProtocolError("invalid memory response")
+            assert isinstance(reply, (VoiceMemorySnapshotEvent, VoiceMemoryRefusedEvent))
+            yield reply
+        raise BridgeProtocolError("the memory subscription closed")
 
     async def __aenter__(self) -> Self:
         return self

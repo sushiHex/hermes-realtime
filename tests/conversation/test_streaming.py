@@ -20,6 +20,7 @@ from hermes_realtime.conversation import (
     UpdateDecision,
     UpdateDecisionKind,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.speech import (
     AudioFrame,
     DeliveredSpeechLedger,
@@ -27,6 +28,32 @@ from hermes_realtime.speech import (
     SpeechChunk,
     Transcript,
 )
+
+
+@pytest.mark.asyncio
+async def test_turn_uses_latest_memory_without_persisting_it() -> None:
+    context = ConversationContextStore()
+    context.set_memory(BuiltinMemorySnapshot(memory="Prefers short replies.", user="Ari"))
+    inference = RequestRecordingInference()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_memory", Transcript(text="What did I prefer?", final=True))
+
+    assert len(inference.requests) == 1
+    assert inference.requests[0].memory == BuiltinMemorySnapshot(
+        memory="Prefers short replies.", user="Ari"
+    )
+    assert inference.requests[0].context.memory == inference.requests[0].memory
+    assert [row.text for row in context.durable_view().messages] == [
+        "What did I prefer?", "I will mention the update now."
+    ]
 
 
 class BlockingIncrementalInference:
