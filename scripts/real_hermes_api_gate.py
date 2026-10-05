@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -58,6 +59,7 @@ try:
         build_local_host_launcher,
     )
     from hermes_realtime.integration import (
+        BridgeAuthenticationError,
         HermesApiConfig,
         HermesApiTaskSession,
         LocalHermesBridgeClient,
@@ -86,9 +88,33 @@ _MAX_BODY_BYTES = 64 * 1024
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 # What a read-back counts a run as when it cannot read it as terminal.
 _NOT_TERMINAL = "not_terminal"
+# What an attestation says for a field it cannot name.
+_UNNAMED = frozenset({"unknown", "elsewhere"})
 # A component's own bounded marker, folded into the gate's single line.
-_COMPONENT_MARKER = re.compile(r"\[([a-z][a-z-]{0,47})\] (\{.*\})")
+_COMPONENT_MARKER = re.compile(r"\[([a-z][a-z0-9-]{0,47})\] (\{.*\})")
 _MAX_COMPONENT_MARKERS = 8
+_MAX_COMPONENT_MARKER_CHARS = 512
+# Library log records at WARNING and above are counted by logger and level, never printed.
+_MAX_LOGGERS = 16
+
+
+class _LogCount(logging.Handler):
+    """Counts records at WARNING and above by logger name and level, keeping no message."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.counts: dict[str, Counter[str]] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        name = record.name[:64]
+        if name not in self.counts and len(self.counts) >= _MAX_LOGGERS:
+            name = "other"
+        self.counts.setdefault(name, Counter())[record.levelname] += 1
+
+    def evidence(self) -> dict[str, object]:
+        if not self.counts:
+            return {}
+        return {"log": {name: dict(sorted(levels.items())) for name, levels in self.counts.items()}}
 
 
 class Refusal(RuntimeError):
@@ -125,10 +151,9 @@ def _installed(home: Path) -> tuple[RuntimeAttestation, dict[str, object]]:
     if Path(hermes_cli.__file__).resolve().parents[1] != checkout:
         raise Refusal("not_install")
     local = attest_runtime()
-    if local.realtime_install == "elsewhere":
-        raise Refusal("not_install")
-    if local.hermes_commit == "unknown":
-        raise Refusal("unknown_commit")
+    # One rule: every field of what this interpreter runs must be named.
+    if _UNNAMED & set(local.model_dump(exclude={"pid"}).values()):
+        raise Refusal("unnamed")
     return local, {
         "hermes": installed_hermes_identity(local.hermes_version, checkout),
         "candidate": {"version": local.realtime_version, "install": local.realtime_install},
@@ -164,14 +189,19 @@ async def _hello(companion: CompanionEndpoint) -> tuple[RuntimeAttestation, list
     """Only a running companion answers; it must offer every capability the gate asks for."""
 
     wanted = (VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, RUNTIME_ATTESTATION_CAPABILITY)
-    async with asyncio.timeout(_HELLO_TIMEOUT_SECONDS):
-        link = await LocalHermesBridgeClient.connect(
-            host="127.0.0.1",
-            port=companion.port,
-            token=companion.token,
-            participant_id="real-hermes-gate",
-            capabilities=wanted,
-        )
+    try:
+        async with asyncio.timeout(_HELLO_TIMEOUT_SECONDS):
+            link = await LocalHermesBridgeClient.connect(
+                host="127.0.0.1",
+                port=companion.port,
+                token=companion.token,
+                participant_id="real-hermes-gate",
+                capabilities=wanted,
+            )
+    except BridgeAuthenticationError as error:
+        # A wrong token, or a plugin that predates runtime attestation and refuses the
+        # capability: a gateway still running it needs a restart.
+        raise Refusal("hello_refused") from error
     async with link:
         if link.capabilities != frozenset(wanted) or link.runtime is None:
             raise Refusal("capability")
@@ -430,7 +460,9 @@ def _components(output: str) -> dict[str, object]:
 
     markers: dict[str, object] = {}
     for line in output.splitlines():
-        match = _COMPONENT_MARKER.fullmatch(line)
+        match = (
+            _COMPONENT_MARKER.fullmatch(line) if len(line) <= _MAX_COMPONENT_MARKER_CHARS else None
+        )
         if match is not None and len(markers) < _MAX_COMPONENT_MARKERS:
             with contextlib.suppress(ValueError):
                 markers[match.group(1)] = json.loads(match.group(2))
@@ -443,6 +475,10 @@ def main(argv: list[str] | None = None) -> int:
     evidence: dict[str, object] = {"stage": "import", "version": 1}
     output = io.StringIO()
     record: dict[str, object] | None = None
+    # The only handler for the run: no library record reaches stderr, and each is counted.
+    log = _LogCount()
+    logging.getLogger().addHandler(log)
+    logging.captureWarnings(True)
     try:
         if _IMPORT_FAILURE is not None:
             raise _IMPORT_FAILURE
@@ -458,11 +494,13 @@ def main(argv: list[str] | None = None) -> int:
         evidence["category"] = error.category if type(error) is Refusal else "error"
         evidence["failure"] = type(error).__name__
     finally:
+        logging.captureWarnings(False)
+        logging.getLogger().removeHandler(log)
+        observed = _components(output.getvalue()) | log.evidence()
         if record is not None:
-            print(json.dumps(record | _components(output.getvalue()), sort_keys=True), flush=True)
+            print(json.dumps(record | observed, sort_keys=True), flush=True)
         else:
-            evidence |= _components(output.getvalue())
-            line = json.dumps(evidence, separators=(",", ":"), sort_keys=True)
+            line = json.dumps(evidence | observed, separators=(",", ":"), sort_keys=True)
             print(_MARKER + line, flush=True)
     return 0 if record is not None else 1
 

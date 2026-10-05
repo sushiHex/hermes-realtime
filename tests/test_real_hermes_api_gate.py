@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -36,7 +37,7 @@ _KEY = "installed-gate-test-key-" + "k" * 24
 _COMPANION_TOKEN = "installed-gate-companion-" + "t" * 24
 _RUN_IDS = ("run_" + "1" * 16, "run_" + "2" * 16, "run_" + "3" * 16)
 _TERMINAL = frozenset({"completed", "failed", "cancelled", "interrupted"})
-_REPOSITORY = Path(hermes_realtime.__file__).resolve().parents[2]
+_PACKAGE = Path(hermes_realtime.__file__).resolve().parent
 _EVERY_CAPABILITY = frozenset({"voice_archive", "voice_review", "runtime_attestation"})
 
 
@@ -64,12 +65,15 @@ def _install(
     hermes_root: Path | None = None,
     realtime_in_install: bool = True,
     detached: bool = True,
+    record: bool = True,
+    copy_package: bool = False,
 ) -> _Install:
     """A home laid out as the installer leaves it, with this interpreter posing as its own.
 
     Hermes is a git checkout at ``home/hermes-agent`` whose committed ``hermes_cli`` this
-    process imports, and this repository is an editable hermes-realtime install in that
-    checkout's ``venv``.
+    process imports, and hermes-realtime is a wheel installed in that checkout's ``venv``, from
+    which this process imports it. ``copy_package`` puts the real package files there, for a
+    gate run in its own process.
     """
 
     home = tmp_path / "home"
@@ -95,12 +99,15 @@ def _install(
         f"Metadata-Version: 2.1\nName: hermes-realtime\nVersion: {hermes_realtime.__version__}\n",
         encoding="utf-8",
     )
-    (metadata / "direct_url.json").write_text(
-        json.dumps({"url": _REPOSITORY.as_uri(), "dir_info": {"editable": True}}),
-        encoding="utf-8",
-    )
+    if record:
+        (metadata / "RECORD").write_bytes(b"hermes_realtime/__init__.py,sha256=test,1\n")
+    if copy_package:
+        shutil.copytree(
+            _PACKAGE, site / "hermes_realtime", ignore=shutil.ignore_patterns("__pycache__")
+        )
     if realtime_in_install:
-        monkeypatch.syspath_prepend(str(site))
+        module = site / "hermes_realtime" / "__init__.py"
+        monkeypatch.setattr(hermes_realtime, "__file__", str(module))
     monkeypatch.delenv("HERMES_REALTIME_LIVEKIT_LOCAL", raising=False)
     return _Install(home, checkout, site)
 
@@ -149,8 +156,9 @@ class _Hermes:
     ``oversized``, or ``http_error`` (a 500 whose body looks terminal). ``terminals``
     overrides how a run ends. ``approval_skipped`` finishes the approval run without asking;
     ``finished_before_stop`` ends the cancellation run before its stop arrives, which Hermes
-    answers with 200 and the run's full status. ``pids`` is what ``/health/detailed``
-    reports on successive reads, the last one repeating.
+    answers with 200 and the run's full status. ``reject_runs`` refuses every dispatch with
+    503. ``pids`` is what ``/health/detailed`` reports on successive reads, the last one
+    repeating.
     """
 
     pids: list[int] = field(default_factory=lambda: [os.getpid()])
@@ -159,6 +167,7 @@ class _Hermes:
     approval_skipped: bool = False
     finished_before_stop: bool = False
     health_status: int = 200
+    reject_runs: bool = False
     runs: list[str] = field(default_factory=list)
     statuses: dict[str, str] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
@@ -179,6 +188,8 @@ class _Hermes:
 
     async def create(self, request: web.Request) -> web.Response:
         self._authorized(request)
+        if self.reject_runs:
+            return web.json_response({"error": {"code": "unavailable"}}, status=503)
         run_id = _RUN_IDS[len(self.runs)]
         self.runs.append(run_id)
         self.statuses[run_id] = "running"
@@ -387,7 +398,7 @@ async def test_the_gate_qualifies_the_installed_runtime_and_prints_nothing_itsel
         "gate": "passed",
         "hermes": {"version": "0.21.0", "commit": _git(install.checkout, "rev-parse", "HEAD"),
                    "baseline": False},
-        "candidate": {"version": hermes_realtime.__version__, "install": "editable"},
+        "candidate": {"version": hermes_realtime.__version__, "install": "wheel"},
         "discovery": {"capabilities": sorted(_EVERY_CAPABILITY)},
         "behaviors": {
             "completion": "completed",
@@ -398,20 +409,6 @@ async def test_the_gate_qualifies_the_installed_runtime_and_prints_nothing_itsel
     }
     assert gateway.companion.hellos == 1
     assert capsys.readouterr().out == ""
-
-
-@pytest.mark.asyncio
-async def test_the_gate_records_a_wheel_installed_in_the_install(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
-) -> None:
-    install = _install(tmp_path, monkeypatch)
-    _write_env(install.home, companion_port=gateway.companion_port)
-    module = install.site / "hermes_realtime" / "__init__.py"
-    monkeypatch.setattr(hermes_realtime, "__file__", str(module))
-
-    record = await qualify(install.home, gateway.api_url, {"stage": "start", "version": 1})
-
-    assert record["candidate"] == {"version": hermes_realtime.__version__, "install": "wheel"}
 
 
 @pytest.mark.asyncio
@@ -432,7 +429,8 @@ async def test_the_gate_refuses_an_interpreter_whose_hermes_is_not_the_install(
         site = Path(sysconfig.get_path("purelib", vars={"base": venv, "platbase": venv}))
         site.parent.mkdir(parents=True)
         install.site.rename(site)
-        monkeypatch.syspath_prepend(str(site))
+        module = site / "hermes_realtime" / "__init__.py"
+        monkeypatch.setattr(hermes_realtime, "__file__", str(module))
 
     error, evidence = await _refused(install.home, gateway.api_url)
 
@@ -441,25 +439,30 @@ async def test_the_gate_refuses_an_interpreter_whose_hermes_is_not_the_install(
 
 
 @pytest.mark.asyncio
-async def test_the_gate_refuses_an_interpreter_whose_hermes_realtime_is_not_the_install(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
+@pytest.mark.parametrize(
+    "unnamed",
+    [
+        pytest.param({"realtime_in_install": False}, id="hermes-realtime-elsewhere"),
+        pytest.param({"detached": False}, id="no-detached-commit"),
+        pytest.param({"record": False}, id="no-wheel-record"),
+        pytest.param({"version": "0.21.0 beta"}, id="no-attestable-hermes-version"),
+    ],
+)
+async def test_the_gate_refuses_an_install_it_cannot_name_in_full(
+    unnamed: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
 ) -> None:
-    install = _install(tmp_path, monkeypatch, realtime_in_install=False)
+    version = unnamed.pop("version", None)
+    install = _install(tmp_path, monkeypatch, **unnamed)  # type: ignore[arg-type]
+    if version is not None:
+        monkeypatch.setattr(sys.modules["hermes_cli"], "__version__", version)
 
     error, evidence = await _refused(install.home, gateway.api_url)
 
-    assert _category(error) == "not_install" and evidence["stage"] == "identity"
-
-
-@pytest.mark.asyncio
-async def test_the_gate_refuses_a_checkout_no_detached_commit_names(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
-) -> None:
-    install = _install(tmp_path, monkeypatch, detached=False)
-
-    error, evidence = await _refused(install.home, gateway.api_url)
-
-    assert _category(error) == "unknown_commit" and evidence["stage"] == "identity"
+    assert _category(error) == "unnamed" and evidence["stage"] == "identity"
+    assert gateway.companion.hellos == 0
 
 
 @pytest.mark.asyncio
@@ -511,7 +514,7 @@ async def test_the_gate_refuses_a_failed_hello(
 
     error, evidence = await _refused(install.home, gateway.api_url)
 
-    assert type(error).__name__ == "BridgeAuthenticationError"
+    assert _category(error) == "hello_refused"
     assert evidence["stage"] == "discovery" and gateway.hermes.runs == []
 
 
@@ -581,7 +584,8 @@ async def test_the_gate_refuses_a_companion_another_process_owns(
     "attested",
     [
         pytest.param({"realtime_version": "9.9.9"}, id="older-wheel"),
-        pytest.param({"realtime_install": "wheel"}, id="other-install"),
+        pytest.param({"realtime_record": "f" * 64}, id="rebuilt-wheel-same-version"),
+        pytest.param({"realtime_install": "elsewhere"}, id="other-install"),
         pytest.param({"hermes_version": "0.20.0"}, id="older-hermes"),
         pytest.param({"hermes_commit": "f" * 40}, id="other-commit"),
     ],
@@ -740,7 +744,7 @@ def _marker_line(lines: list[str]) -> dict[str, object]:
 async def test_the_command_prints_one_record_line_on_a_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
 ) -> None:
-    install = _install(tmp_path, monkeypatch)
+    install = _install(tmp_path, monkeypatch, copy_package=True)
     _write_env(install.home, companion_port=gateway.companion_port)
 
     code, lines, stderr = await _command(
@@ -757,12 +761,38 @@ async def test_the_command_prints_one_record_line_on_a_pass(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "marker"),
+    [
+        pytest.param(
+            {"offered": frozenset({"voice_archive", "voice_review"})},
+            {"category": "capability", "stage": "discovery"},
+            id="missing-capability",
+        ),
+        pytest.param(
+            # The task session logs a warning for a refused dispatch: counted, not printed.
+            {"reject_runs": True},
+            {
+                "category": "behavior",
+                "stage": "completion",
+                "left_running": 0,
+                "log": {"hermes_realtime.integration.api": {"WARNING": 1}},
+            },
+            id="non-202-dispatch",
+        ),
+    ],
+)
 async def test_the_command_prints_one_marker_line_on_a_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
+    change: dict[str, object],
+    marker: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
 ) -> None:
-    install = _install(tmp_path, monkeypatch)
+    install = _install(tmp_path, monkeypatch, copy_package=True)
     _write_env(install.home, companion_port=gateway.companion_port)
-    gateway.companion.offered = frozenset({"voice_archive", "voice_review"})
+    for name, value in change.items():
+        setattr(gateway.companion if name == "offered" else gateway.hermes, name, value)
 
     code, lines, stderr = await _command(
         "--hermes-home",
@@ -773,12 +803,7 @@ async def test_the_command_prints_one_marker_line_on_a_refusal(
     )
 
     assert code == 1 and stderr == ""
-    assert _marker_line(lines) == {
-        "category": "capability",
-        "failure": "Refusal",
-        "stage": "discovery",
-        "version": 1,
-    }
+    assert _marker_line(lines) == {"failure": "Refusal", "version": 1} | marker
 
 
 @pytest.mark.asyncio
@@ -822,6 +847,25 @@ def test_a_component_marker_is_folded_into_the_one_line(
         "failure": "RuntimeError",
         "stage": "identity",
         "version": 1,
+    }
+
+
+def test_a_folded_component_marker_is_bounded_in_length_and_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def installed(home: Path) -> object:
+        print('[long-marker] {"filler": "' + "x" * 600 + '"}')
+        for index in range(12):
+            print(f'[marker-{index:02d}] {{"index": {index}}}')
+        raise Refusal("not_install")
+
+    monkeypatch.setattr(_GATE, "_installed", installed)
+
+    assert _GATE.main(["--hermes-home", str(tmp_path)]) == 1
+
+    evidence = _marker_line(capsys.readouterr().out.splitlines())
+    assert evidence["components"] == {
+        f"marker-{index:02d}": {"index": index} for index in range(8)
     }
 
 
