@@ -404,6 +404,11 @@ class HermesApiTaskSession:
         """What start settled from the run record; None without a record or before start."""
         return self._restart_settlement
 
+    @property
+    def admitted_run_ids(self) -> frozenset[str]:
+        """Every run Hermes admitted for this session, including those it stopped itself."""
+        return frozenset(self._reserved_api_run_ids)
+
     async def _settle_run_record(
         self,
         path: Path,

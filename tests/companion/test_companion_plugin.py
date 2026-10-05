@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from test_archive import FakeHermes
 
 from hermes_realtime import hermes_plugin
 from hermes_realtime.integration import BridgeAuthenticationError, LocalHermesBridgeClient
+from hermes_realtime.protocol import RuntimeAttestation
 
 _TOKEN = "companion-test-token-with-enough-entropy"
 _MARKER = "[voice-companion] "
@@ -224,3 +226,42 @@ def test_the_companion_bridge_refuses_the_wrong_token(
 
     with pytest.raises(BridgeAuthenticationError):
         asyncio.run(wrong())
+
+
+def test_the_companion_attests_the_runtime_captured_when_the_plugin_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hermes: FakeHermes
+) -> None:
+    attestation = RuntimeAttestation(
+        pid=1,
+        hermes_version="0.21.0",
+        hermes_commit="unknown",
+        realtime_version="0.0.3",
+        realtime_install="wheel",
+        realtime_record="unknown",
+    )
+    # The thread each capture ran on: register() runs on Hermes's loader thread, while the
+    # companion builds its bridge later, on its own thread.
+    captures: list[int] = []
+
+    def attest() -> RuntimeAttestation:
+        captures.append(threading.get_ident())
+        return attestation
+
+    monkeypatch.setattr(hermes_plugin, "attest_runtime", attest)
+    port = _free_port()
+    _configure(monkeypatch, port)
+    hermes_plugin.register(_Context(tmp_path))
+    companion = hermes_plugin._companion
+    assert companion is not None and companion.wait_ready(5.0)
+
+    async def attested() -> RuntimeAttestation | None:
+        client = await LocalHermesBridgeClient.connect(
+            host="127.0.0.1", port=port, token=_TOKEN, participant_id="real-hermes-gate",
+            capabilities=("runtime_attestation",),
+        )
+        async with client:
+            return client.runtime
+
+    assert asyncio.run(attested()) == attestation
+    assert asyncio.run(attested()) == attestation
+    assert captures == [threading.get_ident()]

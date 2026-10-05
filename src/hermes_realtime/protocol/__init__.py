@@ -3,6 +3,7 @@
 from .events import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
     VOICE_INTEGRITY_REFUSALS,
@@ -17,6 +18,7 @@ from .events import (
     ControlCancelPayload,
     Durability,
     ProtocolEvent,
+    RuntimeAttestation,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -39,6 +41,7 @@ from .events import (
 __all__ = [
     "BRIDGE_CAPABILITIES",
     "BRIDGE_PROTOCOL_VERSION",
+    "RUNTIME_ATTESTATION_CAPABILITY",
     "VOICE_ARCHIVE_CAPABILITY",
     "VOICE_REVIEW_CAPABILITY",
     "VOICE_EVENT_TYPES",
@@ -53,6 +56,7 @@ __all__ = [
     "ControlCancelPayload",
     "Durability",
     "ProtocolEvent",
+    "RuntimeAttestation",
     "VoiceArchiveAckEvent",
     "VoiceArchiveEvent",
     "VoiceArchiveRefusedEvent",

@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from .companion.archive import ArchivePort
+from .companion.attestation import attest_runtime
 from .companion.host import (
     CompanionEndpoint,
     VoiceCompanionHost,
@@ -28,6 +29,7 @@ from .integration import (
     SessionBindings,
 )
 from .integration.bridge import VoiceArchiveHandler
+from .protocol import RuntimeAttestation
 
 _runtime: HermesPluginRuntime | None = None
 _companion: VoiceCompanionHost | None = None
@@ -74,10 +76,12 @@ def register(context: object) -> None:
             _refuse("context")
             return
         data_dir.mkdir(parents=True, exist_ok=True)
+        # Captured once, now: a gateway left running across an update attests what it loaded.
+        attestation = attest_runtime()
         companion = VoiceCompanionHost(
             store_path=data_dir / _COMPANION_STORE,
             open_port=_open_archive_port,
-            bridge_factory=lambda service: _companion_bridge(endpoint, service),
+            bridge_factory=lambda service: _companion_bridge(endpoint, service, attestation),
         )
         try:
             started = companion.start()
@@ -90,13 +94,16 @@ def register(context: object) -> None:
 
 
 def _companion_bridge(
-    endpoint: CompanionEndpoint, service: VoiceCompanionService
+    endpoint: CompanionEndpoint,
+    service: VoiceCompanionService,
+    attestation: RuntimeAttestation,
 ) -> LocalHermesBridgeServer:
     return create_local_bridge(
         bindings=SessionBindings(),
         token=endpoint.token,
         port=endpoint.port,
         voice=service,
+        attestation=attestation,
     )
 
 
@@ -144,6 +151,7 @@ def create_local_bridge(
     event_id_factory: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
     voice: VoiceArchiveHandler | None = None,
+    attestation: RuntimeAttestation | None = None,
 ) -> LocalHermesBridgeServer:
     """Build an authenticated bridge around the registered Hermes runtime."""
 
@@ -165,6 +173,8 @@ def create_local_bridge(
         clock=now,
     )
     bridge_options: dict[str, Any] = {} if voice is None else {"voice": voice}
+    if attestation is not None:
+        bridge_options["runtime"] = attestation
     return LocalHermesBridgeServer(
         service=service,
         completions=completions,

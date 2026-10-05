@@ -10,11 +10,13 @@ from hermes_realtime.companion.integrity import MAX_BATCH_ROWS, REFUSAL_CATEGORI
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_INTEGRITY_REFUSALS,
     VOICE_REFUSAL_CATEGORIES,
     VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
+    RuntimeAttestation,
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
@@ -64,11 +66,63 @@ def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     return event
 
 
-def test_the_bridge_is_version_0_3_and_offers_archive_and_review() -> None:
+def test_the_bridge_is_version_0_3_and_offers_archive_review_and_attestation() -> None:
     assert BRIDGE_PROTOCOL_VERSION == "0.3"
     assert VOICE_ARCHIVE_CAPABILITY == "voice_archive"
     assert VOICE_REVIEW_CAPABILITY == "voice_review"
-    assert frozenset({"voice_archive", "voice_review"}) == BRIDGE_CAPABILITIES
+    assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
+    assert (
+        frozenset({"voice_archive", "voice_review", "runtime_attestation"})
+        == BRIDGE_CAPABILITIES
+    )
+
+
+def _attestation(**overrides: Any) -> dict[str, Any]:
+    attestation: dict[str, Any] = {
+        "pid": 1,
+        "hermes_version": "0.21.0",
+        "hermes_commit": "0123456789abcdef0123456789abcdef01234567",
+        "realtime_version": "0.0.3",
+        "realtime_install": "wheel",
+        "realtime_record": "0123456789abcdef" * 4,
+    }
+    attestation.update(overrides)
+    return attestation
+
+
+@pytest.mark.parametrize("install", ["wheel", "elsewhere"])
+@pytest.mark.parametrize("commit", ["0123456789abcdef0123456789abcdef01234567", "unknown"])
+@pytest.mark.parametrize("record", ["0123456789abcdef" * 4, "unknown"])
+def test_a_runtime_attestation_round_trips_exactly(install: str, commit: str, record: str) -> None:
+    fields = {"realtime_install": install, "hermes_commit": commit, "realtime_record": record}
+
+    attestation = RuntimeAttestation.model_validate(_attestation(**fields))
+
+    assert attestation.model_dump(mode="json") == _attestation(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"pid": "1"}, id="coerced-pid"),
+        pytest.param({"pid": True}, id="boolean-pid"),
+        pytest.param({"pid": 0}, id="zero-pid"),
+        pytest.param({"pid": 2**53}, id="unbounded-pid"),
+        pytest.param({"hermes_commit": "0123456789ABCDEF0123456789ABCDEF01234567"}, id="upper"),
+        pytest.param({"hermes_commit": "0123456"}, id="short-commit"),
+        pytest.param({"hermes_version": ""}, id="empty-version"),
+        pytest.param({"hermes_version": "0.21.0 /home"}, id="spaced-version"),
+        pytest.param({"realtime_version": "v" * 65}, id="long-version"),
+        pytest.param({"realtime_install": "sdist"}, id="unknown-install"),
+        pytest.param({"realtime_install": "editable"}, id="editable-install"),
+        pytest.param({"realtime_record": "0123456789ABCDEF" * 4}, id="upper-record"),
+        pytest.param({"realtime_record": "0123456789abcdef" * 2}, id="short-record"),
+        pytest.param({"path": "/install"}, id="extra-field"),
+    ],
+)
+def test_a_malformed_runtime_attestation_is_refused(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        RuntimeAttestation.model_validate(_attestation(**overrides))
 
 
 def test_a_voice_archive_round_trips_exactly_and_never_normalizes_text() -> None:

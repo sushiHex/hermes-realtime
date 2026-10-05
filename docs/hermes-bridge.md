@@ -64,18 +64,92 @@ v0.19 exact-delegation APIs. Under v0.20, registration provides packaging compat
 bridge dispatch rejects with the full-host route. Registration fails when neither complete host
 surface is available. Do not apply the v0.19 companion patch to v0.20.
 
-The upgrade qualification gate is `scripts/real_hermes_api_gate.py`. With
-`HERMES_REALTIME_LIVEKIT_LOCAL=1`, it composes the actual full-host configuration used by Desktop:
-Codex natural-work tools, the `natural_v1` conversation profile, knowledge overlap/recovery,
-Moonshine v2 Medium, and Kokoro. It behaviorally exercises authenticated Hermes API work,
-actionable approval rejection, exact cancellation, proactive completion, LiveKit composition, and
-bounded startup/shutdown. Spoken-turn media remains covered by the LiveKit acceptance tests.
-Its passing record names the exact Hermes it ran against: the installed version, the checkout
-commit, and whether that pair is the qualification baseline (v0.21.0 at `29112bef`), which is a
-reference rather than a version ceiling. It refuses a checkout with tracked changes, because no
-commit describes that code. Paths that differ only in case are exempt on a case-insensitive
-checkout only while their one file on disk matches one of their committed versions:
-`29112bef` tracks such paths, and Windows can hold only one of each.
+The upgrade qualification gate is `scripts/real_hermes_api_gate.py`. It observes the operator's
+installed runtime from the outside, the way the full host meets it, and simulates nothing: run it
+with the install's own interpreter while the installed `hermes gateway` is running.
+
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" scripts\real_hermes_api_gate.py
+```
+
+`--hermes-home` defaults to `HERMES_HOME`, else the installer's default home, and
+`--hermes-api-url` to the full host's default, `http://127.0.0.1:8642`; pass the same URL the host
+is given. Every observation is bound to the process under test:
+
+1. **Identity.** This interpreter's `hermes_cli` must be exactly the installer's checkout,
+   `<home>/hermes-agent`, and its own attestation must name every field: the Hermes version,
+   the checkout's detached commit, and the hermes-realtime wheel imported from exactly that
+   checkout's `venv`, identified by the SHA-256 of the wheel's installed `RECORD` (which hashes
+   every file it put down). An editable install or any other source is refused: only a built
+   wheel names exact content. The gate refuses a checkout with tracked changes, because no
+   commit describes that code.
+2. **Endpoint.** `API_SERVER_KEY` and the companion endpoint come from `<home>/.env` through the
+   full host's own loaders; only a literal loopback API URL is accepted.
+3. **The serving process.** The gateway names its process through the authenticated
+   `GET /health/detailed`. A real bridge hello with the companion must offer `voice_archive`,
+   `voice_review` and `runtime_attestation`, and the attestation must name that same process
+   (otherwise another process, such as a CLI or cron run, owns the companion) and exactly the
+   identity inspected in step 1, `RECORD` hash included (otherwise the gateway is still running
+   what it loaded before an update, a reinstall or a rebuilt wheel of the same version: restart
+   it). The gate never discovers plugins in its own process.
+4. **Behaviors.** Through `HermesApiTaskSession`, the class the host uses, it dispatches work
+   that must complete, rejects an actionable approval and requires the run to complete without
+   running the command, and stops a run that must end interrupted, not completed.
+5. **Cleanup.** After the session closes, every run Hermes admitted for it must read back
+   through `GET /v1/runs/{run_id}` as 200 with that run's terminal status; `stopping` is not
+   terminal. A refusal still reads the runs back and counts those left running.
+6. **End.** `/health/detailed` must name the same process at the end: a gateway that restarted
+   during the gate fails it, even though its runs read back as `interrupted`.
+
+It prints exactly one line on stdout and nothing on stderr. A pass prints the JSON record: the
+Hermes version, commit and whether that pair is the qualification baseline (v0.21.0 at
+`29112bef`, a reference rather than a version ceiling); the candidate's version and install
+kind; the negotiated capabilities; each behavior's terminal status; and the cleanup counts. A
+refusal, including a bad argument, a missing default home or an interpreter that cannot import
+the gate, prints one `[real-hermes-gate]` marker with the stage, a bounded category, the
+failure's type and, once runs were admitted, `left_running`. Markers other components print
+while the gate runs are folded into that line under `components` (at most 8, each at most 512
+characters), and library log records at WARNING and above are counted under
+`log: {logger: {level: count}}`, never printed. Process IDs, paths, commits and record hashes
+are compared, never printed beyond the record.
+
+The refusal categories:
+
+- `not_install`: this interpreter's Hermes is not the checkout at `<home>/hermes-agent`.
+- `unnamed`: a field of the install cannot be named: no detached commit, no single installed
+  wheel `RECORD`, `hermes_realtime` imported from anywhere but the install's wheel, or an
+  unreadable Hermes version.
+- `no_companion`: the `.env` names no companion endpoint.
+- `health`: `/health/detailed` did not name the gateway's process.
+- `hello_refused`: a wrong token, or a gateway still running a plugin without runtime
+  attestation: restart the gateway.
+- `capability`: the companion does not offer every capability the gate asks for.
+- `foreign_companion`: another process, not the gateway, owns the companion.
+- `restart_gateway`: the gateway is still running what it loaded before an update, a
+  reinstall or a rebuilt wheel: restart it.
+- `behavior`: a dispatch, approval or cancellation did not end exactly as required.
+- `left_running`: a run the gate created did not read back as terminal.
+- `gateway_restarted`: the gateway's process changed during the gate.
+- `arguments`: the command line was not understood.
+- `error`: anything else; the failure's type names it.
+
+What it does not prove:
+
+- Processes a run spawned (a terminal command's children) are not checked; Hermes reaps those
+  on stop.
+- Edits to the installed wheel's files in `site-packages` after it was installed: `RECORD` is
+  the installer's list of what it put down, and is not recomputed from the files.
+- Hermes edits that were uncommitted when the gateway loaded and reverted before the gate ran:
+  the commit is read from `HEAD` only, and the tracked-changes check sees the tree as it is now.
+
+With `HERMES_REALTIME_LIVEKIT_LOCAL=1`, it also starts and closes the actual full-host
+configuration used by Desktop against the same gateway: Codex natural-work tools, the
+`natural_v1` conversation profile, knowledge overlap/recovery, Moonshine v2 Medium, and Kokoro.
+Spoken-turn media remains covered by the LiveKit acceptance tests.
+
+Paths that differ only in case are exempt from the tracked-changes refusal on a
+case-insensitive checkout only while their one file on disk matches one of their committed
+versions: `29112bef` tracks such paths, and Windows can hold only one of each.
 
 ## Protocol 0.3: the hello, voice archive and review
 
@@ -90,6 +164,20 @@ sends no voice event on a connection whose welcome did not list it, and the serv
 connection that sends one anyway. A voice connection carries voice events only. A refused
 hello leaves one `[hermes-bridge-hello]` marker with its rejection category (`shape`,
 `token`, `participant`, `version` or `capability`), never the token or the participant.
+
+`runtime_attestation` is offered by a companion the plugin built, which captured what its
+process loaded once, when Hermes loaded the plugin. A welcome that negotiates it carries
+`runtime{pid, hermes_version, hermes_commit, realtime_version, realtime_install,
+realtime_record}`, and a welcome that does not must not. `hermes_commit` is the checkout's
+detached commit read from `.git/HEAD`, or `unknown`. `realtime_install` is `wheel` when
+`hermes_realtime` was imported from exactly the install `venv`'s
+`site-packages/hermes_realtime/__init__.py`, else `elsewhere`; `realtime_record` is then the
+SHA-256 of that wheel's single installed `RECORD`, else `unknown`. A process whose install
+cannot be read attests every field as `unknown` or `elsewhere`. The model is strict: exact
+types, `pid` in `[1, 2^53 - 1]`, versions of 1 to 64 characters of `[0-9A-Za-z.+_-]`, lowercase
+hex hashes, and no other field; the client refuses a welcome that breaks it. The capability is
+additive, so existing clients and servers are unchanged; a plugin that predates it refuses the
+hello, since the capability is unknown to it.
 
 Versions are mixed on purpose: the hello and every voice event name `protocol_version`
 `"0.3"` explicitly (a voice event without it is refused), while the work events
