@@ -12,7 +12,13 @@ from hermes_realtime.protocol import (
     VoiceMemoryRefusedEvent,
     VoiceMemorySnapshotEvent,
 )
-from tests.integration.test_bridge_voice import _TOKEN, _server, _Voice
+from tests.integration.test_bridge_voice import (
+    _ATTESTATION,
+    _TOKEN,
+    _ReviewVoice,
+    _server,
+    _Voice,
+)
 
 
 class MemoryVoice(_Voice):
@@ -61,6 +67,32 @@ async def test_memory_stream_is_negotiated_and_disconnect_joins_subscription() -
     finally:
         await client.close()
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_subscription_preserves_review_and_runtime_negotiation() -> None:
+    class CompleteVoice(MemoryVoice, _ReviewVoice):
+        pass
+
+    voice = CompleteVoice()
+    capabilities = ("voice_archive", "voice_review", "voice_memory", "runtime_attestation")
+    async with (
+        _server(voice, runtime=_ATTESTATION) as server,
+        await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token=_TOKEN, participant_id="memory",
+            capabilities=capabilities,
+        ) as client,
+    ):
+        assert client.capabilities == frozenset(capabilities)
+        assert client.runtime == _ATTESTATION
+        assert client.review_interval == 10
+        stream = client.memory(VoiceMemoryEvent(
+            protocol_version="0.4", type="voice_memory",
+            conversation_id="conv", generation=0,
+        ))
+        assert (await anext(stream)).revision == 0
+        await stream.aclose()
+    await asyncio.wait_for(voice.closed.wait(), 2)
 
 
 @pytest.mark.asyncio
