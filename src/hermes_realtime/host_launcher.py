@@ -166,6 +166,8 @@ from hermes_realtime.speech import (
 )
 
 _PublicValue = str | int | bool | None
+# Where Hermes serves its API unless told otherwise (its own default host and port).
+DEFAULT_HERMES_API_URL = "http://127.0.0.1:8642"
 _LIVEKIT_CONFIRMATION_MARGIN_SECONDS = 10.0
 _LIVEKIT_CONFIRMATION_TIMEOUT_SECONDS = (
     MAX_SPEECH_CHUNK_DURATION_SECONDS + _LIVEKIT_CONFIRMATION_MARGIN_SECONDS
@@ -1817,7 +1819,7 @@ def _compose_cli_host(
 def build_local_host_launcher(
     *,
     hermes_api_bearer: str | None,
-    hermes_api_url: str = "http://127.0.0.1:8642",
+    hermes_api_url: str = DEFAULT_HERMES_API_URL,
     livekit_url: str = "ws://127.0.0.1:7880",
     livekit_api_key: str = "devkey",
     livekit_api_secret: str = "local" + "-" + ("x" * 32),
@@ -3175,7 +3177,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--hermes-context-file",
         help="UTF-8 version-1 JSON file containing bounded descriptive Hermes profile data",
     )
-    parser.add_argument("--hermes-api-url", default="http://127.0.0.1:8642")
+    parser.add_argument("--hermes-api-url", default=DEFAULT_HERMES_API_URL)
     parser.add_argument(
         "--hermes-run-record",
         help="JSON file recording Hermes runs a crashed host may have left running "
