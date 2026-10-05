@@ -716,6 +716,54 @@ async def test_api_session_settles_identifiable_run_from_malformed_accepted_resp
 
 
 @pytest.mark.asyncio
+async def test_api_session_names_every_run_hermes_admitted_even_after_close() -> None:
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8765",
+            bearer="admitted-runs-test-bearer-value-32-characters",
+        ),
+        session_id="session_admitted_runs",
+        private_id_factory=lambda: "admitted_runs_private",
+    )
+    responses = iter(
+        (
+            {"run_id": "run_5656565656565656", "status": "started"},
+            # Admitted but malformed: the session stops it, and it is still Hermes's run.
+            {"run_id": "run_6767676767676767", "status": "started", "unexpected": True},
+        )
+    )
+
+    async def request_json(
+        _method: str,
+        _path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> tuple[int, object]:
+        del body
+        return 202, next(responses)
+
+    async def settle(authority: _RunAuthority) -> None:
+        authority.terminal = True
+
+    async def stop_and_wait(_api_run_id: str) -> None:
+        return None
+
+    session._started = True
+    session._request_json = request_json  # type: ignore[method-assign]
+    session._settle_authority = settle  # type: ignore[method-assign]
+    session._stop_and_wait = stop_and_wait  # type: ignore[method-assign]
+    accepted = await session.dispatch(_dispatch_request(sequence=1, task_id="task_admitted"))
+    with pytest.raises(RuntimeError, match="malformed"):
+        await session.dispatch(_dispatch_request(sequence=2, task_id="task_malformed"))
+    assert accepted.payload.accepted is True
+    await session.close()
+
+    assert session.admitted_run_ids == frozenset(
+        {"run_5656565656565656", "run_6767676767676767"}
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_session_rejects_retired_api_run_id_reuse() -> None:
     private_ids = iter(("api_reuse_first", "api_reuse_second"))
     session = HermesApiTaskSession(
