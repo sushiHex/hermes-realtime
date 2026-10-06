@@ -510,6 +510,8 @@ voice conversation**, behind an explicit confirmation, with this limit beside it
 
 > What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP.
 
+> Delegated tasks remain in Hermes and are managed with Hermes's own session controls.
+
 There is no voice command: a misheard utterance must never delete. The authenticated endpoint
 uses the existing bearer, request-bound and CSP rules. Realtime clears the live store so the
 tail rewrites empty, advances the generation, fences and clears its outbox, ignores stale
@@ -522,9 +524,9 @@ their store transactions re-read the fences. Later archive and review events for
 generation are refused. A running review is not cancelled: it finishes normally, and memory
 or skills it writes are covered by the stated limit.
 
-One idempotent reconciler deletes tombstoned generations' whole compression chains and the
-run sessions named by their binding records whenever no review for the generation is admitted
-or alive. It runs when a tombstone is written, when a review thread ends, and at every owned
+One idempotent reconciler deletes tombstoned generations' whole voice compression chains
+whenever no review for the generation is admitted or alive. It runs when a tombstone is
+written, when a review thread ends, and at every owned
 start. Durable intent, rather than a special cancellation, timeout, deferral or resume path,
 drives crash recovery and successor ownership. The complete deletion set must survive native
 deletion orphaning compression children; native session APIs own the deletion itself.
@@ -629,11 +631,13 @@ A backend outage never silences the voice.
   is built-in, because a run's memory sync passes its messages to any configured external
   provider
   ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
-- **Deletion is not unlearning.** "Delete this voice conversation" removes its live tail,
-  archive compression chain and the run sessions named by its binding record. Built-in memory
+- **Deletion is not unlearning.** "Delete this voice conversation" removes its live tail and
+  archive compression chain. Delegated tasks remain in Hermes and are managed with Hermes's
+  own session controls. Built-in memory
   and skills remain and can shape later replies through M4, including writes from a review
-  already running when deletion was requested. Finished run sessions no longer named by the
-  bounded active-run record are outside that record's coverage; no wider erasure is promised.
+  already running when deletion was requested. Deleting only runs still named by the active-run
+  record would make coverage depend on timing and delete sessions of in-flight work, so the
+  owner explicitly excludes all delegated-task sessions from M3. The request has no run-ID list.
   Deletion is logical, not physical: unvacuumed SQLite pages, backups and sync copies remain.
   Hermes run records also remain; terminal records are pruned 24 hours after their last status
   update under the default bearer-client policy. A non-terminal record left by a crash must
@@ -641,6 +645,10 @@ A backend outage never silences the voice.
   ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
   No API route deletes those run records. Provenance for "forget what you learned" remains
   post-MVP; M3 adds no second memory store and no unlearning claim.
+- **Post-MVP task-session deletion.** Tag each delegated run with its conversation and
+  generation at dispatch. A later deletion design can then cover finished runs as well as
+  active ones, with separately reviewed live-work semantics. M3 does not add that ledger or
+  infer ownership from whichever active run IDs happen to remain in the recovery record.
 - **Retention.** Hermes session auto-pruning stays disabled for the MVP. Pruning selects only
   ended sessions
   ([filter](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14371)),
@@ -765,6 +773,8 @@ The companion's milestones must meet these criteria:
       under the successor. CLI-first ownership hands over when the CLI exits.
     - A fact deliberately learned in the deleted conversation still returns through M4.
       This is the product's stated limit, asserted rather than hidden.
+    - Delegated-task sessions remain unchanged in Hermes. Completion refers to the voice
+      archive only, never deletion of delegated work or its objectives.
 11. **Nothing reaches speech.** 0 archive or review events, native summaries, or failures reach
     speech or task dispatch.
 12. **Compatibility.** The compatibility test is green at `29112bef` and fails when one

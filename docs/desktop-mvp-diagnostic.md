@@ -18,6 +18,34 @@ The guide links to the detailed references rather than repeating them:
 [`hermes-bridge.md`](hermes-bridge.md) for the installed-runtime gate and the bridge protocol,
 and the [README](../README.md) for building from source.
 
+## Deleting a voice conversation
+
+Use the browser's **Delete this voice conversation** control and confirm the action.
+There is no voice command for deletion: a misheard utterance must never delete history.
+The control states this limit beside it:
+
+> What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP.
+
+> Delegated tasks remain in Hermes and are managed with Hermes's own session controls.
+
+The live tail and queued archive rows clear immediately and a new generation fences late
+events. The status remains **pending** until the companion verifies that the old generation's
+archive chain has been deleted. An already running review finishes normally; deletion waits
+for it, and anything it learns remains. If the companion is unavailable, pending does not
+mean complete. A restart or successor owner resumes reconciliation from durable intent.
+
+Deletion is logical, not physical erasure. Hermes run records remain (terminal records are
+pruned 24 hours after their last status update); unvacuumed SQLite pages and backups or sync
+copies remain too. A non-terminal run record left by a crash must first be recovered by
+Hermes before its terminal retention applies. Built-in memory and skills are not removed.
+
+For the acceptance session, use synthetic data: verify that a unique phrase disappears from
+the voice tail, each archive-chain session and the next conversation's history; exercise
+pending deletion during a review and after restart; verify separately that a deliberately
+learned fact can still return through M4. Record only results and counts, never the phrase
+or memory content. See [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md).
+Delegated-task session retention is an explicit acceptance witness, not a deletion failure.
+
 ## The profile
 
 | Aspect | MVP setting |
