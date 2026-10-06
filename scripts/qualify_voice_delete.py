@@ -75,6 +75,13 @@ _EXPECTED = {
         "readback_after_delete": 1,
         "model_requests": 2,
     },
+    "scope": {
+        "delegated_relation": 1,
+        "delegated_objective_retained": 1,
+        "fk_on": 1,
+        "post_delete_child_refused": 1,
+        "root_recreation_detected": 1,
+    },
     "unattributed": 0,
 }
 
@@ -225,6 +232,7 @@ async def _qualify(python: Path) -> None:
                 },
                 "succession": succession,
                 "learned_limit": learned,
+                "scope": core["scope"],
                 "unattributed": model.unattributed,
             }
             identity = installed_hermes_identity("0.21.0", PINNED_HERMES / "source")
@@ -262,6 +270,8 @@ async def _run_worker(scenario: str, home: Path) -> None:
 
 
 async def _core(home: Path) -> dict[str, object]:
+    import sqlite3
+
     from hermes_realtime.companion.host import VoiceCompanionService
     from hermes_realtime.conversation import ConversationContextStore
     from hermes_realtime.integration import LocalHermesBridgeClient
@@ -348,6 +358,22 @@ async def _core(home: Path) -> dict[str, object]:
             worker.db.append_message(grandchild, "assistant", phrase)
             chain_ids = (parent, child, grandchild)
             before = _all_messages(worker.db, chain_ids)
+            # An unrelated native delegated task belongs to Hermes, outside
+            # the voice archive's deletion set.
+            task_parent, task_child = "m3_task_parent", "m3_task_delegate"
+            task_objective = "Synthetic delegated objective: use river."
+            worker.db.create_session(task_parent, source="cli")
+            worker.db.create_session(
+                task_child, source="delegate", parent_session_id=task_parent,
+                model_config={"_delegate_from": task_parent},
+            )
+            worker.db.append_message(task_child, "user", task_objective)
+            task_before = worker.db.get_messages(task_child)
+            delegated_relation = int(
+                set(worker.db.get_session_delete_targets(task_parent))
+                == {task_parent, task_child}
+                and task_child not in worker.db.get_session_delete_targets(parent)
+            )
             retired = await writer.request_forget(context)
             foreground_cleared = int(
                 context.snapshot().messages == ()
@@ -373,6 +399,32 @@ async def _core(home: Path) -> dict[str, object]:
             late_review = await service.review(review)
             chain_after = _all_messages(worker.db, chain_ids)
             deletion = worker.store.deletion(retired[0])
+            task_after = worker.db.get_messages(task_child)
+            fk_on = int(worker.db._execute_write(
+                lambda conn: conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            ) == 1)
+            orphan = "m3_post_delete_orphan"
+            try:
+                worker.db.create_session(orphan, source="cli", parent_session_id=parent)
+            except sqlite3.IntegrityError:
+                orphan_refused = True
+            else:
+                orphan_refused = False
+            post_delete_child_refused = int(
+                fk_on == 1 and orphan_refused and worker.port.absent((orphan,))
+            )
+            worker.db.create_session(parent, source="cli")
+            root_recreation_detected = int(not worker.port.absent((parent,)))
+            from hermes_realtime.protocol import VoiceForgetEvent
+
+            replay = await service.forget(VoiceForgetEvent(
+                protocol_version="0.3", type="voice_forget",
+                conversation_id=retired[0], generation=retired[1],
+            ))
+            root_recreation_detected *= int(
+                replay is not None and replay.type == "voice_forget_ack"
+                and replay.state == "complete" and worker.port.absent((parent,))
+            )
             async def memory_connect() -> Any:
                 return await LocalHermesBridgeClient.connect(
                     host=server.host, port=server.port, token=token,
@@ -471,6 +523,17 @@ async def _core(home: Path) -> dict[str, object]:
                     "open_readback_before_archive": opened_memory,
                     "readback_after_delete": learned_after,
                     "model_requests": 0,
+                },
+                "scope": {
+                    "delegated_relation": delegated_relation,
+                    "delegated_objective_retained": int(
+                        _has_phrase(task_before, task_objective)
+                        and task_after == task_before
+                        and worker.port.absent(chain_ids)
+                    ),
+                    "fk_on": fk_on,
+                    "post_delete_child_refused": post_delete_child_refused,
+                    "root_recreation_detected": root_recreation_detected,
                 },
             }
     finally:
@@ -638,11 +701,10 @@ async def _foreign(home: Path) -> dict[str, object]:
         captured = 0
 
         def mutate_after_capture(
-            voice_session_id: str | None, run_session_ids: tuple[str, ...],
-            allow_missing_voice: bool,
+            voice_session_id: str | None, allow_missing_voice: bool,
         ) -> Any:
             nonlocal captured
-            targets = original(voice_session_id, run_session_ids, allow_missing_voice)
+            targets = original(voice_session_id, allow_missing_voice)
             if captured == 0:
                 worker.db.create_session(
                     child, source="cli", parent_session_id=record.session_id,
