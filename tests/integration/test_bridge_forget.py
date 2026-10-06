@@ -1,13 +1,21 @@
 """Deletion is a negotiated private request, never a work or speech event."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
 from hermes_realtime.integration.bridge import BridgeProtocolError, LocalHermesBridgeClient
-from hermes_realtime.protocol import VoiceForgetAckEvent, VoiceForgetEvent
-from tests.integration.test_bridge_voice import _TOKEN, _server, _Voice
+from hermes_realtime.protocol import (
+    VoiceArchiveAckEvent,
+    VoiceForgetAckEvent,
+    VoiceForgetEvent,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    parse_voice_event,
+)
+from tests.integration.test_bridge_voice import _TOKEN, _batch, _ReviewVoice, _server, _Voice
 
 
 class ForgetVoice(_Voice):
@@ -118,3 +126,34 @@ def test_forget_availability_requires_callable_handler() -> None:
     voice = ForgetVoice()
     voice.forget = None  # type: ignore[assignment]
     assert "voice_forget" not in _server(voice)._offered
+
+
+@pytest.mark.asyncio
+async def test_old_0_3_peer_keeps_archive_review_without_forget() -> None:
+    class AllVoice(ForgetVoice, _ReviewVoice):
+        pass
+
+    async with _server(AllVoice()) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        try:
+            writer.write(json.dumps(dict(
+                token=_TOKEN, participant_id="older-peer", protocol_version="0.3",
+                capabilities=["voice_archive", "voice_review"],
+            )).encode() + b"\n")
+            await writer.drain()
+            hello = json.loads(await reader.readline())
+            assert hello == dict(ok=True, protocol_version="0.3",
+                                 capabilities=["voice_archive", "voice_review"],
+                                 review_interval=10)
+            writer.write(_batch().model_dump_json().encode() + b"\n")
+            await writer.drain()
+            assert type(parse_voice_event(await reader.readline())) is VoiceArchiveAckEvent
+            writer.write(VoiceReviewEvent(
+                protocol_version="0.3", type="voice_review", conversation_id="conv",
+                generation=0, seq_from=0, seq_through=1, memory=True, skills=True, closing=False,
+            ).model_dump_json().encode() + b"\n")
+            await writer.drain()
+            assert type(parse_voice_event(await reader.readline())) is VoiceReviewAckEvent
+        finally:
+            writer.close()
+            await writer.wait_closed()
