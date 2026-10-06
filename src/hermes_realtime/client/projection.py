@@ -91,6 +91,7 @@ class BrowserEventProjection:
         self._sequence = 0
         self._overflowed = False
         self._capture_status_reservations: set[ProjectionReservation] = set()
+        self._voice_clear_reservations: set[ProjectionReservation] = set()
 
     def reset(self) -> None:
         """Begin a fresh browser lease with sequence authority restarting at one."""
@@ -99,6 +100,36 @@ class BrowserEventProjection:
         self._sequence = 0
         self._overflowed = False
         self._capture_status_reservations.clear()
+        self._voice_clear_reservations.clear()
+
+    def reserve_voice_clear(self) -> ProjectionReservation:
+        """Retain one nondroppable local-clear publication slot."""
+
+        self.ensure_capacity()
+        reservation = object.__new__(ProjectionReservation)
+        self._voice_clear_reservations.add(reservation)
+        return reservation
+
+    def publish_voice_clear(self, reservation: ProjectionReservation) -> BrowserPublicEvent:
+        """Consume the exact slot after the voice tail delete intent is durable."""
+
+        if (
+            type(reservation) is not ProjectionReservation
+            or reservation not in self._voice_clear_reservations
+        ):
+            raise RuntimeError("voice clear reservation is stale or foreign")
+        self._voice_clear_reservations.remove(reservation)
+        return self._publish_validated("voice_conversation_cleared", {}, reserved=True)
+
+    def release_voice_clear(self, reservation: ProjectionReservation) -> None:
+        """Abandon an exact slot when deletion never acquired a durable intent."""
+
+        if (
+            type(reservation) is not ProjectionReservation
+            or reservation not in self._voice_clear_reservations
+        ):
+            raise RuntimeError("voice clear reservation is stale or foreign")
+        self._voice_clear_reservations.remove(reservation)
 
     def reserve_capture_status(self) -> ProjectionReservation:
         """Retain one nondroppable capture-status publication slot."""
@@ -117,7 +148,8 @@ class BrowserEventProjection:
             raise ValueError("capture status slot count must be between one and four")
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations) + slots
+            or len(self._events) + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations) + slots
             > self._capacity
         ):
             self._overflowed = True
@@ -177,7 +209,8 @@ class BrowserEventProjection:
             raise ValueError("projection slot count is outside the capacity bound")
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations) + slots
+            or len(self._events) + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations) + slots
             > self._capacity
         ):
             self._overflowed = True
@@ -190,8 +223,8 @@ class BrowserEventProjection:
             raise TypeError("kind must be an exact built-in string")
         if kind not in _EVENT_KINDS:
             raise ValueError("event kind is not public")
-        if kind == "capture_status":
-            raise PermissionError("capture status requires a retained reservation")
+        if kind in {"capture_status", "voice_conversation_cleared"}:
+            raise PermissionError("event requires a retained reservation")
         if type(data) is not dict:
             raise TypeError("event data must be an exact built-in dictionary")
         return self._publish_validated(kind, data, reserved=False)
@@ -431,7 +464,8 @@ class BrowserEventProjection:
         # permanently killing the projection this method promises never to fail.
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations) + 1
+            or len(self._events) + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations) + 1
             > self._capacity
         ):
             return None

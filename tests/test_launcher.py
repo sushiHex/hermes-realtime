@@ -2198,6 +2198,7 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
         ) == 0
+        assert not projection._voice_clear_reservations
 
         ConversationStub.fail_resume = True
         with pytest.raises(RuntimeError, match="resume failure"):
@@ -2206,6 +2207,7 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
         ) == 1
+        assert not projection._voice_clear_reservations
         assert await delete("browser_0123456789abcdef", 1) == "pending"
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
@@ -2259,12 +2261,17 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
             await original_write(data)
 
         writer._write = delayed_write
+        projection = harness.browser["projection"]
+        projection._capacity = len(projection._events) + 2
         delete = harness.browser["delete_voice_conversation"]
         operation = asyncio.create_task(delete("browser_0123456789abcdef", 1))
         await asyncio.wait_for(entered.wait(), 2)
+        projection.publish("notification_queued", {})
+        assert projection.publish_advisory("playback_silenced", {}) is None
         operation.cancel()
         with pytest.raises(asyncio.CancelledError):
             await operation
+        assert len(projection._voice_clear_reservations) == 1
         if successor_generation:
             monkeypatch.setattr(
                 host_launcher_module.LiveKitConversationWorker, "active_generation", 2
@@ -2273,10 +2280,10 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
         async with asyncio.timeout(2):
             while harness.events.count("memory:start") < 2:
                 await asyncio.sleep(0.01)
-        projection = harness.browser["projection"]
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
         ) == (0 if successor_generation else 1)
+        assert not projection._voice_clear_reservations
     finally:
         await launcher.close()
 

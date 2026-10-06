@@ -2591,24 +2591,33 @@ def build_local_host_launcher(
             raise PermissionError("delete does not own the active worker generation")
         if writer.pending_forget is not None:
             return "pending"
+        reservation = projection.reserve_voice_clear()
+        reservation_owned = True
 
         def on_durable_clear() -> None:
+            nonlocal reservation_owned
             if voice_memory_receiver is not None:
                 try:
                     voice_memory_receiver.start()
                 except Exception:
                     _LOGGER.warning("voice memory restart after delete failed")
-            if livekit_worker.active_generation != generation:
-                return
             try:
-                projection.publish("voice_conversation_cleared", {})
+                if livekit_worker.active_generation == generation:
+                    projection.publish_voice_clear(reservation)
+                else:
+                    projection.release_voice_clear(reservation)
             except Exception:
                 _LOGGER.warning("voice delete clear projection failed")
+            reservation_owned = False
 
-        token = await conversation.suppress_audio_input(
-            participant_identity=participant_identity,
-            session_generation=generation,
-        )
+        try:
+            token = await conversation.suppress_audio_input(
+                participant_identity=participant_identity,
+                session_generation=generation,
+            )
+        except BaseException:
+            projection.release_voice_clear(reservation)
+            raise
         try:
             async with asyncio.timeout(10.0):
                 await conversation.quiesce_for_delete(
@@ -2621,6 +2630,11 @@ def build_local_host_launcher(
                 await writer.request_forget(context, on_durable_clear=on_durable_clear)
             return "complete" if writer.forget_complete else "pending"
         finally:
+            if reservation_owned and writer.pending_forget is None:
+                try:
+                    projection.release_voice_clear(reservation)
+                except RuntimeError:
+                    _LOGGER.warning("voice delete clear reservation release failed")
             await conversation.resume_audio_input(token)
 
     def voice_delete_status() -> str:

@@ -3,6 +3,69 @@ from __future__ import annotations
 import pytest
 
 from hermes_realtime.client import BrowserEventProjection
+from hermes_realtime.evidence.models import ProjectionReservation
+
+
+def test_voice_clear_reservation_survives_concurrent_publication() -> None:
+    projection = BrowserEventProjection(capacity=2)
+    reservation = projection.reserve_voice_clear()
+
+    projection.publish("notification_queued", {})
+    assert projection.publish_advisory("playback_silenced", {}) is None
+    clear = projection.publish_voice_clear(reservation)
+    assert clear.kind == "voice_conversation_cleared"
+    assert [event.kind for event in projection.events_after(0)] == [
+        "notification_queued", "voice_conversation_cleared",
+    ]
+
+
+def test_voice_clear_and_capture_reservations_account_for_both_slots() -> None:
+    projection = BrowserEventProjection(capacity=2)
+    clear = projection.reserve_voice_clear()
+    capture = projection.reserve_capture_status()
+
+    assert projection.publish_advisory("playback_silenced", {}) is None
+    with pytest.raises(RuntimeError, match="capacity"):
+        projection.publish("notification_queued", {})
+    assert projection.publish_voice_clear(clear).kind == "voice_conversation_cleared"
+    assert projection.publish_capture_status(
+        capture,
+        {
+            "available": True,
+            "captureState": "active",
+            "consentVersion": "realtime-evidence-consent-v1",
+            "disclosureDigest": "a" * 64,
+            "retentionHours": 24,
+        },
+    ).kind == "capture_status"
+
+
+def test_capture_reservation_cannot_take_the_retained_voice_slot() -> None:
+    projection = BrowserEventProjection(capacity=1)
+    projection.reserve_voice_clear()
+    with pytest.raises(RuntimeError, match="capacity"):
+        projection.reserve_capture_status()
+
+
+def test_voice_clear_reservation_rejects_foreign_stale_and_reset_tokens() -> None:
+    projection = BrowserEventProjection(capacity=2)
+    clear = projection.reserve_voice_clear()
+    capture = projection.reserve_capture_status()
+    foreign = object.__new__(ProjectionReservation)
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        projection.publish_voice_clear(foreign)
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        projection.release_voice_clear(foreign)
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        projection.publish_voice_clear(capture)
+    projection.release_voice_clear(clear)
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        projection.publish_voice_clear(clear)
+    projection.release_capture_status_reservations((capture,))
+    clear = projection.reserve_voice_clear()
+    projection.reset()
+    with pytest.raises(RuntimeError, match="stale or foreign"):
+        projection.release_voice_clear(clear)
 
 
 def test_capture_status_reservation_survives_concurrent_publication() -> None:
