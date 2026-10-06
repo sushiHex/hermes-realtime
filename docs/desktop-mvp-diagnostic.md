@@ -38,6 +38,9 @@ Deletion is logical, not physical erasure. Hermes run records remain (terminal r
 pruned 24 hours after their last status update); unvacuumed SQLite pages and backups or sync
 copies remain too. A non-terminal run record left by a crash must first be recovered by
 Hermes before its terminal retention applies. Built-in memory and skills are not removed.
+Completion verifies session absence in Hermes's database. Hermes removes session sidecar
+files on a best-effort basis and can silently retain them if filesystem removal fails;
+completion is not a verified filesystem-erasure receipt.
 
 For the acceptance session, use synthetic data: verify that a unique phrase disappears from
 the voice tail, each archive-chain session and the next conversation's history; exercise
