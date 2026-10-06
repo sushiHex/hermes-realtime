@@ -1614,10 +1614,10 @@ class BrowserSessionDirector:
             if participant_identity != self._active_identity:
                 raise PermissionError("delete participant does not own the active session")
             status = self._voice_delete_status
-            if status is None:
-                raise RuntimeError("voice delete is unavailable")
-            state = status()
-            if type(state) is not str or state not in {"idle", "pending", "complete"}:
+            state = "unavailable" if status is None else status()
+            if type(state) is not str or state not in {
+                "unavailable", "idle", "pending", "complete"
+            }:
                 raise RuntimeError("voice delete status is invalid")
             self._touch_activity()
             return state

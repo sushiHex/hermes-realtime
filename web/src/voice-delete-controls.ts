@@ -1,4 +1,4 @@
-export type VoiceDeleteState = "idle" | "pending" | "complete";
+export type VoiceDeleteState = "unavailable" | "idle" | "pending" | "complete";
 
 type Credential = { token: string; participantIdentity: string };
 type Path = "/api/v1/delete-voice-conversation" | "/api/v1/voice-delete-status";
@@ -14,7 +14,7 @@ export function parseVoiceDeleteState(value: unknown): VoiceDeleteState {
     Object.keys(data).sort().join(",") !== "state,version" ||
     data.version !== 1 ||
     typeof data.state !== "string" ||
-    !["idle", "pending", "complete"].includes(data.state)
+    !["unavailable", "idle", "pending", "complete"].includes(data.state)
   ) {
     throw new TypeError("voice delete status is invalid");
   }
@@ -22,6 +22,7 @@ export function parseVoiceDeleteState(value: unknown): VoiceDeleteState {
 }
 
 export class VoiceDeleteControls {
+  private available = false;
   private pending = false;
   private inFlight = false;
   private timer: number | null = null;
@@ -44,13 +45,14 @@ export class VoiceDeleteControls {
   }
 
   render(): void {
-    this.button.disabled = !this.options.connected() || this.pending || this.inFlight;
+    this.button.disabled = !this.options.connected() || !this.available || this.pending || this.inFlight;
   }
 
   reset(): void {
     this.epoch += 1;
     if (this.timer !== null) window.clearTimeout(this.timer);
     this.timer = null;
+    this.available = false;
     this.pending = false;
     this.inFlight = false;
     this.status.textContent = "Connect to delete this voice conversation.";
@@ -63,7 +65,7 @@ export class VoiceDeleteControls {
 
   async delete(): Promise<void> {
     const credential = this.options.credential();
-    if (credential === null || !this.options.connected() || this.pending || this.inFlight) return;
+    if (credential === null || !this.options.connected() || !this.available || this.pending || this.inFlight) return;
     if (!this.options.confirm(`Delete this voice conversation? ${LIMIT}`)) return;
     const epoch = ++this.epoch;
     this.inFlight = true;
@@ -74,7 +76,7 @@ export class VoiceDeleteControls {
       const state = parseVoiceDeleteState(
         await this.options.request("/api/v1/delete-voice-conversation", credential.token),
       );
-      if (state === "idle") throw new TypeError("delete returned idle");
+      if (state === "idle" || state === "unavailable") throw new TypeError("delete did not start");
       if (
         this.epoch !== epoch ||
         this.options.credential()?.participantIdentity !== credential.participantIdentity ||
@@ -123,13 +125,16 @@ export class VoiceDeleteControls {
   }
 
   private present(state: VoiceDeleteState): void {
+    this.available = state !== "unavailable";
     this.pending = state === "pending";
     this.status.textContent =
-      state === "pending"
-        ? "Deletion pending. Hermes is still verifying the archive."
-        : state === "complete"
-          ? "Voice conversation deleted."
-          : "Ready to delete this voice conversation.";
+      state === "unavailable"
+        ? "Voice conversation deletion is unavailable on this host."
+        : state === "pending"
+          ? "Deletion pending. Hermes is still verifying the archive."
+          : state === "complete"
+            ? "Voice conversation deleted."
+            : "Ready to delete this voice conversation.";
     this.render();
   }
 

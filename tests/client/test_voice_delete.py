@@ -16,6 +16,55 @@ from hermes_realtime.livekit import LiveKitConnection
 
 
 @pytest.mark.asyncio
+async def test_status_reports_unavailable_without_voice_archive_capability() -> None:
+    connection = LiveKitConnection(
+        "wss://livekit.test", "test-key", "synthetic-browser-bootstrap-secret-32-bytes"
+    )
+
+    async def provision(_identity: str) -> int:
+        return 3
+
+    async def submit(*_args: object) -> None:
+        pass
+
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="hermes-local",
+            identity_factory=lambda: "browser_0123456789abcdef",
+        ),
+        provision=provision,
+        submit=submit,
+        stop=submit,
+        approval=submit,
+        projection=BrowserEventProjection(),
+    )
+    credential = await director.start()
+    app = BrowserBootstrapApplication(
+        sessions=director,
+        verifier=BrowserTokenVerifier(connection=connection, room_name="hermes-local"),
+        capability=OneTimeBootstrapCapability(token_factory=lambda: "z" * 43),
+        allowed_origin="https://phone.test:8443",
+        worker_identity="worker_hermes_browser",
+    )
+    headers = {
+        "authorization": f"Bearer {credential.token}",
+        "content-length": "0",
+        "origin": "https://phone.test:8443",
+    }
+    response = await app.handle(
+        method="POST", path="/api/v1/voice-delete-status", headers=headers, body=b""
+    )
+    assert response.status == 200
+    assert json.loads(response.body) == {"state": "unavailable", "version": 1}
+    with pytest.raises(PermissionError):
+        await app.handle(
+            method="POST", path="/api/v1/voice-delete-status",
+            headers=headers | {"authorization": "Bearer invalid"}, body=b"",
+        )
+
+
+@pytest.mark.asyncio
 async def test_delete_control_requires_current_bearer_and_reports_pending() -> None:
     connection = LiveKitConnection(
         "wss://livekit.test", "test-key", "synthetic-browser-bootstrap-secret-32-bytes"

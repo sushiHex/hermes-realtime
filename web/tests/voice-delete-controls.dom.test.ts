@@ -31,6 +31,30 @@ function mount(options: {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("voice conversation deletion control", () => {
+  it("keeps delete disabled before capability status and when this host is unavailable", async () => {
+    const requests: string[] = [];
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async (path) => {
+        requests.push(path);
+        return { version: 1, state: "unavailable" };
+      },
+      clear: () => undefined,
+    });
+
+    expect(button.disabled).toBe(true);
+    await controls.delete();
+    expect(requests).toEqual([]);
+    await controls.refresh();
+    expect(requests).toEqual(["/api/v1/voice-delete-status"]);
+    expect(status.textContent).toBe("Voice conversation deletion is unavailable on this host.");
+    expect(button.disabled).toBe(true);
+    await controls.delete();
+    expect(requests).toEqual(["/api/v1/voice-delete-status"]);
+    controls.reset();
+    dom.window.close();
+  });
+
   it("requires explicit confirmation and clears the visible conversation only on local clear event", async () => {
     const requests: string[] = [];
     const confirmations: string[] = [];
@@ -38,7 +62,11 @@ describe("voice conversation deletion control", () => {
     let clears = 0;
     const { dom, button, status, controls } = mount({
       confirm: (message) => { confirmations.push(message); return allowed; },
-      request: async (path) => { requests.push(path); return response("pending"); },
+      request: async (path) => {
+        if (path === "/api/v1/voice-delete-status") return response("idle");
+        requests.push(path);
+        return response("pending");
+      },
       clear: () => { clears += 1; },
     });
     expect(button.textContent).toContain("Delete this voice conversation");
@@ -48,6 +76,8 @@ describe("voice conversation deletion control", () => {
     expect(dom.window.document.body.textContent).toContain(
       "Delegated tasks remain in Hermes and are managed with Hermes's own session controls.",
     );
+    await controls.refresh();
+    expect(button.disabled).toBe(false);
 
     await controls.delete();
     expect(requests).toEqual([]);
@@ -78,11 +108,12 @@ describe("voice conversation deletion control", () => {
       request: async (path) => {
         if (path === "/api/v1/delete-voice-conversation") return response("pending");
         statusCalls += 1;
-        return statusCalls === 1 ? oldStatus : response("complete");
+        return statusCalls === 1 ? response("idle") : statusCalls === 2 ? oldStatus : response("complete");
       },
       clear: () => undefined,
     });
 
+    await controls.refresh();
     const stale = controls.refresh();
     await controls.delete();
     resolveOld(response("complete"));
@@ -109,24 +140,26 @@ describe("voice conversation deletion control", () => {
       request: async (path) => {
         if (path === "/api/v1/voice-delete-status") {
           statusRequests += 1;
-          return response("complete");
+          return response("idle");
         }
         deletes += 1;
         return deletes === 1 ? oldRequest : newRequest;
       },
       clear: () => undefined,
     });
+    await controls.refresh();
     const old = controls.delete();
     controls.reset();
+    await controls.refresh();
     const current = controls.delete();
     await controls.refresh();
-    expect(statusRequests).toBe(0);
+    expect(statusRequests).toBe(2);
     resolveOld(response("complete"));
     await old;
     expect(status.textContent).toBe("Starting deletion…");
     expect(button.disabled).toBe(true);
     await controls.refresh();
-    expect(statusRequests).toBe(0);
+    expect(statusRequests).toBe(2);
     resolveNew(response("pending"));
     await current;
     expect(status.textContent).toContain("pending");
