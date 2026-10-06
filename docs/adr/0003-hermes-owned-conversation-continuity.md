@@ -298,9 +298,9 @@ announcement with counts only is spoken once voice input is ready and nothing el
 floor. It becomes a context row like any other speech.
 
 The tail is plaintext user data under the host state directory, outside evidence capture and
-purge. Forget clears the store and the file follows; from M3, forget also clears and fences the
-outbox and ignores stale acknowledgments. No forget operation exists yet (#77); until one does,
-delete the file while the host is stopped. The conversation-only launcher keeps no tail and
+purge. M3 deletion clears the store and the file follows; it also clears and fences the
+outbox and ignores stale acknowledgments. The confirmed browser control reports pending until
+the companion verifies the deletion; clearing the tail alone is not completion. The conversation-only launcher keeps no tail and
 archives nothing.
 
 ### 4. A Hermes-side companion archives and reviews
@@ -502,36 +502,46 @@ provider, plugin, and hook behaviour inside the fork is qualified too. Native re
 are suppressed or routed explicitly, and no archive or review event, summary, or failure reaches
 speech or task dispatch. No full-toolset turn exists anywhere in this design.
 
-#### Forget
+#### Delete: reconciliation of durable intent
 
-`voice_forget{conversation_id, generation}` retires a generation. One lock per conversation
-serializes archive commits, review admission, and tombstoning, and each of them also reads the
-tombstone and quarantine inside its own plugin-store transaction. A lock on `state.db` never
-stands in for one on the plugin store. The order is fixed:
+The owner decision on [#159](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6014271008)
+supersedes the earlier cancel-and-join forget design. The browser control is **Delete this
+voice conversation**, behind an explicit confirmation, with this limit beside it:
 
-1. Persist the tombstone. Later archive and review events for that generation are refused.
-2. Set the in-memory generation fence.
-3. Cancel the review run. Before admission this fences it
-   ([fence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/background_review.py#L48-L63));
-   after admission it interrupts the fork
-   ([interrupt](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/background_review.py#L115-L149)).
-4. Join the owned thread. Quiescence means the join returned and the thread is not alive.
-   Hermes's own cancellation waits a bounded time and then lets the review continue
-   ([bounded wait](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/background_review.py#L152-L187)),
-   so a cancel never proves quiescence. On a join timeout, forget reports itself incomplete,
-   defers deletion, and keeps the lease. Memory or skill writes may land while a review unwinds.
-5. Resolve the latest continuation
-   ([resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L12742)),
-   capture every `parent_session_id` link back to the bound session, then delete each link with
-   `delete_session(expected_delete_ids=...)`, persisting progress after each so a partial
-   deletion resumes. Hermes orphans compression children rather than deleting them
-   ([orphaning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14068-L14073)).
-   A walk that cannot reach the bound session reports forget incomplete.
-6. Release the lease, last.
+> What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP.
 
-Realtime clears and fences the outbox and ignores stale acknowledgments. The generation recheck
-applies to companion work; nothing rechecks inside Hermes's review thread. Forget does not remove
-memory or skills already learned.
+There is no voice command: a misheard utterance must never delete. The authenticated endpoint
+uses the existing bearer, request-bound and CSP rules. Realtime clears the live store so the
+tail rewrites empty, advances the generation, fences and clears its outbox, ignores stale
+acknowledgments, and drops cached memory until the next refresh. Its status remains pending
+until the companion verifies completion.
+
+`voice_forget{conversation_id, generation}` persists a durable tombstone in one plugin-store
+transaction. Archive commits, review admission and tombstoning serialize per conversation;
+their store transactions re-read the fences. Later archive and review events for that
+generation are refused. A running review is not cancelled: it finishes normally, and memory
+or skills it writes are covered by the stated limit.
+
+One idempotent reconciler deletes tombstoned generations' whole compression chains and the
+run sessions named by their binding records whenever no review for the generation is admitted
+or alive. It runs when a tombstone is written, when a review thread ends, and at every owned
+start. Durable intent, rather than a special cancellation, timeout, deferral or resume path,
+drives crash recovery and successor ownership. The complete deletion set must survive native
+deletion orphaning compression children; native session APIs own the deletion itself.
+
+`voice_forget_ack{state}` reports `complete` only after a verifying walk finds nothing of the
+generation left, otherwise `pending`. Realtime resends the idempotent request with bounded
+backoff until complete. Protocol stays at 0.3; a separately negotiated capability gates these
+events. An unsupported or unavailable peer never produces a false completion.
+
+#### Ownership by succession
+
+Each process starts a companion thread without blocking plugin load. A thread finding the
+profile lock held waits interruptibly for it rather than standing down permanently. After
+acquiring ownership, it runs M0's open order, then reconciles tombstones before serving work.
+When a CLI or cron owner exits, a waiting gateway can take over without a restart. The lock
+continues to exclude simultaneous owners, and runtime attestation still reports a non-gateway
+owner as `foreign_companion`; succession does not weaken that identity check.
 
 #### Compatibility
 
@@ -619,22 +629,18 @@ A backend outage never silences the voice.
   is built-in, because a run's memory sync passes its messages to any configured external
   provider
   ([sync](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/run_agent.py#L4556)).
-- **Forgetting.** "Forget this conversation" clears the live store, which rewrites the voice
-  tail empty. From M3 it also runs the companion's forget, which deletes the voice session's
-  whole compression chain in the order above. It deletes every run session in the binding
-  record, which hold objectives rather than voice text. The record keeps a run only while it
-  may be running, so how forget names the sessions of finished runs remains open. Curated
-  memory and skills are a separate, explicit operation, and complete file-level erasure is not
-  promised until the delete path is qualified
-  ([delete semantics](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14027-L14116)).
-  A run dispatched with a key also has its status persisted by Hermes, including its output,
-  error, and any approval request still pending
-  ([persistence](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L138-L152)).
-  Under the default policy for bearer clients, a terminal record is pruned once it is more than
-  24 hours past its last status update. A record left non-terminal by a gateway crash is not
-  pruned until Hermes rehydrates it as interrupted
+- **Deletion is not unlearning.** "Delete this voice conversation" removes its live tail,
+  archive compression chain and the run sessions named by its binding record. Built-in memory
+  and skills remain and can shape later replies through M4, including writes from a review
+  already running when deletion was requested. Finished run sessions no longer named by the
+  bounded active-run record are outside that record's coverage; no wider erasure is promised.
+  Deletion is logical, not physical: unvacuumed SQLite pages, backups and sync copies remain.
+  Hermes run records also remain; terminal records are pruned 24 hours after their last status
+  update under the default bearer-client policy. A non-terminal record left by a crash must
+  first be rehydrated as interrupted before pruning applies
   ([pruning](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_run_idempotency.py#L237-L294)).
-  No API route deletes it, so forget does not remove it.
+  No API route deletes those run records. Provenance for "forget what you learned" remains
+  post-MVP; M3 adds no second memory store and no unlearning claim.
 - **Retention.** Hermes session auto-pruning stays disabled for the MVP. Pruning selects only
   ended sessions
   ([filter](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/hermes_state.py#L14371)),
@@ -695,8 +701,9 @@ Withdrawn by the 2026-09-25 amendment:
      for the foreground's context snapshot, under the same profile binding. M4 qualifies the
      realtime foreground applying what Hermes learned. Criteria 13–18. M4 precedes M3 because
      recall across days is the visible MVP promise and readback changes foreground context
-     and latency; M3 stays within the companion.
-   - **M3, forget.** Criterion 10.
+     and latency; M3 adds deletion and companion ownership succession.
+   - **M3, delete.** Durable tombstone reconciliation, ownership succession and the confirmed
+     browser control. Criterion 10; no unlearning.
 
 The upstream route is not on this path. Proposing it stays worthwhile; adopting it is a
 separate change.
@@ -748,9 +755,16 @@ The companion's milestones must meet these criteria:
    or refused.
 9. **Corrections applied.** Every predeclared eligible correction is persisted to memory or a
    skill and applied in a fresh Hermes task, with a declared model and repeat count.
-10. **Forget.** Late events, work already admitted, a hung cancellation, a restart, and a
-    partial deletion never resurrect history or produce a false "complete". Forget stays
-    incomplete until the join returns and the thread is not alive.
+10. **Delete, without unlearning.** Against real pinned Hermes with a declared stand-in model:
+    - A unique phrase is absent afterwards from the tail, every compression-chain session
+      (through `get_messages`), and the next conversation's history.
+    - Late archive/review events are refused and stale acknowledgments are ignored.
+    - Deletion during a running review reports pending, never complete, and completes after
+      the review ends without cancelling it.
+    - A kill, restart or owner exit mid-delete resurrects nothing; reconciliation completes
+      under the successor. CLI-first ownership hands over when the CLI exits.
+    - A fact deliberately learned in the deleted conversation still returns through M4.
+      This is the product's stated limit, asserted rather than hidden.
 11. **Nothing reaches speech.** 0 archive or review events, native summaries, or failures reach
     speech or task dispatch.
 12. **Compatibility.** The compatibility test is green at `29112bef` and fails when one
