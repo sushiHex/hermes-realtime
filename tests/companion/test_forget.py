@@ -166,7 +166,10 @@ async def test_delete_manifest_survives_partial_native_delete(store: CompanionSt
 
 
 @pytest.mark.asyncio
-async def test_admitted_review_defers_without_cancellation(store: CompanionStore) -> None:
+async def test_admitted_review_defers_without_cancellation(
+    store: CompanionStore,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     store.bind("conv", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
     port = FakeDeletePort()
     port.sessions = {"voice_1": None}
@@ -174,6 +177,10 @@ async def test_admitted_review_defers_without_cancellation(store: CompanionStore
     reconciler = VoiceForgetReconciler(store, port, lambda _conversation: admitted)
     assert await reconciler.forget("conv", 0) == "pending"
     assert port.deleted == []
+    assert (
+        '[voice-forget] {"category": "review", "count": 1, "kind": "admitted", '
+        '"stage": "defer", "version": 1}'
+    ) in capsys.readouterr().out
     admitted = False
     assert await reconciler.reconcile("conv") == "complete"
     assert port.deleted == ["voice_1"]

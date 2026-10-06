@@ -99,8 +99,13 @@ class VoiceForgetReconciler:
             except Exception as error:
                 _marker("verify", error)
                 return "pending"
-        if self._review_admitted(conversation_id):
-            return "pending"
+        review_admitted = self._review_admitted(conversation_id)
+        try:
+            if review_admitted:
+                return "pending"
+        finally:
+            if review_admitted:
+                _review_deferral_marker()
         if deletion.targets is None:
             binding = self._store.read(conversation_id)
             voice_id = None if binding is None else binding.session_id
@@ -146,6 +151,23 @@ def _marker(stage: str, error: Exception) -> None:
     print(
         "[voice-forget] "
         + json.dumps({"stage": stage, "version": 1, **outcome}, sort_keys=True),
+        flush=True,
+    )
+
+
+def _review_deferral_marker() -> None:
+    print(
+        "[voice-forget] "
+        + json.dumps(
+            {
+                "category": "review",
+                "count": 1,
+                "kind": "admitted",
+                "stage": "defer",
+                "version": 1,
+            },
+            sort_keys=True,
+        ),
         flush=True,
     )
 
