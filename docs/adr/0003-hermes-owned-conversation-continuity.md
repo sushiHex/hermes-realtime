@@ -547,7 +547,7 @@ owner as `foreign_companion`; succession does not weaken that identity check.
 
 #### Compatibility
 
-`integration/hermes_compat.py` is the only module that names Hermes internals:
+`companion/hermes_compat.py` binds the companion's use of Hermes internals:
 
 - storage: `_execute_write`, `_check_transcript_write_guards`, `_insert_message_rows`,
   `_TRANSCRIPT_WRITE_PATIENCE_S`, `create_session`, and `get_messages`;
