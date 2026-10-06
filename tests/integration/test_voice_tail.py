@@ -125,9 +125,10 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
         b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],'
         b'"review":{"close_reviewed":false,"close_targets":[],"cursor":null,'
         b'"overflow":false,"pending":null,"reviewed_users":0,"rows":[],"users":0},'
-        b'"settled":1},'
+        b'"settled":1},"forget_complete":false,'
         b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
-        b'{"interrupted":true,"role":"assistant","text":"Cut"}],"prior_work":true,"version":3}'
+        b'{"interrupted":true,"role":"assistant","text":"Cut"}],'
+        b'"pending_forget":null,"prior_work":true,"version":4}'
     )
     assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
     assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())

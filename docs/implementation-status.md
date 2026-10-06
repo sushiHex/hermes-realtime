@@ -29,6 +29,17 @@ optional or hardware-dependent test ran. Missing evidence remains unverified.
 | **Hermes memory readback (M4):** [native reader](../src/hermes_realtime/companion/hermes_compat.py) and [receiver](../src/hermes_realtime/integration/voice_memory.py) supply bounded built-in memory as untrusted foreground context. | Explicit companion configuration and negotiated bridge 0.3 `voice_memory`; missing or refused support leaves voice running without memory. | [Installed qualification](../scripts/qualify_voice_memory.py) exercises the pinned Hermes store, M2 review, bridge and foreground with a stand-in model. Exact results belong to [#77](https://github.com/sushiHex/hermes-realtime/issues/77) and the implementation PR. Refresh is asynchronous at open and after finished reviews; turns use the latest snapshot without waiting. Criterion 17 checks that memory adds no authority, including paired with/without-memory tool behavior and refresh-only inactivity. Existing model-initiated routing and its forced-tool limit remain unchanged; a deterministic boundary is a separate [decision (#205)](https://github.com/sushiHex/hermes-realtime/issues/205). Real-model recall quality and prompt-injection resistance remain unqualified. |
 | **Evidence learning/profile import:** no capture-to-learning or runtime captured-text import path is provided. | Excluded from Slice 0. | The [no-learning contract](evidence-capture.md#no-learning-boundary) remains separate from the voice archive and its approved companion review. |
 
+**Voice conversation deletion (M3):** the confirmed browser control and
+[durable sender](../src/hermes_realtime/integration/voice_forget.py) retire the voice binding;
+the [companion reconciler](../src/hermes_realtime/companion/forget.py) deletes its compression
+chain from durable tombstone intent. Activation requires the negotiated `voice_forget`
+capability on bridge 0.3. The [pinned-Hermes qualification](../scripts/qualify_voice_delete.py)
+exercises deletion, late-event fences, review completion, crash recovery and companion
+succession with synthetic fixtures and a stand-in model. Its two labelled owner processes
+run the real companion host, not the full CLI/API entrypoints. Exact candidate results belong
+to #77 and the implementation PR. Learned memory/skills and delegated-task sessions remain;
+the [deletion contract](hermes-bridge.md#voice-conversation-deletion) states the limits.
+
 ## Qualification producer status
 
 The [input-binding implementation](qualification-input-files.md) adds retained

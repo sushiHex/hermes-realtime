@@ -227,7 +227,7 @@ def test_the_store_holds_fences_and_progress_never_transcript_text(tmp_path: Pat
         tables = [
             row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
         ]
-    assert tables == ["voice_archive"]
+    assert tables == ["voice_archive", "voice_deletion"]
     assert columns == [
         "conversation_id",
         "session_id",
@@ -266,6 +266,24 @@ def test_a_journal_mode_that_does_not_take_is_refused() -> None:
     # SQLite answers "memory" to a DELETE request on an in-memory database: nothing durable.
     with pytest.raises(RuntimeError):
         CompanionStore(Path(":memory:"))
+
+
+def test_version_three_store_migrates_with_deletion_table(tmp_path: Path) -> None:
+    path = tmp_path / "companion.db"
+    store = CompanionStore(path)
+    _committed(store)
+    store.close()
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        raw.execute("DROP TABLE voice_deletion")
+        raw.execute("PRAGMA user_version = 3")
+        raw.commit()
+    upgraded = CompanionStore(path)
+    try:
+        assert upgraded.read("conv") is not None
+        assert upgraded.tombstone("conv", 0) is True
+        assert upgraded.deletion("conv") is not None
+    finally:
+        upgraded.close()
 
 
 @pytest.mark.parametrize(

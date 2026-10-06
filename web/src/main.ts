@@ -87,6 +87,7 @@ import {
 } from "./evidence-controls";
 import { mountSearchEgressControls } from "./search-egress-controls";
 import { mountTypedComposerEnterSubmission } from "./typed-composer";
+import { VoiceDeleteControls } from "./voice-delete-controls";
 import {
   parseBootstrapCredential,
   parseCaptureStatus,
@@ -119,6 +120,8 @@ const microphoneActivityLabel = element<HTMLSpanElement>("microphone-activity-la
 const microphoneLevel = element<HTMLElement>("microphone-level");
 const sessionToggleButton = element<HTMLButtonElement>("session-toggle");
 const stopSpeakingButton = element<HTMLButtonElement>("stop-speaking");
+const deleteVoiceButton = element<HTMLButtonElement>("delete-voice-conversation");
+const voiceDeleteStatus = element<HTMLOutputElement>("voice-delete-status");
 const speechRendererState = element<HTMLOutputElement>("speech-renderer-state");
 const muteButton = microphoneActivity;
 const microphoneSelect = element<HTMLSelectElement>("microphone");
@@ -794,6 +797,18 @@ interface AssistantTurnView {
 }
 
 const assistantTurns = new Map<string, AssistantTurnView>();
+const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDeleteStatus, {
+  credential: () => credential,
+  connected: () => controller.state === "connected",
+  confirm: (message) => window.confirm(message),
+  request: requestVoiceDeleteWire,
+  clear: () => {
+    clearPartialTranscript();
+    transcript.replaceChildren();
+    assistantTurns.clear();
+    syncTranscriptEmptyState();
+  },
+});
 const assistantGenerationAuthority = new AssistantGenerationAuthority(256);
 
 const speechTimings = new SpeechTimingRegistry(32);
@@ -1496,7 +1511,9 @@ function addObjectiveLatency(event: PublicEvent): void {
 }
 
 function projectPublicEvent(event: PublicEvent): void {
-  if (event.kind === "session_ready") {
+  if (event.kind === "voice_conversation_cleared") {
+    voiceDeleteControls.cleared();
+  } else if (event.kind === "session_ready") {
     naturalDuplexEnabled = naturalDuplexProfileEnabled({
       conversationProfile: event.data.conversationProfile,
       mode: event.data.mode,
@@ -1922,6 +1939,7 @@ function renderConnectionPresentation(state = controller.state): void {
   connectionStatus.dataset.state = presentation.presentationState;
   readinessHeadline.textContent = presentation.headline;
   readinessDetail.textContent = presentation.detail;
+  voiceDeleteControls.render();
 }
 
 function clearVoicePathReadinessTimer(): void {
@@ -2605,6 +2623,7 @@ async function reverifyMicrophoneAfterNativeReconnect(
   );
   if (!mediaCommitted) return;
   controller.connected();
+  void voiceDeleteControls.refresh();
   if (authoritativeTrack !== null) waitForServerVoicePath();
   addMarker("media_reconnected");
   addMarker(selectedMicrophoneReady ? "voice_input_published" : "typed_input_ready");
@@ -2799,6 +2818,7 @@ async function connect(projectionResync = false): Promise<void> {
     );
     if (!mediaCommitted) return;
     controller.connected();
+    void voiceDeleteControls.refresh();
     if (settled.value !== null) waitForServerVoicePath();
     addMarker(selectedMicrophoneReady ? "voice_input_published" : "typed_input_ready", started);
     if (eventPolling === null) {
@@ -3017,6 +3037,7 @@ async function stop(): Promise<void> {
   delete modelSelectionState.dataset.state;
   evidenceControls.reset();
   searchEgressControls.reset();
+  voiceDeleteControls.reset();
   controller.stopped();
   addMarker("session_stopped");
 }
@@ -3040,6 +3061,21 @@ async function submitTyped(text: string): Promise<void> {
   inputSequence = sequence;
   projectUserTranscript("typed-admission", text);
   addMarker("typed_input_admitted");
+}
+
+async function requestVoiceDeleteWire(
+  path: "/api/v1/delete-voice-conversation" | "/api/v1/voice-delete-status",
+  token: string,
+): Promise<unknown> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: authorization(token),
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  });
+  if (!response.ok) throw new Error("voice delete request failed");
+  return response.json();
 }
 
 async function submitEvidenceControl(

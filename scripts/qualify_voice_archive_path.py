@@ -12,8 +12,9 @@ throwaway Hermes home, with this repository's ``src`` on ``sys.path``:
   registers it with a real ``PluginContext``; registration builds the companion, whose owned
   start takes the profile lock, keeps its store in Hermes's plugin data directory, binds the
   profile's real ``state.db`` and serves the bridge on a loopback port. A second companion
-  process, registered the same way while the first owns the profile, must stand down; the
-  manager's unload closes the owner;
+  process, registered the same way while the first owns the profile, must return promptly
+  from registration and wait without opening either database; the manager's unload closes
+  that waiter;
 - **realtime**: this repository's interpreter drives a real context store, voice tail and
   archive sender through synthetic speech, in steps that stop, crash and restart it.
 
@@ -218,7 +219,10 @@ def _passed(evidence: dict[str, Any], hermes: dict[str, object]) -> bool:
         and reads["messages_route_reads"] == 0
         and evidence["control"]["messages_route_reads"] == 1
         and evidence["control"]["http_requests"] >= 1
-        and evidence["stood_down"] == {"held_markers": 1, "owned": 0}
+        and evidence["contender"] == {
+            "registered": 1, "waiting": 1, "ready": 0, "prompt": 1,
+            "native_opens": 0, "store_opens": 0, "unloaded": 1,
+        }
         and evidence["steps"] == _EXPECTED_STEPS
     )
 
@@ -357,7 +361,7 @@ def _qualify(hermes_python: Path) -> None:
             steps["fill"] = _run(python, realtime, port, token, "fill", str(port))
             companion = _Companion(hermes_python, hermes_home, port, token)
             steps["companion_ready"] = companion.ready()
-            # Hermes discovers plugins in every process: a second one must stand down.
+            # Hermes discovers plugins in every process: a second waits without DB access.
             steps["second_process"] = _Companion(
                 hermes_python, hermes_home, port, token, "contend"
             ).process.wait(timeout=_STEP_TIMEOUT_SECONDS)
@@ -391,7 +395,7 @@ def _qualify(hermes_python: Path) -> None:
             evidence["control"] = json.loads(
                 (realtime / "control.json").read_text(encoding="utf-8")
             )
-            evidence["stood_down"] = json.loads(
+            evidence["contender"] = json.loads(
                 (hermes_home / "contend.json").read_text(encoding="utf-8")
             )
             evidence["steps"] = steps
@@ -466,22 +470,55 @@ def _companion(home: Path, mode: str) -> None:
         get_plugin_manager,
     )
 
+    # The contender keeps the real PluginManager path while counting the two DB-opening
+    # boundaries. Its owned thread may wait on the profile lock; it must never reach them.
+    openings = {"native_opens": 0, "store_opens": 0}
+    if mode == "contend":
+        from hermes_realtime import hermes_plugin
+        from hermes_realtime.companion import host as companion_host
+
+        native_open = hermes_plugin._open_archive_port
+        store_open = companion_host.CompanionStore
+
+        def count_native_open() -> Any:
+            openings["native_opens"] += 1
+            return native_open()
+
+        def count_store_open(path: Path) -> Any:
+            openings["store_opens"] += 1
+            return store_open(path)
+
+        hermes_plugin._open_archive_port = count_native_open
+        companion_host.CompanionStore = count_store_open
+
     (home / "hermes-version.txt").write_text(hermes_cli.__version__, encoding="utf-8")
     captured = io.StringIO()
+    started = time.monotonic()
     with _contextlib.redirect_stdout(captured):
         discover_plugins()
+    registration_seconds = time.monotonic() - started
     sys.stdout.write(captured.getvalue())
     from hermes_realtime import hermes_plugin
 
     companion = hermes_plugin._companion
     if mode == "contend":
-        held = sum(
-            line == '[voice-companion] {"refusal":"held","version":1}'
-            for line in captured.getvalue().splitlines()
-        )
-        result = {"held_markers": held, "owned": int(companion is not None)}
-        (home / "contend.json").write_text(json.dumps(result), encoding="utf-8")
+        thread = None if companion is None else companion._thread
+        result = {
+            "registered": int(companion is not None),
+            "waiting": int(
+                companion is not None and thread is not None and thread.is_alive()
+                and not companion.wait_ready(0)
+            ),
+            "ready": int(companion is not None and companion.wait_ready(0)),
+            "prompt": int(registration_seconds < 15),
+        }
         get_plugin_manager().unload()
+        result.update(openings)
+        result["unloaded"] = int(
+            hermes_plugin._companion is None
+            and thread is not None and not thread.is_alive()
+        )
+        (home / "contend.json").write_text(json.dumps(result), encoding="utf-8")
         return
     if companion is None or not companion.wait_ready(_READY_TIMEOUT_SECONDS):
         raise SystemExit(2)

@@ -302,10 +302,12 @@ BRIDGE_PROTOCOL_VERSION = "0.3"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
 VOICE_MEMORY_CAPABILITY = "voice_memory"
+VOICE_FORGET_CAPABILITY = "voice_forget"
 # A welcome that negotiates it carries ``runtime``: what the serving process loaded.
 RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
 BRIDGE_CAPABILITIES = frozenset({
     VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, VOICE_MEMORY_CAPABILITY,
+    VOICE_FORGET_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
 })
 VOICE_MAX_BATCH_ROWS = 256
@@ -527,6 +529,31 @@ class RuntimeAttestation(StrictModel):
     realtime_record: Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{64}|unknown)$")]
 
 
+class VoiceForgetEvent(StrictModel):
+    """Persist deletion intent for one retired voice generation."""
+
+    protocol_version: Literal["0.3"]
+    type: Literal["voice_forget"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+
+
+class VoiceForgetAckEvent(StrictModel):
+    protocol_version: Literal["0.3"]
+    type: Literal["voice_forget_ack"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+    state: Literal["pending", "complete"]
+
+
+class VoiceForgetRefusedEvent(StrictModel):
+    protocol_version: Literal["0.3"]
+    type: Literal["voice_forget_refused"]
+    conversation_id: VoiceConversationId
+    generation: VoiceIdentity
+    category: VoiceRefusalCategory
+
+
 class VoiceMemoryEvent(StrictModel):
     """Subscribe to fresh profile memory for one foreground conversation binding."""
 
@@ -571,7 +598,10 @@ VoiceEvent: TypeAlias = Annotated[
     | VoiceReviewRefusedEvent
     | VoiceMemoryEvent
     | VoiceMemorySnapshotEvent
-    | VoiceMemoryRefusedEvent,
+    | VoiceMemoryRefusedEvent
+    | VoiceForgetEvent
+    | VoiceForgetAckEvent
+    | VoiceForgetRefusedEvent,
     Field(discriminator="type"),
 ]
 _VOICE_ADAPTER: TypeAdapter[VoiceEvent] = TypeAdapter(VoiceEvent)
@@ -586,6 +616,9 @@ VOICE_EVENT_TYPES = frozenset(
         "voice_memory",
         "voice_memory_snapshot",
         "voice_memory_refused",
+        "voice_forget",
+        "voice_forget_ack",
+        "voice_forget_refused",
     }
 )
 

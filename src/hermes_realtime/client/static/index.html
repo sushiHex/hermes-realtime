@@ -183,6 +183,18 @@
             </div>
           </section>
 
+          <section class="panel inspector-card evidence-disclosure" aria-labelledby="voice-delete-title">
+            <p class="section-kicker">Conversation control</p>
+            <h2 id="voice-delete-title">Delete voice conversation</h2>
+            <p id="voice-delete-limit" class="evidence-disclosure-copy">What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own session controls.</p>
+            <div class="evidence-controls">
+              <output id="voice-delete-status" class="evidence-capture-status" role="status" aria-live="polite">Connect to delete this voice conversation.</output>
+              <div class="evidence-control-actions">
+                <button id="delete-voice-conversation" class="button danger" type="button" aria-describedby="voice-delete-limit voice-delete-status" disabled>Delete this voice conversation</button>
+              </div>
+            </div>
+          </section>
+
           <section id="search-egress-disclosure" class="panel inspector-card evidence-disclosure" aria-labelledby="search-egress-disclosure-title">
             <p class="section-kicker">Optional external search</p>
             <h2 id="search-egress-disclosure-title">Public search disclosure</h2>

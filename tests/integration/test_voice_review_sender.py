@@ -581,6 +581,8 @@ async def test_v2_migration_preserves_outbox_and_baselines_review(tmp_path: Path
 
     old = json.loads(path.read_text())
     old["version"] = 2
+    del old["pending_forget"]
+    del old["forget_complete"]
     del old["archive"]["review"]
     path.write_text(json.dumps(old, separators=(",", ":"), sort_keys=True))
 

@@ -151,14 +151,14 @@ Paths that differ only in case are exempt from the tracked-changes refusal on a
 case-insensitive checkout only while their one file on disk matches one of their committed
 versions: `29112bef` tracks such paths, and Windows can hold only one of each.
 
-## Protocol 0.3: the hello, voice archive, review and memory
+## Protocol 0.3: the hello, voice archive, review, memory and deletion
 
 The hello is exactly
 `{"token", "participant_id", "protocol_version": "0.3", "capabilities": [...]}`. The server
 answers `{"ok": true, "protocol_version": "0.3", "capabilities": [...]}` with the requested
 capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
 repeated capability, or with any other key, is refused. The voice capabilities are
-`voice_archive`, `voice_review` and `voice_memory`, offered by the ready companion.
+`voice_archive`, `voice_review`, `voice_memory` and `voice_forget`, offered by the ready companion.
 Memory is an additive 0.3 capability, not a new wire version; peers without it keep
 dispatch, archive and review on their existing connections. A welcome that
 negotiates review also carries its profile's bounded `review_interval`. Realtime
@@ -266,6 +266,43 @@ with a NUL, becomes a gap instead of entering a frozen batch. A version-1 tail m
 the first write; its restored rows get identities then, so their `ts` is the time of that
 restart, not the time their speech settled, which a version-1 tail never recorded.
 
+## Voice conversation deletion
+
+The separately negotiated `voice_forget` capability keeps bridge version 0.3. A dedicated
+connection sends `voice_forget{conversation_id, generation}` and receives a bound
+`voice_forget_ack{conversation_id, generation, state}` with `pending` or `complete`, or a
+bounded `voice_forget_refused` category. Unknown or unavailable capability never means
+completion, and the sender retries durable intent with bounded backoff. No event is routed
+to speech or task dispatch.
+
+The browser's confirmed **Delete this voice conversation** action clears the live tail,
+fences the old archive/review outbox and stale acknowledgments, advances the generation with
+a fresh conversation identity, and drops the memory snapshot. The pending old identity is
+retained in the existing atomic tail file across restart. The UI stays pending until an
+exact complete receipt arrives; there is no voice deletion command.
+
+The companion persists a tombstone before native deletion. A single idempotent reconciler
+runs on the tombstone, natural review-thread completion and owned startup. An admitted or
+alive review keeps deletion pending; deletion never cancels it. A durable manifest preserves
+the whole compression chain across native deletion's child-orphaning behavior, and completion
+requires a verifying walk. Profile ownership waits on the companion thread and passes to a
+waiting process after the owner exits. Plugin load stays nonblocking; runtime attestation
+continues to detect a non-gateway owner.
+
+What Hermes learned from it (memories and skills) stays and may still shape replies. There is
+no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own
+session controls. No run-session IDs are included in the delete request. Deletion is logical:
+Hermes run records, unvacuumed SQLite pages,
+backups and sync copies remain. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
+for the exact support limits and [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md)
+for the qualification contract.
+
+`uv run python scripts/qualify_voice_delete.py` exercises pinned Hermes with synthetic data
+and a stand-in model: chain deletion, late-event fences, running-review pending status,
+crash recovery, owner succession and retained learned memory. The succession witness runs
+the real companion host in two labelled processes, not the complete Hermes CLI and API
+server entrypoints. Exact candidate receipts belong to the implementation PR and #77.
+
 ## Voice companion hosting
 
 Registration builds the companion when the environment the gateway runs in names both
@@ -274,18 +311,19 @@ Registration builds the companion when the environment the gateway runs in names
 a plugin context without `on_unload` and a `state.data_dir`, is refused with one
 `[voice-companion]` marker; dispatch still registers.
 
-Hermes discovers plugins in every process (the gateway, the CLI, cron), so the owned start
-first takes an exclusive OS lock beside the plugin store and holds it until unload. A
-process that finds it held stands down: it touches no lease, row or store, and prints one
-`{"refusal":"held"}` marker. The owner then runs on its own event-loop thread. It binds
+Hermes discovers plugins in every process (the gateway, the CLI, cron). Start launches the
+companion thread without waiting on plugin load. That thread waits interruptibly for the
+exclusive OS lock beside the plugin store, touching no lease, row or store until it owns
+the lock. A waiting gateway can take over after a CLI or cron owner exits. The owner binds
 the profile's `state.db`, as Hermes resolves it, and the plugin store `voice-companion.db`
 in the plugin's data directory, checks compatibility and durability, and only then starts
 the bridge on the configured port. Start opens no conversation: each opens on contact
 whenever it is not ready (M0's order: fences, compatibility and durability, lease,
 verification), so an unknown outcome or a lost lease recovers in the same process, while a
 quarantined or tombstoned one stays refused. At most 16 are live at once; the store binds
-at most 4,096 and refuses a new one past that (`conversations`), which M3's forget will
-prune. Unload closes the bridge, releases every lease, closes the store and `state.db`, and
+at most 4,096 and refuses a new one past that (`conversations`). Tombstones retain their
+fences within bounded storage; deletion does not silently discard replay protection to
+recover capacity. Unload closes the bridge, releases every lease, closes the store and `state.db`, and
 releases the lock; a close that fails keeps the companion owned for a later retry. A
 second owned start in one process is refused as `multiplexed`.
 
@@ -347,8 +385,8 @@ upgraded together.
 The installed qualification is `uv run python scripts/qualify_voice_review.py`, against
 the pinned Hermes with a stand-in model and synthetic fixtures. Its attribution and
 correction checks establish the integration's behavior with that declared model; they
-do not establish the reasoning quality of a production model. Memory readback into the
-realtime foreground remains M4, and forgetting remains M3.
+do not establish the reasoning quality of a production model. M4 supplies foreground memory
+readback; M3 supplies conversation deletion with the explicit no-unlearning limit above.
 
 ## Worker
 

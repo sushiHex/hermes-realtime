@@ -590,6 +590,19 @@ def _stand_in(**overrides: Any) -> types.ModuleType:
 
         def close(self) -> None: ...
 
+        @staticmethod
+        def _delete_unreferenced_system_prompts(conn: Any) -> None: ...
+
+        @staticmethod
+        def _remove_session_files(sessions_dir: Any, session_id: Any) -> None: ...
+
+        def get_session_delete_targets(self, session_id: Any) -> list[str]: ...
+
+        def delete_session(
+            self, session_id: Any, sessions_dir: Any = None,
+            expected_delete_ids: Any = None,
+        ) -> bool: ...
+
     for name, value in overrides.items():
         if value is None:
             delattr(SessionDB, name)

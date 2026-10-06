@@ -435,6 +435,7 @@ const EVENT_KINDS = new Set([
   "barge_in_non_speech_suppressed",
   "barge_in_verifier_unavailable",
   "capture_status",
+  "voice_conversation_cleared",
   "completion_received",
   "echo_barge_in_confirmed",
   "echo_suppressed",
@@ -534,6 +535,9 @@ function parseEvent(value: unknown): PublicEvent {
     });
   }
   if (value.kind === "capture_status") parseCaptureStatus(value.data);
+  if (value.kind === "voice_conversation_cleared" && Object.keys(value.data).length !== 0) {
+    throw new TypeError("voice delete event must be empty");
+  }
   if (value.kind === "search_egress_status") parseSearchEgressStatus(value.data);
   if (
     value.kind === "voice_input_ready" &&

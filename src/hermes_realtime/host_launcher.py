@@ -102,6 +102,7 @@ from hermes_realtime.integration import (
     HermesRestartSettlement,
 )
 from hermes_realtime.integration.voice_archive import VoiceArchiveSender, bridge_connector
+from hermes_realtime.integration.voice_forget import VoiceForgetSender, forget_connector
 from hermes_realtime.integration.voice_memory import VoiceMemoryReceiver, memory_connector
 from hermes_realtime.integration.voice_review import (
     VoiceReviewSender,
@@ -2124,6 +2125,16 @@ def build_local_host_launcher(
         if voice_tail_writer is not None and voice_companion is not None
         else None
     )
+    voice_forget_sender = (
+        VoiceForgetSender(
+            voice_tail_writer,
+            forget_connector(
+                host="127.0.0.1", port=voice_companion.port, token=voice_companion.token
+            ),
+        )
+        if voice_tail_writer is not None and voice_companion is not None
+        else None
+    )
     context = ConversationContextStore(
         on_change=voice_tail_writer.update if voice_tail_writer is not None else None,
     )
@@ -2572,6 +2583,81 @@ def build_local_host_launcher(
         projection.publish_advisory("playback_silenced", {})
         return True
 
+    async def delete_voice_conversation(participant_identity: str, generation: int) -> str:
+        writer = voice_tail_writer
+        if writer is None or voice_forget_sender is None:
+            raise RuntimeError("voice delete is unavailable")
+        if livekit_worker.active_generation != generation:
+            raise PermissionError("delete does not own the active worker generation")
+        if writer.pending_forget is not None:
+            return "pending"
+        old_binding = writer.binding
+        reservation = projection.reserve_voice_clear()
+        reservation_owned = True
+        input_release_owned = True
+
+        def on_durable_clear() -> None:
+            nonlocal reservation_owned, input_release_owned
+            if voice_memory_receiver is not None:
+                try:
+                    voice_memory_receiver.start()
+                except Exception:
+                    _LOGGER.warning("voice memory restart after delete failed")
+            try:
+                if livekit_worker.active_generation == generation:
+                    projection.publish_voice_clear(reservation)
+                else:
+                    projection.release_voice_clear(reservation)
+            except Exception:
+                _LOGGER.warning("voice delete clear projection failed")
+                return
+            reservation_owned = False
+            try:
+                conversation.release_suppressed_input_after_clear(token)
+            except Exception:
+                _LOGGER.warning("voice delete input release failed")
+                return
+            input_release_owned = False
+
+        try:
+            token = await conversation.suppress_audio_input(
+                participant_identity=participant_identity,
+                session_generation=generation,
+                suppress_typed=True,
+            )
+        except BaseException:
+            projection.release_voice_clear(reservation)
+            raise
+        try:
+            async with asyncio.timeout(10.0):
+                await conversation.quiesce_for_delete(
+                    participant_identity=participant_identity,
+                    session_generation=generation,
+                )
+                await speech.cancel_for_binding_close()
+                if voice_memory_receiver is not None:
+                    await voice_memory_receiver.close()
+                await writer.request_forget(context, on_durable_clear=on_durable_clear)
+            return "complete" if writer.forget_complete else "pending"
+        finally:
+            # A canceled caller cannot release either authority after the writer rotates.
+            # Its one-shot durable callback still owns the clear and input lease.
+            if reservation_owned and writer.binding == old_binding:
+                try:
+                    projection.release_voice_clear(reservation)
+                except RuntimeError:
+                    _LOGGER.warning("voice delete clear reservation release failed")
+            if input_release_owned and writer.binding == old_binding:
+                await conversation.resume_audio_input(token)
+
+    def voice_delete_status() -> str:
+        writer = voice_tail_writer
+        if writer is None or voice_forget_sender is None:
+            raise RuntimeError("voice delete is unavailable")
+        if writer.pending_forget is not None:
+            return "pending"
+        return "complete" if writer.forget_complete else "idle"
+
     runtime = BrowserClientRuntime(
         connection=connection,
         room_name=room_name,
@@ -2602,6 +2688,10 @@ def build_local_host_launcher(
         select_model=select_model,
         activate_media=activate_media,
         yield_speech=yield_active_speech if conversation_profile == "natural_v1" else None,
+        delete_voice_conversation=(
+            delete_voice_conversation if voice_forget_sender is not None else None
+        ),
+        voice_delete_status=voice_delete_status if voice_forget_sender is not None else None,
         conversation_profile=conversation_profile,
         on_session_started=session_started,
         projection=projection,
@@ -2664,6 +2754,8 @@ def build_local_host_launcher(
             voice_review_sender.start()
         if voice_memory_receiver is not None:
             voice_memory_receiver.start()
+        if voice_forget_sender is not None:
+            voice_forget_sender.start()
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2775,6 +2867,7 @@ def build_local_host_launcher(
             readiness_cue_tasks,
             work_close_owner,
             *((voice_memory_receiver,) if voice_memory_receiver is not None else ()),
+            *((voice_forget_sender,) if voice_forget_sender is not None else ()),
             # After the runtime closed actions and speech, so the final flag is written.
             # Before the tail, so no acknowledgment races its final write.
             *((voice_archive_sender,) if voice_archive_sender is not None else ()),

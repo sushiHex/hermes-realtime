@@ -245,6 +245,13 @@ async def test_host_shutdown_awaits_review_before_closing_voice_senders(
         async def close(self) -> None:
             events.append("review sender closed")
 
+    class FakeForgetSender:
+        def __init__(self, writer: object, connect: object) -> None:
+            del writer, connect
+
+        async def close(self) -> None:
+            events.append("forget sender closed")
+
     class Provider:
         async def close(self) -> None:
             pass
@@ -255,6 +262,7 @@ async def test_host_shutdown_awaits_review_before_closing_voice_senders(
     monkeypatch.setattr(host_launcher, "VoiceTailWriter", FakeWriter)
     monkeypatch.setattr(host_launcher, "VoiceArchiveSender", FakeArchiveSender)
     monkeypatch.setattr(host_launcher, "VoiceReviewSender", FakeReviewSender)
+    monkeypatch.setattr(host_launcher, "VoiceForgetSender", FakeForgetSender)
 
     monkeypatch.setattr(host_launcher, "_build_streaming_inference", lambda **_: Provider())
     monkeypatch.setattr(host_launcher, "_build_synthesizer", lambda **_: Provider())

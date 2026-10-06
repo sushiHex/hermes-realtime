@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Self
+from typing import Any, Protocol, Self, cast
 
 from pydantic import ValidationError
 
@@ -23,6 +23,7 @@ from hermes_realtime.protocol import (
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
+    VOICE_FORGET_CAPABILITY,
     VOICE_MEMORY_CAPABILITY,
     VOICE_REVIEW_CAPABILITY,
     ControlCancelAcknowledgedEvent,
@@ -32,6 +33,9 @@ from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceForgetAckEvent,
+    VoiceForgetEvent,
+    VoiceForgetRefusedEvent,
     VoiceMemoryEvent,
     VoiceMemoryRefusedEvent,
     VoiceMemorySnapshotEvent,
@@ -88,6 +92,13 @@ class VoiceArchiveHandler(Protocol):
     def memory(
         self, event: VoiceMemoryEvent,
     ) -> AsyncIterator[VoiceMemorySnapshotEvent | VoiceMemoryRefusedEvent]: ...
+
+    @property
+    def forget_available(self) -> bool: ...
+
+    async def forget(
+        self, event: VoiceForgetEvent,
+    ) -> VoiceForgetAckEvent | VoiceForgetRefusedEvent | None: ...
 
 
 def _capabilities(value: object) -> frozenset[str] | None:
@@ -196,6 +207,9 @@ class LocalHermesBridgeServer:
         if (getattr(voice, "memory_available", False) is True
                 and callable(getattr(voice, "memory", None))):
             self._offered |= frozenset({VOICE_MEMORY_CAPABILITY})
+        if (getattr(voice, "forget_available", False) is True
+                and callable(getattr(voice, "forget", None))):
+            self._offered |= frozenset({VOICE_FORGET_CAPABILITY})
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe_completion: Callable[[], None] | None = None
         self._completion_tasks: set[asyncio.Task[WorkCompletedEvent | None]] = set()
@@ -732,12 +746,15 @@ class LocalHermesBridgeServer:
         async with connection.event_lock:
             reply: (
                 VoiceArchiveAckEvent | VoiceArchiveRefusedEvent
-                | VoiceReviewAckEvent | VoiceReviewRefusedEvent | None
+                | VoiceReviewAckEvent | VoiceReviewRefusedEvent
+                | VoiceForgetAckEvent | VoiceForgetRefusedEvent | None
             )
             if type(event) is VoiceArchiveEvent and VOICE_ARCHIVE_CAPABILITY in negotiated:
                 reply = await voice.archive(event)
             elif type(event) is VoiceReviewEvent and VOICE_REVIEW_CAPABILITY in negotiated:
                 reply = await voice.review(event)
+            elif type(event) is VoiceForgetEvent and VOICE_FORGET_CAPABILITY in negotiated:
+                reply = await voice.forget(event)
             else:
                 raise BridgeProtocolError("voice request was not negotiated")
             if reply is None:
@@ -990,6 +1007,22 @@ class LocalHermesBridgeClient:
         if not isinstance(reply, (VoiceReviewAckEvent, VoiceReviewRefusedEvent)):
             raise BridgeProtocolError("the companion answered with another voice event")
         return reply
+
+    async def forget(
+        self, event: VoiceForgetEvent,
+    ) -> VoiceForgetAckEvent | VoiceForgetRefusedEvent:
+        if VOICE_FORGET_CAPABILITY not in self._capabilities:
+            raise BridgeProtocolError("the companion did not advertise voice forget")
+        if type(event) is not VoiceForgetEvent:
+            raise TypeError("forget request must be exact")
+        await self._send_json(event.model_dump(mode="json"))
+        raw = await self._reader.readline()
+        if not raw:
+            raise BridgeProtocolError("the companion closed before answering")
+        reply = parse_voice_event(raw)
+        if type(reply) not in (VoiceForgetAckEvent, VoiceForgetRefusedEvent):
+            raise BridgeProtocolError("the companion answered with another voice event")
+        return cast(VoiceForgetAckEvent | VoiceForgetRefusedEvent, reply)
 
     async def memory(
         self, event: VoiceMemoryEvent,

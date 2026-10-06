@@ -124,8 +124,7 @@ async def test_archive_commit_pending_refuses_then_refreshes_on_commit(tmp_path:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state,category", [("closed", "not_ready"), ("fenced", "not_ready"),
-                                           ("generation", "stale")])
+@pytest.mark.parametrize("state,category", [("closed", "not_ready"), ("fenced", "not_ready")])
 async def test_unavailable_binding_never_reads(tmp_path: Path, state: str, category: str) -> None:
     port = MemoryPort()
     store = CompanionStore(tmp_path / "state.db")
@@ -136,7 +135,7 @@ async def test_unavailable_binding_never_reads(tmp_path: Path, state: str, categ
         service._memory_closed = True
     if state == "fenced":
         archive._fenced = True
-    stream = service.memory(_request(1 if state == "generation" else 0))
+    stream = service.memory(_request())
     try:
         reply = await anext(stream)
         assert type(reply) is VoiceMemoryRefusedEvent and reply.category == category

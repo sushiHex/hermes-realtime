@@ -2116,11 +2116,15 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
         return unreachable
 
     from hermes_realtime.integration import voice_archive as voice_archive_module
+    from hermes_realtime.integration import voice_forget as voice_forget_module
     from hermes_realtime.integration import voice_review as voice_review_module
 
     # The harness records on a tail subclass; the sender checks the exact type it gets.
     monkeypatch.setattr(
         voice_archive_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
+    )
+    monkeypatch.setattr(
+        voice_forget_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
     )
     monkeypatch.setattr(
         voice_review_module, "VoiceTailWriter", host_launcher_module.VoiceTailWriter
@@ -2132,6 +2136,205 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
     monkeypatch.setattr(host_launcher_module, "review_connector", connector)
     monkeypatch.setattr(host_launcher_module, "memory_connector", connector)
     return connectors
+
+
+@pytest.mark.asyncio
+async def test_voice_delete_memory_close_failure_preserves_old_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    memory_base = host_launcher_module.VoiceMemoryReceiver
+    receivers: list[Any] = []
+
+    class MemoryReceiver(memory_base):
+        fail_next_close = False
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            receivers.append(self)
+
+        async def close(self) -> None:
+            if self.fail_next_close:
+                self.fail_next_close = False
+                raise RuntimeError("synthetic memory shutdown failure")
+            await super().close()
+
+    class ConversationStub:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def suppress_audio_input(self, **_kwargs: Any) -> object:
+            return object()
+
+        async def quiesce_for_delete(self, **_kwargs: Any) -> None:
+            pass
+
+        async def resume_audio_input(self, _token: object) -> bool:
+            return True
+
+        def release_suppressed_input_after_clear(self, _token: object) -> bool:
+            return True
+
+    monkeypatch.setattr(host_launcher_module, "VoiceMemoryReceiver", MemoryReceiver)
+    monkeypatch.setattr(host_launcher_module, "ReconnectSafeConversationWorker", ConversationStub)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        assert harness.context is not None
+        harness.context.record_user_transcript(Transcript(text="old conversation", final=True))
+        assert receivers
+        receivers[0].fail_next_close = True
+        delete = harness.browser["delete_voice_conversation"]
+        with pytest.raises(RuntimeError, match="memory shutdown failure"):
+            await delete("browser_0123456789abcdef", 1)
+        assert harness.context.snapshot().messages
+        projection = harness.browser["projection"]
+        assert [event.kind for event in projection._events].count(
+            "voice_conversation_cleared"
+        ) == 0
+        assert not projection._voice_clear_reservations
+
+        assert await delete("browser_0123456789abcdef", 1) == "pending"
+        assert harness.context.snapshot().messages == ()
+        assert [event.kind for event in projection._events].count(
+            "voice_conversation_cleared"
+        ) == 1
+        assert not projection._voice_clear_reservations
+        assert await delete("browser_0123456789abcdef", 1) == "pending"
+        assert [event.kind for event in projection._events].count(
+            "voice_conversation_cleared"
+        ) == 1
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("successor_generation", "projection_failure"),
+    [(False, False), (True, False), (False, True)],
+)
+async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    successor_generation: bool,
+    projection_failure: bool,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+
+    class ConversationStub:
+        instance: ConversationStub | None = None
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.suppressed = False
+            self.resumes = 0
+            self.admitted: list[str] = []
+            ConversationStub.instance = self
+
+        async def suppress_audio_input(self, **_kwargs: Any) -> object:
+            assert _kwargs["suppress_typed"] is True
+            self.suppressed = True
+            return object()
+
+        async def quiesce_for_delete(self, **_kwargs: Any) -> None:
+            pass
+
+        async def resume_audio_input(self, _token: object) -> bool:
+            self.suppressed = False
+            self.resumes += 1
+            return True
+
+        def release_suppressed_input_after_clear(self, _token: object) -> bool:
+            self.suppressed = False
+            self.resumes += 1
+            return True
+
+        def admit_input(self, source: str) -> bool:
+            if self.suppressed:
+                return False
+            self.admitted.append(source)
+            return True
+
+    monkeypatch.setattr(host_launcher_module, "ReconnectSafeConversationWorker", ConversationStub)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        assert harness.context is not None
+        writer = harness.context._on_change.__self__  # type: ignore[union-attr]
+        async with asyncio.timeout(2):
+            while writer._written_version < writer._version:
+                await asyncio.sleep(0.01)
+        original_write = writer._write
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_write(data: bytes) -> None:
+            if (
+                writer.pending_forget is not None
+                and writer._written_version < writer._forget_version
+            ):
+                entered.set()
+                await release.wait()
+            await original_write(data)
+
+        writer._write = delayed_write
+        projection = harness.browser["projection"]
+        projection._capacity = len(projection._events) + 2
+        delete = harness.browser["delete_voice_conversation"]
+        operation = asyncio.create_task(delete("browser_0123456789abcdef", 1))
+        await asyncio.wait_for(entered.wait(), 2)
+        assert writer.pending_forget is not None
+        projection.publish("notification_queued", {})
+        assert projection.publish_advisory("playback_silenced", {}) is None
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert ConversationStub.instance is not None
+        typed_before_clear = ConversationStub.instance.admit_input("typed before durable clear")
+        microphone_before_clear = ConversationStub.instance.admit_input(
+            "microphone before durable clear"
+        )
+        resumes_before_clear = ConversationStub.instance.resumes
+        assert len(projection._voice_clear_reservations) == 1
+        if successor_generation:
+            monkeypatch.setattr(
+                host_launcher_module.LiveKitConversationWorker, "active_generation", 2
+            )
+        if projection_failure:
+            def refuse_clear(_reservation: object) -> None:
+                raise RuntimeError("synthetic projection failure")
+
+            monkeypatch.setattr(projection, "publish_voice_clear", refuse_clear)
+        release.set()
+        async with asyncio.timeout(2):
+            while writer._written_version < writer._forget_version:
+                await asyncio.sleep(0.01)
+        assert [event.kind for event in projection._events].count(
+            "voice_conversation_cleared"
+        ) == (0 if successor_generation or projection_failure else 1)
+        assert len(projection._voice_clear_reservations) == int(projection_failure)
+        assert not typed_before_clear
+        assert not microphone_before_clear
+        assert resumes_before_clear == 0
+        assert ConversationStub.instance.suppressed is projection_failure
+        assert ConversationStub.instance.resumes == int(not projection_failure)
+        if not projection_failure:
+            assert ConversationStub.instance.admit_input("typed after durable clear")
+            assert ConversationStub.instance.admit_input("microphone after durable clear")
+            assert ConversationStub.instance.admitted == [
+                "typed after durable clear", "microphone after durable clear"
+            ]
+    finally:
+        release.set()
+        await launcher.close()
 
 
 @pytest.mark.asyncio

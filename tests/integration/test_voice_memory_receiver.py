@@ -142,6 +142,54 @@ def _snapshot(revision: int, memory: str) -> VoiceMemorySnapshotEvent:
 
 
 @pytest.mark.asyncio
+async def test_delete_rebind_clears_old_memory_and_subscribes_new_binding() -> None:
+    context = ConversationContextStore()
+    binding = ["conversation_1", 0]
+    links: list[MemoryLink] = []
+
+    async def connect() -> MemoryLink:
+        link = MemoryLink()
+        links.append(link)
+        return link
+
+    receiver = VoiceMemoryReceiver(
+        context, connect, binding=lambda: (binding[0], binding[1]),
+        initial_backoff_seconds=0.01,
+    )
+    receiver.start()
+    async with asyncio.timeout(2):
+        while not links:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(links[0].started.wait(), 2)
+    await links[0].events.put(_snapshot(1, "old memory"))
+    async with asyncio.timeout(2):
+        while context.snapshot().memory is None:
+            await asyncio.sleep(0.01)
+
+    binding[:] = ["conversation_2", 1]
+    await receiver.rebind()
+    assert links[0].closed
+    assert context.snapshot().memory is None
+    async with asyncio.timeout(2):
+        while len(links) < 2:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(links[1].started.wait(), 2)
+    assert links[1].request is not None
+    assert (links[1].request.conversation_id, links[1].request.generation) == (
+        "conversation_2", 1,
+    )
+    await links[1].events.put(VoiceMemorySnapshotEvent(
+        protocol_version="0.3", type="voice_memory_snapshot",
+        conversation_id="conversation_2", generation=1, revision=1,
+        memory="new memory", user="Ari", truncated=False,
+    ))
+    async with asyncio.timeout(2):
+        while context.snapshot().memory != BuiltinMemorySnapshot("new memory", "Ari"):
+            await asyncio.sleep(0.01)
+    await receiver.close()
+
+
+@pytest.mark.asyncio
 async def test_receiver_applies_pushes_and_clears_on_refusal() -> None:
     context = ConversationContextStore()
     changes = _observe(context)

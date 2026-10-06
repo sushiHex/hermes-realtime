@@ -127,6 +127,12 @@ class VoiceMemoryReceiver:
         await self._drop()
         self._context.set_memory(None)
 
+    async def rebind(self) -> None:
+        """Discard the old subscription and refresh memory for a new voice binding."""
+
+        await self.close()
+        self.start()
+
     async def _drop(self) -> None:
         link, self._link = self._link, None
         if link is not None:
