@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
@@ -54,6 +56,44 @@ async def test_turn_uses_latest_memory_without_persisting_it() -> None:
     assert [row.text for row in context.durable_view().messages] == [
         "What did I prefer?", "I will mention the update now."
     ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_boundary_binds_memory_digest_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.conversation import streaming
+
+    captured: list[bytes] = []
+    encode = streaming._committed_conversation_context_snapshot_bytes
+
+    def capture(**fields: object) -> bytes:
+        result = encode(**fields)  # type: ignore[arg-type]
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(streaming, "_committed_conversation_context_snapshot_bytes", capture)
+    context = ConversationContextStore()
+    memory = BuiltinMemorySnapshot(
+        memory="Synthetic \u5408\u6210 preference.", user="Alias", truncated=True
+    )
+    context.set_memory(memory)
+    loop = StreamingSpeechLoop(
+        context=context, foreground=ForegroundTurnCoordinator(),
+        inference=RequestRecordingInference(), synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+    )
+    await loop.respond("turn_memory_digest", Transcript(text="Hello.", final=True))
+    assert len(captured) == 1
+    memory_bytes = json.dumps(
+        {"memory": memory.memory, "user": memory.user, "truncated": True},
+        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8")
+    assert json.loads(captured[0])["memory"] == {
+        "bytes": len(memory_bytes), "sha256": hashlib.sha256(memory_bytes).hexdigest(),
+    }
+    assert memory.memory.encode("utf-8") not in captured[0]
+    assert memory.user.encode("utf-8") not in captured[0]
 
 
 class BlockingIncrementalInference:

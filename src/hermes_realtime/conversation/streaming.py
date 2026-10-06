@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -25,6 +26,7 @@ from hermes_realtime.evidence import (
     TerminalReason,
     TurnKind,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.production_observation import (
     CloseResultV1,
     CloseStageV1,
@@ -98,23 +100,30 @@ def _committed_conversation_context_snapshot_bytes(
     active_tasks: tuple[tuple[str, str], ...],
     terminal_task_count: int,
     updates: tuple[tuple[int, str, str, str], ...] = (),
+    memory: BuiltinMemorySnapshot | None = None,
 ) -> bytes:
     """Encode the authoritative adapter boundary for content-free observation.
 
     An interrupted assistant row carries a trailing ``True``; other rows are pairs.
     """
 
+    payload: dict[str, object] = {
+        "activeTasks": active_tasks,
+        "messages": messages,
+        "revision": revision,
+        "terminalTaskCount": terminal_task_count,
+        "updates": updates,
+    }
+    if memory is not None:
+        memory_bytes = json.dumps(
+            {"memory": memory.memory, "user": memory.user, "truncated": memory.truncated},
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        payload["memory"] = {
+            "bytes": len(memory_bytes), "sha256": hashlib.sha256(memory_bytes).hexdigest(),
+        }
     return json.dumps(
-        {
-            "activeTasks": active_tasks,
-            "messages": messages,
-            "revision": revision,
-            "terminalTaskCount": terminal_task_count,
-            "updates": updates,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
     ).encode("utf-8")
 
 
@@ -869,6 +878,7 @@ class StreamingSpeechLoop:
                     committed_conversation_context_snapshot = (
                         _committed_conversation_context_snapshot_bytes(
                             revision=snapshot.revision,
+                            memory=snapshot.memory,
                             messages=tuple(
                                 (message.role, message.text, True)
                                 if message.interrupted

@@ -34,6 +34,7 @@ def _good() -> dict[str, object]:
     return {
         "recall": {
             "review_finished": 1, "next": 1, "restart": 1, "gap_hours": 25, "gap": 1,
+            "non_ascii_over_cap": 1, "newest_correction": 1,
         },
         "freshness": {
             "finished_before_open": 2, "visible_at_open": 2,
@@ -49,6 +50,7 @@ def _good() -> dict[str, object]:
         },
         "authority": {
             "data_only": 1,
+            "ollama_data_only": 1,
             "forced_pairs": 2,
             "baseline_dispatches": 1,
             "memory_dispatches": 1,
@@ -112,6 +114,7 @@ def test_extra_or_missing_field_fails(section: str) -> None:
         ("recall", "review_finished", 0), ("recall", "next", 0),
         ("recall", "restart", 0), ("recall", "gap_hours", 24),
         ("recall", "gap", 0),
+        ("recall", "non_ascii_over_cap", 0), ("recall", "newest_correction", 0),
         ("freshness", "finished_before_open", 1),
         ("freshness", "visible_at_open", 1),
         ("freshness", "post_review_refresh", 0),
@@ -122,6 +125,7 @@ def test_extra_or_missing_field_fails(section: str) -> None:
         ("latency", "samples", 99), ("latency", "p95_delta_us", 21),
         ("latency", "reads_turn", 1),
         ("authority", "data_only", 0),
+        ("authority", "ollama_data_only", 0),
         ("authority", "forced_pairs", 1),
         ("authority", "baseline_dispatches", 0),
         ("authority", "memory_dispatches", 0),
@@ -306,3 +310,26 @@ async def test_memory_in_codex_instruction_channel_fails_data_only_witness(
         refresh_tool_calls=0, refresh_notifications=0, samples=1,
     )
     assert observed["authority"]["data_only"] == 0
+
+
+@pytest.mark.asyncio
+async def test_memory_in_ollama_user_role_fails_data_only_witness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    render = OllamaStreamingInference._messages
+
+    def user_role(snapshot: object) -> list[dict[str, str]]:
+        messages = render(snapshot)
+        if snapshot.memory is not None:
+            messages[0]["role"] = "user"
+        return messages
+
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", staticmethod(user_role))
+    observed = await _SCRIPT._turn_witness(
+        BuiltinMemorySnapshot("Synthetic untrusted data.", "", False),
+        attack_seen=True, refresh_turns=0, refresh_tool_calls=0,
+        refresh_notifications=0, samples=1,
+    )
+    assert observed["authority"]["ollama_data_only"] == 0
