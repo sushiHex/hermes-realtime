@@ -143,6 +143,7 @@ class VoiceReviewCoordinator:
         self._interval: int | None = None
         self._closed = False
         self._on_finished: Callable[[], None] = lambda: None
+        self._on_ended: Callable[[str], None] = lambda _conversation: None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._parent_closes: dict[int, asyncio.Task[None]] = {}
         self._cancel_tasks: dict[str, asyncio.Task[None]] = {}
@@ -187,6 +188,15 @@ class VoiceReviewCoordinator:
     def active(self, conversation_id: str) -> str | None:
         running = self._active.get(conversation_id)
         return None if running is None else running.review_id
+
+    def admitted(self, conversation_id: str) -> bool:
+        """Whether a local review still owns admission or may still write."""
+        running = self._active.get(conversation_id)
+        return running is not None and (
+            running.thread.is_alive()
+            or self._store.review_outcome(conversation_id, running.review_id)
+            in {"reserved", "accepted"}
+        )
 
     async def review(self, request: ReviewRequest) -> ReviewAdmission:
         evidence: dict[str, str | int] | None = None
@@ -340,6 +350,7 @@ class VoiceReviewCoordinator:
         self._store.finish_review(conversation_id, review_id, outcome)
         if outcome == "finished":
             self._on_finished()
+        self._on_ended(conversation_id)
         _marker({"outcome": outcome, "version": 1})
 
     async def _build_parent_owned(self, key: tuple[str, int], session_id: str) -> Any:

@@ -30,7 +30,7 @@ from hermes_realtime.companion.integrity import (
 
 # Version 1 was a draft without the tied progress and quarantine constraints; version 2
 # could not record a "count" quarantine.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _MAX_HOLDER_CHARS = 256
@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS voice_archive (
     CHECK (quarantine IS NULL OR quarantine IN ({_QUARANTINE_SQL}))
 ) STRICT
 """
+_DELETE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS voice_deletion (
+    conversation_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    manifest TEXT,
+    complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0, 1)),
+    CHECK (complete = 0 OR manifest IS NOT NULL)
+) STRICT
+"""
 _COLUMNS = (
     "conversation_id, session_id, committed_count, committed_chain, committed_generation, "
     "committed_seq, pending_count, pending_chain, pending_generation, pending_seq, "
@@ -123,6 +132,19 @@ class ConversationRecord:
     holder: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class DeleteTarget:
+    session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionRecord:
+    conversation_id: str
+    generation: int
+    targets: tuple[DeleteTarget, ...] | None
+    complete: bool
+
+
 def _progress(count: Any, chain: Any, generation: Any, seq: Any) -> Progress | None:
     if count is None:
         return None
@@ -156,9 +178,10 @@ class CompanionStore:
                 raise RuntimeError("companion store could not use a rollback journal")
             self._connection.execute("PRAGMA synchronous = FULL")
             version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, _SCHEMA_VERSION):
+            if version not in (0, 3, _SCHEMA_VERSION):
                 raise RuntimeError("companion store has an unsupported schema version")
             self._connection.execute(_SCHEMA)
+            self._connection.execute(_DELETE_SCHEMA)
             self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         except BaseException:
             self._connection.close()
@@ -206,6 +229,128 @@ class CompanionStore:
         return self._step(  # type: ignore[no-any-return]
             conversation_id, lambda row: None if row is None else self._record(row)
         )
+
+    @staticmethod
+    def _delete_ids(ids: tuple[str, ...]) -> tuple[str, ...]:
+        if type(ids) is not tuple or len(ids) > MAX_BOUND_CONVERSATIONS:
+            raise ValueError("delete ids must be a bounded tuple")
+        if any(type(item) is not str or _SESSION_ID.fullmatch(item) is None for item in ids):
+            raise ValueError("delete id is invalid")
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate delete id")
+        return ids
+
+    @staticmethod
+    def _deletion(row: Any) -> DeletionRecord:
+        try:
+            document = row[2]
+            if document is not None and (
+                type(document) is not str
+                or len(document) > MAX_BOUND_CONVERSATIONS * 131 + 2
+            ):
+                raise ValueError("manifest document invalid")
+            raw_manifest = None if document is None else json.loads(document)
+            if raw_manifest is not None and type(raw_manifest) is not list:
+                raise ValueError("manifest must be a list")
+            targets = None if raw_manifest is None else tuple(
+                DeleteTarget(item) for item in raw_manifest
+            )
+            if targets is not None:
+                if len(targets) > MAX_BOUND_CONVERSATIONS:
+                    raise ValueError("too many targets")
+                CompanionStore._delete_ids(tuple(target.session_id for target in targets))
+            if type(row[1]) is not int or not 0 <= row[1] <= MAX_IDENTITY:
+                raise ValueError("generation invalid")
+            if row[3] not in (0, 1) or (row[3] == 1 and targets is None):
+                raise ValueError("completion invalid")
+        except (TypeError, KeyError, ValueError):
+            raise RuntimeError("deletion record is invalid") from None
+        return DeletionRecord(row[0], row[1], targets, bool(row[3]))
+
+    def deletion(self, conversation_id: str) -> DeletionRecord | None:
+        validate_conversation_id(conversation_id)
+        row = self._connection.execute(
+            "SELECT conversation_id, generation, manifest, complete "
+            "FROM voice_deletion WHERE conversation_id = ?", (conversation_id,),
+        ).fetchone()
+        return None if row is None else self._deletion(row)
+
+    def pending_deletions(self) -> tuple[str, ...]:
+        rows = self._connection.execute(
+            "SELECT conversation_id FROM voice_deletion ORDER BY conversation_id"
+        ).fetchmany(MAX_BOUND_CONVERSATIONS + 1)
+        if len(rows) > MAX_BOUND_CONVERSATIONS:
+            raise RuntimeError("deletion conversation bound exceeded")
+        return tuple(row[0] for row in rows)
+
+    def tombstone(self, conversation_id: str, generation: int) -> bool:
+        """Persist the generation fence before any native delete."""
+        validate_conversation_id(conversation_id)
+        if type(generation) is not int or not 0 <= generation <= MAX_IDENTITY:
+            raise ValueError("generation is invalid")
+
+        def action(row: Any) -> bool:
+            existing = self.deletion(conversation_id)
+            if existing is not None:
+                if existing.generation != generation:
+                    raise ArchiveRefusal("stale")
+                return False
+            if row is not None:
+                cursor_generation = row[4] if row[4] is not None else row[8]
+                if cursor_generation is not None and cursor_generation != generation:
+                    raise ArchiveRefusal("stale")
+            (count,) = self._connection.execute("SELECT COUNT(*) FROM voice_deletion").fetchone()
+            if count >= MAX_BOUND_CONVERSATIONS:
+                raise ArchiveRefusal("conversations")
+            self._connection.execute(
+                "INSERT INTO voice_deletion(conversation_id, generation) VALUES (?, ?)",
+                (conversation_id, generation),
+            )
+            if row is not None:
+                self._connection.execute(
+                    "UPDATE voice_archive SET tombstone = ? WHERE conversation_id = ?",
+                    (generation, conversation_id),
+                )
+            return True
+
+        return self._step(conversation_id, action)  # type: ignore[no-any-return]
+
+    def set_delete_manifest(
+        self, conversation_id: str, targets: tuple[DeleteTarget, ...]
+    ) -> None:
+        if type(targets) is not tuple:
+            raise ValueError("targets must be bounded")
+        if any(type(target) is not DeleteTarget for target in targets):
+            raise TypeError("targets must be exact DeleteTarget values")
+        self._delete_ids(tuple(target.session_id for target in targets))
+        document = json.dumps(
+            [target.session_id for target in targets],
+            separators=(",", ":"),
+        )
+        def action(_row: Any) -> None:
+            current = self.deletion(conversation_id)
+            if current is None:
+                raise ArchiveRefusal("unbound")
+            if current.targets is not None:
+                if current.targets != targets:
+                    raise ArchiveRefusal("stale")
+                return
+            self._connection.execute(
+                "UPDATE voice_deletion SET manifest = ? WHERE conversation_id = ?",
+                (document, conversation_id),
+            )
+        self._step(conversation_id, action)
+
+    def mark_delete_complete(self, conversation_id: str) -> None:
+        def action(_row: Any) -> None:
+            current = self.deletion(conversation_id)
+            if current is None or current.targets is None:
+                raise ArchiveRefusal("pending")
+            self._connection.execute(
+                "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+        self._step(conversation_id, action)
 
     @staticmethod
     def _review_key(request: Any) -> str:
@@ -398,13 +543,15 @@ class CompanionStore:
         pending = _columns(creation)
 
         def action(row: Any) -> ConversationRecord:
+            if self.deletion(conversation_id) is not None:
+                raise ArchiveRefusal("tombstoned")
             if row is not None or self._connection.execute(
                 "SELECT 1 FROM voice_archive WHERE session_id = ?", (session_id,)
             ).fetchone():
                 raise ArchiveRefusal("bound")
             (bound,) = self._connection.execute("SELECT COUNT(*) FROM voice_archive").fetchone()
             if bound >= MAX_BOUND_CONVERSATIONS:
-                # Fails closed on binding, never at start; forget (M3) prunes.
+                # Retired generation fences are retained, so capacity fails closed.
                 raise ArchiveRefusal("conversations")
             self._connection.execute(
                 "INSERT INTO voice_archive (conversation_id, session_id, pending_count, "

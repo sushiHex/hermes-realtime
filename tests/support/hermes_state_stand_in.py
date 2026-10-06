@@ -138,6 +138,22 @@ class SessionDB:
     def close(self) -> None:
         self._conn.close()
 
+    @staticmethod
+    def _delete_unreferenced_system_prompts(conn: Any) -> None:
+        pass
+
+    @staticmethod
+    def _remove_session_files(sessions_dir: Any, session_id: Any) -> None:
+        pass
+
+    def get_session_delete_targets(self, session_id: Any) -> list[str]:
+        return []
+
+    def delete_session(
+        self, session_id: Any, sessions_dir: Any = None, expected_delete_ids: Any = None,
+    ) -> bool:
+        return False
+
     def _execute_write(self, fn: Any, patience_s: Any = None) -> Any:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")

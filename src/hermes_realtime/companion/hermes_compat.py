@@ -50,7 +50,11 @@ from hermes_realtime.companion.review import (
     MAX_REVIEW_TOKENS,
     ReviewRequest,
 )
-from hermes_realtime.companion.store import ConversationRecord
+from hermes_realtime.companion.store import (
+    MAX_BOUND_CONVERSATIONS,
+    ConversationRecord,
+    DeleteTarget,
+)
 from hermes_realtime.memory import MEMORY_MAX_BLOCK_BYTES, BuiltinMemorySnapshot
 
 HERMES_MODULE = "hermes_state"
@@ -95,6 +99,12 @@ ARCHIVE_SURFACE: tuple[SurfaceName, ...] = (
     ),
     SurfaceName("SessionDB.release_session_turn_lease", ("self", "session_id", "holder")),
     SurfaceName("SessionDB.close", ("self",)),
+    SurfaceName("SessionDB._delete_unreferenced_system_prompts", ("conn",)),
+    SurfaceName("SessionDB._remove_session_files", ("sessions_dir", "session_id")),
+    SurfaceName(
+        "SessionDB.delete_session",
+        ("self", "session_id", "sessions_dir", "expected_delete_ids"),
+    ),
 )
 REVIEW_SURFACE: tuple[SurfaceName, ...] = (
     SurfaceName("SessionDB.db_path", None),
@@ -363,6 +373,147 @@ def read_projection(db: Any, session_id: str, cap: int) -> Projection | None:
     return _method(_session_db(db), "SessionDB._execute_write")(  # type: ignore[no-any-return]
         lambda conn: _read_projection(conn, session_id, cap)
     )
+
+
+def _compression_child(child: dict[str, Any], parent_id: str) -> bool:
+    """Match the pinned Hermes continuation rule, refusing malformed lineage."""
+    size = child.get("config_length")
+    if type(size) is int and size > 4096:
+        raise ArchiveRefusal("lineage")
+    if child["source"] == "tool":
+        return False
+    raw = child["model_config"]
+    try:
+        config = {} if raw is None else json.loads(raw)
+    except (TypeError, ValueError):
+        raise ArchiveRefusal("lineage") from None
+    if type(config) is not dict:
+        raise ArchiveRefusal("lineage")
+    return config.get("_branched_from") != parent_id and config.get("_delegate_from") != parent_id
+
+
+def _bounded_delete_subtree(conn: Any, session_id: str) -> None:
+    """Bound native delegate traversal, including marker-only and parent links."""
+    rows = conn.execute(
+        "WITH RECURSIVE linked(id) AS ("
+        "SELECT id FROM sessions WHERE id = ? "
+        "UNION "
+        "SELECT child.id FROM sessions child JOIN linked parent ON "
+        "child.parent_session_id = parent.id OR "
+        "json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') = parent.id"
+        ") SELECT id FROM linked LIMIT ?",
+        (session_id, MAX_BOUND_CONVERSATIONS + 1),
+    ).fetchall()
+    if len(rows) > MAX_BOUND_CONVERSATIONS:
+        raise ArchiveRefusal("capacity")
+
+
+def capture_delete_targets(
+    db: Any, voice_session_id: str | None, allow_missing_voice: bool,
+) -> tuple[DeleteTarget, ...]:
+    """Freeze every compression segment before Hermes can orphan its parent links."""
+    roots = (voice_session_id,) if voice_session_id is not None else ()
+
+    def capture(conn: Any) -> tuple[DeleteTarget, ...]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for root in roots:
+            current = root
+            while True:
+                if current in seen or len(seen) >= MAX_BOUND_CONVERSATIONS:
+                    raise ArchiveRefusal("lineage")
+                row = conn.execute(
+                    "SELECT id, end_reason FROM sessions WHERE id = ?", (current,)
+                ).fetchone()
+                if row is None:
+                    if current == voice_session_id and allow_missing_voice:
+                        break
+                    raise ArchiveRefusal("missing" if current == root else "lineage")
+                seen.add(current)
+                ordered.append(current)
+                _bounded_delete_subtree(conn, current)
+                if row["end_reason"] != "compression":
+                    break
+                children = conn.execute(
+                    "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
+                    "length(model_config) AS config_length FROM sessions "
+                    "WHERE parent_session_id = ? ORDER BY id LIMIT ?",
+                    (current, MAX_BOUND_CONVERSATIONS + 1),
+                ).fetchall()
+                if len(children) > MAX_BOUND_CONVERSATIONS:
+                    raise ArchiveRefusal("lineage")
+                continuation = [
+                    child["id"] for child in children
+                    if _compression_child(dict(child), current)
+                ]
+                if len(continuation) != 1:
+                    raise ArchiveRefusal("lineage")
+                current = continuation[0]
+        return tuple(
+            DeleteTarget(session_id) for session_id in reversed(ordered)
+        )
+
+    return _method(_session_db(db), "SessionDB._execute_write")(capture)  # type: ignore[no-any-return]
+
+
+def delete_target(db: Any, target: DeleteTarget) -> bool:
+    session_db = _session_db(db)
+    session_id = target.session_id
+
+    class GuardedNativeDelete:
+        """Use Hermes deletion unchanged, inserting a guard in its write transaction."""
+
+        def _execute_write(self, action: Any) -> Any:
+            def guarded(conn: Any) -> Any:
+                _bounded_delete_subtree(conn, session_id)
+                parent = conn.execute(
+                    "SELECT end_reason FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if parent is not None and parent["end_reason"] == "compression":
+                    children = conn.execute(
+                        "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
+                        "length(model_config) AS config_length FROM sessions "
+                        "WHERE parent_session_id = ? LIMIT ?",
+                        (session_id, MAX_BOUND_CONVERSATIONS + 1),
+                    ).fetchall()
+                    if len(children) > MAX_BOUND_CONVERSATIONS or any(
+                        _compression_child(dict(child), session_id) for child in children
+                    ):
+                        raise ArchiveRefusal("lineage")
+                return action(conn)
+            return _method(session_db, "SessionDB._execute_write")(guarded)
+
+        def _delete_unreferenced_system_prompts(self, conn: Any) -> None:
+            _method(session_db, "SessionDB._delete_unreferenced_system_prompts")(conn)
+
+        def _remove_session_files(self, sessions_dir: Path | None, sid: str) -> None:
+            _method(session_db, "SessionDB._remove_session_files")(sessions_dir, sid)
+
+    sessions_dir = Path(session_db.db_path).parent / "sessions"
+    deleted = resolve("SessionDB.delete_session")(
+        GuardedNativeDelete(), session_id, sessions_dir=sessions_dir,
+        expected_delete_ids=[session_id],
+    )
+    if deleted is not True:
+        # Native returns false for either an already removed row or a changed
+        # delegate cascade. The caller's final absence walk distinguishes them.
+        still_present = _method(session_db, "SessionDB._execute_write")(
+            lambda conn: conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is not None
+        )
+        if still_present is True:
+            raise ArchiveRefusal("lineage")
+    return bool(deleted)
+
+
+def delete_targets_absent(db: Any, session_ids: tuple[str, ...]) -> bool:
+    def read(conn: Any) -> bool:
+        return all(
+            conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
+            for sid in session_ids
+        )
+    return bool(_method(_session_db(db), "SessionDB._execute_write")(read))
 
 
 def open_session_db() -> Any:
@@ -815,6 +966,19 @@ class HermesArchivePort:
 
     def read_projection(self, session_id: str, cap: int) -> Projection | None:
         return read_projection(self._db, session_id, cap)
+
+    def capture_delete_targets(
+        self, voice_session_id: str | None, allow_missing_voice: bool,
+    ) -> tuple[DeleteTarget, ...]:
+        return capture_delete_targets(
+            self._db, voice_session_id, allow_missing_voice
+        )
+
+    def delete_target(self, target: DeleteTarget) -> bool:
+        return delete_target(self._db, target)
+
+    def absent(self, session_ids: tuple[str, ...]) -> bool:
+        return delete_targets_absent(self._db, session_ids)
 
     def archive_rows(
         self,

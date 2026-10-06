@@ -24,12 +24,15 @@ from hermes_realtime.companion.host import (
 )
 from hermes_realtime.companion.integrity import ArchiveRefusal
 from hermes_realtime.companion.review import ReviewAdmission, ReviewRequest
-from hermes_realtime.companion.store import CompanionStore
+from hermes_realtime.companion.store import CompanionStore, DeleteTarget
 from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
     VoiceArchiveRow,
+    VoiceForgetAckEvent,
+    VoiceForgetEvent,
+    VoiceMemoryEvent,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
@@ -74,6 +77,124 @@ def _service(tmp_path: Path, hermes: FakeHermes) -> tuple[VoiceCompanionService,
     store = CompanionStore(tmp_path / "companion.db")
     archive = VoiceArchive(store, hermes, lease_ttl_seconds=30.0)
     return VoiceCompanionService(archive, store, hermes), store
+
+
+@pytest.mark.asyncio
+async def test_fresh_conversation_recalls_at_advanced_generation_before_archive(
+    tmp_path: Path,
+) -> None:
+    hermes = FakeHermes()
+    hermes.read_builtin_memory = lambda: None  # type: ignore[attr-defined]
+    service, store = _service(tmp_path, hermes)
+    try:
+        await service.start()
+        store.tombstone("old", 0)
+        old = VoiceMemoryEvent(
+            protocol_version="0.3", type="voice_memory",
+            conversation_id="old", generation=0,
+        )
+        fresh = VoiceMemoryEvent(
+            protocol_version="0.3", type="voice_memory",
+            conversation_id="fresh", generation=1,
+        )
+        with pytest.raises(ArchiveRefusal, match="tombstoned"):
+            service._memory_status(old)
+        service._memory_status(fresh)
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_forget_completes_after_native_absence_and_retires_archive_lease(
+    tmp_path: Path,
+) -> None:
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = (  # type: ignore[attr-defined]
+        lambda voice, _missing: (DeleteTarget(voice),)
+    )
+
+    def delete(target: DeleteTarget) -> bool:
+        hermes.sessions.pop(target.session_id)
+        hermes.rows.pop(target.session_id)
+        return True
+
+    hermes.delete_target = delete  # type: ignore[attr-defined]
+    hermes.absent = (  # type: ignore[attr-defined]
+        lambda ids: all(session_id not in hermes.sessions for session_id in ids)
+    )
+    service, store = _service(tmp_path, hermes)
+    try:
+        await service.start()
+        await service._ensure_open("conv")
+        assert hermes.lease
+        reply = await service.forget(VoiceForgetEvent(
+            protocol_version="0.3", type="voice_forget",
+            conversation_id="conv", generation=0,
+        ))
+        assert type(reply) is VoiceForgetAckEvent and reply.state == "complete"
+        assert hermes.sessions == {}
+        assert hermes.lease == {}
+        assert service._archive.ready("conv") is False
+        assert store.deletion("conv") is not None
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_end_reconciles_only_after_natural_thread_exit(tmp_path: Path) -> None:
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = (  # type: ignore[attr-defined]
+        lambda voice, _missing: (DeleteTarget(voice),)
+    )
+
+    def delete(target: DeleteTarget) -> bool:
+        hermes.sessions.pop(target.session_id)
+        hermes.rows.pop(target.session_id)
+        return True
+
+    hermes.delete_target = delete  # type: ignore[attr-defined]
+    hermes.absent = (  # type: ignore[attr-defined]
+        lambda ids: all(session_id not in hermes.sessions for session_id in ids)
+    )
+
+    class Review:
+        alive = True
+
+        async def start(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        def admitted(self, _conversation: str) -> bool:
+            return self.alive
+
+    review = Review()
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, hermes)
+    service = VoiceCompanionService(archive, store, hermes, review)  # type: ignore[arg-type]
+    try:
+        await service.start()
+        await service._ensure_open("conv")
+        reply = await service.forget(VoiceForgetEvent(
+            protocol_version="0.3", type="voice_forget",
+            conversation_id="conv", generation=0,
+        ))
+        assert type(reply) is VoiceForgetAckEvent and reply.state == "pending"
+        service._review_ended("conv")
+        await asyncio.sleep(0.1)
+        assert hermes.sessions
+        review.alive = False
+        await asyncio.wait_for(asyncio.gather(*service._forget_tasks), 2)
+        assert hermes.sessions == {}
+        deletion = store.deletion("conv")
+        assert deletion is not None and deletion.complete
+    finally:
+        review.alive = False
+        await service.close()
+        store.close()
 
 
 class _AcceptingReview:
@@ -515,7 +636,7 @@ def _probe(mode: str, data_dir: Path, control: Path, port: int) -> subprocess.Po
     )
 
 
-def test_a_second_process_finding_the_profile_owned_stands_down(tmp_path: Path) -> None:
+def test_a_second_process_waits_and_succeeds_after_owner_unloads(tmp_path: Path) -> None:
     import socket
 
     with socket.socket() as listener:
@@ -531,23 +652,16 @@ def test_a_second_process_finding_the_profile_owned_stands_down(tmp_path: Path) 
             assert holder.poll() is None and time.monotonic() < deadline
             time.sleep(0.05)
         contender = _probe("contend", data_dir, control, port)
-        output = contender.communicate(timeout=60)[0].decode("utf-8", "replace")
+        time.sleep(0.2)
+        assert contender.poll() is None
     finally:
         (control / "stop").write_text("stop", encoding="utf-8")
         holder.wait(timeout=60)
-
-    # The contender touched no lease, row, store or port, and left nothing to unload.
+    output = contender.communicate(timeout=60)[0].decode("utf-8", "replace")
     assert _markers(output, "[probe] ") == [
-        {"owned": False, "open_port": 0, "hermes_calls": 0, "unload_callbacks": 0}
-    ]
-    assert _markers(output, _HOST_MARKER) == [{"refusal": "held", "version": 1}]
-    assert holder.returncode == 0
-    # Once the owner unloads, the profile can be owned again.
-    successor = _probe("contend", data_dir, control, port)
-    later = successor.communicate(timeout=60)[0].decode("utf-8", "replace")
-    assert _markers(later, "[probe] ") == [
         {"owned": True, "open_port": 1, "hermes_calls": 2, "unload_callbacks": 1}
     ]
+    assert holder.returncode == 0
 
 
 def test_the_profile_lock_is_taken_before_anything_and_held_until_close(
@@ -566,6 +680,51 @@ def test_the_profile_lock_is_taken_before_anything_and_held_until_close(
     descriptor = lock_run_record(store_path)
     assert descriptor is not None
     unlock_run_record(descriptor)
+
+
+def test_waiting_owner_takes_over_after_profile_lock_released(tmp_path: Path) -> None:
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    store_path = tmp_path / "companion.db"
+    descriptor = lock_run_record(store_path)
+    assert descriptor is not None
+    hermes = FakeHermes()
+    host = _host(tmp_path, hermes, [])
+    try:
+        assert host.start() is True
+        assert host.wait_ready(0.2) is False
+        assert hermes.calls == []
+        unlock_run_record(descriptor)
+        descriptor = None
+        assert host.wait_ready(5.0) is True
+        assert "check_compatibility" in hermes.calls
+    finally:
+        if descriptor is not None:
+            unlock_run_record(descriptor)
+        host.close()
+
+
+def test_waiting_owner_stops_without_opening_profile_on_unload(tmp_path: Path) -> None:
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    store_path = tmp_path / "companion.db"
+    descriptor = lock_run_record(store_path)
+    assert descriptor is not None
+    hermes = FakeHermes()
+    host = _host(tmp_path, hermes, [])
+    try:
+        assert host.start() is True
+        assert host.wait_ready(0.2) is False
+        host.close()
+        unlock_run_record(descriptor)
+        descriptor = None
+        time.sleep(0.2)
+        assert hermes.calls == []
+        assert not any(thread.name == "voice-companion" for thread in threading.enumerate())
+    finally:
+        if descriptor is not None:
+            unlock_run_record(descriptor)
+        host.close()
 
 
 def test_close_releases_every_lease_and_stops_the_loop_thread(tmp_path: Path) -> None:

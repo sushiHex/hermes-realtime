@@ -3,9 +3,9 @@
 Plugin registration builds a ``VoiceCompanionHost``; that is not readiness. Its owned start
 runs on one dedicated event-loop thread, so it neither needs nor blocks Hermes's own loop:
 
-1. it takes the profile's exclusive OS lock beside the plugin store; another process
-   (Hermes discovers plugins in the gateway, the CLI and cron alike) that finds it held
-   stands down without touching any lease, row or store;
+1. its companion thread waits interruptibly for the profile's exclusive OS lock beside
+   the plugin store; another process (Hermes discovers plugins in the gateway, the CLI
+   and cron alike) can hand off ownership without a restart;
 2. it binds exactly one profile's database (``open_port``) and the plugin store, and
    checks compatibility and durability for the profile;
 3. only then does it build and start the bridge, which advertises ``voice_archive``.
@@ -30,7 +30,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 from hermes_realtime.companion.archive import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -38,6 +38,7 @@ from hermes_realtime.companion.archive import (
     ArchivePort,
     VoiceArchive,
 )
+from hermes_realtime.companion.forget import DeletePort, VoiceForgetReconciler
 from hermes_realtime.companion.integrity import (
     ArchiveRefusal,
     Identity,
@@ -56,6 +57,9 @@ from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceForgetAckEvent,
+    VoiceForgetEvent,
+    VoiceForgetRefusedEvent,
     VoiceMemoryEvent,
     VoiceMemoryRefusedEvent,
     VoiceMemorySnapshotEvent,
@@ -138,6 +142,18 @@ class VoiceCompanionService:
         self._store = store
         self._port = port
         self._review = review
+        self._forget = (
+            VoiceForgetReconciler(
+                store, cast(DeletePort, port),
+                lambda conversation: review.admitted(conversation) if review else False,
+                archive._guard,
+                archive._tombstone_owned,
+                archive._retire_owned,
+            )
+            if all(callable(getattr(port, name, None)) for name in
+                   ("capture_delete_targets", "delete_target", "absent")) else None
+        )
+        self._forget_tasks: set[asyncio.Task[str]] = set()
         self._open_lock = asyncio.Lock()
         self._memory_ready = False
         self._memory_closed = False
@@ -147,6 +163,28 @@ class VoiceCompanionService:
         archive._on_state_change = self._memory_changed
         if review is not None:
             review._on_finished = self._memory_finished
+            review._on_ended = self._review_ended
+
+    def _review_ended(self, conversation_id: str) -> None:
+        if self._forget is not None and self._store.deletion(conversation_id) is not None:
+            task = asyncio.create_task(self._reconcile_after_review_end(conversation_id))
+            self._forget_tasks.add(task)
+            task.add_done_callback(self._forget_done)
+
+    async def _reconcile_after_review_end(self, conversation_id: str) -> str:
+        # The callback is queued from the review thread's finally before that
+        # thread actually exits. Observe its natural end without cancelling it.
+        while self._review is not None and self._review.admitted(conversation_id):
+            await asyncio.sleep(0.01)
+        assert self._forget is not None
+        return await self._forget.reconcile(conversation_id)
+
+    def _forget_done(self, task: asyncio.Task[str]) -> None:
+        self._forget_tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                _marker({"failure": type(error).__name__, "version": 1})
 
     async def start(self) -> None:
         """Compatibility and durability for the profile; no conversation opens here.
@@ -164,11 +202,43 @@ class VoiceCompanionService:
                 await self._review.start()
             except ArchiveRefusal as refusal:
                 _marker({"refusal": refusal.category, "version": 1})
+        if self._forget is not None:
+            await self._forget.reconcile_all()
         self._memory_ready = True
 
     @property
     def memory_available(self) -> bool:
         return self._memory_ready and callable(getattr(self._port, "read_builtin_memory", None))
+
+    @property
+    def forget_available(self) -> bool:
+        return self._memory_ready and self._forget is not None
+
+    async def forget(
+        self, event: VoiceForgetEvent
+    ) -> VoiceForgetAckEvent | VoiceForgetRefusedEvent | None:
+        if type(event) is not VoiceForgetEvent:
+            raise TypeError("event must be an exact VoiceForgetEvent")
+        try:
+            if self._forget is None or not self._memory_ready:
+                raise ArchiveRefusal("not_ready")
+            state = await self._forget.forget(event.conversation_id, event.generation)
+        except ArchiveRefusal as refusal:
+            _marker({"refusal": refusal.category, "version": 1})
+            return VoiceForgetRefusedEvent(
+                protocol_version="0.3", type="voice_forget_refused",
+                conversation_id=event.conversation_id, generation=event.generation,
+                category=refusal.category,
+            )
+        except Exception as error:
+            _marker({"failure": type(error).__name__, "version": 1})
+            return None
+        self._memory_changed()
+        return VoiceForgetAckEvent(
+            protocol_version="0.3", type="voice_forget_ack",
+            conversation_id=event.conversation_id, generation=event.generation,
+            state=state,
+        )
 
     def _memory_changed(self) -> None:
         for event in self._memory_events:
@@ -184,12 +254,12 @@ class VoiceCompanionService:
     def _memory_status(self, event: VoiceMemoryEvent, *, recovering: bool = False) -> None:
         if self._memory_closed or not self.memory_available or self._archive._fenced:
             raise ArchiveRefusal("not_ready")
+        if self._store.deletion(event.conversation_id) is not None:
+            raise ArchiveRefusal("tombstoned")
         record = self._store.read(event.conversation_id)
         # Authentication binds the profile. A new conversation may recall before its
         # first archived row; a memory read never allocates a Hermes session or binding.
         if record is None:
-            if event.generation != 0:
-                raise ArchiveRefusal("stale")
             return
         if record.quarantine is not None:
             raise ArchiveRefusal("quarantined")
@@ -198,8 +268,7 @@ class VoiceCompanionService:
         if record.committed is None:
             raise ArchiveRefusal("pending")
         cursor = record.committed.cursor
-        generation = 0 if cursor is None else cursor.generation
-        if event.generation != generation:
+        if cursor is not None and event.generation != cursor.generation:
             raise ArchiveRefusal("stale")
         if record.pending is not None and not recovering:
             raise ArchiveRefusal("pending")
@@ -421,6 +490,12 @@ class VoiceCompanionService:
                 raise ReviewQuiescenceError("memory read has not quiesced")
         if self._review is not None:
             await self._review.close()
+        if self._forget_tasks:
+            _, forget_pending = await asyncio.wait(
+                self._forget_tasks, timeout=_DEFAULT_CLOSE_TIMEOUT_SECONDS
+            )
+            if forget_pending:
+                raise ReviewQuiescenceError("forget reconciliation has not quiesced")
         await self._archive.close()
 
 
@@ -470,10 +545,8 @@ class VoiceCompanionHost:
     def start(self) -> bool:
         """Begin the owned start on the companion thread; readiness comes later.
 
-        The first step is an exclusive OS lock beside the plugin store, held until close:
-        Hermes discovers plugins in every process (gateway, CLI, cron), and only one of them
-        may own the profile's archive. A process that finds it held does nothing (no lease,
-        row or store is touched), emits one marker, and returns False.
+        Start never waits for another process's profile lock on the plugin thread.
+        The owned companion thread waits for it before opening any database.
         """
 
         global _owner
@@ -483,11 +556,6 @@ class VoiceCompanionHost:
                 raise RuntimeError("one companion serves one profile; multiplexing is refused")
             if self._thread is not None:
                 raise RuntimeError("a companion host starts at most once")
-            profile_lock = lock_run_record(self._store_path)
-            if profile_lock is None:
-                _marker({"refusal": "held", "version": 1})
-                return False
-            self._profile_lock = profile_lock
             _owner = self
             self._thread = threading.Thread(target=self._run, name="voice-companion", daemon=True)
         self._thread.start()
@@ -541,6 +609,15 @@ class VoiceCompanionHost:
                 stop.set()
         evidence: dict[str, str | int] | None = None
         try:
+            while not stop.is_set():
+                profile_lock = lock_run_record(self._store_path)
+                if profile_lock is not None:
+                    self._profile_lock = profile_lock
+                    break
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+            if stop.is_set():
+                return
             port = await asyncio.to_thread(self._open_port)
             try:
                 store = CompanionStore(self._store_path)

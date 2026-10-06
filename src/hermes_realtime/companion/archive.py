@@ -221,6 +221,21 @@ class VoiceArchive:
         live = self._live.get(conversation_id)
         return not self._fenced and live is not None and live.ready
 
+    def _tombstone_owned(self, conversation_id: str) -> None:
+        """Fence an open generation after its tombstone is durable, under `_guard`."""
+        live = self._live.get(conversation_id)
+        if live is not None:
+            live.ready = False
+
+    async def _retire_owned(self, conversation_id: str) -> None:
+        """Release a deleted generation's lease after native absence is verified."""
+        live = self._live.get(conversation_id)
+        if live is None:
+            return
+        await self._release(live)
+        self._live.pop(conversation_id, None)
+        self._on_state_change()
+
     @contextlib.asynccontextmanager
     async def _guard(self, conversation_id: str) -> AsyncIterator[None]:
         """Hold the conversation's lock. Its slot is freed once nobody holds, awaits or
