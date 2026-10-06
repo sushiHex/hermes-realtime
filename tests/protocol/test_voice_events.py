@@ -74,7 +74,8 @@ def test_the_bridge_stays_at_version_0_3_and_memory_is_a_capability() -> None:
     assert VOICE_MEMORY_CAPABILITY == "voice_memory"
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
     assert (
-        frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation"})
+        frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation",
+                   "voice_forget"})
         == BRIDGE_CAPABILITIES
     )
 
@@ -210,7 +211,7 @@ def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
             id="no-protocol-version",
         ),
         pytest.param(_range("voice_archive_ack", seq_from=5), id="reversed-ack"),
-        pytest.param(_range("voice_forget"), id="unknown-type"),
+        pytest.param(_range("voice_unknown"), id="unknown-type"),
     ],
 )
 def test_every_malformed_voice_event_is_refused(event: dict[str, Any]) -> None:

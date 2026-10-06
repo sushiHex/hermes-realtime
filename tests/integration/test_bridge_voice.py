@@ -194,7 +194,7 @@ async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers
     [
         pytest.param({"token": _TOKEN, "participant_id": "p1"}, id="a-0.1-hello"),
         pytest.param(_valid_hello(protocol_version="0.4"), id="wrong-version"),
-        pytest.param(_valid_hello(capabilities=["voice_forget"]), id="unknown-capability"),
+        pytest.param(_valid_hello(capabilities=["voice_unknown"]), id="unknown-capability"),
         pytest.param(_valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"),
         pytest.param(_valid_hello(capabilities="voice_archive"), id="capabilities-not-a-list"),
         pytest.param(_valid_hello(extra=1), id="extra-key"),
@@ -214,7 +214,7 @@ _BRIDGE_MARKER = "[hermes-bridge-hello] "
     ("hello", "category"),
     [
         pytest.param(_valid_hello(protocol_version="0.4"), "version", id="version"),
-        pytest.param(_valid_hello(capabilities=["voice_forget"]), "capability", id="unknown"),
+        pytest.param(_valid_hello(capabilities=["voice_unknown"]), "capability", id="unknown"),
         pytest.param(
             _valid_hello(capabilities=["voice_archive", "voice_archive"]),
             "capability",
