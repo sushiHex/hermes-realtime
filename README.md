@@ -82,9 +82,11 @@ Entry-point discovery is an optional packaging check. To exercise it, install th
 ```bash
 python -c "import hermes_cli, sys; print(sys.executable)"
 hermes plugins enable hermes-realtime --no-allow-tool-override
-hermes plugins doctor hermes-realtime --ci
 hermes plugins list --enabled
 ```
+
+Do not use `hermes plugins doctor` for this check: in Hermes v0.21.0 it resolves only plugin
+directories, never entry points, so it reports this package as not found.
 
 If Hermes uses an isolated environment, use that environment's Python or install with `uv pip install --python <path-to-hermes-python> dist/hermes_realtime-<version>-py3-none-any.whl`.
 
@@ -156,6 +158,7 @@ for contributor workflow, code, and evidence. Find substantive work and outcome
 groups in [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) and
 [Milestones](https://github.com/sushiHex/hermes-realtime/milestones).
 
+- [Desktop MVP setup and diagnostic session](docs/desktop-mvp-diagnostic.md)
 - [Local LiveKit setup and automated gates](docs/local-livekit.md)
 - [Hermes bridge and natural-work authority](docs/hermes-bridge.md)
 - [Source-backed routing, privacy, and benchmark controls](docs/source-backed-latency.md)
