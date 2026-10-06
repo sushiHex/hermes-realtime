@@ -27,7 +27,7 @@ class MemoryPort(FakeHermes):
 
 
 def _request(generation: int = 0) -> VoiceMemoryEvent:
-    return VoiceMemoryEvent(protocol_version="0.4", type="voice_memory",
+    return VoiceMemoryEvent(protocol_version="0.3", type="voice_memory",
                             conversation_id="conv", generation=generation)
 
 
@@ -80,6 +80,44 @@ async def test_quarantine_clears_subscribed_memory_without_another_native_read(
         assert reply.category == "quarantined"
         assert port.reads == 1
     finally:
+        await stream.aclose()
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_archive_commit_pending_refuses_then_refreshes_on_commit(tmp_path: Path) -> None:
+    port = MemoryPort()
+    store = CompanionStore(tmp_path / "state.db")
+    archive = VoiceArchive(store, port)
+    service = VoiceCompanionService(archive, store, port)
+    await service.start()
+    await archive.open("conv")
+    stream = service.memory(_request())
+    port.gate = threading.Event()
+    committing: asyncio.Task[object] | None = None
+    try:
+        first = await anext(stream)
+        committing = asyncio.create_task(
+            archive.archive("conv", VoiceBatch(0, 0, 1, _rows(0, 2)))
+        )
+        assert await asyncio.to_thread(port.entered.wait, 2)
+        record = store.read("conv")
+        assert record is not None and record.pending is not None
+        service._memory_finished()
+        refused = await asyncio.wait_for(anext(stream), 2)
+        assert type(refused) is VoiceMemoryRefusedEvent
+        assert refused.category == "pending"
+        assert port.reads == 1
+        port.gate.set()
+        await asyncio.wait_for(committing, 2)
+        refreshed = await asyncio.wait_for(anext(stream), 2)
+        assert refreshed.memory == port.value.memory
+        assert refreshed.revision > first.revision
+    finally:
+        port.gate.set()
+        if committing is not None:
+            await committing
         await stream.aclose()
         await service.close()
         store.close()
@@ -218,6 +256,8 @@ async def test_quarantine_during_native_read_discards_result(tmp_path: Path) -> 
         assert await asyncio.to_thread(entered.wait, 2)
         archive._quarantine("conv", "mismatch")
         release.set()
+        # This is the sole status check after the native read; without it,
+        # the quarantined memory is yielded as a snapshot.
         reply = await asyncio.wait_for(pending, 2)
         assert type(reply) is VoiceMemoryRefusedEvent and reply.category == "quarantined"
     finally:

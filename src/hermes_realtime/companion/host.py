@@ -111,7 +111,7 @@ def _refused(event: VoiceArchiveEvent, category: str) -> VoiceArchiveRefusedEven
     """A refusal of exactly this batch's range; the category set is the protocol's."""
     return VoiceArchiveRefusedEvent.model_validate(
         {
-            "protocol_version": "0.4",
+            "protocol_version": "0.3",
             "type": "voice_archive_refused",
             "conversation_id": event.conversation_id,
             "generation": event.generation,
@@ -218,7 +218,6 @@ class VoiceCompanionService:
             if not callable(reader):
                 raise ArchiveRefusal("not_ready")
             value = await self._archive._call(reader)
-            self._memory_status(event)
             if type(value) is not BuiltinMemorySnapshot:
                 raise ArchiveRefusal("invalid")
             return value
@@ -237,7 +236,7 @@ class VoiceCompanionService:
         if len(self._memory_events) >= 32:
             try:
                 yield VoiceMemoryRefusedEvent(
-                    protocol_version="0.4", type="voice_memory_refused",
+                    protocol_version="0.3", type="voice_memory_refused",
                     conversation_id=event.conversation_id, generation=event.generation,
                     category="capacity",
                 )
@@ -267,7 +266,7 @@ class VoiceCompanionService:
                         )
                         self._memory_status(event)
                         yield VoiceMemorySnapshotEvent(
-                            protocol_version="0.4", type="voice_memory_snapshot",
+                            protocol_version="0.3", type="voice_memory_snapshot",
                             conversation_id=event.conversation_id, generation=event.generation,
                             revision=revision, memory=value.memory, user=value.user,
                             truncated=value.truncated,
@@ -280,7 +279,7 @@ class VoiceCompanionService:
                     evidence = {"refusal": category, "version": 1}
                     last_revision = -1
                     yield VoiceMemoryRefusedEvent(
-                        protocol_version="0.4", type="voice_memory_refused",
+                        protocol_version="0.3", type="voice_memory_refused",
                         conversation_id=event.conversation_id, generation=event.generation,
                         category=category,
                     )
@@ -323,7 +322,7 @@ class VoiceCompanionService:
             )
         except ArchiveRefusal as refusal:
             return VoiceReviewRefusedEvent(
-                protocol_version="0.4", type="voice_review_refused",
+                protocol_version="0.3", type="voice_review_refused",
                 conversation_id=event.conversation_id, generation=event.generation,
                 seq_from=event.seq_from, seq_through=event.seq_through,
                 closing=event.closing, category=refusal.category,
@@ -334,7 +333,7 @@ class VoiceCompanionService:
             if evidence is not None:
                 _marker(evidence)
         return VoiceReviewAckEvent(
-            protocol_version="0.4", type="voice_review_ack",
+            protocol_version="0.3", type="voice_review_ack",
             conversation_id=event.conversation_id, generation=event.generation,
             seq_from=event.seq_from, seq_through=event.seq_through,
             closing=event.closing, review_id=result.review_id, status="accepted",
@@ -358,7 +357,7 @@ class VoiceCompanionService:
             return None
         ack = result.ack
         return VoiceArchiveAckEvent(
-            protocol_version="0.4",
+            protocol_version="0.3",
             type="voice_archive_ack",
             conversation_id=ack.conversation_id,
             generation=ack.generation,

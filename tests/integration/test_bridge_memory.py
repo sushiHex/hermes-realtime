@@ -8,13 +8,18 @@ import pytest
 
 from hermes_realtime.integration.bridge import BridgeProtocolError, LocalHermesBridgeClient
 from hermes_realtime.protocol import (
+    VoiceArchiveAckEvent,
     VoiceMemoryEvent,
     VoiceMemoryRefusedEvent,
     VoiceMemorySnapshotEvent,
+    VoiceReviewAckEvent,
+    VoiceReviewEvent,
+    parse_voice_event,
 )
 from tests.integration.test_bridge_voice import (
     _ATTESTATION,
     _TOKEN,
+    _batch,
     _ReviewVoice,
     _server,
     _Voice,
@@ -35,7 +40,7 @@ class MemoryVoice(_Voice):
                 if revision:
                     await self.changed.wait()
                 yield VoiceMemorySnapshotEvent(
-                    protocol_version="0.4", type="voice_memory_snapshot",
+                    protocol_version="0.3", type="voice_memory_snapshot",
                     conversation_id=request.conversation_id, generation=request.generation,
                     revision=revision, memory="", user="", truncated=False,
                 )
@@ -55,7 +60,7 @@ async def test_memory_stream_is_negotiated_and_disconnect_joins_subscription() -
     )
     try:
         assert client.capabilities == frozenset({"voice_memory"})
-        event = VoiceMemoryEvent(protocol_version="0.4", type="voice_memory",
+        event = VoiceMemoryEvent(protocol_version="0.3", type="voice_memory",
                                  conversation_id="conv", generation=0)
         stream = client.memory(event)
         assert (await anext(stream)).revision == 0
@@ -87,12 +92,62 @@ async def test_memory_subscription_preserves_review_and_runtime_negotiation() ->
         assert client.runtime == _ATTESTATION
         assert client.review_interval == 10
         stream = client.memory(VoiceMemoryEvent(
-            protocol_version="0.4", type="voice_memory",
+            protocol_version="0.3", type="voice_memory",
             conversation_id="conv", generation=0,
         ))
         assert (await anext(stream)).revision == 0
         await stream.aclose()
     await asyncio.wait_for(voice.closed.wait(), 2)
+
+
+@pytest.mark.asyncio
+async def test_a_0_3_peer_without_memory_keeps_archive_and_review() -> None:
+    voice = _ReviewVoice()
+    async with _server(voice) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        try:
+            writer.write(json.dumps({
+                "token": _TOKEN,
+                "participant_id": "old-peer",
+                "protocol_version": "0.3",
+                "capabilities": ["voice_archive", "voice_review", "voice_memory"],
+            }).encode("utf-8") + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline()) == {
+                "ok": True,
+                "protocol_version": "0.3",
+                "capabilities": ["voice_archive", "voice_review"],
+                "review_interval": 10,
+            }
+            archive = _batch()
+            writer.write(archive.model_dump_json().encode("utf-8") + b"\n")
+            await writer.drain()
+            assert type(parse_voice_event(await reader.readline())) is VoiceArchiveAckEvent
+            review = VoiceReviewEvent(
+                protocol_version="0.3",
+                type="voice_review",
+                conversation_id="conv",
+                generation=0,
+                seq_from=0,
+                seq_through=1,
+                memory=True,
+                skills=True,
+                closing=False,
+            )
+            writer.write(review.model_dump_json().encode("utf-8") + b"\n")
+            await writer.drain()
+            assert type(parse_voice_event(await reader.readline())) is VoiceReviewAckEvent
+            request = VoiceMemoryEvent(
+                protocol_version="0.3", type="voice_memory", conversation_id="conv", generation=0,
+            )
+            writer.write(request.model_dump_json().encode("utf-8") + b"\n")
+            await writer.drain()
+            assert await reader.readline() == b""
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    assert voice.events == [_batch()]
+    assert voice.reviews == [review]
 
 
 @pytest.mark.asyncio
@@ -113,7 +168,7 @@ async def test_memory_disconnect_bounds_uncooperative_producer_but_keeps_ownersh
             self.producer = asyncio.current_task()
             try:
                 yield VoiceMemorySnapshotEvent(
-                    protocol_version="0.4", type="voice_memory_snapshot",
+                    protocol_version="0.3", type="voice_memory_snapshot",
                     conversation_id=request.conversation_id, generation=request.generation,
                     revision=0, memory="", user="", truncated=False,
                 )
@@ -140,7 +195,7 @@ async def test_memory_disconnect_bounds_uncooperative_producer_but_keeps_ownersh
     )
     try:
         request = VoiceMemoryEvent(
-            protocol_version="0.4", type="voice_memory",
+            protocol_version="0.3", type="voice_memory",
             conversation_id="conv", generation=0,
         )
         stream = client.memory(request)
@@ -186,7 +241,7 @@ async def test_partial_memory_capability_is_not_offered(available, method) -> No
         )
         try:
             assert not client.capabilities
-            event = VoiceMemoryEvent(protocol_version="0.4", type="voice_memory",
+            event = VoiceMemoryEvent(protocol_version="0.3", type="voice_memory",
                                      conversation_id="conv", generation=0)
             with pytest.raises(BridgeProtocolError):
                 await anext(client.memory(event))
@@ -206,10 +261,10 @@ async def test_memory_client_rejects_other_binding_or_event(field, value) -> Non
             pass
 
     reader = asyncio.StreamReader()
-    event = VoiceMemoryEvent(protocol_version="0.4", type="voice_memory",
+    event = VoiceMemoryEvent(protocol_version="0.3", type="voice_memory",
                              conversation_id="conv", generation=0)
     reply = VoiceMemorySnapshotEvent(
-        protocol_version="0.4", type="voice_memory_snapshot", conversation_id="conv",
+        protocol_version="0.3", type="voice_memory_snapshot", conversation_id="conv",
         generation=0, revision=0, memory="", user="", truncated=False,
     ).model_dump()
     reply[field] = value
@@ -232,7 +287,7 @@ async def test_server_refuses_unnegotiated_subscription() -> None:
             host=server.host, port=server.port, token=_TOKEN, participant_id="memory",
         )
         try:
-            event = VoiceMemoryEvent(protocol_version="0.4", type="voice_memory",
+            event = VoiceMemoryEvent(protocol_version="0.3", type="voice_memory",
                                      conversation_id="conv", generation=0)
             await client._send_json(event.model_dump())
             assert await asyncio.wait_for(client._reader.readline(), 1) == b""
@@ -251,7 +306,7 @@ async def test_memory_stream_rejects_a_second_request_and_joins_producer() -> No
         )
         try:
             request = VoiceMemoryEvent(
-                protocol_version="0.4", type="voice_memory",
+                protocol_version="0.3", type="voice_memory",
                 conversation_id="conv", generation=0,
             )
             await client._send_json(request.model_dump())
@@ -274,7 +329,7 @@ async def test_server_never_publishes_an_invalid_memory_reply(kind: str) -> None
                 yield cast(Any, request)
             else:
                 yield VoiceMemorySnapshotEvent(
-                    protocol_version="0.4", type="voice_memory_snapshot",
+                    protocol_version="0.3", type="voice_memory_snapshot",
                     conversation_id=(
                         "other" if kind == "conversation_id" else request.conversation_id
                     ),
@@ -289,7 +344,7 @@ async def test_server_never_publishes_an_invalid_memory_reply(kind: str) -> None
         )
         try:
             request = VoiceMemoryEvent(
-                protocol_version="0.4", type="voice_memory",
+                protocol_version="0.3", type="voice_memory",
                 conversation_id="conv", generation=0,
             )
             await client._send_json(request.model_dump())
@@ -314,7 +369,7 @@ async def test_client_requires_exact_request_and_closed_stream_is_an_error() -> 
     writer = Writer()
     client = LocalHermesBridgeClient(reader, cast(Any, writer))
     request = VoiceMemoryEvent(
-        protocol_version="0.4", type="voice_memory",
+        protocol_version="0.3", type="voice_memory",
         conversation_id="conv", generation=0,
     )
     with pytest.raises(BridgeProtocolError, match="did not advertise"):
@@ -323,7 +378,7 @@ async def test_client_requires_exact_request_and_closed_stream_is_an_error() -> 
 
     client._capabilities = frozenset({"voice_memory"})
     wrong = VoiceMemorySnapshotEvent(
-        protocol_version="0.4", type="voice_memory_snapshot",
+        protocol_version="0.3", type="voice_memory_snapshot",
         conversation_id="conv", generation=0, revision=0,
         memory="", user="", truncated=False,
     )

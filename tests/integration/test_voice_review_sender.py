@@ -49,7 +49,7 @@ class _Link:
         await asyncio.sleep(0)
         self.requests.append(event)
         fields = dict(
-            protocol_version="0.4",
+            protocol_version="0.3",
             conversation_id=event.conversation_id,
             generation=event.generation,
             seq_from=event.seq_from,
@@ -146,7 +146,7 @@ async def test_normal_close_settles_one_final_archive_and_review_without_restart
 
         async def archive(self, event: VoiceArchiveEvent) -> VoiceArchiveAckEvent:
             return VoiceArchiveAckEvent(
-                protocol_version="0.4",
+                protocol_version="0.3",
                 type="voice_archive_ack",
                 conversation_id=event.conversation_id,
                 generation=event.generation,

@@ -20,6 +20,7 @@ from hermes_realtime.protocol import (
 )
 
 _MARKER = "[voice-memory-receive] "
+_RETAINING_REFUSALS = frozenset({"pending", "capacity"})
 
 
 class VoiceMemoryLink(Protocol):
@@ -100,7 +101,7 @@ class VoiceMemoryReceiver:
         if type(identity) is not tuple or len(identity) != 2:
             raise TypeError("memory binding must be an exact pair")
         self._request = VoiceMemoryEvent(
-            protocol_version="0.4",
+            protocol_version="0.3",
             type="voice_memory",
             conversation_id=identity[0],
             generation=identity[1],
@@ -177,7 +178,8 @@ class VoiceMemoryReceiver:
                             _marker({"refusal": "binding", "version": 1})
                             return
                         if type(event) is VoiceMemoryRefusedEvent:
-                            self._context.set_memory(None)
+                            if event.category not in _RETAINING_REFUSALS:
+                                self._context.set_memory(None)
                             _marker({"refusal": event.category, "version": 1})
                             continue
                         assert type(event) is VoiceMemorySnapshotEvent

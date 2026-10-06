@@ -298,7 +298,7 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
 # rows and gaps, which role may carry a gap or a flag) are the companion's, which answers
 # them with a category refusal rather than a dropped connection.
 
-BRIDGE_PROTOCOL_VERSION = "0.4"
+BRIDGE_PROTOCOL_VERSION = "0.3"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
 VOICE_MEMORY_CAPABILITY = "voice_memory"
@@ -440,7 +440,7 @@ class VoiceArchiveRow(StrictModel):
 
 class _VoiceRange(StrictModel):
     # Explicit on every voice event: the work events stay at "0.1".
-    protocol_version: Literal["0.4"]
+    protocol_version: Literal["0.3"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
     seq_from: VoiceIdentity
@@ -530,14 +530,14 @@ class RuntimeAttestation(StrictModel):
 class VoiceMemoryEvent(StrictModel):
     """Subscribe to fresh profile memory for one foreground conversation binding."""
 
-    protocol_version: Literal["0.4"]
+    protocol_version: Literal["0.3"]
     type: Literal["voice_memory"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
 
 
 class VoiceMemorySnapshotEvent(StrictModel):
-    protocol_version: Literal["0.4"]
+    protocol_version: Literal["0.3"]
     type: Literal["voice_memory_snapshot"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity
@@ -555,7 +555,7 @@ class VoiceMemorySnapshotEvent(StrictModel):
 
 
 class VoiceMemoryRefusedEvent(StrictModel):
-    protocol_version: Literal["0.4"]
+    protocol_version: Literal["0.3"]
     type: Literal["voice_memory_refused"]
     conversation_id: VoiceConversationId
     generation: VoiceIdentity

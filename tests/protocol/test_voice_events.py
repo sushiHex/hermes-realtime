@@ -13,6 +13,7 @@ from hermes_realtime.protocol import (
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_INTEGRITY_REFUSALS,
+    VOICE_MEMORY_CAPABILITY,
     VOICE_REFUSAL_CATEGORIES,
     VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
@@ -41,7 +42,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
 
 def _archive(**overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.4",
+        "protocol_version": "0.3",
         "type": "voice_archive",
         "conversation_id": "conv_1-a",
         "generation": 0,
@@ -55,7 +56,7 @@ def _archive(**overrides: Any) -> dict[str, Any]:
 
 def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     event: dict[str, Any] = {
-        "protocol_version": "0.4",
+        "protocol_version": "0.3",
         "type": kind,
         "conversation_id": "conv",
         "generation": 0,
@@ -66,10 +67,11 @@ def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     return event
 
 
-def test_the_bridge_is_version_0_4_and_offers_archive_review_memory_and_attestation() -> None:
-    assert BRIDGE_PROTOCOL_VERSION == "0.4"
+def test_the_bridge_stays_at_version_0_3_and_memory_is_a_capability() -> None:
+    assert BRIDGE_PROTOCOL_VERSION == "0.3"
     assert VOICE_ARCHIVE_CAPABILITY == "voice_archive"
     assert VOICE_REVIEW_CAPABILITY == "voice_review"
+    assert VOICE_MEMORY_CAPABILITY == "voice_memory"
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
     assert (
         frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation"})
@@ -172,6 +174,7 @@ def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
     "event",
     [
         pytest.param(_archive(protocol_version="0.1"), id="version-0.1"),
+        pytest.param(_archive(protocol_version="0.4"), id="version-0.4"),
         pytest.param(_archive(extra=1), id="extra-field"),
         pytest.param(_archive(conversation_id="has space"), id="bad-conversation-id"),
         pytest.param(_archive(conversation_id="c" * 65), id="long-conversation-id"),

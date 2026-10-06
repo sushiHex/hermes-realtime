@@ -38,7 +38,7 @@ def _row(seq: int, gap: list[int] | None = None) -> dict[str, Any]:
 
 def _event(*rows: dict[str, Any]) -> dict[str, Any]:
     start = rows[0]["gap_before"][0] if rows[0]["gap_before"] else rows[0]["seq"]
-    return {"protocol_version": "0.4", "type": "voice_archive", "conversation_id": "qualify",
+    return {"protocol_version": "0.3", "type": "voice_archive", "conversation_id": "qualify",
             "generation": 0, "seq_from": start, "seq_through": rows[-1]["seq"],
             "rows": list(rows)}
 
