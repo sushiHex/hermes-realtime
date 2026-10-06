@@ -231,3 +231,75 @@ async def test_old_review_ack_cannot_advance_new_binding(tmp_path: Path) -> None
     assert not writer.acknowledge_review(old_review)
     assert writer.binding == ("new", 1)
     await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_request_still_publishes_durable_clear(tmp_path: Path) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("old", "new")).__next__)
+    context = ConversationContextStore(on_change=writer.update)
+    await writer.open(context)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_write = writer._write
+    cleared: list[tuple[str, int]] = []
+
+    async def delayed_write(data: bytes) -> None:
+        entered.set()
+        await release.wait()
+        await original_write(data)
+
+    writer._write = delayed_write  # type: ignore[method-assign]
+    deletion = asyncio.create_task(writer.request_forget(
+        context, on_durable_clear=lambda: cleared.append(writer.binding),
+    ))
+    await asyncio.wait_for(entered.wait(), 2)
+    deletion.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await deletion
+    assert cleared == []
+    release.set()
+    async with asyncio.timeout(2):
+        while not cleared:
+            await asyncio.sleep(0.01)
+    assert cleared == [("new", 1)]
+    assert writer.pending_forget == ("old", 0)
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_tail_write_does_not_publish_clear(tmp_path: Path) -> None:
+    writer = VoiceTailWriter(
+        tmp_path / "tail.json", conversation_ids=iter(("old", "new")).__next__,
+        initial_backoff_seconds=0.01,
+    )
+    context = ConversationContextStore(on_change=writer.update)
+    await writer.open(context)
+    original_write = writer._write
+    failed = asyncio.Event()
+    retry_entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+    clears: list[str] = []
+
+    async def transient_failure(data: bytes) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            failed.set()
+            raise OSError("synthetic write failure")
+        retry_entered.set()
+        await release.wait()
+        await original_write(data)
+
+    writer._write = transient_failure  # type: ignore[method-assign]
+    deletion = asyncio.create_task(writer.request_forget(
+        context, on_durable_clear=lambda: clears.append("cleared"),
+    ))
+    await asyncio.wait_for(failed.wait(), 2)
+    await asyncio.wait_for(retry_entered.wait(), 2)
+    assert clears == []
+    assert not deletion.done()
+    release.set()
+    await asyncio.wait_for(deletion, 2)
+    assert clears == ["cleared"]
+    await writer.close()

@@ -648,6 +648,7 @@ class VoiceTailWriter:
         self._pending_forget: tuple[str, int] | None = None
         self._forget_complete = False
         self._forget_version = 0
+        self._on_durable_clear: Callable[[], None] | None = None
         self._review_frozen_version = 0
         self._last_activity = time.monotonic()
         self._version = 0
@@ -790,11 +791,18 @@ class VoiceTailWriter:
     def forget_complete(self) -> bool:
         return self._forget_complete
 
-    async def request_forget(self, store: ConversationContextStore) -> tuple[str, int]:
+    async def request_forget(
+        self,
+        store: ConversationContextStore,
+        *,
+        on_durable_clear: Callable[[], None] | None = None,
+    ) -> tuple[str, int]:
         """Retire the current binding and durably record its delete intent."""
 
         if type(store) is not ConversationContextStore:
             raise TypeError("forget store must be an exact ConversationContextStore")
+        if on_durable_clear is not None and not callable(on_durable_clear):
+            raise TypeError("durable clear callback must be callable")
         if self._owner is None:
             raise RuntimeError("voice tail is not open")
         if self._pending_forget is not None:
@@ -821,6 +829,7 @@ class VoiceTailWriter:
         self._review_frozen_version = 0
         self._pending_forget = old
         self._forget_complete = False
+        self._on_durable_clear = on_durable_clear
         self._changed()
         self._forget_version = self._version
         while self._written_version < self._forget_version:
@@ -1275,6 +1284,13 @@ class VoiceTailWriter:
             else:
                 backoff = self._initial_backoff
                 self._written_version = version
+                if self._written_version >= self._forget_version:
+                    callback, self._on_durable_clear = self._on_durable_clear, None
+                    if callback is not None:
+                        try:
+                            callback()
+                        except Exception:
+                            _LOGGER.warning("voice tail durable clear callback failed")
                 self._notify()
 
     async def _write(self, data: bytes) -> None:

@@ -1602,7 +1602,6 @@ class BrowserSessionDirector:
             state = await operation(identity, generation)
             if type(state) is not str or state not in {"pending", "complete"}:
                 raise RuntimeError("voice delete returned an invalid state")
-            self._projection.publish("voice_conversation_cleared", {})
             self._touch_activity()
             return state
 

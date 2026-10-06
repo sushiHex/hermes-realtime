@@ -22,6 +22,7 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
     )
     observed: list[tuple[str, int]] = []
     state = "idle"
+    projection = BrowserEventProjection()
 
     async def provision(_identity: str) -> int:
         return 3
@@ -33,6 +34,7 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
         nonlocal state
         observed.append((identity, generation))
         state = "pending"
+        projection.publish("voice_conversation_cleared", {})
         return "pending"
 
     director = BrowserSessionDirector(
@@ -45,7 +47,7 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
         submit=submit,
         stop=submit,
         approval=submit,
-        projection=BrowserEventProjection(),
+        projection=projection,
         delete_voice_conversation=delete,
         voice_delete_status=lambda: state,
     )

@@ -2591,6 +2591,20 @@ def build_local_host_launcher(
             raise PermissionError("delete does not own the active worker generation")
         if writer.pending_forget is not None:
             return "pending"
+
+        def on_durable_clear() -> None:
+            if voice_memory_receiver is not None:
+                try:
+                    voice_memory_receiver.start()
+                except Exception:
+                    _LOGGER.warning("voice memory restart after delete failed")
+            if livekit_worker.active_generation != generation:
+                return
+            try:
+                projection.publish("voice_conversation_cleared", {})
+            except Exception:
+                _LOGGER.warning("voice delete clear projection failed")
+
         token = await conversation.suppress_audio_input(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -2602,10 +2616,9 @@ def build_local_host_launcher(
                     session_generation=generation,
                 )
                 await speech.cancel_for_binding_close()
-                await writer.request_forget(context)
-            if voice_memory_receiver is not None:
-                async with asyncio.timeout(10.0):
-                    await voice_memory_receiver.rebind()
+                if voice_memory_receiver is not None:
+                    await voice_memory_receiver.close()
+                await writer.request_forget(context, on_durable_clear=on_durable_clear)
             return "complete" if writer.forget_complete else "pending"
         finally:
             await conversation.resume_audio_input(token)
