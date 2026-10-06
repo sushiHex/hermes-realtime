@@ -317,6 +317,8 @@ class BrowserSessionDirector:
         on_session_started: Callable[[str, int], None] | None = None,
         voice_configuration: Callable[[], tuple[tuple[str, ...], str | None]] | None = None,
         select_voice: Callable[[str], Awaitable[None]] | None = None,
+        delete_voice_conversation: Callable[[str, int], Awaitable[str]] | None = None,
+        voice_delete_status: Callable[[], str] | None = None,
         evidence_consent: Callable[
             [BrowserBindingSnapshot, EvidenceConsentRequestV1],
             BrowserEvidenceConsentOperation,
@@ -415,6 +417,12 @@ class BrowserSessionDirector:
         self._reprovision = reprovision
         self._submit = submit
         self._stop = stop
+        if delete_voice_conversation is not None and not callable(delete_voice_conversation):
+            raise TypeError("delete_voice_conversation must be callable")
+        if voice_delete_status is not None and not callable(voice_delete_status):
+            raise TypeError("voice_delete_status must be callable")
+        self._delete_voice_conversation = delete_voice_conversation
+        self._voice_delete_status = voice_delete_status
         self._approval = approval
         self._projection = projection
         self._speech_runtime = speech_runtime or BrowserSpeechRuntime(
@@ -1574,6 +1582,46 @@ class BrowserSessionDirector:
                 raise ValueError("voice is not in the active provider catalog")
             await selector(voice)
             self._touch_activity()
+
+    async def delete_voice_conversation(self, *, participant_identity: str) -> str:
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact string")
+        async with self._start_lock:
+            identity, generation = self._active_identity, self._active_generation
+            if identity is None or generation is None:
+                raise RuntimeError("no browser session is active")
+            if participant_identity != identity:
+                raise PermissionError("delete participant does not own the active session")
+            operation = self._delete_voice_conversation
+            if operation is None:
+                raise RuntimeError("voice delete is unavailable")
+            status = self._voice_delete_status
+            if status is not None and status() == "pending":
+                return "pending"
+            self._projection.ensure_capacity()
+            state = await operation(identity, generation)
+            if type(state) is not str or state not in {"pending", "complete"}:
+                raise RuntimeError("voice delete returned an invalid state")
+            self._projection.publish("voice_conversation_cleared", {})
+            self._touch_activity()
+            return state
+
+    async def current_voice_delete_status(self, *, participant_identity: str) -> str:
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact string")
+        async with self._start_lock:
+            if self._active_identity is None or self._active_generation is None:
+                raise RuntimeError("no browser session is active")
+            if participant_identity != self._active_identity:
+                raise PermissionError("delete participant does not own the active session")
+            status = self._voice_delete_status
+            if status is None:
+                raise RuntimeError("voice delete is unavailable")
+            state = status()
+            if type(state) is not str or state not in {"idle", "pending", "complete"}:
+                raise RuntimeError("voice delete status is invalid")
+            self._touch_activity()
+            return state
 
     async def stop(
         self,

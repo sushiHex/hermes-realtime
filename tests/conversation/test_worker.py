@@ -417,6 +417,82 @@ def evidence_action_executor_probe() -> tuple[
 
 
 @pytest.mark.asyncio
+async def test_delete_quiesces_old_response_without_closing_binding() -> None:
+    executor, _, _ = action_executor_probe()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    transcriber = FinalOnPushTranscriber()
+
+    async def respond(
+        self: ConversationUpdateExecutor,
+        turn_id: str,
+        transcript: Transcript,
+        authority: UserTurnAuthorityV1 | None = None,
+        *,
+        reservation: Any | None = None,
+    ) -> None:
+        del turn_id, transcript, authority
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            if reservation is not None:
+                self._operation_scheduler.release(reservation)
+
+    executor.respond = MethodType(respond, executor)  # type: ignore[method-assign]
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=7,
+        vad=SilenceVad(),
+        stt=transcriber,
+        actions=executor,
+    )
+    worker.start()
+    await worker.submit_final_transcript(
+        participant_identity="browser_user", session_generation=7,
+        typed_sequence=1, text="old conversation",
+    )
+    await asyncio.wait_for(started.wait(), 2)
+
+    await worker.quiesce_for_delete()
+
+    assert cancelled.is_set()
+    assert transcriber.cancel_calls == 1
+    assert not worker._response_operations
+    assert not worker._closed
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_quiesce_rejects_bool_generation_before_touching_binding() -> None:
+    executor, _, _ = action_executor_probe()
+
+    def binding_factory(
+        participant_identity: str,
+        generation: int,
+        actions: ConversationUpdateExecutor,
+    ) -> ConversationSessionWorker:
+        return ConversationSessionWorker(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            vad=SilenceVad(),
+            stt=FinalOnPushTranscriber(),
+            actions=actions,
+        )
+
+    worker = ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
+    assert await worker.bind("browser_user") == 1
+    with pytest.raises(TypeError, match="exact integer"):
+        await worker.quiesce_for_delete(
+            participant_identity="browser_user", session_generation=True
+        )
+    await worker.close()
+
+
+@pytest.mark.asyncio
 async def test_session_worker_confirms_server_audio_path_on_first_pcm_frame() -> None:
     executor, _, _ = action_executor_probe()
     ready: list[str] = []

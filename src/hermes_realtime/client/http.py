@@ -139,6 +139,7 @@ class BrowserBootstrapApplication:
         routes = {
             "/api/v1/approval",
             "/api/v1/audio-diagnostic",
+            "/api/v1/delete-voice-conversation",
             "/api/v1/events",
             "/api/v1/evidence-consent",
             "/api/v1/evidence-revoke",
@@ -153,6 +154,7 @@ class BrowserBootstrapApplication:
             "/api/v1/search-egress-revoke",
             "/api/v1/stop",
             "/api/v1/voice",
+            "/api/v1/voice-delete-status",
             "/api/v1/voices",
             "/api/v1/yield",
         }
@@ -244,6 +246,24 @@ class BrowserBootstrapApplication:
             status = 200
         elif path in stable_bootstrap_paths | stable_rebind_paths:
             pass
+        elif path == "/api/v1/delete-voice-conversation":
+            if body or "content-type" in headers:
+                raise ValueError("voice delete request body must be empty")
+            identity = self._verifier.verify(bearer)
+            state = await self._sessions.delete_voice_conversation(
+                participant_identity=identity,
+            )
+            payload = {"state": state, "version": 1}
+            status = 200
+        elif path == "/api/v1/voice-delete-status":
+            if body or "content-type" in headers:
+                raise ValueError("voice delete status body must be empty")
+            identity = self._verifier.verify(bearer)
+            state = await self._sessions.current_voice_delete_status(
+                participant_identity=identity,
+            )
+            payload = {"state": state, "version": 1}
+            status = 200
         elif path == "/api/v1/projection-resync":
             if body or "content-type" in headers:
                 raise ValueError("projection resync request body must be empty")

@@ -189,8 +189,14 @@ class VoiceReviewSender:
                         skills=True,
                         closing=request.closing,
                     )
+                    if self._writer.binding != (request.conversation_id, request.generation):
+                        await self._drop()
+                        break
                     async with asyncio.timeout(self._timeout):
                         reply = await link.review(event)
+                    if self._writer.binding != (request.conversation_id, request.generation):
+                        await self._drop()
+                        break
                     if not _names(reply, request):
                         raise RuntimeError("review reply named another range")
                     if type(reply) is VoiceReviewAckEvent:

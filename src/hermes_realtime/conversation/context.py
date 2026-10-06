@@ -499,6 +499,18 @@ class ConversationContextStore:
         self._revision = 1
         self._notify_change()
 
+    def clear_voice_history(self) -> None:
+        """Start a new heard conversation without changing live task authority."""
+
+        self._messages.clear()
+        self._evicted = 0
+        self._open_assistant_segment = None
+        self._assistant_admissions_by_object_id.clear()
+        self._terminal_task_count = 0
+        self._memory = None
+        self._revision += 1
+        self._notify_change()
+
     def mark_prior_work_ended(self) -> None:
         """Record that work from before a restart exists and ended; idempotent."""
 

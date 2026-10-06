@@ -207,6 +207,9 @@ class VoiceArchiveSender:
                     evidence = {"refusal": "capability"}
                     return "unknown"
                 self._link = link
+            if self._writer.binding != (event.conversation_id, event.generation):
+                await self._drop()
+                return "acknowledged"
             self.sent += 1
             self.resent += resend
             try:
@@ -216,6 +219,10 @@ class VoiceArchiveSender:
                 await self._drop()
                 evidence = {"outcome": "unknown", "cause": type(error).__name__}
                 return "unknown"
+            if self._writer.binding != (event.conversation_id, event.generation):
+                # A deleted generation cannot fence or advance its successor.
+                await self._drop()
+                return "acknowledged"
             if type(reply) is VoiceArchiveRefusedEvent and _names(reply, event):
                 if reply.category in VOICE_TRANSIENT_REFUSALS:
                     # The companion cannot take it now; the batch is not wrong. One marker

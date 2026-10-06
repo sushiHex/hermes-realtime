@@ -81,6 +81,8 @@ class BrowserClientRuntime:
         projection: BrowserEventProjection | None = None,
         voice_configuration: Callable[[], tuple[tuple[str, ...], str | None]] | None = None,
         select_voice: Callable[[str], Awaitable[None]] | None = None,
+        delete_voice_conversation: Callable[[str, int], Awaitable[str]] | None = None,
+        voice_delete_status: Callable[[], str] | None = None,
         evidence_consent: Callable[
             [BrowserBindingSnapshot, EvidenceConsentRequestV1],
             BrowserEvidenceConsentOperation,
@@ -219,6 +221,8 @@ class BrowserClientRuntime:
             on_session_started=on_session_started,
             voice_configuration=voice_configuration,
             select_voice=select_voice,
+            delete_voice_conversation=delete_voice_conversation,
+            voice_delete_status=voice_delete_status,
             evidence_consent=evidence_consent,
             evidence_status=evidence_status,
             evidence_revoke=evidence_revoke,

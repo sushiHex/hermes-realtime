@@ -873,6 +873,28 @@ class ConversationSessionWorker:
             await asyncio.gather(*operations, return_exceptions=True)
         self._raise_terminal_error()
 
+    async def quiesce_for_delete(self) -> None:
+        """Settle old foreground and STT work while keeping this binding usable."""
+
+        async with self._audio_lock:
+            if self._closed:
+                raise RuntimeError("conversation session worker is closed")
+            self._active_utterance_ticket = None
+            for operation in tuple(self._response_operations):
+                operation.cancel()
+            await self._stt.cancel()
+            await self._actions.cancel_foreground()
+            operations = tuple(self._response_operations)
+            if operations:
+                _, pending = await asyncio.wait(
+                    operations, timeout=self._cleanup_timeout_seconds
+                )
+                if pending:
+                    raise TimeoutError("foreground delete cleanup exceeded its bound")
+            self._clear_pre_roll()
+            self._clear_echo_candidate()
+            self._raise_terminal_error()
+
     async def close(self) -> None:
         """Stop this binding and close the shared action authority."""
 
@@ -1238,6 +1260,26 @@ class ReconnectSafeConversationWorker:
                 self._media_incarnation = None
                 self._media_track_name = None
                 self._audio_input_suppression = None
+
+    async def quiesce_for_delete(
+        self, *, participant_identity: str, session_generation: int
+    ) -> None:
+        """Fence already admitted input before the voice context is cleared."""
+
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact built-in string")
+        if type(session_generation) is not int:
+            raise TypeError("session_generation must be an exact integer")
+        async with self._binding_lock:
+            binding = self._binding
+            if (
+                self._closed
+                or binding is None
+                or binding.participant_identity != participant_identity
+                or session_generation != self._generation
+            ):
+                raise PermissionError("delete does not own the active binding")
+            await binding.quiesce_for_delete()
 
     async def activate_media(
         self,

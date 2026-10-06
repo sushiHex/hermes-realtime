@@ -52,7 +52,8 @@ from hermes_realtime.integration.run_record import (
     write_run_record,
 )
 
-_VERSION = 3
+_VERSION = 4
+_REVIEW_VERSION = 3
 _ARCHIVE_VERSION = 2
 _LEGACY_VERSION = 1
 _MARKER_PREFIX = "[voice-tail] "
@@ -68,6 +69,7 @@ _ENVELOPE_OVERHEAD_BYTES = 64
 _ARCHIVE_OVERHEAD_BYTES = 320
 _LEGACY_FIELDS = frozenset({"messages", "prior_work", "version"})
 _DOCUMENT_FIELDS = frozenset({"archive", "messages", "prior_work", "version"})
+_FORGET_DOCUMENT_FIELDS = _DOCUMENT_FIELDS | {"pending_forget", "forget_complete"}
 _ROW_FIELDS = frozenset({"interrupted", "role", "text"})
 _ARCHIVE_FIELDS = frozenset(
     {"conversation_id", "cursor", "frozen", "gap", "generation", "next_seq", "outbox", "settled"}
@@ -175,6 +177,8 @@ class VoiceTail:
 
     conversation: DurableConversation
     archive: ArchiveOutbox | None
+    pending_forget: tuple[str, int] | None = None
+    forget_complete: bool = False
 
 
 def max_voice_tail_bytes(
@@ -191,6 +195,7 @@ def max_voice_tail_bytes(
         + _MAX_REVIEW_ROWS * (25 + 18)
         + _ENVELOPE_OVERHEAD_BYTES
         + _ARCHIVE_OVERHEAD_BYTES
+        + 128  # one bounded pending forget identity in version 4
     )
 
 
@@ -199,7 +204,12 @@ def row_wire_bound(text: str) -> int:
     return _WIRE_ROW_OVERHEAD_BYTES + _MAX_WIRE_BYTES_PER_CHAR * len(text)
 
 
-def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes:
+def voice_tail_bytes(
+    view: DurableConversation,
+    archive: ArchiveOutbox,
+    pending_forget: tuple[str, int] | None = None,
+    forget_complete: bool = False,
+) -> bytes:
     document = {
         "archive": {
             "conversation_id": archive.conversation_id,
@@ -243,6 +253,8 @@ def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes
             for message in view.messages
         ],
         "prior_work": view.prior_work,
+        "pending_forget": None if pending_forget is None else list(pending_forget),
+        "forget_complete": forget_complete,
         "version": _VERSION,
     }
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -493,10 +505,36 @@ def parse_voice_tail(
     if type(document) is not dict:
         return None
     version = document.get("version")
-    if type(version) is not int or version not in (_LEGACY_VERSION, _ARCHIVE_VERSION, _VERSION):
+    if type(version) is not int or version not in (
+        _LEGACY_VERSION, _ARCHIVE_VERSION, _REVIEW_VERSION, _VERSION
+    ):
         return None
-    if set(document) != (_LEGACY_FIELDS if version == _LEGACY_VERSION else _DOCUMENT_FIELDS):
+    required_fields = (
+        _LEGACY_FIELDS if version == _LEGACY_VERSION
+        else _FORGET_DOCUMENT_FIELDS if version == _VERSION
+        else _DOCUMENT_FIELDS
+    )
+    if set(document) != required_fields:
         return None
+    pending_forget = None
+    forget_complete = False
+    if version == _VERSION:
+        forget_complete = document["forget_complete"]
+        if type(forget_complete) is not bool:
+            return None
+        raw_forget = document["pending_forget"]
+        if raw_forget is not None:
+            if (
+                type(raw_forget) is not list
+                or len(raw_forget) != 2
+                or type(raw_forget[0]) is not str
+                or _CONVERSATION_ID.fullmatch(raw_forget[0]) is None
+                or not _identity(raw_forget[1])
+            ):
+                return None
+            pending_forget = (raw_forget[0], raw_forget[1])
+        if pending_forget is not None and forget_complete:
+            return None
     rows, prior_work = document["messages"], document["prior_work"]
     if type(prior_work) is not bool:
         return None
@@ -512,15 +550,25 @@ def parse_voice_tail(
             return None
         messages.append(ConversationMessage(role=role, text=text, interrupted=interrupted))
     archive = None
-    if version in (_ARCHIVE_VERSION, _VERSION):
+    if version in (_ARCHIVE_VERSION, _REVIEW_VERSION, _VERSION):
         archive = _parse_archive(
             document["archive"], len(messages), max_item_chars, max_outbox_rows
         )
         if archive is None:
             return None
-        if (version == _VERSION) != (archive.review is not None):
+        if (version >= _REVIEW_VERSION) != (archive.review is not None):
             return None
-    return VoiceTail(DurableConversation(messages=tuple(messages), prior_work=prior_work), archive)
+        if pending_forget is not None and (
+            archive.generation <= pending_forget[1]
+            or archive.conversation_id == pending_forget[0]
+        ):
+            return None
+    return VoiceTail(
+        DurableConversation(messages=tuple(messages), prior_work=prior_work),
+        archive,
+        pending_forget,
+        forget_complete,
+    )
 
 
 def _marker(prefix: str, evidence: dict[str, str | int]) -> None:
@@ -597,6 +645,9 @@ class VoiceTailWriter:
         self._frozen = 0
         self._gap: tuple[int, int] | None = None
         self._review = ReviewProgress()
+        self._pending_forget: tuple[str, int] | None = None
+        self._forget_complete = False
+        self._forget_version = 0
         self._review_frozen_version = 0
         self._last_activity = time.monotonic()
         self._version = 0
@@ -730,6 +781,72 @@ class VoiceTailWriter:
         if self._owner is None:
             raise RuntimeError("voice tail binding is available only while open")
         return self._conversation_id, self._generation
+
+    @property
+    def pending_forget(self) -> tuple[str, int] | None:
+        return self._pending_forget
+
+    @property
+    def forget_complete(self) -> bool:
+        return self._forget_complete
+
+    async def request_forget(self, store: ConversationContextStore) -> tuple[str, int]:
+        """Retire the current binding and durably record its delete intent."""
+
+        if type(store) is not ConversationContextStore:
+            raise TypeError("forget store must be an exact ConversationContextStore")
+        if self._owner is None:
+            raise RuntimeError("voice tail is not open")
+        if self._pending_forget is not None:
+            raise RuntimeError("a voice delete is already pending")
+        if self._generation >= MAX_IDENTITY:
+            raise RuntimeError("voice generation capacity is exhausted")
+        old = self.binding
+        new_id = self._conversation_ids()
+        if (
+            type(new_id) is not str
+            or _CONVERSATION_ID.fullmatch(new_id) is None
+            or new_id == old[0]
+        ):
+            raise ValueError("replacement conversation id is invalid")
+        # All changes before the first suspension run on the event loop as one transition.
+        store.clear_voice_history()
+        self._conversation_id = new_id
+        self._generation = old[1] + 1
+        self._seq_base = self._next_seq = 0
+        self._cursor = self._gap = None
+        self._outbox = []
+        self._frozen = 0
+        self._review = ReviewProgress()
+        self._review_frozen_version = 0
+        self._pending_forget = old
+        self._forget_complete = False
+        self._changed()
+        self._forget_version = self._version
+        while self._written_version < self._forget_version:
+            await self._tick.wait()
+        return old
+
+    async def next_forget(self) -> tuple[str, int]:
+        """Return only an intent already present in the durable tail."""
+
+        while True:
+            pending = self._pending_forget
+            if (
+                self._owner is not None
+                and pending is not None
+                and self._written_version >= self._forget_version
+            ):
+                return pending
+            await self._tick.wait()
+
+    def acknowledge_forget(self, binding: tuple[str, int]) -> bool:
+        if type(binding) is not tuple or binding != self._pending_forget:
+            return False
+        self._pending_forget = None
+        self._forget_complete = True
+        self._changed()
+        return True
 
     def _batch(self) -> ArchiveBatch:
         rows = tuple(self._outbox[: self._frozen])
@@ -1051,6 +1168,8 @@ class VoiceTailWriter:
         self._outbox = []
         self._frozen = 0
         self._review = ReviewProgress()
+        self._pending_forget = None
+        self._forget_complete = False
 
     def _load(self, archive: ArchiveOutbox) -> None:
         self._conversation_id = archive.conversation_id
@@ -1083,6 +1202,8 @@ class VoiceTailWriter:
                     self._fresh()
                 else:
                     self._load(tail.archive)
+                self._pending_forget = tail.pending_forget
+                self._forget_complete = tail.forget_complete
                 store.restore(tail.conversation)
             except ValueError:
                 # A refused restore mutated nothing; only a loaded archive must be dropped.
@@ -1134,7 +1255,10 @@ class VoiceTailWriter:
                 self._wake.clear()
                 continue
             version = self._version
-            data = voice_tail_bytes(self._latest, self._archive_state())
+            data = voice_tail_bytes(
+                self._latest, self._archive_state(), self._pending_forget,
+                self._forget_complete,
+            )
             self._dirty = False
             try:
                 await self._write(data)

@@ -22,6 +22,7 @@ _EVENT_KINDS = frozenset(
         "barge_in_verifier_unavailable",
         "completion_received",
         "capture_status",
+        "voice_conversation_cleared",
         "echo_barge_in_confirmed",
         "echo_suppressed",
         "transcript_echo_suppressed",
@@ -202,6 +203,8 @@ class BrowserEventProjection:
         *,
         reserved: bool,
     ) -> BrowserPublicEvent:
+        if kind == "voice_conversation_cleared" and data:
+            raise ValueError("voice delete event carries no data")
         if kind == "session_ready":
             expected = {
                 "conversationProfile",
