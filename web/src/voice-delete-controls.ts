@@ -99,7 +99,7 @@ export class VoiceDeleteControls {
     if (this.inFlight) return;
     const credential = this.options.credential();
     if (credential === null || !this.options.connected()) return;
-    const epoch = this.epoch;
+    const epoch = ++this.epoch;
     try {
       const state = parseVoiceDeleteState(
         await this.options.request("/api/v1/voice-delete-status", credential.token),

@@ -133,4 +133,29 @@ describe("voice conversation deletion control", () => {
     controls.reset();
     dom.window.close();
   });
+
+  it("ignores an older pending refresh after a newer refresh confirms completion", async () => {
+    let resolveOld!: (value: unknown) => void;
+    const oldStatus = new Promise<unknown>((resolve) => { resolveOld = resolve; });
+    let statusCalls = 0;
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async () => {
+        statusCalls += 1;
+        return statusCalls === 1 ? oldStatus : response("complete");
+      },
+      clear: () => undefined,
+    });
+
+    const old = controls.refresh();
+    await controls.refresh();
+    expect(status.textContent).toBe("Voice conversation deleted.");
+    expect(button.disabled).toBe(false);
+    resolveOld(response("pending"));
+    await old;
+    expect(status.textContent).toBe("Voice conversation deleted.");
+    expect(button.disabled).toBe(false);
+    controls.reset();
+    dom.window.close();
+  });
 });
