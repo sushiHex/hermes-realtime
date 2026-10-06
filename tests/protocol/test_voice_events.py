@@ -13,6 +13,7 @@ from hermes_realtime.protocol import (
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_INTEGRITY_REFUSALS,
+    VOICE_MEMORY_CAPABILITY,
     VOICE_REFUSAL_CATEGORIES,
     VOICE_REVIEW_CAPABILITY,
     VOICE_TRANSIENT_REFUSALS,
@@ -66,13 +67,14 @@ def _range(kind: str, **overrides: Any) -> dict[str, Any]:
     return event
 
 
-def test_the_bridge_is_version_0_3_and_offers_archive_review_and_attestation() -> None:
+def test_the_bridge_stays_at_version_0_3_and_memory_is_a_capability() -> None:
     assert BRIDGE_PROTOCOL_VERSION == "0.3"
     assert VOICE_ARCHIVE_CAPABILITY == "voice_archive"
     assert VOICE_REVIEW_CAPABILITY == "voice_review"
+    assert VOICE_MEMORY_CAPABILITY == "voice_memory"
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
     assert (
-        frozenset({"voice_archive", "voice_review", "runtime_attestation"})
+        frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation"})
         == BRIDGE_CAPABILITIES
     )
 
@@ -125,6 +127,7 @@ def test_a_malformed_runtime_attestation_is_refused(overrides: dict[str, Any]) -
         RuntimeAttestation.model_validate(_attestation(**overrides))
 
 
+
 def test_a_voice_archive_round_trips_exactly_and_never_normalizes_text() -> None:
     event = parse_voice_event(json.dumps(_archive()))
 
@@ -171,6 +174,7 @@ def test_every_category_that_can_mean_the_archive_is_wrong_fences() -> None:
     "event",
     [
         pytest.param(_archive(protocol_version="0.1"), id="version-0.1"),
+        pytest.param(_archive(protocol_version="0.4"), id="version-0.4"),
         pytest.param(_archive(extra=1), id="extra-field"),
         pytest.param(_archive(conversation_id="has space"), id="bad-conversation-id"),
         pytest.param(_archive(conversation_id="c" * 65), id="long-conversation-id"),

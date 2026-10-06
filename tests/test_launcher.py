@@ -2075,6 +2075,7 @@ async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_
 
 def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> list[object]:
     from hermes_realtime.integration.voice_archive import VoiceArchiveSender
+    from hermes_realtime.integration.voice_memory import VoiceMemoryReceiver
     from hermes_realtime.integration.voice_review import VoiceReviewSender
 
     connectors: list[object] = []
@@ -2097,6 +2098,15 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
             events.append("review:close")
             await super().close()
 
+    class RecordingMemoryReceiver(VoiceMemoryReceiver):
+        def start(self) -> None:
+            events.append("memory:start")
+            super().start()
+
+        async def close(self) -> None:
+            events.append("memory:close")
+            await super().close()
+
     def connector(*, host: str, port: int, token: str) -> object:
         connectors.append((host, port, token))
 
@@ -2117,8 +2127,10 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
     )
     monkeypatch.setattr(host_launcher_module, "VoiceArchiveSender", RecordingSender)
     monkeypatch.setattr(host_launcher_module, "VoiceReviewSender", RecordingReviewSender)
+    monkeypatch.setattr(host_launcher_module, "VoiceMemoryReceiver", RecordingMemoryReceiver)
     monkeypatch.setattr(host_launcher_module, "bridge_connector", connector)
     monkeypatch.setattr(host_launcher_module, "review_connector", connector)
+    monkeypatch.setattr(host_launcher_module, "memory_connector", connector)
     return connectors
 
 
@@ -2140,10 +2152,12 @@ async def test_full_host_archives_through_the_companion_after_the_tail_opens(
             "tail:open",
             "archive:start",
             "review:start",
+            "memory:start",
             "preflight",
             "runtime:start",
         ]
         assert connectors == [
+            ("127.0.0.1", 8766, "companion-token-with-enough-entropy"),
             ("127.0.0.1", 8766, "companion-token-with-enough-entropy"),
             ("127.0.0.1", 8766, "companion-token-with-enough-entropy"),
         ]
@@ -2151,8 +2165,9 @@ async def test_full_host_archives_through_the_companion_after_the_tail_opens(
         await launcher.close()
 
     # The sender stops before the tail's final write.
-    assert harness.events[5:] == [
+    assert harness.events[6:] == [
         "actions:closed",
+        "memory:close",
         "archive:close",
         "review:close",
         "tail:close",

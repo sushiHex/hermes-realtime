@@ -151,14 +151,16 @@ Paths that differ only in case are exempt from the tracked-changes refusal on a
 case-insensitive checkout only while their one file on disk matches one of their committed
 versions: `29112bef` tracks such paths, and Windows can hold only one of each.
 
-## Protocol 0.3: the hello, voice archive and review
+## Protocol 0.3: the hello, voice archive, review and memory
 
 The hello is exactly
 `{"token", "participant_id", "protocol_version": "0.3", "capabilities": [...]}`. The server
 answers `{"ok": true, "protocol_version": "0.3", "capabilities": [...]}` with the requested
 capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
 repeated capability, or with any other key, is refused. The voice capabilities are
-`voice_archive` and `voice_review`, offered by the ready companion. A welcome that
+`voice_archive`, `voice_review` and `voice_memory`, offered by the ready companion.
+Memory is an additive 0.3 capability, not a new wire version; peers without it keep
+dispatch, archive and review on their existing connections. A welcome that
 negotiates review also carries its profile's bounded `review_interval`. Realtime
 sends no voice event on a connection whose welcome did not list it, and the server closes a
 connection that sends one anyway. A voice connection carries voice events only. A refused
@@ -183,6 +185,60 @@ Versions are mixed on purpose: the hello and every voice event name `protocol_ve
 `"0.3"` explicitly (a voice event without it is refused), while the work events
 (`work.*`, `control.*`) keep `"0.1"`. The two event families parse separately, and
 neither parser accepts the other's events.
+
+Memory uses a dedicated subscription connection. One
+`voice_memory{conversation_id, generation}` request receives ordered
+`voice_memory_snapshot{conversation_id, generation, revision, memory, user, truncated}`
+events. Each block is capped at 4,096 UTF-8 bytes. A
+`voice_memory_refused{conversation_id, generation, category}` event clears the foreground
+snapshot for binding, integrity or unavailable states. Transient `pending` and memory-read
+`capacity` refusals retain the last snapshot while the connection remains bound; disconnect
+still clears it. Revisions order snapshots within a connection, not across companion restarts.
+The foreground keeps a per-connection revision high-watermark. No refusal lowers that
+mark; a later snapshot must have a revision at least as high, and an equal revision is
+accepted.
+Reconnect delays grow to a bounded maximum after connection or stream failures, including
+failures after a successful handshake. The delay resets only when the connection delivers
+its first valid snapshot.
+The companion reads its bound profile through Hermes's native memory parser, sanitizer
+and renderer at subscription open and after a review finishes. Reads use bounded file
+input, Hermes's configured character limits and the rendered byte cap. Oversize input
+keeps the longest suffix of whole sanitized entries that fits both limits, with the
+truncation marker first. Newest entries win, including repeated entries. A bounded tail
+read discards any partial first entry before Hermes parses the remaining complete entries.
+
+The foreground never waits for this read on a turn. It uses the latest received snapshot
+as context data explicitly labelled untrusted. Memory does not add tool permissions. A new
+conversation can read before its first archived row without creating an archive session.
+An existing binding must be verified and ready. Quarantine, generation changes, binding/integrity refusals
+and connection loss clear memory. Missing or unsupported capability leaves voice running
+without memory; no periodic refresh or second durable memory store is introduced.
+
+**Authority qualification:** ADR criterion 17 compares admitted calls with and without
+memory under identical forced model behavior. It also checks that refresh alone starts no
+foreground turn or tool call, that the model cannot grant approval, and that memory appears
+only in its labelled prompt data section. These are structural checks on what memory adds,
+not a test of model obedience.
+
+**Existing boundary's limit:** valid advertised model tool calls can dispatch or cancel on
+a neutral-user turn. The forced stand-in probe records one dispatch and one cancellation;
+M4 leaves natural routing unchanged. This does not prove a production model will follow an
+adversarial memory entry. A deterministic boundary is a separate decision in
+[#205](https://github.com/sushiHex/hermes-realtime/issues/205); no option is implemented here.
+
+Memory in Codex and Ollama is labelled reference data. Ollama carries its labelled JSON
+in a system message, leaving conversation messages unchanged; placement and labelling do
+not establish model prompt-injection resistance. Ollama's `num_ctx` is not set by this
+adapter, so the configured model/server context window may truncate input despite the
+memory byte cap. Adapter-boundary evidence includes the SHA-256 and UTF-8 byte length of
+canonical memory JSON, never the memory contents.
+
+**Freshness limits:** an open conversation refreshes after this companion's reviews report
+`finished`, not after failed or cancelled reviews. Memory written by other Hermes sessions,
+or written before a failed/cancelled review, waits until the next conversation opens.
+Hermes may replace blocked entries with a `[BLOCKED: ... use memory(action=remove)]`
+placeholder. That is retained as untrusted data; the foreground has no memory-removal tool
+and cannot perform that suggested action.
 
 `voice_archive{conversation_id, generation, seq_from, seq_through, rows[{seq, role, text,
 interrupted, ts, gap_before}]}` is answered on the same connection by

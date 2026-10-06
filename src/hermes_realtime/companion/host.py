@@ -27,7 +27,7 @@ import asyncio
 import contextlib
 import json
 import threading
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -51,10 +51,14 @@ from hermes_realtime.companion.review import (
 )
 from hermes_realtime.companion.store import CompanionStore
 from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceMemoryEvent,
+    VoiceMemoryRefusedEvent,
+    VoiceMemorySnapshotEvent,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
@@ -66,6 +70,7 @@ _MIN_TOKEN_CHARS = 24
 _MAX_TOKEN_CHARS = 512
 _DEFAULT_CLOSE_TIMEOUT_SECONDS = 15.0
 _SUBMIT_TIMEOUT_SECONDS = 60.0
+_MEMORY_TIMEOUT_SECONDS = 10.0
 _MARKER = "[voice-companion] "
 _T = TypeVar("_T")
 _owner_lock = threading.Lock()
@@ -134,6 +139,14 @@ class VoiceCompanionService:
         self._port = port
         self._review = review
         self._open_lock = asyncio.Lock()
+        self._memory_ready = False
+        self._memory_closed = False
+        self._memory_revision = 0
+        self._memory_events: set[asyncio.Event] = set()
+        self._memory_reads: set[asyncio.Task[BuiltinMemorySnapshot]] = set()
+        archive._on_state_change = self._memory_changed
+        if review is not None:
+            review._on_finished = self._memory_finished
 
     async def start(self) -> None:
         """Compatibility and durability for the profile; no conversation opens here.
@@ -151,6 +164,133 @@ class VoiceCompanionService:
                 await self._review.start()
             except ArchiveRefusal as refusal:
                 _marker({"refusal": refusal.category, "version": 1})
+        self._memory_ready = True
+
+    @property
+    def memory_available(self) -> bool:
+        return self._memory_ready and callable(getattr(self._port, "read_builtin_memory", None))
+
+    def _memory_changed(self) -> None:
+        for event in self._memory_events:
+            event.set()
+
+    def _memory_finished(self) -> None:
+        if self._memory_revision == 2**53 - 1:
+            self._memory_ready = False
+        else:
+            self._memory_revision += 1
+        self._memory_changed()
+
+    def _memory_status(self, event: VoiceMemoryEvent, *, recovering: bool = False) -> None:
+        if self._memory_closed or not self.memory_available or self._archive._fenced:
+            raise ArchiveRefusal("not_ready")
+        record = self._store.read(event.conversation_id)
+        # Authentication binds the profile. A new conversation may recall before its
+        # first archived row; a memory read never allocates a Hermes session or binding.
+        if record is None:
+            if event.generation != 0:
+                raise ArchiveRefusal("stale")
+            return
+        if record.quarantine is not None:
+            raise ArchiveRefusal("quarantined")
+        if record.tombstone is not None:
+            raise ArchiveRefusal("tombstoned")
+        if record.committed is None:
+            raise ArchiveRefusal("pending")
+        cursor = record.committed.cursor
+        generation = 0 if cursor is None else cursor.generation
+        if event.generation != generation:
+            raise ArchiveRefusal("stale")
+        if record.pending is not None and not recovering:
+            raise ArchiveRefusal("pending")
+        if not recovering and not self._archive.ready(event.conversation_id):
+            raise ArchiveRefusal("not_ready")
+
+    async def _read_memory(
+        self, event: VoiceMemoryEvent, *, recovering: bool,
+    ) -> BuiltinMemorySnapshot:
+        self._memory_status(event, recovering=recovering)
+        if recovering and self._store.read(event.conversation_id) is not None:
+            await self._ensure_open(event.conversation_id)
+        async with self._archive._guard(event.conversation_id):
+            self._memory_status(event)
+            reader = getattr(self._port, "read_builtin_memory", None)
+            if not callable(reader):
+                raise ArchiveRefusal("not_ready")
+            value = await self._archive._call(reader)
+            if type(value) is not BuiltinMemorySnapshot:
+                raise ArchiveRefusal("invalid")
+            return value
+
+    def _memory_read_done(self, task: asyncio.Task[BuiltinMemorySnapshot]) -> None:
+        self._memory_reads.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def memory(
+        self, event: VoiceMemoryEvent,
+    ) -> AsyncIterator[VoiceMemorySnapshotEvent | VoiceMemoryRefusedEvent]:
+        """One open read and finished-review refreshes; no timer or turn-path I/O."""
+        if type(event) is not VoiceMemoryEvent:
+            raise TypeError("memory request must be exact")
+        if len(self._memory_events) >= 32:
+            try:
+                yield VoiceMemoryRefusedEvent(
+                    protocol_version="0.3", type="voice_memory_refused",
+                    conversation_id=event.conversation_id, generation=event.generation,
+                    category="capacity",
+                )
+            finally:
+                print('[voice-memory] {"refusal": "capacity", "version": 1}', flush=True)
+            return
+        changed = asyncio.Event()
+        self._memory_events.add(changed)
+        last_revision = -1
+        first = True
+        try:
+            while True:
+                changed.clear()
+                evidence: dict[str, str | int] | None = None
+                try:
+                    self._memory_status(event, recovering=first)
+                    revision = self._memory_revision
+                    if revision != last_revision:
+                        if len(self._memory_reads) >= 32:
+                            raise ArchiveRefusal("capacity")
+                        work = asyncio.create_task(self._read_memory(event, recovering=first))
+                        self._memory_reads.add(work)
+                        work.add_done_callback(self._memory_read_done)
+                        first = False
+                        value = await asyncio.wait_for(
+                            asyncio.shield(work), _MEMORY_TIMEOUT_SECONDS,
+                        )
+                        self._memory_status(event)
+                        yield VoiceMemorySnapshotEvent(
+                            protocol_version="0.3", type="voice_memory_snapshot",
+                            conversation_id=event.conversation_id, generation=event.generation,
+                            revision=revision, memory=value.memory, user=value.user,
+                            truncated=value.truncated,
+                        )
+                        last_revision = revision
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    category = error.category if type(error) is ArchiveRefusal else "not_ready"
+                    evidence = {"refusal": category, "version": 1}
+                    last_revision = -1
+                    yield VoiceMemoryRefusedEvent(
+                        protocol_version="0.3", type="voice_memory_refused",
+                        conversation_id=event.conversation_id, generation=event.generation,
+                        category=category,
+                    )
+                finally:
+                    if evidence is not None:
+                        print("[voice-memory] " + json.dumps(evidence, sort_keys=True), flush=True)
+                if self._memory_closed:
+                    return
+                await changed.wait()
+        finally:
+            self._memory_events.discard(changed)
 
     @property
     def review_interval(self) -> int | None:
@@ -267,6 +407,18 @@ class VoiceCompanionService:
                 await self._archive.open(conversation_id)
 
     async def close(self) -> None:
+        self._memory_closed = True
+        self._memory_changed()
+        reads = tuple(self._memory_reads)
+        for work in reads:
+            work.cancel()
+        if reads:
+            try:
+                _, pending = await asyncio.wait(reads, timeout=_MEMORY_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                raise ReviewQuiescenceError("memory read has not quiesced") from None
+            if pending:
+                raise ReviewQuiescenceError("memory read has not quiesced")
         if self._review is not None:
             await self._review.close()
         await self._archive.close()

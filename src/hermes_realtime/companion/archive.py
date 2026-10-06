@@ -142,9 +142,21 @@ class _Live:
 
     session_id: str
     holder: str
-    ready: bool = False
+    _ready: bool = False
     leased: bool = True
     refresh: asyncio.Task[None] | None = None
+    on_change: Callable[[], None] = lambda: None
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    @ready.setter
+    def ready(self, value: bool) -> None:
+        changed = value != self._ready
+        self._ready = value
+        if changed:
+            self.on_change()
 
 
 def _marker(prefix: str, evidence: dict[str, str | int]) -> None:
@@ -195,6 +207,7 @@ class VoiceArchive:
         self._users: dict[str, int] = {}
         self._live: dict[str, _Live] = {}
         self._fenced = False
+        self._on_state_change: Callable[[], None] = lambda: None
 
     def holder(self, conversation_id: str) -> str:
         """The lease holder of this open conversation: unique to this process and this open."""
@@ -303,7 +316,7 @@ class VoiceArchive:
         )
         if acquired is not True:
             raise ArchiveRefusal("lease_held")
-        live = _Live(record.session_id, holder)
+        live = _Live(record.session_id, holder, on_change=lambda: self._on_state_change())
         self._live[conversation_id] = live
         try:
             recovery = await self._verify(conversation_id, record)
@@ -368,6 +381,7 @@ class VoiceArchive:
             self._store.quarantine(conversation_id, category)
         except BaseException:
             self._fenced = True
+            self._on_state_change()
             raise RuntimeError("the quarantine could not be persisted; companion fenced") from None
 
     # --- archiving -------------------------------------------------------------------------
@@ -381,7 +395,9 @@ class VoiceArchive:
         try:
             conversation_id = _checked_id(conversation_id)
             async with self._guard(conversation_id):
-                return await self._archive(conversation_id, batch)
+                result = await self._archive(conversation_id, batch)
+                self._on_state_change()
+                return result
         except ArchiveRefusal as refusal:
             evidence = {"refusal": refusal.category, "rows": count, "version": 1}
             raise

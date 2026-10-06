@@ -193,7 +193,7 @@ async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers
     "hello",
     [
         pytest.param({"token": _TOKEN, "participant_id": "p1"}, id="a-0.1-hello"),
-        pytest.param(_valid_hello(protocol_version="0.1"), id="wrong-version"),
+        pytest.param(_valid_hello(protocol_version="0.4"), id="wrong-version"),
         pytest.param(_valid_hello(capabilities=["voice_forget"]), id="unknown-capability"),
         pytest.param(_valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"),
         pytest.param(_valid_hello(capabilities="voice_archive"), id="capabilities-not-a-list"),
@@ -213,7 +213,7 @@ _BRIDGE_MARKER = "[hermes-bridge-hello] "
 @pytest.mark.parametrize(
     ("hello", "category"),
     [
-        pytest.param(_valid_hello(protocol_version="0.1"), "version", id="version"),
+        pytest.param(_valid_hello(protocol_version="0.4"), "version", id="version"),
         pytest.param(_valid_hello(capabilities=["voice_forget"]), "capability", id="unknown"),
         pytest.param(
             _valid_hello(capabilities=["voice_archive", "voice_archive"]),
@@ -470,7 +470,7 @@ async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
     [
         pytest.param({"ok": True}, id="a-0.1-welcome"),
         pytest.param(
-            {"ok": True, "protocol_version": "0.2", "capabilities": []}, id="wrong-version"
+            {"ok": True, "protocol_version": "0.4", "capabilities": []}, id="wrong-version"
         ),
         pytest.param(
             {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]},

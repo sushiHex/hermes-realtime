@@ -15,6 +15,7 @@ from hermes_realtime.conversation import (
     ConversationRole,
     DurableConversation,
 )
+from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.speech import (
     AudioFrame,
     DeliveredSpeechConfirmation,
@@ -22,6 +23,48 @@ from hermes_realtime.speech import (
     SpeechChunk,
     Transcript,
 )
+
+
+def test_memory_snapshot_is_detached_and_never_enters_durable_tail() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(on_change=changes.append)
+    source = BuiltinMemorySnapshot(memory="Prefers concise replies.", user="Name: Ari")
+
+    context.set_memory(source)
+    first = context.snapshot()
+    assert first.memory == source
+    assert first.revision == 1
+    assert changes == []
+    assert context.durable_view().messages == ()
+
+    object.__setattr__(source, "memory", "forged replacement")
+    assert context.snapshot().memory == BuiltinMemorySnapshot(
+        memory="Prefers concise replies.", user="Name: Ari"
+    )
+    assert first.memory == context.snapshot().memory
+    assert first.memory is not None
+    object.__setattr__(first.memory, "memory", "snapshot rewrite")
+    assert context.snapshot().memory == BuiltinMemorySnapshot(
+        memory="Prefers concise replies.", user="Name: Ari"
+    )
+
+    context.set_memory(BuiltinMemorySnapshot(memory="Prefers concise replies.", user="Name: Ari"))
+    assert context.snapshot().revision == 1
+    context.set_memory(None)
+    assert context.snapshot().memory is None
+    assert context.snapshot().revision == 2
+    assert changes == []
+
+
+def test_snapshot_rejects_nonexact_memory_value() -> None:
+    with pytest.raises(TypeError, match="memory"):
+        ConversationContextSnapshot(
+            revision=0, messages=(), active_tasks=(), memory=cast(Any, {"memory": "forged"})
+        )
+    context = ConversationContextStore()
+    with pytest.raises(TypeError, match="memory"):
+        context.set_memory(cast(Any, "forged"))
+    assert context.snapshot().revision == 0
 
 
 def _confirm_assistant_text(

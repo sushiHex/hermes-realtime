@@ -26,6 +26,7 @@ from hermes_realtime.protocol import (
     WorkCompletedEvent,
     WorkDispatchAcknowledgedEvent,
     WorkDispatchRequestedEvent,
+    parse_event,
 )
 
 
@@ -169,6 +170,39 @@ async def test_loopback_bridge_streams_acknowledgment_and_completion() -> None:
         assert completion.run_id == "deleg_task_001"
         assert completion.sequence > acknowledgment.sequence
         assert completion.payload.summary.startswith("Option B")
+
+
+@pytest.mark.asyncio
+async def test_a_0_3_peer_without_memory_keeps_dispatch() -> None:
+    service, completions = bridge_components()
+    async with LocalHermesBridgeServer(
+        service=service,
+        completions=completions,
+        token="test-token-with-sufficient-entropy",
+    ) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        try:
+            writer.write(json.dumps({
+                "token": "test-token-with-sufficient-entropy",
+                "participant_id": "participant_001",
+                "protocol_version": "0.3",
+                "capabilities": [],
+            }).encode("utf-8") + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline()) == {
+                "ok": True,
+                "protocol_version": "0.3",
+                "capabilities": [],
+            }
+            writer.write(request().model_dump_json().encode("utf-8") + b"\n")
+            await writer.drain()
+            acknowledgment = parse_event(await reader.readline())
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    assert isinstance(acknowledgment, WorkDispatchAcknowledgedEvent)
+    assert acknowledgment.payload.run_id == "deleg_task_001"
 
 
 @pytest.mark.asyncio

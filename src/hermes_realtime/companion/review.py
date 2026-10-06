@@ -142,6 +142,7 @@ class VoiceReviewCoordinator:
         self._active: dict[str, _Running] = {}
         self._interval: int | None = None
         self._closed = False
+        self._on_finished: Callable[[], None] = lambda: None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._parent_closes: dict[int, asyncio.Task[None]] = {}
         self._cancel_tasks: dict[str, asyncio.Task[None]] = {}
@@ -337,6 +338,8 @@ class VoiceReviewCoordinator:
             return
         outcome = "cancelled" if running.cancelled else "failed" if running.failure else "finished"
         self._store.finish_review(conversation_id, review_id, outcome)
+        if outcome == "finished":
+            self._on_finished()
         _marker({"outcome": outcome, "version": 1})
 
     async def _build_parent_owned(self, key: tuple[str, int], session_id: str) -> Any:

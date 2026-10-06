@@ -102,6 +102,7 @@ from hermes_realtime.integration import (
     HermesRestartSettlement,
 )
 from hermes_realtime.integration.voice_archive import VoiceArchiveSender, bridge_connector
+from hermes_realtime.integration.voice_memory import VoiceMemoryReceiver, memory_connector
 from hermes_realtime.integration.voice_review import (
     VoiceReviewSender,
     review_connector,
@@ -2126,6 +2127,17 @@ def build_local_host_launcher(
     context = ConversationContextStore(
         on_change=voice_tail_writer.update if voice_tail_writer is not None else None,
     )
+    voice_memory_receiver = (
+        VoiceMemoryReceiver(
+            context,
+            memory_connector(
+                host="127.0.0.1", port=voice_companion.port, token=voice_companion.token
+            ),
+            binding=lambda: voice_tail_writer.binding,
+        )
+        if voice_tail_writer is not None and voice_companion is not None
+        else None
+    )
     restart_announcement: str | None = None
     foreground = ForegroundTurnCoordinator(
         drain_timeout=10.0,
@@ -2650,6 +2662,8 @@ def build_local_host_launcher(
             voice_archive_sender.start()
         if voice_review_sender is not None:
             voice_review_sender.start()
+        if voice_memory_receiver is not None:
+            voice_memory_receiver.start()
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2760,6 +2774,7 @@ def build_local_host_launcher(
         providers=(
             readiness_cue_tasks,
             work_close_owner,
+            *((voice_memory_receiver,) if voice_memory_receiver is not None else ()),
             # After the runtime closed actions and speech, so the final flag is written.
             # Before the tail, so no acknowledgment races its final write.
             *((voice_archive_sender,) if voice_archive_sender is not None else ()),

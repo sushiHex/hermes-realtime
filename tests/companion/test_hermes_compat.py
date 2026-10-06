@@ -447,7 +447,7 @@ def test_importing_the_compat_module_does_not_import_hermes() -> None:
             imported.update(alias.name.split(".")[0] for alias in node.names)
     assert imported == {
         "__future__", "contextlib", "copy", "hashlib", "importlib", "inspect",
-        "json", "pathlib", "threading", "time", "typing",
+        "json", "os", "pathlib", "stat", "threading", "time", "typing",
         "hermes_realtime",
     }
 
@@ -475,7 +475,8 @@ def test_every_hermes_attribute_the_module_uses_is_on_the_surface() -> None:
             assert isinstance(argument, ast.Constant), "surface names must be literals"
             used.add(argument.value)
     pinned_parent_methods = {
-        "run_agent.AIAgent._safe_print", "run_agent.AIAgent._emit_auxiliary_failure"
+        "run_agent.AIAgent._safe_print", "run_agent.AIAgent._emit_auxiliary_failure",
+        "tools.memory_tool.MemoryStore.__init__",
     }
     assert used | hermes_compat.REVIEW_INSTANCE_FIELDS | pinned_parent_methods == {
         entry.name for entry in SURFACE

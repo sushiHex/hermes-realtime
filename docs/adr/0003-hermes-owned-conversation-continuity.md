@@ -691,10 +691,12 @@ Withdrawn by the 2026-09-25 amendment:
      generation. Criteria 1 and 4.
    - **M2, review.** The review parent, admission, windows, trigger, and execution boundary.
      Criteria 6, 7, 8, 9, and 11.
-   - **M3, forget.** Criterion 10.
    - **M4, memory readback.** A model-free bridge read returns fresh, bounded built-in memory
      for the foreground's context snapshot, under the same profile binding. M4 qualifies the
-     realtime foreground applying what Hermes learned.
+     realtime foreground applying what Hermes learned. Criteria 13–18. M4 precedes M3 because
+     recall across days is the visible MVP promise and readback changes foreground context
+     and latency; M3 stays within the companion.
+   - **M3, forget.** Criterion 10.
 
 The upstream route is not on this path. Proposing it stays worthwhile; adopting it is a
 separate change.
@@ -755,6 +757,29 @@ The companion's milestones must meet these criteria:
     enumerated name or the whitelist set is mutated. Every relied-on check has negative
     evidence, including wrong-profile credentials or store, a lifecycle reload, and missing
     admission evidence. The equivalence and fingerprint fixtures pass.
+13. **Memory recall.** A correction persisted by M2 review appears in the next conversation's
+    foreground snapshot, including after a host restart and a simulated gap exceeding 24
+    hours. Qualify against real pinned Hermes with a declared stand-in model.
+14. **Memory freshness.** The conversation-open snapshot reflects every review finished
+    before that read. Refresh at conversation open and after each review reports finished,
+    without polling. Turns use the latest available snapshot and never wait for a read.
+15. **Memory isolation.** Only the bound profile's built-in memory and user entries reach the
+    snapshot. Another profile's memory never appears. An absent, not-ready, or quarantined
+    companion supplies no memory; loss or change of binding clears the prior snapshot.
+16. **Memory latency.** There are zero memory reads on the turn path. Record the p95
+    turn-start delta against the baseline, with the measurement boundary and sample count.
+17. **Memory adds no authority.** With identical forced model behavior, admitted dispatches,
+    cancellations, and approvals with memory present equal those without memory. A memory
+    refresh alone starts zero foreground turns and zero tool calls. The model never grants
+    approval. Memory reaches the prompt only in its labelled data section, not instructions;
+    the conversation store remains I/O-free. This qualifies the boundary added by memory,
+    not model obedience: existing model-initiated natural routing is unchanged. Retain the
+    forced-tool probe as evidence of that existing boundary's limit; a deterministic boundary
+    for model-initiated dispatch and cancellation requires a separate decision.
+18. **Memory bounds.** Read through Hermes's own memory-store API, with its limits and a hard
+    cap. Oversized memory is truncated by a declared deterministic rule, never returned
+    unbounded. No model call or external memory provider participates. Unknown or partial
+    bridge capability supplies no memory while voice continues.
 
 Each guard follows the repository evidence rules: one bounded, content-free refusal marker, and
 one mutation per guard shown to fail alone.
