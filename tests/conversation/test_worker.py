@@ -2057,7 +2057,9 @@ async def test_media_activation_cannot_relabel_an_admitted_old_packet(
 
 
 @pytest.mark.asyncio
-async def test_readiness_cue_input_suppression_discards_pcm_until_exact_token_resumes() -> None:
+async def test_readiness_cue_input_suppression_discards_pcm_until_exact_token_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executor, _, _ = action_executor_probe()
     transcriber = CapturingTranscriber()
 
@@ -2080,6 +2082,15 @@ async def test_readiness_cue_input_suppression_discards_pcm_until_exact_token_re
     )
     generation = await worker.bind("browser_user")
     frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    typed: list[str] = []
+
+    async def capture_typed(_binding: ConversationSessionWorker, **kwargs: Any) -> None:
+        typed.append(kwargs["text"])
+
+    assert worker._binding is not None
+    monkeypatch.setattr(
+        worker._binding, "submit_final_transcript", MethodType(capture_typed, worker._binding)
+    )
 
     token = await worker.suppress_audio_input(
         participant_identity="browser_user",
@@ -2087,6 +2098,11 @@ async def test_readiness_cue_input_suppression_discards_pcm_until_exact_token_re
     )
     await worker.receive_audio("browser_user", generation, frame)
     assert transcriber.frames == []
+    await worker.submit_final_transcript(
+        participant_identity="browser_user", session_generation=generation,
+        typed_sequence=1, text="typed during readiness cue",
+    )
+    assert typed == ["typed during readiness cue"]
     assert await worker.resume_audio_input(object()) is False
     await worker.receive_audio("browser_user", generation, frame)
     assert transcriber.frames == []
@@ -2094,6 +2110,72 @@ async def test_readiness_cue_input_suppression_discards_pcm_until_exact_token_re
     assert await worker.resume_audio_input(token) is True
     await worker.receive_audio("browser_user", generation, frame)
     assert transcriber.frames == [frame]
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_input_suppression_blocks_typed_and_pcm_until_durable_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, _, _ = action_executor_probe()
+    transcriber = CapturingTranscriber()
+
+    def binding_factory(
+        participant_identity: str, generation: int, actions: ConversationUpdateExecutor
+    ) -> ConversationSessionWorker:
+        return ConversationSessionWorker(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            vad=ScriptedVad(VoiceActivity.SPEECH_STARTED),
+            stt=transcriber,
+            actions=actions,
+        )
+
+    worker = ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
+    generation = await worker.bind("browser_user")
+    typed: list[str] = []
+
+    async def capture_typed(_binding: ConversationSessionWorker, **kwargs: Any) -> None:
+        typed.append(kwargs["text"])
+
+    assert worker._binding is not None
+    monkeypatch.setattr(
+        worker._binding, "submit_final_transcript", MethodType(capture_typed, worker._binding)
+    )
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    token = await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=generation,
+        suppress_typed=True,
+    )
+    await worker.receive_audio("browser_user", generation, frame)
+    with pytest.raises(RuntimeError, match="input is suppressed"):
+        await worker.submit_final_transcript(
+            participant_identity="browser_user", session_generation=generation,
+            typed_sequence=1, text="typed before durable clear",
+        )
+    assert typed == []
+    assert transcriber.frames == []
+    assert worker.release_suppressed_input_after_clear(object()) is False
+    assert worker.release_suppressed_input_after_clear(token) is True
+    await worker.submit_final_transcript(
+        participant_identity="browser_user", session_generation=generation,
+        typed_sequence=1, text="typed after durable clear",
+    )
+    await worker.receive_audio("browser_user", generation, frame)
+    assert typed == ["typed after durable clear"]
+    assert transcriber.frames == [frame]
+    stale_token = await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=generation,
+        suppress_typed=True,
+    )
+    next_generation = await worker.bind("browser_user")
+    next_token = await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=next_generation,
+        suppress_typed=True,
+    )
+    assert worker.release_suppressed_input_after_clear(stale_token) is False
+    assert await worker.resume_audio_input(stale_token) is False
+    assert worker.release_suppressed_input_after_clear(next_token) is True
     await worker.close()
 
 

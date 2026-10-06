@@ -1199,7 +1199,7 @@ class ReconnectSafeConversationWorker:
         self._media_track_name: str | None = None
         self._binding: ConversationSessionWorker | None = None
         self._generation = 0
-        self._audio_input_suppression: tuple[int, str, object] | None = None
+        self._audio_input_suppression: tuple[int, str, object, bool] | None = None
         self._binding_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
         self._closed = False
@@ -1317,13 +1317,16 @@ class ReconnectSafeConversationWorker:
         *,
         participant_identity: str,
         session_generation: int,
+        suppress_typed: bool = False,
     ) -> object:
-        """Discard exact-session PCM until the returned authority token resumes it."""
+        """Fence exact-session input until the returned authority token resumes it."""
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
         if type(session_generation) is not int:
             raise TypeError("session_generation must be an exact integer")
+        if type(suppress_typed) is not bool:
+            raise TypeError("suppress_typed must be an exact boolean")
         async with self._binding_lock:
             binding = self._binding
             if (
@@ -1340,11 +1343,12 @@ class ReconnectSafeConversationWorker:
                 session_generation,
                 participant_identity,
                 token,
+                suppress_typed,
             )
             return token
 
     async def resume_audio_input(self, token: object) -> bool:
-        """Resume PCM only for the exact current suppression token."""
+        """Resume input only for the exact current suppression token."""
 
         async with self._binding_lock:
             suppression = self._audio_input_suppression
@@ -1352,6 +1356,15 @@ class ReconnectSafeConversationWorker:
                 return False
             self._audio_input_suppression = None
             return True
+
+    def release_suppressed_input_after_clear(self, token: object) -> bool:
+        """Release a durable clear's exact lease without yielding past new input."""
+
+        suppression = self._audio_input_suppression
+        if suppression is None or suppression[2] is not token:
+            return False
+        self._audio_input_suppression = None
+        return True
 
     async def receive_audio(
         self,
@@ -1404,6 +1417,14 @@ class ReconnectSafeConversationWorker:
             binding = self._binding
             if binding is None or session_generation != self._generation:
                 raise RuntimeError("typed input belongs to a stale session generation")
+            suppression = self._audio_input_suppression
+            if (
+                suppression is not None
+                and suppression[3]
+                and suppression[0] == session_generation
+                and suppression[1] == participant_identity
+            ):
+                raise RuntimeError("typed input is suppressed")
         await binding.submit_final_transcript(
             participant_identity=participant_identity,
             session_generation=session_generation,

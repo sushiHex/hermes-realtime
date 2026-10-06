@@ -2591,11 +2591,13 @@ def build_local_host_launcher(
             raise PermissionError("delete does not own the active worker generation")
         if writer.pending_forget is not None:
             return "pending"
+        old_binding = writer.binding
         reservation = projection.reserve_voice_clear()
         reservation_owned = True
+        input_release_owned = True
 
         def on_durable_clear() -> None:
-            nonlocal reservation_owned
+            nonlocal reservation_owned, input_release_owned
             if voice_memory_receiver is not None:
                 try:
                     voice_memory_receiver.start()
@@ -2608,12 +2610,20 @@ def build_local_host_launcher(
                     projection.release_voice_clear(reservation)
             except Exception:
                 _LOGGER.warning("voice delete clear projection failed")
+                return
             reservation_owned = False
+            try:
+                conversation.release_suppressed_input_after_clear(token)
+            except Exception:
+                _LOGGER.warning("voice delete input release failed")
+                return
+            input_release_owned = False
 
         try:
             token = await conversation.suppress_audio_input(
                 participant_identity=participant_identity,
                 session_generation=generation,
+                suppress_typed=True,
             )
         except BaseException:
             projection.release_voice_clear(reservation)
@@ -2630,12 +2640,15 @@ def build_local_host_launcher(
                 await writer.request_forget(context, on_durable_clear=on_durable_clear)
             return "complete" if writer.forget_complete else "pending"
         finally:
-            if reservation_owned and writer.pending_forget is None:
+            # A canceled caller cannot release either authority after the writer rotates.
+            # Its one-shot durable callback still owns the clear and input lease.
+            if reservation_owned and writer.binding == old_binding:
                 try:
                     projection.release_voice_clear(reservation)
                 except RuntimeError:
                     _LOGGER.warning("voice delete clear reservation release failed")
-            await conversation.resume_audio_input(token)
+            if input_release_owned and writer.binding == old_binding:
+                await conversation.resume_audio_input(token)
 
     def voice_delete_status() -> str:
         writer = voice_tail_writer
