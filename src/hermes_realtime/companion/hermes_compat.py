@@ -896,7 +896,7 @@ class HermesArchivePort:
     def _bounded_memory_source(
         path: Path,
     ) -> tuple[bytes, tuple[int, int, int, int]] | None:
-        """Read only a bounded prefix of one regular file and bind it to its identity."""
+        """Read a bounded tail of one regular file and bind it to its identity."""
 
         try:
             before = path.lstat()
@@ -906,6 +906,7 @@ class HermesArchivePort:
             raise ArchiveRefusal("configuration")
         with path.open("rb") as source:
             opened = os.fstat(source.fileno())
+            source.seek(max(0, before.st_size - (_MEMORY_FILE_BYTES + 1)))
             raw = source.read(_MEMORY_FILE_BYTES + 1)
         after = path.lstat()
         def identity(value: os.stat_result) -> tuple[int, int, int, int]:
@@ -920,33 +921,42 @@ class HermesArchivePort:
         return raw, identity(after)
 
     @staticmethod
-    def _memory_text(raw: bytes) -> tuple[str, bool]:
-        truncated = len(raw) > _MEMORY_FILE_BYTES
-        prefix = raw[:_MEMORY_FILE_BYTES]
+    def _memory_text(raw: bytes, source_size: int) -> tuple[str, bool, bool]:
+        truncated = source_size > _MEMORY_FILE_BYTES
+        partial_start = source_size > len(raw)
+        if partial_start:
+            # A tail read can start inside one UTF-8 character. Discard only
+            # continuation bytes at that boundary; malformed interior data
+            # still fails strict decoding.
+            skip = 0
+            while skip < 3 and skip < len(raw) and 0x80 <= raw[skip] <= 0xBF:
+                skip += 1
+            raw = raw[skip:]
         try:
-            return prefix.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"), truncated
-        except UnicodeDecodeError as error:
-            if not (
-                truncated
-                and error.reason == "unexpected end of data"
-                and error.end == len(prefix)
-            ):
-                raise ArchiveRefusal("configuration") from None
-            return (
-                prefix[:error.start].decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"),
-                True,
-            )
+            text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeDecodeError:
+            raise ArchiveRefusal("configuration") from None
+        return text, truncated, partial_start
 
     @staticmethod
     def _native_memory_block(
         store: Any, target: str, filename: str, raw: bytes,
-        char_limit: int, delimiter: str,
+        char_limit: int, delimiter: str, source_size: int,
     ) -> tuple[str, bool]:
-        text, source_truncated = HermesArchivePort._memory_text(raw)
+        text, source_truncated, partial_start = HermesArchivePort._memory_text(
+            raw, source_size
+        )
+        if partial_start:
+            # The first native entry may be a fragment of the file's prior
+            # entry. Start strictly after the first whole delimiter.
+            boundary = text.find(delimiter)
+            text = text[boundary + len(delimiter):] if boundary >= 0 else ""
         entries = resolve("tools.memory_tool.MemoryStore._parse_entries")(text)
         if type(entries) is not list or any(type(entry) is not str for entry in entries):
             raise ArchiveRefusal("incompatible")
-        unique = list(dict.fromkeys(entries))
+        # The reader favors the latest occurrence when an older duplicate
+        # would otherwise consume the suffix budget.
+        unique = list(dict.fromkeys(reversed(entries)))[::-1]
         sanitized = resolve("tools.memory_tool.MemoryStore._sanitize_entries_for_snapshot")(
             unique, filename
         )
@@ -964,12 +974,17 @@ class HermesArchivePort:
             truncated = True
         if char_limit < len(_MEMORY_TRUNCATED_MARKER):
             raise ArchiveRefusal("configuration")
-        high = min(len(content), char_limit - len(_MEMORY_TRUNCATED_MARKER))
+        high = len(sanitized)
         best: str | None = None
         low = 0
         while low <= high:
             middle = (low + high) // 2
-            block = render(store, target, [content[:middle] + _MEMORY_TRUNCATED_MARKER])
+            suffix = sanitized[-middle:] if middle else []
+            selected = [_MEMORY_TRUNCATED_MARKER, *suffix]
+            if len(delimiter.join(selected)) > char_limit:
+                high = middle - 1
+                continue
+            block = render(store, target, selected)
             if type(block) is not str:
                 raise ArchiveRefusal("incompatible")
             if len(block.encode("utf-8")) <= MEMORY_MAX_BLOCK_BYTES:
@@ -1048,7 +1063,7 @@ class HermesArchivePort:
                     block, cut = self._native_memory_block(
                         store, target, filename,
                         b"" if source is None else source[0],
-                        limit, delimiter,
+                        limit, delimiter, 0 if source is None else source[1][2],
                     )
                     blocks.append(block)
                     truncated = truncated or cut

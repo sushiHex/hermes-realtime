@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -118,31 +120,97 @@ def test_readback_omits_disabled_target(
     assert snapshot == BuiltinMemorySnapshot("memory:enabled", "")
 
 
-def test_readback_truncates_oversize_valid_prefix_and_keeps_byte_bound(
+def test_readback_truncates_oversize_source_to_newest_complete_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     memory_dir = tmp_path / "memories"
     memory_dir.mkdir()
-    (memory_dir / "MEMORY.md").write_bytes(b"A" * 20_000 + b"POISON beyond cap")
+    (memory_dir / "MEMORY.md").write_bytes(
+        b"A" * 20_000 + b"\n\xc2\xa7\nNewest correction: use violet."
+    )
     port, _, _ = _reader_port(monkeypatch, tmp_path)
     snapshot = port.read_builtin_memory()
     assert snapshot.truncated
-    assert snapshot.memory.startswith("memory:AAAA")
-    assert "POISON" not in snapshot.memory
-    assert "[truncated]" in snapshot.memory
+    assert snapshot.memory == "memory:[truncated]\n§\nNewest correction: use violet."
     assert len(snapshot.memory.encode("utf-8")) <= MEMORY_MAX_BLOCK_BYTES
 
 
-def test_readback_drops_only_incomplete_utf8_at_prefix_boundary(
+def test_readback_keeps_longest_suffix_of_whole_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(
+        "oldest-entry-is-long\n§\nmiddle\n§\nnewest", encoding="utf-8"
+    )
+    port, _, table = _reader_port(monkeypatch, tmp_path)
+    table["hermes_cli.config.load_config_readonly"] = lambda: {
+        "memory": {
+            "memory_char_limit": 29, "user_char_limit": 1375,
+            "memory_enabled": True, "user_profile_enabled": False,
+        }
+    }
+    snapshot = port.read_builtin_memory()
+    assert snapshot.memory == "memory:[truncated]\n§\nmiddle\n§\nnewest"
+    assert snapshot.truncated
+
+
+def test_readback_recent_duplicate_outweighs_old_occurrence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(
+        "repeat\n§\n" + "old" * 20 + "\n§\nrepeat", encoding="utf-8"
+    )
+    port, _, table = _reader_port(monkeypatch, tmp_path)
+    table["hermes_cli.config.load_config_readonly"] = lambda: {
+        "memory": {
+            "memory_char_limit": 30, "user_char_limit": 1375,
+            "memory_enabled": True, "user_profile_enabled": False,
+        }
+    }
+    snapshot = port.read_builtin_memory()
+    assert snapshot.memory == "memory:[truncated]\n§\nrepeat"
+
+
+def test_readback_refuses_incomplete_utf8_at_file_end(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     memory_dir = tmp_path / "memories"
     memory_dir.mkdir()
-    (memory_dir / "MEMORY.md").write_bytes(b"A" * (16_384 - 1) + "€".encode() + b"end")
+    (memory_dir / "MEMORY.md").write_bytes(b"A" * 20_000 + b"\xe2")
+    port, _, _ = _reader_port(monkeypatch, tmp_path)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port.read_builtin_memory()
+
+
+def test_readback_tail_utf8_boundary_preserves_newest_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    newest = "\n§\nLatest correction: café 🧭.".encode()
+    after_euro = b"B" * (16_383 - len(newest)) + newest
+    (memory_dir / "MEMORY.md").write_bytes(b"A" * 1_000 + "€".encode() + after_euro)
     port, _, _ = _reader_port(monkeypatch, tmp_path)
     snapshot = port.read_builtin_memory()
-    assert snapshot.truncated
+    assert snapshot.memory == "memory:[truncated]\n§\nLatest correction: café 🧭."
     assert "�" not in snapshot.memory
+
+
+def test_readback_discards_partial_first_native_entry_after_tail_seek(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text(
+        ("POISON" + "A" * 994) * 20 + "\n§\nNewest safe correction.",
+        encoding="utf-8",
+    )
+    port, _, _ = _reader_port(monkeypatch, tmp_path)
+    snapshot = port.read_builtin_memory()
+    assert snapshot.memory == "memory:[truncated]\n§\nNewest safe correction."
 
 
 def test_readback_refuses_interior_invalid_utf8(
@@ -166,6 +234,70 @@ def test_readback_refuses_wrong_memory_dir(
     table["tools.memory_tool.get_memory_dir"] = lambda: tmp_path.parent / "other"
     with pytest.raises(ArchiveRefusal, match="configuration"):
         port.read_builtin_memory()
+
+
+def test_readback_refuses_memory_directory_redirect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "bound"
+    home.mkdir()
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "MEMORY.md").write_text("Foreign preference.", encoding="utf-8")
+    memory_dir = home / "memories"
+    try:
+        memory_dir.symlink_to(foreign, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Windows without symlink privilege: model the same resolved-path
+        # mismatch while leaving a readable file for the removed-guard mutant.
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("Foreign preference.", encoding="utf-8")
+        original_resolve = Path.resolve
+
+        def redirected(self: Path, *args: Any, **kwargs: Any) -> Path:
+            if self == memory_dir:
+                return foreign
+            return original_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", redirected)
+    port, calls, _ = _reader_port(monkeypatch, home)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port.read_builtin_memory()
+    assert "parse" not in calls
+
+
+@pytest.mark.parametrize("symlink_on_first_check", (True, False))
+def test_readback_refuses_symlink_mode_at_each_file_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, symlink_on_first_check: bool,
+) -> None:
+    memory_dir = tmp_path / "memories"
+    memory_dir.mkdir()
+    memory_file = memory_dir / "MEMORY.md"
+    memory_file.write_text("Synthetic preference.", encoding="utf-8")
+    original_lstat = Path.lstat
+    actual = original_lstat(memory_file)
+    symlink_stat = SimpleNamespace(
+        st_mode=stat.S_IFLNK | 0o777,
+        st_dev=actual.st_dev, st_ino=actual.st_ino,
+        st_size=actual.st_size, st_mtime_ns=actual.st_mtime_ns,
+    )
+    checks = 0
+
+    def switched_mode(self: Path) -> Any:
+        nonlocal checks
+        result = original_lstat(self)
+        if self != memory_file:
+            return result
+        checks += 1
+        if (checks == 1) == symlink_on_first_check:
+            return symlink_stat
+        return result
+
+    monkeypatch.setattr(Path, "lstat", switched_mode)
+    port, calls, _ = _reader_port(monkeypatch, tmp_path)
+    with pytest.raises(ArchiveRefusal, match="configuration"):
+        port.read_builtin_memory()
+    assert "parse" not in calls
 
 
 def test_readback_refuses_native_home_mismatch(
@@ -242,7 +374,9 @@ def test_readback_native_char_limit_and_hard_byte_limit(
 ) -> None:
     memory_dir = tmp_path / "memories"
     memory_dir.mkdir()
-    (memory_dir / "MEMORY.md").write_text("€" * 1_500, encoding="utf-8")
+    (memory_dir / "MEMORY.md").write_text(
+        "€" * 1_500 + "\n§\nLatest correction: use bleu 🧭.", encoding="utf-8"
+    )
     port, _, table = _reader_port(monkeypatch, tmp_path)
     table["hermes_cli.config.load_config_readonly"] = lambda: {
         "memory": {
@@ -254,9 +388,10 @@ def test_readback_native_char_limit_and_hard_byte_limit(
     }
     snapshot = port.read_builtin_memory()
     assert snapshot.truncated
-    assert snapshot.memory.endswith("[truncated]")
+    assert snapshot.memory.startswith("memory:[truncated]\n§\n")
+    assert snapshot.memory.endswith("Latest correction: use bleu 🧭.")
     assert len(snapshot.memory.encode("utf-8")) <= MEMORY_MAX_BLOCK_BYTES
-    assert snapshot.memory.count("€") > 1_000
+    assert "€" not in snapshot.memory
 
 
 def test_readback_native_char_limit_even_when_byte_bound_fits(
@@ -264,7 +399,9 @@ def test_readback_native_char_limit_even_when_byte_bound_fits(
 ) -> None:
     memory_dir = tmp_path / "memories"
     memory_dir.mkdir()
-    (memory_dir / "MEMORY.md").write_bytes(b"A" * 200)
+    (memory_dir / "MEMORY.md").write_bytes(
+        b"A" * 200 + b"\n\xc2\xa7\nNewest correction."
+    )
     port, _, table = _reader_port(monkeypatch, tmp_path)
     table["hermes_cli.config.load_config_readonly"] = lambda: {
         "memory": {
@@ -276,7 +413,7 @@ def test_readback_native_char_limit_even_when_byte_bound_fits(
     }
     snapshot = port.read_builtin_memory()
     assert snapshot.truncated
-    assert snapshot.memory.endswith("[truncated]")
+    assert snapshot.memory == "memory:[truncated]\n§\nNewest correction."
     assert len(snapshot.memory.removeprefix("memory:")) <= 50
 
 
