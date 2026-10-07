@@ -2135,7 +2135,44 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
     monkeypatch.setattr(host_launcher_module, "bridge_connector", connector)
     monkeypatch.setattr(host_launcher_module, "review_connector", connector)
     monkeypatch.setattr(host_launcher_module, "memory_connector", connector)
+    monkeypatch.setattr(host_launcher_module, "forget_connector", _pending_forget_connector)
     return connectors
+
+
+async def _negotiated(harness: Any) -> None:
+    """Wait until the forget sender's link has negotiated ``voice_forget``."""
+    async with asyncio.timeout(2):
+        while harness.browser["voice_delete_status"]() == "unavailable":
+            await asyncio.sleep(0.01)
+
+
+def _pending_forget_connector(*, host: str, port: int, token: str) -> object:
+    """A companion that negotiates ``voice_forget`` and keeps every delete pending."""
+    from hermes_realtime.protocol import (
+        VOICE_FORGET_CAPABILITY,
+        VoiceForgetAckEvent,
+        VoiceForgetEvent,
+    )
+
+    del host, port, token
+
+    class Link:
+        capabilities = frozenset({VOICE_FORGET_CAPABILITY})
+
+        async def forget(self, event: VoiceForgetEvent) -> VoiceForgetAckEvent:
+            return VoiceForgetAckEvent(
+                protocol_version="0.3", type="voice_forget_ack",
+                conversation_id=event.conversation_id, generation=event.generation,
+                state="pending",
+            )
+
+        async def close(self) -> None:
+            pass
+
+    async def connect() -> Link:
+        return Link()
+
+    return connect
 
 
 @pytest.mark.asyncio
@@ -2189,6 +2226,7 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
         harness.context.record_user_transcript(Transcript(text="old conversation", final=True))
         assert receivers
         receivers[0].fail_next_close = True
+        await _negotiated(harness)
         delete = harness.browser["delete_voice_conversation"]
         with pytest.raises(RuntimeError, match="memory shutdown failure"):
             await delete("browser_0123456789abcdef", 1)
@@ -2205,10 +2243,11 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
             "voice_conversation_cleared"
         ) == 1
         assert not projection._voice_clear_reservations
+        # The pending delete never blocks the next one; the new conversation is cleared too.
         assert await delete("browser_0123456789abcdef", 1) == "pending"
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
-        ) == 1
+        ) == 2
     finally:
         await launcher.close()
 
@@ -2278,7 +2317,7 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
 
         async def delayed_write(data: bytes) -> None:
             if (
-                writer.pending_forget is not None
+                writer.pending_deletes
                 and writer._written_version < writer._forget_version
             ):
                 entered.set()
@@ -2288,10 +2327,11 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
         writer._write = delayed_write
         projection = harness.browser["projection"]
         projection._capacity = len(projection._events) + 2
+        await _negotiated(harness)
         delete = harness.browser["delete_voice_conversation"]
         operation = asyncio.create_task(delete("browser_0123456789abcdef", 1))
         await asyncio.wait_for(entered.wait(), 2)
-        assert writer.pending_forget is not None
+        assert writer.pending_deletes
         projection.publish("notification_queued", {})
         assert projection.publish_advisory("playback_silenced", {}) is None
         operation.cancel()
@@ -2334,6 +2374,270 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
             ]
     finally:
         release.set()
+        await launcher.close()
+
+
+def _forget_connector_offering(capabilities: frozenset[str], state: str) -> object:
+    from hermes_realtime.protocol import VoiceForgetAckEvent, VoiceForgetEvent
+
+    def connector(*, host: str, port: int, token: str) -> object:
+        del host, port, token
+
+        class Link:
+            def __init__(self) -> None:
+                self.capabilities = capabilities
+
+            async def forget(self, event: VoiceForgetEvent) -> VoiceForgetAckEvent:
+                return VoiceForgetAckEvent(
+                    protocol_version="0.3", type="voice_forget_ack",
+                    conversation_id=event.conversation_id, generation=event.generation,
+                    state=state,
+                )
+
+            async def close(self) -> None:
+                pass
+
+        async def connect() -> Link:
+            return Link()
+
+        return connect
+
+    return connector
+
+
+class _DeleteConversationStub:
+    def __init__(self, **_kwargs: Any) -> None:
+        pass
+
+    async def suppress_audio_input(self, **_kwargs: Any) -> object:
+        return object()
+
+    async def quiesce_for_delete(self, **_kwargs: Any) -> None:
+        pass
+
+    async def resume_audio_input(self, _token: object) -> bool:
+        return True
+
+    def release_suppressed_input_after_clear(self, _token: object) -> bool:
+        return True
+
+
+@pytest.mark.asyncio
+async def test_voice_delete_is_offered_only_when_voice_forget_is_negotiated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    connected = asyncio.Event()
+    without = _forget_connector_offering(frozenset({"voice_archive"}), "complete")
+
+    def observed(**kwargs: Any) -> Any:
+        connect = without(**kwargs)  # type: ignore[operator]
+
+        async def wrapped() -> Any:
+            connected.set()
+            return await connect()
+
+        return wrapped
+
+    monkeypatch.setattr(host_launcher_module, "forget_connector", observed)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        assert harness.context is not None
+        harness.context.record_user_transcript(Transcript(text="kept", final=True))
+        await asyncio.wait_for(connected.wait(), 2)
+        assert harness.browser["voice_delete_status"]() == "unavailable"
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await harness.browser["delete_voice_conversation"]("browser_0123456789abcdef", 1)
+        assert harness.context.snapshot().messages
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_delete_reads_pending_even_without_a_capable_link(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module,
+        "forget_connector",
+        _forget_connector_offering(frozenset({"voice_archive"}), "complete"),
+    )
+    (tmp_path / "voice-tail-v1.deletes.json").write_bytes(
+        voice_deletes_bytes(VoiceDeletes(pending=(("old", 0),)))
+    )
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        assert harness.browser["voice_delete_status"]() == "pending"
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_a_completed_delete_is_not_reported_for_an_unrelated_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    # A delete completed, then the tail was lost: the fresh conversation did not replace it.
+    (tmp_path / "voice-tail-v1.deletes.json").write_bytes(
+        voice_deletes_bytes(VoiceDeletes(outcome=("old", 0)))
+    )
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        assert harness.browser["voice_delete_status"]() == "idle"
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_voice_delete_reports_pending_then_complete_for_the_replaced_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    from hermes_realtime.protocol import VOICE_FORGET_CAPABILITY
+
+    monkeypatch.setattr(
+        host_launcher_module,
+        "forget_connector",
+        _forget_connector_offering(frozenset({VOICE_FORGET_CAPABILITY}), "complete"),
+    )
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        status = harness.browser["voice_delete_status"]
+        assert status() == "idle"
+        assert await harness.browser["delete_voice_conversation"](
+            "browser_0123456789abcdef", 1
+        ) in {"pending", "complete"}
+        async with asyncio.timeout(2):
+            while status() != "complete":
+                await asyncio.sleep(0.01)
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_voice_delete_is_unavailable_while_evidence_capture_keeps_a_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+    senders: list[Any] = []
+
+    class RecordingForgetSender(host_launcher_module.VoiceForgetSender):  # type: ignore[misc]
+        def start(self) -> None:
+            senders.append(self)
+            super().start()
+
+    monkeypatch.setattr(host_launcher_module, "VoiceForgetSender", RecordingForgetSender)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(
+        voice_tail=tmp_path / "voice-tail-v1.json",
+        voice_companion=endpoint,
+        evidence_capture=True,
+        evidence_database=tmp_path / "capture-v1.sqlite3",
+    )
+    await launcher.start()
+    try:
+        # The companion does offer voice_forget; only the spool's copy withholds the control.
+        async with asyncio.timeout(2):
+            while not senders[0].negotiated:
+                await asyncio.sleep(0.01)
+        assert harness.browser["voice_delete_status"]() == "unavailable"
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await harness.browser["delete_voice_conversation"]("browser_0123456789abcdef", 1)
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_delete_record_reports_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    (tmp_path / "voice-tail-v1.deletes.json").write_bytes(b"garbage")
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        assert harness.browser["voice_delete_status"]() == "unknown"
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_delete_restarts_the_memory_receiver_it_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+
+    async def refused(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        raise RuntimeError("synthetic delete refusal")
+
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        assert harness.context is not None
+        writer = harness.context._on_change.__self__  # type: ignore[union-attr]
+        monkeypatch.setattr(writer, "request_forget", refused)
+        with pytest.raises(RuntimeError, match="synthetic delete refusal"):
+            await harness.browser["delete_voice_conversation"]("browser_0123456789abcdef", 1)
+        assert harness.events.count("memory:close") == 1
+        assert harness.events.count("memory:start") == 2
+    finally:
         await launcher.close()
 
 

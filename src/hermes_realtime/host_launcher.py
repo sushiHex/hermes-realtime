@@ -2589,12 +2589,13 @@ def build_local_host_launcher(
             raise RuntimeError("voice delete is unavailable")
         if livekit_worker.active_generation != generation:
             raise PermissionError("delete does not own the active worker generation")
-        if writer.pending_forget is not None:
-            return "pending"
+        if not voice_delete_offered():
+            raise RuntimeError("voice delete is unavailable")
         old_binding = writer.binding
         reservation = projection.reserve_voice_clear()
         reservation_owned = True
         input_release_owned = True
+        memory_closed = False
 
         def on_durable_clear() -> None:
             nonlocal reservation_owned, input_release_owned
@@ -2636,12 +2637,21 @@ def build_local_host_launcher(
                 )
                 await speech.cancel_for_binding_close()
                 if voice_memory_receiver is not None:
+                    # A failed close leaves the receiver running, so it needs no restart.
                     await voice_memory_receiver.close()
+                    memory_closed = True
                 await writer.request_forget(context, on_durable_clear=on_durable_clear)
-            return "complete" if writer.forget_complete else "pending"
+            settled = old_binding not in writer.pending_deletes
+            return "complete" if settled and writer.delete_outcome == old_binding else "pending"
         finally:
             # A canceled caller cannot release either authority after the writer rotates.
             # Its one-shot durable callback still owns the clear and input lease.
+            if memory_closed and writer.binding == old_binding:
+                assert voice_memory_receiver is not None
+                try:
+                    voice_memory_receiver.start()
+                except Exception:
+                    _LOGGER.warning("voice memory restart after a failed delete failed")
             if reservation_owned and writer.binding == old_binding:
                 try:
                     projection.release_voice_clear(reservation)
@@ -2650,13 +2660,27 @@ def build_local_host_launcher(
             if input_release_owned and writer.binding == old_binding:
                 await conversation.resume_audio_input(token)
 
+    def voice_delete_offered() -> bool:
+        # The evidence spool keeps its own copy, which only revoking consent erases.
+        return (
+            voice_forget_sender is not None
+            and voice_forget_sender.negotiated
+            and not evidence_capture
+        )
+
     def voice_delete_status() -> str:
         writer = voice_tail_writer
         if writer is None or voice_forget_sender is None:
             raise RuntimeError("voice delete is unavailable")
-        if writer.pending_forget is not None:
+        # A recorded delete stays pending whatever the link does; it resumes on reconnect.
+        if writer.pending_deletes:
             return "pending"
-        return "complete" if writer.forget_complete else "idle"
+        if not voice_delete_offered():
+            return "unavailable"
+        if writer.delete_outcome == "unknown":
+            return "unknown"
+        # Complete names only the conversation the current one replaced.
+        return "complete" if writer.deleted_previous else "idle"
 
     runtime = BrowserClientRuntime(
         connection=connection,
