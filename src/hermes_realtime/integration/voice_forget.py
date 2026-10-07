@@ -57,9 +57,10 @@ def _marker(evidence: dict[str, str | int]) -> None:
 class VoiceForgetSender:
     """Resend every persisted delete, unchanged, until each has an exact complete ack.
 
-    The link is held open while idle, so ``negotiated`` reports whether the companion
-    offers ``voice_forget`` now, not whether it did at the last delete. Each round sends
-    every pending delete, so one that stays pending never holds up a later one.
+    The link is held open while idle, so ``negotiated`` reports the held link, not the
+    last delete. The bridge is request and reply, so a link the companion dropped while
+    idle is noticed, and replaced, only at its next use. Each round sends every pending
+    delete, so one that stays pending never holds up a later one.
     """
 
     def __init__(
@@ -95,9 +96,11 @@ class VoiceForgetSender:
 
     @property
     def negotiated(self) -> bool:
-        """Whether a live link to the companion negotiated ``voice_forget``.
+        """Whether the held link to the companion negotiated ``voice_forget``.
 
         Only a link that offers the capability is ever held, so holding one is the answer.
+        A link dropped while idle still counts until its next use fails; a delete then
+        stays pending, never complete, until a capable companion verifies it.
         """
         return self._link is not None
 

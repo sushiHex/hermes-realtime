@@ -290,13 +290,18 @@ holds its companion link open and resends every pending delete each round, so on
 pending never blocks a later delete. The browser status is one of:
 
 - `pending`: at least one recorded delete is not yet verified, whatever the link's state;
-- `unavailable`: the live link has not negotiated `voice_forget`, or evidence capture is on;
+- `unavailable`: no held link has negotiated `voice_forget`, or evidence capture is on. The
+  bridge is request and reply, so a link the companion dropped while idle still counts until
+  its next use fails; a delete made in that window stays `pending`, never `complete`, until a
+  capable companion verifies it;
 - `unknown`: an earlier delete record could not be read, so its outcome is not known;
 - `complete`: the last verified delete is the conversation the current one replaced;
 - `idle`: none of the above; the control is offered and there is no delete to report.
 
 The control is offered whenever the status is not `unavailable`, including while a delete is
-pending.
+pending. `pending` wins over `unavailable`, so while a delete is pending and no capable link
+is held, the host refuses a further delete before clearing anything and the browser re-reads
+the status.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler
 runs on the tombstone, natural review-thread completion and owned startup. An admitted or
