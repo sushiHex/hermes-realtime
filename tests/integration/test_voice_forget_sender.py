@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from hermes_realtime.conversation import (
     ConversationMessage,
     DurableConversation,
 )
+from hermes_realtime.integration import voice_tail as voice_tail_module
 from hermes_realtime.integration.voice_archive import VoiceArchiveSender
 from hermes_realtime.integration.voice_forget import VoiceForgetSender
 from hermes_realtime.integration.voice_tail import VoiceTailWriter
@@ -37,7 +39,7 @@ async def test_delete_intent_is_durable_and_stale_archive_ack_is_fenced(tmp_path
 
     assert old == ("old", 0)
     assert writer.binding == ("new", 1)
-    assert writer.pending_forget == old
+    assert writer.pending_deletes == (old,)
     assert context.snapshot().messages == ()
     assert not writer.acknowledge(*(
         batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
@@ -48,9 +50,9 @@ async def test_delete_intent_is_durable_and_stale_archive_ack_is_fenced(tmp_path
     restored_context = ConversationContextStore(on_change=restored.update)
     await restored.open(restored_context)
     assert restored.binding == ("new", 1)
-    assert restored.pending_forget == old
+    assert restored.pending_deletes == (old,)
     assert restored_context.snapshot().messages == ()
-    assert await asyncio.wait_for(restored.next_forget(), 2) == old
+    assert await asyncio.wait_for(restored.next_deletes(), 2) == (old,)
     assert restored.acknowledge_forget(old)
     await restored.close()
 
@@ -107,14 +109,82 @@ async def test_old_archive_refusal_cannot_fence_new_generation(tmp_path: Path) -
     await writer.close()
 
 @pytest.mark.asyncio
-async def test_a_second_delete_cannot_erase_unsettled_intent(tmp_path: Path) -> None:
-    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("a", "b")).__next__)
+async def test_a_stuck_delete_never_holds_up_a_later_one(tmp_path: Path) -> None:
+    writer = VoiceTailWriter(
+        tmp_path / "tail.json", conversation_ids=iter(("a", "b", "c")).__next__
+    )
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
-    await writer.request_forget(context)
-    with pytest.raises(RuntimeError, match="pending"):
-        await writer.request_forget(context)
-    assert writer.pending_forget == ("a", 0)
+    stuck = await writer.request_forget(context)
+    later = await writer.request_forget(context)
+
+    class Link:
+        capabilities = frozenset({VOICE_FORGET_CAPABILITY})
+
+        async def forget(self, event: VoiceForgetEvent) -> VoiceForgetAckEvent:
+            return VoiceForgetAckEvent(
+                protocol_version="0.3", type="voice_forget_ack",
+                conversation_id=event.conversation_id, generation=event.generation,
+                state="pending" if event.conversation_id == "a" else "complete",
+            )
+
+        async def close(self) -> None:
+            pass
+
+    async def connect() -> Link:
+        return Link()
+
+    sender = VoiceForgetSender(
+        writer, connect, initial_backoff_seconds=0.01, max_backoff_seconds=0.01
+    )
+    sender.start()
+    async with asyncio.timeout(2):
+        while later in writer.pending_deletes:
+            await asyncio.sleep(0.01)
+    assert writer.pending_deletes == (stuck,)
+    assert sender.negotiated
+    await sender.close()
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_the_sender_reports_negotiation_only_from_a_live_capable_link(
+    tmp_path: Path,
+) -> None:
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "a")
+    context = ConversationContextStore(on_change=writer.update)
+    await writer.open(context)
+    capabilities: frozenset[str] = frozenset({"voice_archive"})
+    connected = asyncio.Event()
+
+    class Link:
+        def __init__(self) -> None:
+            self.capabilities = capabilities
+
+        async def forget(self, event: VoiceForgetEvent) -> VoiceForgetAckEvent:
+            raise AssertionError("no delete is pending")
+
+        async def close(self) -> None:
+            pass
+
+    async def connect() -> Link:
+        connected.set()
+        return Link()
+
+    sender = VoiceForgetSender(
+        writer, connect, initial_backoff_seconds=0.01, max_backoff_seconds=0.01
+    )
+    assert not sender.negotiated
+    sender.start()
+    await asyncio.wait_for(connected.wait(), 2)
+    await asyncio.sleep(0.05)
+    assert not sender.negotiated
+    capabilities = frozenset({VOICE_FORGET_CAPABILITY})
+    async with asyncio.timeout(2):
+        while not sender.negotiated:
+            await asyncio.sleep(0.01)
+    await sender.close()
+    assert not sender.negotiated
     await writer.close()
 
 
@@ -153,7 +223,7 @@ async def test_sender_retains_pending_until_exact_complete(tmp_path: Path) -> No
     )
     sender.start()
     async with asyncio.timeout(2):
-        while writer.pending_forget is not None:
+        while writer.pending_deletes:
             await asyncio.sleep(0.01)
     assert len(requests) >= 3
     assert all((r.conversation_id, r.generation) == old for r in requests)
@@ -162,20 +232,24 @@ async def test_sender_retains_pending_until_exact_complete(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_sender_waits_for_durable_delete_intent(tmp_path: Path) -> None:
+async def test_sender_waits_for_durable_delete_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("a", "b")).__next__)
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    original_write = writer._write
+    entered = threading.Event()
+    release = threading.Event()
+    original_write = voice_tail_module.write_run_record
 
-    async def delayed_write(data: bytes) -> None:
-        entered.set()
-        await release.wait()
-        await original_write(data)
+    def delayed_write(path: Path, data: bytes) -> None:
+        # Only the delete record is held back; the sender must wait for exactly it.
+        if path.name == "tail.deletes.json":
+            entered.set()
+            release.wait(5)
+        original_write(path, data)
 
-    writer._write = delayed_write  # type: ignore[method-assign]
+    monkeypatch.setattr(voice_tail_module, "write_run_record", delayed_write)
     calls: list[VoiceForgetEvent] = []
 
     class Link:
@@ -198,14 +272,14 @@ async def test_sender_waits_for_durable_delete_intent(tmp_path: Path) -> None:
     sender = VoiceForgetSender(writer, connect, initial_backoff_seconds=0.01)
     sender.start()
     deletion = asyncio.create_task(writer.request_forget(context))
-    await asyncio.wait_for(entered.wait(), 2)
+    assert await asyncio.to_thread(entered.wait, 2)
     await asyncio.sleep(0.05)
     assert calls == []
     assert not deletion.done()
     release.set()
     await asyncio.wait_for(deletion, 2)
     async with asyncio.timeout(2):
-        while writer.pending_forget is not None:
+        while writer.pending_deletes:
             await asyncio.sleep(0.01)
     assert len(calls) == 1
     await sender.close()
@@ -262,7 +336,7 @@ async def test_cancelled_delete_request_still_publishes_durable_clear(tmp_path: 
         while not cleared:
             await asyncio.sleep(0.01)
     assert cleared == [("new", 1)]
-    assert writer.pending_forget == ("old", 0)
+    assert writer.pending_deletes == (("old", 0),)
     await writer.close()
 
 

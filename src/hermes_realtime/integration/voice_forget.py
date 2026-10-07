@@ -55,7 +55,12 @@ def _marker(evidence: dict[str, str | int]) -> None:
 
 
 class VoiceForgetSender:
-    """Resend an unchanged, persisted identity until an exact complete acknowledgment."""
+    """Resend every persisted delete, unchanged, until each has an exact complete ack.
+
+    The link is held open while idle, so ``negotiated`` reports whether the companion
+    offers ``voice_forget`` now, not whether it did at the last delete. Each round sends
+    every pending delete, so one that stays pending never holds up a later one.
+    """
 
     def __init__(
         self,
@@ -88,6 +93,14 @@ class VoiceForgetSender:
         self._link: VoiceForgetLink | None = None
         self._last_failure: str | None = None
 
+    @property
+    def negotiated(self) -> bool:
+        """Whether a live link to the companion negotiated ``voice_forget``.
+
+        Only a link that offers the capability is ever held, so holding one is the answer.
+        """
+        return self._link is not None
+
     def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("forget sender starts at most once")
@@ -109,41 +122,24 @@ class VoiceForgetSender:
     async def _run(self) -> None:
         backoff = self._initial_backoff
         while True:
-            conversation_id, generation = await self._writer.next_forget()
-            event = VoiceForgetEvent(
-                protocol_version="0.3",
-                type="voice_forget",
-                conversation_id=conversation_id,
-                generation=generation,
-            )
             try:
-                if self._link is None:
+                link = self._link
+                if link is None:
                     async with asyncio.timeout(self._timeout):
                         link = await self._connect()
                     if VOICE_FORGET_CAPABILITY not in link.capabilities:
-                        await link.close()
+                        with suppress(Exception):
+                            await link.close()
                         raise RuntimeError("forget capability unavailable")
                     self._link = link
-                async with asyncio.timeout(self._timeout):
-                    reply = await self._link.forget(event)
-                if (
-                    type(reply) not in (VoiceForgetAckEvent, VoiceForgetRefusedEvent)
-                    or (reply.conversation_id, reply.generation)
-                    != (conversation_id, generation)
-                ):
-                    raise RuntimeError("forget reply named another binding")
-                if type(reply) is VoiceForgetAckEvent and reply.state == "complete":
-                    if self._writer.acknowledge_forget((conversation_id, generation)):
-                        self._last_failure = None
-                        backoff = self._initial_backoff
-                        continue
-                    raise RuntimeError("forget intent changed before acknowledgment")
-                reason = "pending"
-                if type(reply) is VoiceForgetRefusedEvent:
-                    reason = reply.category
-                if self._last_failure != reason:
-                    _marker({"outcome": reason})
-                self._last_failure = reason
+                pending = await self._writer.next_deletes()
+                settled = 0
+                for binding in pending:
+                    settled += await self._settle(link, binding)
+                if settled == len(pending):
+                    self._last_failure = None
+                    backoff = self._initial_backoff
+                    continue
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -154,6 +150,33 @@ class VoiceForgetSender:
                 await self._drop()
             await self._sleep(backoff)
             backoff = min(backoff * 2, self._max_backoff)
+
+    async def _settle(self, link: VoiceForgetLink, binding: tuple[str, int]) -> bool:
+        """Send one delete; True once the companion verified it complete and it is settled."""
+
+        conversation_id, generation = binding
+        event = VoiceForgetEvent(
+            protocol_version="0.3",
+            type="voice_forget",
+            conversation_id=conversation_id,
+            generation=generation,
+        )
+        async with asyncio.timeout(self._timeout):
+            reply = await link.forget(event)
+        if (
+            type(reply) not in (VoiceForgetAckEvent, VoiceForgetRefusedEvent)
+            or (reply.conversation_id, reply.generation) != binding
+        ):
+            raise RuntimeError("forget reply named another binding")
+        if type(reply) is VoiceForgetAckEvent and reply.state == "complete":
+            if self._writer.acknowledge_forget(binding):
+                return True
+            raise RuntimeError("forget intent changed before acknowledgment")
+        reason = reply.category if type(reply) is VoiceForgetRefusedEvent else "pending"
+        if self._last_failure != reason:
+            _marker({"outcome": reason})
+        self._last_failure = reason
+        return False
 
 
 __all__ = ["VoiceForgetLink", "VoiceForgetSender", "forget_connector"]
