@@ -54,6 +54,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 from real_gate_support import (
     HERMES_BASELINE,
@@ -152,7 +153,9 @@ _DELETE_STATES = {
     "Connect to delete this voice conversation.": "disconnected",
 }
 _TERMINAL_TASK = frozenset({"completed", "failed", "interrupted", "rejected"})
+_ANSWERED_PATHS = frozenset({"/api/v1/input", "/api/v1/approval"})
 _REPLY_SECONDS = 180.0
+_APPROVAL_CARD_SECONDS = 120.0
 # An abandoned browser session holds the persistent front door until the host reaps it.
 _RECONNECT_SECONDS = 420.0
 # Decoded remote audio energy above which a reply was audible.
@@ -234,6 +237,30 @@ def route(body: object) -> tuple[str, str]:
     return ("text", "")
 
 
+def tool_outcome(body: object) -> str | None:
+    """What Hermes reported for the tool call this request answers, as a category.
+
+    Hermes itself writes the result of a command it was asked to approve: "denied" when the
+    user refused it, "blocked" when anything else stopped it, "ran" otherwise. None when the
+    request answers no tool call.
+    """
+
+    messages = body.get("messages") if type(body) is dict else None
+    if type(messages) is not list:
+        return None
+    users = [index for index, message in enumerate(messages) if _role(message) == "user"]
+    results = [
+        _text(message)
+        for message in messages[(users[-1] + 1 if users else 0) :]
+        if _role(message) == "tool"
+    ]
+    if not results:
+        return None
+    if "BLOCKED: User denied" in results[-1]:
+        return "denied"
+    return "blocked" if "BLOCKED" in results[-1] else "ran"
+
+
 def _role(message: object) -> object:
     return message.get("role") if type(message) is dict else None
 
@@ -249,6 +276,7 @@ class StandInModel:
         self.requests: Counter[str] = Counter()
         self.open: Counter[str] = Counter()
         self.started: Counter[str] = Counter()
+        self.tool_outcomes: Counter[str] = Counter()
         self._runner: Any = None
 
     async def start(self) -> str:
@@ -283,6 +311,9 @@ class StandInModel:
             return web.Response(status=400)
         kind, argument = route(body)
         self.requests[kind] += 1
+        outcome = tool_outcome(body)
+        if outcome is not None:
+            self.tool_outcomes[outcome] += 1
         stream = type(body) is dict and body.get("stream") is True
         if kind == "tool":
             return await self._answer(request, stream, tool=argument)
@@ -863,6 +894,15 @@ def cancel_work_verdict(open_after_cancel: int) -> list[Finding]:
     return [("fail", "work_left_running")] if open_after_cancel else []
 
 
+def page_input_verdict(name: str, status: int | None, witnessed: bool) -> list[Finding]:
+    """A typed turn or an approval decision, judged twice: by the server's status for it on
+    the wire, and by what came of it (a reply, or Hermes's own report of the refusal)."""
+
+    if status is None or not 200 <= status < 300:
+        return [("fail", f"{name}_refused")]
+    return [] if witnessed else [("fail", f"{name}_without_effect")]
+
+
 def audio_without_speech(
     timeline: list[tuple[float, float]],
     cue_at: float | None,
@@ -1319,6 +1359,9 @@ class Rehearsal:
         self.playwright: Any = None
         self.ready = {"gateway": False, "host": False, "browser": False}
         self.dialogs: Counter[str] = Counter()
+        # The server's status for every typed turn and approval decision the page sent, as
+        # the browser's network layer saw it, never as the page reported it.
+        self.answers: list[tuple[str, int]] = []
         self.deleted = False
         self.containment: Containment | None = None
         self._step: Step | None = None
@@ -1907,6 +1950,13 @@ class Rehearsal:
                 await dialog.dismiss()
 
         self.page.on("dialog", accept_delete)
+
+        def record_answer(response: Any) -> None:
+            path = urlsplit(response.url).path
+            if response.request.method == "POST" and path in _ANSWERED_PATHS:
+                self.answers.append((path, int(response.status)))
+
+        self.page.on("response", record_answer)
         await self.open_page()
         self.processes.observe()
         self.ready["browser"] = True
@@ -2097,6 +2147,10 @@ class Rehearsal:
             since = await self.mark()
             step.timings["stop_connect_to_listening_s"] = await self.connect()
             await self._after_reconnect(step, "stop_connect", since)
+            # Spend a typed turn and an approval decision in this session first: the reloaded
+            # page restarts both its counters, so the session behind it must restart them too.
+            await self._typed_round(step, "typed_before_reload")
+            await self._approval_round(step, "approval_before_reload")
             step.stage = "reload"
             await self.page.reload()
             await self.page.wait_for_load_state("networkidle")
@@ -2111,7 +2165,66 @@ class Rehearsal:
                     _RECONNECT_SECONDS
                 )
             await self._after_reconnect(step, "reload_connect", since)
+            await self._typed_round(step, "typed_after_reload")
+            await self._approval_round(step, "approval_after_reload")
             await self._context_check(step, "context_carried_over")
+
+    def _answer_since(self, mark: int, path: str) -> int | None:
+        statuses = [status for seen, status in self.answers[mark:] if seen == path]
+        return statuses[-1] if statuses else None
+
+    async def _typed_round(self, step: Step, name: str) -> None:
+        """One typed turn: the server's status for it on the wire, and the reply it drew."""
+
+        step.stage = name
+        before = await self.snapshot()
+        await self.mark()
+        mark = len(self.answers)
+        await self.type("Please answer in one short sentence: what is two plus two?")
+        replied = False
+        with contextlib.suppress(TimeoutError):
+            await self.reply(before)
+            replied = True
+        status = self._answer_since(mark, "/api/v1/input")
+        step.notes[f"{name}_status"] = status
+        step.notes[f"{name}_replied"] = replied
+        step.apply(page_input_verdict(name, status, replied))
+
+    async def _approval_round(self, step: Step, name: str) -> None:
+        """One task that needs approval, rejected from its card: the server's status for the
+        decision on the wire, and Hermes's own report to the model that the user denied it."""
+
+        step.stage = name
+        denied = self.stand_in.tool_outcomes["denied"]
+        before = await self.snapshot()
+        ids = {identity for identity, _ in before["tasks"]}
+        sent = time.monotonic()
+        await self.type(f"task: run chmod 777 rehearsal-{name.replace('_', '-')}-target")
+        card = self.page.locator(
+            "#transcript li[data-operation=approval][data-status=pending]"
+        ).last
+        try:
+            await card.wait_for(state="visible", timeout=_APPROVAL_CARD_SECONDS * 1000)
+        except Exception:
+            step.notes[f"{name}_card"] = False
+            step.fail(f"{name}_no_card")
+            return
+        step.notes[f"{name}_card"] = True
+        mark = len(self.answers)
+        await card.get_by_role("button", name="Reject").click()
+        task_id: str | None = None
+        sequence: list[str] = []
+        with contextlib.suppress(TimeoutError):
+            task_id, sequence = await self.track_task(ids, sent, step, _REPLY_SECONDS)
+        deadline = time.monotonic() + 30
+        while self.stand_in.tool_outcomes["denied"] == denied and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+        witnessed = self.stand_in.tool_outcomes["denied"] > denied
+        status = self._answer_since(mark, "/api/v1/approval")
+        step.notes[f"{name}_status"] = status
+        step.notes[f"{name}_denied_by_hermes"] = witnessed
+        step.notes[f"{name}_task_states"] = sequence
+        step.apply(page_input_verdict(name, status, witnessed))
 
     async def _after_reconnect(self, step: Step, name: str, since: float) -> None:
         """No stale audio and no duplicated transcript entries after a reconnect."""

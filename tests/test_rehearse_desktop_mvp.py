@@ -263,6 +263,33 @@ def test_context_and_work_verdicts() -> None:
     assert rehearsal.restart_work_verdict(1, 1, 1) == [("fail", "work_left_running")]
 
 
+def test_a_page_input_needs_both_the_wire_status_and_its_effect() -> None:
+    verdict = rehearsal.page_input_verdict
+    assert verdict("typed_after_reload", 200, True) == []
+    assert verdict("typed_after_reload", 503, True) == [("fail", "typed_after_reload_refused")]
+    assert verdict("typed_after_reload", 409, False) == [("fail", "typed_after_reload_refused")]
+    assert verdict("typed_after_reload", None, True) == [("fail", "typed_after_reload_refused")]
+    assert verdict("approval_after_reload", 204, False) == [
+        ("fail", "approval_after_reload_without_effect")
+    ]
+
+
+def test_the_stand_in_reads_the_hermes_verdict_on_its_tool_call() -> None:
+    def answered(content: str) -> dict[str, object]:
+        return _body("task: run chmod 777 x", after=[{"role": "tool", "content": content}])
+
+    outcome = rehearsal.tool_outcome
+    assert outcome(answered('{"error": "BLOCKED: User denied this command."}')) == "denied"
+    assert outcome(answered("BLOCKED: this command matches a deny rule")) == "blocked"
+    assert outcome(answered('{"output": "", "exit_code": 0}')) == "ran"
+    assert outcome(_body("task: run chmod 777 x")) is None
+    # Only a result after the last user turn answers this request.
+    stale = _body("again", after=[])
+    stale["messages"].insert(1, {"role": "tool", "content": "BLOCKED: User denied"})
+    assert outcome(stale) is None
+    assert outcome("not a request") is None
+
+
 def _frames(start: float, seconds: float, energy: float) -> list[tuple[float, float]]:
     return [(start + 50 * index, energy) for index in range(int(seconds * 20))]
 
@@ -390,6 +417,22 @@ def test_every_verdict_is_applied_where_it_is_observed() -> None:
     assert "self.quiet(step" in source["_after_reconnect"]
     assert source["reconnect"].count("self._after_reconnect(") == 2
     assert "self._context_check(" in source["reconnect"]
+    # The page's counters are spent before the reload and used again after it.
+    reconnect = source["reconnect"]
+    reload_at = reconnect.index("await self.page.reload()")
+    for round_call in (
+        'self._typed_round(step, "typed_before_reload")',
+        'self._approval_round(step, "approval_before_reload")',
+    ):
+        assert reconnect.index(round_call) < reload_at
+    for round_call in (
+        'self._typed_round(step, "typed_after_reload")',
+        'self._approval_round(step, "approval_after_reload")',
+    ):
+        assert reload_at < reconnect.index(round_call) < reconnect.index("self._context_check(")
+    for name in ("_typed_round", "_approval_round"):
+        method = inspect.getsource(getattr(rehearsal.Rehearsal, name))
+        assert "step.apply(page_input_verdict(" in method
     assert "step.apply(context_verdict(" in source["_context_check"]
     assert "restart_work_verdict(" in source["restart"]
     assert "self._context_check(" in source["restart"]
