@@ -103,6 +103,8 @@ _SEEDED_SOURCES = ("voice_tail", "hermes_database")
 _FRAME_ENERGY = 1e-6
 # The readiness cue is one short spoken chunk.
 _CUE_MAX_SECONDS = 2.0
+# How far from the page's voice-input confirmation the cue may start or end.
+_CUE_WINDOW_MS = 3000.0
 _MAX_MARKER_CHARS = 512
 _MAX_MARKERS = 32
 _NOTICE = re.compile(
@@ -874,8 +876,12 @@ def audio_without_speech(
     loud = [(at, energy) for at, energy in timeline if energy > _FRAME_ENERGY]
     cue: list[tuple[float, float]] = []
     if cue_at is not None:
+        # The host plays the cue when it confirms voice input, and the page learns of that
+        # confirmation at its next event poll, so the cue may start before the page's marker.
         window = [
-            (at, energy) for at, energy in loud if cue_at - 1000 <= at <= cue_at + 3000
+            (at, energy)
+            for at, energy in loud
+            if cue_at - _CUE_WINDOW_MS <= at <= cue_at + _CUE_WINDOW_MS
         ]
         contiguous = all(b[0] - a[0] <= 250 for a, b in zip(window, window[1:], strict=False))
         if window and contiguous and window[-1][0] - window[0][0] <= _CUE_MAX_SECONDS * 1000:
@@ -883,6 +889,7 @@ def audio_without_speech(
     unexcused = sum(energy for at, energy in loud if (at, energy) not in cue)
     notes: dict[str, object] = {
         "cue_seconds": round((cue[-1][0] - cue[0][0]) / 1000 + 0.05, 2) if cue else 0.0,
+        "first_sound_ms": round(loud[0][0] - cue_at) if loud and cue_at is not None else None,
         "unexcused_energy": round(unexcused, 6),
         "new_assistant_rows": new_assistant_rows,
     }

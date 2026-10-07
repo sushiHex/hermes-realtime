@@ -272,10 +272,22 @@ def test_only_the_identified_readiness_cue_is_excused() -> None:
     timeline = sorted(quiet + cue)
 
     assert rehearsal.audio_without_speech(timeline, 900.0, 0)[0] == []
+    # The page learns of the confirmation at its next poll, after the cue may have started.
+    assert rehearsal.audio_without_speech(timeline, 2500.0, 0)[0] == []
     # Without an identified cue, the same burst is stale.
     assert rehearsal.audio_without_speech(timeline, None, 0)[0] == [("differ", "stale_audio")]
     # A burst away from the confirmation is stale.
     assert rehearsal.audio_without_speech(sorted(quiet + cue + late), 900.0, 0)[0] == [
+        ("differ", "stale_audio")
+    ]
+    # A cue-sized burst far from the confirmation is not the cue.
+    far = _frames(8000, 1.0, 5e-4)
+    assert rehearsal.audio_without_speech(sorted(_frames(0, 10, 0.0) + far), 900.0, 0)[0] == [
+        ("differ", "stale_audio")
+    ]
+    # Two bursts are not one cue, however short together.
+    split = _frames(1000, 0.25, 5e-4) + _frames(1800, 0.25, 5e-4)
+    assert rehearsal.audio_without_speech(sorted(quiet + split), 900.0, 0)[0] == [
         ("differ", "stale_audio")
     ]
     # A burst longer than one cue is stale, even inside the window around the confirmation.
