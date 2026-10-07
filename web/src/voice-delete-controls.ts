@@ -1,9 +1,10 @@
-export type VoiceDeleteState = "unavailable" | "idle" | "pending" | "complete";
+export type VoiceDeleteState = "unavailable" | "idle" | "pending" | "complete" | "unknown";
 
 type Credential = { token: string; participantIdentity: string };
 type Path = "/api/v1/delete-voice-conversation" | "/api/v1/voice-delete-status";
 
-const LIMIT = "What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own session controls.";
+const STATES: readonly string[] = ["unavailable", "idle", "pending", "complete", "unknown"];
+const LIMIT = "What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own session controls. A copy made with Hermes /branch is a separate conversation: deletion stays pending until you delete that copy in Hermes.";
 
 export function parseVoiceDeleteState(value: unknown): VoiceDeleteState {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -14,7 +15,7 @@ export function parseVoiceDeleteState(value: unknown): VoiceDeleteState {
     Object.keys(data).sort().join(",") !== "state,version" ||
     data.version !== 1 ||
     typeof data.state !== "string" ||
-    !["unavailable", "idle", "pending", "complete"].includes(data.state)
+    !STATES.includes(data.state)
   ) {
     throw new TypeError("voice delete status is invalid");
   }
@@ -45,7 +46,8 @@ export class VoiceDeleteControls {
   }
 
   render(): void {
-    this.button.disabled = !this.options.connected() || !this.available || this.pending || this.inFlight;
+    // A pending delete never blocks the next one: the current conversation is a new one.
+    this.button.disabled = !this.options.connected() || !this.available || this.inFlight;
   }
 
   reset(): void {
@@ -65,7 +67,7 @@ export class VoiceDeleteControls {
 
   async delete(): Promise<void> {
     const credential = this.options.credential();
-    if (credential === null || !this.options.connected() || !this.available || this.pending || this.inFlight) return;
+    if (credential === null || !this.options.connected() || !this.available || this.inFlight) return;
     if (!this.options.confirm(`Delete this voice conversation? ${LIMIT}`)) return;
     const epoch = ++this.epoch;
     this.inFlight = true;
@@ -76,7 +78,7 @@ export class VoiceDeleteControls {
       const state = parseVoiceDeleteState(
         await this.options.request("/api/v1/delete-voice-conversation", credential.token),
       );
-      if (state === "idle" || state === "unavailable") throw new TypeError("delete did not start");
+      if (state !== "pending" && state !== "complete") throw new TypeError("delete did not start");
       if (
         this.epoch !== epoch ||
         this.options.credential()?.participantIdentity !== credential.participantIdentity ||
@@ -129,12 +131,14 @@ export class VoiceDeleteControls {
     this.pending = state === "pending";
     this.status.textContent =
       state === "unavailable"
-        ? "Voice conversation deletion is unavailable on this host."
+        ? "Voice conversation deletion is unavailable on this host. It needs the Hermes voice companion, and is off while evidence capture keeps its own copy (Revoke consent and erase removes that copy)."
         : state === "pending"
           ? "Deletion pending. Hermes is still verifying the archive."
           : state === "complete"
             ? "Voice conversation deleted."
-            : "Ready to delete this voice conversation.";
+            : state === "unknown"
+              ? "An earlier deletion could not be confirmed: its record was unreadable. Check Hermes's own session controls."
+              : "Ready to delete this voice conversation.";
     this.render();
   }
 

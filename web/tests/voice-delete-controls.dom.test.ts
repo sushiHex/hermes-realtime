@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { VoiceDeleteControls } from "../src/voice-delete-controls";
 
 const markup = readFileSync(fileURLToPath(new URL("../index.html", import.meta.url)), "utf8");
-const response = (state: "idle" | "pending" | "complete") => ({ version: 1, state });
+const response = (state: "idle" | "pending" | "complete" | "unknown") => ({ version: 1, state });
 
 function mount(options: {
   confirm: (message: string) => boolean;
@@ -47,7 +47,8 @@ describe("voice conversation deletion control", () => {
     expect(requests).toEqual([]);
     await controls.refresh();
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
-    expect(status.textContent).toBe("Voice conversation deletion is unavailable on this host.");
+    expect(status.textContent).toContain("Voice conversation deletion is unavailable on this host.");
+    expect(status.textContent).toContain("evidence capture keeps its own copy");
     expect(button.disabled).toBe(true);
     await controls.delete();
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
@@ -90,7 +91,7 @@ describe("voice conversation deletion control", () => {
     expect(requests).toEqual(["/api/v1/delete-voice-conversation"]);
     expect(status.textContent).toContain("pending");
     expect(status.textContent).not.toContain("deleted");
-    expect(button.disabled).toBe(true);
+    expect(button.disabled).toBe(false);
     expect(clears).toBe(0);
 
     controls.cleared();
@@ -119,7 +120,7 @@ describe("voice conversation deletion control", () => {
     resolveOld(response("complete"));
     await stale;
     expect(status.textContent).toContain("pending");
-    expect(button.disabled).toBe(true);
+    expect(button.disabled).toBe(false);
 
     await controls.refresh();
     expect(status.textContent).toBe("Voice conversation deleted.");
@@ -163,6 +164,55 @@ describe("voice conversation deletion control", () => {
     resolveNew(response("pending"));
     await current;
     expect(status.textContent).toContain("pending");
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("lets a later conversation be deleted while an earlier delete is pending", async () => {
+    const requests: string[] = [];
+    const { dom, button, controls } = mount({
+      confirm: () => true,
+      request: async (path) => {
+        requests.push(path);
+        return response("pending");
+      },
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect(button.disabled).toBe(false);
+    await controls.delete();
+    await controls.delete();
+    expect(requests.filter((path) => path === "/api/v1/delete-voice-conversation")).toHaveLength(2);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("reports an unreadable delete record as unknown, never as ready", async () => {
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async () => ({ version: 1, state: "unknown" }),
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect(status.textContent).toContain("could not be confirmed");
+    expect(status.textContent).not.toContain("Ready");
+    expect(button.disabled).toBe(false);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("states that a Hermes /branch copy keeps a deletion pending", async () => {
+    const confirmations: string[] = [];
+    const { dom, controls } = mount({
+      confirm: (message) => { confirmations.push(message); return false; },
+      request: async () => response("idle"),
+      clear: () => undefined,
+    });
+    const limit = "A copy made with Hermes /branch is a separate conversation: deletion stays pending until you delete that copy in Hermes.";
+    expect(dom.window.document.body.textContent).toContain(limit);
+    await controls.refresh();
+    await controls.delete();
+    expect(confirmations[0]).toContain(limit);
     controls.reset();
     dom.window.close();
   });
