@@ -57,8 +57,12 @@ Deletion is logical, not physical erasure. These remain, by design:
 - **Hermes run records.** Terminal records are pruned 24 hours after their last status update.
   A non-terminal record left by a crash must first be recovered by Hermes before that
   retention applies.
-- **Unvacuumed SQLite pages and WAL frames.** Deleted rows can persist as bytes in free pages
-  and the write-ahead log until SQLite reuses them.
+- **Unmerged search-index segments, unvacuumed SQLite pages and WAL frames.** After a delete,
+  no row or search match in Hermes's `state.db` holds the text, but its terms can persist in
+  Hermes's full-text index segments, and its bytes in free pages and the write-ahead log, until
+  they are rewritten. To erase those too, stop the gateway and run Hermes's own
+  `hermes sessions optimize` (FTS merge, then VACUUM); the M3 qualification verifies that
+  afterwards no table, segment or raw byte of `state.db` or its WAL holds the phrase.
 - **Backups and sync copies** of the Hermes home.
 - **Hermes `/branch` copies.** A copy is an independent conversation you may have continued,
   so it is never deleted for you. While one remains, the deletion stays **pending**; it
@@ -306,6 +310,10 @@ From the host:
   archiving for this host.
 - `[voice-review-send]`: a review was refused (`refusal`), or kept for retry
   (`outcome: retained`).
+- `[voice-memory-receive]`: the memory readback stream was refused or dropped. `refusal:
+  pending` appears on every run: the companion holds the read while the conversation's
+  archive has a write in flight, the stream stays open, and the readback follows once the
+  write commits. `outcome: disconnected` means the link dropped and is retried.
 - `[voice-review-close]`: at shutdown, a review close could not settle (`deadline`,
   `unsettled`, `not_open`), or had nothing to cover (`empty_window`).
 - `[hermes-run-record-lock]`: `cause: held`, another host holds the Hermes run record.
@@ -327,6 +335,9 @@ From the gateway (the companion runs inside it):
   be opened, a batch was refused, or the archive lease was lost.
 - `[voice-review]`: a review was refused, or ended (`outcome: finished`, `failed` or
   `cancelled`).
+- `[voice-memory]`: the companion refused a memory read. `refusal: pending` is the companion
+  side of the host's `[voice-memory-receive]` line above and appears on every run; other
+  categories, such as `capacity` or `tombstoned`, are findings.
 - `[voice-forget]`: a delete stays pending, with the `stage` it reached and why: `category`
   (`review` while a review runs, `present` or `branch_copies` while a session or a `/branch`
   copy remains), `refusal`, or `failure`.
@@ -487,8 +498,9 @@ microphone, and wait for **Listening — speak naturally**. Then:
 
 - **Do:** ask one short ordinary question aloud.
 - **Observe:** no `[voice-tail]` marker at this first start, since the old tail was moved aside.
-  Your final transcript appears, the reply is audible, and the assistant transcript appears as
-  it is delivered. The **Session model** panel shows the providers and models in use.
+  A short spoken readiness cue plays once the session is listening; it plays on every
+  **Connect** and is expected. Your final transcript appears, the reply is audible, and the
+  assistant transcript appears as it is delivered. The **Session model** panel shows the providers and models in use.
 - **Record:** any marker from the start; audible yes or no; **Response last**;
   `transcript_to_first_token` and `first_token_to_audio`.
 
@@ -524,8 +536,10 @@ microphone, and wait for **Listening — speak naturally**. Then:
 
 ### 7. Reconnect the browser
 
-- **Do:** press **Stop session**, then **Connect** again. Separately, reload the page and press
-  **Connect**.
+- **Do:** press **Stop session**, then **Connect** again. Separately, press **Stop session**,
+  reload the page and press **Connect**. Press **Stop session** before reloading: today a
+  reload without it leaves the old session to be reaped, and **Connect** is refused for about
+  300 seconds. If you see that refusal after a reload, record it as a known finding.
 - **Observe:** the session returns to **Listening**, without stale audio or duplicated
   transcript entries, and a question that depends on the earlier conversation is answered in
   context.
@@ -591,6 +605,10 @@ it as a separate observation.
   query lists nothing.
 - **Record:** whether each `Ctrl-C` exited cleanly; the number of processes left; any marker
   printed at shutdown, such as `[voice-review-close]`.
+
+A clean host stop exits with code 130 and currently prints several LiveKit SDK `FfiHandle`
+tracebacks (5 to 12 have been seen). They are known shutdown noise, not a finding; record only
+their count.
 
 The conversation persists on purpose. The host keeps the recent heard conversation in
 `%LOCALAPPDATA%\HermesRealtime\state\voice-tail-v1.json` beside its Hermes run record, and the

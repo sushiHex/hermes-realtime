@@ -314,14 +314,20 @@ it may hold the user's own later work, so the companion never deletes it: while 
 carries the `_branched_from` marker of a deleted session, the delete stays pending, and it
 completes once the user deletes the copy in Hermes. With evidence capture on, the spool keeps
 its own copy of the transcript, so the control is unavailable; **Revoke consent and erase**
-removes that copy. Deletion is logical: Hermes run records, unvacuumed SQLite pages and WAL
-frames, backups and sync copies remain. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
+removes that copy. Deletion is logical: Hermes run records, unmerged full-text index segments,
+unvacuumed SQLite pages and WAL frames, backups and sync copies remain. Hermes's own
+`hermes sessions optimize` (FTS merge, then VACUUM, with the gateway stopped) erases the
+segments, pages and frames. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
 for the exact support limits and [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md)
 for the qualification contract.
 
 `uv run python scripts/qualify_voice_delete.py` exercises pinned Hermes with synthetic data
 and a stand-in model: chain deletion, late-event fences, running-review pending status,
-crash recovery, owner succession and retained learned memory. The succession witness runs
+crash recovery, owner succession and retained learned memory. It scans every table of
+`state.db`, FTS shadow tables included, with an FTS `MATCH` per index: no row or match holds
+the phrase after the delete, a `/branch` copy keeps it pending until removed, and after
+Hermes's `SessionDB.vacuum()` (the `hermes sessions optimize` path) no table, segment or raw
+byte of the database or its WAL holds it. The succession witness runs
 the real companion host in two labelled processes, not the complete Hermes CLI and API
 server entrypoints. Exact candidate receipts belong to the implementation PR and #77.
 

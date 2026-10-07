@@ -640,8 +640,10 @@ A backend outage never silences the voice.
   already running when deletion was requested. Deleting only runs still named by the active-run
   record would make coverage depend on timing and delete sessions of in-flight work, so the
   owner explicitly excludes all delegated-task sessions from M3. The request has no run-ID list.
-  Deletion is logical, not physical: unvacuumed SQLite pages, WAL frames, backups and sync
-  copies remain. Hermes `/branch` copies are independent conversations the user may have
+  Deletion is logical, not physical: unmerged full-text index segments, unvacuumed SQLite
+  pages, WAL frames, backups and sync copies remain. The companion runs inside the live
+  gateway, and a full FTS optimize holds Hermes's write lock for seconds on a large store, so
+  physical erasure stays Hermes's own `hermes sessions optimize`, run with the gateway stopped. Hermes `/branch` copies are independent conversations the user may have
   continued, so M3 never deletes them; while one still names a deleted session through its
   `_branched_from` marker, the delete stays pending. Evidence capture keeps its own transcript
   copy, so the voice delete control is unavailable while capture is on.
