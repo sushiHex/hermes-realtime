@@ -379,49 +379,92 @@ env -u PYTHONPATH uv run --frozen --extra local --extra browser-acceptance \
   python scripts/rehearse_desktop_mvp.py --ollama-model <name from ollama list>
 ```
 
-It builds a throwaway Hermes home under the system temporary directory, laid out the way the
-upstream installer lays it out: the pinned `29112bef` checkout at `home/hermes-agent`, its
-locked environment in `home/hermes-agent/venv`, this checkout's built wheel installed there, and
-the plugin enabled and memory turned off with the runbook's own `hermes` commands. Hermes's model
-is a stand-in served by the script, so no provider key is involved. It then starts, each one
-detached with a log and a recorded PID:
+**What runs is HEAD.** The record is bound to a commit, as the release gates are. The script
+clones `HEAD` into the run directory and builds the wheel there. The host runs from that wheel,
+in its own environment made from the locked dependencies. The installed-runtime gate and the
+host's child wrapper come from the same clone. The setup line records the commit, whether the
+tree it came from was clean, whether the running harness matches `HEAD`, and that the host
+imported the wheel.
 
+**The composed stack.** It builds a throwaway Hermes home under the system temporary directory,
+laid out the way the upstream installer lays it out:
+- the pinned `29112bef` checkout at `home/hermes-agent`, with its locked environment in
+  `home/hermes-agent/venv` and the candidate wheel installed there;
+- the plugin enabled, and memory turned off, with the runbook's own `hermes` commands;
+- for Hermes's model, a stand-in served by the script, so no provider key is involved.
+
+It then starts each of these with a log:
 - `hermes gateway run` from that home, with the companion inside it;
 - the pinned LiveKit server (`.tools/livekit/livekit-server.exe`, verified by SHA-256);
 - the full host with the runbook's flags (`--persistent-loopback-launch`,
-  `--allow-unsandboxed-hermes-tasks`, Ollama with the named model, default speech providers), and
-  its voice tail and run record inside the run directory;
+  `--allow-unsandboxed-hermes-tasks`, Ollama with the named model, default speech providers),
+  with its voice tail and run record inside the run directory;
 - a headless system Chrome, driven through the DevTools protocol.
 
-The browser's microphone is a synthetic track. Spoken steps play Kokoro-synthesized clips into
-it, so speech crosses WebRTC, LiveKit, VAD and Moonshine for real. No physical microphone or
-speaker is involved: the track reports the AEC-only processing the page requires without running
-it, and "audible" means the decoded remote audio track carried energy during the reply. Context
-carried over a reconnect or a restart is checked on the context the host keeps, its voice tail;
-whether the foreground model then used it is recorded beside that, since it depends on the model.
+**Containment.** The rehearsal joins a kill-on-close Job Object before it starts anything, and
+every process it starts inherits that job. A rehearsal killed outright therefore leaves no
+orphan. The job is also what the final count of running processes reads. A command that times
+out is ended with its whole process tree.
 
-It walks the session steps in order, plus voice deletion (M3), which the runbook has no session
-step for, and prints one `[desktop-mvp-rehearsal] {...}` line per step in the record sheet's
-categories: `outcome`, `timings`, the bounded markers the host and gateway printed during the
-step, and `notes`. A failed step is recorded, a later step reconnects the page if it must, and
-the rehearsal continues. A final `summary` line counts the processes left running by image name
-(it must be empty); the exit code is 0 only when every step was `as_expected` and nothing was
-left. When a required piece is missing (Windows, the pinned LiveKit binary, system Chrome,
-Playwright, Kokoro, git, uv, a running Ollama with the named model, or a free port 7880) it
-prints one `not_run` preflight line and exits 0.
+**Every verdict comes from an independent observation.** A verdict never rests on one of the
+script's own actions succeeding.
+- *Speech.* The final transcript must contain the spoken words. The microphone is a synthetic
+  track that plays Kokoro-synthesized clips, so speech crosses WebRTC, LiveKit, VAD and Moonshine
+  for real. "Audible" means the decoded remote audio track carried energy.
+- *Stale audio.* After each Connect, the page is watched for audio no one asked for. Only the
+  host's readiness cue is excused, and only when it is identified: one burst of at most two
+  seconds around the page's own voice-input confirmation. Any other energy, or any assistant row,
+  is stale.
+- *A delegated task.* The result Hermes produced must appear in a background-result row.
+- *Cancel and restart.* A cancel must hang up the stand-in's stream. A restart needs work running
+  through the crash, and that work stopped after settlement.
+- *Context.* Context carried over a reconnect or a restart means the step-3 fact is still in the
+  context the host keeps (its voice tail), and the model's reply used it. Nothing restates the
+  fact, so the bounded context window shows up as a `different` verdict.
+- *Deletion.* The phrase must be found before deletion, in the voice tail and in Hermes's
+  database. Afterwards it must be gone from four places:
+  - the page;
+  - the tail;
+  - every column of every table and every full-text index of `state.db`;
+  - the `sessions/` and `memories/` files.
 
-Ctrl-C cannot reach a detached process, so two things differ from the operator's session:
+  The check runs again after the follow-up turn and at cleanup, and every assistant row of the
+  follow-up reply is read. A missing database is a failure. A phrase left only in built-in
+  memory is the documented no-unlearning limit, so it reads as `different`.
+- *Tracebacks.* A traceback outside a named allowlist of known upstream noise makes its step
+  `different`. The allowlist holds LiveKit's FFI handle disposal at exit and Hermes's Unix-socket
+  watchdog on Windows.
 
-- The host runs as `python scripts/rehearse_desktop_mvp.py --host-child <stop file> -- <host
-  flags>` under `uv run`. When the stop file appears, the child interrupts its main thread
-  exactly as Ctrl-C does. The forced restart still ends the whole `uv` process tree abruptly.
+**Records.** Each step prints one `[desktop-mvp-rehearsal] {...}` line in the record sheet's
+categories: `outcome`, `timings`, markers and `notes`. Markers are kept by name, from the
+components this session runs. They are re-rendered from their values, which may only be counts,
+flags and short categories; anything else is counted and dropped. A failed step is recorded, a
+later step reconnects the page if it must, and the rehearsal continues. The final `summary` line
+counts what is left running by image name, and it must be empty. The exit code is 0 only when
+every step was `as_expected` and nothing was left.
+
+**Preflight.** When a required piece is missing, the script prints one `not_run` preflight line
+and exits 0. The pieces are Windows, the pinned LiveKit binary, system Chrome, Playwright,
+Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880,
+such as an orphaned server, is a `failed` preflight with exit code 1.
+
+**Differences from the operator's session.** Ctrl-C cannot reach a detached process, so:
+- The host runs as `<host env>/python <clone>/scripts/rehearse_desktop_mvp.py --host-child <stop
+  file> -- <host flags>`. When the stop file appears, the child interrupts its main thread
+  exactly as Ctrl-C does. The forced restart ends the whole host process tree abruptly.
 - The gateway is stopped through Hermes's own Windows stop path, the planned-stop marker that
-  `hermes gateway stop` writes; LiveKit is killed. `hermes gateway status` and `stop` themselves
-  are not run: on a machine with its own gateway, their process scan could reach that one.
+  `hermes gateway stop` writes. LiveKit is killed.
+- `hermes gateway status` and `stop` themselves are not run: on a machine with its own gateway,
+  their process scan could reach that one.
 
-The throwaway gateway and host use free ports, so a gateway already running on 8642 is left
-alone. The run directory is left in place with private logs that may hold paths; publish only
-the rehearsal's own lines.
+**Limits.**
+- The throwaway gateway and host use free ports, so a gateway already running on 8642 is left
+  alone.
+- The run directory is left in place. It holds private logs that may contain paths, the
+  throwaway home's `.env` with its generated API and companion keys, and a `state.db` with the
+  synthetic conversation. Publish only the rehearsal's own lines.
+- The stand-in model never writes memory, so the deletion step does not exercise a review
+  copying the conversation into memory.
 
 ### Launch
 

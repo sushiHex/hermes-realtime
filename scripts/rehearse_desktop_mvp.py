@@ -70,8 +70,39 @@ _LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd
 _LIVEKIT_KEYS = "devkey: local-" + "x" * 32 + "\n"
 _OLLAMA = "http://127.0.0.1:11434"
 _DETACHED = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-# A bounded marker other code printed: `[name] {json}`, recorded verbatim.
+# A bounded marker other code printed: `[name] {json}`.
 _MARKER_LINE = re.compile(r"\[[a-z][a-z0-9-]{0,47}\] \{.*\}")
+# The markers this session's components print (the runbook's list, plus memory readback and
+# Hermes's identity check); any other name is counted, never recorded.
+_KNOWN_MARKERS = frozenset(
+    {
+        "voice-tail", "voice-tail-lock", "voice-tail-outbox", "voice-archive-send",
+        "voice-review-send", "voice-review-close", "hermes-run-record-lock",
+        "hermes-restart-settlement", "hermes-dispatch-recovery", "codex-session-auth",
+        "codex-tool-refusal", "voice-companion", "voice-archive-open", "voice-archive",
+        "voice-archive-lease", "voice-review", "hermes-bridge-hello", "voice-memory",
+        "voice-memory-receive", "voice-memory-stream", "voice-forget", "voice-forget-send",
+        "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
+    }
+)  # fmt: skip
+_MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+_EXCEPTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,79}")
+# Tracebacks known to be upstream noise; any other one is a finding.
+_KNOWN_TRACEBACKS = {
+    # LiveKit's Python SDK disposes FFI handles after its server at interpreter exit.
+    "livekit_ffi_handle_dispose": (("FfiHandle", "_ffi_client.py"), "AssertionError"),
+    # Hermes's gateway watchdog uses a Unix socket API that Windows lacks.
+    "hermes_watchdog_unix_server": (
+        ("shutdown_watchdog.py", "start_unix_server"),
+        "AttributeError",
+    ),
+}
+# Where the conversation's phrase must be found before deletion.
+_SEEDED_SOURCES = ("voice_tail", "hermes_database")
+# One 50 ms window louder than this is sound (about -47 dBFS).
+_FRAME_ENERGY = 1e-6
+# The readiness cue is one short spoken chunk.
+_CUE_MAX_SECONDS = 2.0
 _MAX_MARKER_CHARS = 512
 _MAX_MARKERS = 32
 _NOTICE = re.compile(
@@ -123,8 +154,12 @@ _RECONNECT_SECONDS = 420.0
 # Decoded remote audio energy above which a reply was audible.
 _AUDIBLE_ENERGY = 1e-4
 _VIEWPORT = {"width": 1366, "height": 768}
-# Long enough for the readiness cue the host plays when voice input becomes ready.
-_CUE_SECONDS = 4.0
+# How long a page is watched after Connect for audio no one asked for.
+_QUIET_SECONDS = 7.0
+# How long a stop is given to reach the stand-in model's stream.
+_SETTLE_SECONDS = 15.0
+# The stand-in model's answer to a dispatched task, as Hermes returns it.
+_STAND_IN_RESULT = "Rehearsal step complete."
 # Rare enough that no other turn in the session, or a guess, says one.
 _BIRDS = ("hoopoe", "cassowary", "quetzal", "lyrebird", "kingfisher")
 # The operator's spoken lines, synthesized once per run.
@@ -252,7 +287,7 @@ class StandInModel:
         if kind == "timed":
             await asyncio.sleep(int(argument))
             return await self._answer(request, stream, text="The long rehearsal task finished.")
-        return await self._answer(request, stream, text="Rehearsal step complete.")
+        return await self._answer(request, stream, text=_STAND_IN_RESULT)
 
     async def _answer(
         self, request: Any, stream: bool, *, text: str | None = None, tool: str | None = None
@@ -391,6 +426,70 @@ def started_at(pid: int) -> int | None:
         kernel.CloseHandle(ctypes.c_void_p(handle))
 
 
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _ExtendedLimits(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimits),
+        ("IoInfo", ctypes.c_uint64 * 6),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class Containment:
+    """A kill-on-close Job Object holding this process and everything it starts.
+
+    Every child inherits the job, so even a hard-killed rehearsal leaves no orphan: the
+    system closes the job with the last handle and terminates what is in it. The job is
+    also the authority on what is still running.
+    """
+
+    def __init__(self) -> None:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        self._kernel = kernel
+        self._job = kernel.CreateJobObjectW(None, None)
+        if not self._job:
+            raise OSError("the job object could not be created")
+        limits = _ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(
+            ctypes.c_void_p(self._job), 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ) or not kernel.AssignProcessToJobObject(
+            ctypes.c_void_p(self._job), ctypes.c_void_p(kernel.GetCurrentProcess())
+        ):
+            raise OSError("this process could not join its job object")
+
+    def members(self) -> set[int]:
+        """Every process in the job, this one included."""
+
+        size = 4096
+        buffer = (ctypes.c_uint8 * (8 + 8 * size))()
+        if not self._kernel.QueryInformationJobObject(
+            ctypes.c_void_p(self._job), 3, buffer, ctypes.sizeof(buffer), None
+        ):
+            raise OSError("the job object could not be read")
+        count = int.from_bytes(bytes(buffer[4:8]), "little")
+        ids = (ctypes.c_size_t * count).from_buffer(buffer, 8)
+        return {int(pid) for pid in ids}
+
+
 def descendants(table: Mapping[int, tuple[int, str]], roots: set[int]) -> set[int]:
     """The roots that are alive and every process below them."""
 
@@ -471,13 +570,7 @@ class Processes:
         self.observe()
         started = time.monotonic()
         if process.poll() is None:
-            subprocess.run(
-                ("taskkill", "/PID", str(process.pid), "/T", "/F"),
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                check=False,
-                creationflags=0x08000000,
-            )
+            _kill_tree(process.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=30)
         return time.monotonic() - started
@@ -511,10 +604,15 @@ class Processes:
             with contextlib.suppress(OSError):
                 stream.close()
 
-    def survivors(self) -> dict[str, int]:
-        """What is left running, by image name."""
+    def survivors(self, containment: Containment | None) -> dict[str, int]:
+        """What is left running, by image name: every process still in the job, and any
+        process seen in an owned tree, so nothing that escaped either view is missed."""
 
-        return dict(Counter(image for _, image in self.alive()))
+        table = process_table()
+        left = {pid for pid, _ in self.alive()}
+        if containment is not None:
+            left |= containment.members() - {os.getpid()}
+        return dict(Counter(table[pid][1] for pid in left if pid in table))
 
 
 def listeners(port: int) -> list[str]:
@@ -556,16 +654,34 @@ def _run(
     cwd: Path | None = None,
     timeout: float = 600,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    """Run one command to completion; on a timeout, end its whole tree, not just its root."""
+
+    process = subprocess.Popen(
         argv,
         env=None if env is None else dict(env),
         cwd=cwd,
         stdin=subprocess.DEVNULL,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
+        creationflags=0x08000000,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(process.pid)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
+def _kill_tree(pid: int) -> None:
+    subprocess.run(
+        ("taskkill", "/PID", str(pid), "/T", "/F"),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
         check=False,
         creationflags=0x08000000,
     )
@@ -596,18 +712,226 @@ class LogTail:
 
 
 def markers(lines: list[str]) -> tuple[list[str], int]:
-    """The bounded markers among ``lines``, verbatim and in order, and how many were dropped."""
+    """The known markers among ``lines``, re-rendered from their values, and the rest counted.
+
+    A marker is kept by name, from the components this session runs, and only its scalar
+    values are rendered: a category, a count or a flag. Any other line, or a value that could
+    carry text, is never recorded, so an upstream line holding a path cannot leak.
+    """
 
     found: list[str] = []
+    dropped = 0
     for line in lines:
-        if len(line) > _MAX_MARKER_CHARS or _MARKER_LINE.fullmatch(line) is None:
+        if _MARKER_LINE.fullmatch(line) is None:
             continue
+        if len(line) > _MAX_MARKER_CHARS:
+            dropped += 1
+            continue
+        name = line[1 : line.index("]")]
         try:
-            json.loads(line.split("] ", 1)[1])  # The pattern already requires an object.
+            value = json.loads(line.split("] ", 1)[1])
         except ValueError:
+            value = None
+        if name not in _KNOWN_MARKERS or type(value) is not dict or not _is_category(value):
+            dropped += 1
             continue
-        found.append(line)
-    return found[:_MAX_MARKERS], max(len(found) - _MAX_MARKERS, 0)
+        found.append(f"[{name}] " + json.dumps(value, separators=(",", ":"), sort_keys=True))
+    return found[:_MAX_MARKERS], dropped + max(len(found) - _MAX_MARKERS, 0)
+
+
+def _is_category(value: object, depth: int = 0) -> bool:
+    """A count, a flag, a short category, or a list or object of those, at most 3 deep."""
+
+    if value is None or type(value) in (bool, int):
+        return True
+    if type(value) is str:
+        return _MARKER_CATEGORY.fullmatch(value) is not None
+    if type(value) is list and depth < 3:
+        return len(value) <= 16 and all(_is_category(item, depth + 1) for item in value)
+    if type(value) is dict and depth < 3:
+        return all(
+            type(key) is str
+            and _MARKER_CATEGORY.fullmatch(key) is not None
+            and _is_category(field, depth + 1)
+            for key, field in value.items()
+        )
+    return False
+
+
+def tracebacks(lines: list[str]) -> tuple[Counter[str], Counter[str]]:
+    """Tracebacks in a log: (known, by allowlist entry; unexpected, by exception type).
+
+    Only the exception's type name leaves the log: never its message or its frames.
+    """
+
+    known: Counter[str] = Counter()
+    unexpected: Counter[str] = Counter()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if "Traceback (most recent call last):" not in line:
+            index += 1
+            continue
+        start = max(index - 1, 0)  # "Exception ignored in: ..." names the owner.
+        index += 1
+        while index < len(lines) and lines[index][:1] in (" ", "|", "+", "\t"):
+            index += 1
+        final = lines[index] if index < len(lines) else ""
+        block = "\n".join(lines[start : index + 1])
+        exception = final.split(":", 1)[0].strip()
+        if _EXCEPTION_NAME.fullmatch(exception) is None:
+            exception = "unparsed"
+        for name, (needles, expected) in _KNOWN_TRACEBACKS.items():
+            if exception == expected and all(needle in block for needle in needles):
+                known[name] += 1
+                break
+        else:
+            unexpected[exception] += 1
+        index += 1
+    return known, unexpected
+
+
+Finding = tuple[str, str]  # ("differ" | "fail", category)
+
+
+def transcript_matches(expected: str, heard: str) -> bool:
+    """Every word of four letters or more in the spoken line is in the final transcript."""
+
+    words = set(re.findall(r"[a-z]+", heard.casefold()))
+    return all(word in words for word in re.findall(r"[a-z]{4,}", expected.casefold()))
+
+
+def deletion_verdict(
+    before: Mapping[str, int],
+    after: Mapping[str, int],
+    follow_up: Mapping[str, int],
+    next_reply_has_phrase: bool,
+) -> list[Finding]:
+    """The phrase must have been everywhere it is looked for, and then nowhere."""
+
+    findings: list[Finding] = []
+    if any(before.get(source, 0) <= 0 for source in _SEEDED_SOURCES):
+        findings.append(("fail", "phrase_not_seeded"))
+    findings += retained_verdict(after, "phrase_retained")
+    findings += retained_verdict(follow_up, "phrase_returned")
+    if next_reply_has_phrase:
+        findings.append(("fail", "phrase_in_next_reply"))
+    return findings
+
+
+def retained_verdict(scan: Mapping[str, int], category: str) -> list[Finding]:
+    """A deleted phrase found anywhere fails; in built-in memory it is the documented limit."""
+
+    retained = {key for key, count in scan.items() if count}
+    if retained - {"memories"}:
+        return [("fail", category)]
+    if retained:
+        # Built-in memory is not erased by design: there is no unlearning in the MVP.
+        return [("differ", "memory_retains_phrase")]
+    return []
+
+
+def context_verdict(in_kept_context: bool, answered: bool) -> list[Finding]:
+    """Was the earlier fact still in the context the host keeps, and was it used?"""
+
+    findings: list[Finding] = []
+    if not in_kept_context:
+        findings.append(("differ", "context_lost"))
+    if not answered:
+        findings.append(("differ", "context_not_answered"))
+    return findings
+
+
+def restart_work_verdict(
+    before_crash: int, after_crash: int, after_settlement: int
+) -> list[Finding]:
+    """The crash must leave real work running, and the restart must stop it."""
+
+    findings: list[Finding] = []
+    if before_crash < 1 or after_crash < 1:
+        findings.append(("differ", "no_work_left_by_crash"))
+    if after_settlement:
+        findings.append(("fail", "work_left_running"))
+    return findings
+
+
+def cancel_work_verdict(open_after_cancel: int) -> list[Finding]:
+    return [("fail", "work_left_running")] if open_after_cancel else []
+
+
+def audio_without_speech(
+    timeline: list[tuple[float, float]],
+    cue_at: float | None,
+    new_assistant_rows: int,
+) -> tuple[list[Finding], dict[str, object]]:
+    """Audio no one asked for, with only the host's identified readiness cue excused.
+
+    ``timeline`` holds (page time, decoded energy) per 50 ms window. The cue is excused only
+    when it is one burst of at most ``_CUE_MAX_SECONDS`` around the page's own
+    voice-input confirmation; any other energy, or any assistant row, is stale.
+    """
+
+    loud = [(at, energy) for at, energy in timeline if energy > _FRAME_ENERGY]
+    cue: list[tuple[float, float]] = []
+    if cue_at is not None:
+        window = [
+            (at, energy) for at, energy in loud if cue_at - 1000 <= at <= cue_at + 3000
+        ]
+        contiguous = all(b[0] - a[0] <= 250 for a, b in zip(window, window[1:], strict=False))
+        if window and contiguous and window[-1][0] - window[0][0] <= _CUE_MAX_SECONDS * 1000:
+            cue = window
+    unexcused = sum(energy for at, energy in loud if (at, energy) not in cue)
+    notes: dict[str, object] = {
+        "cue_seconds": round((cue[-1][0] - cue[0][0]) / 1000 + 0.05, 2) if cue else 0.0,
+        "unexcused_energy": round(unexcused, 6),
+        "new_assistant_rows": new_assistant_rows,
+    }
+    findings: list[Finding] = []
+    if unexcused > _AUDIBLE_ENERGY or new_assistant_rows:
+        findings.append(("differ", "stale_audio"))
+    return findings, notes
+
+
+def phrase_in_database(database: Path, phrase: str) -> int:
+    """Rows holding ``phrase`` in any column of any table, or matching it in any FTS index.
+
+    A missing database is an error, never a zero.
+    """
+
+    if not database.is_file():
+        raise FileNotFoundError("the Hermes state database is missing")
+    pattern = f"%{phrase.casefold()}%"
+    total = 0
+    with contextlib.closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as db:
+        tables = db.execute(
+            "SELECT name, coalesce(sql, '') FROM sqlite_master WHERE type = 'table'"
+            " AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for table, sql in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            if re.search(r"USING\s+fts", sql, re.IGNORECASE):
+                with contextlib.suppress(sqlite3.Error):
+                    query = f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?"
+                    total += db.execute(query, ('"' + phrase + '"',)).fetchone()[0]
+            for column in db.execute(f"PRAGMA table_info({quoted})").fetchall():
+                name = '"' + str(column[1]).replace('"', '""') + '"'
+                with contextlib.suppress(sqlite3.Error):
+                    total += db.execute(
+                        f"SELECT count(*) FROM {quoted} WHERE lower(CAST({name} AS TEXT)) LIKE ?",
+                        (pattern,),
+                    ).fetchone()[0]
+    return int(total)
+
+
+def phrase_in_files(directory: Path, phrase: str) -> int:
+    """Occurrences of ``phrase`` in every file under ``directory``; a missing one is an error."""
+
+    if not directory.is_dir():
+        raise FileNotFoundError("a Hermes directory to scan is missing")
+    needle = phrase.casefold().encode()
+    return sum(
+        path.read_bytes().lower().count(needle) for path in directory.rglob("*") if path.is_file()
+    )
 
 
 def notice(lines: list[str]) -> dict[str, int] | None:
@@ -660,6 +984,10 @@ class Step:
     def skip(self, category: str) -> None:
         self.outcome, self.category = "not_run", category
 
+    def apply(self, findings: list[Finding]) -> None:
+        for level, category in findings:
+            (self.fail if level == "fail" else self.differ)(category)
+
     def lines(self, source: str | None = None) -> list[str]:
         found: list[str] = []
         for log in self._logs:
@@ -674,16 +1002,19 @@ class Step:
     def record(self) -> dict[str, object]:
         found: list[str] = []
         dropped = 0
-        errors: dict[str, int] = {}
+        known: Counter[str] = Counter()
+        unexpected: Counter[str] = Counter()
         for log in self._logs:
             log.poll()
             new = log.lines[self._start.get(id(log), 0) :]
             lines, extra = markers(new)
             found.extend(f"{log.source}: {line}" for line in lines)
             dropped += extra
-            tracebacks = sum("Traceback (most recent call last)" in line for line in new)
-            if tracebacks:
-                errors[log.source] = errors.get(log.source, 0) + tracebacks
+            allowed, other = tracebacks(new)
+            known += allowed
+            unexpected += Counter({f"{log.source}:{name}": n for name, n in other.items()})
+        if unexpected and "unexpected_traceback" not in self.findings:
+            self.differ("unexpected_traceback")
         record: dict[str, object] = {
             "markers": found[:_MAX_MARKERS],
             "name": self.name,
@@ -699,8 +1030,8 @@ class Step:
             record["findings"] = self.findings
         if dropped or len(found) > _MAX_MARKERS:
             record["markers_dropped"] = dropped + max(len(found) - _MAX_MARKERS, 0)
-        if errors:
-            record["tracebacks"] = errors
+        if known or unexpected:
+            record["tracebacks"] = {"known": dict(known), "unexpected": dict(unexpected)}
         return record
 
 
@@ -765,6 +1096,7 @@ _INIT_SCRIPT = r"""
   let analyser = null;
   let measured = null;
   let energy = 0;
+  const timeline = [];
   const window_ = new Float32Array(1024);
   setInterval(() => {
     const stream = document.querySelector("#remote-audio")?.srcObject;
@@ -783,16 +1115,38 @@ _INIT_SCRIPT = r"""
     analyser.getFloatTimeDomainData(window_);
     let sum = 0;
     for (const sample of window_) sum += sample * sample;
-    energy += (sum / window_.length) * 0.05;
+    const increment = (sum / window_.length) * 0.05;
+    energy += increment;
+    timeline.push([performance.now(), increment]);
+    if (timeline.length > 4000) timeline.shift();
   }, 50);
   window.__rehearsalEnergy = async () => {
     if (meter !== null) await meter.resume();
     return energy;
   };
+  window.__rehearsalTimeline = (since) => timeline.filter(([at]) => at >= since);
+  window.__rehearsalNow = () => performance.now();
+  // Page markers by name and time, so the readiness cue can be identified, not assumed.
+  window.__rehearsalMarkers = [];
+  // Rows present before a turn are marked, so a check reads only the turn's own rows.
+  window.__rehearsalMark = () => {
+    for (const item of document.querySelectorAll("#transcript li")) {
+      item.dataset.rehearsalSeen = "1";
+    }
+  };
+  window.__rehearsalUnseen = (role) =>
+    [...document.querySelectorAll(`#transcript li[data-role=${role}]`)]
+      .filter((item) => item.dataset.rehearsalSeen !== "1"
+        && item.dataset.partialTranscript !== "true")
+      .map((item) => item.textContent ?? "");
   window.__rehearsalTasks = [];
   const record = (item) => {
     if (item instanceof HTMLElement && item.dataset.operation === "task" && item.dataset.status) {
       window.__rehearsalTasks.push([item.dataset.taskId, item.dataset.status, performance.now()]);
+    }
+    if (item instanceof HTMLLIElement && item.parentElement?.id === "markers") {
+      const name = (item.textContent ?? "").split(":", 1)[0];
+      window.__rehearsalMarkers.push([name, performance.now()]);
     }
   };
   new MutationObserver((mutations) => {
@@ -914,7 +1268,7 @@ def preflight(model: str | None) -> list[str]:
         if model not in names:
             missing.append("ollama_model")
     if listeners(7880):
-        missing.append("livekit_port_free")
+        missing.append("livekit_port_in_use")
     return missing
 
 
@@ -925,6 +1279,9 @@ class Rehearsal:
         self.home = run_dir / "home"
         self.logs_dir = run_dir / "logs"
         self.state_dir = run_dir / "state"
+        self.candidate = run_dir / "candidate"
+        self.host_env = run_dir / "host-env"
+        self.wheel = Path()
         self.processes = Processes(run_dir)
         self.stand_in = StandInModel()
         self.logs: list[LogTail] = []
@@ -941,6 +1298,8 @@ class Rehearsal:
         self.playwright: Any = None
         self.ready = {"gateway": False, "host": False, "browser": False}
         self.dialogs: Counter[str] = Counter()
+        self.deleted = False
+        self.containment: Containment | None = None
         self._step: Step | None = None
 
     # -- helpers --
@@ -973,6 +1332,10 @@ class Rehearsal:
     @property
     def hermes_cli(self) -> Path:
         return self.home / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
+
+    @property
+    def host_python(self) -> Path:
+        return self.host_env / "Scripts" / "python.exe"
 
     async def snapshot(self) -> dict[str, Any]:
         value = await self.page.evaluate(_SNAPSHOT)
@@ -1010,14 +1373,50 @@ class Rehearsal:
             "reply",
         )
 
-    async def last_assistant_has(self, word: str) -> bool:
-        text = await self.page.evaluate(
-            "() => { const items = [...document.querySelectorAll("
-            "'#transcript li[data-role=assistant]')].filter("
-            "(item) => item.dataset.partialTranscript !== 'true');"
-            " return items.length ? items[items.length - 1].textContent : ''; }"
+    async def mark(self) -> float:
+        """Mark every row on the page as seen; the page time to observe from."""
+
+        await self.page.evaluate("() => window.__rehearsalMark()")
+        return float(await self.page.evaluate("() => window.__rehearsalNow()"))
+
+    async def unseen(self, role: str) -> list[str]:
+        """The final rows of ``role`` added since the last mark (held here, never recorded)."""
+
+        rows = await self.page.evaluate("(role) => window.__rehearsalUnseen(role)", role)
+        return [str(row) for row in rows]
+
+    async def unseen_assistant_rows(self) -> int:
+        """Assistant rows added since the last mark, live ones included."""
+
+        return int(
+            await self.page.evaluate(
+                "() => [...document.querySelectorAll('#transcript li[data-role=assistant]')]"
+                ".filter((item) => item.dataset.rehearsalSeen !== '1').length"
+            )
         )
-        return type(text) is str and word.casefold() in text.casefold()
+
+    async def turn_has_phrase(self) -> bool:
+        """Does any assistant row of this turn say the phrase? Replies span one row per
+        sentence, so every row since the mark is read, not only the last."""
+
+        return any(self.phrase in row.casefold() for row in await self.unseen("assistant"))
+
+    async def quiet(self, step: Step, name: str, since: float) -> None:
+        """Was anything heard after ``since`` that no one asked for, beyond the readiness cue?"""
+
+        timeline = await self.page.evaluate("(since) => window.__rehearsalTimeline(since)", since)
+        confirmations = [
+            float(at)
+            for marker, at in await self.page.evaluate("() => window.__rehearsalMarkers")
+            if marker == "voice_input_server_confirmed" and float(at) >= since
+        ]
+        findings, notes = audio_without_speech(
+            [(float(at), float(energy)) for at, energy in timeline],
+            confirmations[0] if confirmations else None,
+            await self.unseen_assistant_rows(),
+        )
+        step.notes[f"{name}_audio"] = notes
+        step.apply(findings)
 
     async def energy(self) -> float:
         return float(await self.page.evaluate("() => window.__rehearsalEnergy()"))
@@ -1092,6 +1491,8 @@ class Rehearsal:
     async def setup(self) -> None:
         async with self.step("setup", "setup") as step:
             started = time.monotonic()
+            step.notes["candidate"] = await asyncio.to_thread(self._candidate)
+            step.time("candidate_s", started)
             cache_python = await asyncio.to_thread(provision_pinned_hermes)
             del cache_python
             checkout = self.home / "hermes-agent"
@@ -1162,24 +1563,77 @@ class Rehearsal:
             return f"exit_{completed.returncode}"
         return "ok"
 
-    async def _install_wheel(self, step: Step) -> dict[str, object]:
-        out = self.run_dir / "dist"
-        built = await asyncio.to_thread(
-            _run,
-            ["uv", "build", "--wheel", "--out-dir", str(out)],
-            env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+    def _candidate(self) -> dict[str, object]:
+        """Bind the run to a commit: a clone of HEAD, its wheel, and a host env from both.
+
+        The working tree may hold anything; what runs is exactly HEAD, and the record says
+        which commit that is and whether the tree it was taken from was clean.
+        """
+
+        commit = _run(["git", "rev-parse", "HEAD"], cwd=_REPOSITORY).stdout.strip()
+        tracked = _run(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=_REPOSITORY
+        ).stdout
+        harness = _run(
+            ["git", "diff", "--quiet", "HEAD", "--", "scripts/rehearse_desktop_mvp.py"],
             cwd=_REPOSITORY,
+        ).returncode
+        if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            raise RuntimeError("the candidate commit could not be read")
+        for argv in (
+            ["git", "clone", "-q", "--no-checkout", "--no-hardlinks", str(_REPOSITORY),
+             str(self.candidate)],
+            ["git", "-C", str(self.candidate), "checkout", "-q", "--detach", commit],
+        ):  # fmt: skip
+            if _run(argv).returncode != 0:
+                raise RuntimeError("the candidate clone failed")
+        clean_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
+        }
+        built = _run(
+            ["uv", "build", "--wheel", "--out-dir", str(self.run_dir / "dist")],
+            env=clean_env,
+            cwd=self.candidate,
         )
-        wheels = sorted(out.glob("hermes_realtime-*-py3-none-any.whl"))
+        wheels = sorted((self.run_dir / "dist").glob("hermes_realtime-*-py3-none-any.whl"))
         if built.returncode != 0 or len(wheels) != 1:
             raise RuntimeError("the candidate wheel did not build")
+        self.wheel = wheels[0]
+        requirements = self.run_dir / "host-requirements.txt"
+        steps = (
+            ["uv", "export", "--frozen", "--no-dev", "--extra", "local", "--no-emit-project",
+             "--no-hashes", "--quiet", "-o", str(requirements)],
+            ["uv", "venv", "--quiet", "--python", "3.11", str(self.host_env)],
+            ["uv", "pip", "install", "--quiet", "--python", str(self.host_python), "-r",
+             str(requirements)],
+            ["uv", "pip", "install", "--quiet", "--no-deps", "--python", str(self.host_python),
+             str(self.wheel)],
+        )  # fmt: skip
+        for argv in steps:
+            if _run(argv, env=clean_env, cwd=self.candidate, timeout=1800).returncode != 0:
+                raise RuntimeError("the candidate host environment did not install")
+        located = _run(
+            [str(self.host_python), "-I", "-c",
+             "import hermes_realtime; print(hermes_realtime.__file__)"],
+            env=clean_env,
+        ).stdout.strip()  # fmt: skip
+        return {
+            "commit": commit,
+            "clean": tracked == "",
+            "harness_at_head": harness == 0,
+            "host_from_wheel": Path(located).resolve().is_relative_to(self.host_env.resolve()),
+        }
+
+    async def _install_wheel(self, step: Step) -> dict[str, object]:
         python = str(self.hermes_python)
         before = await asyncio.to_thread(_run, ["uv", "pip", "freeze", "--python", python])
         installed = await asyncio.to_thread(
             _run,
             [
                 "uv", "pip", "install", "--reinstall-package", "hermes-realtime",
-                "--python", python, str(wheels[0]),
+                "--python", python, str(self.wheel),
             ],
         )
         if installed.returncode != 0:
@@ -1188,7 +1642,7 @@ class Rehearsal:
         old = {line for line in before.stdout.splitlines() if "hermes-realtime" not in line}
         new = {line for line in after.stdout.splitlines() if "hermes-realtime" not in line}
         return {
-            "wheel_version": wheels[0].name.split("-")[1],
+            "wheel_version": self.wheel.name.split("-")[1],
             "shared_packages_changed": len(old ^ new),
         }
 
@@ -1239,14 +1693,14 @@ class Rehearsal:
                 _run,
                 [
                     str(self.hermes_python),
-                    str(_REPOSITORY / "scripts" / "real_hermes_api_gate.py"),
+                    str(self.candidate / "scripts" / "real_hermes_api_gate.py"),
                     "--hermes-home",
                     str(self.home),
                     "--hermes-api-url",
                     f"http://127.0.0.1:{self.api_port}",
                 ],
                 env=_isolated(self.home),
-                cwd=_REPOSITORY,
+                cwd=self.candidate,
                 timeout=1200,
             )
             step.time("gate_s", started)
@@ -1255,14 +1709,19 @@ class Rehearsal:
             step.notes["stderr_bytes"] = len(completed.stderr.encode())
             line = lines[-1] if lines else ""
             if line.startswith("[real-hermes-gate] "):
-                step.notes["gate"] = line
+                refusal, _ = markers([line])
+                step.notes["gate"] = refusal[0] if refusal else "unrecognised"
                 step.fail("gate_refused")
             else:
                 try:
                     record = json.loads(line)
                 except ValueError:
                     record = None
-                if type(record) is not dict or record.get("gate") != "passed":
+                if (
+                    type(record) is not dict
+                    or record.get("gate") != "passed"
+                    or not _is_category(record)
+                ):
                     step.fail("gate_unreadable")
                 else:
                     step.notes["gate"] = record
@@ -1287,18 +1746,18 @@ class Rehearsal:
                 step.differ("voice_tail_at_first_start")
             await self._start_browser()
             step.time("browser_ready_s", started)
+            since = await self.mark()
             step.timings["connect_to_listening_s"] = await self.connect()
-            await self._readiness_cue(step, "connect")
-            # What the page plays while nothing is said: the floor for "audible" and "stale".
-            idle = await self.energy()
-            await asyncio.sleep(3)
-            step.notes["idle_audio_energy"] = round(await self.energy() - idle, 6)
+            # Nothing should be heard but the identified readiness cue.
+            await asyncio.sleep(_QUIET_SECONDS)
+            await self.quiet(step, "connect", since)
             step.notes["session_model"] = await self.page.evaluate(
                 "() => Object.fromEntries(['model-provider','model-name','stt-provider',"
                 "'stt-model','tts-provider','tts-model'].map((id) => "
                 "[id, (document.getElementById(id)?.textContent ?? '').trim()]))"
             )
             before = await self.snapshot()
+            await self.mark()
             energy = await self.energy()
             spoken = time.monotonic()
             await self.speak("question")
@@ -1310,6 +1769,11 @@ class Rehearsal:
                 step.notes["final_transcript"] = False
                 step.differ("no_final_transcript")
                 return
+            # The transcript must say what was spoken, not merely exist.
+            heard = " ".join(await self.unseen("user"))
+            step.notes["transcript_matches"] = transcript_matches(_CLIPS["question"], heard)
+            if not step.notes["transcript_matches"]:
+                step.differ("transcript_mismatch")
             after = await self.reply(before)
             step.time("reply_delivered_s", spoken)
             await self._reply_observations(step, after, await self.energy() - energy)
@@ -1340,8 +1804,8 @@ class Rehearsal:
 
     def _host_argv(self) -> list[str]:
         return [
-            "uv", "run", "--frozen", "--extra", "local", "python",
-            str(Path(__file__).resolve()),
+            str(self.host_python),
+            str(self.candidate / "scripts" / "rehearse_desktop_mvp.py"),
             "--host-child", str(self.run_dir / _HOST_STOP_FILE), "--",
             "--hermes-env-file", str(self.home / ".env"),
             "--hermes-api-url", f"http://127.0.0.1:{self.api_port}",
@@ -1360,8 +1824,12 @@ class Rehearsal:
         self.processes.spawn(
             "host",
             self._host_argv(),
-            env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
-            cwd=_REPOSITORY,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
+            },
+            cwd=self.candidate,
             log=log,
         )
         async with asyncio.timeout(900):
@@ -1460,6 +1928,7 @@ class Rehearsal:
             await self.ensure_connected(step)
             before = await self.snapshot()
             ids = {identity for identity, _ in before["tasks"]}
+            await self.mark()
             sent = time.monotonic()
             await self.type("task: Reply with one sentence confirming the rehearsal delegation.")
             task_id, sequence = await self.track_task(ids, sent, step, 300)
@@ -1468,17 +1937,20 @@ class Rehearsal:
             step.notes["states"] = sequence
             if sequence[:1] != ["active"] or sequence[-1:] != ["completed"]:
                 step.differ("state_sequence")
-            try:
-                await self.wait(
-                    lambda now: now["results"] > before["results"]
-                    or now["assistants"] > before["assistants"] + 0,
-                    60,
-                    "result_reported",
-                )
-                step.notes["result_reported"] = True
-            except TimeoutError:
-                step.notes["result_reported"] = False
+            # The result Hermes produced must reach the page: the stand-in's own sentence in a
+            # background-result row. A spoken reply alone is recorded, not counted.
+            step.stage = "result_reported"
+            reported = False
+            deadline = time.monotonic() + 60
+            while not reported and time.monotonic() < deadline:
+                rows = await self.unseen("task-result")
+                reported = any(_STAND_IN_RESULT in row for row in rows)
+                if not reported:
+                    await asyncio.sleep(0.2)
+            step.notes["result_reported"] = reported
+            if not reported:
                 step.differ("result_not_reported")
+            step.notes["assistant_rows_after_result"] = len(await self.unseen("assistant"))
             body = await self.page.evaluate("() => document.body.innerText")
             step.notes["private_ids"] = len(_PRIVATE_ID.findall(body))
             if step.notes["private_ids"]:
@@ -1585,8 +2057,12 @@ class Rehearsal:
             step.notes["other_tasks_changed"] = changed
             if changed:
                 step.fail("other_task_changed")
-            await asyncio.sleep(2)
+            # The stop must reach the work itself: the stand-in's stream must be hung up.
+            deadline = time.monotonic() + _SETTLE_SECONDS
+            while self.stand_in.open["cancellation"] and time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
             step.notes["model_streams_open"] = self.stand_in.open["cancellation"]
+            step.apply(cancel_work_verdict(self.stand_in.open["cancellation"]))
 
     # -- session step 7 --
 
@@ -1596,19 +2072,18 @@ class Rehearsal:
                 step.skip("no_browser")
                 return
             await self.ensure_connected(step)
-            # Whether the fact from step 3 is still among the heard messages the host keeps.
-            step.notes["earlier_fact_in_window"] = self._tail_count() > 0
-            await self._restate(step)
             await self.page.locator("#session-toggle").click()
             await self.wait(
                 lambda now: now["toggle"] == "Connect" and not now["typed"], 60, "stopped"
             )
             step.stage = "stop_connect"
+            since = await self.mark()
             step.timings["stop_connect_to_listening_s"] = await self.connect()
-            await self._after_reconnect(step, "stop_connect")
+            await self._after_reconnect(step, "stop_connect", since)
             step.stage = "reload"
             await self.page.reload()
             await self.page.wait_for_load_state("networkidle")
+            since = await self.mark()
             try:
                 step.timings["reload_connect_to_listening_s"] = await self.connect()
             except TimeoutError:
@@ -1618,34 +2093,14 @@ class Rehearsal:
                 step.timings["reload_connect_recovered_s"] = await self.connect_until(
                     _RECONNECT_SECONDS
                 )
-            await self._after_reconnect(step, "reload_connect")
+            await self._after_reconnect(step, "reload_connect", since)
             await self._context_check(step, "context_carried_over")
 
-    async def _readiness_cue(self, step: Step, name: str) -> None:
-        """Let the host's readiness cue, played once voice input is ready, finish; record it."""
-
-        energy = await self.energy()
-        await asyncio.sleep(_CUE_SECONDS)
-        step.notes[f"{name}_readiness_cue"] = (await self.energy() - energy) > _AUDIBLE_ENERGY
-
-    async def _after_reconnect(self, step: Step, name: str) -> None:
+    async def _after_reconnect(self, step: Step, name: str, since: float) -> None:
         """No stale audio and no duplicated transcript entries after a reconnect."""
 
-        await self._readiness_cue(step, name)
-        before = await self.snapshot()
-        energy = await self.energy()
-        await asyncio.sleep(3)
-        after = await self.snapshot()
-        heard = await self.energy() - energy
-        stale = (
-            heard > _AUDIBLE_ENERGY
-            and after["assistants"] == before["assistants"]
-            and after["live"] == before["live"] == 0
-        )
-        step.notes[f"{name}_stale_audio"] = stale
-        step.notes[f"{name}_audio_energy"] = round(heard, 6)
-        if stale:
-            step.differ("stale_audio")
+        await asyncio.sleep(_QUIET_SECONDS)
+        await self.quiet(step, name, since)
         entries = await self.page.evaluate(
             "() => [...document.querySelectorAll('#transcript li[data-role]')]"
             ".map((item) => item.dataset.role + ':' + item.textContent)"
@@ -1657,34 +2112,24 @@ class Rehearsal:
 
     async def _ask_phrase(self) -> bool:
         before = await self.snapshot()
+        await self.mark()
         await self.type("What is my favorite bird? Answer with one word.")
         await self.reply(before)
-        return await self.last_assistant_has(self.phrase)
-
-    async def _restate(self, step: Step) -> None:
-        """Restate the fact a later context question depends on.
-
-        The host keeps the last 16 heard messages as context, one per spoken sentence, so a
-        long reply pushes an older fact out; restating it here tests carry-over, not that bound.
-        """
-
-        step.stage = "restate"
-        before = await self.snapshot()
-        await self.type(f"Please keep in mind that my favorite bird is the {self.phrase}.")
-        await self.reply(before)
+        return await self.turn_has_phrase()
 
     async def _context_check(self, step: Step, name: str) -> None:
-        """Is the fact in the context the host carried over, and did the model use it?
+        """Is the step-3 fact still in the context the host keeps, and was it used?
 
-        The voice tail holds exactly the context the host keeps and restores, so the first
-        answer is mechanical. The second depends on the foreground model, and is recorded.
+        Nothing restates it: when the host's bounded window has dropped it, the verdict says
+        so. The voice tail holds exactly the context the host keeps and restores.
         """
 
+        step.stage = name
         carried = self._tail_count() > 0
+        answered = await self._ask_phrase()
         step.notes[name] = carried
-        if not carried:
-            step.differ("context_lost")
-        step.notes[f"{name}_answered"] = await self._ask_phrase()
+        step.notes[f"{name}_answered"] = answered
+        step.apply(context_verdict(carried, answered))
 
     def _tail_count(self) -> int:
         tail = self.state_dir / "voice-tail-v1.json"
@@ -1700,7 +2145,6 @@ class Rehearsal:
                 step.skip("no_browser")
                 return
             await self.ensure_connected(step)
-            await self._restate(step)
             before = await self.snapshot()
             ids = {identity for identity, _ in before["tasks"]}
             await self.type(
@@ -1714,10 +2158,13 @@ class Rehearsal:
             await self.wait(
                 lambda now: self.stand_in.open["restart"] > 0, 60, "work_started"
             )
+            running_before_crash = self.stand_in.open["restart"]
             step.timings["kill_s"] = round(self.processes.kill("host"), 2)
             self.ready["host"] = False
             await asyncio.sleep(2)
-            step.notes["work_running_after_crash"] = self.stand_in.open["restart"]
+            running_after_crash = self.stand_in.open["restart"]
+            step.notes["work_running_before_crash"] = running_before_crash
+            step.notes["work_running_after_crash"] = running_after_crash
             restarted = time.monotonic()
             await self.start_host()
             step.time("restart_to_url_s", restarted)
@@ -1733,10 +2180,15 @@ class Rehearsal:
                 step.differ("no_settlement")
             if step.notes["notice"] is None:
                 step.differ("no_notice")
-            await asyncio.sleep(2)
+            deadline = time.monotonic() + _SETTLE_SECONDS
+            while self.stand_in.open["restart"] and time.monotonic() < deadline:
+                await asyncio.sleep(0.2)
             step.notes["work_running_after_settlement"] = self.stand_in.open["restart"]
-            if self.stand_in.open["restart"]:
-                step.fail("work_left_running")
+            step.apply(
+                restart_work_verdict(
+                    running_before_crash, running_after_crash, self.stand_in.open["restart"]
+                )
+            )
             await self.open_page()
             step.timings["connect_to_listening_s"] = await self.connect()
             await asyncio.sleep(15)
@@ -1759,7 +2211,8 @@ class Rehearsal:
                 step.skip("no_browser")
                 return
             await self.ensure_connected(step)
-            step.notes["phrase_before"] = await self._phrase_counts()
+            seeded = await self._phrase_counts()
+            step.notes["phrase_before"] = seeded
             initial = await self.snapshot()
             step.notes["initial_state"] = _DELETE_STATES.get(initial["deletion"], "other")
             if not initial["deletable"]:
@@ -1801,17 +2254,17 @@ class Rehearsal:
             step.notes["states"] = states
             after = await self._phrase_counts()
             step.notes["phrase_after"] = after
-            if any(after.values()):
-                step.fail("phrase_retained")
-            before = await self.snapshot()
-            await self.type("What is my favorite bird? Answer with one word.")
-            await self.reply(before)
-            step.notes["phrase_in_next_reply"] = await self.last_assistant_has(self.phrase)
-            if step.notes["phrase_in_next_reply"]:
-                step.fail("phrase_in_next_reply")
+            asked = await self._ask_phrase()
+            step.notes["phrase_in_next_reply"] = asked
+            follow_up = await self._phrase_counts()
+            step.notes["phrase_after_follow_up"] = follow_up
+            step.apply(deletion_verdict(seeded, after, follow_up, asked))
+            self.deleted = True
 
     async def _phrase_counts(self) -> dict[str, int]:
-        """Where the conversation's unique phrase still is, as counts."""
+        """Where the conversation's unique phrase still is, as counts: the page, the voice
+        tail, every table and full-text index of Hermes's database, and its session and
+        memory files."""
 
         page = await self.page.evaluate(
             "(word) => (document.querySelector('#transcript')?.textContent ?? '')"
@@ -1821,20 +2274,10 @@ class Rehearsal:
         return {
             "page": int(page),
             "voice_tail": self._tail_count(),
-            "hermes_messages": self._db_count(),
+            "hermes_database": phrase_in_database(self.home / "state.db", self.phrase),
+            "sessions": phrase_in_files(self.home / "sessions", self.phrase),
+            "memories": phrase_in_files(self.home / "memories", self.phrase),
         }
-
-    def _db_count(self) -> int:
-        database = self.home / "state.db"
-        if not database.exists():
-            return 0
-        uri = f"{database.as_uri()}?mode=ro"
-        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
-            row = db.execute(
-                "SELECT count(*) FROM messages WHERE lower(content) LIKE ?",
-                (f"%{self.phrase}%",),
-            ).fetchone()
-        return int(row[0])
 
     # -- session step 9 --
 
@@ -1872,6 +2315,12 @@ class Rehearsal:
             if "livekit" in self.processes.roots:
                 self.processes.kill("livekit")
                 step.notes["livekit_stop"] = "killed"
+            if self.deleted:
+                # With every writer stopped, the deleted phrase must still be gone.
+                step.stage = "phrase_rescan"
+                final = await self._phrase_counts()
+                step.notes["phrase_at_cleanup"] = final
+                step.apply(retained_verdict(final, "phrase_returned"))
         self.processes.observe()
 
     def _planned_stop(self) -> bool:
@@ -1906,7 +2355,8 @@ class Rehearsal:
         await self.stand_in.close()
         ports = [7880, self.api_port, self.companion_port, self.host_port]
         return {
-            "processes_left": self.processes.survivors(),
+            "processes_left": self.processes.survivors(self.containment),
+            "contained": self.containment is not None,
             "ports_listening": sum(1 for port in ports if listeners(port)),
         }
 
@@ -1962,6 +2412,10 @@ async def _rehearse(run_dir: Path, model: str) -> int:
         directory.mkdir(parents=True, exist_ok=True)
     left: dict[str, object] = {}
     try:
+        try:
+            rehearsal.containment = Containment()
+        except OSError:
+            rehearsal.containment = None  # Reported in the summary; survivors still counted.
         rehearsal.clips = await _synthesize_clips()
         await rehearsal.setup()
         for step in (
@@ -2028,16 +2482,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     missing = preflight(args.ollama_model)
     if missing:
-        _emit(
-            {
-                "name": "preflight",
-                "notes": {"missing": missing},
-                "outcome": "not_run",
-                "step": "preflight",
-                "version": 1,
-            }
-        )
-        return 0
+        # A listener already on 7880, such as an orphaned server, is a failure, not a skip.
+        occupied = "livekit_port_in_use" in missing
+        record: dict[str, object] = {
+            "name": "preflight",
+            "notes": {"missing": missing},
+            "outcome": "failed" if occupied else "not_run",
+            "step": "preflight",
+            "version": 1,
+        }
+        if occupied:
+            record["category"] = "livekit_port_in_use"
+        _emit(record)
+        return 1 if occupied else 0
     run_dir = args.run_dir or Path(tempfile.mkdtemp(prefix="hermes-mvp-rehearsal-"))
     run_dir.mkdir(parents=True, exist_ok=True)
     return asyncio.run(_rehearse(run_dir.resolve(), args.ollama_model))
