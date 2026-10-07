@@ -105,6 +105,8 @@ _FRAME_ENERGY = 1e-6
 _CUE_MAX_SECONDS = 2.0
 # How far from the page's voice-input confirmation the cue may start or end.
 _CUE_WINDOW_MS = 3000.0
+# A cue delivered as a reconnect starts can stall once mid-word (about 350 ms observed).
+_CUE_GAP_MS = 500.0
 _MAX_MARKER_CHARS = 512
 _MAX_MARKERS = 32
 _NOTICE = re.compile(
@@ -883,13 +885,17 @@ def audio_without_speech(
             for at, energy in loud
             if cue_at - _CUE_WINDOW_MS <= at <= cue_at + _CUE_WINDOW_MS
         ]
-        contiguous = all(b[0] - a[0] <= 250 for a, b in zip(window, window[1:], strict=False))
+        gaps = [b[0] - a[0] for a, b in zip(window, window[1:], strict=False)]
+        contiguous = all(gap <= _CUE_GAP_MS for gap in gaps)
         if window and contiguous and window[-1][0] - window[0][0] <= _CUE_MAX_SECONDS * 1000:
             cue = window
     unexcused = sum(energy for at, energy in loud if (at, energy) not in cue)
     notes: dict[str, object] = {
         "cue_seconds": round((cue[-1][0] - cue[0][0]) / 1000 + 0.05, 2) if cue else 0.0,
         "first_sound_ms": round(loud[0][0] - cue_at) if loud and cue_at is not None else None,
+        "cue_max_gap_ms": round(
+            max((b[0] - a[0] for a, b in zip(cue, cue[1:], strict=False)), default=0)
+        ),
         "unexcused_energy": round(unexcused, 6),
         "new_assistant_rows": new_assistant_rows,
     }

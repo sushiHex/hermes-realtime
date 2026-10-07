@@ -282,6 +282,11 @@ def test_only_the_identified_readiness_cue_is_excused() -> None:
     assert rehearsal.audio_without_speech(sorted(quiet + cue + late), 900.0, 0)[0] == [
         ("differ", "stale_audio")
     ]
+    # A cue that stalls once mid-word, as observed at a reconnect, is still the one cue.
+    stalled = _frames(1000, 0.3, 5e-4) + _frames(1650, 0.3, 5e-4)
+    findings, notes = rehearsal.audio_without_speech(sorted(quiet + stalled), 900.0, 0)
+    assert findings == []
+    assert notes["cue_max_gap_ms"] == 400
     # A cue-sized burst far from the confirmation is not the cue.
     far = _frames(8000, 1.0, 5e-4)
     assert rehearsal.audio_without_speech(sorted(_frames(0, 10, 0.0) + far), 900.0, 0)[0] == [
