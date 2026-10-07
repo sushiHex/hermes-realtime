@@ -97,6 +97,8 @@ def test_markers_are_kept_by_name_and_rendered_from_their_values() -> None:
         '[voice-archive-send] {"note":"two words"}',
         '[voice-archive-send] {"Bad Key":1}',
         "[voice-review] {" + '"x":"' + "a" * 600 + '"}',
+        # Every value a category, but past the line bound: still dropped.
+        "[voice-tail] {" + ",".join(f'"k{index}":{index}' for index in range(80)) + "}",
         '  [voice-tail] {"x":1}',
         '[real-hermes-gate] {"category":"health","components":{"hermes-identity":'
         '{"refusal":"modified"}},"log":{"aiohttp.client":{"WARNING":1}},"version":1}',
@@ -111,7 +113,7 @@ def test_markers_are_kept_by_name_and_rendered_from_their_values() -> None:
         '{"refusal":"modified"}},"log":{"aiohttp.client":{"WARNING":1}},"version":1}',
     ]
     # Unknown names, text-bearing values and malformed bodies are counted, never recorded.
-    assert dropped == 6
+    assert dropped == 7
     assert "someone" not in json.dumps(found)
 
 
