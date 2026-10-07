@@ -396,7 +396,9 @@ detached with a log and a recorded PID:
 The browser's microphone is a synthetic track. Spoken steps play Kokoro-synthesized clips into
 it, so speech crosses WebRTC, LiveKit, VAD and Moonshine for real. No physical microphone or
 speaker is involved: the track reports the AEC-only processing the page requires without running
-it, and "audible" means the decoded remote audio track carried energy during the reply.
+it, and "audible" means the decoded remote audio track carried energy during the reply. Context
+carried over a reconnect or a restart is checked on the context the host keeps, its voice tail;
+whether the foreground model then used it is recorded beside that, since it depends on the model.
 
 It walks the session steps in order, plus voice deletion (M3), which the runbook has no session
 step for, and prints one `[desktop-mvp-rehearsal] {...}` line per step in the record sheet's

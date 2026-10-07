@@ -1596,6 +1596,9 @@ class Rehearsal:
                 step.skip("no_browser")
                 return
             await self.ensure_connected(step)
+            # Whether the fact from step 3 is still among the heard messages the host keeps.
+            step.notes["earlier_fact_in_window"] = self._tail_count() > 0
+            await self._restate(step)
             await self.page.locator("#session-toggle").click()
             await self.wait(
                 lambda now: now["toggle"] == "Connect" and not now["typed"], 60, "stopped"
@@ -1616,9 +1619,7 @@ class Rehearsal:
                     _RECONNECT_SECONDS
                 )
             await self._after_reconnect(step, "reload_connect")
-            step.notes["context_carried_over"] = await self._ask_phrase()
-            if not step.notes["context_carried_over"]:
-                step.differ("context_lost")
+            await self._context_check(step, "context_carried_over")
 
     async def _readiness_cue(self, step: Step, name: str) -> None:
         """Let the host's readiness cue, played once voice input is ready, finish; record it."""
@@ -1660,6 +1661,37 @@ class Rehearsal:
         await self.reply(before)
         return await self.last_assistant_has(self.phrase)
 
+    async def _restate(self, step: Step) -> None:
+        """Restate the fact a later context question depends on.
+
+        The host keeps the last 16 heard messages as context, one per spoken sentence, so a
+        long reply pushes an older fact out; restating it here tests carry-over, not that bound.
+        """
+
+        step.stage = "restate"
+        before = await self.snapshot()
+        await self.type(f"Please keep in mind that my favorite bird is the {self.phrase}.")
+        await self.reply(before)
+
+    async def _context_check(self, step: Step, name: str) -> None:
+        """Is the fact in the context the host carried over, and did the model use it?
+
+        The voice tail holds exactly the context the host keeps and restores, so the first
+        answer is mechanical. The second depends on the foreground model, and is recorded.
+        """
+
+        carried = self._tail_count() > 0
+        step.notes[name] = carried
+        if not carried:
+            step.differ("context_lost")
+        step.notes[f"{name}_answered"] = await self._ask_phrase()
+
+    def _tail_count(self) -> int:
+        tail = self.state_dir / "voice-tail-v1.json"
+        if not tail.exists():
+            return 0
+        return tail.read_text(encoding="utf-8").casefold().count(self.phrase)
+
     # -- session step 8 --
 
     async def restart(self) -> None:
@@ -1668,11 +1700,7 @@ class Rehearsal:
                 step.skip("no_browser")
                 return
             await self.ensure_connected(step)
-            # The host keeps the last 16 heard messages as context, so the fact the question
-            # after the restart depends on is restated here, inside that window.
-            seeded = await self.snapshot()
-            await self.type(f"Please keep in mind that my favorite bird is the {self.phrase}.")
-            await self.reply(seeded)
+            await self._restate(step)
             before = await self.snapshot()
             ids = {identity for identity, _ in before["tasks"]}
             await self.type(
@@ -1720,9 +1748,7 @@ class Rehearsal:
             step.notes["announcements"] = announcements
             if announcements != 1:
                 step.differ("announcement_count")
-            step.notes["context_resumed"] = await self._ask_phrase()
-            if not step.notes["context_resumed"]:
-                step.differ("context_lost")
+            await self._context_check(step, "context_resumed")
 
     # -- M3: deletion, which the runbook has no session step for --
 
@@ -1792,11 +1818,11 @@ class Rehearsal:
             ".toLowerCase().split(word).length - 1",
             self.phrase,
         )
-        tail = self.state_dir / "voice-tail-v1.json"
-        tail_count = (
-            tail.read_text(encoding="utf-8").casefold().count(self.phrase) if tail.exists() else 0
-        )
-        return {"page": int(page), "voice_tail": tail_count, "hermes_messages": self._db_count()}
+        return {
+            "page": int(page),
+            "voice_tail": self._tail_count(),
+            "hermes_messages": self._db_count(),
+        }
 
     def _db_count(self) -> int:
         database = self.home / "state.db"
