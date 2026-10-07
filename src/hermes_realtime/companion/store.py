@@ -264,7 +264,8 @@ class CompanionStore:
             if row[3] not in (0, 1) or (row[3] == 1 and targets is None):
                 raise ValueError("completion invalid")
         except (TypeError, KeyError, ValueError):
-            raise RuntimeError("deletion record is invalid") from None
+            # Its existence still fences the conversation; nothing else depends on it.
+            raise ArchiveRefusal("quarantined") from None
         return DeletionRecord(row[0], row[1], targets, bool(row[3]))
 
     def deletion(self, conversation_id: str) -> DeletionRecord | None:
@@ -277,11 +278,33 @@ class CompanionStore:
 
     def pending_deletions(self) -> tuple[str, ...]:
         rows = self._connection.execute(
-            "SELECT conversation_id FROM voice_deletion ORDER BY conversation_id"
+            "SELECT conversation_id FROM voice_deletion WHERE complete = 0 "
+            "ORDER BY conversation_id"
         ).fetchmany(MAX_BOUND_CONVERSATIONS + 1)
         if len(rows) > MAX_BOUND_CONVERSATIONS:
             raise RuntimeError("deletion conversation bound exceeded")
         return tuple(row[0] for row in rows)
+
+    def prune_completed(self) -> None:
+        """Drop completed deletions, which only fence late events, at an owned start.
+
+        A late event can only travel on a bridge connection that existed when its
+        generation was tombstoned. An owned start serves no connection yet, so no
+        earlier connection survives it, and the fence has nothing left to stop.
+        """
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "DELETE FROM voice_archive WHERE conversation_id IN "
+                "(SELECT conversation_id FROM voice_deletion WHERE complete = 1)"
+            )
+            connection.execute("DELETE FROM voice_deletion WHERE complete = 1")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
 
     def tombstone(self, conversation_id: str, generation: int) -> bool:
         """Persist the generation fence before any native delete."""
@@ -299,7 +322,10 @@ class CompanionStore:
                 cursor_generation = row[4] if row[4] is not None else row[8]
                 if cursor_generation is not None and cursor_generation != generation:
                     raise ArchiveRefusal("stale")
-            (count,) = self._connection.execute("SELECT COUNT(*) FROM voice_deletion").fetchone()
+            # Only deletions still to reconcile hold capacity; completed ones are fences.
+            (count,) = self._connection.execute(
+                "SELECT COUNT(*) FROM voice_deletion WHERE complete = 0"
+            ).fetchone()
             if count >= MAX_BOUND_CONVERSATIONS:
                 raise ArchiveRefusal("conversations")
             self._connection.execute(
@@ -342,6 +368,8 @@ class CompanionStore:
         self._step(conversation_id, action)
 
     def mark_delete_complete(self, conversation_id: str) -> None:
+        """Record completion; the binding goes with it, and the deletion row fences."""
+
         def action(_row: Any) -> None:
             current = self.deletion(conversation_id)
             if current is None or current.targets is None:
@@ -349,6 +377,9 @@ class CompanionStore:
             self._connection.execute(
                 "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = ?",
                 (conversation_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM voice_archive WHERE conversation_id = ?", (conversation_id,)
             )
         self._step(conversation_id, action)
 
@@ -551,7 +582,7 @@ class CompanionStore:
                 raise ArchiveRefusal("bound")
             (bound,) = self._connection.execute("SELECT COUNT(*) FROM voice_archive").fetchone()
             if bound >= MAX_BOUND_CONVERSATIONS:
-                # Retired generation fences are retained, so capacity fails closed.
+                # Live bindings only: a completed delete removes its binding.
                 raise ArchiveRefusal("conversations")
             self._connection.execute(
                 "INSERT INTO voice_archive (conversation_id, session_id, pending_count, "

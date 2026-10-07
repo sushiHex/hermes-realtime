@@ -504,6 +504,9 @@ def delete_target(db: Any, target: DeleteTarget) -> bool:
         )
         if still_present is True:
             raise ArchiveRefusal("lineage")
+        # A previous attempt may have committed the row and been killed before Hermes
+        # removed the session's files; removing absent files is a no-op.
+        _method(session_db, "SessionDB._remove_session_files")(sessions_dir, session_id)
     return bool(deleted)
 
 
@@ -513,6 +516,26 @@ def delete_targets_absent(db: Any, session_ids: tuple[str, ...]) -> bool:
             conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
             for sid in session_ids
         )
+    return bool(_method(_session_db(db), "SessionDB._execute_write")(read))
+
+
+def branch_copies_absent(db: Any, session_ids: tuple[str, ...]) -> bool:
+    """Whether no session Hermes's ``/branch`` copied from these sessions remains.
+
+    Hermes keeps branches on delete and only clears their parent link, so the stable
+    ``_branched_from`` marker is what still names the session they were copied from.
+    """
+
+    def read(conn: Any) -> bool:
+        return all(
+            conn.execute(
+                "SELECT 1 FROM sessions WHERE json_extract(COALESCE(model_config, '{}'), "
+                "'$._branched_from') = ? LIMIT 1",
+                (sid,),
+            ).fetchone() is None
+            for sid in session_ids
+        )
+
     return bool(_method(_session_db(db), "SessionDB._execute_write")(read))
 
 
@@ -979,6 +1002,9 @@ class HermesArchivePort:
 
     def absent(self, session_ids: tuple[str, ...]) -> bool:
         return delete_targets_absent(self._db, session_ids)
+
+    def branch_copies_absent(self, session_ids: tuple[str, ...]) -> bool:
+        return branch_copies_absent(self._db, session_ids)
 
     def archive_rows(
         self,

@@ -151,7 +151,8 @@ class VoiceCompanionService:
                 archive._retire_owned,
             )
             if all(callable(getattr(port, name, None)) for name in
-                   ("capture_delete_targets", "delete_target", "absent")) else None
+                   ("capture_delete_targets", "delete_target", "absent", "branch_copies_absent"))
+            else None
         )
         self._forget_tasks: set[asyncio.Task[str]] = set()
         self._open_lock = asyncio.Lock()
@@ -204,6 +205,8 @@ class VoiceCompanionService:
                 _marker({"refusal": refusal.category, "version": 1})
         if self._forget is not None:
             await self._forget.reconcile_all()
+        # Before the bridge serves any connection: see CompanionStore.prune_completed.
+        self._store.prune_completed()
         self._memory_ready = True
 
     @property

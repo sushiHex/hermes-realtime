@@ -80,3 +80,69 @@ def test_native_delete_refuses_new_compression_child_inside_write_transaction(
         assert native_actions == []
     finally:
         connection.close()
+
+
+def _native_db(connection: sqlite3.Connection, tmp_path: Path) -> Any:
+    class SessionDB:
+        db_path = str(tmp_path / "state.db")
+
+        def _execute_write(self, action: Any) -> Any:
+            return action(connection)
+
+    return SessionDB
+
+
+def test_a_branch_copy_is_found_even_after_hermes_orphaned_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, model_config TEXT)"
+    )
+    # Hermes's delete set the parent link to NULL; the /branch marker survives.
+    connection.execute(
+        "INSERT INTO sessions VALUES ('copy', NULL, '{\"_branched_from\": \"voice\"}')"
+    )
+    connection.execute("INSERT INTO sessions VALUES ('other', NULL, '{\"_branched_from\": \"x\"}')")
+    session_db = _native_db(connection, tmp_path)
+    monkeypatch.setattr(hermes_compat, "resolve", lambda name: session_db)
+    try:
+        assert hermes_compat.branch_copies_absent(session_db(), ("voice",)) is False
+        connection.execute("DELETE FROM sessions WHERE id = 'copy'")
+        assert hermes_compat.branch_copies_absent(session_db(), ("voice",)) is True
+    finally:
+        connection.close()
+
+
+def test_a_retried_delete_still_removes_the_session_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, "
+        "source TEXT, model_config TEXT, end_reason TEXT)"
+    )
+    removed: list[tuple[Path | None, str]] = []
+    session_db = _native_db(connection, tmp_path)
+    session_db._remove_session_files = lambda self, directory, sid: removed.append(
+        (directory, sid)
+    )
+
+    def native_delete(receiver: Any, session_id: str, **_options: Any) -> bool:
+        # A previous attempt committed the row deletion and was killed before its files.
+        return False
+
+    original_resolve = hermes_compat.resolve
+    monkeypatch.setattr(
+        hermes_compat, "resolve",
+        lambda name: session_db if name == "SessionDB" else (
+            native_delete if name == "SessionDB.delete_session" else original_resolve(name)
+        ),
+    )
+    try:
+        assert hermes_compat.delete_target(session_db(), DeleteTarget("voice")) is False
+        assert removed == [(tmp_path / "sessions", "voice")]
+    finally:
+        connection.close()

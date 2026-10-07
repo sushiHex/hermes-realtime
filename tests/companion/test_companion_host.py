@@ -123,6 +123,9 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
     )
+    hermes.branch_copies_absent = (  # type: ignore[attr-defined]
+        lambda _ids: True
+    )
     service, store = _service(tmp_path, hermes)
     try:
         await service.start()
@@ -143,6 +146,31 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
 
 
 @pytest.mark.asyncio
+async def test_an_owned_start_prunes_completed_deletions_before_serving(
+    tmp_path: Path,
+) -> None:
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
+    hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
+    hermes.absent = lambda _ids: True  # type: ignore[attr-defined]
+    hermes.branch_copies_absent = lambda _ids: True  # type: ignore[attr-defined]
+    service, store = _service(tmp_path, hermes)
+    try:
+        store.tombstone("done", 0)
+        store.set_delete_manifest("done", ())
+        store.mark_delete_complete("done")
+        # Completed during this start's own reconciliation, still before any connection.
+        store.tombstone("open", 0)
+
+        await service.start()
+
+        assert store.deletion("done") is None and store.deletion("open") is None
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_review_end_reconciles_only_after_natural_thread_exit(tmp_path: Path) -> None:
     hermes = FakeHermes()
     hermes.capture_delete_targets = (  # type: ignore[attr-defined]
@@ -157,6 +185,9 @@ async def test_review_end_reconciles_only_after_natural_thread_exit(tmp_path: Pa
     hermes.delete_target = delete  # type: ignore[attr-defined]
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
+    )
+    hermes.branch_copies_absent = (  # type: ignore[attr-defined]
+        lambda _ids: True
     )
 
     class Review:
