@@ -201,6 +201,30 @@ describe("voice conversation deletion control", () => {
     dom.window.close();
   });
 
+  it("never treats a delete answered with unknown as started", async () => {
+    const requests: string[] = [];
+    const { dom, status, controls } = mount({
+      confirm: () => true,
+      request: (path) => {
+        requests.push(path);
+        if (path === "/api/v1/delete-voice-conversation") return Promise.resolve(response("unknown"));
+        // The recovery refresh stays in flight, so the status shows the delete's own outcome.
+        return requests.length === 1 ? Promise.resolve(response("idle")) : new Promise<unknown>(() => undefined);
+      },
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    await controls.delete();
+    expect(status.textContent).toBe("Deletion could not be confirmed. Checking status.");
+    expect(requests).toEqual([
+      "/api/v1/voice-delete-status",
+      "/api/v1/delete-voice-conversation",
+      "/api/v1/voice-delete-status",
+    ]);
+    controls.reset();
+    dom.window.close();
+  });
+
   it("states that a Hermes /branch copy keeps a deletion pending", async () => {
     const confirmations: string[] = [];
     const { dom, controls } = mount({
