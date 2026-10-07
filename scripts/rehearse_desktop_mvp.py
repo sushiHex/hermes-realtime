@@ -184,6 +184,9 @@ def _emit(record: Mapping[str, object]) -> None:
 # --- The stand-in model -------------------------------------------------------------------
 
 _CHMOD = re.compile(r"chmod 777 (\S+)")
+# What Hermes writes when the user refused a command it asked to approve: "Command denied by
+# user" on the API approval path the host uses, "User denied" on the interactive ones.
+_DENIED = re.compile(r"BLOCKED: (?:Command denied by user|User denied)")
 _TIMED = re.compile(r"\babout (\d{1,3}) seconds\b")
 _LABEL = re.compile(r"\brehearsal ([a-z]+) task\b")
 _ENDLESS = ("until you are stopped", "think carefully for several minutes")
@@ -256,7 +259,7 @@ def tool_outcome(body: object) -> str | None:
     ]
     if not results:
         return None
-    if "BLOCKED: User denied" in results[-1]:
+    if _DENIED.search(results[-1]) is not None:
         return "denied"
     return "blocked" if "BLOCKED" in results[-1] else "ran"
 
@@ -682,6 +685,12 @@ def _loopback_only(addresses: list[str]) -> bool:
     return bool(addresses) and all(address in {"127.0.0.1", "[::1]"} for address in addresses)
 
 
+def listener_verdict(name: str, addresses: list[str]) -> list[Finding]:
+    """A listener is part of the security boundary: anything but loopback fails the step."""
+
+    return [] if _loopback_only(addresses) else [("fail", f"{name}_not_loopback")]
+
+
 def _run(
     argv: list[str],
     *,
@@ -864,6 +873,48 @@ def retained_verdict(scan: Mapping[str, int], category: str) -> list[Finding]:
         # Built-in memory is not erased by design: there is no unlearning in the MVP.
         return [("differ", "memory_retains_phrase")]
     return []
+
+
+def tail_rows(raw: bytes) -> list[tuple[str, str]] | None:
+    """The (role, text) rows of a voice tail document, or None when it is not one."""
+
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    rows = document.get("messages") if type(document) is dict else None
+    if type(rows) is not list:
+        return None
+    parsed: list[tuple[str, str]] = []
+    for row in rows:
+        if type(row) is not dict or type(row.get("role")) is not str:
+            return None
+        if type(row.get("text")) is not str:
+            return None
+        parsed.append((row["role"], row["text"]))
+    return parsed
+
+
+def stated_by_user(rows: list[tuple[str, str]], phrase: str) -> bool:
+    """Is the fact in a row the user said? The model's own echo of it is not the fact."""
+
+    folded = phrase.casefold()
+    return any(role == "user" and folded in text.casefold() for role, text in rows)
+
+
+def restored_fact(loaded: list[tuple[str, str]] | None, restored: object, phrase: str) -> bool:
+    """Did a restarted host load the user's statement of the fact?
+
+    The host restores a tail whole or not at all, so its restore count must equal the rows
+    of the file it read, and the user's statement must be among them.
+    """
+
+    return (
+        loaded is not None
+        and type(restored) is int
+        and restored == len(loaded)
+        and stated_by_user(loaded, phrase)
+    )
 
 
 def context_verdict(in_kept_context: bool, answered: bool) -> list[Finding]:
@@ -1734,12 +1785,13 @@ class Rehearsal:
                 await asyncio.sleep(0.5)
             while not listeners(self.companion_port):
                 await asyncio.sleep(0.5)
-        step.notes["api_loopback_only"] = _loopback_only(listeners(self.api_port))
-        step.notes["companion_loopback_only"] = _loopback_only(listeners(self.companion_port))
-        if not (step.notes["api_loopback_only"] and step.notes["companion_loopback_only"]):
-            step.differ("not_loopback")
+        exposed = listener_verdict("api", listeners(self.api_port)) + listener_verdict(
+            "companion", listeners(self.companion_port)
+        )
+        step.apply(exposed)
         self.processes.observe()
-        self.ready["gateway"] = True
+        # Nothing runs behind a listener that is open beyond loopback.
+        self.ready["gateway"] = not exposed
 
     # -- session step 1 --
 
@@ -1797,7 +1849,8 @@ class Rehearsal:
                 return
             started = time.monotonic()
             step.notes["prior_voice_tail"] = (self.state_dir / "voice-tail-v1.json").exists()
-            await self._start_livekit(step)
+            if not await self._start_livekit(step):
+                return
             step.time("livekit_ready_s", started)
             await self.start_host()
             step.time("host_ready_s", started)
@@ -1849,7 +1902,9 @@ class Rehearsal:
             if name in named:
                 step.timings[f"{name}_ms"] = named[name]
 
-    async def _start_livekit(self, step: Step) -> None:
+    async def _start_livekit(self, step: Step) -> bool:
+        """Start LiveKit; False, with the step failed, when signaling is open beyond loopback."""
+
         log = self.logs_dir / "livekit.log"
         self.processes.spawn(
             "livekit",
@@ -1860,7 +1915,10 @@ class Rehearsal:
         async with asyncio.timeout(30):
             while _http("http://127.0.0.1:7880/") != (200, b"OK"):
                 await asyncio.sleep(0.2)
-        step.notes["livekit_signaling_loopback_only"] = listeners(7880) == ["127.0.0.1"]
+        exposed = listener_verdict("livekit_signaling", listeners(7880))
+        step.notes["livekit_signaling_loopback_only"] = not exposed
+        step.apply(exposed)
+        return not exposed
 
     def _host_argv(self) -> list[str]:
         return [
@@ -2147,10 +2205,6 @@ class Rehearsal:
             since = await self.mark()
             step.timings["stop_connect_to_listening_s"] = await self.connect()
             await self._after_reconnect(step, "stop_connect", since)
-            # Spend a typed turn and an approval decision in this session first: the reloaded
-            # page restarts both its counters, so the session behind it must restart them too.
-            await self._typed_round(step, "typed_before_reload")
-            await self._approval_round(step, "approval_before_reload")
             step.stage = "reload"
             await self.page.reload()
             await self.page.wait_for_load_state("networkidle")
@@ -2165,9 +2219,35 @@ class Rehearsal:
                     _RECONNECT_SECONDS
                 )
             await self._after_reconnect(step, "reload_connect", since)
+            # The same host kept running: the tail mirrors the context it holds.
+            rows = tail_rows(self._tail_bytes())
+            step.notes["context_rows"] = None if rows is None else len(rows)
+            await self._context_check(
+                step, "context_carried_over", rows is not None and stated_by_user(rows, self.phrase)
+            )
+
+    # -- after deletion: a reloaded page's input counters, which the runbook has no step for --
+
+    async def reload_inputs(self) -> None:
+        """A reloaded page restarts its typed-input and approval counters, so the session
+        behind it must restart them too. Its own step, after the context checks and the
+        deletion: its turns would otherwise push the step-3 fact out of the bounded tail."""
+
+        async with self.step("reload_inputs", "reload_input_counters") as step:
+            step.notes["runbook_step"] = None
+            if not self.ready["browser"]:
+                step.skip("no_browser")
+                return
+            await self.ensure_connected(step)
+            # Spend both counters in this session, then reload and use them again.
+            await self._typed_round(step, "typed_before_reload")
+            await self._approval_round(step, "approval_before_reload")
+            step.stage = "reload"
+            await self.page.reload()
+            await self.page.wait_for_load_state("networkidle")
+            step.timings["reload_connect_to_listening_s"] = await self.connect()
             await self._typed_round(step, "typed_after_reload")
             await self._approval_round(step, "approval_after_reload")
-            await self._context_check(step, "context_carried_over")
 
     def _answer_since(self, mark: int, path: str) -> int | None:
         statuses = [status for seen, status in self.answers[mark:] if seen == path]
@@ -2247,21 +2327,26 @@ class Rehearsal:
         await self.reply(before)
         return await self.turn_has_phrase()
 
-    async def _context_check(self, step: Step, name: str) -> None:
+    async def _context_check(self, step: Step, name: str, carried: bool) -> None:
         """Is the step-3 fact still in the context the host keeps, and was it used?
 
         Nothing restates it: when the host's bounded window has dropped it, the verdict says
-        so. The voice tail holds exactly the context the host keeps and restores.
+        so. The caller judges ``carried`` from the rows the host keeps, never from a raw count.
         """
 
         step.stage = name
-        carried = self._tail_count() > 0
         answered = await self._ask_phrase()
         step.notes[name] = carried
         step.notes[f"{name}_answered"] = answered
         step.apply(context_verdict(carried, answered))
 
+    def _tail_bytes(self) -> bytes:
+        tail = self.state_dir / "voice-tail-v1.json"
+        return tail.read_bytes() if tail.exists() else b""
+
     def _tail_count(self) -> int:
+        """Every occurrence of the phrase in the tail file: what a deletion must remove."""
+
         tail = self.state_dir / "voice-tail-v1.json"
         if not tail.exists():
             return 0
@@ -2295,6 +2380,8 @@ class Rehearsal:
             running_after_crash = self.stand_in.open["restart"]
             step.notes["work_running_before_crash"] = running_before_crash
             step.notes["work_running_after_crash"] = running_after_crash
+            # Exactly what the new host will read, taken before it can write anything.
+            loaded = tail_rows(self._tail_bytes())
             restarted = time.monotonic()
             await self.start_host()
             step.time("restart_to_url_s", restarted)
@@ -2330,7 +2417,10 @@ class Rehearsal:
             step.notes["announcements"] = announcements
             if announcements != 1:
                 step.differ("announcement_count")
-            await self._context_check(step, "context_resumed")
+            step.notes["context_rows"] = None if loaded is None else len(loaded)
+            await self._context_check(
+                step, "context_resumed", restored_fact(loaded, restored, self.phrase)
+            )
 
     # -- M3: deletion, which the runbook has no session step for --
 
@@ -2558,6 +2648,7 @@ async def _rehearse(run_dir: Path, model: str) -> int:
             rehearsal.reconnect,
             rehearsal.restart,
             rehearsal.delete,
+            rehearsal.reload_inputs,
             rehearsal.cleanup,
         ):
             await step()

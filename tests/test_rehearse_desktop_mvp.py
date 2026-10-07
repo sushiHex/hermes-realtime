@@ -263,6 +263,42 @@ def test_context_and_work_verdicts() -> None:
     assert rehearsal.restart_work_verdict(1, 1, 1) == [("fail", "work_left_running")]
 
 
+def test_any_listener_beyond_loopback_fails() -> None:
+    verdict = rehearsal.listener_verdict
+    assert verdict("livekit_signaling", ["127.0.0.1"]) == []
+    assert verdict("api", ["127.0.0.1", "[::1]"]) == []
+    for addresses in (["0.0.0.0"], ["127.0.0.1", "192.0.2.1"], ["[::]"], []):
+        assert verdict("livekit_signaling", addresses) == [
+            ("fail", "livekit_signaling_not_loopback")
+        ]
+
+
+def _tail(*rows: tuple[str, str]) -> bytes:
+    return json.dumps(
+        {"messages": [{"role": r, "text": t, "interrupted": False} for r, t in rows]}
+    ).encode()
+
+
+def test_carried_context_is_the_user_stating_it_not_the_model_echoing_it() -> None:
+    stated = rehearsal.tail_rows(_tail(("user", "My bird is the Heron."), ("assistant", "ok")))
+    echoed = rehearsal.tail_rows(_tail(("user", "What is my bird?"), ("assistant", "Heron")))
+    assert stated is not None and echoed is not None
+    assert rehearsal.stated_by_user(stated, "heron")
+    assert not rehearsal.stated_by_user(echoed, "heron")
+    for raw in (b"", b"{not json", b'{"messages": {}}', b'{"messages": [{"role": 1}]}', b"[]"):
+        assert rehearsal.tail_rows(raw) is None
+
+
+def test_a_restarted_host_must_have_loaded_every_row_it_read() -> None:
+    loaded = rehearsal.tail_rows(_tail(("user", "My bird is the heron."), ("assistant", "ok")))
+    assert rehearsal.restored_fact(loaded, 2, "heron")
+    # A partial restore, a refused one, or no file at all is not the fact carried.
+    assert not rehearsal.restored_fact(loaded, 1, "heron")
+    assert not rehearsal.restored_fact(loaded, None, "heron")
+    assert not rehearsal.restored_fact(None, 2, "heron")
+    assert not rehearsal.restored_fact(loaded, 2, "wren")
+
+
 def test_a_page_input_needs_both_the_wire_status_and_its_effect() -> None:
     verdict = rehearsal.page_input_verdict
     assert verdict("typed_after_reload", 200, True) == []
@@ -279,6 +315,12 @@ def test_the_stand_in_reads_the_hermes_verdict_on_its_tool_call() -> None:
         return _body("task: run chmod 777 x", after=[{"role": "tool", "content": content}])
 
     outcome = rehearsal.tool_outcome
+    # The wording the pinned Hermes stores for a decision rejected on the API approval path.
+    api_denial = (
+        '{"output": "", "exit_code": -1, "error": "BLOCKED: Command denied by user. The user'
+        ' has NOT consented to this action."}'
+    )
+    assert outcome(answered(api_denial)) == "denied"
     assert outcome(answered('{"error": "BLOCKED: User denied this command."}')) == "denied"
     assert outcome(answered("BLOCKED: this command matches a deny rule")) == "blocked"
     assert outcome(answered('{"output": "", "exit_code": 0}')) == "ran"
@@ -405,37 +447,59 @@ def test_every_verdict_is_applied_where_it_is_observed() -> None:
             "_context_check",
             "restart",
             "delete",
+            "reload_inputs",
             "cleanup",
             "quiet",
             "_ask_phrase",
+            "_start_livekit",
         )
     }
+    gateway = inspect.getsource(rehearsal.Rehearsal._start_gateway)
+    assert gateway.count("listener_verdict(") == 2
+    assert '"api", listeners(self.api_port)' in gateway
+    assert '"companion", listeners(self.companion_port)' in gateway
+    assert 'listener_verdict("livekit_signaling"' in source["_start_livekit"]
+    assert "step.apply(exposed)" in gateway
+    assert "step.apply(exposed)" in source["_start_livekit"]
+    assert "if not await self._start_livekit(step):" in source["start_and_talk"]
     assert "self.quiet(step" in source["start_and_talk"]
     assert "transcript_matches(" in source["start_and_talk"]
     assert 'step.differ("result_not_reported")' in source["delegate"]
     assert "step.apply(cancel_work_verdict(" in source["cancel"]
     assert "self.quiet(step" in source["_after_reconnect"]
     assert source["reconnect"].count("self._after_reconnect(") == 2
-    assert "self._context_check(" in source["reconnect"]
-    # The page's counters are spent before the reload and used again after it.
-    reconnect = source["reconnect"]
-    reload_at = reconnect.index("await self.page.reload()")
+    assert "stated_by_user(rows, self.phrase)" in source["reconnect"]
+    # The page's counters are spent before the reload and used again after it, in a step of
+    # their own, so their turns cannot push the step-3 fact out of the bounded tail.
+    inputs = source["reload_inputs"]
+    reload_at = inputs.index("await self.page.reload()")
     for round_call in (
         'self._typed_round(step, "typed_before_reload")',
         'self._approval_round(step, "approval_before_reload")',
     ):
-        assert reconnect.index(round_call) < reload_at
+        assert inputs.index(round_call) < reload_at
     for round_call in (
         'self._typed_round(step, "typed_after_reload")',
         'self._approval_round(step, "approval_after_reload")',
     ):
-        assert reload_at < reconnect.index(round_call) < reconnect.index("self._context_check(")
+        assert reload_at < inputs.index(round_call)
+    for name in ("reconnect", "restart"):
+        assert "_round(" not in source[name]
+    order = inspect.getsource(rehearsal._rehearse)
+    assert order.index("rehearsal.delete,") < order.index("rehearsal.reload_inputs,")
     for name in ("_typed_round", "_approval_round"):
         method = inspect.getsource(getattr(rehearsal.Rehearsal, name))
         assert "step.apply(page_input_verdict(" in method
     assert "step.apply(context_verdict(" in source["_context_check"]
     assert "restart_work_verdict(" in source["restart"]
-    assert "self._context_check(" in source["restart"]
+    # The restarted host's context is judged from the file it read, before it could write.
+    restart = source["restart"]
+    assert restart.index("loaded = tail_rows(self._tail_bytes())") < restart.index(
+        "await self.start_host()"
+    )
+    assert "restored_fact(loaded, restored, self.phrase)" in restart
+    for name in ("reconnect", "restart", "_context_check"):
+        assert "_tail_count" not in source[name]
     assert "step.apply(deletion_verdict(" in source["delete"]
     assert "step.apply(retained_verdict(" in source["cleanup"]
     assert "step.apply(findings)" in source["quiet"]

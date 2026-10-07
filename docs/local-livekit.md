@@ -418,9 +418,18 @@ script's own actions succeeding.
 - *A delegated task.* The result Hermes produced must appear in a background-result row.
 - *Cancel and restart.* A cancel must hang up the stand-in's stream. A restart needs work running
   through the crash, and that work stopped after settlement.
-- *Context.* Context carried over a reconnect or a restart means the step-3 fact is still in the
-  context the host keeps (its voice tail), and the model's reply used it. Nothing restates the
-  fact, so the bounded context window shows up as a `different` verdict.
+- *Context.* Context carried over a reconnect or a restart means two things: the user's own
+  step-3 row stating the fact is among the rows the host keeps (its voice tail), and the model's
+  reply used it. The model's echo of the fact does not count. After a restart, the rows are the
+  ones the new host read, captured before it started. The host must also report restoring exactly
+  that many. Nothing restates the fact, so the bounded context window shows up as a `different`
+  verdict.
+- *Listeners.* The Hermes API, the companion and LiveKit signaling must listen on loopback only.
+  Any other address fails the step, and nothing runs behind that listener.
+- *Reload inputs.* A step after the deletion spends a typed turn and an approval decision, reloads
+  the page, and makes one of each again. Each is judged by its status as the browser's network
+  layer saw it, and by its effect: a reply, or Hermes's own report to the model that the user
+  denied the command. It runs last so its turns cannot push the step-3 fact out of the tail.
 - *Deletion.* The phrase must be found before deletion, in the voice tail and in Hermes's
   database. Afterwards it must be gone from four places:
   - the page;
