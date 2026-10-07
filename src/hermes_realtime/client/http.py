@@ -192,8 +192,7 @@ class BrowserBootstrapApplication:
                     raise PermissionError("stable session request is invalid")
                 await authorizer.authorize(peer)
             elif type(authorizer) is LoopbackPeerAuthorizer:
-                if type(peer) is not LoopbackPeerAddress:
-                    raise PermissionError("stable session request is invalid")
+                # The authorizer refuses anything but an exact loopback peer, None included.
                 await authorizer.authorize(peer)
             else:
                 raise PermissionError("stable session request is invalid")
