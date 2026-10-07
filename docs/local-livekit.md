@@ -259,6 +259,28 @@ machine loopback boundary: any local process can construct the same HTTP request
 session while no browser session is active. Enable it only on a single-user trusted workstation;
 retain the one-use diagnostic flow where local processes are outside the trust boundary.
 
+A stable-launch tab survives a reload. The tab keeps in its own `sessionStorage` only what
+`/api/v1/stable-rebind` needs: the session's current participant identity, which rotates on
+every rebind, and the request ID of a reload rebind still awaiting its answer. It never stores
+the LiveKit token. After a reload, **Connect** presents that identity with `"freshView": true`;
+the session rotates the identity as any rebind does and resets everything the page holds, since
+the reloaded page kept nothing: the event projection restarts at sequence one with the session's
+own description and every task still running and approval still actionable, and the typed-input
+and approval counters restart at zero, as the page's do. Only a definitive verdict changes what
+the tab remembers. A rotation (2xx) remembers the new identity; when no session is active (409)
+the tab forgets the identity and bootstraps; an identity that is not the active one is refused
+(403) and forgotten, so a reload never replaces another tab's session. Every other outcome keeps
+the identity and its request ID for the next **Connect**, which replays the same request, so a
+rotation whose answer was lost is answered again instead of refused: a transient refusal (503,
+such as a reload during the readiness cue, refused until the host has settled that speech), a
+network error, or a failure later in connect. The server answers 409 for exactly "no session is
+active"; every other state refusal is 503. A leaving page never reconnects the session it is
+leaving: the LiveKit SDK's own page-leave disconnect is turned off, since the page would read it
+as a dropped connection and rebind, rotating the identity the reloaded tab is about to present.
+Only a stop that succeeded forgets the stored identity. A duplicated tab copies
+`sessionStorage` and can therefore rebind the session away from the original, which then needs
+**Connect** again. The one-use fragment launch stores nothing and still needs a fresh launch.
+
 ## Conversation-only loopback launcher
 
 Milestone 6.1 supplies a runnable local profile for the first desktop conversation slice:
