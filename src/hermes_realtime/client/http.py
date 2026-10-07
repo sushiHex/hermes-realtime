@@ -213,10 +213,12 @@ class BrowserBootstrapApplication:
                     )
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     raise ValueError("stable rebind body must be strict UTF-8 JSON") from None
-                if type(decoded) is not dict or set(decoded) != {
-                    "participantIdentity",
-                    "requestId",
-                }:
+                # A reloaded page kept only its identity, so it also asks for a fresh view.
+                required = {"participantIdentity", "requestId"}
+                if type(decoded) is not dict or set(decoded) not in (
+                    required,
+                    required | {"freshView"},
+                ):
                     raise ValueError(
                         "stable rebind must contain exact participantIdentity and requestId"
                     )
@@ -224,9 +226,13 @@ class BrowserBootstrapApplication:
                 request_id = decoded["requestId"]
                 if type(participant_identity) is not str or type(request_id) is not str:
                     raise TypeError("stable rebind fields must be exact strings")
+                fresh_view = "freshView" in decoded
+                if fresh_view and decoded["freshView"] is not True:
+                    raise ValueError("stable rebind freshView must be exactly true")
                 credential = await self._sessions.rebind(
                     participant_identity=participant_identity,
                     request_id=request_id,
+                    fresh_view=fresh_view,
                 )
             payload: object = self._credential_payload(credential)
             status = 200

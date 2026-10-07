@@ -969,11 +969,21 @@ class BrowserSessionDirector:
         *,
         participant_identity: str,
         request_id: str | None = None,
+        fresh_view: bool = False,
     ) -> BrowserJoinCredential:
+        """Rotate the active browser identity, keeping the session.
+
+        ``fresh_view`` is for a page that kept nothing but its identity, such as a reload: its
+        projection restarts at sequence one with the session's own description.
+        """
+
+        if type(fresh_view) is not bool:
+            raise TypeError("fresh_view must be an exact boolean")
         async with self._model_operation_lock:
             return await self._rebind_after_model_operations(
                 participant_identity=participant_identity,
                 request_id=request_id,
+                fresh_view=fresh_view,
             )
 
     async def projection_resync(
@@ -1032,40 +1042,7 @@ class BrowserSessionDirector:
                             failures,
                         ) from None
                     raise
-                self._projection.reset()
-                self._projection.ensure_capacity(
-                    1
-                    + (1 if self._model_configuration is not None else 0)
-                    + (1 if self._search_egress_authority is not None else 0)
-                )
-                self._projection.publish(
-                    "session_ready",
-                    {
-                        "conversationProfile": self._conversation_profile,
-                        "mode": "microphone_or_typed",
-                        **self._speech_runtime.public_data(),
-                    },
-                )
-                if self._model_configuration is not None:
-                    self._projection.publish(
-                        "session_model",
-                        self._model_configuration.public_data(),
-                    )
-                status_reservation = (
-                    self._projection.reserve_capture_status()
-                    if self._evidence_status is not None
-                    else None
-                )
-                if status_reservation is not None:
-                    status_provider = self._evidence_status
-                    assert status_provider is not None
-                    status = status_provider()
-                    if type(status) is not CaptureStatusV1:
-                        raise TypeError("evidence_status must return an exact CaptureStatusV1")
-                    self._projection.publish_capture_status(
-                        status_reservation,
-                        cast(dict[str, PublicValue], capture_status_to_primitive(status)),
-                    )
+                self._publish_fresh_view()
                 self._previous_rebind_request = None
                 self._previous_rebind_credential = None
                 self._active_identity = credential.participant_identity
@@ -1092,11 +1069,54 @@ class BrowserSessionDirector:
                 self._touch_activity()
                 return credential
 
+    def _publish_fresh_view(self) -> None:
+        """Restart the projection at sequence one with the session's own description.
+
+        A page whose cursor or view is gone needs what a new session would show it; the
+        search egress status follows when the caller binds the replacement identity.
+        """
+
+        self._projection.reset()
+        self._projection.ensure_capacity(
+            1
+            + (1 if self._model_configuration is not None else 0)
+            + (1 if self._search_egress_authority is not None else 0)
+        )
+        self._projection.publish(
+            "session_ready",
+            {
+                "conversationProfile": self._conversation_profile,
+                "mode": "microphone_or_typed",
+                **self._speech_runtime.public_data(),
+            },
+        )
+        if self._model_configuration is not None:
+            self._projection.publish(
+                "session_model",
+                self._model_configuration.public_data(),
+            )
+        status_reservation = (
+            self._projection.reserve_capture_status()
+            if self._evidence_status is not None
+            else None
+        )
+        if status_reservation is not None:
+            status_provider = self._evidence_status
+            assert status_provider is not None
+            status = status_provider()
+            if type(status) is not CaptureStatusV1:
+                raise TypeError("evidence_status must return an exact CaptureStatusV1")
+            self._projection.publish_capture_status(
+                status_reservation,
+                cast(dict[str, PublicValue], capture_status_to_primitive(status)),
+            )
+
     async def _rebind_after_model_operations(
         self,
         *,
         participant_identity: str,
         request_id: str | None,
+        fresh_view: bool,
     ) -> BrowserJoinCredential:
         """Rotate a stale browser identity while preserving session-owned conversation state."""
 
@@ -1162,6 +1182,8 @@ class BrowserSessionDirector:
                         failures,
                     ) from None
                 raise
+            if fresh_view:
+                self._publish_fresh_view()
             self._previous_rebind_request = (
                 (identity, request_id) if request_id is not None else None
             )

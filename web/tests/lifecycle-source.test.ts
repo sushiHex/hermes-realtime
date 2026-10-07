@@ -8,6 +8,42 @@ const mainSource = readFileSync(
   "utf8",
 );
 
+describe("reloaded tab rebind wiring", () => {
+  it("remembers the identity at every credential change and forgets it on stop", () => {
+    const setter = mainSource.indexOf("function setCredential(");
+    const setterEnd = mainSource.indexOf("\n}\n", setter);
+    expect(setter).toBeGreaterThan(-1);
+    const outside = mainSource.slice(0, setter) + mainSource.slice(setterEnd);
+    expect(outside.match(/\bcredential = /g) ?? []).toHaveLength(0);
+    expect(outside).toContain("let credential: BootstrapCredential | null = null;");
+    expect(mainSource.slice(setter, setterEnd)).toContain(
+      "if (stableLaunch) rememberSessionIdentity(tabStorage(), value?.participantIdentity ?? null);",
+    );
+    expect(mainSource.match(/setCredential\(null\)/g)?.length).toBe(2);
+  });
+
+  it("starts a stable tab by rebinding its remembered identity before any bootstrap", () => {
+    const connectStart = mainSource.indexOf("async function connect(");
+    const freshPath = mainSource.indexOf(
+      "\n    } else {\n",
+      mainSource.indexOf("    if (resuming) {", connectStart),
+    );
+    expect(freshPath).toBeGreaterThan(connectStart);
+    expect(mainSource.slice(freshPath, freshPath + 120)).toContain(
+      "setCredential(await bootstrapOrReload(localOperation.signal));",
+    );
+    expect(mainSource).toContain(
+      "reloadIdentity = stableLaunch ? rememberedSessionIdentity(tabStorage()) : null;",
+    );
+    const reload = mainSource.indexOf("async function bootstrapOrReload(");
+    const reloadEnd = mainSource.indexOf("\n}\n", reload);
+    const body = mainSource.slice(reload, reloadEnd);
+    // Only an answer settles the identity, and only "no session is active" bootstraps.
+    expect(body.indexOf("reloadIdentity = null;")).toBeGreaterThan(body.indexOf("await connectionFetch("));
+    expect(body).toContain("if (!rebindFailureAllowsFreshBootstrap(response.status)) {");
+  });
+});
+
 describe("browser lifecycle wiring", () => {
   it("releases residual remote playback before error-resume room teardown", () => {
     const blockStart = mainSource.indexOf("  if (errorResume) {", mainSource.indexOf("async function connect"));

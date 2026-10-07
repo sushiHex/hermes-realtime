@@ -2218,6 +2218,154 @@ async def test_loopback_stable_rebind_enforces_peer_browser_and_session_authorit
     assert rebound == ["browser_fedcba9876543210"]
 
 
+def _reload_director(
+    projection: BrowserEventProjection,
+) -> tuple[BrowserSessionDirector, list[str]]:
+    identities = iter(
+        ("browser_0123456789abcdef", "browser_fedcba9876543210", "browser_00112233aabbccdd")
+    )
+    rebound: list[str] = []
+
+    async def provision(_identity: str) -> int:
+        return 1
+
+    async def reprovision(identity: str) -> int:
+        rebound.append(identity)
+        return len(rebound) + 1
+
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="room",
+            identity_factory=lambda: next(identities),
+        ),
+        provision=provision,
+        reprovision=reprovision,
+        submit=_noop_submit,
+        stop=_noop_stop,
+        approval=_noop_approval,
+        projection=projection,
+    )
+    return director, rebound
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_view_rebind_restarts_the_projection_a_reconnect_keeps() -> None:
+    projection = BrowserEventProjection()
+    director, rebound = _reload_director(projection)
+    initial = await director.start()
+    await director.public_events_after(
+        participant_identity=initial.participant_identity, sequence=1
+    )
+
+    reconnected = await director.rebind(participant_identity=initial.participant_identity)
+
+    # A reconnecting page keeps its view and its cursor: nothing is replayed.
+    assert projection.events_after(0) == ()
+
+    reloaded = await director.rebind(
+        participant_identity=reconnected.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+
+    # A reloaded page has no view: it gets the session's own description from sequence one.
+    events = projection.events_after(0)
+    assert [(event.sequence, event.kind) for event in events] == [(1, "session_ready")]
+    assert rebound == [reconnected.participant_identity, reloaded.participant_identity]
+    assert director.active_identity == reloaded.participant_identity
+    replay = await director.rebind(
+        participant_identity=reconnected.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+    assert replay == reloaded
+    assert [event.sequence for event in projection.events_after(0)] == [1]
+    with pytest.raises(TypeError, match="fresh_view"):
+        await director.rebind(
+            participant_identity=reloaded.participant_identity,
+            fresh_view=1,  # type: ignore[arg-type]
+        )
+    assert director.active_identity == reloaded.participant_identity
+
+
+@pytest.mark.asyncio
+async def test_loopback_stable_rebind_admits_exactly_a_true_fresh_view() -> None:
+    projection = BrowserEventProjection()
+    director, rebound = _reload_director(projection)
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+    app = BrowserBootstrapApplication(
+        sessions=director,
+        verifier=BrowserTokenVerifier(connection=connection, room_name="room"),
+        capability=None,
+        allowed_origin="http://127.0.0.1:8765",
+        worker_identity="worker_hermes_browser",
+        loopback_authorizer=LoopbackPeerAuthorizer(),
+    )
+    peer = LoopbackPeerAddress.from_peername(("127.0.0.1", 54321))
+    common = {"origin": "http://127.0.0.1:8765", "sec-fetch-site": "same-origin"}
+    initial = json.loads(
+        (
+            await app.handle(
+                method="POST",
+                path="/api/v1/stable-bootstrap",
+                headers={**common, "content-length": "0"},
+                body=b"",
+                peer=peer,
+            )
+        ).body
+    )
+    await director.public_events_after(
+        participant_identity=initial["participantIdentity"], sequence=1
+    )
+
+    def request(fields: dict[str, object]) -> tuple[dict[str, str], bytes]:
+        body = json.dumps(fields, separators=(",", ":")).encode("utf-8")
+        headers = {
+            **common,
+            "content-length": str(len(body)),
+            "content-type": "application/json",
+        }
+        return headers, body
+
+    base = {
+        "participantIdentity": initial["participantIdentity"],
+        "requestId": "rebind_0123456789abcdef",
+    }
+    for rejected in (
+        base | {"freshView": False},
+        base | {"freshView": 1},
+        base | {"freshView": "true"},
+        base | {"freshView": True, "extra": True},
+    ):
+        headers, body = request(rejected)
+        with pytest.raises((TypeError, ValueError)):
+            await app.handle(
+                method="POST",
+                path="/api/v1/stable-rebind",
+                headers=headers,
+                body=body,
+                peer=peer,
+            )
+    assert rebound == []
+
+    headers, body = request(base | {"freshView": True})
+    response = await app.handle(
+        method="POST",
+        path="/api/v1/stable-rebind",
+        headers=headers,
+        body=body,
+        peer=peer,
+    )
+
+    assert response.status == 200
+    assert json.loads(response.body)["participantIdentity"] == "browser_fedcba9876543210"
+    assert [(event.sequence, event.kind) for event in projection.events_after(0)] == [
+        (1, "session_ready")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_stable_tailnet_bootstrap_uses_peer_without_bearer() -> None:
     provisioned: list[str] = []

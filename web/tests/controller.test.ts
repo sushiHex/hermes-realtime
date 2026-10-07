@@ -36,6 +36,11 @@ import {
   reboundCredential,
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
+  reloadedCredential,
+  reloadRebindRequestParameters,
+  rememberedSessionIdentity,
+  rememberSessionIdentity,
+  SESSION_IDENTITY_KEY,
   ResponseLatencyStatistics,
   formatLatencyDuration,
   ObjectiveLatencyTracker,
@@ -777,6 +782,95 @@ describe("terminal reconnect credential rotation", () => {
     expect(terminalDisconnectIsAuthoritative("disconnected", true)).toBe(true);
     expect(terminalDisconnectIsAuthoritative("disconnected", false)).toBe(false);
     expect(terminalDisconnectIsAuthoritative("reconnecting", true)).toBe(false);
+  });
+});
+
+describe("reloaded page rebind", () => {
+  const identity = "browser_0123456789abcdef";
+
+  class MemoryStorage {
+    readonly values = new Map<string, string>();
+    getItem(key: string): string | null {
+      return this.values.get(key) ?? null;
+    }
+    setItem(key: string, value: string): void {
+      this.values.set(key, value);
+    }
+    removeItem(key: string): void {
+      this.values.delete(key);
+    }
+  }
+
+  const throwing = {
+    getItem(): string | null {
+      throw new Error("storage blocked");
+    },
+    setItem(): void {
+      throw new Error("storage blocked");
+    },
+    removeItem(): void {
+      throw new Error("storage blocked");
+    },
+  };
+
+  it("rebinds a stable session by its identity and asks for a fresh view", () => {
+    expect(reloadRebindRequestParameters(identity, "rebind_0123456789abcdef")).toEqual({
+      path: "/api/v1/stable-rebind",
+      bearer: null,
+      body: JSON.stringify({
+        participantIdentity: identity,
+        requestId: "rebind_0123456789abcdef",
+        freshView: true,
+      }),
+    });
+    expect(() => reloadRebindRequestParameters(identity, "reload_1")).toThrow(/request/i);
+    expect(() =>
+      reloadRebindRequestParameters("browser_NOTHEX", "rebind_0123456789abcdef"),
+    ).toThrow(/identity/i);
+  });
+
+  it("remembers only the participant identity, per tab, and forgets it on stop", () => {
+    const storage = new MemoryStorage();
+    rememberSessionIdentity(storage, identity);
+    expect([...storage.values.entries()]).toEqual([[SESSION_IDENTITY_KEY, identity]]);
+    expect(rememberedSessionIdentity(storage)).toBe(identity);
+
+    rememberSessionIdentity(storage, null);
+    expect(storage.values.size).toBe(0);
+    expect(rememberedSessionIdentity(storage)).toBeNull();
+  });
+
+  it("fails closed to a fresh bootstrap on anything but a valid identity", () => {
+    const storage = new MemoryStorage();
+    for (const value of [
+      "browser_NOTHEX",
+      ` ${identity}`,
+      JSON.stringify({ participantIdentity: identity }),
+      "old.token.value",
+    ]) {
+      storage.setItem(SESSION_IDENTITY_KEY, value);
+      expect(rememberedSessionIdentity(storage)).toBeNull();
+    }
+    expect(rememberedSessionIdentity(throwing)).toBeNull();
+    expect(rememberedSessionIdentity(null)).toBeNull();
+    expect(() => rememberSessionIdentity(throwing, identity)).not.toThrow();
+    expect(() => rememberSessionIdentity(null, identity)).not.toThrow();
+  });
+
+  it("requires the reloaded credential to rotate the remembered identity", () => {
+    const replacement = {
+      version: 1 as const,
+      url: "ws://127.0.0.1:7880",
+      roomName: "hermes-local",
+      participantIdentity: "browser_fedcba9876543210",
+      workerIdentity: "worker_hermes_browser",
+      expiresInSeconds: 60,
+      token: "new.token.value",
+    };
+    expect(reloadedCredential(identity, replacement)).toBe(replacement);
+    expect(() =>
+      reloadedCredential(identity, { ...replacement, participantIdentity: identity }),
+    ).toThrow(/identity/i);
   });
 });
 

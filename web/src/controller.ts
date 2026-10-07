@@ -4,6 +4,7 @@ import type {
   SessionModelConfiguration,
   SessionTokenUsage,
 } from "./protocol";
+import { isBrowserIdentity } from "./protocol";
 
 export type ClientState =
   | "idle"
@@ -417,12 +418,14 @@ export interface RebindRequestParameters {
   readonly body: string | null;
 }
 
+const REBIND_REQUEST_ID = /^rebind_[A-Za-z0-9-]{9,121}$/;
+
 export function rebindRequestParameters(
   stableLaunch: boolean,
   credential: BootstrapCredential,
   requestId: string,
 ): RebindRequestParameters {
-  if (!/^rebind_[A-Za-z0-9-]{9,121}$/.test(requestId)) {
+  if (!REBIND_REQUEST_ID.test(requestId)) {
     throw new Error("rebind request identifier is invalid");
   }
   if (stableLaunch) {
@@ -444,6 +447,61 @@ export function rebindRequestParameters(
 
 export function rebindFailureAllowsFreshBootstrap(status: number): boolean {
   return status === 409;
+}
+
+// A stable launch remembers, per tab, the one value its rebind needs: the participant
+// identity, which rotates on every rebind. A reload then reconnects the same session the
+// way a dropped connection does. The bearer token is never stored.
+export const SESSION_IDENTITY_KEY = "hermes-realtime.stable-session-identity.v1";
+
+type IdentityStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+export function rememberSessionIdentity(
+  storage: IdentityStorage | null,
+  identity: string | null,
+): void {
+  try {
+    if (identity === null) storage?.removeItem(SESSION_IDENTITY_KEY);
+    else storage?.setItem(SESSION_IDENTITY_KEY, identity);
+  } catch {
+    // Without storage a reload bootstraps afresh, as it always has.
+  }
+}
+
+export function rememberedSessionIdentity(storage: IdentityStorage | null): string | null {
+  try {
+    const value = storage?.getItem(SESSION_IDENTITY_KEY) ?? null;
+    return isBrowserIdentity(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function reloadRebindRequestParameters(
+  identity: string,
+  requestId: string,
+): RebindRequestParameters {
+  if (!REBIND_REQUEST_ID.test(requestId)) {
+    throw new Error("rebind request identifier is invalid");
+  }
+  if (!isBrowserIdentity(identity)) {
+    throw new Error("remembered participant identity is invalid");
+  }
+  return {
+    path: "/api/v1/stable-rebind",
+    bearer: null,
+    body: JSON.stringify({ participantIdentity: identity, requestId, freshView: true }),
+  };
+}
+
+export function reloadedCredential(
+  identity: string,
+  replacement: BootstrapCredential,
+): BootstrapCredential {
+  if (replacement.participantIdentity === identity) {
+    throw new Error("reload rebind did not rotate participant identity");
+  }
+  return replacement;
 }
 
 export async function settleStableDisconnect(

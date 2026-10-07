@@ -44,6 +44,10 @@ import {
   reboundCredential,
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
+  reloadedCredential,
+  reloadRebindRequestParameters,
+  rememberedSessionIdentity,
+  rememberSessionIdentity,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -313,6 +317,8 @@ const responseLatency = new ResponseLatencyStatistics();
 let capability: string | null = null;
 let stableLaunch = false;
 let credential: BootstrapCredential | null = null;
+// The identity a reloaded tab remembered, until one reload rebind settles it.
+let reloadIdentity: string | null = null;
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
@@ -2062,6 +2068,47 @@ async function connectionFetch(
   }
 }
 
+function tabStorage(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+// Every credential change passes here, so the tab's remembered identity always names the
+// session's current identity, and is forgotten when the session ends.
+function setCredential(value: BootstrapCredential | null): void {
+  credential = value;
+  if (stableLaunch) rememberSessionIdentity(tabStorage(), value?.participantIdentity ?? null);
+}
+
+// A reloaded tab reconnects its session through the identity it remembered; it starts a
+// new session only when none is active (409), exactly as a dropped connection does.
+async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredential> {
+  const remembered = reloadIdentity;
+  if (remembered === null) return bootstrap(signal);
+  const request = reloadRebindRequestParameters(remembered, `rebind_${crypto.randomUUID()}`);
+  const response = await connectionFetch(request.path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: request.body,
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  }, signal);
+  // Only an answer settles the remembered identity; a failed request may be retried.
+  reloadIdentity = null;
+  if (response.ok) {
+    addMarker("session_reloaded");
+    return reloadedCredential(remembered, parseBootstrapCredential(await response.json()));
+  }
+  if (!rebindFailureAllowsFreshBootstrap(response.status)) {
+    throw new SessionRebindRejected(response.status);
+  }
+  return bootstrap(signal);
+}
+
 async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
   const request = bootstrapRequestParameters(stableLaunch, capability);
   const response = await connectionFetch(request.path, {
@@ -2158,7 +2205,7 @@ async function refreshCredential(): Promise<void> {
   ) {
     throw new Error("credential refresh changed session authority");
   }
-  credential = refreshed;
+  setCredential(refreshed);
   addMarker("credential_refreshed");
   scheduleCredentialRefresh(refreshed);
 }
@@ -2221,7 +2268,7 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
   const observedStopVersion = sessionStopVersion;
   const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
   if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
-  credential = replacement;
+  setCredential(replacement);
   pendingRebindRequestId = null;
   clearCredentialRefresh();
   eventSequence = 0;
@@ -2703,19 +2750,23 @@ async function connect(projectionResync = false): Promise<void> {
         eventPolling?.abort();
         eventPolling = null;
         try {
-          credential = await rebindBrowserCredential(
-            previousCredential,
-            localOperation.signal,
-            rebindRequestId,
+          setCredential(
+            await rebindBrowserCredential(
+              previousCredential,
+              localOperation.signal,
+              rebindRequestId,
+            ),
           );
           addMarker("session_rebound", started);
         } catch (error) {
           if (localOperation.signal.aborted) throw error;
           try {
-            credential = await rebindBrowserCredential(
-              previousCredential,
-              localOperation.signal,
-              rebindRequestId,
+            setCredential(
+              await rebindBrowserCredential(
+                previousCredential,
+                localOperation.signal,
+                rebindRequestId,
+              ),
             );
             addMarker("session_rebound_after_retry", started);
           } catch (retryError) {
@@ -2727,7 +2778,7 @@ async function connect(projectionResync = false): Promise<void> {
             ) {
               throw retryError;
             }
-            credential = await bootstrap(localOperation.signal);
+            setCredential(await bootstrap(localOperation.signal));
             sessionReplaced = true;
             resetSessionInputAuthority();
             addMarker("session_replaced", started);
@@ -2737,7 +2788,7 @@ async function connect(projectionResync = false): Promise<void> {
         pendingRebindRequestId = null;
       }
     } else {
-      credential = await bootstrap(localOperation.signal);
+      setCredential(await bootstrapOrReload(localOperation.signal));
       pendingRebindRequestId = null;
       resetSessionInputAuthority();
       addMarker("bootstrap_complete", started);
@@ -2850,7 +2901,7 @@ async function connect(projectionResync = false): Promise<void> {
     clearCredentialRefresh();
     eventPolling?.abort();
     eventPolling = null;
-    credential = null;
+    setCredential(null);
     capability = null;
     controller.failed();
     addMarker("connection_failed", started);
@@ -3011,7 +3062,7 @@ async function stop(): Promise<void> {
   interruptActiveAssistantTurn();
   clearCredentialRefresh();
   microphoneSignalMonitor.stop();
-  credential = null;
+  setCredential(null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;
@@ -3263,6 +3314,7 @@ typedForm.addEventListener("submit", (event) => {
 try {
   capability = takeOptionalBootstrapCapability(window.location, window.history);
   stableLaunch = capability === null;
+  reloadIdentity = stableLaunch ? rememberedSessionIdentity(tabStorage()) : null;
   addMarker(capability === null ? "stable_launch_ready" : "launch_capability_loaded");
   renderSessionToggle();
 } catch {
