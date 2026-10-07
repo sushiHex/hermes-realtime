@@ -106,9 +106,12 @@ class VoiceForgetReconciler:
         evidence: dict[str, str | int] | None = None
         stage = "verify"
         try:
-            if deletion.complete and deletion.targets is not None:
-                if await self._remaining(deletion.targets) is None:
-                    return "complete"
+            if (
+                deletion.complete
+                and deletion.targets is not None
+                and await self._remaining(deletion.targets) is None
+            ):
+                return "complete"
             stage = "defer"
             if self._review_admitted(conversation_id):
                 evidence = {"category": "review", "count": 1, "kind": "admitted"}
