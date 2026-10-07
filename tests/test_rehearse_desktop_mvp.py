@@ -93,7 +93,7 @@ def test_markers_are_kept_by_name_and_rendered_from_their_values() -> None:
         '[Bad-Name] {"x":1}',
         '[some-upstream-tool] {"x":1}',
         '[hermes-restart-settlement] {"stopped":1}',
-        '[voice-archive-send] {"path":"C:/Users/someone/home"}',
+        '[voice-archive-send] {"path":"C:/Users/user/home"}',
         '[voice-archive-send] {"note":"two words"}',
         '[voice-archive-send] {"Bad Key":1}',
         "[voice-review] {" + '"x":"' + "a" * 600 + '"}',
@@ -114,7 +114,7 @@ def test_markers_are_kept_by_name_and_rendered_from_their_values() -> None:
     ]
     # Unknown names, text-bearing values and malformed bodies are counted, never recorded.
     assert dropped == 7
-    assert "someone" not in json.dumps(found)
+    assert "Users" not in json.dumps(found)
 
 
 def test_markers_are_capped_and_the_rest_counted() -> None:
@@ -138,8 +138,8 @@ def test_tracebacks_are_classified_by_allowlist_and_unknown_ones_named_by_type()
         "    tick_server = await asyncio.start_unix_server(",
         "AttributeError: module 'asyncio' has no attribute 'start_unix_server'",
         "Traceback (most recent call last):",
-        '  File "C:\\Users\\someone\\private.py", line 1, in f',
-        "RuntimeError: secret detail C:\\Users\\someone",
+        '  File "C:\\Users\\user\\private.py", line 1, in f',
+        "RuntimeError: secret detail C:\\Users\\user",
         "Traceback (most recent call last):",
         '  File "C:\\x\\_ffi_client.py", line 1, in f',
         "ValueError: not the known one",
