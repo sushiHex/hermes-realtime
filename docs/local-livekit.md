@@ -259,6 +259,17 @@ machine loopback boundary: any local process can construct the same HTTP request
 session while no browser session is active. Enable it only on a single-user trusted workstation;
 retain the one-use diagnostic flow where local processes are outside the trust boundary.
 
+A stable-launch tab survives a reload. The tab keeps one value in its own `sessionStorage`: the
+session's current participant identity, which is all `/api/v1/stable-rebind` needs and which
+rotates on every rebind. It never stores the LiveKit token. After a reload, **Connect** presents
+that identity with `"freshView": true`; the session rotates the identity as any rebind does, and
+restarts the page's event projection at sequence one with the session's own description, since
+the reloaded page kept no view or cursor. When no session is active (409) the tab bootstraps; an
+identity that is not the active one is refused (403), so a reload never replaces another tab's
+session. Stop, or a failed connect, forgets the stored identity. A duplicated tab copies
+`sessionStorage` and can therefore rebind the session away from the original, which then needs
+**Connect** again. The one-use fragment launch stores nothing and still needs a fresh launch.
+
 ## Conversation-only loopback launcher
 
 Milestone 6.1 supplies a runnable local profile for the first desktop conversation slice:
