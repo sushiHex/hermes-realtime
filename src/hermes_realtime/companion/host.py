@@ -51,7 +51,11 @@ from hermes_realtime.companion.review import (
     VoiceReviewCoordinator,
 )
 from hermes_realtime.companion.store import CompanionStore
-from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+from hermes_realtime.integration.run_record import (
+    lock_run_record,
+    unlock_run_record,
+    wait_for_run_record_lock,
+)
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
@@ -612,15 +616,10 @@ class VoiceCompanionHost:
                 stop.set()
         evidence: dict[str, str | int] | None = None
         try:
-            while not stop.is_set():
-                profile_lock = lock_run_record(self._store_path)
-                if profile_lock is not None:
-                    self._profile_lock = profile_lock
-                    break
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=0.1)
-            if stop.is_set():
+            profile_lock = await self._wait_for_profile_lock(stop)
+            if profile_lock is None:
                 return
+            self._profile_lock = profile_lock
             port = await asyncio.to_thread(self._open_port)
             try:
                 store = CompanionStore(self._store_path)
@@ -664,6 +663,58 @@ class VoiceCompanionHost:
             self._service = None
             if evidence is not None:
                 _marker(evidence)
+
+    async def _wait_for_profile_lock(self, stop: asyncio.Event) -> int | None:
+        """The profile lock, or None on stop; a held lock is awaited, never polled.
+
+        The blocking wait runs on a daemon thread that a stop abandons: if that thread
+        acquires the lock afterwards, it releases it at once, so a stop never keeps it.
+        """
+
+        held = lock_run_record(self._store_path)
+        if held is not None:
+            return held
+        loop = asyncio.get_running_loop()
+        acquired = asyncio.Event()
+        handoff = threading.Lock()
+        outcome: dict[str, int | bool] = {"abandoned": False}
+
+        def wait() -> None:
+            try:
+                descriptor = wait_for_run_record_lock(self._store_path)
+            except BaseException:
+                descriptor = None
+            with handoff:
+                if outcome["abandoned"]:
+                    if descriptor is not None:
+                        unlock_run_record(descriptor)
+                    return
+                if descriptor is not None:
+                    outcome["descriptor"] = descriptor
+            with contextlib.suppress(RuntimeError):  # The loop already ended.
+                loop.call_soon_threadsafe(acquired.set)
+
+        threading.Thread(target=wait, name="voice-companion-lock", daemon=True).start()
+        waits = {asyncio.create_task(acquired.wait()), asyncio.create_task(stop.wait())}
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waits:
+                task.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+            with handoff:
+                descriptor = outcome.get("descriptor")
+                keep = descriptor is not None and not stop.is_set()
+                outcome["abandoned"] = not keep
+        if keep:
+            assert type(descriptor) is int
+            return descriptor
+        if descriptor is not None:
+            assert type(descriptor) is int
+            unlock_run_record(descriptor)
+        if not stop.is_set():
+            raise RuntimeError("the profile lock could not be awaited")
+        return None
 
     async def _serve(self, service: VoiceCompanionService, stop: asyncio.Event) -> None:
         bridge = self._bridge_factory(service)

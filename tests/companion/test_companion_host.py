@@ -735,6 +735,40 @@ def test_waiting_owner_takes_over_after_profile_lock_released(tmp_path: Path) ->
         host.close()
 
 
+def test_a_waiting_owner_blocks_on_the_lock_instead_of_polling_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_realtime.companion import host as host_module
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    attempts: list[Path] = []
+    original = host_module.lock_run_record
+
+    def counted(path: Path) -> int | None:
+        attempts.append(path)
+        return original(path)
+
+    monkeypatch.setattr(host_module, "lock_run_record", counted)
+    store_path = tmp_path / "companion.db"
+    descriptor = lock_run_record(store_path)
+    assert descriptor is not None
+    host = _host(tmp_path, FakeHermes(), [])
+    try:
+        assert host.start() is True
+        assert host.wait_ready(0.5) is False
+        # One non-blocking attempt, then the OS wakes the waiter: no 100 ms polling.
+        assert len(attempts) == 1
+        started = time.monotonic()
+        unlock_run_record(descriptor)
+        descriptor = None
+        assert host.wait_ready(5.0) is True
+        assert time.monotonic() - started < 1.0
+    finally:
+        if descriptor is not None:
+            unlock_run_record(descriptor)
+        host.close()
+
+
 def test_waiting_owner_stops_without_opening_profile_on_unload(tmp_path: Path) -> None:
     from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
 
@@ -752,6 +786,9 @@ def test_waiting_owner_stops_without_opening_profile_on_unload(tmp_path: Path) -
         time.sleep(0.2)
         assert hermes.calls == []
         assert not any(thread.name == "voice-companion" for thread in threading.enumerate())
+        # The abandoned waiter took the released lock and gave it straight back.
+        descriptor = lock_run_record(store_path)
+        assert descriptor is not None
     finally:
         if descriptor is not None:
             unlock_run_record(descriptor)
