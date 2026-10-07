@@ -126,7 +126,11 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
     hermes.branch_copies_absent = (  # type: ignore[attr-defined]
         lambda _ids: True
     )
-    service, store = _service(tmp_path, hermes)
+    store = CompanionStore(tmp_path / "companion.db")
+    review = _AcceptingReview()
+    service = VoiceCompanionService(
+        VoiceArchive(store, hermes, lease_ttl_seconds=30.0), store, hermes, review,  # type: ignore[arg-type]
+    )
     try:
         await service.start()
         await service._ensure_open("conv")
@@ -140,6 +144,14 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
         assert hermes.lease == {}
         assert service._archive.ready("conv") is False
         assert store.deletion("conv") is not None
+        # Completion drops the binding; the fence still answers every late event.
+        late_review = await service.review(_review_event("conv"))
+        assert type(late_review) is VoiceReviewRefusedEvent
+        assert late_review.category == "tombstoned"
+        late_archive = await service.archive(_event([_row(0)], conversation="conv"))
+        assert type(late_archive) is VoiceArchiveRefusedEvent
+        assert late_archive.category == "tombstoned"
+        assert review.requests == []
     finally:
         await service.close()
         store.close()
@@ -244,6 +256,9 @@ class _AcceptingReview:
             "vr_synthetic", "accepted", request.conversation_id, request.generation,
             request.seq_from, request.seq_through, request.closing,
         )
+
+    def admitted(self, _conversation_id: str) -> bool:
+        return False
 
 
 def _review_event(conversation_id: str) -> VoiceReviewEvent:

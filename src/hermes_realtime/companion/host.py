@@ -386,6 +386,9 @@ class VoiceCompanionService:
         try:
             if self._review is None:
                 raise ArchiveRefusal("not_ready")
+            # The fence outlives the binding a completed delete drops.
+            if self._store.deletion(event.conversation_id) is not None:
+                raise ArchiveRefusal("tombstoned")
             if self._store.read(event.conversation_id) is None:
                 evidence = {"refusal": "unbound", "version": 1}
                 raise ArchiveRefusal("unbound")
