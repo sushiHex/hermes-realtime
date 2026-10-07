@@ -368,6 +368,59 @@ or updating either Hermes or `hermes-realtime`: the gate refuses a gateway still
 loaded before (`restart_gateway`). See [`hermes-bridge.md`](hermes-bridge.md) for what it checks,
 what it records and what it does not prove.
 
+### Automated dress rehearsal of the desktop MVP session
+
+`scripts/rehearse_desktop_mvp.py` runs the
+[diagnostic session](desktop-mvp-diagnostic.md#the-diagnostic-session) unattended against the
+composed stack, so integration findings surface before the operator's session:
+
+```bash
+env -u PYTHONPATH uv run --frozen --extra local --extra browser-acceptance \
+  python scripts/rehearse_desktop_mvp.py --ollama-model <name from ollama list>
+```
+
+It builds a throwaway Hermes home under the system temporary directory, laid out the way the
+upstream installer lays it out: the pinned `29112bef` checkout at `home/hermes-agent`, its
+locked environment in `home/hermes-agent/venv`, this checkout's built wheel installed there, and
+the plugin enabled and memory turned off with the runbook's own `hermes` commands. Hermes's model
+is a stand-in served by the script, so no provider key is involved. It then starts, each one
+detached with a log and a recorded PID:
+
+- `hermes gateway run` from that home, with the companion inside it;
+- the pinned LiveKit server (`.tools/livekit/livekit-server.exe`, verified by SHA-256);
+- the full host with the runbook's flags (`--persistent-loopback-launch`,
+  `--allow-unsandboxed-hermes-tasks`, Ollama with the named model, default speech providers), and
+  its voice tail and run record inside the run directory;
+- a headless system Chrome, driven through the DevTools protocol.
+
+The browser's microphone is a synthetic track. Spoken steps play Kokoro-synthesized clips into
+it, so speech crosses WebRTC, LiveKit, VAD and Moonshine for real. No physical microphone or
+speaker is involved: the track reports the AEC-only processing the page requires without running
+it, and "audible" means the decoded remote audio track carried energy during the reply.
+
+It walks the session steps in order, plus voice deletion (M3), which the runbook has no session
+step for, and prints one `[desktop-mvp-rehearsal] {...}` line per step in the record sheet's
+categories: `outcome`, `timings`, the bounded markers the host and gateway printed during the
+step, and `notes`. A failed step is recorded, a later step reconnects the page if it must, and
+the rehearsal continues. A final `summary` line counts the processes left running by image name
+(it must be empty); the exit code is 0 only when every step was `as_expected` and nothing was
+left. When a required piece is missing (Windows, the pinned LiveKit binary, system Chrome,
+Playwright, Kokoro, git, uv, a running Ollama with the named model, or a free port 7880) it
+prints one `not_run` preflight line and exits 0.
+
+Ctrl-C cannot reach a detached process, so two things differ from the operator's session:
+
+- The host runs as `python scripts/rehearse_desktop_mvp.py --host-child <stop file> -- <host
+  flags>` under `uv run`. When the stop file appears, the child interrupts its main thread
+  exactly as Ctrl-C does. The forced restart still ends the whole `uv` process tree abruptly.
+- The gateway is stopped through Hermes's own Windows stop path, the planned-stop marker that
+  `hermes gateway stop` writes; LiveKit is killed. `hermes gateway status` and `stop` themselves
+  are not run: on a machine with its own gateway, their process scan could reach that one.
+
+The throwaway gateway and host use free ports, so a gateway already running on 8642 is left
+alone. The run directory is left in place with private logs that may hold paths; publish only
+the rehearsal's own lines.
+
 ### Launch
 
 1. In terminal A, start the pinned local LiveKit server and leave it running:
