@@ -36,12 +36,13 @@ import {
   reboundCredential,
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
-  reloadedCredential,
+  ReloadRebindRefused,
+  reloadOrBootstrap,
   reloadRebindIsSettled,
   reloadRebindRequestParameters,
-  rememberedSessionIdentity,
-  rememberSessionIdentity,
-  SESSION_IDENTITY_KEY,
+  rememberedSession,
+  rememberSession,
+  SESSION_KEY,
   ResponseLatencyStatistics,
   formatLatencyDuration,
   ObjectiveLatencyTracker,
@@ -788,6 +789,16 @@ describe("terminal reconnect credential rotation", () => {
 
 describe("reloaded page rebind", () => {
   const identity = "browser_0123456789abcdef";
+  const rotated = "browser_fedcba9876543210";
+  const credentialFor = (participantIdentity: string) => ({
+    version: 1 as const,
+    url: "ws://127.0.0.1:7880",
+    roomName: "hermes-local",
+    participantIdentity,
+    workerIdentity: "worker_hermes_browser",
+    expiresInSeconds: 60,
+    token: "new.token.value",
+  });
 
   class MemoryStorage {
     readonly values = new Map<string, string>();
@@ -814,72 +825,123 @@ describe("reloaded page rebind", () => {
     },
   };
 
-  it("rebinds a stable session by its identity and asks for a fresh view", () => {
-    expect(reloadRebindRequestParameters(identity, "rebind_0123456789abcdef")).toEqual({
-      path: "/api/v1/stable-rebind",
-      bearer: null,
-      body: JSON.stringify({
-        participantIdentity: identity,
-        requestId: "rebind_0123456789abcdef",
-        freshView: true,
-      }),
-    });
-    expect(() => reloadRebindRequestParameters(identity, "reload_1")).toThrow(/request/i);
-    expect(() =>
-      reloadRebindRequestParameters("browser_NOTHEX", "rebind_0123456789abcdef"),
-    ).toThrow(/identity/i);
+  function harness(answers: Array<{ status: number; body?: unknown } | Error>) {
+    const storage = new MemoryStorage();
+    rememberSession(storage, { identity, requestId: null });
+    const sent: Array<{ path: string; body: Record<string, unknown> }> = [];
+    let bootstraps = 0;
+    let ids = 0;
+    const run = () =>
+      reloadOrBootstrap({
+        storage,
+        newRequestId: () => `rebind_00000000000${++ids}`,
+        rebind: async (path, body) => {
+          sent.push({ path, body: JSON.parse(body) as Record<string, unknown> });
+          const answer = answers.shift();
+          if (answer === undefined || answer instanceof Error) throw answer ?? new Error("none");
+          return {
+            ok: answer.status >= 200 && answer.status < 300,
+            status: answer.status,
+            json: async () => answer.body,
+          };
+        },
+        bootstrap: async () => {
+          bootstraps += 1;
+          return credentialFor("browser_00000000000000aa");
+        },
+        parse: (value) => value as ReturnType<typeof credentialFor>,
+      });
+    return { storage, sent, run, bootstraps: () => bootstraps };
+  }
+
+  it("rebinds a remembered session with a fresh view and remembers the rotation", async () => {
+    const { storage, sent, run, bootstraps } = harness([
+      { status: 200, body: credentialFor(rotated) },
+    ]);
+
+    const result = await run();
+
+    expect(result.participantIdentity).toBe(rotated);
+    expect(sent).toEqual([
+      {
+        path: "/api/v1/stable-rebind",
+        body: { participantIdentity: identity, requestId: "rebind_000000000001", freshView: true },
+      },
+    ]);
+    expect(rememberedSession(storage)).toEqual({ identity: rotated, requestId: null });
+    expect(bootstraps()).toBe(0);
   });
 
-  it("remembers only the participant identity, per tab, and forgets it on stop", () => {
-    const storage = new MemoryStorage();
-    rememberSessionIdentity(storage, identity);
-    expect([...storage.values.entries()]).toEqual([[SESSION_IDENTITY_KEY, identity]]);
-    expect(rememberedSessionIdentity(storage)).toBe(identity);
-
-    rememberSessionIdentity(storage, null);
-    expect(storage.values.size).toBe(0);
-    expect(rememberedSessionIdentity(storage)).toBeNull();
-  });
-
-  it("fails closed to a fresh bootstrap on anything but a valid identity", () => {
-    const storage = new MemoryStorage();
-    for (const value of [
-      "browser_NOTHEX",
-      ` ${identity}`,
-      JSON.stringify({ participantIdentity: identity }),
-      "old.token.value",
-    ]) {
-      storage.setItem(SESSION_IDENTITY_KEY, value);
-      expect(rememberedSessionIdentity(storage)).toBeNull();
+  it("keeps the identity and its request through anything but a definitive verdict", async () => {
+    for (const failure of [{ status: 503 }, { status: 408 }, new Error("network")]) {
+      const { storage, sent, run, bootstraps } = harness([
+        failure,
+        { status: 200, body: credentialFor(rotated) },
+      ]);
+      await expect(run()).rejects.toThrow();
+      expect(rememberedSession(storage)).toEqual({
+        identity,
+        requestId: "rebind_000000000001",
+      });
+      // The retry replays the same request, so a rotation whose answer was lost replays.
+      await run();
+      expect(sent.map((request) => request.body.requestId)).toEqual([
+        "rebind_000000000001",
+        "rebind_000000000001",
+      ]);
+      expect(bootstraps()).toBe(0);
     }
-    expect(rememberedSessionIdentity(throwing)).toBeNull();
-    expect(rememberedSessionIdentity(null)).toBeNull();
-    expect(() => rememberSessionIdentity(throwing, identity)).not.toThrow();
-    expect(() => rememberSessionIdentity(null, identity)).not.toThrow();
   });
 
-  it("settles the remembered identity only on a definitive answer", () => {
+  it("keeps the identity when a rotation's answer cannot be read", async () => {
+    const { storage, run } = harness([{ status: 200, body: credentialFor(identity) }]);
+    await expect(run()).rejects.toThrow(/rotate/i);
+    expect(rememberedSession(storage)?.identity).toBe(identity);
+  });
+
+  it("forgets on 409 and starts a new session, and forgets on 403 without one", async () => {
+    const gone = harness([{ status: 409 }]);
+    expect((await gone.run()).participantIdentity).toBe("browser_00000000000000aa");
+    expect(gone.bootstraps()).toBe(1);
+    expect(gone.storage.values.size).toBe(0);
+
+    const other = harness([{ status: 403 }]);
+    await expect(other.run()).rejects.toBeInstanceOf(ReloadRebindRefused);
+    expect(other.bootstraps()).toBe(0);
+    expect(other.storage.values.size).toBe(0);
+  });
+
+  it("bootstraps a tab that remembers nothing, or nothing valid", async () => {
+    for (const value of [
+      null,
+      JSON.stringify({ identity: "browser_NOTHEX", requestId: null }),
+      JSON.stringify({ identity, requestId: "reload_1" }),
+      JSON.stringify({ identity, requestId: null, token: "old.token.value" }),
+      identity,
+      "{not json",
+    ]) {
+      const { storage, sent, run, bootstraps } = harness([]);
+      if (value === null) storage.values.clear();
+      else storage.values.set(SESSION_KEY, value);
+      await run();
+      expect(sent).toEqual([]);
+      expect(bootstraps()).toBe(1);
+    }
+    expect(rememberedSession(throwing)).toBeNull();
+    expect(rememberedSession(null)).toBeNull();
+    expect(() => rememberSession(throwing, { identity, requestId: null })).not.toThrow();
+  });
+
+  it("settles only on a rotation, 409 or 403", () => {
     expect(reloadRebindIsSettled(200)).toBe(true);
     expect(reloadRebindIsSettled(403)).toBe(true);
     expect(reloadRebindIsSettled(409)).toBe(true);
     for (const transient of [408, 429, 500, 503]) {
       expect(reloadRebindIsSettled(transient)).toBe(false);
     }
-  });
-
-  it("requires the reloaded credential to rotate the remembered identity", () => {
-    const replacement = {
-      version: 1 as const,
-      url: "ws://127.0.0.1:7880",
-      roomName: "hermes-local",
-      participantIdentity: "browser_fedcba9876543210",
-      workerIdentity: "worker_hermes_browser",
-      expiresInSeconds: 60,
-      token: "new.token.value",
-    };
-    expect(reloadedCredential(identity, replacement)).toBe(replacement);
+    expect(() => reloadRebindRequestParameters(identity, "reload_1")).toThrow(/request/i);
     expect(() =>
-      reloadedCredential(identity, { ...replacement, participantIdentity: identity }),
+      reloadRebindRequestParameters("browser_NOTHEX", "rebind_0123456789abcdef"),
     ).toThrow(/identity/i);
   });
 });

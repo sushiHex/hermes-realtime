@@ -450,28 +450,46 @@ export function rebindFailureAllowsFreshBootstrap(status: number): boolean {
 }
 
 // A stable launch remembers, per tab, the one value its rebind needs: the participant
-// identity, which rotates on every rebind. A reload then reconnects the same session the
-// way a dropped connection does. The bearer token is never stored.
-export const SESSION_IDENTITY_KEY = "hermes-realtime.stable-session-identity.v1";
+// identity, which rotates on every rebind, and the request a rebind of it has in flight.
+// A reload then reconnects the same session the way a dropped connection does. The bearer
+// token is never stored.
+export const SESSION_KEY = "hermes-realtime.stable-session.v1";
 
-type IdentityStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+type SessionStorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
-export function rememberSessionIdentity(
-  storage: IdentityStorage | null,
-  identity: string | null,
+export interface RememberedSession {
+  readonly identity: string;
+  // The reload rebind sent for this identity and not yet answered, so a lost answer
+  // replays instead of meeting an identity the server has already rotated.
+  readonly requestId: string | null;
+}
+
+export function rememberSession(
+  storage: SessionStorageLike | null,
+  session: RememberedSession | null,
 ): void {
   try {
-    if (identity === null) storage?.removeItem(SESSION_IDENTITY_KEY);
-    else storage?.setItem(SESSION_IDENTITY_KEY, identity);
+    if (session === null) storage?.removeItem(SESSION_KEY);
+    else storage?.setItem(SESSION_KEY, JSON.stringify(session));
   } catch {
     // Without storage a reload bootstraps afresh, as it always has.
   }
 }
 
-export function rememberedSessionIdentity(storage: IdentityStorage | null): string | null {
+export function rememberedSession(storage: SessionStorageLike | null): RememberedSession | null {
   try {
-    const value = storage?.getItem(SESSION_IDENTITY_KEY) ?? null;
-    return isBrowserIdentity(value) ? value : null;
+    const raw = storage?.getItem(SESSION_KEY) ?? null;
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (Object.keys(record).sort().join(",") !== "identity,requestId") return null;
+    const { identity, requestId } = record;
+    if (!isBrowserIdentity(identity)) return null;
+    if (requestId !== null && (typeof requestId !== "string" || !REBIND_REQUEST_ID.test(requestId))) {
+      return null;
+    }
+    return { identity, requestId };
   } catch {
     return null;
   }
@@ -494,21 +512,57 @@ export function reloadRebindRequestParameters(
   };
 }
 
-// A rebind (2xx), "no session is active" (409) and "not this session" (403) are definitive;
-// anything else, such as a session still settling speech, may be retried with the identity.
+// A rotation (2xx), "no session is active" (409) and "not this session" (403) are the only
+// definitive verdicts; any other answer, or none, leaves the session remembered.
 export function reloadRebindIsSettled(status: number): boolean {
   return (status >= 200 && status < 300) || status === 403 || status === 409;
 }
 
-export function reloadedCredential(
-  identity: string,
-  replacement: BootstrapCredential,
-): BootstrapCredential {
-  if (replacement.participantIdentity === identity) {
-    throw new Error("reload rebind did not rotate participant identity");
-  }
-  return replacement;
+export interface ReloadAnswer {
+  readonly ok: boolean;
+  readonly status: number;
+  json(): Promise<unknown>;
 }
+
+export class ReloadRebindRefused extends Error {
+  constructor(readonly status: number) {
+    super("reload rebind refused");
+  }
+}
+
+// A stable tab with a remembered session rebinds it, with a fresh view, before any
+// bootstrap. Only a definitive verdict changes what is remembered: a rotation remembers the
+// new identity, 409 and 403 forget the old one, and 409 alone starts a new session. A
+// request that fails in transit, or any other answer, keeps the identity and its request for
+// the next Connect, so a rotation whose answer was lost is replayed.
+export async function reloadOrBootstrap(options: {
+  readonly storage: SessionStorageLike | null;
+  readonly newRequestId: () => string;
+  readonly rebind: (path: string, body: string) => Promise<ReloadAnswer>;
+  readonly bootstrap: () => Promise<BootstrapCredential>;
+  readonly parse: (value: unknown) => BootstrapCredential;
+}): Promise<BootstrapCredential> {
+  const remembered = rememberedSession(options.storage);
+  if (remembered === null) return options.bootstrap();
+  const requestId = remembered.requestId ?? options.newRequestId();
+  rememberSession(options.storage, { identity: remembered.identity, requestId });
+  const request = reloadRebindRequestParameters(remembered.identity, requestId);
+  const answer = await options.rebind(request.path, request.body ?? "");
+  if (answer.ok) {
+    const replacement = options.parse(await answer.json());
+    if (replacement.participantIdentity === remembered.identity) {
+      throw new Error("reload rebind did not rotate participant identity");
+    }
+    rememberSession(options.storage, { identity: replacement.participantIdentity, requestId: null });
+    return replacement;
+  }
+  if (reloadRebindIsSettled(answer.status)) rememberSession(options.storage, null);
+  if (!rebindFailureAllowsFreshBootstrap(answer.status)) {
+    throw new ReloadRebindRefused(answer.status);
+  }
+  return options.bootstrap();
+}
+
 
 export async function settleStableDisconnect(
   stopRemote: () => Promise<void>,

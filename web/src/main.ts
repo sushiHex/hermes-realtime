@@ -44,11 +44,8 @@ import {
   reboundCredential,
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
-  reloadedCredential,
-  reloadRebindIsSettled,
-  reloadRebindRequestParameters,
-  rememberedSessionIdentity,
-  rememberSessionIdentity,
+  reloadOrBootstrap,
+  rememberSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -318,8 +315,6 @@ const responseLatency = new ResponseLatencyStatistics();
 let capability: string | null = null;
 let stableLaunch = false;
 let credential: BootstrapCredential | null = null;
-// The identity a reloaded tab remembered, until one reload rebind settles it.
-let reloadIdentity: string | null = null;
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
@@ -2077,36 +2072,39 @@ function tabStorage(): Storage | null {
   }
 }
 
-// Every credential change passes here, so the tab's remembered identity always names the
-// session's current identity, and is forgotten when the session ends.
+// Every new credential passes here, so the tab remembers the session's current identity.
+// Clearing the in-memory credential never forgets it: only a definitive verdict does (the
+// stop that succeeded, or a reload rebind answered 403 or 409).
 function setCredential(value: BootstrapCredential | null): void {
   credential = value;
-  if (stableLaunch) rememberSessionIdentity(tabStorage(), value?.participantIdentity ?? null);
+  if (stableLaunch && value !== null) {
+    rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });
+  }
 }
 
-// A reloaded tab reconnects its session through the identity it remembered; it starts a
-// new session only when none is active (409), exactly as a dropped connection does.
 async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredential> {
-  const remembered = reloadIdentity;
-  if (remembered === null) return bootstrap(signal);
-  const request = reloadRebindRequestParameters(remembered, `rebind_${crypto.randomUUID()}`);
-  const response = await connectionFetch(request.path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: request.body,
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-  }, signal);
-  if (reloadRebindIsSettled(response.status)) reloadIdentity = null;
-  if (response.ok) {
-    addMarker("session_reloaded");
-    return reloadedCredential(remembered, parseBootstrapCredential(await response.json()));
-  }
-  if (!rebindFailureAllowsFreshBootstrap(response.status)) {
-    throw new SessionRebindRejected(response.status);
-  }
-  return bootstrap(signal);
+  if (!stableLaunch) return bootstrap(signal);
+  let reloaded = false;
+  const result = await reloadOrBootstrap({
+    storage: tabStorage(),
+    newRequestId: () => `rebind_${crypto.randomUUID()}`,
+    rebind: async (path, body) => {
+      const response = await connectionFetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+      }, signal);
+      reloaded = response.ok;
+      return response;
+    },
+    bootstrap: () => bootstrap(signal),
+    parse: parseBootstrapCredential,
+  });
+  if (reloaded) addMarker("session_reloaded");
+  return result;
 }
 
 async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
@@ -3070,6 +3068,8 @@ async function stop(): Promise<void> {
   clearCredentialRefresh();
   microphoneSignalMonitor.stop();
   setCredential(null);
+  // The remote stop succeeded: the session is gone, so the tab forgets it.
+  if (stableLaunch) rememberSession(tabStorage(), null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;
@@ -3321,7 +3321,6 @@ typedForm.addEventListener("submit", (event) => {
 try {
   capability = takeOptionalBootstrapCapability(window.location, window.history);
   stableLaunch = capability === null;
-  reloadIdentity = stableLaunch ? rememberedSessionIdentity(tabStorage()) : null;
   addMarker(capability === null ? "stable_launch_ready" : "launch_capability_loaded");
   renderSessionToggle();
 } catch {

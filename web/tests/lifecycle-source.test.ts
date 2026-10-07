@@ -9,20 +9,31 @@ const mainSource = readFileSync(
 );
 
 describe("reloaded tab rebind wiring", () => {
-  it("remembers the identity at every credential change and forgets it on stop", () => {
+  it("remembers every new credential and forgets the session only after a stop succeeds", () => {
     const setter = mainSource.indexOf("function setCredential(");
     const setterEnd = mainSource.indexOf("\n}\n", setter);
     expect(setter).toBeGreaterThan(-1);
     const outside = mainSource.slice(0, setter) + mainSource.slice(setterEnd);
     expect(outside.match(/\bcredential = /g) ?? []).toHaveLength(0);
     expect(outside).toContain("let credential: BootstrapCredential | null = null;");
-    expect(mainSource.slice(setter, setterEnd)).toContain(
-      "if (stableLaunch) rememberSessionIdentity(tabStorage(), value?.participantIdentity ?? null);",
+    const body = mainSource.slice(setter, setterEnd);
+    expect(body).toContain("if (stableLaunch && value !== null) {");
+    expect(body).toContain(
+      "rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });",
     );
-    expect(mainSource.match(/setCredential\(null\)/g)?.length).toBe(2);
+    // A failed connect clears the credential in memory but never the remembered session.
+    const forget = "if (stableLaunch) rememberSession(tabStorage(), null);";
+    expect(mainSource.split(forget)).toHaveLength(2);
+    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(2);
+    const stop = mainSource.indexOf("async function stop(");
+    const stopBody = mainSource.slice(stop, mainSource.indexOf("\n}\n", stop));
+    expect(stopBody.indexOf(forget)).toBeGreaterThan(stopBody.indexOf("} finally {"));
+    expect(stopBody.indexOf("} finally {")).toBeGreaterThan(
+      stopBody.indexOf('if (!response.ok) throw new Error("session stop was rejected");'),
+    );
   });
 
-  it("starts a stable tab by rebinding its remembered identity before any bootstrap", () => {
+  it("starts a stable tab by rebinding its remembered session before any bootstrap", () => {
     const connectStart = mainSource.indexOf("async function connect(");
     const freshPath = mainSource.indexOf(
       "\n    } else {\n",
@@ -32,17 +43,13 @@ describe("reloaded tab rebind wiring", () => {
     expect(mainSource.slice(freshPath, freshPath + 120)).toContain(
       "setCredential(await bootstrapOrReload(localOperation.signal));",
     );
-    expect(mainSource).toContain(
-      "reloadIdentity = stableLaunch ? rememberedSessionIdentity(tabStorage()) : null;",
-    );
     const reload = mainSource.indexOf("async function bootstrapOrReload(");
     const reloadEnd = mainSource.indexOf("\n}\n", reload);
     const body = mainSource.slice(reload, reloadEnd);
-    // Only a definitive answer settles the identity, and only "no session is active"
-    // bootstraps.
-    expect(body).toContain("if (reloadRebindIsSettled(response.status)) reloadIdentity = null;");
-    expect(body.match(/reloadIdentity = null/g)).toHaveLength(1);
-    expect(body).toContain("if (!rebindFailureAllowsFreshBootstrap(response.status)) {");
+    // The verdict rules live in reloadOrBootstrap, tested behaviorally in controller.test.ts.
+    expect(body).toContain("if (!stableLaunch) return bootstrap(signal);");
+    expect(body).toContain("const result = await reloadOrBootstrap({");
+    expect(body).toContain("storage: tabStorage(),");
   });
 
   it("never lets a leaving page reconnect the session it is leaving", () => {
