@@ -626,6 +626,39 @@ async def test_review_is_acknowledged_only_after_owned_thread_starts(
 
 
 @pytest.mark.asyncio
+async def test_a_review_stays_admitted_until_its_outcome_is_recorded(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: type("Parent", (), {})())
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        await review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        await asyncio.wait_for(port.started.wait(), 5)
+        # Hold back the loop's recording of the outcome, as a busy loop would.
+        record_outcome = review._finished
+        held: list[tuple[str, str]] = []
+        review._finished = lambda *identity: held.append(identity)  # type: ignore[method-assign]
+        port.release.set()
+        thread = review._active["conv"].thread
+        await asyncio.to_thread(thread.join, 5)
+        assert not thread.is_alive() and len(held) == 1
+
+        # The thread has exited, but a delete must not race the ledger write still due.
+        assert review.admitted("conv") is True
+        record_outcome(*held[0])
+        assert review.admitted("conv") is False
+    finally:
+        port.release.set()
+        await review.close()
+        await archive.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retained", ["failed", "unknown"])
 async def test_late_completion_cannot_promote_a_retained_admission_failure(
     tmp_path: Path, retained: str
