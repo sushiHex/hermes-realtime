@@ -40,6 +40,9 @@ _EXPECTED = {
         "chain_phrase": 0,
         "next_history_phrase": 0,
         "foreground_cleared": 1,
+        "branch_copy_pending": 1,
+        "state_db_scanned": 1,
+        "state_db_phrase": 0,
         "chain_walked": 1,
         "foreign_child_pending": 1,
         "complete_after_child_removed": 1,
@@ -167,6 +170,57 @@ def _has_phrase(messages: Any, phrase: str) -> bool:
     return phrase in json.dumps(messages, ensure_ascii=False)
 
 
+def _scan_state(path: Path, phrase: str) -> dict[str, int]:
+    """Count the phrase in every table of a Hermes state.db, FTS shadow tables included.
+
+    A cell matches when it holds the phrase or its random hex, the one token an FTS
+    tokenizer keeps whole. FTS segment blobs prefix-compress their terms, so an FTS
+    ``MATCH`` for that token is the index's logical check. Raw file bytes (the
+    database and its WAL) are counted too: SQLite leaves deleted content in free
+    pages and WAL frames until they are reused, so that count is residue, not rows.
+    """
+    import sqlite3
+
+    token = phrase.rsplit("-", 1)[1]
+    needles = (phrase, token)
+    bytes_needles = tuple(needle.encode("utf-8") for needle in needles)
+    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        schema = connection.execute(
+            "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        cells = unreadable = matches = fts = 0
+        for name, sql in schema:
+            quoted = '"' + name.replace('"', '""') + '"'
+            try:
+                for row in connection.execute(f"SELECT * FROM {quoted}"):
+                    for value in row:
+                        if type(value) is str:
+                            cells += any(needle in value for needle in needles)
+                        elif type(value) is bytes:
+                            cells += any(needle in value for needle in bytes_needles)
+            except sqlite3.Error:
+                unreadable += 1
+                continue
+            if sql.upper().startswith("CREATE VIRTUAL TABLE") and "FTS" in sql.upper():
+                fts += 1
+                matches += connection.execute(
+                    f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?", (f'"{token}"',)
+                ).fetchone()[0]
+    finally:
+        connection.close()
+    residue = sum(
+        file.read_bytes().count(needle)
+        for file in (path, path.with_name(path.name + "-wal"))
+        if file.is_file()
+        for needle in bytes_needles
+    )
+    return {
+        "tables": len(schema), "fts_tables": fts, "unreadable": unreadable,
+        "cells": cells, "fts_matches": matches, "residue": residue,
+    }
+
+
 async def _qualify(python: Path) -> None:
     evidence: dict[str, object] = {"version": 1}
     model = m4._MemoryStandInModel()
@@ -238,6 +292,7 @@ async def _qualify(python: Path) -> None:
             identity = installed_hermes_identity("0.21.0", PINNED_HERMES / "source")
             evidence["hermes"] = identity
             evidence["observed"] = observed
+            evidence["residue"] = core["residue"]
             evidence["passed"] = _passed(observed, identity)
         except BaseException as error:
             evidence["failure"] = type(error).__name__
@@ -358,6 +413,14 @@ async def _core(home: Path) -> dict[str, object]:
             worker.db.append_message(grandchild, "assistant", phrase)
             chain_ids = (parent, child, grandchild)
             before = _all_messages(worker.db, chain_ids)
+            # A Hermes /branch copy of the live segment: an independent conversation
+            # Hermes keeps, so the delete stays pending until the user removes it.
+            branch = "m3_branch_copy"
+            worker.db.create_session(
+                branch, source="cli", parent_session_id=grandchild,
+                model_config={"_branched_from": grandchild},
+            )
+            worker.db.append_message(branch, "user", phrase)
             # An unrelated native delegated task belongs to Hermes, outside
             # the voice archive's deletion set.
             task_parent, task_child = "m3_task_parent", "m3_task_delegate"
@@ -374,6 +437,7 @@ async def _core(home: Path) -> dict[str, object]:
                 == {task_parent, task_child}
                 and task_child not in worker.db.get_session_delete_targets(parent)
             )
+            scan_before = _scan_state(home / "state.db", phrase)
             retired = await writer.request_forget(context)
             foreground_cleared = int(
                 context.snapshot().messages == ()
@@ -392,9 +456,27 @@ async def _core(home: Path) -> dict[str, object]:
                 initial_backoff_seconds=0.05, max_backoff_seconds=0.1,
             )
             forget_sender.start()
-            await until(lambda: writer.pending_forget is None)
+
+            def chain_deleted() -> bool:
+                deletion = worker.store.deletion(retired[0])
+                return (
+                    deletion is not None and deletion.targets is not None
+                    and worker.port.absent(chain_ids)
+                )
+
+            await until(chain_deleted)
+            # Several resend rounds pass; the surviving copy keeps the delete pending.
+            await asyncio.sleep(0.5)
+            branch_pending = int(
+                retired in writer.pending_deletes
+                and not worker.port.absent((branch,))
+                and worker.store.deletion(retired[0]).complete is False
+            )
+            worker.db.delete_session(branch)
+            await until(lambda: not writer.pending_deletes)
             stale_forget_ack = not writer.acknowledge_forget(retired)
             tail_after_complete = (home / "tail.json").read_text(encoding="utf-8")
+            scan_after = _scan_state(home / "state.db", phrase)
             late_archive = await service.archive(original)
             late_review = await service.review(review)
             chain_after = _all_messages(worker.db, chain_ids)
@@ -479,9 +561,10 @@ async def _core(home: Path) -> dict[str, object]:
                     try:
                         await asyncio.sleep(0.15)
                         unsupported_incomplete = int(
-                            unsupported_writer.pending_forget == unsupported_old
+                            unsupported_writer.pending_deletes == (unsupported_old,)
+                            and not unsupported_sender.negotiated
                             and unsupported_old[0] in (
-                                home / "unsupported-tail.json"
+                                home / "unsupported-tail.deletes.json"
                             ).read_text(encoding="utf-8")
                         )
                     finally:
@@ -494,6 +577,16 @@ async def _core(home: Path) -> dict[str, object]:
                     "chain_phrase": int(_has_phrase(chain_after, phrase)),
                     "next_history_phrase": int(_has_phrase(next_history, phrase)),
                     "foreground_cleared": foreground_cleared,
+                    "branch_copy_pending": branch_pending,
+                    # The scanner sees the phrase before the delete (so it can), in
+                    # every readable table, and in no table or FTS index after it.
+                    "state_db_scanned": int(
+                        scan_before["cells"] > 0 and scan_before["fts_tables"] > 0
+                        and scan_before["fts_matches"] > 0
+                        and scan_before["unreadable"] == 0 and scan_after["unreadable"] == 0
+                        and scan_after["tables"] == scan_before["tables"]
+                    ),
+                    "state_db_phrase": scan_after["cells"] + scan_after["fts_matches"],
                     "chain_walked": int(
                         _has_phrase(before, phrase) and len(chain_ids) == 3
                         and deletion is not None and deletion.complete
@@ -535,6 +628,8 @@ async def _core(home: Path) -> dict[str, object]:
                     "post_delete_child_refused": post_delete_child_refused,
                     "root_recreation_detected": root_recreation_detected,
                 },
+                # Reported, not gated: free pages and WAL frames keep bytes until reuse.
+                "residue": {"before": scan_before["residue"], "after": scan_after["residue"]},
             }
     finally:
         if receiver is not None:
