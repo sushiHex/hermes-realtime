@@ -43,6 +43,7 @@ _EXPECTED = {
         "branch_copy_pending": 1,
         "state_db_scanned": 1,
         "state_db_phrase": 0,
+        "optimized_phrase": 0,
         "chain_walked": 1,
         "foreign_child_pending": 1,
         "complete_after_child_removed": 1,
@@ -170,14 +171,14 @@ def _has_phrase(messages: Any, phrase: str) -> bool:
     return phrase in json.dumps(messages, ensure_ascii=False)
 
 
-def _scan_state(path: Path, phrase: str) -> dict[str, int]:
+def _scan_state(path: Path, phrase: str) -> dict[str, Any]:
     """Count the phrase in every table of a Hermes state.db, FTS shadow tables included.
 
     A cell matches when it holds the phrase or its random hex, the one token an FTS
-    tokenizer keeps whole. FTS segment blobs prefix-compress their terms, so an FTS
-    ``MATCH`` for that token is the index's logical check. Raw file bytes (the
-    database and its WAL) are counted too: SQLite leaves deleted content in free
-    pages and WAL frames until they are reused, so that count is residue, not rows.
+    tokenizer keeps whole. Rows and FTS ``MATCH`` results are the logical view. An FTS
+    index's segment table (``<index>_data``) keeps a deleted row's terms until a merge
+    rewrites the segment, and raw file bytes (the database and its WAL) keep deleted
+    content in free pages and frames until reuse; both are counted separately.
     """
     import sqlite3
 
@@ -189,24 +190,38 @@ def _scan_state(path: Path, phrase: str) -> dict[str, int]:
         schema = connection.execute(
             "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
-        cells = unreadable = matches = fts = 0
-        for name, sql in schema:
+        indexes = {
+            name for name, sql in schema
+            if sql.upper().startswith("CREATE VIRTUAL TABLE") and "FTS" in sql.upper()
+        }
+        segments = {f"{name}_data" for name in indexes}
+        cells = segment_cells = unreadable = matches = 0
+        holders: set[str] = set()
+        for name, _sql in schema:
             quoted = '"' + name.replace('"', '""') + '"'
             try:
                 for row in connection.execute(f"SELECT * FROM {quoted}"):
                     for value in row:
-                        if type(value) is str:
-                            cells += any(needle in value for needle in needles)
-                        elif type(value) is bytes:
-                            cells += any(needle in value for needle in bytes_needles)
+                        hit = (
+                            any(needle in value for needle in needles)
+                            if type(value) is str
+                            else any(needle in value for needle in bytes_needles)
+                            if type(value) is bytes
+                            else False
+                        )
+                        if hit:
+                            holders.add(name)
+                            if name in segments:
+                                segment_cells += 1
+                            else:
+                                cells += 1
+                if name in indexes:
+                    matches += connection.execute(
+                        f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?",
+                        (f'"{token}"',),
+                    ).fetchone()[0]
             except sqlite3.Error:
                 unreadable += 1
-                continue
-            if sql.upper().startswith("CREATE VIRTUAL TABLE") and "FTS" in sql.upper():
-                fts += 1
-                matches += connection.execute(
-                    f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?", (f'"{token}"',)
-                ).fetchone()[0]
     finally:
         connection.close()
     residue = sum(
@@ -216,8 +231,11 @@ def _scan_state(path: Path, phrase: str) -> dict[str, int]:
         for needle in bytes_needles
     )
     return {
-        "tables": len(schema), "fts_tables": fts, "unreadable": unreadable,
-        "cells": cells, "fts_matches": matches, "residue": residue,
+        "tables": len(schema), "fts_tables": len(indexes), "unreadable": unreadable,
+        "cells": cells, "fts_matches": matches, "segment_cells": segment_cells,
+        "residue": residue,
+        # Hermes's own table names only, so a remaining copy can be located.
+        "holders": sorted(holders),
     }
 
 
@@ -477,6 +495,10 @@ async def _core(home: Path) -> dict[str, object]:
             stale_forget_ack = not writer.acknowledge_forget(retired)
             tail_after_complete = (home / "tail.json").read_text(encoding="utf-8")
             scan_after = _scan_state(home / "state.db", phrase)
+            # Physical erasure is Hermes's own maintenance, `hermes sessions optimize`
+            # (FTS optimize, then VACUUM), run with no other writer, as Hermes requires.
+            optimized_indexes = worker.db.vacuum()
+            scan_optimized = _scan_state(home / "state.db", phrase)
             late_archive = await service.archive(original)
             late_review = await service.review(review)
             chain_after = _all_messages(worker.db, chain_ids)
@@ -586,7 +608,13 @@ async def _core(home: Path) -> dict[str, object]:
                         and scan_before["unreadable"] == 0 and scan_after["unreadable"] == 0
                         and scan_after["tables"] == scan_before["tables"]
                     ),
+                    # Logical: no row and no FTS match holds the phrase after the delete.
                     "state_db_phrase": scan_after["cells"] + scan_after["fts_matches"],
+                    # Physical, after Hermes's optimize: no cell, segment or raw byte.
+                    "optimized_phrase": int(optimized_indexes == 0) + (
+                        scan_optimized["cells"] + scan_optimized["fts_matches"]
+                        + scan_optimized["segment_cells"] + scan_optimized["residue"]
+                    ),
                     "chain_walked": int(
                         _has_phrase(before, phrase) and len(chain_ids) == 3
                         and deletion is not None and deletion.complete
@@ -629,7 +657,11 @@ async def _core(home: Path) -> dict[str, object]:
                     "root_recreation_detected": root_recreation_detected,
                 },
                 # Reported, not gated: free pages and WAL frames keep bytes until reuse.
-                "residue": {"before": scan_before["residue"], "after": scan_after["residue"]},
+                "residue": {
+                    "before": scan_before["residue"], "after": scan_after["residue"],
+                    "segment_cells_after": scan_after["segment_cells"],
+                    "holders_after": scan_after["holders"],
+                },
             }
     finally:
         if receiver is not None:
@@ -751,8 +783,10 @@ async def _restart(home: Path) -> dict[str, object]:
         residual_before = int(
             not worker.port.absent((ids[0],)) and worker.port.absent((ids[1],))
         )
+        before = worker.store.deletion("m3crash")
         await service.start()  # Owner start reconciles the frozen delete manifest.
-        deletion = worker.store.deletion("m3crash")
+        # Owned start prunes only completed fences, so a pruned fence was completed.
+        pruned = worker.store.deletion("m3crash") is None
         native_absent = worker.port.absent(ids)
         messages_absent = not _all_messages(worker.db, ids)
         repeat = await service.forget(VoiceForgetEvent(
@@ -761,7 +795,10 @@ async def _restart(home: Path) -> dict[str, object]:
         ))
         return {"restart": {
             "residual_before": residual_before,
-            "complete": int(deletion is not None and deletion.complete and native_absent),
+            "complete": int(
+                before is not None and not before.complete and before.targets is not None
+                and pruned and native_absent
+            ),
             "no_resurrection": int(
                 messages_absent and repeat is not None
                 and repeat.type == "voice_forget_ack" and repeat.state == "complete"
@@ -877,6 +914,17 @@ def _host_actor(home: Path, role: str) -> dict[str, object]:
             )))
             if archive is None or archive.type != "voice_archive_ack":
                 raise RuntimeError("CLI owner did not archive")
+            async def read_binding() -> Any:
+                return service._store.read(case)
+
+            # The store belongs to the companion loop thread.
+            bound = host.submit(read_binding())
+            if bound is None:
+                raise RuntimeError("CLI owner did not bind")
+            # Kept in the throwaway home for the successor; never emitted.
+            (home / "cli-session.json").write_text(
+                json.dumps(bound.session_id), encoding="utf-8"
+            )
 
             def fail_delete(_target: Any) -> bool:
                 raise RuntimeError("injected owner exit before native deletion")
@@ -898,12 +946,15 @@ def _host_actor(home: Path, role: str) -> dict[str, object]:
                 time.sleep(0.05)
             return result
         case = "m3_cli_handoff"
+        session_id = json.loads((home / "cli-session.json").read_text(encoding="utf-8"))
+
         async def inspect() -> dict[str, int]:
-            deletion = service._store.deletion(case)
-            record = service._store.read(case)
+            # The CLI owner left the fence pending; the successor's owned start
+            # completed it and pruned it, which only ever happens to completed fences.
             return {"complete": int(
-                deletion is not None and deletion.complete
-                and record is not None and service._port.absent((record.session_id,))
+                service._store.deletion(case) is None
+                and service._store.read(case) is None
+                and service._port.absent((session_id,))
             )}
 
         result = host.submit(inspect())
