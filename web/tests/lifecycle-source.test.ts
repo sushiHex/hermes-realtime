@@ -8,6 +8,59 @@ const mainSource = readFileSync(
   "utf8",
 );
 
+describe("reloaded tab rebind wiring", () => {
+  it("remembers every new credential and forgets the session only after a stop succeeds", () => {
+    const setter = mainSource.indexOf("function setCredential(");
+    const setterEnd = mainSource.indexOf("\n}\n", setter);
+    expect(setter).toBeGreaterThan(-1);
+    const outside = mainSource.slice(0, setter) + mainSource.slice(setterEnd);
+    expect(outside.match(/\bcredential = /g) ?? []).toHaveLength(0);
+    expect(outside).toContain("let credential: BootstrapCredential | null = null;");
+    const body = mainSource.slice(setter, setterEnd);
+    expect(body).toContain("if (stableLaunch && value !== null) {");
+    expect(body).toContain(
+      "rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });",
+    );
+    // A failed connect clears the credential in memory but never the remembered session.
+    const forget = "if (stableLaunch) rememberSession(tabStorage(), null);";
+    expect(mainSource.split(forget)).toHaveLength(2);
+    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(2);
+    const stop = mainSource.indexOf("async function stop(");
+    const stopBody = mainSource.slice(stop, mainSource.indexOf("\n}\n", stop));
+    expect(stopBody.indexOf(forget)).toBeGreaterThan(stopBody.indexOf("} finally {"));
+    expect(stopBody.indexOf("} finally {")).toBeGreaterThan(
+      stopBody.indexOf('if (!response.ok) throw new Error("session stop was rejected");'),
+    );
+  });
+
+  it("starts a stable tab by rebinding its remembered session before any bootstrap", () => {
+    const connectStart = mainSource.indexOf("async function connect(");
+    const freshPath = mainSource.indexOf(
+      "\n    } else {\n",
+      mainSource.indexOf("    if (resuming) {", connectStart),
+    );
+    expect(freshPath).toBeGreaterThan(connectStart);
+    expect(mainSource.slice(freshPath, freshPath + 120)).toContain(
+      "setCredential(await bootstrapOrReload(localOperation.signal));",
+    );
+    const reload = mainSource.indexOf("async function bootstrapOrReload(");
+    const reloadEnd = mainSource.indexOf("\n}\n", reload);
+    const body = mainSource.slice(reload, reloadEnd);
+    // The verdict rules live in reloadOrBootstrap, tested behaviorally in controller.test.ts.
+    expect(body).toContain("if (!stableLaunch) return bootstrap(signal);");
+    expect(body).toContain("const result = await reloadOrBootstrap({");
+    expect(body).toContain("storage: tabStorage(),");
+  });
+
+  it("never lets a leaving page reconnect the session it is leaving", () => {
+    // The SDK's page-leave disconnect would read as a dropped connection and rebind,
+    // rotating the identity under the reloaded tab.
+    const rooms = mainSource.match(/new Room\(\{[^}]*\}\)/g) ?? [];
+    expect(rooms.length).toBeGreaterThan(0);
+    for (const room of rooms) expect(room).toContain("disconnectOnPageLeave: false");
+  });
+});
+
 describe("browser lifecycle wiring", () => {
   it("releases residual remote playback before error-resume room teardown", () => {
     const blockStart = mainSource.indexOf("  if (errorResume) {", mainSource.indexOf("async function connect"));

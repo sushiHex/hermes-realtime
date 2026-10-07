@@ -43,7 +43,7 @@ class LoopbackPeerAddress:
 class LoopbackPeerAuthorizer:
     """Authorize only an exact loopback peer captured from the accepted socket."""
 
-    async def authorize(self, peer: LoopbackPeerAddress) -> None:
+    async def authorize(self, peer: object) -> None:
         if type(peer) is not LoopbackPeerAddress:
             raise LoopbackAuthorizationError()
         try:

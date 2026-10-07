@@ -96,6 +96,10 @@ const ROOM = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const IDENTITY = /^browser_[a-f0-9]{16,64}$/;
 const WORKER_IDENTITY = /^worker_[A-Za-z0-9_-]{8,64}$/;
 
+export function isBrowserIdentity(value: unknown): value is string {
+  return typeof value === "string" && IDENTITY.test(value);
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return (
     typeof value === "object" &&

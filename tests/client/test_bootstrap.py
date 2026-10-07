@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -2216,6 +2217,390 @@ async def test_loopback_stable_rebind_enforces_peer_browser_and_session_authorit
     assert first.body == replay.body
     assert json.loads(first.body)["participantIdentity"] == "browser_fedcba9876543210"
     assert rebound == ["browser_fedcba9876543210"]
+
+
+def _reload_director(
+    projection: BrowserEventProjection,
+) -> tuple[BrowserSessionDirector, list[str]]:
+    identities = iter(
+        ("browser_0123456789abcdef", "browser_fedcba9876543210", "browser_00112233aabbccdd")
+    )
+    rebound: list[str] = []
+
+    async def provision(_identity: str) -> int:
+        return 1
+
+    async def reprovision(identity: str) -> int:
+        rebound.append(identity)
+        return len(rebound) + 1
+
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="room",
+            identity_factory=lambda: next(identities),
+        ),
+        provision=provision,
+        reprovision=reprovision,
+        submit=_noop_submit,
+        stop=_noop_stop,
+        approval=_noop_approval,
+        projection=projection,
+    )
+    return director, rebound
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_view_rebind_restarts_the_projection_a_reconnect_keeps() -> None:
+    projection = BrowserEventProjection()
+    director, rebound = _reload_director(projection)
+    initial = await director.start()
+    await director.public_events_after(
+        participant_identity=initial.participant_identity, sequence=1
+    )
+
+    reconnected = await director.rebind(participant_identity=initial.participant_identity)
+
+    # A reconnecting page keeps its view and its cursor: nothing is replayed.
+    assert projection.events_after(0) == ()
+
+    reloaded = await director.rebind(
+        participant_identity=reconnected.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+
+    # A reloaded page has no view: it gets the session's own description from sequence one.
+    events = projection.events_after(0)
+    assert [(event.sequence, event.kind) for event in events] == [(1, "session_ready")]
+    assert rebound == [reconnected.participant_identity, reloaded.participant_identity]
+    assert director.active_identity == reloaded.participant_identity
+    replay = await director.rebind(
+        participant_identity=reconnected.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+    assert replay == reloaded
+    assert [event.sequence for event in projection.events_after(0)] == [1]
+    with pytest.raises(TypeError, match="fresh_view"):
+        await director.rebind(
+            participant_identity=reloaded.participant_identity,
+            fresh_view=1,  # type: ignore[arg-type]
+        )
+    assert director.active_identity == reloaded.participant_identity
+
+
+def _counting_director(
+    projection: BrowserEventProjection, *, refused_decisions: int = 0
+) -> tuple[BrowserSessionDirector, list[tuple[str, int, str]], list[tuple[str, int, str]]]:
+    identities = iter(f"browser_{index:016x}" for index in range(1, 64))
+    typed: list[tuple[str, int, str]] = []
+    approvals: list[tuple[str, int, str]] = []
+    generations = iter(range(2, 64))
+
+    async def provision(_identity: str) -> int:
+        return 1
+
+    async def reprovision(_identity: str) -> int:
+        return next(generations)
+
+    async def submit(identity: str, generation: int, sequence: int, text: str) -> None:
+        del generation
+        typed.append((identity, sequence, text))
+
+    async def approval(
+        identity: str, generation: int, sequence: int, approval_id: str, decision: str
+    ) -> None:
+        del generation, decision
+        approvals.append((identity, sequence, approval_id))
+        if len(approvals) <= refused_decisions:
+            raise RuntimeError("no Hermes approval is pending")
+
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="room",
+            identity_factory=lambda: next(identities),
+        ),
+        provision=provision,
+        reprovision=reprovision,
+        submit=submit,
+        stop=_noop_stop,
+        approval=approval,
+        projection=projection,
+    )
+    return director, typed, approvals
+
+
+@pytest.mark.asyncio
+async def test_a_reloaded_page_types_and_decides_again_from_sequence_one() -> None:
+    projection = BrowserEventProjection()
+    director, typed, approvals = _counting_director(projection)
+    first = await director.start()
+    await director.submit_text(
+        participant_identity=first.participant_identity, sequence=1, text="a"
+    )
+    await director.submit_text(
+        participant_identity=first.participant_identity, sequence=2, text="b"
+    )
+    await director.decide_approval(
+        participant_identity=first.participant_identity,
+        approval_id="approval_0123456789abcdef",
+        sequence=1,
+        decision="reject",
+    )
+
+    reloaded = await director.rebind(
+        participant_identity=first.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+    # The reloaded page restarts its counters at one; so must the session.
+    await director.submit_text(
+        participant_identity=reloaded.participant_identity, sequence=1, text="b"
+    )
+    await director.decide_approval(
+        participant_identity=reloaded.participant_identity,
+        approval_id="approval_fedcba9876543210",
+        sequence=1,
+        decision="approve",
+    )
+
+    assert typed[-1] == (reloaded.participant_identity, 1, "b")
+    # The page restarted at one; the authority behind it sees its own next decision.
+    assert approvals[-1] == (reloaded.participant_identity, 2, "approval_fedcba9876543210")
+
+
+@pytest.mark.asyncio
+async def test_the_approval_authority_sees_one_rising_sequence_whatever_the_page_restarts() -> None:
+    # The host's approval authority outlives every page and session, and refuses any
+    # decision that is not the next in its own sequence, as HermesApiTaskSession does.
+    projection = BrowserEventProjection()
+    director, _, approvals = _counting_director(projection)
+    first = await director.start()
+
+    async def decide(identity: str, page_sequence: int, suffix: str) -> None:
+        await director.decide_approval(
+            participant_identity=identity,
+            approval_id=f"approval_{suffix * 16}",
+            sequence=page_sequence,
+            decision="reject",
+        )
+
+    await decide(first.participant_identity, 1, "a")
+    reloaded = await director.rebind(
+        participant_identity=first.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+    await decide(reloaded.participant_identity, 1, "b")
+    resynced = await director.projection_resync(participant_identity=reloaded.participant_identity)
+    await decide(resynced.participant_identity, 1, "c")
+    # A replayed decision reaches the authority once.
+    await decide(resynced.participant_identity, 1, "c")
+    await director.stop(participant_identity=resynced.participant_identity)
+    second = await director.start()
+    await decide(second.participant_identity, 1, "d")
+
+    assert [sequence for _, sequence, _ in approvals] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_decision_spends_no_authority_sequence() -> None:
+    director, _, approvals = _counting_director(BrowserEventProjection(), refused_decisions=1)
+    first = await director.start()
+    for _ in range(2):
+        with contextlib.suppress(RuntimeError):
+            await director.decide_approval(
+                participant_identity=first.participant_identity,
+                approval_id="approval_0123456789abcdef",
+                sequence=1,
+                decision="approve",
+            )
+    assert [sequence for _, sequence, _ in approvals] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_view_resends_open_tasks_and_approvals_and_drops_settled_ones() -> None:
+    projection = BrowserEventProjection()
+    director, _, _ = _counting_director(projection)
+    first = await director.start()
+    open_task = {"taskId": "task_open", "status": "active"}
+    settled_task = {"taskId": "task_done", "status": "active"}
+    open_approval = {
+        "actionable": True,
+        "approvalId": "approval_0123456789abcdef",
+        "command": "chmod 777 /tmp/x",
+        "description": "change permissions",
+        "state": "pending",
+        "taskId": "task_open",
+    }
+    projection.publish("task_state", dict(open_task))
+    projection.publish("task_state", dict(settled_task))
+    projection.publish("task_state", {"taskId": "task_done", "status": "completed"})
+    projection.publish("approval_state", dict(open_approval))
+    projection.publish(
+        "approval_state",
+        dict(open_approval, approvalId="approval_fedcba9876543210"),
+    )
+    projection.publish(
+        "approval_state",
+        {"actionable": False, "approvalId": "approval_fedcba9876543210", "state": "reject"},
+    )
+
+    await director.rebind(
+        participant_identity=first.participant_identity,
+        request_id="rebind_0123456789abcdef",
+        fresh_view=True,
+    )
+
+    events = [(event.kind, dict(event.data)) for event in projection.events_after(0)]
+    assert [kind for kind, _ in events] == ["session_ready", "task_state", "approval_state"]
+    assert events[1][1] == open_task
+    assert events[2][1] == open_approval
+
+
+@pytest.mark.asyncio
+async def test_a_refused_fresh_view_leaves_the_live_tab_untouched() -> None:
+    projection = BrowserEventProjection()
+    director, typed, _ = _counting_director(projection)
+    first = await director.start()
+    await director.submit_text(
+        participant_identity=first.participant_identity, sequence=1, text="a"
+    )
+    before = projection.events_after(0)
+
+    with pytest.raises(PermissionError, match="does not own"):
+        await director.rebind(
+            participant_identity="browser_00000000deadbeef",
+            request_id="rebind_0123456789abcdef",
+            fresh_view=True,
+        )
+
+    # Nothing about the live tab changed: its events, its identity and its counters.
+    assert projection.events_after(0) == before
+    assert director.active_identity == first.participant_identity
+    await director.submit_text(
+        participant_identity=first.participant_identity, sequence=2, text="b"
+    )
+    assert typed[-1] == (first.participant_identity, 2, "b")
+
+
+@pytest.mark.asyncio
+async def test_no_session_is_its_own_verdict() -> None:
+    from hermes_realtime.client.session import NoBrowserSession
+
+    director, _, _ = _counting_director(BrowserEventProjection())
+    with pytest.raises(NoBrowserSession):
+        await director.rebind(participant_identity="browser_00000000deadbeef")
+    assert issubclass(NoBrowserSession, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_loopback_stable_rebind_admits_exactly_a_true_fresh_view() -> None:
+    projection = BrowserEventProjection()
+    director, rebound = _reload_director(projection)
+    connection = LiveKitConnection("wss://livekit.test", "key", "s" * 32)
+    app = BrowserBootstrapApplication(
+        sessions=director,
+        verifier=BrowserTokenVerifier(connection=connection, room_name="room"),
+        capability=None,
+        allowed_origin="http://127.0.0.1:8765",
+        worker_identity="worker_hermes_browser",
+        loopback_authorizer=LoopbackPeerAuthorizer(),
+    )
+    peer = LoopbackPeerAddress.from_peername(("127.0.0.1", 54321))
+    common = {"origin": "http://127.0.0.1:8765", "sec-fetch-site": "same-origin"}
+    initial = json.loads(
+        (
+            await app.handle(
+                method="POST",
+                path="/api/v1/stable-bootstrap",
+                headers={**common, "content-length": "0"},
+                body=b"",
+                peer=peer,
+            )
+        ).body
+    )
+    await director.public_events_after(
+        participant_identity=initial["participantIdentity"], sequence=1
+    )
+
+    def request(fields: dict[str, object]) -> tuple[dict[str, str], bytes]:
+        body = json.dumps(fields, separators=(",", ":")).encode("utf-8")
+        headers = {
+            **common,
+            "content-length": str(len(body)),
+            "content-type": "application/json",
+        }
+        return headers, body
+
+    base = {
+        "participantIdentity": initial["participantIdentity"],
+        "requestId": "rebind_0123456789abcdef",
+    }
+    for rejected in (
+        base | {"freshView": False},
+        base | {"freshView": 1},
+        base | {"freshView": "true"},
+        base | {"freshView": True, "extra": True},
+    ):
+        headers, body = request(rejected)
+        with pytest.raises((TypeError, ValueError)):
+            await app.handle(
+                method="POST",
+                path="/api/v1/stable-rebind",
+                headers=headers,
+                body=body,
+                peer=peer,
+            )
+    assert rebound == []
+
+    # Every trust check holds before a fresh view can touch the live tab.
+    events = projection.events_after(0)
+    headers, body = request(base | {"freshView": True})
+    stranger, stranger_body = request(
+        base | {"freshView": True, "participantIdentity": "browser_00000000deadbeef"}
+    )
+    for refused_headers, refused_body, refused_peer in (
+        ({**headers, "origin": "http://127.0.0.1:9999"}, body, peer),
+        ({k: v for k, v in headers.items() if k != "sec-fetch-site"}, body, peer),
+        ({**headers, "sec-fetch-site": "cross-site"}, body, peer),
+        ({**headers, "authorization": "Bearer forbidden"}, body, peer),
+        (headers, body, None),
+        (headers, body, TailnetPeerAddress.from_peername(("100.64.1.2", 54321))),
+        # A peer value that never came from a loopback socket.
+        (headers, body, LoopbackPeerAddress(ip="192.0.2.1", port=54321)),
+        (stranger, stranger_body, peer),
+    ):
+        with pytest.raises(PermissionError):
+            await app.handle(
+                method="POST",
+                path="/api/v1/stable-rebind",
+                headers=refused_headers,
+                body=refused_body,
+                peer=refused_peer,
+            )
+        assert projection.events_after(0) == events
+    assert rebound == []
+    assert director.active_identity == initial["participantIdentity"]
+
+    headers, body = request(base | {"freshView": True})
+    response = await app.handle(
+        method="POST",
+        path="/api/v1/stable-rebind",
+        headers=headers,
+        body=body,
+        peer=peer,
+    )
+
+    assert response.status == 200
+    assert json.loads(response.body)["participantIdentity"] == "browser_fedcba9876543210"
+    assert [(event.sequence, event.kind) for event in projection.events_after(0)] == [
+        (1, "session_ready")
+    ]
 
 
 @pytest.mark.asyncio
