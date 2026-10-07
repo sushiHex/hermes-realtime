@@ -209,11 +209,30 @@ def test_an_owned_start_prunes_completed_fences(store: CompanionStore) -> None:
     store.set_delete_manifest("done", (DeleteTarget("voice_1"),))
     store.mark_delete_complete("done")
     store.tombstone("open", 0)
+    # A completed deletion is a fence only; it is never reconciled again.
+    assert store.pending_deletions() == ("open",)
 
     store.prune_completed()
 
     assert store.deletion("done") is None and store.read("done") is None
     assert store.pending_deletions() == ("open",)
+
+
+def test_pruning_drops_a_binding_an_earlier_build_kept_after_completion(
+    store: CompanionStore,
+) -> None:
+    store.bind("legacy", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
+    store.tombstone("legacy", 0)
+    store.set_delete_manifest("legacy", (DeleteTarget("voice_1"),))
+    # The previous release marked completion and kept the binding.
+    store._connection.execute(
+        "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = 'legacy'"
+    )
+    assert store.read("legacy") is not None
+
+    store.prune_completed()
+
+    assert store.read("legacy") is None and store.deletion("legacy") is None
 
 
 @pytest.mark.asyncio
