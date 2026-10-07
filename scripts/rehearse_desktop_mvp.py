@@ -899,6 +899,14 @@ def audio_without_speech(
     return findings, notes
 
 
+def harness_matches_head(repository: Path, path: str) -> bool:
+    """Is the running harness exactly the file HEAD tracks? An untracked copy is not."""
+
+    tracked = _run(["git", "ls-files", "--error-unmatch", "--", path], cwd=repository)
+    unchanged = _run(["git", "diff", "--quiet", "HEAD", "--", path], cwd=repository)
+    return tracked.returncode == 0 and unchanged.returncode == 0
+
+
 def phrase_in_database(database: Path, phrase: str) -> int:
     """Rows holding ``phrase`` in any column of any table, or matching it in any FTS index.
 
@@ -1581,10 +1589,6 @@ class Rehearsal:
         tracked = _run(
             ["git", "status", "--porcelain", "--untracked-files=no"], cwd=_REPOSITORY
         ).stdout
-        harness = _run(
-            ["git", "diff", "--quiet", "HEAD", "--", "scripts/rehearse_desktop_mvp.py"],
-            cwd=_REPOSITORY,
-        ).returncode
         if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
             raise RuntimeError("the candidate commit could not be read")
         for argv in (
@@ -1629,7 +1633,7 @@ class Rehearsal:
         return {
             "commit": commit,
             "clean": tracked == "",
-            "harness_at_head": harness == 0,
+            "harness_at_head": harness_matches_head(_REPOSITORY, "scripts/rehearse_desktop_mvp.py"),
             "host_from_wheel": Path(located).resolve().is_relative_to(self.host_env.resolve()),
         }
 

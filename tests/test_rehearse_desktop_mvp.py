@@ -337,6 +337,30 @@ def test_the_file_scan_reads_every_file_and_refuses_a_missing_directory(tmp_path
         rehearsal.phrase_in_files(tmp_path / "memories", "hoopoe")
 
 
+def test_the_harness_matches_head_only_when_tracked_and_unchanged(tmp_path: Path) -> None:
+    import subprocess
+
+    def git(*arguments: str) -> None:
+        subprocess.run(
+            ("git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments),
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    git("init", "-q")
+    (tmp_path / "harness.py").write_text("one\n", encoding="utf-8")
+    assert not rehearsal.harness_matches_head(tmp_path, "harness.py")  # no HEAD yet
+    git("add", "harness.py")
+    git("commit", "-q", "-m", "c")
+    assert rehearsal.harness_matches_head(tmp_path, "harness.py")
+    (tmp_path / "harness.py").write_text("two\n", encoding="utf-8")
+    assert not rehearsal.harness_matches_head(tmp_path, "harness.py")
+    (tmp_path / "copy.py").write_text("untracked\n", encoding="utf-8")
+    assert not rehearsal.harness_matches_head(tmp_path, "copy.py")
+
+
 def test_every_verdict_is_applied_where_it_is_observed() -> None:
     source = {
         name: inspect.getsource(getattr(rehearsal.Rehearsal, name))
