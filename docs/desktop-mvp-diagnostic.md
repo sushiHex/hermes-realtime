@@ -28,22 +28,50 @@ The control states this limit beside it:
 
 > Delegated tasks remain in Hermes and are managed with Hermes's own session controls.
 
+> A copy made with Hermes /branch is a separate conversation: deletion stays pending until you delete that copy in Hermes.
+
 The live tail and queued archive rows clear immediately and a new generation fences late
 events. The status remains **pending** until the companion verifies that the old generation's
-archive chain has been deleted. An already running review finishes normally; deletion waits
-for it, and anything it learns remains. If the companion is unavailable, pending does not
-mean complete. A restart or successor owner resumes reconciliation from durable intent.
+archive chain has been deleted and no `/branch` copy of it remains. An already running review
+finishes normally; deletion waits for it, and anything it learns remains. If the companion is
+unavailable, pending does not mean complete. A restart or successor owner resumes
+reconciliation from durable intent, which survives a corrupt or reset voice tail. A pending
+delete never blocks deleting the next conversation. **Complete** refers only to the
+conversation the current one replaced. **Unknown** means an earlier delete record could not
+be read: check that conversation with Hermes's own session controls.
 
-Deletion is logical, not physical erasure. Hermes run records remain (terminal records are
-pruned 24 hours after their last status update); unvacuumed SQLite pages and backups or sync
-copies remain too. A non-terminal run record left by a crash must first be recovered by
-Hermes before its terminal retention applies. Built-in memory and skills are not removed.
-Completion verifies session absence in Hermes's database. Hermes removes session sidecar
-files on a best-effort basis and can silently retain them if filesystem removal fails;
-completion is not a verified filesystem-erasure receipt.
+The control is unavailable while the companion does not offer `voice_forget`, and while
+evidence capture is on, because the evidence spool keeps its own copy of the transcript; use
+**Revoke consent and erase** to remove that copy.
+
+### Support limits
+
+Deletion removes the conversation's voice tail and its archive compression chain in Hermes.
+Deletion is logical, not physical erasure. These remain, by design:
+
+- **Learned memory and skills.** What Hermes learned from the conversation stays and may still
+  shape replies, including what a review already running at deletion learns. There is no
+  unlearning in the MVP.
+- **Delegated tasks.** Their sessions and objectives remain in Hermes and are managed with
+  Hermes's own session controls.
+- **Hermes run records.** Terminal records are pruned 24 hours after their last status update.
+  A non-terminal record left by a crash must first be recovered by Hermes before that
+  retention applies.
+- **Unvacuumed SQLite pages and WAL frames.** Deleted rows can persist as bytes in free pages
+  and the write-ahead log until SQLite reuses them.
+- **Backups and sync copies** of the Hermes home.
+- **Hermes `/branch` copies.** A copy is an independent conversation you may have continued,
+  so it is never deleted for you. While one remains, the deletion stays **pending**; it
+  completes once you delete the copy in Hermes.
+- **The evidence spool.** With evidence capture on, the control is unavailable; **Revoke
+  consent and erase** removes the spool's copy.
+- **Session sidecar files.** Completion verifies session absence in Hermes's database. Hermes
+  removes sidecar files on a best-effort basis and can silently retain them if filesystem
+  removal fails; completion is not a verified filesystem-erasure receipt.
 
 For the acceptance session, use synthetic data: verify that a unique phrase disappears from
-the voice tail, each archive-chain session and the next conversation's history; exercise
+the voice tail, each archive-chain session, every table of Hermes's `state.db` (FTS indexes
+included) and the next conversation's history; exercise
 pending deletion during a review and after restart; verify separately that a deliberately
 learned fact can still return through M4. Record only results and counts, never the phrase
 or memory content. See [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md).
@@ -262,8 +290,13 @@ From the gate:
 From the host:
 
 - `[voice-tail]`: at start, `restored` and `outbox` counts when the conversation was restored,
-  or `refusal: malformed` when the tail was unusable and a fresh conversation began. No marker
-  means no tail existed yet.
+  or `refusal: malformed` when the tail was unusable and a fresh conversation began, or
+  `retired: 1` when a recorded delete's conversation was retired before its cleared tail was
+  written. No marker means no tail existed yet.
+- `[voice-deletes]`: `refusal: malformed`, the delete record was unreadable; the delete status
+  reads `unknown`.
+- `[voice-forget-send]`: a delete is not yet verified: `outcome: pending`, a refusal category,
+  or `outcome: unknown` with a `cause` when the companion link failed. The delete is resent.
 - `[voice-tail-lock]`: `cause: held`, another host holds the voice tail; this one does not start.
 - `[voice-tail-outbox]`: unsent archive rows were dropped (`overflow`, `evicted`, `invalid`),
   or a review or close bound was reached.
@@ -294,6 +327,9 @@ From the gateway (the companion runs inside it):
   be opened, a batch was refused, or the archive lease was lost.
 - `[voice-review]`: a review was refused, or ended (`outcome: finished`, `failed` or
   `cancelled`).
+- `[voice-forget]`: a delete stays pending, with the `stage` it reached and why: `category`
+  (`review` while a review runs, `present` or `branch_copies` while a session or a `/branch`
+  copy remains), `refusal`, or `failure`.
 - `[hermes-bridge-hello]`: a hello was refused: `shape`, `token`, `participant`, `version` or
   `capability`.
 
@@ -523,7 +559,22 @@ A clean stop with `Ctrl-C` instead stops the session's runs as it shuts down, so
 restores history but prints no settlement and makes no announcement. If you also try it, record
 it as a separate observation.
 
-### 9. Cleanup
+### 9. Delete the voice conversation
+
+- **Do:** speak or type a short unique phrase that appears nowhere else, such as a made-up
+  word, and wait for the reply. Then press **Delete this voice conversation** and confirm.
+  When the status reads **Voice conversation deleted.**, ask a question that would need the
+  phrase to answer.
+- **Observe:** the transcript clears at once and the status reads **pending**, then
+  **Voice conversation deleted.** The reply to the follow-up question does not know the
+  phrase, and the next conversation's history in Hermes does not contain it. A fact
+  deliberately taught in the deleted conversation may still come back through memory: that
+  is the stated limit (see [Support limits](#support-limits)), not a failure.
+- **Record:** the status transitions in order (for example `pending`, `complete`); seconds
+  from confirming to `complete`; phrase returned yes or no; any `[voice-forget-send]` or
+  `[voice-forget]` marker. Never record the phrase itself.
+
+### 10. Cleanup
 
 - **Do:** press **Stop session**, then `Ctrl-C` in terminal B (host), C (gateway) and A
   (LiveKit). Check that nothing is left running:
@@ -543,6 +594,7 @@ it as a separate observation.
 
 The conversation persists on purpose. The host keeps the recent heard conversation in
 `%LOCALAPPDATA%\HermesRealtime\state\voice-tail-v1.json` beside its Hermes run record, and the
-companion archives it into Hermes. To forget the local copy, delete that file while the host is
-stopped; the tail moved aside in session step 2 is yours to keep or delete the same way.
-Deleting the archived voice history from Hermes is not available yet.
+companion archives it into Hermes. Session step 9's control deletes both the local copy and
+the archived history. Its delete record, `voice-tail-v1.deletes.json` beside the tail, holds
+only conversation identities. The tail moved aside in session step 2 is yours to keep or delete
+while the host is stopped.

@@ -277,9 +277,26 @@ to speech or task dispatch.
 
 The browser's confirmed **Delete this voice conversation** action clears the live tail,
 fences the old archive/review outbox and stale acknowledgments, advances the generation with
-a fresh conversation identity, and drops the memory snapshot. The pending old identity is
-retained in the existing atomic tail file across restart. The UI stays pending until an
-exact complete receipt arrives; there is no voice deletion command.
+a fresh conversation identity, and drops the memory snapshot. The old identity is recorded in
+a delete record beside the tail (`<tail>.deletes.json`), which the tail writer persists before
+every tail write. Nothing that resets the tail touches it: a corrupt tail, a tail an older
+build rewrote, or a restore the store refuses all keep the intent, and a tail still bound to a
+recorded identity is retired when it opens. A version-4 tail's intent moves into the record.
+An unreadable record is reported as `unknown`, with a `[voice-deletes]` marker, never as
+idle. There is no voice deletion command.
+
+The record holds up to 64 pending deletes and the last one verified complete. The sender
+holds its companion link open and resends every pending delete each round, so one that stays
+pending never blocks a later delete. The browser status is one of:
+
+- `pending`: at least one recorded delete is not yet verified, whatever the link's state;
+- `unavailable`: the live link has not negotiated `voice_forget`, or evidence capture is on;
+- `unknown`: an earlier delete record could not be read, so its outcome is not known;
+- `complete`: the last verified delete is the conversation the current one replaced;
+- `idle`: none of the above; the control is offered and there is no delete to report.
+
+The control is offered whenever the status is not `unavailable`, including while a delete is
+pending.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler
 runs on the tombstone, natural review-thread completion and owned startup. An admitted or
@@ -291,9 +308,14 @@ continues to detect a non-gateway owner.
 
 What Hermes learned from it (memories and skills) stays and may still shape replies. There is
 no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own
-session controls. No run-session IDs are included in the delete request. Deletion is logical:
-Hermes run records, unvacuumed SQLite pages,
-backups and sync copies remain. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
+session controls. No run-session IDs are included in the delete request. A copy made with
+Hermes `/branch` is an independent conversation Hermes keeps (native deletion orphans it), and
+it may hold the user's own later work, so the companion never deletes it: while one still
+carries the `_branched_from` marker of a deleted session, the delete stays pending, and it
+completes once the user deletes the copy in Hermes. With evidence capture on, the spool keeps
+its own copy of the transcript, so the control is unavailable; **Revoke consent and erase**
+removes that copy. Deletion is logical: Hermes run records, unvacuumed SQLite pages and WAL
+frames, backups and sync copies remain. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
 for the exact support limits and [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md)
 for the qualification contract.
 
