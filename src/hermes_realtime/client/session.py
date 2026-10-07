@@ -36,6 +36,10 @@ from .projection import BrowserEventProjection, BrowserPublicEvent, PublicValue
 _LOGGER = logging.getLogger(__name__)
 
 
+class NoBrowserSession(RuntimeError):
+    """No browser session is active: the one state refusal a client may act on as such."""
+
+
 @dataclass(frozen=True, slots=True)
 class BrowserAudioDiagnostic:
     stream_id: str
@@ -490,6 +494,9 @@ class BrowserSessionDirector:
         self._last_input_request: tuple[int, str] | None = None
         self._last_approval_sequence = 0
         self._last_approval_request: tuple[int, str, str] | None = None
+        # The approval authority outlives every page and session and admits only the next
+        # decision in its own sequence, so it is given this one, which never restarts.
+        self._approval_authority_sequence = 0
         self._audio_diagnostics: dict[str, BrowserAudioDiagnostic] = {}
         self._last_activity: float | None = None
 
@@ -514,7 +521,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("participant does not own the active session")
             return BrowserBindingSnapshot(
@@ -536,7 +543,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("participant does not own the active session")
             authority = self._search_egress_authority
@@ -569,7 +576,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("participant does not own the active session")
             authority = self._search_egress_authority
@@ -605,7 +612,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("participant does not own the active session")
             binding = BrowserBindingSnapshot(
@@ -1001,7 +1008,7 @@ class BrowserSessionDirector:
                 identity = self._active_identity
                 generation = self._active_generation
                 if identity is None or generation is None:
-                    raise RuntimeError("no browser session is active")
+                    raise NoBrowserSession("no browser session is active")
                 if participant_identity != identity:
                     raise PermissionError(
                         "projection resync participant does not own the active session"
@@ -1042,7 +1049,7 @@ class BrowserSessionDirector:
                             failures,
                         ) from None
                     raise
-                self._publish_fresh_view()
+                self._fresh_view()
                 self._previous_rebind_request = None
                 self._previous_rebind_credential = None
                 self._active_identity = credential.participant_identity
@@ -1061,19 +1068,17 @@ class BrowserSessionDirector:
                     credential.participant_identity,
                     replacement_generation,
                 )
-                self._last_input_sequence = 0
-                self._last_input_request = None
-                self._last_approval_sequence = 0
-                self._last_approval_request = None
                 self._audio_diagnostics.clear()
                 self._touch_activity()
                 return credential
 
-    def _publish_fresh_view(self) -> None:
-        """Restart the projection at sequence one with the session's own description.
+    def _fresh_view(self) -> None:
+        """Reset everything a page holds, for a page that kept nothing but its identity.
 
-        A page whose cursor or view is gone needs what a new session would show it; the
-        search egress status follows when the caller binds the replacement identity.
+        Its projection restarts at sequence one with the session's own description and the
+        tasks and approvals still open; its typed-input and approval counters restart at
+        zero, as the page's do. The search egress status follows when the caller binds the
+        replacement identity.
         """
 
         self._projection.reset()
@@ -1081,6 +1086,7 @@ class BrowserSessionDirector:
             1
             + (1 if self._model_configuration is not None else 0)
             + (1 if self._search_egress_authority is not None else 0)
+            + self._projection.open_state_count
         )
         self._projection.publish(
             "session_ready",
@@ -1110,6 +1116,11 @@ class BrowserSessionDirector:
                 status_reservation,
                 cast(dict[str, PublicValue], capture_status_to_primitive(status)),
             )
+        self._projection.republish_open_state()
+        self._last_input_sequence = 0
+        self._last_input_request = None
+        self._last_approval_sequence = 0
+        self._last_approval_request = None
 
     async def _rebind_after_model_operations(
         self,
@@ -1137,7 +1148,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 if (participant_identity, request_id) == self._previous_rebind_request:
                     replay = self._previous_rebind_credential
@@ -1183,7 +1194,7 @@ class BrowserSessionDirector:
                     ) from None
                 raise
             if fresh_view:
-                self._publish_fresh_view()
+                self._fresh_view()
             self._previous_rebind_request = (
                 (identity, request_id) if request_id is not None else None
             )
@@ -1226,7 +1237,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("media participant does not own the active session")
             activate = self._activate_media
@@ -1257,7 +1268,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError(
                     "audio diagnostic participant does not own the active session"
@@ -1321,7 +1332,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("typed participant does not own the active session")
             request = (sequence, text)
@@ -1384,7 +1395,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("yield participant does not own the active session")
             callback = self._yield_speech
@@ -1428,7 +1439,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("approval participant does not own the active session")
             request = (sequence, approval_id, decision)
@@ -1441,7 +1452,9 @@ class BrowserSessionDirector:
             if sequence != self._last_approval_sequence + 1:
                 raise RuntimeError("approval sequence is not the next expected value")
             self._projection.ensure_capacity()
-            await self._approval(identity, generation, sequence, approval_id, decision)
+            authority_sequence = self._approval_authority_sequence + 1
+            await self._approval(identity, generation, authority_sequence, approval_id, decision)
+            self._approval_authority_sequence = authority_sequence
             self._projection.publish(
                 "approval_state",
                 {
@@ -1469,7 +1482,7 @@ class BrowserSessionDirector:
         async with self._start_lock:
             identity = self._active_identity
             if identity is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("event participant does not own the active session")
             self._projection.acknowledge_through(sequence)
@@ -1489,7 +1502,7 @@ class BrowserSessionDirector:
         async with self._start_lock:
             identity = self._active_identity
             if identity is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("refresh participant does not own the active session")
             credential = self._issuer.issue_for_identity(identity)
@@ -1503,7 +1516,7 @@ class BrowserSessionDirector:
     ) -> tuple[tuple[str, ...], str | None]:
         async with self._start_lock:
             if self._active_identity is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != self._active_identity:
                 raise PermissionError("voice participant does not own the active session")
             configuration = self._voice_configuration
@@ -1592,7 +1605,7 @@ class BrowserSessionDirector:
             raise TypeError("voice must be an exact built-in string")
         async with self._start_lock:
             if self._active_identity is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != self._active_identity:
                 raise PermissionError("voice participant does not own the active session")
             configuration = self._voice_configuration
@@ -1611,7 +1624,7 @@ class BrowserSessionDirector:
         async with self._start_lock:
             identity, generation = self._active_identity, self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != identity:
                 raise PermissionError("delete participant does not own the active session")
             operation = self._delete_voice_conversation
@@ -1632,7 +1645,7 @@ class BrowserSessionDirector:
             raise TypeError("participant_identity must be an exact string")
         async with self._start_lock:
             if self._active_identity is None or self._active_generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if participant_identity != self._active_identity:
                 raise PermissionError("delete participant does not own the active session")
             status = self._voice_delete_status
@@ -1669,7 +1682,7 @@ class BrowserSessionDirector:
             identity = self._active_identity
             generation = self._active_generation
             if identity is None or generation is None:
-                raise RuntimeError("no browser session is active")
+                raise NoBrowserSession("no browser session is active")
             if (
                 participant_identity != identity
                 and (participant_identity, request_id) != self._previous_rebind_request
@@ -1870,7 +1883,7 @@ class BrowserSessionDirector:
         identity = self._active_identity
         generation = self._active_generation
         if identity is None or generation is None:
-            raise RuntimeError("no browser session is active")
+            raise NoBrowserSession("no browser session is active")
         if participant_identity != identity:
             raise PermissionError("model participant does not own the active session")
         return identity, generation, self._model_operation_epoch
