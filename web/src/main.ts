@@ -45,6 +45,7 @@ import {
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
   reloadedCredential,
+  reloadRebindIsSettled,
   reloadRebindRequestParameters,
   rememberedSessionIdentity,
   rememberSessionIdentity,
@@ -2097,8 +2098,7 @@ async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredenti
     credentials: "omit",
     referrerPolicy: "no-referrer",
   }, signal);
-  // Only an answer settles the remembered identity; a failed request may be retried.
-  reloadIdentity = null;
+  if (reloadRebindIsSettled(response.status)) reloadIdentity = null;
   if (response.ok) {
     addMarker("session_reloaded");
     return reloadedCredential(remembered, parseBootstrapCredential(await response.json()));
@@ -2796,7 +2796,14 @@ async function connect(projectionResync = false): Promise<void> {
     }
     const activeCredential = credential;
     if (activeCredential === null) throw new Error("active credential is unavailable");
-    const activeRoom = new Room({ adaptiveStream: true, dynacast: true, webAudioMix: true });
+    // No SDK disconnect on page leave: it would read as a dropped connection, and the
+    // leaving page would rebind, rotating the identity a reloaded tab is about to present.
+    const activeRoom = new Room({
+      adaptiveStream: true,
+      dynacast: true,
+      webAudioMix: true,
+      disconnectOnPageLeave: false,
+    });
     attemptedRoom = activeRoom;
     attempt = new ConnectionAttempt<Room>((obsoleteRoom) => obsoleteRoom.disconnect());
     connectionAttempt = attempt;

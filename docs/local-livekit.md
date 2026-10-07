@@ -266,7 +266,12 @@ that identity with `"freshView": true`; the session rotates the identity as any 
 restarts the page's event projection at sequence one with the session's own description, since
 the reloaded page kept no view or cursor. When no session is active (409) the tab bootstraps; an
 identity that is not the active one is refused (403), so a reload never replaces another tab's
-session. Stop, or a failed connect, forgets the stored identity. A duplicated tab copies
+session. Any other refusal is transient and keeps the identity for the next **Connect**: a
+reload during speech, such as the readiness cue, is refused until the host has settled that
+speech. A leaving page never reconnects the session it is leaving: the LiveKit SDK's own
+page-leave disconnect is turned off, since the page would read it as a dropped connection and
+rebind, rotating the identity the reloaded tab is about to present. Stop, or a failed connect,
+forgets the stored identity. A duplicated tab copies
 `sessionStorage` and can therefore rebind the session away from the original, which then needs
 **Connect** again. The one-use fragment launch stores nothing and still needs a fresh launch.
 

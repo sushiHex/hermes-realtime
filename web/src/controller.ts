@@ -494,6 +494,12 @@ export function reloadRebindRequestParameters(
   };
 }
 
+// A rebind (2xx), "no session is active" (409) and "not this session" (403) are definitive;
+// anything else, such as a session still settling speech, may be retried with the identity.
+export function reloadRebindIsSettled(status: number): boolean {
+  return (status >= 200 && status < 300) || status === 403 || status === 409;
+}
+
 export function reloadedCredential(
   identity: string,
   replacement: BootstrapCredential,

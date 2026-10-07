@@ -38,9 +38,19 @@ describe("reloaded tab rebind wiring", () => {
     const reload = mainSource.indexOf("async function bootstrapOrReload(");
     const reloadEnd = mainSource.indexOf("\n}\n", reload);
     const body = mainSource.slice(reload, reloadEnd);
-    // Only an answer settles the identity, and only "no session is active" bootstraps.
-    expect(body.indexOf("reloadIdentity = null;")).toBeGreaterThan(body.indexOf("await connectionFetch("));
+    // Only a definitive answer settles the identity, and only "no session is active"
+    // bootstraps.
+    expect(body).toContain("if (reloadRebindIsSettled(response.status)) reloadIdentity = null;");
+    expect(body.match(/reloadIdentity = null/g)).toHaveLength(1);
     expect(body).toContain("if (!rebindFailureAllowsFreshBootstrap(response.status)) {");
+  });
+
+  it("never lets a leaving page reconnect the session it is leaving", () => {
+    // The SDK's page-leave disconnect would read as a dropped connection and rebind,
+    // rotating the identity under the reloaded tab.
+    const rooms = mainSource.match(/new Room\(\{[^}]*\}\)/g) ?? [];
+    expect(rooms.length).toBeGreaterThan(0);
+    for (const room of rooms) expect(room).toContain("disconnectOnPageLeave: false");
   });
 });
 

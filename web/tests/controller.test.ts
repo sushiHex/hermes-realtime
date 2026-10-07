@@ -37,6 +37,7 @@ import {
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
   reloadedCredential,
+  reloadRebindIsSettled,
   reloadRebindRequestParameters,
   rememberedSessionIdentity,
   rememberSessionIdentity,
@@ -855,6 +856,15 @@ describe("reloaded page rebind", () => {
     expect(rememberedSessionIdentity(null)).toBeNull();
     expect(() => rememberSessionIdentity(throwing, identity)).not.toThrow();
     expect(() => rememberSessionIdentity(null, identity)).not.toThrow();
+  });
+
+  it("settles the remembered identity only on a definitive answer", () => {
+    expect(reloadRebindIsSettled(200)).toBe(true);
+    expect(reloadRebindIsSettled(403)).toBe(true);
+    expect(reloadRebindIsSettled(409)).toBe(true);
+    for (const transient of [408, 429, 500, 503]) {
+      expect(reloadRebindIsSettled(transient)).toBe(false);
+    }
   });
 
   it("requires the reloaded credential to rotate the remembered identity", () => {
