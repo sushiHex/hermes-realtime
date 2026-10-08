@@ -9,19 +9,46 @@ The first media tracer bullet uses a native LiveKit server on the Hermes host. L
 - SHA-256: `a326e025de516e93dfb3719bcd28e5a4ac16f21bcf1ef562499403ca98cc65fe`
 - Release: <https://github.com/livekit/livekit/releases/tag/v1.13.4>
 
-Downloaded binaries belong under `.tools/livekit/`, which Git ignores. Verify the archive against the release `checksums.txt` before extracting it.
+Every checkout, worktree and clone shares one copy of the server, installed once per user
+outside all of them:
+
+```text
+%LOCALAPPDATA%\hermes-realtime\tools\livekit-1.13.4\livekit-server.exe
+```
+
+Install it from the root of any checkout:
+
+```sh
+uv run python -m scripts.local_livekit install
+```
+
+[`scripts/local_livekit.py`](../scripts/local_livekit.py) downloads the pinned archive, checks
+its SHA-256 and the SHA-256 of the executable inside it, and writes only the verified
+executable. A verified copy is left alone, so the command is safe to repeat. Every local
+launcher, test and gate that starts LiveKit resolves it through that module and checks its hash
+again before running it. Do not copy the server into a checkout: Windows Firewall remembers its
+decision per program path, and each new copy asks again.
+
+The qualification producers and the native release gate take the server as an explicit
+`--livekit-executable` with its SHA-256. Locally, give them the shared copy:
+
+```powershell
+$livekitExecutable = uv run --frozen --group dev python -m scripts.local_livekit path
+if ($LASTEXITCODE -ne 0) { throw 'the shared LiveKit server is missing or unverified' }
+$livekitSha256 = (Get-FileHash -LiteralPath $livekitExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+```
 
 ## Start the local server
 
 From Git Bash in the repository root:
 
 ```sh
-LIVEKIT_KEYS="devkey: $(python -c "print('local-' + 'x' * 32)")"$'\n' \
-  ./.tools/livekit/livekit-server.exe --dev --bind 127.0.0.1
+uv run python -m scripts.local_livekit serve
 ```
 
-The command overrides LiveKit's short built-in development secret with a deterministic
-38-character loopback-only test secret constructed at runtime:
+It runs the shared server with `--dev --bind 127.0.0.1` until `Ctrl-C`. It also overrides
+LiveKit's short built-in development secret with a deterministic 38-character loopback-only
+test secret:
 
 ```text
 API key: devkey
@@ -32,7 +59,62 @@ WebSocket URL: ws://127.0.0.1:7880
 These credentials remain public and predictable. They must never be used for a LAN,
 internet-facing, or production deployment.
 
-On Windows, `--bind 127.0.0.1` restricts the HTTP/WebSocket signaling listener, but LiveKit 1.13.4 still opens its RTC TCP and UDP listeners on available interfaces. Keep Windows Firewall enabled and do not add inbound allow rules for this development process. Verify the actual listeners and firewall rules rather than assuming the media sockets are loopback-only.
+On Windows, `--bind 127.0.0.1` restricts the HTTP/WebSocket signaling listener, but LiveKit
+1.13.4 still opens its RTC listeners beyond loopback: TCP 7881 on the wildcard address and
+UDP 7882 on every interface address. Keep Windows Firewall enabled and do not add inbound
+allow rules for this development process.
+
+These listeners cannot usefully be held to loopback. A configuration can do it
+(`rtc.tcp_port: 0` and `rtc.ips.includes: [127.0.0.1/32]` with
+`rtc.enable_loopback_candidate: true` and `rtc.node_ip: 127.0.0.1` leave only 127.0.0.1
+sockets), but no client can then connect. libwebrtc, which both the LiveKit Python SDK and
+Chrome use, gathers ICE candidates only on non-loopback adapters, and Windows refuses to send
+from such an address to 127.0.0.1 (`WSAEADDRNOTAVAIL`). Room joins time out.
+
+So the first run of the shared server shows one Windows Firewall prompt, for its one path.
+Answer it with **Cancel**; do not allow access. Cancel adds two inbound **Block** rules (TCP
+and UDP) for that path on the Private and Public profiles, and because there is only one path,
+that decision holds for every checkout.
+
+Local media still works under those Block rules. With them in place, the native integration
+tests and the real-Chrome self-acceptance gate pass, and every ICE candidate pair LiveKit selected
+was UDP to port 7882 with both ends on this computer's own adapter addresses (LAN, Tailscale,
+WSL and link-local, IPv4 and IPv6). The client and the server are the same host, so that
+traffic is not subject to the inbound filter, while the same ports stay blocked to every other
+machine. No allow rule is needed.
+
+Windows Firewall applies a Block rule over any Allow rule for the same traffic, so those Block
+rules also stop every remote client of this binary, whatever Allow rule is added for its
+ports. LAN, Tailscale or phone use of LiveKit needs a server binary at a different path, or the
+removal of the shared path's Block rules.
+
+Earlier per-checkout copies each left their own pair of Allow rules. To remove them, run this
+in an elevated PowerShell, review what `-WhatIf` reports, then run it again without `-WhatIf`.
+It touches only Allow rules for copies under a checkout's `.tools\livekit\`:
+
+```powershell
+Get-NetFirewallApplicationFilter |
+  Where-Object { $_.Program -like '*\.tools\livekit\livekit-server.exe' } |
+  Get-NetFirewallRule |
+  Where-Object { $_.Action -eq 'Allow' } |
+  Remove-NetFirewallRule -WhatIf
+```
+
+Copies extracted elsewhere, such as under the system temporary directory, may have left
+rules too. This lists every remaining LiveKit Allow rule outside the shared path, for review
+by hand:
+
+```powershell
+$shared = Join-Path $env:LOCALAPPDATA 'hermes-realtime\tools\livekit-1.13.4\livekit-server.exe'
+Get-NetFirewallApplicationFilter |
+  Where-Object { $_.Program -like '*\livekit-server.exe' -and $_.Program -ne $shared } |
+  Where-Object { ($_ | Get-NetFirewallRule).Action -eq 'Allow' } |
+  Select-Object -ExpandProperty Program -Unique
+```
+
+`$env:LOCALAPPDATA` belongs to the account running PowerShell. If you elevate as a different
+administrator account, it names that account's directory, not yours, so set `$shared` to
+your own shared path.
 
 ## Verify readiness
 
@@ -63,8 +145,7 @@ This milestone exposes the transport and streaming loop, not an end-user microph
 1. Start the server in one Git Bash terminal and leave it running:
 
    ```sh
-   LIVEKIT_KEYS="devkey: $(python -c "print('local-' + 'x' * 32)")"$'\n' \
-   ./.tools/livekit/livekit-server.exe --dev --bind 127.0.0.1
+   uv run python -m scripts.local_livekit serve
    ```
 
 2. In a second terminal, verify signaling readiness:
@@ -193,7 +274,7 @@ Do **not** expose LiveKit `--dev` or its documented development credentials to t
 1. A non-development LiveKit deployment reachable through a trusted `wss://` URL.
 2. `BrowserClientRuntime(lan_mode=True, ssl_context=..., canonical_origin="https://<trusted-host>:<port>")`.
 3. A certificate chain trusted by the iPhone, with the canonical hostname in its SAN.
-4. A narrowly scoped Windows Firewall rule for only the intended TLS listener and LiveKit media ports.
+4. A narrowly scoped Windows Firewall rule for only the intended TLS listener and LiveKit media ports. The shared development binary's Block rules override any Allow rule for it (see [Pinned development server](#pinned-development-server)), so the deployment runs from a different path.
 5. Delivery of the one-use launch URL through a private channel; never logs, shell history, screenshots, issue text, or query parameters.
 6. Verification that API key/secret values do not appear in HTML, JavaScript, HTTP bodies, browser storage, or evidence artifacts.
 
@@ -417,7 +498,7 @@ laid out the way the upstream installer lays it out:
 
 It then starts each of these with a log:
 - `hermes gateway run` from that home, with the companion inside it;
-- the pinned LiveKit server (`.tools/livekit/livekit-server.exe`, verified by SHA-256);
+- the shared pinned LiveKit server, verified by SHA-256 before it starts;
 - the full host with the runbook's flags (`--persistent-loopback-launch`,
   `--allow-unsandboxed-hermes-tasks`, Ollama with the named model, default speech providers),
   with its voice tail and run record inside the run directory;
@@ -502,8 +583,7 @@ such as an orphaned server, is a `failed` preflight with exit code 1.
 1. In terminal A, start the pinned local LiveKit server and leave it running:
 
    ```bash
-   LIVEKIT_KEYS="devkey: $(python -c "print('local-' + 'x' * 32)")"$'\n' \
-   ./.tools/livekit/livekit-server.exe --dev --bind 127.0.0.1
+   uv run python -m scripts.local_livekit serve
    ```
 
 2. In terminal B, from the repository root, install the locked local profile and launch

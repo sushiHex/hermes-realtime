@@ -478,7 +478,9 @@ def test_browser_self_acceptance_accepts_only_explicit_livekit_executable_overri
 
     assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_SERVER")' in source
     assert 'os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256", "")' in source
-    assert 'Path(__file__).parents[2] / ".tools/livekit/livekit-server.exe"' in source
+    assert "executable = local_livekit.verified_server()" in source
+    assert "local_livekit.server_command(executable)" in source
+    assert ".tools/livekit" not in source
 
 
 def test_native_livekit_gate_binds_the_verified_executable_and_owned_listener() -> None:
