@@ -864,7 +864,11 @@ class VoiceTailWriter:
         self._review_frozen_version = 0
 
     async def next_deletes(self) -> tuple[tuple[str, int], ...]:
-        """Every pending delete already durable in the record, once there is one."""
+        """Every pending delete durable in the record and in the tail that retired it.
+
+        The record lands before the tail, so a record alone would let the companion
+        delete, and acknowledge, a conversation whose tail is still on disk.
+        """
 
         while True:
             pending = tuple(
@@ -872,18 +876,27 @@ class VoiceTailWriter:
                 for binding in (self._written_deletes or VoiceDeletes()).pending
                 if binding in self._deletes.pending
             )
-            if self._owner is not None and pending:
+            if (
+                self._owner is not None
+                and pending
+                and self._written_version >= self._forget_version
+            ):
                 return pending
             await self._tick.wait()
 
     def acknowledge_forget(self, binding: tuple[str, int]) -> bool:
-        """Settle one delete the companion verified complete; others stay pending."""
+        """Settle one delete the companion verified complete; others stay pending.
+
+        The outcome keeps the newest completed generation, so an older delete settling
+        late never hides that the conversation this one replaced was deleted.
+        """
 
         if type(binding) is not tuple or binding not in self._deletes.pending:
             return False
+        outcome = self._deletes.outcome
         self._deletes = VoiceDeletes(
             pending=tuple(item for item in self._deletes.pending if item != binding),
-            outcome=binding,
+            outcome=outcome if type(outcome) is tuple and outcome[1] > binding[1] else binding,
         )
         self._changed()
         return True
@@ -1256,17 +1269,24 @@ class VoiceTailWriter:
                 if tail is None:
                     raise ValueError("voice tail is malformed")
                 pending = self._deletes.pending
-                if tail.pending_forget is not None and tail.pending_forget not in pending:
-                    # A version-4 tail held its intent itself; the record holds it now.
+                outcome = self._deletes.outcome
+                if tail.pending_forget is not None and tail.pending_forget not in (
+                    *pending, outcome
+                ):
+                    # A version-4 tail held its one intent itself; the record holds it now,
+                    # in the slot it keeps beyond MAX_PENDING_DELETES for exactly this.
                     pending = (*pending, tail.pending_forget)
                     self._deletes = replace(self._deletes, pending=pending)
-                if tail.archive is not None and any(
-                    conversation_id == tail.archive.conversation_id
-                    for conversation_id, _generation in pending
-                ):
-                    # Recorded for deletion before its cleared tail could be written.
+                known = {binding[0] for binding in pending}
+                if type(outcome) is tuple:
+                    known.add(outcome[0])
+                if tail.archive is not None and tail.archive.conversation_id in known:
+                    # The record knows this conversation as deleted, pending or complete:
+                    # whatever order the files landed in, it is never restored.
                     self._retire(self._new_id(), tail.archive.generation + 1)
-                    self._dirty = True
+                    # Nothing is handed to the companion before this retirement is durable.
+                    self._changed()
+                    self._forget_version = self._version
                     evidence = {"retired": 1, "version": 1}
                     return
                 if tail.archive is None:

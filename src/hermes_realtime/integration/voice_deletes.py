@@ -3,11 +3,12 @@
 A delete is an intent until the companion verifies that nothing of its generation remains.
 The intent outlives anything that resets the tail: a corrupt tail, a tail a rolled-back
 build cannot read, or a restore the store refuses. It is written before the tail is
-cleared (write-ahead), so a tail still bound to a recorded intent is retired when it opens.
+cleared (write-ahead), so a tail still bound to a recorded intent, or to the completed
+outcome, is retired when it opens.
 
 The record holds every pending delete, so a delete that stays pending never blocks a later
-one, and the outcome of the last delete to settle: the binding it completed, or
-``unknown`` when an earlier record could not be read and its intents are lost.
+one, and an outcome: the newest binding verified complete, or ``unknown`` when an earlier
+record could not be read and its intents are lost.
 """
 
 from __future__ import annotations
@@ -20,13 +21,15 @@ from typing import Literal
 from hermes_realtime.integration.run_record import strict_object
 
 _VERSION = 1
-# Deletes still to verify; a bound, never a lifetime limit, since each one settles.
+# Deletes a request may leave to verify; a bound, never a lifetime limit, since each settles.
 MAX_PENDING_DELETES = 64
+# The record holds one more: a version-4 tail's single intent moves in even when it is full.
+_MAX_RECORDED = MAX_PENDING_DELETES + 1
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_IDENTITY = 2**53 - 1
 # A binding is at most 64 id characters and 16 digits, with JSON punctuation.
 _MAX_BINDING_BYTES = 96
-MAX_VOICE_DELETES_BYTES = (MAX_PENDING_DELETES + 1) * _MAX_BINDING_BYTES + 128
+MAX_VOICE_DELETES_BYTES = (_MAX_RECORDED + 1) * _MAX_BINDING_BYTES + 128
 
 Binding = tuple[str, int]
 Outcome = Binding | Literal["unknown"] | None
@@ -66,7 +69,7 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
         or type(document["version"]) is not int
         or document["version"] != _VERSION
         or type(document["pending"]) is not list
-        or len(document["pending"]) > MAX_PENDING_DELETES
+        or len(document["pending"]) > _MAX_RECORDED
     ):
         return None
     pending = tuple(_binding(item) for item in document["pending"])
@@ -87,7 +90,7 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
 def voice_deletes_bytes(deletes: VoiceDeletes) -> bytes:
     if type(deletes) is not VoiceDeletes:
         raise TypeError("deletes must be an exact VoiceDeletes")
-    if len(deletes.pending) > MAX_PENDING_DELETES:
+    if len(deletes.pending) > _MAX_RECORDED:
         raise ValueError("too many pending voice deletes")
     outcome = deletes.outcome
     document = {
