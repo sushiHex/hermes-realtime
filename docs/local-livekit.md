@@ -34,6 +34,7 @@ The qualification producers and the native release gate take the server as an ex
 
 ```powershell
 $livekitExecutable = uv run --frozen --group dev python -m scripts.local_livekit path
+if ($LASTEXITCODE -ne 0) { throw 'the shared LiveKit server is missing or unverified' }
 $livekitSha256 = (Get-FileHash -LiteralPath $livekitExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
 ```
 
@@ -82,17 +83,38 @@ WSL and link-local, IPv4 and IPv6). The client and the server are the same host,
 traffic is not subject to the inbound filter, while the same ports stay blocked to every other
 machine. No allow rule is needed.
 
-Earlier per-checkout copies each left their own pair of rules. To list the LiveKit rules for
-any path other than the shared one, run this in an elevated PowerShell, review its output,
-then run it again without `-WhatIf` to remove them:
+Windows Firewall applies a Block rule over any Allow rule for the same traffic, so those Block
+rules also stop every remote client of this binary, whatever Allow rule is added for its
+ports. LAN, Tailscale or phone use of LiveKit needs a server binary at a different path, or the
+removal of the shared path's Block rules.
+
+Earlier per-checkout copies each left their own pair of Allow rules. To remove them, run this
+in an elevated PowerShell, review what `-WhatIf` reports, then run it again without `-WhatIf`.
+It touches only Allow rules for copies under a checkout's `.tools\livekit\`:
+
+```powershell
+Get-NetFirewallApplicationFilter |
+  Where-Object { $_.Program -like '*\.tools\livekit\livekit-server.exe' } |
+  Get-NetFirewallRule |
+  Where-Object { $_.Action -eq 'Allow' } |
+  Remove-NetFirewallRule -WhatIf
+```
+
+Copies extracted elsewhere, such as under the system temporary directory, may have left
+rules too. This lists every remaining LiveKit Allow rule outside the shared path, for review
+by hand:
 
 ```powershell
 $shared = Join-Path $env:LOCALAPPDATA 'hermes-realtime\tools\livekit-1.13.4\livekit-server.exe'
 Get-NetFirewallApplicationFilter |
   Where-Object { $_.Program -like '*\livekit-server.exe' -and $_.Program -ne $shared } |
-  Get-NetFirewallRule |
-  Remove-NetFirewallRule -WhatIf
+  Where-Object { ($_ | Get-NetFirewallRule).Action -eq 'Allow' } |
+  Select-Object -ExpandProperty Program -Unique
 ```
+
+`$env:LOCALAPPDATA` belongs to the account running PowerShell. If you elevate as a different
+administrator account, it names that account's directory, not yours, so set `$shared` to
+your own shared path.
 
 ## Verify readiness
 
@@ -252,7 +274,7 @@ Do **not** expose LiveKit `--dev` or its documented development credentials to t
 1. A non-development LiveKit deployment reachable through a trusted `wss://` URL.
 2. `BrowserClientRuntime(lan_mode=True, ssl_context=..., canonical_origin="https://<trusted-host>:<port>")`.
 3. A certificate chain trusted by the iPhone, with the canonical hostname in its SAN.
-4. A narrowly scoped Windows Firewall rule for only the intended TLS listener and LiveKit media ports.
+4. A narrowly scoped Windows Firewall rule for only the intended TLS listener and LiveKit media ports. The shared development binary's Block rules override any Allow rule for it (see [Pinned development server](#pinned-development-server)), so the deployment runs from a different path.
 5. Delivery of the one-use launch URL through a private channel; never logs, shell history, screenshots, issue text, or query parameters.
 6. Verification that API key/secret values do not appear in HTML, JavaScript, HTTP bodies, browser storage, or evidence artifacts.
 

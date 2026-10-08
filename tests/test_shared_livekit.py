@@ -3,6 +3,7 @@
 import hashlib
 import io
 import re
+import subprocess
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -66,7 +67,12 @@ def test_the_pins_equal_every_other_record_of_them() -> None:
         livekit_files._WORKFLOW_PIN.findall(workflow)
         == [(asset.encode(), local_livekit.ARCHIVE_SHA256.encode())] * 2
     )
-    assert local_livekit.ARCHIVE_URL.endswith(f"/v{local_livekit.VERSION}/{asset}")
+    release = f"https://github.com/livekit/livekit/releases/download/v{local_livekit.VERSION}"
+    assert f"{release}/{asset}" == local_livekit.ARCHIVE_URL
+    assert (
+        re.findall(rb"Invoke-WebRequest '([^']+)' -OutFile \$archive", workflow)
+        == [local_livekit.ARCHIVE_URL.encode()] * 2
+    )
     assert livekit_files._BROWSER_PIN.findall(browser) == [local_livekit.EXECUTABLE_SHA256.encode()]
     assert re.findall(r"- LiveKit Server: `v([0-9.]+)`", docs) == [local_livekit.VERSION]
     assert re.findall(r"- SHA-256: `([0-9a-f]{64})`", docs) == [local_livekit.ARCHIVE_SHA256]
@@ -208,3 +214,83 @@ def test_every_local_launcher_resolves_the_server_through_the_helper() -> None:
     for source in (rehearsal, browser):
         assert ".tools" not in source
         assert '"--dev", "--bind"' not in source
+
+
+def test_install_removes_its_staged_copy_when_placing_it_fails(
+    tmp_path: Path, release: tuple[bytes, bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, _ = release
+    environ = {"LOCALAPPDATA": str(tmp_path)}
+    path = local_livekit.shared_path(environ)
+
+    def refuse(source: str, target: Path) -> None:
+        raise PermissionError("the server is in use")
+
+    monkeypatch.setattr(local_livekit.os, "replace", refuse)
+
+    with pytest.raises(PermissionError):
+        local_livekit.install(environ, fetch=lambda url: archive)
+    assert list(path.parent.iterdir()) == []
+
+
+def test_the_path_command_prints_only_a_verified_server(
+    tmp_path: Path,
+    release: tuple[bytes, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, executable = release
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    path = local_livekit.shared_path()
+    path.parent.mkdir(parents=True)
+    path.write_bytes(executable + b"tampered")
+
+    assert local_livekit.main(["path"]) == 1
+    assert capsys.readouterr().out == ""
+    path.write_bytes(executable)
+    assert local_livekit.main(["path"]) == 0
+    assert capsys.readouterr().out == f"{path}\n"
+
+
+class _Launched:
+    calls: list[tuple[list[str], object, dict[str, str]]] = []
+
+    def __init__(self, command: list[str], *, stdin: object, env: dict[str, str]) -> None:
+        self.calls.append((command, stdin, env))
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def test_serve_launches_the_verified_server_with_the_development_keys(
+    tmp_path: Path, release: tuple[bytes, bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, executable = release
+    environ = {"LOCALAPPDATA": str(tmp_path)}
+    path = local_livekit.shared_path(environ)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(executable)
+    monkeypatch.setattr(_Launched, "calls", [])
+    monkeypatch.setattr(local_livekit.subprocess, "Popen", _Launched)
+
+    assert local_livekit.serve(environ) == 0
+    [(command, stdin, env)] = _Launched.calls
+    assert command == local_livekit.server_command(path)
+    assert stdin is subprocess.DEVNULL
+    assert env["LIVEKIT_KEYS"] == local_livekit.DEVELOPMENT_KEYS
+
+
+def test_serve_refuses_an_altered_server_before_launching_it(
+    tmp_path: Path, release: tuple[bytes, bytes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, executable = release
+    environ = {"LOCALAPPDATA": str(tmp_path)}
+    path = local_livekit.shared_path(environ)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(executable + b"tampered")
+    monkeypatch.setattr(_Launched, "calls", [])
+    monkeypatch.setattr(local_livekit.subprocess, "Popen", _Launched)
+
+    with pytest.raises(local_livekit.LiveKitUnavailable, match="SHA-256"):
+        local_livekit.serve(environ)
+    assert _Launched.calls == []

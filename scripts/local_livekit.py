@@ -3,7 +3,8 @@
 Windows Firewall keys its decisions to a program's path. A copy of the server in each
 checkout asks again from every worktree and clone, so every local launcher runs the one copy
 installed per user at ``%LOCALAPPDATA%\\hermes-realtime\\tools\\livekit-<version>\\``, outside
-every checkout, and verifies its SHA-256 before each use. One path is one firewall decision.
+every checkout, and verifies its SHA-256 just before each launch. One path is one firewall
+decision.
 
 ``--bind 127.0.0.1`` holds only signaling to loopback; LiveKit 1.13.4 opens its RTC sockets on
 every interface. A configuration can hold those to loopback too (``rtc.tcp_port: 0`` with
