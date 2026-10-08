@@ -39,6 +39,7 @@ from hermes_realtime.speech import (
     Transcript,
     VoiceActivity,
 )
+from scripts import local_livekit
 from tests.support.qualification import InProcessQualificationComposition
 
 _PINNED_LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd916"
@@ -256,7 +257,10 @@ def _livekit_responding() -> bool:
 def _owned_livekit() -> Iterator[None]:
     configured = os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_SERVER")
     if configured is None:
-        executable = Path(__file__).parents[2] / ".tools/livekit/livekit-server.exe"
+        try:
+            executable = local_livekit.verified_server()
+        except local_livekit.LiveKitUnavailable as error:
+            pytest.fail(str(error))
         expected_sha256 = _PINNED_LIVEKIT_SHA256
     else:
         executable = Path(configured)
@@ -272,7 +276,7 @@ def _owned_livekit() -> Iterator[None]:
         pytest.fail("LiveKit executable SHA-256 mismatch")
     if _livekit_responding():
         pytest.fail("refusing to use a pre-existing LiveKit listener")
-    environment = os.environ | {"LIVEKIT_KEYS": "devkey: local-" + "x" * 32 + "\n"}
+    environment = os.environ | {"LIVEKIT_KEYS": local_livekit.DEVELOPMENT_KEYS}
     with ExitStack() as stack:
         configured_log_dir = os.environ.get("HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR")
         if configured_log_dir is None:
@@ -285,7 +289,7 @@ def _owned_livekit() -> Iterator[None]:
             standard_output = stack.enter_context((log_dir / "browser-livekit.out").open("wb"))
             standard_error = stack.enter_context((log_dir / "browser-livekit.err").open("wb"))
         process = subprocess.Popen(
-            [str(executable), "--dev", "--bind", "127.0.0.1"],
+            local_livekit.server_command(executable),
             env=environment,
             stdout=standard_output,
             stderr=standard_error,
