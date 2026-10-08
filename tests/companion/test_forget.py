@@ -202,7 +202,9 @@ def test_a_completed_delete_frees_its_capacity_so_the_4097th_still_archives_and_
         store.bind("conv_0", "voice_x", creation)
 
 
-def test_an_owned_start_prunes_completed_fences(store: CompanionStore) -> None:
+def test_a_completed_fence_outlives_an_owned_start_so_its_conversation_never_rebinds(
+    store: CompanionStore,
+) -> None:
     creation = Progress(genesis(EXPECTED_HEADER), None)
     store.bind("done", "voice_1", creation)
     store.tombstone("done", 0)
@@ -212,13 +214,17 @@ def test_an_owned_start_prunes_completed_fences(store: CompanionStore) -> None:
     # A completed deletion is a fence only; it is never reconciled again.
     assert store.pending_deletions() == ("open",)
 
-    store.prune_completed()
+    store.drop_completed_bindings()
 
-    assert store.deletion("done") is None and store.read("done") is None
+    deletion = store.deletion("done")
+    assert deletion is not None and deletion.complete and store.read("done") is None
     assert store.pending_deletions() == ("open",)
+    # A restored outbox or a resend on a later connection still meets the fence.
+    with pytest.raises(ArchiveRefusal, match="tombstoned"):
+        store.bind("done", "voice_2", creation)
 
 
-def test_pruning_drops_a_binding_an_earlier_build_kept_after_completion(
+def test_an_owned_start_drops_a_binding_an_earlier_build_kept_after_completion(
     store: CompanionStore,
 ) -> None:
     store.bind("legacy", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
@@ -230,9 +236,10 @@ def test_pruning_drops_a_binding_an_earlier_build_kept_after_completion(
     )
     assert store.read("legacy") is not None
 
-    store.prune_completed()
+    store.drop_completed_bindings()
 
-    assert store.read("legacy") is None and store.deletion("legacy") is None
+    deletion = store.deletion("legacy")
+    assert store.read("legacy") is None and deletion is not None and deletion.complete
 
 
 @pytest.mark.asyncio

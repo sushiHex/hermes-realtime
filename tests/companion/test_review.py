@@ -593,6 +593,35 @@ def test_restart_review_scan_is_bounded(tmp_path: Path, monkeypatch: pytest.Monk
         store.close()
 
 
+def test_a_corrupt_review_ledger_quarantines_only_its_conversation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    try:
+        for conversation in ("bad", "good"):
+            store._connection.execute(
+                "INSERT INTO voice_archive "
+                "(conversation_id, session_id, pending_count, pending_chain) "
+                "VALUES (?, ?, 0, ?)",
+                (conversation, f"session_{conversation}", "0" * 64),
+            )
+        store._connection.execute(
+            "UPDATE voice_archive SET review_ledger = '{not json' WHERE conversation_id = 'bad'"
+        )
+
+        # The owned start's recovery runs here; it must not raise.
+        VoiceReviewCoordinator(VoiceArchive(store, FakeHermes()), store, FakeReviewPort(), print)
+
+        bad, good = store.read("bad"), store.read("good")
+        assert bad is not None and bad.quarantine == "recovery"
+        assert good is not None and good.quarantine is None
+        assert '[voice-review] {"count":1,"refusal":"quarantined","version":1}' in (
+            capsys.readouterr().out
+        )
+    finally:
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_review_is_acknowledged_only_after_owned_thread_starts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]

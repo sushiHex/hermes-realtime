@@ -209,8 +209,7 @@ class VoiceCompanionService:
                 _marker({"refusal": refusal.category, "version": 1})
         if self._forget is not None:
             await self._forget.reconcile_all()
-        # Before the bridge serves any connection: see CompanionStore.prune_completed.
-        self._store.prune_completed()
+        self._store.drop_completed_bindings()
         self._memory_ready = True
 
     @property

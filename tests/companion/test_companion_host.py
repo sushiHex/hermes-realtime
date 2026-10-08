@@ -158,9 +158,12 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
 
 
 @pytest.mark.asyncio
-async def test_an_owned_start_prunes_completed_deletions_before_serving(
+async def test_an_owned_start_keeps_completed_fences_and_drops_their_bindings(
     tmp_path: Path,
 ) -> None:
+    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
+    from hermes_realtime.companion.store import Progress
+
     hermes = FakeHermes()
     hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
     hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
@@ -168,15 +171,22 @@ async def test_an_owned_start_prunes_completed_deletions_before_serving(
     hermes.branch_copies_absent = lambda _ids: True  # type: ignore[attr-defined]
     service, store = _service(tmp_path, hermes)
     try:
-        store.tombstone("done", 0)
-        store.set_delete_manifest("done", ())
-        store.mark_delete_complete("done")
-        # Completed during this start's own reconciliation, still before any connection.
+        store.bind("legacy", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
+        store.tombstone("legacy", 0)
+        store.set_delete_manifest("legacy", ())
+        # The previous release marked completion and kept the binding.
+        store._connection.execute(
+            "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = 'legacy'"
+        )
+        # Completed during this start's own reconciliation.
         store.tombstone("open", 0)
 
         await service.start()
 
-        assert store.deletion("done") is None and store.deletion("open") is None
+        for conversation in ("legacy", "open"):
+            deletion = store.deletion(conversation)
+            assert deletion is not None and deletion.complete
+        assert store.read("legacy") is None
     finally:
         await service.close()
         store.close()

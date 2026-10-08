@@ -285,12 +285,12 @@ class CompanionStore:
             raise RuntimeError("deletion conversation bound exceeded")
         return tuple(row[0] for row in rows)
 
-    def prune_completed(self) -> None:
-        """Drop completed deletions, which only fence late events, at an owned start.
+    def drop_completed_bindings(self) -> None:
+        """Drop any binding an earlier build kept beside a completed deletion.
 
-        A late event can only travel on a bridge connection that existed when its
-        generation was tombstoned. An owned start serves no connection yet, so no
-        earlier connection survives it, and the fence has nothing left to stop.
+        The deletion row itself stays: it is the only fence against a resent delete or a
+        late event for that conversation, and either can arrive on any later connection.
+        A completed row holds no capacity, so keeping it costs one small row, not a cap.
         """
 
         connection = self._connection
@@ -300,7 +300,6 @@ class CompanionStore:
                 "DELETE FROM voice_archive WHERE conversation_id IN "
                 "(SELECT conversation_id FROM voice_deletion WHERE complete = 1)"
             )
-            connection.execute("DELETE FROM voice_deletion WHERE complete = 1")
             connection.execute("COMMIT")
         except BaseException:
             connection.execute("ROLLBACK")
@@ -531,19 +530,33 @@ class CompanionStore:
             return None
         return self._step(conversation_id, action)  # type: ignore[no-any-return]
 
-    def recover_reviews(self) -> None:
-        """A prior process's admitted thread cannot be observed; retain unknown evidence."""
+    def recover_reviews(self) -> int:
+        """A prior process's admitted thread cannot be observed; retain unknown evidence.
+
+        A ledger that cannot be read quarantines only its own conversation, so one corrupt
+        row never stops an owned start. Returns how many were quarantined.
+        """
 
         connection = self._connection
+        quarantined = 0
         connection.execute("BEGIN IMMEDIATE")
         try:
-            cursor = connection.execute(
+            rows = connection.execute(
                 "SELECT conversation_id, review_ledger FROM voice_archive"
-            )
-            for count, (conversation_id, raw) in enumerate(cursor, start=1):
-                if count > MAX_BOUND_CONVERSATIONS:
-                    raise RuntimeError("review ledger conversation bound exceeded")
-                ledger = self._decode_review_ledger(raw)
+            ).fetchmany(MAX_BOUND_CONVERSATIONS + 1)
+            if len(rows) > MAX_BOUND_CONVERSATIONS:
+                raise RuntimeError("review ledger conversation bound exceeded")
+            for conversation_id, raw in rows:
+                try:
+                    ledger = self._decode_review_ledger(raw)
+                except RuntimeError:
+                    connection.execute(
+                        "UPDATE voice_archive SET quarantine = COALESCE(quarantine, 'recovery') "
+                        "WHERE conversation_id = ?",
+                        (conversation_id,),
+                    )
+                    quarantined += 1
+                    continue
                 if any(entry["outcome"] in {"reserved", "accepted"} for entry in ledger.values()):
                     for entry in ledger.values():
                         if entry["outcome"] in {"reserved", "accepted"}:
@@ -559,6 +572,7 @@ class CompanionStore:
         except BaseException:
             connection.execute("ROLLBACK")
             raise
+        return quarantined
 
     def bind(
         self, conversation_id: str, session_id: str, creation: Progress
