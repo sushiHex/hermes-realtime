@@ -131,7 +131,8 @@ async def test_pending_deletes_are_bounded(tmp_path: Path) -> None:
     names = [f"c{number}" for number in range(MAX_PENDING_DELETES + 2)]
     writer, store = await _open(tmp_path / "voice-tail.json", *names)
     for _ in range(MAX_PENDING_DELETES):
-        await writer.request_forget(store)
+        # A request waits for its durable write; a write that keeps failing fails the test.
+        await asyncio.wait_for(writer.request_forget(store), 5)
     binding = writer.binding
 
     with pytest.raises(RuntimeError, match="capacity"):
