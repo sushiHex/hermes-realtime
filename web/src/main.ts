@@ -44,6 +44,8 @@ import {
   reboundCredential,
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
+  reloadOrBootstrap,
+  rememberSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -2062,6 +2064,49 @@ async function connectionFetch(
   }
 }
 
+function tabStorage(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+// Every new credential passes here, so the tab remembers the session's current identity.
+// Clearing the in-memory credential never forgets it: only a definitive verdict does (the
+// stop that succeeded, or a reload rebind answered 403 or 409).
+function setCredential(value: BootstrapCredential | null): void {
+  credential = value;
+  if (stableLaunch && value !== null) {
+    rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });
+  }
+}
+
+async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredential> {
+  if (!stableLaunch) return bootstrap(signal);
+  let reloaded = false;
+  const result = await reloadOrBootstrap({
+    storage: tabStorage(),
+    newRequestId: () => `rebind_${crypto.randomUUID()}`,
+    rebind: async (path, body) => {
+      const response = await connectionFetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+      }, signal);
+      reloaded = response.ok;
+      return response;
+    },
+    bootstrap: () => bootstrap(signal),
+    parse: parseBootstrapCredential,
+  });
+  if (reloaded) addMarker("session_reloaded");
+  return result;
+}
+
 async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
   const request = bootstrapRequestParameters(stableLaunch, capability);
   const response = await connectionFetch(request.path, {
@@ -2158,7 +2203,7 @@ async function refreshCredential(): Promise<void> {
   ) {
     throw new Error("credential refresh changed session authority");
   }
-  credential = refreshed;
+  setCredential(refreshed);
   addMarker("credential_refreshed");
   scheduleCredentialRefresh(refreshed);
 }
@@ -2221,7 +2266,7 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
   const observedStopVersion = sessionStopVersion;
   const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
   if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
-  credential = replacement;
+  setCredential(replacement);
   pendingRebindRequestId = null;
   clearCredentialRefresh();
   eventSequence = 0;
@@ -2703,19 +2748,23 @@ async function connect(projectionResync = false): Promise<void> {
         eventPolling?.abort();
         eventPolling = null;
         try {
-          credential = await rebindBrowserCredential(
-            previousCredential,
-            localOperation.signal,
-            rebindRequestId,
+          setCredential(
+            await rebindBrowserCredential(
+              previousCredential,
+              localOperation.signal,
+              rebindRequestId,
+            ),
           );
           addMarker("session_rebound", started);
         } catch (error) {
           if (localOperation.signal.aborted) throw error;
           try {
-            credential = await rebindBrowserCredential(
-              previousCredential,
-              localOperation.signal,
-              rebindRequestId,
+            setCredential(
+              await rebindBrowserCredential(
+                previousCredential,
+                localOperation.signal,
+                rebindRequestId,
+              ),
             );
             addMarker("session_rebound_after_retry", started);
           } catch (retryError) {
@@ -2727,7 +2776,7 @@ async function connect(projectionResync = false): Promise<void> {
             ) {
               throw retryError;
             }
-            credential = await bootstrap(localOperation.signal);
+            setCredential(await bootstrap(localOperation.signal));
             sessionReplaced = true;
             resetSessionInputAuthority();
             addMarker("session_replaced", started);
@@ -2737,7 +2786,7 @@ async function connect(projectionResync = false): Promise<void> {
         pendingRebindRequestId = null;
       }
     } else {
-      credential = await bootstrap(localOperation.signal);
+      setCredential(await bootstrapOrReload(localOperation.signal));
       pendingRebindRequestId = null;
       resetSessionInputAuthority();
       addMarker("bootstrap_complete", started);
@@ -2745,7 +2794,14 @@ async function connect(projectionResync = false): Promise<void> {
     }
     const activeCredential = credential;
     if (activeCredential === null) throw new Error("active credential is unavailable");
-    const activeRoom = new Room({ adaptiveStream: true, dynacast: true, webAudioMix: true });
+    // No SDK disconnect on page leave: it would read as a dropped connection, and the
+    // leaving page would rebind, rotating the identity a reloaded tab is about to present.
+    const activeRoom = new Room({
+      adaptiveStream: true,
+      dynacast: true,
+      webAudioMix: true,
+      disconnectOnPageLeave: false,
+    });
     attemptedRoom = activeRoom;
     attempt = new ConnectionAttempt<Room>((obsoleteRoom) => obsoleteRoom.disconnect());
     connectionAttempt = attempt;
@@ -2850,7 +2906,7 @@ async function connect(projectionResync = false): Promise<void> {
     clearCredentialRefresh();
     eventPolling?.abort();
     eventPolling = null;
-    credential = null;
+    setCredential(null);
     capability = null;
     controller.failed();
     addMarker("connection_failed", started);
@@ -3011,7 +3067,9 @@ async function stop(): Promise<void> {
   interruptActiveAssistantTurn();
   clearCredentialRefresh();
   microphoneSignalMonitor.stop();
-  credential = null;
+  setCredential(null);
+  // The remote stop succeeded: the session is gone, so the tab forgets it.
+  if (stableLaunch) rememberSession(tabStorage(), null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;

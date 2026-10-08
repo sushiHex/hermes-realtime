@@ -259,6 +259,28 @@ machine loopback boundary: any local process can construct the same HTTP request
 session while no browser session is active. Enable it only on a single-user trusted workstation;
 retain the one-use diagnostic flow where local processes are outside the trust boundary.
 
+A stable-launch tab survives a reload. The tab keeps in its own `sessionStorage` only what
+`/api/v1/stable-rebind` needs: the session's current participant identity, which rotates on
+every rebind, and the request ID of a reload rebind still awaiting its answer. It never stores
+the LiveKit token. After a reload, **Connect** presents that identity with `"freshView": true`;
+the session rotates the identity as any rebind does and resets everything the page holds, since
+the reloaded page kept nothing: the event projection restarts at sequence one with the session's
+own description and every task still running and approval still actionable, and the typed-input
+and approval counters restart at zero, as the page's do. Only a definitive verdict changes what
+the tab remembers. A rotation (2xx) remembers the new identity; when no session is active (409)
+the tab forgets the identity and bootstraps; an identity that is not the active one is refused
+(403) and forgotten, so a reload never replaces another tab's session. Every other outcome keeps
+the identity and its request ID for the next **Connect**, which replays the same request, so a
+rotation whose answer was lost is answered again instead of refused: a transient refusal (503,
+such as a reload during the readiness cue, refused until the host has settled that speech), a
+network error, or a failure later in connect. The server answers 409 for exactly "no session is
+active"; every other state refusal is 503. A leaving page never reconnects the session it is
+leaving: the LiveKit SDK's own page-leave disconnect is turned off, since the page would read it
+as a dropped connection and rebind, rotating the identity the reloaded tab is about to present.
+Only a stop that succeeded forgets the stored identity. A duplicated tab copies
+`sessionStorage` and can therefore rebind the session away from the original, which then needs
+**Connect** again. The one-use fragment launch stores nothing and still needs a fresh launch.
+
 ## Conversation-only loopback launcher
 
 Milestone 6.1 supplies a runnable local profile for the first desktop conversation slice:
@@ -367,6 +389,113 @@ It dispatches real work, so the gateway's model is called. Restart the gateway a
 or updating either Hermes or `hermes-realtime`: the gate refuses a gateway still running what it
 loaded before (`restart_gateway`). See [`hermes-bridge.md`](hermes-bridge.md) for what it checks,
 what it records and what it does not prove.
+
+### Automated dress rehearsal of the desktop MVP session
+
+`scripts/rehearse_desktop_mvp.py` runs the
+[diagnostic session](desktop-mvp-diagnostic.md#the-diagnostic-session) unattended against the
+composed stack, so integration findings surface before the operator's session:
+
+```bash
+env -u PYTHONPATH uv run --frozen --extra local --extra browser-acceptance \
+  python scripts/rehearse_desktop_mvp.py --ollama-model <name from ollama list>
+```
+
+**What runs is HEAD.** The record is bound to a commit, as the release gates are. The script
+clones `HEAD` into the run directory and builds the wheel there. The host runs from that wheel,
+in its own environment made from the locked dependencies. The installed-runtime gate and the
+host's child wrapper come from the same clone. The setup line records the commit, whether the
+tree it came from was clean, whether the running harness matches `HEAD`, and that the host
+imported the wheel.
+
+**The composed stack.** It builds a throwaway Hermes home under the system temporary directory,
+laid out the way the upstream installer lays it out:
+- the pinned `29112bef` checkout at `home/hermes-agent`, with its locked environment in
+  `home/hermes-agent/venv` and the candidate wheel installed there;
+- the plugin enabled, and memory turned off, with the runbook's own `hermes` commands;
+- for Hermes's model, a stand-in served by the script, so no provider key is involved.
+
+It then starts each of these with a log:
+- `hermes gateway run` from that home, with the companion inside it;
+- the pinned LiveKit server (`.tools/livekit/livekit-server.exe`, verified by SHA-256);
+- the full host with the runbook's flags (`--persistent-loopback-launch`,
+  `--allow-unsandboxed-hermes-tasks`, Ollama with the named model, default speech providers),
+  with its voice tail and run record inside the run directory;
+- a headless system Chrome, driven through the DevTools protocol.
+
+**Containment.** The rehearsal joins a kill-on-close Job Object before it starts anything, and
+every process it starts inherits that job. A rehearsal killed outright therefore leaves no
+orphan. The job is also what the final count of running processes reads. A command that times
+out is ended with its whole process tree.
+
+**Every verdict comes from an independent observation.** A verdict never rests on one of the
+script's own actions succeeding.
+- *Speech.* The final transcript must contain the spoken words. The microphone is a synthetic
+  track that plays Kokoro-synthesized clips, so speech crosses WebRTC, LiveKit, VAD and Moonshine
+  for real. "Audible" means the decoded remote audio track carried energy.
+- *Stale audio.* After each Connect, the page is watched for audio no one asked for. Only the
+  host's readiness cue is excused, and only when it is identified: one burst of at most two
+  seconds around the page's own voice-input confirmation. Any other energy, or any assistant row,
+  is stale.
+- *A delegated task.* The result Hermes produced must appear in a background-result row.
+- *Cancel and restart.* A cancel must hang up the stand-in's stream. A restart needs work running
+  through the crash, and that work stopped after settlement.
+- *Context.* Context carried over a reconnect or a restart means two things: the user's own
+  step-3 row stating the fact is among the rows the host keeps (its voice tail), and the model's
+  reply used it. The model's echo of the fact does not count. After a restart, the rows are the
+  ones the new host read, captured before it started. The host must also report restoring exactly
+  that many. Nothing restates the fact, so the bounded context window shows up as a `different`
+  verdict.
+- *Listeners.* The Hermes API, the companion and LiveKit signaling must listen on loopback only.
+  Any other address fails the step, and nothing runs behind that listener.
+- *Reload inputs.* A step after the deletion spends a typed turn and an approval decision, reloads
+  the page, and makes one of each again. Each is judged by its status as the browser's network
+  layer saw it, and by its effect: a reply, or Hermes's own report to the model that the user
+  denied the command. It runs last so its turns cannot push the step-3 fact out of the tail.
+- *Deletion.* The phrase must be found before deletion, in the voice tail and in Hermes's
+  database. Afterwards it must be gone from four places:
+  - the page;
+  - the tail;
+  - every column of every table and every full-text index of `state.db`;
+  - the `sessions/` and `memories/` files.
+
+  The check runs again after the follow-up turn and at cleanup, and every assistant row of the
+  follow-up reply is read. A missing database is a failure. A phrase left only in built-in
+  memory is the documented no-unlearning limit, so it reads as `different`.
+- *Tracebacks.* A traceback outside a named allowlist of known upstream noise makes its step
+  `different`. The allowlist holds LiveKit's FFI handle disposal at exit and Hermes's Unix-socket
+  watchdog on Windows.
+
+**Records.** Each step prints one `[desktop-mvp-rehearsal] {...}` line in the record sheet's
+categories: `outcome`, `timings`, markers and `notes`. Markers are kept by name, from the
+components this session runs. They are re-rendered from their values, which may only be counts,
+flags and short categories; anything else is counted and dropped. A failed step is recorded, a
+later step reconnects the page if it must, and the rehearsal continues. The final `summary` line
+counts what is left running by image name, and it must be empty. The exit code is 0 only when
+every step was `as_expected` and nothing was left.
+
+**Preflight.** When a required piece is missing, the script prints one `not_run` preflight line
+and exits 0. The pieces are Windows, the pinned LiveKit binary, system Chrome, Playwright,
+Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880,
+such as an orphaned server, is a `failed` preflight with exit code 1.
+
+**Differences from the operator's session.** Ctrl-C cannot reach a detached process, so:
+- The host runs as `<host env>/python <clone>/scripts/rehearse_desktop_mvp.py --host-child <stop
+  file> -- <host flags>`. When the stop file appears, the child interrupts its main thread
+  exactly as Ctrl-C does. The forced restart ends the whole host process tree abruptly.
+- The gateway is stopped through Hermes's own Windows stop path, the planned-stop marker that
+  `hermes gateway stop` writes. LiveKit is killed.
+- `hermes gateway status` and `stop` themselves are not run: on a machine with its own gateway,
+  their process scan could reach that one.
+
+**Limits.**
+- The throwaway gateway and host use free ports, so a gateway already running on 8642 is left
+  alone.
+- The run directory is left in place. It holds private logs that may contain paths, the
+  throwaway home's `.env` with its generated API and companion keys, and a `state.db` with the
+  synthetic conversation. Publish only the rehearsal's own lines.
+- The stand-in model never writes memory, so the deletion step does not exercise a review
+  copying the conversation into memory.
 
 ### Launch
 

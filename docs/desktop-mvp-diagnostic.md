@@ -536,10 +536,9 @@ microphone, and wait for **Listening — speak naturally**. Then:
 
 ### 7. Reconnect the browser
 
-- **Do:** press **Stop session**, then **Connect** again. Separately, press **Stop session**,
-  reload the page and press **Connect**. Press **Stop session** before reloading: today a
-  reload without it leaves the old session to be reaped, and **Connect** is refused for about
-  300 seconds. If you see that refusal after a reload, record it as a known finding.
+- **Do:** press **Stop session**, then **Connect** again. Separately, reload the page without
+  stopping and press **Connect**: the reloaded tab rebinds its own session (see
+  [Local LiveKit](local-livekit.md#remote-full-host-activation-seam)). A refused **Connect** after a reload is a finding.
 - **Observe:** the session returns to **Listening**, without stale audio or duplicated
   transcript entries, and a question that depends on the earlier conversation is answered in
   context.

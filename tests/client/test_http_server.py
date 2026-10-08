@@ -394,3 +394,16 @@ async def test_server_authorizes_stable_loopback_from_the_socket_peer(
     assert response.startswith(b"HTTP/1.1 200 OK\r\n")
     assert len(provisioned) == 1
     assert provisioned[0].startswith("browser_")
+
+
+def test_only_an_absent_session_is_a_conflict() -> None:
+    from hermes_realtime.client.session import NoBrowserSession
+
+    status = server_module.error_status
+    assert status(NoBrowserSession("no browser session is active")) == 409
+    # Any other state refusal is transient: a client must not read it as no session.
+    assert status(RuntimeError("cannot unbind a peer with active speech chunks")) == 503
+    assert status(PermissionError("not this session")) == 403
+    assert status(ValueError("malformed")) == 400
+    assert status(TimeoutError()) == 408
+    assert status(OSError("other")) == 503
