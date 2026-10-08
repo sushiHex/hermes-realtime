@@ -276,8 +276,8 @@ The self-test proves that a tracked secret excluded by `export-ignore` is absent
 from `git archive` yet still rejected from its committed blob, and that stale
 packaged static files fail the pre-build snapshot comparison.
 
-To reproduce the native integration portion locally, first download, verify, and
-extract the pinned Windows archive exactly as described in
+To reproduce the native integration portion locally, first install the shared pinned server
+with `uv run python -m scripts.local_livekit install` as described in
 [`local-livekit.md`](local-livekit.md), but do not start the server separately. From
 a clean, committed repository root, run this PowerShell block. It retains the exact
 executable hash and process ID, verifies that the owned process has the only loopback
@@ -286,7 +286,8 @@ listener, and supplies all three ownership facts required by the native gate:
 ```powershell
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath '.').Path
-$server = (Resolve-Path -LiteralPath '.tools/livekit/livekit-server.exe').Path
+$server = uv run --frozen --group dev python -m scripts.local_livekit path
+if ($LASTEXITCODE -ne 0) { throw 'the shared LiveKit server is missing or unverified' }
 $serverHash = (Get-FileHash -LiteralPath $server -Algorithm SHA256).Hash.ToLowerInvariant()
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('hermes-livekit-' + [guid]::NewGuid().ToString('N'))
 $names = @('LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'LIVEKIT_KEYS')
