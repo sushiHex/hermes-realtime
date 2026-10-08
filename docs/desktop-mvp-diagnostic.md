@@ -33,10 +33,12 @@ The control states this limit beside it:
 The live tail and queued archive rows clear immediately and a new generation fences late
 events. The status remains **pending** until the companion verifies that the old generation's
 archive chain has been deleted and no `/branch` copy of it remains. An already running review
-finishes normally; deletion waits for it, and anything it learns remains. If the companion is
-unavailable, pending does not mean complete. A restart or successor owner resumes
-reconciliation from durable intent, which survives a corrupt or reset voice tail. A pending
-delete never blocks deleting the next conversation. **Complete** refers only to the
+finishes normally; deletion waits for it, and anything it learns remains. While the companion
+is unavailable the status reads **unavailable**, and a deletion already started stays recorded
+and resumes when the companion is back. A restart or successor owner resumes reconciliation
+from durable intent, which survives a corrupt or reset voice tail; a voice tail the delete
+record names is never restored, whatever order a crash left the files in. A pending delete
+never blocks deleting the next conversation. **Complete** refers only to the
 conversation the current one replaced. **Unknown** means an earlier delete record could not
 be read: check that conversation with Hermes's own session controls.
 
@@ -62,13 +64,21 @@ Deletion is logical, not physical erasure. These remain, by design:
   Hermes's full-text index segments, and its bytes in free pages and the write-ahead log, until
   they are rewritten. To erase those too, stop the gateway and run Hermes's own
   `hermes sessions optimize` (FTS merge, then VACUUM); the M3 qualification verifies that
-  afterwards no table, segment or raw byte of `state.db` or its WAL holds the phrase.
+  afterwards no table, segment or raw byte of `state.db` or its WAL holds the phrase. A
+  trigram index stores three-character terms a byte search cannot recognize; for that index
+  the qualification checks that no search matches the phrase and that the index was merged.
 - **Backups and sync copies** of the Hermes home.
 - **Hermes `/branch` copies.** A copy is an independent conversation you may have continued,
   so it is never deleted for you. While one remains, the deletion stays **pending**; it
-  completes once you delete the copy in Hermes.
+  completes once you delete the copy in Hermes. Only copies made directly from the deleted
+  conversation are tracked. A copy made from a copy names only the copy it came from, so once
+  that copy is deleted nothing ties it to the deleted conversation and the deletion can
+  complete while it remains. Delete copies of copies yourself.
 - **The evidence spool.** With evidence capture on, the control is unavailable; **Revoke
-  consent and erase** removes the spool's copy.
+  consent and erase** removes the spool's copy. The control checks only the current run: a
+  spool left by an earlier run with capture on keeps what it captured until its retention
+  expiry, which is enforced only while a capture-enabled host runs, or until
+  `hermes-realtime-host --purge-evidence` removes the whole store.
 - **Session sidecar files.** Completion verifies session absence in Hermes's database. Hermes
   removes sidecar files on a best-effort basis and can silently retain them if filesystem
   removal fails; completion is not a verified filesystem-erasure receipt.

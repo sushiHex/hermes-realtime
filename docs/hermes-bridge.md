@@ -281,27 +281,34 @@ a fresh conversation identity, and drops the memory snapshot. The old identity i
 a delete record beside the tail (`<tail>.deletes.json`), which the tail writer persists before
 every tail write. Nothing that resets the tail touches it: a corrupt tail, a tail an older
 build rewrote, or a restore the store refuses all keep the intent, and a tail still bound to a
-recorded identity is retired when it opens. A version-4 tail's intent moves into the record.
-An unreadable record is reported as `unknown`, with a `[voice-deletes]` marker, never as
-idle. There is no voice deletion command.
+recorded identity is retired when it opens. A tail whose conversation the record names as
+completed is retired the same way, so no crash ordering restores a deleted conversation. A
+delete reaches the companion only once both the record and the cleared tail are durable. A
+version-4 tail's intent moves into the record, which keeps one slot beyond the 64 a request
+may fill for it. An unreadable record is reported as `unknown`, with a `[voice-deletes]`
+marker, never as idle. There is no voice deletion command.
 
-The record holds up to 64 pending deletes and the last one verified complete. The sender
+The record holds up to 64 pending deletes and the newest one verified complete. The sender
 holds its companion link open and resends every pending delete each round, so one that stays
-pending never blocks a later delete. The browser status is one of:
+pending never blocks a later delete. The browser status is the first that applies of:
 
-- `pending`: at least one recorded delete is not yet verified, whatever the link's state;
-- `unavailable`: no held link has negotiated `voice_forget`, or evidence capture is on. The
-  bridge is request and reply, so a link the companion dropped while idle still counts until
-  its next use fails; a delete made in that window stays `pending`, never `complete`, until a
-  capable companion verifies it;
+- `unavailable`: no held link has negotiated `voice_forget`, or evidence capture is on. A
+  recorded delete stays in the record and resumes once a capable link is back. The bridge is
+  request and reply, so a link the companion dropped while idle still counts until its next
+  use fails; a delete made in that window stays `pending`, never `complete`, until a capable
+  companion verifies it;
+- `pending`: at least one recorded delete is not yet verified;
 - `unknown`: an earlier delete record could not be read, so its outcome is not known;
-- `complete`: the last verified delete is the conversation the current one replaced;
+- `complete`: the newest verified delete is the conversation the current one replaced;
 - `idle`: none of the above; the control is offered and there is no delete to report.
 
 The control is offered whenever the status is not `unavailable`, including while a delete is
-pending. `pending` wins over `unavailable`, so while a delete is pending and no capable link
-is held, the host refuses a further delete before clearing anything and the browser re-reads
-the status.
+pending. A page that saw a delete pending keeps polling while the status reads `unavailable`.
+
+The companion keeps a completed deletion's tombstone for good, as the fence against a resent
+delete or a late event on any later connection; only incomplete deletions count toward its
+capacity. An owned start drops any archive binding an earlier build kept beside a completed
+deletion.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler
 runs on the tombstone, natural review-thread completion and owned startup. An admitted or
@@ -317,9 +324,12 @@ session controls. No run-session IDs are included in the delete request. A copy 
 Hermes `/branch` is an independent conversation Hermes keeps (native deletion orphans it), and
 it may hold the user's own later work, so the companion never deletes it: while one still
 carries the `_branched_from` marker of a deleted session, the delete stays pending, and it
-completes once the user deletes the copy in Hermes. With evidence capture on, the spool keeps
-its own copy of the transcript, so the control is unavailable; **Revoke consent and erase**
-removes that copy. Deletion is logical: Hermes run records, unmerged full-text index segments,
+completes once the user deletes the copy in Hermes. Only direct copies are tracked: a copy of
+a copy carries only its own source's marker, so once that source copy is deleted nothing ties
+it to the deleted conversation. With evidence capture on, the spool keeps its own copy of the
+transcript, so the control is unavailable; **Revoke consent and erase** removes that copy. The
+check covers only the current run's capture setting, so a spool an earlier capture-enabled run
+left keeps its contents until its retention expiry or a full `--purge-evidence`. Deletion is logical: Hermes run records, unmerged full-text index segments,
 unvacuumed SQLite pages and WAL frames, backups and sync copies remain. Hermes's own
 `hermes sessions optimize` (FTS merge, then VACUUM, with the gateway stopped) erases the
 segments, pages and frames. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)

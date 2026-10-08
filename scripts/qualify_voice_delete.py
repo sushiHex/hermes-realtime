@@ -610,8 +610,10 @@ async def _core(home: Path) -> dict[str, object]:
                     ),
                     # Logical: no row and no FTS match holds the phrase after the delete.
                     "state_db_phrase": scan_after["cells"] + scan_after["fts_matches"],
-                    # Physical, after Hermes's optimize: no cell, segment or raw byte.
-                    "optimized_phrase": int(optimized_indexes == 0) + (
+                    # Physical, after Hermes optimized every FTS index: no cell, segment or
+                    # raw byte. A trigram index stores three-character terms these needles
+                    # cannot see, so for it the MATCH count above is the whole check.
+                    "optimized_phrase": int(optimized_indexes != scan_optimized["fts_tables"]) + (
                         scan_optimized["cells"] + scan_optimized["fts_matches"]
                         + scan_optimized["segment_cells"] + scan_optimized["residue"]
                     ),
@@ -785,8 +787,7 @@ async def _restart(home: Path) -> dict[str, object]:
         )
         before = worker.store.deletion("m3crash")
         await service.start()  # Owner start reconciles the frozen delete manifest.
-        # Owned start prunes only completed fences, so a pruned fence was completed.
-        pruned = worker.store.deletion("m3crash") is None
+        after = worker.store.deletion("m3crash")
         native_absent = worker.port.absent(ids)
         messages_absent = not _all_messages(worker.db, ids)
         repeat = await service.forget(VoiceForgetEvent(
@@ -797,7 +798,7 @@ async def _restart(home: Path) -> dict[str, object]:
             "residual_before": residual_before,
             "complete": int(
                 before is not None and not before.complete and before.targets is not None
-                and pruned and native_absent
+                and after is not None and after.complete and native_absent
             ),
             "no_resurrection": int(
                 messages_absent and repeat is not None
@@ -950,9 +951,10 @@ def _host_actor(home: Path, role: str) -> dict[str, object]:
 
         async def inspect() -> dict[str, int]:
             # The CLI owner left the fence pending; the successor's owned start
-            # completed it and pruned it, which only ever happens to completed fences.
+            # completed it, dropped its binding and kept the fence.
+            deletion = service._store.deletion(case)
             return {"complete": int(
-                service._store.deletion(case) is None
+                deletion is not None and deletion.complete
                 and service._store.read(case) is None
                 and service._port.absent((session_id,))
             )}
