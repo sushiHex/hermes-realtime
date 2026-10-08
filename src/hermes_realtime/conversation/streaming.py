@@ -1196,6 +1196,9 @@ class StreamingSpeechLoop:
         async with self._lifecycle_lock:
             if self._active_turn_id != turn_id or not self.foreground_active:
                 return False
+            # Only a barge-in lets the interrupted word finish; every other
+            # revocation is a hard stop.
+            self._playback.finish_word_on_cancel(turn_id)
             self._authority_revision += 1
             self._revoke_active_locked(terminal_reason=TerminalReason.BARGE_IN)
         await self._settle_owned_cleanups()

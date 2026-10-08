@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+import struct
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -487,6 +490,287 @@ async def test_publish_rechecks_connection_when_disconnect_wins_lock() -> None:
 
     assert room.local_participant.unpublished == []
     assert peer._audio_source is None
+
+
+_RATE = 48_000
+
+
+def _ms(value: float) -> int:
+    return round(_RATE * value / 1000)
+
+
+def _word(ms: float, amplitude: int = 12_000) -> list[int]:
+    return [
+        round(amplitude * math.sin(2 * math.pi * 220 * index / _RATE))
+        for index in range(_ms(ms))
+    ]
+
+
+def _gap(ms: float) -> list[int]:
+    return [0] * _ms(ms)
+
+
+def _speech(turn_id: str, chunk_id: str, samples: list[int]) -> SpeechChunk:
+    return SpeechChunk(
+        turn_id=turn_id,
+        chunk_id=chunk_id,
+        text=chunk_id,
+        audio=AudioFrame(
+            pcm=struct.pack(f"<{len(samples)}h", *samples),
+            sample_rate_hz=_RATE,
+            channels=1,
+        ),
+    )
+
+
+class _PlayoutClock:
+    """Fake playout clock: the native queue advances exactly with elapsed time."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.sleeps: list[float] = []
+        self.block: asyncio.Event | None = None
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if self.block is not None:
+            await self.block.wait()
+        self.now += seconds
+
+
+class _PlayoutSource(_Closable):
+    def __init__(self, clock: _PlayoutClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.events: list[str] = []
+        self.captured: list[list[int]] = []
+        self.started_at: float | None = None
+        self.cleared_at: float | None = None
+
+    def clear_queue(self) -> None:
+        self.events.append("clear")
+        self.cleared_at = self.clock.now
+
+    async def capture_frame(self, frame: rtc.AudioFrame) -> None:
+        self.events.append("capture")
+        if self.started_at is None:
+            self.started_at = self.clock.now
+        self.captured.append(list(frame.data))
+
+    async def wait_for_playout(self) -> None:
+        self.events.append("playout")
+
+    def played_until(self) -> int:
+        """Samples handed to the track before the queue was cleared."""
+
+        assert self.started_at is not None and self.cleared_at is not None
+        return round((self.cleared_at - self.started_at) * _RATE)
+
+
+async def _published_peer(
+    samples: list[int],
+    *,
+    played_ms: float,
+) -> tuple[LiveKitRoomPeer, _PlayoutSource, _PlayoutClock, SpeechChunk]:
+    clock = _PlayoutClock()
+    source = _PlayoutSource(clock)
+    peer = LiveKitRoomPeer(_connection(), identity="peer")
+    room = _DelayedPublicationRoom()
+    room.local_participant.release.set()
+    peer._room = cast(Any, room)
+    peer._connected = True
+    peer._audio_source = cast(Any, source)
+    peer._publication_sid = "TR_speech"
+    peer._active_speech_track_name = "hermes-speech-test"
+    peer._clock = clock
+    peer._sleep = clock.sleep
+    chunk = _speech("turn_001", "chunk_001", samples)
+    await peer.prepare_speech_chunk(chunk)
+    await peer.publish_speech_chunk(chunk)
+    clock.now += played_ms / 1000
+    return peer, source, clock, chunk
+
+
+def _fade_source(samples: list[int], captured: list[int]) -> tuple[int, list[int]]:
+    """The captured fade's PCM before padding: (length, samples)."""
+
+    length = _ms(15)
+    assert len(captured) % (_RATE // 100) == 0
+    assert all(sample == 0 for sample in captured[length:])
+    return length, captured[:length]
+
+
+def _stop_evidence(capsys: pytest.CaptureFixture[str]) -> list[dict[str, object]]:
+    marker = "[speech-stop] "
+    return [
+        json.loads(line[len(marker) :])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(marker)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_speech_stops_in_the_next_word_gap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    samples = _word(150) + _gap(60) + _word(400)
+    peer, source, clock, chunk = await _published_peer(samples, played_ms=20)
+
+    await peer.cancel_speech_chunk(chunk, finish_word=True)
+
+    assert clock.sleeps == [pytest.approx(0.130)]
+    assert source.events == ["capture", "clear", "capture", "playout"]
+    stop = source.played_until()
+    assert _ms(150) <= stop <= _ms(210) - _ms(15)
+    _length, fade = _fade_source(samples, source.captured[1])
+    assert all(sample == 0 for sample in fade)
+    assert _stop_evidence(capsys) == [
+        {"faded": True, "mode": "word", "outcome": "gap", "tail_ms": 130}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_speech_without_a_gap_fades_at_the_cap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    samples = _word(1_000)
+    peer, source, clock, chunk = await _published_peer(samples, played_ms=100)
+
+    await peer.cancel_speech_chunk(chunk, finish_word=True)
+
+    assert clock.sleeps == [pytest.approx(0.300)]
+    stop = source.played_until()
+    assert stop == _ms(400)
+    length, fade = _fade_source(samples, source.captured[1])
+    assert fade[-1] == 0
+    assert abs(fade[0] - samples[stop]) <= 12_000 * math.pi / length
+    assert _stop_evidence(capsys) == [
+        {"faded": True, "mode": "word", "outcome": "cap", "tail_ms": 300}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_speech_ending_inside_the_cap_plays_out(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    samples = _word(200)
+    peer, source, clock, chunk = await _published_peer(samples, played_ms=100)
+
+    await peer.cancel_speech_chunk(chunk, finish_word=True)
+
+    assert clock.sleeps == [pytest.approx(0.100)]
+    assert source.events == ["capture", "clear"]
+    assert _stop_evidence(capsys) == [
+        {"faded": False, "mode": "word", "outcome": "end", "tail_ms": 100}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_is_immediate_with_only_the_fade(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    samples = _word(150) + _gap(60) + _word(400)
+    peer, source, clock, chunk = await _published_peer(samples, played_ms=20)
+
+    await peer.cancel_speech_chunk(chunk)
+
+    assert clock.sleeps == []
+    assert source.events == ["capture", "clear", "capture", "playout"]
+    assert source.played_until() == _ms(20)
+    length, fade = _fade_source(samples, source.captured[1])
+    assert fade[-1] == 0
+    assert abs(fade[0] - samples[_ms(20)]) <= 12_000 * math.pi / length
+    assert _stop_evidence(capsys) == [
+        {"faded": True, "mode": "hard", "outcome": "immediate", "tail_ms": 0}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("played_ms", "expected_ms"), [(103, 100), (107, 110)])
+async def test_fade_starts_at_the_nearest_native_ten_ms_block(
+    played_ms: float,
+    expected_ms: int,
+) -> None:
+    samples = list(range(-15_000, 15_000, 1))[: _ms(500)]
+    peer, source, _clock, chunk = await _published_peer(samples, played_ms=played_ms)
+
+    await peer.cancel_speech_chunk(chunk)
+
+    _length, fade = _fade_source(samples, source.captured[1])
+    assert abs(fade[0] - samples[_ms(expected_ms)]) <= 1
+
+
+@pytest.mark.asyncio
+async def test_unpublished_speech_cancel_only_clears() -> None:
+    clock = _PlayoutClock()
+    source = _PlayoutSource(clock)
+    peer = LiveKitRoomPeer(_connection(), identity="peer")
+    peer._connected = True
+    peer._audio_source = cast(Any, source)
+    peer._publication_sid = "TR_speech"
+    peer._active_speech_track_name = "hermes-speech-test"
+    peer._clock = clock
+    peer._sleep = clock.sleep
+    chunk = _speech("turn_001", "chunk_001", _word(200))
+    await peer.prepare_speech_chunk(chunk)
+
+    await peer.cancel_speech_chunk(chunk, finish_word=True)
+
+    assert source.events == ["clear"]
+    assert clock.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_word_tail_still_clears_the_queue(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    peer, source, clock, chunk = await _published_peer(_word(1_000), played_ms=10)
+    clock.block = asyncio.Event()
+
+    task = asyncio.create_task(peer.cancel_speech_chunk(chunk, finish_word=True))
+    while not clock.sleeps:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert source.events == ["capture", "clear"]
+    assert _stop_evidence(capsys) == [
+        {"faded": False, "mode": "word", "outcome": "cap", "tail_ms": 300}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_speech_waits_for_the_word_tail_without_overlap() -> None:
+    peer, source, clock, chunk = await _published_peer(_word(1_000), played_ms=10)
+    clock.block = asyncio.Event()
+    following = _speech("turn_002", "chunk_002", _word(100))
+
+    tail = asyncio.create_task(peer.cancel_speech_chunk(chunk, finish_word=True))
+    while not clock.sleeps:
+        await asyncio.sleep(0)
+    next_prepare = asyncio.create_task(peer.prepare_speech_chunk(following))
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert not next_prepare.done()
+    clock.block.set()
+    await tail
+    await next_prepare
+    await peer.publish_speech_chunk(following)
+
+    assert source.events == ["capture", "clear", "capture", "playout", "capture"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_a_non_boolean_finish_word() -> None:
+    peer, _source, _clock, chunk = await _published_peer(_word(100), played_ms=10)
+
+    with pytest.raises(TypeError, match="finish_word"):
+        await peer.cancel_speech_chunk(chunk, finish_word=cast(Any, 1))
 
 
 @pytest.mark.asyncio

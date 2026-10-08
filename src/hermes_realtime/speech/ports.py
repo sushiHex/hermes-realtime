@@ -54,4 +54,13 @@ class SpeechPlayback(Protocol):
         """Play only while ``is_valid`` authorizes the foreground generation."""
         ...
 
+    def finish_word_on_cancel(self, turn_id: str) -> None:
+        """Let the coming barge-in cancellation of ``turn_id`` finish its word.
+
+        Called synchronously before the foreground is cancelled. The cancelled
+        ``play()`` may then play a bounded tail of already-synthesized PCM to
+        the next word gap before it returns; ``cancel()`` stays immediate.
+        """
+        ...
+
     async def cancel(self, turn_id: str) -> None: ...

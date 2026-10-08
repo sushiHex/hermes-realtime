@@ -169,6 +169,14 @@ host admits up to 256 response segments (the loop supports at most 4,096), each 
 4,096 characters, while synthesis keeps at most one logical speech chunk of look-ahead. An
 interruption synchronously revokes active stream authority, cancels consumer/provider work, and
 retains only unconfirmed text eligible for explicit replay under current generation authority.
+A barge-in lets the interrupted word finish: the peer keeps playing the already-queued PCM to the
+next gap between words (a run of at least 25 ms of 5 ms frames 20 dB below the chunk's
+90th-percentile frame level), capped at 300 ms, then cuts the queue and appends a 15 ms
+raised-cosine fade. Every other stop (Stop speaking, session end, explicit cancellation) cuts at
+once with only the fade. The interrupted chunk never confirms delivery, so none of it enters the
+transcript or model context, and the next chunk cannot start until the tail has drained. Each stop
+prints one `[speech-stop]` JSON line with its mode, outcome (`gap`, `cap`, `end`, `immediate`,
+or `unpublished`), tail length and whether it faded.
 Under `natural_v1`, local microphone onset is presentation-only: the browser attenuates the exact
 current stream through a 750 ms local-quiet debounce and retains the exact renderer claim for at
 most 10 seconds while server evidence settles. A rejected claim restores full volume; a matching

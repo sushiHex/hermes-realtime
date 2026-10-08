@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -21,6 +23,21 @@ from hermes_realtime.speech.types import (
     ParticipantAudioFrame,
     SpeechChunk,
 )
+from hermes_realtime.speech.word_boundary import (
+    MAX_WORD_TAIL_SECONDS,
+    fade_out,
+    word_boundary_stop,
+)
+
+_SPEECH_STOP_MARKER = "[speech-stop] "
+
+
+def _word_stop_outcome(audio: AudioFrame, position: int, stop: int) -> str:
+    total = len(audio.pcm) // (2 * audio.channels)
+    cap = position + round(MAX_WORD_TAIL_SECONDS * audio.sample_rate_hz)
+    if stop < min(total, cap):
+        return "gap"
+    return "end" if stop == total else "cap"
 
 
 class _Publication(Protocol):
@@ -120,6 +137,12 @@ class LiveKitRoomPeer:
         self._active_speech_track_name: str | None = None
         self._active_speech_chunk_key: tuple[str, str] | None = None
         self._speech_publication_ready = False
+        # When the active chunk's PCM entered the empty native queue. The
+        # perf_counter clock is used because time.monotonic, which LiveKit's own
+        # queued_duration uses, ticks at 15.6 ms on Windows.
+        self._speech_playout_started_at: float | None = None
+        self._clock: Callable[[], float] = time.perf_counter
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         self._publish_lock = asyncio.Lock()
         self._connected = False
         self._closed = False
@@ -321,6 +344,7 @@ class LiveKitRoomPeer:
                 if source is None:
                     raise RuntimeError("audio source preparation failed")
                 samples_per_channel = len(chunk.audio.pcm) // (2 * chunk.audio.channels)
+                self._speech_playout_started_at = self._clock()
                 await source.capture_frame(
                     rtc.AudioFrame(
                         data=chunk.audio.pcm,
@@ -343,8 +367,18 @@ class LiveKitRoomPeer:
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
-        await self._release_speech_chunk(chunk, timeout_seconds, cancelled=True)
+        """Stop the chunk with a fade; ``finish_word`` first plays on to the next gap."""
+
+        if type(finish_word) is not bool:
+            raise TypeError("finish_word must be an exact boolean")
+        await self._release_speech_chunk(
+            chunk,
+            timeout_seconds,
+            cancelled=True,
+            finish_word=finish_word,
+        )
 
     async def _release_speech_chunk(
         self,
@@ -352,6 +386,7 @@ class LiveKitRoomPeer:
         timeout_seconds: float,
         *,
         cancelled: bool,
+        finish_word: bool = False,
     ) -> None:
         if type(chunk) is not SpeechChunk:
             raise TypeError("chunk must be an exact SpeechChunk")
@@ -364,9 +399,14 @@ class LiveKitRoomPeer:
                 source = self._audio_source
                 if source is not None:
                     if cancelled:
-                        source.clear_queue()
+                        await self._stop_speech_locked(
+                            source,
+                            chunk.audio,
+                            finish_word=finish_word,
+                        )
                     else:
                         await source.wait_for_playout()
+                self._speech_playout_started_at = None
                 if not self._speech_publication_ready:
                     if self._publication_task is not None:
                         await self._settle_publication_for_publish()
@@ -381,6 +421,77 @@ class LiveKitRoomPeer:
                     self._local_track = None
                     self._active_speech_track_name = None
                 self._active_speech_chunk_key = None
+
+    async def _stop_speech_locked(
+        self,
+        source: rtc.AudioSource,
+        audio: AudioFrame,
+        *,
+        finish_word: bool,
+    ) -> None:
+        evidence: dict[str, object] = {
+            "mode": "word" if finish_word else "hard",
+            "outcome": "unpublished",
+            "tail_ms": 0,
+            "faded": False,
+        }
+        try:
+            started = self._speech_playout_started_at
+            if started is None:
+                source.clear_queue()
+                return
+            position = self._playout_position(audio, started)
+            evidence["outcome"] = "immediate"
+            try:
+                if finish_word:
+                    # The queued PCM keeps playing, unspliced, until the next
+                    # word gap; the queue is cut there, where it is already quiet.
+                    stop = word_boundary_stop(audio, position)
+                    evidence["outcome"] = _word_stop_outcome(audio, position, stop)
+                    if stop > position:
+                        evidence["tail_ms"] = round(
+                            (stop - position) * 1_000 / audio.sample_rate_hz
+                        )
+                        await self._sleep((stop - position) / audio.sample_rate_hz)
+                        position = self._playout_position(audio, started)
+            finally:
+                source.clear_queue()
+            faded = fade_out(audio, position)
+            if faded is None:
+                return
+            # Pad to whole native 10 ms blocks so no partial block lingers in
+            # the queue ahead of the next chunk.
+            block_bytes = 2 * audio.channels * max(1, audio.sample_rate_hz // 100)
+            pcm = faded.pcm + bytes(-len(faded.pcm) % block_bytes)
+            await source.capture_frame(
+                rtc.AudioFrame(
+                    data=pcm,
+                    sample_rate=audio.sample_rate_hz,
+                    num_channels=audio.channels,
+                    samples_per_channel=len(pcm) // (2 * audio.channels),
+                )
+            )
+            evidence["faded"] = True
+            await source.wait_for_playout()
+        finally:
+            print(
+                _SPEECH_STOP_MARKER
+                + json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
+
+    def _playout_position(self, audio: AudioFrame, started: float) -> int:
+        """Estimate the samples already handed to the track.
+
+        The native source hands one 10 ms block to the track per tick, so the
+        true position is a block multiple; the continuous estimate is snapped
+        to the nearest one.
+        """
+
+        total = len(audio.pcm) // (2 * audio.channels)
+        block = max(1, audio.sample_rate_hz // 100)
+        elapsed = max(0.0, self._clock() - started) * audio.sample_rate_hz
+        return min(total, round(elapsed / block) * block)
 
     def _validate_audio_publish(self, frame: AudioFrame, timeout_seconds: float) -> None:
         if not self._connected:
@@ -632,6 +743,7 @@ class LiveKitRoomPeer:
                                 self._audio_source = None
                                 self._active_speech_track_name = None
                                 self._active_speech_chunk_key = None
+                                self._speech_playout_started_at = None
                                 self._speech_publication_ready = False
 
                         if (

@@ -1,6 +1,7 @@
 import asyncio
 import struct
 from collections.abc import Callable
+from typing import Any, cast
 
 import pytest
 
@@ -16,6 +17,7 @@ class RecordingPublisher:
         self.frames: list[AudioFrame] = []
         self.prepared: list[AudioFrame] = []
         self.clear_count = 0
+        self.finish_word_requests: list[bool] = []
         self._stream_counter = 0
 
     async def prepare_speech_chunk(
@@ -51,10 +53,12 @@ class RecordingPublisher:
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
         del chunk
         del timeout_seconds
         self.clear_count += 1
+        self.finish_word_requests.append(finish_word)
 
 
 class RecordingEchoReference:
@@ -233,10 +237,15 @@ class FailingFinishPublisher(RecordingPublisher):
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
         if self.fail_finish:
             raise RuntimeError("finish failed")
-        await super().cancel_speech_chunk(chunk, timeout_seconds=timeout_seconds)
+        await super().cancel_speech_chunk(
+            chunk,
+            timeout_seconds=timeout_seconds,
+            finish_word=finish_word,
+        )
 
 
 class CancellationRacingPublishFailurePublisher(RecordingPublisher):
@@ -265,11 +274,16 @@ class CancellationRacingPublishFailurePublisher(RecordingPublisher):
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
         self.cancel_calls += 1
         if self.cancel_calls > 1:
             raise RuntimeError("speech chunk is not prepared")
-        await super().cancel_speech_chunk(chunk, timeout_seconds=timeout_seconds)
+        await super().cancel_speech_chunk(
+            chunk,
+            timeout_seconds=timeout_seconds,
+            finish_word=finish_word,
+        )
         self.cancellation_finished.set()
 
 
@@ -583,6 +597,123 @@ async def test_repeated_play_cancellation_waits_for_echo_reference_finalization(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert reference.ended == [reference.token]
+
+
+async def _cancel_play_after_publish(
+    playback: LiveKitSpeechPlayback,
+    confirmation: BlockingConfirmation,
+    *,
+    mark_turn_id: str | None,
+) -> None:
+    task = asyncio.create_task(playback.play(_chunk(), is_valid=lambda: True))
+    await asyncio.wait_for(confirmation.started.wait(), timeout=1)
+    if mark_turn_id is not None:
+        playback.finish_word_on_cancel(mark_turn_id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_barge_in_cancellation_lets_the_publisher_finish_the_word() -> None:
+    publisher = RecordingPublisher()
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+
+    await _cancel_play_after_publish(playback, confirmation, mark_turn_id="turn_001")
+
+    assert publisher.finish_word_requests == [True]
+    assert confirmation.confirmed == []
+
+
+@pytest.mark.asyncio
+async def test_unmarked_cancellation_is_a_hard_stop() -> None:
+    publisher = RecordingPublisher()
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+
+    await _cancel_play_after_publish(playback, confirmation, mark_turn_id=None)
+
+    assert publisher.finish_word_requests == [False]
+
+
+@pytest.mark.asyncio
+async def test_finish_word_mark_is_scoped_to_its_turn() -> None:
+    publisher = RecordingPublisher()
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+
+    await _cancel_play_after_publish(playback, confirmation, mark_turn_id="turn_other")
+
+    assert publisher.finish_word_requests == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", ["turn_cancel", "stop_speaking_claim"])
+async def test_explicit_cancel_stays_hard_even_after_a_barge_in_mark(explicit: str) -> None:
+    publisher = RecordingPublisher()
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(
+        publisher=publisher,
+        confirmation=confirmation,
+        stream_generation=lambda _chunk: 7,
+    )
+    chunk = _chunk()
+    task = asyncio.create_task(playback.play(chunk, is_valid=lambda: True))
+    await asyncio.wait_for(confirmation.started.wait(), timeout=1)
+
+    playback.finish_word_on_cancel("turn_001")
+    if explicit == "turn_cancel":
+        await playback.cancel("turn_001")
+    else:
+        assert await playback.cancel_if_active_stream(
+            turn_id=chunk.turn_id,
+            turn_generation=7,
+            chunk_id=chunk.chunk_id,
+            stream_identity="stream_1",
+        )
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert publisher.finish_word_requests == [False]
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_after_a_barge_in_mark_is_a_hard_stop() -> None:
+    publisher = RecordingPublisher()
+    confirmation = FailingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+    playback.finish_word_on_cancel("turn_001")
+
+    with pytest.raises(RuntimeError, match="confirmation failed"):
+        await playback.play(_chunk(), is_valid=lambda: True)
+
+    assert publisher.finish_word_requests == [False]
+
+
+@pytest.mark.asyncio
+async def test_turn_cancel_retires_an_unused_barge_in_mark() -> None:
+    publisher = RecordingPublisher()
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+    playback.finish_word_on_cancel("turn_001")
+    await playback.cancel("turn_001")
+
+    await _cancel_play_after_publish(playback, confirmation, mark_turn_id=None)
+
+    assert publisher.finish_word_requests == [False]
+
+
+def test_finish_word_mark_rejects_invalid_turn_ids() -> None:
+    playback = LiveKitSpeechPlayback(
+        publisher=RecordingPublisher(),
+        confirmation=BlockingConfirmation(),
+    )
+
+    with pytest.raises(TypeError, match="turn_id"):
+        playback.finish_word_on_cancel(cast(Any, 1))
+    with pytest.raises(ValueError, match="turn_id"):
+        playback.finish_word_on_cancel("")
 
 
 @pytest.mark.asyncio

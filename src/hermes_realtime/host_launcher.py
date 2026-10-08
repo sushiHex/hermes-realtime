@@ -563,6 +563,9 @@ class _SerializedSpeechPlayback:
         async with self._gate:
             await self._delegate.play(chunk, is_valid=is_valid)
 
+    def finish_word_on_cancel(self, turn_id: str) -> None:
+        self._delegate.finish_word_on_cancel(turn_id)
+
     async def cancel(self, turn_id: str) -> None:
         await self._delegate.cancel(turn_id)
 
