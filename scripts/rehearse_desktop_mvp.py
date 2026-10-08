@@ -12,7 +12,7 @@ runbook's session steps in order:
   with the runbook's own ``hermes`` commands. Hermes's model is a stand-in served by this process;
 - the companion inside that gateway;
 - the full host (``hermes-realtime-host --hermes-env-file ...``) with the runbook's flags;
-- the pinned local LiveKit server;
+- the shared pinned LiveKit server (``scripts/local_livekit.py``);
 - a headless system Chrome. Its microphone is a synthetic track: spoken steps play Kokoro-
   synthesized clips into it, so speech crosses WebRTC, LiveKit, VAD and Moonshine for real.
 
@@ -34,7 +34,6 @@ import asyncio
 import base64
 import contextlib
 import ctypes
-import hashlib
 import importlib
 import json
 import os
@@ -56,6 +55,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import urlsplit
 
+import local_livekit
 from real_gate_support import (
     HERMES_BASELINE,
     PINNED_HERMES,
@@ -66,9 +66,6 @@ from real_gate_support import (
 _PREFIX = "[desktop-mvp-rehearsal] "
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
-_LIVEKIT = _REPOSITORY / ".tools" / "livekit" / "livekit-server.exe"
-_LIVEKIT_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fcbd916"
-_LIVEKIT_KEYS = "devkey: local-" + "x" * 32 + "\n"
 _OLLAMA = "http://127.0.0.1:11434"
 _DETACHED = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 # A bounded marker other code printed: `[name] {json}`.
@@ -1356,9 +1353,9 @@ def preflight(model: str | None) -> list[str]:
         return ["windows"]
     if model is None:
         missing.append("ollama_model")
-    if not _LIVEKIT.is_file() or hashlib.sha256(_LIVEKIT.read_bytes()).hexdigest() != (
-        _LIVEKIT_SHA256
-    ):
+    try:
+        local_livekit.verified_server()
+    except local_livekit.LiveKitUnavailable:
         missing.append("livekit")
     if _chrome() is None:
         missing.append("chrome")
@@ -1909,8 +1906,8 @@ class Rehearsal:
         log = self.logs_dir / "livekit.log"
         self.processes.spawn(
             "livekit",
-            [str(_LIVEKIT), "--dev", "--bind", "127.0.0.1"],
-            env=os.environ | {"LIVEKIT_KEYS": _LIVEKIT_KEYS},
+            local_livekit.server_command(local_livekit.verified_server()),
+            env=os.environ | {"LIVEKIT_KEYS": local_livekit.DEVELOPMENT_KEYS},
             log=log,
         )
         async with asyncio.timeout(30):
