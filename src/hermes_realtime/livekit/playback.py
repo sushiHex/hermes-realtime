@@ -73,6 +73,7 @@ class LiveKitAudioPublisher(Protocol):
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None: ...
 
 
@@ -155,8 +156,14 @@ class ReconnectSafeLiveKitAudioPublisher:
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
-        await self._release_chunk(chunk, timeout_seconds=timeout_seconds, cancel=True)
+        await self._release_chunk(
+            chunk,
+            timeout_seconds=timeout_seconds,
+            cancel=True,
+            finish_word=finish_word,
+        )
 
     async def _release_chunk(
         self,
@@ -164,12 +171,17 @@ class ReconnectSafeLiveKitAudioPublisher:
         *,
         timeout_seconds: float,
         cancel: bool,
+        finish_word: bool = False,
     ) -> None:
         trusted = _trusted_chunk(chunk)
         key = (trusted.turn_id, trusted.chunk_id)
         peer = await self._chunk_peer(trusted)
         if cancel:
-            await peer.cancel_speech_chunk(trusted, timeout_seconds=timeout_seconds)
+            await peer.cancel_speech_chunk(
+                trusted,
+                timeout_seconds=timeout_seconds,
+                finish_word=finish_word,
+            )
         else:
             await peer.finish_speech_chunk(trusted, timeout_seconds=timeout_seconds)
         async with self._lock:
@@ -481,6 +493,22 @@ class LiveKitSpeechPlayback:
         self._cancelled: set[object] = set()
         self._confirmation_released: set[object] = set()
         self._publication_released: set[object] = set()
+        self._finish_word_turn_id: str | None = None
+
+    def finish_word_on_cancel(self, turn_id: str) -> None:
+        """Let the coming cancellation of ``turn_id``'s chunk finish its word.
+
+        A barge-in calls this synchronously, before it cancels the foreground
+        task that owns ``play()``. That cancellation then plays the chunk on to
+        its next word gap (bounded) and fades out. Explicit ``cancel()`` and
+        ``cancel_if_active_stream()`` stay hard stops.
+        """
+
+        if type(turn_id) is not str:
+            raise TypeError("turn_id must be an exact built-in string")
+        if not turn_id:
+            raise ValueError("turn_id must not be empty")
+        self._finish_word_turn_id = turn_id
 
     async def play(
         self,
@@ -542,9 +570,16 @@ class LiveKitSpeechPlayback:
                             timeout_seconds=self._publish_timeout_seconds,
                         )
                     elif not external_cleanup_owned:
+                        # Only a barge-in's cancellation finishes the word; a
+                        # transport failure stops at once.
+                        finish_word = (
+                            self._finish_word_turn_id == trusted.turn_id
+                            and not self._contains_non_cancellation(operation_error)
+                        )
                         await self._publisher.cancel_speech_chunk(
                             trusted,
                             timeout_seconds=self._publish_timeout_seconds,
+                            finish_word=finish_word,
                         )
                         self._publication_released.add(token)
                 except BaseException as error:
@@ -670,6 +705,8 @@ class LiveKitSpeechPlayback:
             raise TypeError("turn_id must be an exact built-in string")
         if not turn_id:
             raise ValueError("turn_id must not be empty")
+        if self._finish_word_turn_id == turn_id:
+            self._finish_word_turn_id = None
         claimed_token: object | None = None
         async with self._lifecycle_lock:
             claimed = self._active

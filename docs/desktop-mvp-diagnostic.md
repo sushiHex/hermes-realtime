@@ -284,6 +284,13 @@ From the host:
 - `[codex-session-auth]`: the Codex sign-in is unusable (`malformed`) or about to expire
   (`expiring`); run `codex` once.
 - `[codex-tool-refusal]`: natural work tools only; not expected in this profile.
+- `[speech-stop]`: one per stopped speech chunk. `mode: word` is a barge-in, which plays on to
+  the next gap between words (`outcome: gap`), to the 300 ms cap (`cap`) or to the chunk end
+  (`end`), with `tail_ms` of extra audio; `mode: hard` is any other stop (`immediate`).
+  `faded` says whether the 15 ms fade was appended. `stop_block` is the 10 ms block it cut at,
+  `late_ms` how far past the planned stop the cut landed, and `clamped` that the playout clock
+  had run past the end of the chunk. A `late_ms` well above 20, or `clamped` on a stop you
+  heard mid-word, means the playout clock drifted from the audio: record it.
 
 From the gateway (the companion runs inside it):
 
@@ -473,10 +480,14 @@ microphone, and wait for **Listening — speak naturally**. Then:
 
 - **Do:** start a longer harmless task with `task: `. While it is active, ask a question, and
   speak over the reply while it plays.
-- **Observe:** playback stops or lowers when you speak, and the task card stays active and later
-  completes: interrupting speech must not cancel the task.
-- **Record:** whether playback yielded; the task's states before and after the interruption,
-  and its final state; any latency markers that appeared.
+- **Observe:** playback stops or lowers when you speak, finishing the word it was on (at most
+  about 300 ms more) and fading out rather than cutting mid-syllable; the host prints
+  `[speech-stop]` with `mode: word`. The task card stays active and later completes:
+  interrupting speech must not cancel the task. Your first words overlap the agent's last
+  word: check that none of the agent's words appear in your own transcript line.
+- **Record:** whether playback yielded; whether it cut mid-word or clicked; whether any agent
+  words leaked into your transcript; the `[speech-stop]` line; the task's states before and
+  after the interruption, and its final state; any latency markers that appeared.
 
 ### 6. Cancel a task
 

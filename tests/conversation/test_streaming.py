@@ -557,6 +557,10 @@ class RecordingPlayback:
         self.chunks: list[SpeechChunk] = []
         self.first_chunk_played = asyncio.Event()
         self.cancelled_turns: list[str] = []
+        self.finish_word_turns: list[str] = []
+
+    def finish_word_on_cancel(self, turn_id: str) -> None:
+        self.finish_word_turns.append(turn_id)
 
     async def play(
         self,
@@ -1328,6 +1332,110 @@ async def test_conditional_cancel_preserves_stale_owner_and_revokes_exact_owner(
         await response
     assert loop.active_turn_id is None
     assert loop.foreground_active is False
+
+
+class CancellationObservingPlayback(BlockingFirstPlayback):
+    def __init__(self) -> None:
+        super().__init__()
+        self.marks_at_cancellation: list[tuple[str, ...]] = []
+
+    async def play(
+        self,
+        chunk: SpeechChunk,
+        *,
+        is_valid: Callable[[], bool],
+    ) -> None:
+        try:
+            await super().play(chunk, is_valid=is_valid)
+        except asyncio.CancelledError:
+            self.marks_at_cancellation.append(tuple(self.finish_word_turns))
+            raise
+
+
+@pytest.mark.asyncio
+async def test_barge_in_marks_a_word_boundary_stop_before_cancelling_playback() -> None:
+    playback = CancellationObservingPlayback()
+    context = ConversationContextStore()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=PerTurnInference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.first_play_started.wait(), timeout=1)
+
+    assert await loop.cancel_if_active("turn_001") is True
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert playback.marks_at_cancellation == [("turn_001",)]
+    assert playback.cancelled_turns == ["turn_001"]
+    assert loop.foreground_active is False
+    # The interrupted chunk never confirmed delivery, so nothing of it was heard.
+    assert [message.text for message in context.snapshot().messages] == ["Question?"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_method",
+    (
+        "cancel",
+        "cancel_for_host_shutdown",
+        "cancel_for_binding_close",
+        "cancel_for_retention_expiry",
+        "close",
+    ),
+)
+async def test_hard_stops_do_not_finish_the_word(cancel_method: str) -> None:
+    playback = CancellationObservingPlayback()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=PerTurnInference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.first_play_started.wait(), timeout=1)
+
+    await getattr(loop, cancel_method)()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert playback.marks_at_cancellation == [()]
+    assert playback.finish_word_turns == []
+
+
+@pytest.mark.asyncio
+async def test_stale_barge_in_does_not_mark_the_current_turn() -> None:
+    playback = CancellationObservingPlayback()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=PerTurnInference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.first_play_started.wait(), timeout=1)
+
+    assert await loop.cancel_if_active("turn_000") is False
+    assert playback.finish_word_turns == []
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
 
 
 @pytest.mark.asyncio
