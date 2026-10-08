@@ -85,7 +85,7 @@ export class VoiceDeleteControls {
         this.options.credential()?.token !== credential.token
       ) return;
       this.present(state);
-      if (state === "pending") this.schedule(credential.participantIdentity);
+      if (this.pending) this.schedule(credential.participantIdentity);
     } catch {
       if (this.epoch !== epoch) return;
       this.status.textContent = "Deletion could not be confirmed. Checking status.";
@@ -114,7 +114,7 @@ export class VoiceDeleteControls {
         this.options.credential()?.token !== credential.token
       ) return;
       this.present(state);
-      if (state === "pending") this.schedule(credential.participantIdentity);
+      if (this.pending) this.schedule(credential.participantIdentity);
     } catch {
       if (
         this.epoch !== epoch ||
@@ -128,10 +128,11 @@ export class VoiceDeleteControls {
 
   private present(state: VoiceDeleteState): void {
     this.available = state !== "unavailable";
-    this.pending = state === "pending";
+    // A delete this page saw pending is still polled while the companion is away.
+    this.pending = state === "pending" || (state === "unavailable" && this.pending);
     this.status.textContent =
       state === "unavailable"
-        ? "Voice conversation deletion is unavailable on this host. It needs the Hermes voice companion, and is off while evidence capture keeps its own copy (Revoke consent and erase removes that copy)."
+        ? "Voice conversation deletion is unavailable on this host. It needs the Hermes voice companion, and is off while evidence capture keeps its own copy (Revoke consent and erase removes that copy). A deletion already started resumes when the companion is back."
         : state === "pending"
           ? "Deletion pending. Hermes is still verifying the archive."
           : state === "complete"

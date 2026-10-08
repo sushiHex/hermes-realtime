@@ -49,6 +49,7 @@ describe("voice conversation deletion control", () => {
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
     expect(status.textContent).toContain("Voice conversation deletion is unavailable on this host.");
     expect(status.textContent).toContain("evidence capture keeps its own copy");
+    expect(status.textContent).toContain("A deletion already started resumes when the companion is back.");
     expect(button.disabled).toBe(true);
     await controls.delete();
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
@@ -197,6 +198,36 @@ describe("voice conversation deletion control", () => {
     expect(status.textContent).toContain("could not be confirmed");
     expect(status.textContent).not.toContain("Ready");
     expect(button.disabled).toBe(false);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("keeps polling a pending delete while the companion is away, with delete disabled", async () => {
+    const states = ["pending", "unavailable"];
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async () => ({ version: 1, state: states.shift() ?? "unavailable" }),
+      clear: () => undefined,
+    });
+    const timer = () => (controls as unknown as { timer: unknown }).timer;
+    await controls.refresh();
+    expect(timer()).not.toBeNull();
+    await controls.refresh();
+    expect(status.textContent).toContain("A deletion already started resumes when the companion is back.");
+    expect(button.disabled).toBe(true);
+    expect(timer()).not.toBeNull();
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("does not poll an unavailable host it never saw a delete pending on", async () => {
+    const { dom, controls } = mount({
+      confirm: () => true,
+      request: async () => ({ version: 1, state: "unavailable" }),
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect((controls as unknown as { timer: unknown }).timer).toBeNull();
     controls.reset();
     dom.window.close();
   });

@@ -2598,7 +2598,7 @@ def build_local_host_launcher(
         reservation = projection.reserve_voice_clear()
         reservation_owned = True
         input_release_owned = True
-        memory_closed = False
+        memory_closing = False
 
         def on_durable_clear() -> None:
             nonlocal reservation_owned, input_release_owned
@@ -2640,19 +2640,21 @@ def build_local_host_launcher(
                 )
                 await speech.cancel_for_binding_close()
                 if voice_memory_receiver is not None:
-                    # A failed close leaves the receiver running, so it needs no restart.
+                    # Close cancels the receiver at once, so even a close that fails or is
+                    # interrupted leaves it stopped: from here a kept binding restarts it.
+                    memory_closing = True
                     await voice_memory_receiver.close()
-                    memory_closed = True
                 await writer.request_forget(context, on_durable_clear=on_durable_clear)
             settled = old_binding not in writer.pending_deletes
             return "complete" if settled and writer.delete_outcome == old_binding else "pending"
         finally:
             # A canceled caller cannot release either authority after the writer rotates.
             # Its one-shot durable callback still owns the clear and input lease.
-            if memory_closed and writer.binding == old_binding:
+            if memory_closing and writer.binding == old_binding:
                 assert voice_memory_receiver is not None
                 try:
-                    voice_memory_receiver.start()
+                    # Rebind settles whatever the close left, then starts it again.
+                    await voice_memory_receiver.rebind()
                 except Exception:
                     _LOGGER.warning("voice memory restart after a failed delete failed")
             if reservation_owned and writer.binding == old_binding:
@@ -2675,11 +2677,12 @@ def build_local_host_launcher(
         writer = voice_tail_writer
         if writer is None or voice_forget_sender is None:
             raise RuntimeError("voice delete is unavailable")
-        # A recorded delete stays pending whatever the link does; it resumes on reconnect.
-        if writer.pending_deletes:
-            return "pending"
+        # Unavailable first, so the control is never offered for a delete the host refuses.
+        # A recorded delete stays in the record and resumes once a capable link returns.
         if not voice_delete_offered():
             return "unavailable"
+        if writer.pending_deletes:
+            return "pending"
         if writer.delete_outcome == "unknown":
             return "unknown"
         # Complete names only the conversation the current one replaced.

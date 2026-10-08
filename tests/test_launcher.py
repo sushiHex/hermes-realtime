@@ -2463,12 +2463,16 @@ async def test_voice_delete_is_offered_only_when_voice_forget_is_negotiated(
 
 
 @pytest.mark.asyncio
-async def test_a_recorded_delete_reads_pending_even_without_a_capable_link(
+async def test_a_recorded_delete_reads_unavailable_without_a_capable_link_and_stays_recorded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from hermes_realtime.companion.host import CompanionEndpoint
-    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+    from hermes_realtime.integration.voice_deletes import (
+        VoiceDeletes,
+        parse_voice_deletes,
+        voice_deletes_bytes,
+    )
 
     harness = _FullHostHarness(monkeypatch)
     _recording_sender(monkeypatch, harness.events)
@@ -2484,9 +2488,12 @@ async def test_a_recorded_delete_reads_pending_even_without_a_capable_link(
     launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
     await launcher.start()
     try:
-        assert harness.browser["voice_delete_status"]() == "pending"
+        # The host would refuse a delete, so the control is not offered.
+        assert harness.browser["voice_delete_status"]() == "unavailable"
     finally:
         await launcher.close()
+    recorded = parse_voice_deletes((tmp_path / "voice-tail-v1.deletes.json").read_bytes())
+    assert recorded is not None and recorded.pending == (("old", 0),)
 
 
 @pytest.mark.asyncio
@@ -2635,7 +2642,45 @@ async def test_a_failed_delete_restarts_the_memory_receiver_it_closed(
         monkeypatch.setattr(writer, "request_forget", refused)
         with pytest.raises(RuntimeError, match="synthetic delete refusal"):
             await harness.browser["delete_voice_conversation"]("browser_0123456789abcdef", 1)
-        assert harness.events.count("memory:close") == 1
+        # The delete's close, then the restart's rebind: it settles and starts again.
+        assert harness.events.count("memory:close") == 2
+        assert harness.events.count("memory:start") == 2
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_whose_memory_close_fails_still_restarts_the_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+    receiver_type = host_launcher_module.VoiceMemoryReceiver
+    real_close = receiver_type.close
+    failures = [True]
+
+    async def close(self: Any) -> None:
+        if failures and failures.pop():
+            # Close has already cancelled the receiver when its wait is cut short.
+            assert self._task is not None
+            self._task.cancel()
+            raise RuntimeError("memory receiver did not stop before close timeout")
+        await real_close(self)
+
+    monkeypatch.setattr(receiver_type, "close", close)
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        with pytest.raises(RuntimeError, match="close timeout"):
+            await harness.browser["delete_voice_conversation"]("browser_0123456789abcdef", 1)
         assert harness.events.count("memory:start") == 2
     finally:
         await launcher.close()
