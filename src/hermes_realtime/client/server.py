@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from .http import BrowserBootstrapApplication, BrowserBootstrapResponse
 from .loopback import LoopbackPeerAddress
+from .session import NoBrowserSession
 from .tailnet import TailnetPeerAddress
 
 BrowserPeerAddress = LoopbackPeerAddress | TailnetPeerAddress
@@ -32,6 +33,21 @@ _DNS_HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
 )
 _ENDS_IN_NUMBER = re.compile(r"(?:[0-9]+|0[xX][0-9A-Fa-f]*)\Z")
+
+
+def error_status(error: Exception) -> int:
+    """The status a refused request answers with. 409 means exactly that no session is
+    active, so a client may start one; every other state refusal is transient (503)."""
+
+    if isinstance(error, PermissionError):
+        return 403
+    if isinstance(error, (TypeError, ValueError, UnicodeError, asyncio.IncompleteReadError)):
+        return 400
+    if isinstance(error, (TimeoutError, asyncio.LimitOverrunError)):
+        return 408
+    if isinstance(error, NoBrowserSession):
+        return 409
+    return 503
 
 
 def _livekit_http_origin(value: object) -> str:
@@ -185,16 +201,8 @@ class BrowserHttpServer:
                 peer = None
         try:
             response = await self._read_and_dispatch(reader, peer=peer)
-        except PermissionError:
-            response = self._error_response(403)
-        except (TypeError, ValueError, UnicodeError, asyncio.IncompleteReadError):
-            response = self._error_response(400)
-        except (TimeoutError, asyncio.LimitOverrunError):
-            response = self._error_response(408)
-        except RuntimeError:
-            response = self._error_response(409)
-        except Exception:
-            response = self._error_response(503)
+        except Exception as error:
+            response = self._error_response(error_status(error))
         try:
             writer.write(self._encode_response(response))
             await writer.drain()

@@ -765,6 +765,25 @@ def test_release_gate_registers_fast_track_for_sdist_and_script_mypy(
     assert environment["BASE"] == "retained"
 
 
+def test_release_gate_type_checks_the_desktop_mvp_rehearsal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    release_gate = run_path(str(root / "scripts" / "release_gate.py"))
+    registered = "scripts/rehearse_desktop_mvp.py"
+    calls: list[tuple[str, ...]] = []
+
+    def observe_run(*command: str, cwd: Path, env: dict[str, str] | None = None) -> None:
+        del cwd, env
+        calls.append(command)
+
+    monkeypatch.setitem(release_gate["run_script_mypy"].__globals__, "run", observe_run)
+    release_gate["run_script_mypy"](root, {"BASE": "retained"})
+
+    assert len(calls) == 1
+    assert calls[0].count(registered) == 1
+
+
 def test_canonical_baseline_diff_uses_exact_no_ext_diff_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

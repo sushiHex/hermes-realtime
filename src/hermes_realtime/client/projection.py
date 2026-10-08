@@ -92,15 +92,49 @@ class BrowserEventProjection:
         self._overflowed = False
         self._capture_status_reservations: set[ProjectionReservation] = set()
         self._voice_clear_reservations: set[ProjectionReservation] = set()
+        # The latest event of every task still running and every approval still actionable,
+        # in first-published order, so a page that kept nothing can be shown them again.
+        self._open_state: dict[tuple[str, str], dict[str, PublicValue]] = {}
 
     def reset(self) -> None:
-        """Begin a fresh browser lease with sequence authority restarting at one."""
+        """Begin a fresh browser lease with sequence authority restarting at one.
+
+        Open tasks and approvals are not part of the lease: they stay until they settle.
+        """
 
         self._events.clear()
         self._sequence = 0
         self._overflowed = False
         self._capture_status_reservations.clear()
         self._voice_clear_reservations.clear()
+
+    @property
+    def open_state_count(self) -> int:
+        return len(self._open_state)
+
+    def republish_open_state(self) -> None:
+        """Publish again every task still running and every approval still actionable."""
+
+        if self._open_state:
+            self.ensure_capacity(len(self._open_state))
+        for (kind, _), data in list(self._open_state.items()):
+            self.publish(kind, dict(data))
+
+    @staticmethod
+    def _open_key(kind: str, data: dict[str, PublicValue]) -> tuple[str, str] | None:
+        """The open-state entry an event sets, or None when it settles or concerns none."""
+
+        if kind == "task_state" and type(data.get("taskId")) is str:
+            return (kind, cast(str, data["taskId"]))
+        if kind == "approval_state" and type(data.get("approvalId")) is str:
+            return (kind, cast(str, data["approvalId"]))
+        return None
+
+    @staticmethod
+    def _is_open(kind: str, data: Mapping[str, PublicValue]) -> bool:
+        if kind == "task_state":
+            return data.get("status") in {"active", "cancelling"}
+        return data.get("actionable") is True
 
     def reserve_voice_clear(self) -> ProjectionReservation:
         """Retain one nondroppable local-clear publication slot."""
@@ -399,6 +433,10 @@ class BrowserEventProjection:
                 raise ValueError("event integer is outside the browser-safe range")
             projected[key] = value
 
+        open_key = self._open_key(kind, projected)
+        opens = open_key is not None and self._is_open(kind, projected)
+        if opens and open_key not in self._open_state and len(self._open_state) >= self._capacity:
+            raise RuntimeError("open task and approval state exceeds the projection bound")
         if not reserved:
             self.ensure_capacity()
         observed = self._clock()
@@ -414,6 +452,11 @@ class BrowserEventProjection:
             data=MappingProxyType(projected),
         )
         self._events.append(event)
+        if open_key is not None:
+            if opens:
+                self._open_state[open_key] = projected
+            else:
+                self._open_state.pop(open_key, None)
         return event
 
     @staticmethod
