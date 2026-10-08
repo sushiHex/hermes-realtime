@@ -13,6 +13,7 @@ function mount(options: {
   confirm: (message: string) => boolean;
   request: (path: string, token: string) => Promise<unknown>;
   clear: () => void;
+  pollIntervalMs?: number;
 }) {
   const dom = new JSDOM(markup);
   vi.stubGlobal("window", dom.window);
@@ -20,10 +21,10 @@ function mount(options: {
   const status = dom.window.document.querySelector<HTMLOutputElement>("#voice-delete-status");
   if (!button || !status) throw new Error("voice delete controls missing");
   const controls = new VoiceDeleteControls(button, status, {
+    pollIntervalMs: 100_000,
     ...options,
     credential: () => ({ token: "synthetic-token", participantIdentity: "participant-a" }),
     connected: () => true,
-    pollIntervalMs: 100_000,
   });
   return { dom, button, status, controls };
 }
@@ -203,19 +204,28 @@ describe("voice conversation deletion control", () => {
   });
 
   it("keeps polling a pending delete while the companion is away, with delete disabled", async () => {
-    const states = ["pending", "unavailable"];
+    // The companion goes away while the delete is pending, then comes back and completes it.
+    const states = ["pending", "unavailable", "unavailable", "complete"];
+    const seen: string[] = [];
+    let whileAway: { text: string | null; disabled: boolean } | null = null;
     const { dom, button, status, controls } = mount({
       confirm: () => true,
-      request: async () => ({ version: 1, state: states.shift() ?? "unavailable" }),
+      request: async () => {
+        // The poll after the first unavailable answer: what the page shows while away.
+        if (seen.length === 2) whileAway = { text: status.textContent, disabled: button.disabled };
+        const state = states.shift() ?? "complete";
+        seen.push(state);
+        return { version: 1, state };
+      },
       clear: () => undefined,
+      pollIntervalMs: 5,
     });
-    const timer = () => (controls as unknown as { timer: unknown }).timer;
     await controls.refresh();
-    expect(timer()).not.toBeNull();
-    await controls.refresh();
-    expect(status.textContent).toContain("A deletion already started resumes when the companion is back.");
-    expect(button.disabled).toBe(true);
-    expect(timer()).not.toBeNull();
+    await vi.waitFor(() => expect(status.textContent).toBe("Voice conversation deleted."));
+    expect(whileAway).not.toBeNull();
+    expect(whileAway!.text).toContain("A deletion already started resumes when the companion is back.");
+    expect(whileAway!.disabled).toBe(true);
+    expect(seen).toEqual(["pending", "unavailable", "unavailable", "complete"]);
     controls.reset();
     dom.window.close();
   });

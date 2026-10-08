@@ -864,18 +864,15 @@ class VoiceTailWriter:
         self._review_frozen_version = 0
 
     async def next_deletes(self) -> tuple[tuple[str, int], ...]:
-        """Every pending delete durable in the record and in the tail that retired it.
+        """Every pending delete, once the tail write that retired its binding is durable.
 
-        The record lands before the tail, so a record alone would let the companion
-        delete, and acknowledge, a conversation whose tail is still on disk.
+        The record lands before the tail in every pass, so that write holds the record
+        too. The record alone would let the companion delete, and acknowledge, a
+        conversation whose tail is still on disk.
         """
 
         while True:
-            pending = tuple(
-                binding
-                for binding in (self._written_deletes or VoiceDeletes()).pending
-                if binding in self._deletes.pending
-            )
+            pending = self._deletes.pending
             if (
                 self._owner is not None
                 and pending
