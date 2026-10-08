@@ -90,6 +90,9 @@ class _BlockingPlayback:
     async def cancel(self, turn_id: str) -> None:
         del turn_id
 
+    def finish_word_on_cancel(self, turn_id: str) -> None:
+        self.calls.append(f"finish_word:{turn_id}")
+
 
 class _UnusedTaskController:
     async def dispatch(self, *, objective: str, utterance_id: str) -> object:
@@ -190,6 +193,22 @@ async def test_serialized_playback_never_overlaps_readiness_and_foreground_audio
     delegate.release_first.set()
     await asyncio.gather(first_task, second_task)
     assert delegate.calls == ["ready", "answer"]
+
+
+@pytest.mark.asyncio
+async def test_serialized_playback_forwards_barge_in_mark_past_the_held_gate() -> None:
+    delegate = _BlockingPlayback()
+    playback = _SerializedSpeechPlayback(delegate, asyncio.Lock())
+    audio = AudioFrame(pcm=b"\x00\x00", sample_rate_hz=48_000, channels=1)
+    chunk = SpeechChunk(turn_id="turn", chunk_id="answer", text="Answer.", audio=audio)
+
+    playing = asyncio.create_task(playback.play(chunk, is_valid=lambda: True))
+    await delegate.first_started.wait()
+    playback.finish_word_on_cancel("turn")
+
+    assert delegate.calls == ["answer", "finish_word:turn"]
+    delegate.release_first.set()
+    await playing
 
 
 @pytest.mark.asyncio

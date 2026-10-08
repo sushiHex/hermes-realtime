@@ -55,9 +55,10 @@ def _peer_probe() -> tuple[LiveKitRoomPeer, list[str]]:
         chunk: SpeechChunk,
         *,
         timeout_seconds: float = 10,
+        finish_word: bool = False,
     ) -> None:
         del self, chunk, timeout_seconds
-        events.append("cancel")
+        events.append("cancel:finish_word" if finish_word else "cancel")
 
     peer.prepare_speech_chunk = MethodType(prepare, peer)  # type: ignore[method-assign]
     peer.publish_speech_chunk = MethodType(publish, peer)  # type: ignore[method-assign]
@@ -97,6 +98,20 @@ async def test_reconnect_safe_publisher_cancel_releases_chunk_authority() -> Non
     await publisher.unbind(peer)
 
     assert events == ["prepare", "cancel"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_safe_publisher_forwards_word_boundary_cancel() -> None:
+    peer, events = _peer_probe()
+    publisher = ReconnectSafeLiveKitAudioPublisher()
+    chunk = _chunk()
+
+    await publisher.bind(peer)
+    await publisher.prepare_speech_chunk(chunk)
+    await publisher.cancel_speech_chunk(chunk, finish_word=True)
+    await publisher.unbind(peer)
+
+    assert events == ["prepare", "cancel:finish_word"]
 
 
 @pytest.mark.asyncio

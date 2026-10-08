@@ -117,6 +117,15 @@ def test_markers_are_kept_by_name_and_rendered_from_their_values() -> None:
     assert "Users" not in json.dumps(found)
 
 
+def test_the_interrupt_step_keeps_the_speech_stop_marker() -> None:
+    found, dropped = rehearsal.markers(
+        ['[speech-stop] {"faded":true,"mode":"word","outcome":"gap","tail_ms":130}']
+    )
+
+    assert found == ['[speech-stop] {"faded":true,"mode":"word","outcome":"gap","tail_ms":130}']
+    assert dropped == 0
+
+
 def test_markers_are_capped_and_the_rest_counted() -> None:
     lines = [f'[voice-archive-send] {{"n":{index}}}' for index in range(40)]
 
