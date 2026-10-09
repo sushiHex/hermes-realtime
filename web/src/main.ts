@@ -45,6 +45,7 @@ import {
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
   reloadOrBootstrap,
+  reloadRebindIsSettled,
   rememberSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
@@ -2103,7 +2104,7 @@ function tabStorage(): Storage | null {
 
 // Every new credential passes here, so the tab remembers the session's current identity.
 // Clearing the in-memory credential never forgets it: only a definitive verdict does (the
-// stop that succeeded, or a reload rebind answered 403 or 409).
+// stop that succeeded, or a rebind answered 403 or 409).
 function setCredential(value: BootstrapCredential | null): void {
   credential = value;
   if (stableLaunch && value !== null) {
@@ -2767,7 +2768,7 @@ async function connect(projectionResync = false): Promise<void> {
   clearPartialTranscript();
   prepareMicrophoneSignalMonitor();
   const startingState = controller.state;
-  const disconnectedResume = startingState === "disconnected";
+  const disconnectedResume = startingState === "disconnected" && credential !== null;
   const errorResume = startingState === "error" && credential !== null;
   const resuming = disconnectedResume || errorResume;
   if (!resuming && credential === null && !stableLaunch && capability === null) {
@@ -2830,6 +2831,15 @@ async function connect(projectionResync = false): Promise<void> {
     }
     setCredential(candidate);
   };
+  const retireRejectedCredential = (error: unknown): boolean => {
+    if (!(error instanceof SessionRebindRejected) || !reloadRebindIsSettled(error.status)) return false;
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) throw error;
+    clearCredentialRefresh();
+    setCredential(null);
+    pendingRebindRequestId = null;
+    if (stableLaunch) rememberSession(tabStorage(), null);
+    return true;
+  };
   try {
     if (resuming) {
       const previousCredential = credential;
@@ -2855,8 +2865,9 @@ async function connect(projectionResync = false): Promise<void> {
           );
           addMarker("session_rebound", started);
         } catch (error) {
-          if (localOperation.signal.aborted) throw error;
           try {
+            if (retireRejectedCredential(error)) throw error;
+            if (localOperation.signal.aborted) throw error;
             commitCredential(
               await rebindBrowserCredential(
                 previousCredential,
@@ -2866,6 +2877,7 @@ async function connect(projectionResync = false): Promise<void> {
             );
             addMarker("session_rebound_after_retry", started);
           } catch (retryError) {
+            retireRejectedCredential(retryError);
             if (localOperation.signal.aborted) throw retryError;
             if (!stableLaunch) throw retryError;
             if (
@@ -2875,7 +2887,10 @@ async function connect(projectionResync = false): Promise<void> {
               throw retryError;
             }
             failureStage = "bootstrap";
+            controller.disconnected();
+            controller.beginConnect();
             commitCredential(await bootstrap(localOperation.signal));
+            controller.bootstrapReady();
             sessionReplaced = true;
             resetSessionInputAuthority();
             addMarker("session_replaced", started);
@@ -3016,7 +3031,7 @@ async function connect(projectionResync = false): Promise<void> {
     if (sessionStopVersion !== observedStopVersion) return;
     refused = { stage: failureStage, category: connectionFailureCategory(error) };
     connectionFailure = refused;
-    if (resuming) {
+    if (resuming && failureStage !== "bootstrap") {
       controller.disconnected();
       renderConnectionPresentation();
       addMarker("media_reconnect_failed", started);

@@ -51,7 +51,10 @@ categories and safe retry guidance beside the control. Bootstrap, initial room
 connection, and an in-flight stop disable the control; microphone preparation and
 reconnection keep Disconnect available for an independent user stop.
 A refused remote stop keeps Disconnect available for that same stop; a consumed
-one-shot launch requires a fresh launch. An admitted room's exact speech worker
+one-shot launch requires a fresh launch. Definitive rebind refusals retire the
+rejected identity; transient refusals retain replay authority. Only a 409 starts
+an automatic fresh stable bootstrap, which uses the initial connection states.
+An admitted room's exact speech worker
 departure releases local audio and offers an explicit reconnect while preserving
 session and visible history. Newer lifecycle operations supersede older cleanup
 continuations, credential responses, and configuration responses. Local cleanup

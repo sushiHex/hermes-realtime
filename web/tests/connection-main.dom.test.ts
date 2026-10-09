@@ -34,14 +34,14 @@ const credential = {
 };
 let dom: JSDOM;
 
-async function mount(request: (path: string) => Response | Promise<Response>, remembered = false) {
+async function mount(request: (path: string) => Response | Promise<Response>, remembered = false, oneShot = false) {
   vi.resetModules();
   media.connect.mockReset().mockResolvedValue();
   media.disconnect.mockReset().mockResolvedValue();
   media.microphone.mockReset().mockResolvedValue(undefined);
   media.rooms.length = 0;
   dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
-    url: "http://localhost/", pretendToBeVisual: true,
+    url: oneShot ? `http://localhost/#bootstrap=${"a".repeat(43)}` : "http://localhost/", pretendToBeVisual: true,
   });
   for (const key of ["window", "document", "HTMLElement", "HTMLMediaElement", "Option"] as const) {
     vi.stubGlobal(key, key === "window" ? dom.window : dom.window[key]);
@@ -215,17 +215,11 @@ describe("mounted connection recovery", () => {
     expect(recovery.hidden).toBe(true);
   });
 
-  it.each(["rebind", "bootstrap"] as const)("rejects a late %s answer after reconnect is stopped", async (phase) => {
+  it("rejects a late rebind answer after reconnect is stopped", async () => {
     let answer!: () => void;
-    let bootstraps = 0;
     const replacement = { ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.late.token" };
     const { toggle, recovery, fetch } = await mount((path) => {
-      if (path === "/api/v1/stable-rebind") return phase === "bootstrap"
-        ? new Response(null, { status: 409 })
-        : new Promise<Response>((resolve) => { answer = () => resolve(Response.json(replacement)); });
-      if (path === "/api/v1/stable-bootstrap" && ++bootstraps > 1) {
-        return new Promise<Response>((resolve) => { answer = () => resolve(Response.json(replacement)); });
-      }
+      if (path === "/api/v1/stable-rebind") return new Promise<Response>((resolve) => { answer = () => resolve(Response.json(replacement)); });
       return normalRequest(path);
     });
     toggle.click();
@@ -281,6 +275,140 @@ describe("mounted connection recovery", () => {
     expect(toggle.textContent).toBe("Disconnect");
     expect(recovery.hidden).toBe(true);
     expect(media.disconnect).not.toHaveBeenCalled();
+  });
+
+  it("retires a definitive 403 rebind refusal and requires explicit fresh bootstrap", async () => {
+    const { toggle, recovery, fetch } = await mount((path) => path === "/api/v1/stable-rebind"
+      ? new Response(null, { status: 403 }) : normalRequest(path));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(recovery.dataset.category).toBe("authorization-refused"));
+    expect(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")).toBeNull();
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-rebind")).toHaveLength(1);
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-bootstrap")).toHaveLength(1);
+    expect(toggle.disabled).toBe(false);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-bootstrap")).toHaveLength(2);
+  });
+
+  it("retires a definitive one-shot 409 rebind refusal and requires fresh launch", async () => {
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/bootstrap") return Response.json(credential);
+      if (path === "/api/v1/rebind") return new Response(null, { status: 409 });
+      return normalRequest(path);
+    }, false, true);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("rebind"));
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.textContent).toBe("Fresh launch required");
+    expect(recovery.textContent).toContain("fresh launch from the host");
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/rebind")).toHaveLength(1);
+  });
+
+  it("retires old authority before a 409 fallback bootstrap fails", async () => {
+    let bootstraps = 0;
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/stable-rebind") return new Response(null, { status: 409 });
+      if (path === "/api/v1/stable-bootstrap" && ++bootstraps === 2) return new Response(null, { status: 503 });
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("bootstrap"));
+    expect(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")).toBeNull();
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-rebind")).toHaveLength(1);
+    expect(bootstraps).toBe(3);
+  });
+
+  it("classifies a pending 409 fallback as fresh bootstrap until admission", async () => {
+    let admit!: () => void;
+    let bootstraps = 0;
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/stable-rebind") return new Response(null, { status: 409 });
+      if (path === "/api/v1/stable-bootstrap" && ++bootstraps > 1) return new Promise<Response>((resolve) => { admit = () => resolve(Response.json(credential)); });
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(admit).toBeDefined());
+    expect(toggle.textContent).toBe("Connecting…");
+    expect(toggle.disabled).toBe(true);
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("bootstrapping");
+    expect(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")).toBeNull();
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stop")).toHaveLength(0);
+    let releaseMicrophone!: () => void;
+    media.microphone.mockReturnValueOnce(new Promise<undefined>((resolve) => { releaseMicrophone = () => resolve(undefined); }));
+    admit();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("preparing"));
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.textContent).toBe("Disconnect");
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped"));
+    releaseMicrophone();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stop")).toHaveLength(1);
+    expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(true);
+  });
+
+  it("preserves transient rebind replay authority until a successful answer", async () => {
+    let rebinds = 0;
+    const { toggle, recovery, fetch } = await mount((path) => path === "/api/v1/stable-rebind" && ++rebinds <= 2
+      ? new Response(null, { status: 503 }) : normalRequest(path));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("rebind"));
+    expect(JSON.parse(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")!).identity).toBe(credential.participantIdentity);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    const requests = fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-rebind");
+    expect(requests).toHaveLength(3);
+    expect(new Set(requests.map(([, init]) => JSON.parse(init!.body as string).requestId)).size).toBe(1);
+  });
+
+  it("does not retire a replacement credential for a late old 403 refusal", async () => {
+    let refuseOld!: () => void;
+    let rebinds = 0;
+    let bootstraps = 0;
+    const newer = { ...credential, participantIdentity: "browser_1111111111111111", token: "synthetic.newer.token" };
+    const { toggle, recovery } = await mount((path) => {
+      if (path === "/api/v1/stable-rebind" && ++rebinds === 1) return new Promise<Response>((resolve) => { refuseOld = () => resolve(new Response(null, { status: 403 })); });
+      if (path === "/api/v1/stable-bootstrap" && ++bootstraps > 1) return Response.json(newer);
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(refuseOld).toBeDefined());
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+    refuseOld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(JSON.parse(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")!).identity).toBe(newer.participantIdentity);
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(recovery.hidden).toBe(true);
   });
 
   it("ignores a stale room departure after a replacement session connects", async () => {

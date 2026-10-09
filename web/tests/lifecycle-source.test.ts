@@ -9,7 +9,7 @@ const mainSource = readFileSync(
 );
 
 describe("reloaded tab rebind wiring", () => {
-  it("remembers every new credential and forgets the session only after a stop succeeds", () => {
+  it("remembers every credential and forgets only on a stop or definitive rebind verdict", () => {
     const setter = mainSource.indexOf("function setCredential(");
     const setterEnd = mainSource.indexOf("\n}\n", setter);
     expect(setter).toBeGreaterThan(-1);
@@ -21,10 +21,10 @@ describe("reloaded tab rebind wiring", () => {
     expect(body).toContain(
       "rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });",
     );
-    // A failed connect clears the credential in memory but never the remembered session.
+    // Transient failures retain the remembered identity; definitive rebind and stop clear it.
     const forget = "if (stableLaunch) rememberSession(tabStorage(), null);";
-    expect(mainSource.split(forget)).toHaveLength(2);
-    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(2);
+    expect(mainSource.split(forget)).toHaveLength(3);
+    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(3);
     const stop = mainSource.indexOf("async function stop(");
     const stopBody = mainSource.slice(stop, mainSource.indexOf("\n}\n", stop));
     expect(stopBody.indexOf(forget)).toBeGreaterThan(stopBody.indexOf("} finally {"));
