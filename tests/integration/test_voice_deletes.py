@@ -18,6 +18,7 @@ from hermes_realtime.integration.voice_deletes import (
 )
 from hermes_realtime.integration.voice_tail import VoiceTailWriter
 from hermes_realtime.speech import Transcript
+from tests.support.live_record import read_live_record
 
 
 def _ids(*names: str):  # type: ignore[no-untyped-def]
@@ -267,7 +268,7 @@ async def test_no_delete_record_is_written_until_a_delete_is_recorded(tmp_path: 
     path = tmp_path / "voice-tail.json"
     writer, store = await _open(path, "conv")
     store.record_user_transcript(Transcript(text="kept history", final=True))
-    await _until(lambda: path.exists() and b"kept history" in path.read_bytes())
+    await _until(lambda: b"kept history" in (read_live_record(path) or b""))
     await writer.close()
 
     assert not _deletes_path(path).exists()
@@ -303,9 +304,10 @@ async def _until(predicate) -> None:  # type: ignore[no-untyped-def]
 
 
 def _recorded(path: Path) -> VoiceDeletes:
-    if not _deletes_path(path).exists():
+    raw = read_live_record(_deletes_path(path))
+    if raw is None:
         return VoiceDeletes()
-    recorded = parse_voice_deletes(_deletes_path(path).read_bytes())
+    recorded = parse_voice_deletes(raw)
     assert recorded is not None
     return recorded
 
@@ -327,7 +329,7 @@ async def _delete_with_the_tail_unwritable(
     await writer.open(store)
     store.record_user_transcript(Transcript(text="a deleted phrase", final=True))
     await _offer(writer, store)
-    await _until(lambda: path.exists() and b"a deleted phrase" in path.read_bytes())
+    await _until(lambda: b"a deleted phrase" in (read_live_record(path) or b""))
     writer.fail = True
     request = asyncio.create_task(writer.request_forget(store))
     # The record lands; the cleared tail does not.
@@ -344,12 +346,12 @@ async def test_a_delete_reaches_the_companion_only_after_its_cleared_tail_is_dur
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(writer.next_deletes(), 0.3)
-    assert b"a deleted phrase" in path.read_bytes() and not request.done()
+    assert b"a deleted phrase" in (read_live_record(path) or b"") and not request.done()
 
     writer.fail = False
     assert await asyncio.wait_for(writer.next_deletes(), 5) == (("old", 0),)
     assert await asyncio.wait_for(request, 5) == ("old", 0)
-    assert b"a deleted phrase" not in path.read_bytes()
+    assert b"a deleted phrase" not in (read_live_record(path) or b"")
     await writer.close()
 
 
@@ -364,7 +366,7 @@ async def test_a_tail_the_record_knows_as_deleted_is_never_restored(
         # However the acknowledgment arrived, the record now names it complete.
         assert writer.acknowledge_forget(("old", 0)) is True
         await _until(
-            lambda: parse_voice_deletes(_deletes_path(path).read_bytes())
+            lambda: parse_voice_deletes(read_live_record(_deletes_path(path)) or b"")
             == VoiceDeletes(outcome=("old", 0), live=("new", 1))
         )
     assert b"a deleted phrase" in path.read_bytes()
