@@ -2197,7 +2197,7 @@ async def test_reconnect_worker_can_close_only_media_binding_before_transport_un
         return ConversationSessionWorker(
             participant_identity=participant_identity,
             session_generation=generation,
-            vad=SilenceVad(),
+            vad=ScriptedVad(VoiceActivity.SPEECH_STARTED),
             stt=transcriber,
             actions=actions,
         )
@@ -2214,7 +2214,10 @@ async def test_reconnect_worker_can_close_only_media_binding_before_transport_un
     frame = AudioFrame(pcm=b"\x00\x00" * 160, sample_rate_hz=16_000, channels=1)
     with pytest.raises(RuntimeError, match="stale"):
         await worker.receive_audio("browser_user", first_generation, frame)
-    assert await worker.bind("browser_user") == first_generation + 1
+    next_generation = await worker.bind("browser_user")
+    assert next_generation == first_generation + 1
+    await worker.receive_audio("browser_user", next_generation, frame)
+    assert transcribers[1].push_calls == 1
     await worker.close()
 
 
