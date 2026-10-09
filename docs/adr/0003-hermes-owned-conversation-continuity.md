@@ -212,8 +212,9 @@ entry:
 - **Admitted:** the run's Hermes ID, which also names its session. Never the private protocol
   ID, never the objective.
 
-The record is versioned, bounded by the active-run capacity, and, with the durable voice tail
-below, one of only two persisted realtime files. It is owned by one host at a time: a host
+The record is versioned and bounded by the active-run capacity. Realtime also persists the
+durable voice tail and its separate deletion-intent record, described below. The binding
+record is owned by one host at a time: a host
 holds an exclusive lock on it from before it
 settles the record until after its final write, and a second host fails to start rather than
 stop runs it does not own. #77 item 4 admits exactly this kind of bounded transient reference.
