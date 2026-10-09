@@ -128,6 +128,19 @@ async def test_a_proof_spliced_from_another_handshake_is_refused(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", ["0" * 63, "A" * 64, "0" * 65])
+async def test_a_welcome_with_a_malformed_server_nonce_is_refused_even_when_signed(
+    nonce: str,
+) -> None:
+    companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome, server_nonce=nonce)
+    server, port = await companion.start()
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await _connect(port)
+    assert len(companion.received) == 1
+
+
+@pytest.mark.asyncio
 async def test_no_attestation_is_read_before_the_server_proof_verifies(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

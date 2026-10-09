@@ -106,6 +106,7 @@ class FakeCompanion:
     shape: Callable[[dict[str, object]], dict[str, object]]
     sign: Callable[[dict[str, object]], dict[str, object]] = lambda covered: covered
     accept: str = "valid"
+    server_nonce: str | None = None
     received: list[object] = field(default_factory=list)
     server_nonces: list[str] = field(default_factory=list)
 
@@ -116,7 +117,7 @@ class FakeCompanion:
             assert type(document) is dict
             welcome = self.shape(document)
             if welcome.get("ok") is True:
-                server_nonce = secrets.token_hex(32)
+                server_nonce = self.server_nonce or secrets.token_hex(32)
                 self.server_nonces.append(server_nonce)
                 covered = {
                     "participant_id": document["participant_id"],
