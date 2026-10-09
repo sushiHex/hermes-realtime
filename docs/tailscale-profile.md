@@ -71,7 +71,9 @@ accepting one canonical IPv4 address within `100.64.0.0/10`. Its credential vali
 uses the existing remote launcher bounds and rejects the loopback development values;
 credentials remain outside the rendered configuration. Its immutable desired-rule
 specification records the two exact names and every field in the table below. This
-pure specification neither reads adapter or firewall state nor applies policy.
+pure specification derives its program path from the same remote resolver, but does
+not verify the binary; a future setup must verify it before using the specification.
+It neither reads adapter or firewall state nor applies policy.
 The pinned [LiveKit sample configuration](https://github.com/livekit/livekit/blob/v1.13.4/config-sample.yaml)
 defines these fields, and the [port reference](https://docs.livekit.io/transport/self-hosting/ports-firewall/)
 distinguishes signaling TCP 7880, ICE/TCP 7881, and UDP mux 7882. Keep signaling

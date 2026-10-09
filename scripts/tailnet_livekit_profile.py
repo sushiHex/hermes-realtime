@@ -7,8 +7,8 @@ changes Windows policy, writes a config, or starts a process.
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from scripts import local_livekit
 
@@ -67,7 +67,6 @@ def validate_credentials(api_key: str, api_secret: str) -> None:
         raise TypeError("remote credentials must be exact strings")
     if (
         not api_key
-        or not api_secret
         or api_key == "devkey"
         or api_secret == "local-" + "x" * 32
         or len(api_key) > 256
@@ -77,17 +76,11 @@ def validate_credentials(api_key: str, api_secret: str) -> None:
 
 
 def desired_firewall_rules(
-    executable: Path, address: str, interface_alias: str, observed_profile: str
+    environ: Mapping[str, str], address: str, interface_alias: str, observed_profile: str
 ) -> tuple[FirewallRuleSpec, FirewallRuleSpec]:
-    """Specify the two exact-name persistent Allow rules; never apply them."""
+    """Specify rules for the one shared remote path; the caller must verify its bytes."""
 
-    if not isinstance(executable, Path) or not executable.is_absolute():
-        raise ValueError("remote executable path must be absolute")
-    if (
-        executable.parent.name != f"livekit-{local_livekit.VERSION}-tailnet"
-        or executable.name != "livekit-server.exe"
-    ):
-        raise ValueError("remote executable path must name the separate pinned profile")
+    program = str(local_livekit.remote_path(environ))
     ipv4 = _tailnet_ipv4(address)
     if type(interface_alias) is not str:
         raise TypeError("interface alias must be an exact string")
@@ -113,7 +106,7 @@ def desired_firewall_rules(
             direction="Inbound",
             action="Allow",
             enabled=True,
-            program=str(executable),
+            program=program,
             protocol=protocol,
             local_port=port,
             remote_address=str(_TAILNET),
