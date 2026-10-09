@@ -14,6 +14,23 @@ and microphone/speaker classes. Use synthetic conversation data. Preserve the
 existing personal profile and unrelated processes. A separate test home must
 have its own state and loopback endpoints, not a copied personal memory store.
 
+Bind the install to the candidate by equality, not by its version string:
+
+1. Build one wheel from the clean frozen checkout and record its SHA-256.
+2. For both the host and Hermes interpreters, compare the installed package and
+   distribution metadata payload with that wheel's manifest: exact file set,
+   content hashes and sizes. Read and hash actual files; a copied `RECORD` alone
+   is not proof. Account explicitly for installer-generated artifacts such as
+   bytecode and installation metadata; unexpected package files are a refusal.
+3. After that comparison passes, record each install's `RECORD` digest. Require
+   the gateway's authenticated runtime attestation to equal the verified Hermes
+   install's digest, and run the host from the verified host install. A changed
+   install requires comparison and process restart before observations.
+
+The installed gate's version/install-kind report and gate-to-gateway attestation
+equality do not perform step 2. A same-version stale wheel fails this binding.
+Publish only the candidate/artifact digests, comparison counts and outcomes.
+
 ### Isolated-session setup overrides
 
 The diagnostic guide describes a single default installation. For a separate
@@ -26,11 +43,13 @@ test installation, these rules override its setup and process-control examples:
 - Allocate separate available literal-loopback API and companion ports. Pass
   the test home and its API URL to the installed gate; pass the same API URL and
   the test home's `.env` to the host. Keep the test voice tail and run record in
-  separate state paths. A refused bind is a setup finding; select another free
-  port instead of terminating its listener.
+  separate state paths. A refused API or companion bind is a setup finding;
+  select another free port instead of terminating its listener.
 - Reuse the pinned shared LiveKit executable through the existing verified
-  resolver. Refuse occupied LiveKit/host ports rather than replacing their
-  processes. No new binary path or firewall rule is needed for this session.
+  resolver. This procedure uses the documented default LiveKit/host ports; it
+  does not add an alternate LiveKit launch mode. If either is occupied, mark
+  setup `not_run` and defer the session rather than replacing its listener.
+  No new binary path or firewall rule is needed for this session.
 - Start owned long-lived processes without visible console windows, with stdin
   disconnected. Keep exact process ownership for restart and cleanup; restart
   only this session's host and stop only this session's gateway/LiveKit. A healthy
