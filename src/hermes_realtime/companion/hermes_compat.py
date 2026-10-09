@@ -499,6 +499,9 @@ def delete_target(db: Any, target: DeleteTarget) -> bool:
         )
         if still_present is True:
             raise ArchiveRefusal("lineage")
+        # A previous attempt may have committed the row and been killed before Hermes
+        # removed the session's files; removing absent files is a no-op.
+        _method(session_db, "SessionDB._remove_session_files")(sessions_dir, session_id)
     return bool(deleted)
 
 
@@ -508,6 +511,91 @@ def delete_targets_absent(db: Any, session_ids: tuple[str, ...]) -> bool:
             conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
             for sid in session_ids
         )
+    return bool(_method(_session_db(db), "SessionDB._execute_write")(read))
+
+
+_BRANCHED_FROM_SQL = (
+    "SELECT id FROM sessions WHERE json_extract(COALESCE(model_config, '{}'), "
+    "'$._branched_from') = ? ORDER BY id LIMIT ?"
+)
+
+
+def capture_copies(db: Any, session_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Every copy of these sessions, frozen before Hermes's delete orphans them.
+
+    A copy is a ``/branch`` copy (``_branched_from``), an API-server fork (a child by
+    ``parent_session_id`` alone), anything copied from a copy, and each one's
+    compression continuations. Delegated-task children are tasks, not copies.
+    """
+
+    chain = set(session_ids)
+
+    def capture(conn: Any) -> tuple[str, ...]:
+        found: list[str] = []
+        seen = set(chain)
+        frontier = list(session_ids)
+        while frontier:
+            parent = frontier.pop(0)
+            children = conn.execute(
+                "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
+                "length(model_config) AS config_length FROM sessions "
+                "WHERE parent_session_id = ? ORDER BY id LIMIT ?",
+                (parent, MAX_BOUND_CONVERSATIONS + 1),
+            ).fetchall()
+            linked = [
+                child["id"] for child in children
+                if not _delegated_child(dict(child), parent)
+            ] + [
+                row["id"] for row in conn.execute(
+                    _BRANCHED_FROM_SQL, (parent, MAX_BOUND_CONVERSATIONS + 1)
+                ).fetchall()
+            ]
+            for session_id in linked:
+                if session_id in seen:
+                    continue
+                seen.add(session_id)
+                found.append(session_id)
+                frontier.append(session_id)
+                if len(found) > MAX_BOUND_CONVERSATIONS:
+                    raise ArchiveRefusal("capacity")
+        return tuple(found)
+
+    return _method(_session_db(db), "SessionDB._execute_write")(capture)  # type: ignore[no-any-return]
+
+
+def _delegated_child(child: dict[str, Any], parent_id: str) -> bool:
+    """A delegated task's session: a tool-sourced child, or one marked as delegated."""
+    size = child.get("config_length")
+    if type(size) is int and size > 4096:
+        raise ArchiveRefusal("lineage")
+    if child["source"] == "tool":
+        return True
+    raw = child["model_config"]
+    try:
+        config = {} if raw is None else json.loads(raw)
+    except (TypeError, ValueError):
+        raise ArchiveRefusal("lineage") from None
+    if type(config) is not dict:
+        raise ArchiveRefusal("lineage")
+    return config.get("_delegate_from") == parent_id
+
+
+def copies_absent(db: Any, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool:
+    """Whether every frozen copy is gone and no ``/branch`` copy names a chain session.
+
+    Hermes keeps branches on delete and only clears their parent link, so the stable
+    ``_branched_from`` marker still finds a copy made after the manifest was frozen.
+    """
+
+    def read(conn: Any) -> bool:
+        return all(
+            conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None
+            for sid in copies
+        ) and all(
+            conn.execute(_BRANCHED_FROM_SQL, (sid, 1)).fetchone() is None
+            for sid in (*session_ids, *copies)
+        )
+
     return bool(_method(_session_db(db), "SessionDB._execute_write")(read))
 
 
@@ -974,6 +1062,12 @@ class HermesArchivePort:
 
     def absent(self, session_ids: tuple[str, ...]) -> bool:
         return delete_targets_absent(self._db, session_ids)
+
+    def capture_copies(self, session_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return capture_copies(self._db, session_ids)
+
+    def copies_absent(self, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool:
+        return copies_absent(self._db, session_ids, copies)
 
     def archive_rows(
         self,

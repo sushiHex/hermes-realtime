@@ -7,12 +7,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { VoiceDeleteControls } from "../src/voice-delete-controls";
 
 const markup = readFileSync(fileURLToPath(new URL("../index.html", import.meta.url)), "utf8");
-const response = (state: "idle" | "pending" | "complete") => ({ version: 1, state });
+const response = (state: "idle" | "pending" | "complete" | "unknown") => ({ version: 1, state });
 
 function mount(options: {
   confirm: (message: string) => boolean;
   request: (path: string, token: string) => Promise<unknown>;
   clear: () => void;
+  pollIntervalMs?: number;
 }) {
   const dom = new JSDOM(markup);
   vi.stubGlobal("window", dom.window);
@@ -20,10 +21,10 @@ function mount(options: {
   const status = dom.window.document.querySelector<HTMLOutputElement>("#voice-delete-status");
   if (!button || !status) throw new Error("voice delete controls missing");
   const controls = new VoiceDeleteControls(button, status, {
+    pollIntervalMs: 100_000,
     ...options,
     credential: () => ({ token: "synthetic-token", participantIdentity: "participant-a" }),
     connected: () => true,
-    pollIntervalMs: 100_000,
   });
   return { dom, button, status, controls };
 }
@@ -47,7 +48,9 @@ describe("voice conversation deletion control", () => {
     expect(requests).toEqual([]);
     await controls.refresh();
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
-    expect(status.textContent).toBe("Voice conversation deletion is unavailable on this host.");
+    expect(status.textContent).toContain("Voice conversation deletion is unavailable on this host.");
+    expect(status.textContent).toContain("evidence capture keeps its own copy");
+    expect(status.textContent).toContain("A deletion already started resumes when the companion is back.");
     expect(button.disabled).toBe(true);
     await controls.delete();
     expect(requests).toEqual(["/api/v1/voice-delete-status"]);
@@ -90,7 +93,7 @@ describe("voice conversation deletion control", () => {
     expect(requests).toEqual(["/api/v1/delete-voice-conversation"]);
     expect(status.textContent).toContain("pending");
     expect(status.textContent).not.toContain("deleted");
-    expect(button.disabled).toBe(true);
+    expect(button.disabled).toBe(false);
     expect(clears).toBe(0);
 
     controls.cleared();
@@ -119,7 +122,7 @@ describe("voice conversation deletion control", () => {
     resolveOld(response("complete"));
     await stale;
     expect(status.textContent).toContain("pending");
-    expect(button.disabled).toBe(true);
+    expect(button.disabled).toBe(false);
 
     await controls.refresh();
     expect(status.textContent).toBe("Voice conversation deleted.");
@@ -163,6 +166,118 @@ describe("voice conversation deletion control", () => {
     resolveNew(response("pending"));
     await current;
     expect(status.textContent).toContain("pending");
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("lets a later conversation be deleted while an earlier delete is pending", async () => {
+    const requests: string[] = [];
+    const { dom, button, controls } = mount({
+      confirm: () => true,
+      request: async (path) => {
+        requests.push(path);
+        return response("pending");
+      },
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect(button.disabled).toBe(false);
+    await controls.delete();
+    await controls.delete();
+    expect(requests.filter((path) => path === "/api/v1/delete-voice-conversation")).toHaveLength(2);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("reports an unreadable delete record as unknown, never as ready", async () => {
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async () => ({ version: 1, state: "unknown" }),
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect(status.textContent).toContain("could not be confirmed");
+    expect(status.textContent).not.toContain("Ready");
+    expect(button.disabled).toBe(false);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("keeps polling a pending delete while the companion is away, with delete disabled", async () => {
+    // The companion goes away while the delete is pending, then comes back and completes it.
+    const states = ["pending", "unavailable", "unavailable", "complete"];
+    const seen: string[] = [];
+    let whileAway: { text: string | null; disabled: boolean } | null = null;
+    const { dom, button, status, controls } = mount({
+      confirm: () => true,
+      request: async () => {
+        // The poll after the first unavailable answer: what the page shows while away.
+        if (seen.length === 2) whileAway = { text: status.textContent, disabled: button.disabled };
+        const state = states.shift() ?? "complete";
+        seen.push(state);
+        return { version: 1, state };
+      },
+      clear: () => undefined,
+      pollIntervalMs: 5,
+    });
+    await controls.refresh();
+    await vi.waitFor(() => expect(status.textContent).toBe("Voice conversation deleted."));
+    expect(whileAway).not.toBeNull();
+    expect(whileAway!.text).toContain("A deletion already started resumes when the companion is back.");
+    expect(whileAway!.disabled).toBe(true);
+    expect(seen).toEqual(["pending", "unavailable", "unavailable", "complete"]);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("does not poll an unavailable host it never saw a delete pending on", async () => {
+    const { dom, controls } = mount({
+      confirm: () => true,
+      request: async () => ({ version: 1, state: "unavailable" }),
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    expect((controls as unknown as { timer: unknown }).timer).toBeNull();
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("never treats a delete answered with unknown as started", async () => {
+    const requests: string[] = [];
+    const { dom, status, controls } = mount({
+      confirm: () => true,
+      request: (path) => {
+        requests.push(path);
+        if (path === "/api/v1/delete-voice-conversation") return Promise.resolve(response("unknown"));
+        // The recovery refresh stays in flight, so the status shows the delete's own outcome.
+        return requests.length === 1 ? Promise.resolve(response("idle")) : new Promise<unknown>(() => undefined);
+      },
+      clear: () => undefined,
+    });
+    await controls.refresh();
+    await controls.delete();
+    expect(status.textContent).toBe("Deletion could not be confirmed. Checking status.");
+    expect(requests).toEqual([
+      "/api/v1/voice-delete-status",
+      "/api/v1/delete-voice-conversation",
+      "/api/v1/voice-delete-status",
+    ]);
+    controls.reset();
+    dom.window.close();
+  });
+
+  it("states that a Hermes /branch copy keeps a deletion pending", async () => {
+    const confirmations: string[] = [];
+    const { dom, controls } = mount({
+      confirm: (message) => { confirmations.push(message); return false; },
+      request: async () => response("idle"),
+      clear: () => undefined,
+    });
+    const limit = "A copy made with Hermes /branch is a separate conversation: deletion stays pending until you delete that copy in Hermes.";
+    expect(dom.window.document.body.textContent).toContain(limit);
+    await controls.refresh();
+    await controls.delete();
+    expect(confirmations[0]).toContain(limit);
     controls.reset();
     dom.window.close();
   });

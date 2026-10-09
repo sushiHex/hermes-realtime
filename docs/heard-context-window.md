@@ -149,7 +149,7 @@ it always holds at least one row.
   window the companion refuses. A store with rows over about 2,700 characters would break it,
   and the fix then is a lower `max_item_chars`.
 
-Older version-4 tails still parse, so the tail version is unchanged, and they fail closed:
+Tails written before this change still parse, so the tail version is unchanged, and they fail closed:
 - **Rows without a cost** are costed as the largest row the store can hold:
   `36 + 6 × max_item_chars`, which is 6,180 bytes at 1,024. They are reviewed in smaller
   windows.

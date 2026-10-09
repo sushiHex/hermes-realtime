@@ -37,8 +37,10 @@ capability on bridge 0.3. The [pinned-Hermes qualification](../scripts/qualify_v
 exercises deletion, late-event fences, review completion, crash recovery and companion
 succession with synthetic fixtures and a stand-in model. Its two labelled owner processes
 run the real companion host, not the full CLI/API entrypoints. Exact candidate results belong
-to #77 and the implementation PR. Learned memory/skills and delegated-task sessions remain;
-the [deletion contract](hermes-bridge.md#voice-conversation-deletion) states the limits.
+to #77 and the implementation PR. Learned memory/skills, delegated-task sessions and Hermes
+`/branch` copies remain (a remaining copy keeps the delete pending), and the control is
+unavailable while evidence capture is on; the
+[deletion contract](hermes-bridge.md#voice-conversation-deletion) states the limits.
 
 ## Qualification producer status
 

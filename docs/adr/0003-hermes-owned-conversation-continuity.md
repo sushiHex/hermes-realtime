@@ -299,8 +299,10 @@ floor. It becomes a context row like any other speech.
 
 The tail is plaintext user data under the host state directory, outside evidence capture and
 purge. M3 deletion clears the store and the file follows; it also clears and fences the
-outbox and ignores stale acknowledgments. The confirmed browser control reports pending until
-the companion verifies the deletion; clearing the tail alone is not completion. The conversation-only launcher keeps no tail and
+outbox and ignores stale acknowledgments. The delete intent lives in a separate record that
+is written before every tail write and never reset with the tail. The confirmed browser
+control reports pending until the companion verifies the deletion; clearing the tail alone is
+not completion. The conversation-only launcher keeps no tail and
 archives nothing.
 
 ### 4. A Hermes-side companion archives and reviews
@@ -638,7 +640,18 @@ A backend outage never silences the voice.
   already running when deletion was requested. Deleting only runs still named by the active-run
   record would make coverage depend on timing and delete sessions of in-flight work, so the
   owner explicitly excludes all delegated-task sessions from M3. The request has no run-ID list.
-  Deletion is logical, not physical: unvacuumed SQLite pages, backups and sync copies remain.
+  Deletion is logical, not physical: unmerged full-text index segments, unvacuumed SQLite
+  pages, WAL frames, backups and sync copies remain. The companion runs inside the live
+  gateway, and a full FTS optimize holds Hermes's write lock for seconds on a large store, so
+  physical erasure stays Hermes's own `hermes sessions optimize`, run with the gateway stopped. Hermes `/branch` copies and API forks are independent conversations the user may
+  have continued, so M3 never deletes them. Every copy that exists when the delete is captured
+  is frozen into the manifest, with its compression continuations and copies made from it,
+  and while any remains, or a `/branch` copy still names a chain session or frozen copy, the
+  delete stays pending. A copy made later from a frozen copy is tracked only while that source
+  exists. A delete for a conversation the companion never bound is refused, never completed;
+  one no archive batch ever left the host for completes on the host. Evidence capture keeps its
+  own transcript copy, so the voice delete control is unavailable while capture is on; a spool
+  an earlier capture-enabled run left is not detected.
   Hermes run records also remain; terminal records are pruned 24 hours after their last status
   update under the default bearer-client policy. A non-terminal record left by a crash must
   first be rehydrated as interrupted before pruning applies
