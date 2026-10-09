@@ -280,13 +280,17 @@ fences the old archive/review outbox and stale acknowledgments, advances the gen
 a fresh conversation identity, and drops the memory snapshot. The old identity is recorded in
 a delete record beside the tail (`<tail>.deletes.json`), which the tail writer persists before
 every tail write. Nothing that resets the tail touches it: a corrupt tail, a tail an older
-build rewrote, or a restore the store refuses all keep the intent, and a tail still bound to a
-recorded identity is retired when it opens. A tail whose conversation the record names as
-completed is retired the same way, so no crash ordering restores a deleted conversation. A
-delete reaches the companion only once both the record and the cleared tail are durable. A
-version-4 tail's intent moves into the record, which keeps one slot beyond the 64 a request
-may fill for it. An unreadable record is reported as `unknown`, with a `[voice-deletes]`
-marker, never as idle. There is no voice deletion command.
+build rewrote, or a restore the store refuses all keep the intent. The record also names the
+live binding, written ahead of every tail that carries it. Once it holds any delete, or
+cannot be read, the open fails closed: only a tail bound to that live binding is restored,
+and any other tail (a deleted conversation's, whatever order a crash left the files in, or a
+version-1 tail with no identity) is retired. A pending delete reaches the companion only after
+a fresh tail write has replaced whatever the open found, so both the record and the cleared
+tail are durable. A version-4 tail's intent moves into the record, which keeps one slot beyond
+the 64 a request may fill for it. An unreadable record is reported as `unknown`, with a
+`[voice-deletes]` marker, never as idle, and is rewritten as that known loss, never as empty.
+A delete of a conversation no archive batch ever left the host for completes locally, since
+no companion can hold it. There is no voice deletion command.
 
 The record holds up to 64 pending deletes and the newest one verified complete. The sender
 holds its companion link open and resends every pending delete each round, so one that stays
@@ -308,7 +312,10 @@ pending. A page that saw a delete pending keeps polling while the status reads `
 The companion keeps a completed deletion's tombstone for good, as the fence against a resent
 delete or a late event on any later connection; only incomplete deletions count toward its
 capacity. An owned start drops any archive binding an earlier build kept beside a completed
-deletion.
+deletion. A delete for a conversation the companion never bound is refused (`unbound`) and
+not fenced, never completed: the store cannot tell "never archived" from "archived in another
+profile". The page clear is keyed on the voice generation it clears, so a browser that
+reconnected while the delete was pending still clears its transcript.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler
 runs on the tombstone, natural review-thread completion and owned startup. An admitted or
@@ -320,13 +327,15 @@ continues to detect a non-gateway owner.
 
 What Hermes learned from it (memories and skills) stays and may still shape replies. There is
 no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own
-session controls. No run-session IDs are included in the delete request. A copy made with
-Hermes `/branch` is an independent conversation Hermes keeps (native deletion orphans it), and
-it may hold the user's own later work, so the companion never deletes it: while one still
-carries the `_branched_from` marker of a deleted session, the delete stays pending, and it
-completes once the user deletes the copy in Hermes. Only direct copies are tracked: a copy of
-a copy carries only its own source's marker, so once that source copy is deleted nothing ties
-it to the deleted conversation. With evidence capture on, the spool keeps its own copy of the
+session controls. No run-session IDs are included in the delete request. A copy of a chain
+session (a `/branch` copy with its `_branched_from` marker, or an API-server fork, which has
+only a parent link) is an independent conversation Hermes keeps (native deletion orphans it),
+and it may hold the user's own later work, so the companion never deletes it. Before the
+chain goes, the companion freezes every copy into the manifest, with each copy's compression
+continuations and any copy made from a copy; while any frozen copy, or any `/branch` copy
+that still names a chain session or a frozen copy, remains, the delete stays pending, and it
+completes once the user deletes them in Hermes. A copy made later from a frozen copy is
+tracked only while its source exists. With evidence capture on, the spool keeps its own copy of the
 transcript, so the control is unavailable; **Revoke consent and erase** removes that copy. The
 check covers only the current run's capture setting, so a spool an earlier capture-enabled run
 left keeps its contents until its retention expiry or a full `--purge-evidence`. Deletion is logical: Hermes run records, unmerged full-text index segments,
@@ -340,7 +349,8 @@ for the qualification contract.
 and a stand-in model: chain deletion, late-event fences, running-review pending status,
 crash recovery, owner succession and retained learned memory. It scans every table of
 `state.db`, FTS shadow tables included, with an FTS `MATCH` per index: no row or match holds
-the phrase after the delete, a `/branch` copy keeps it pending until removed, and after
+the phrase after the delete, a `/branch` copy and then an orphaned API fork each keep it
+pending until removed, and after
 Hermes's `SessionDB.vacuum()` (the `hermes sessions optimize` path) no table, segment or raw
 byte of the database or its WAL holds it. The succession witness runs
 the real companion host in two labelled processes, not the complete Hermes CLI and API

@@ -68,12 +68,14 @@ Deletion is logical, not physical erasure. These remain, by design:
   trigram index stores three-character terms a byte search cannot recognize; for that index
   the qualification checks that no search matches the phrase and that the index was merged.
 - **Backups and sync copies** of the Hermes home.
-- **Hermes `/branch` copies.** A copy is an independent conversation you may have continued,
-  so it is never deleted for you. While one remains, the deletion stays **pending**; it
-  completes once you delete the copy in Hermes. Only copies made directly from the deleted
-  conversation are tracked. A copy made from a copy names only the copy it came from, so once
-  that copy is deleted nothing ties it to the deleted conversation and the deletion can
-  complete while it remains. Delete copies of copies yourself.
+- **Copies: Hermes `/branch` copies and API forks.** A copy is an independent conversation you
+  may have continued, so it is never deleted for you. While one remains, the deletion stays
+  **pending**; it completes once you delete the copy in Hermes. Every copy that exists when
+  the deletion starts is recorded then, with its compression continuations and any copy made
+  from it, so deleting them in any order still leaves the deletion pending until all are
+  gone. A copy made later, from such a copy, is tracked only while the copy it came from
+  still exists: Hermes then keeps nothing that ties it to the deleted conversation. Delete
+  copies made after a deletion yourself.
 - **The evidence spool.** With evidence capture on, the control is unavailable; **Revoke
   consent and erase** removes the spool's copy. The control checks only the current run: a
   spool left by an earlier run with capture on keeps what it captured until its retention

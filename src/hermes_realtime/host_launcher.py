@@ -2608,7 +2608,9 @@ def build_local_host_launcher(
                 except Exception:
                     _LOGGER.warning("voice memory restart after delete failed")
             try:
-                if livekit_worker.active_generation == generation:
+                # Keyed on the voice generation it clears, not the worker generation: a
+                # reconnect while the delete was pending still shows the cleared transcript.
+                if writer.binding[1] == old_binding[1] + 1:
                     projection.publish_voice_clear(reservation)
                 else:
                     projection.release_voice_clear(reservation)

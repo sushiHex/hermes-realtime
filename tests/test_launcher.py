@@ -2139,6 +2139,16 @@ def _recording_sender(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> lis
     return connectors
 
 
+async def _offer(harness: Any) -> None:
+    """Let one batch leave the host, so the companion may hold the current binding."""
+    assert harness.context is not None
+    harness.context.record_user_transcript(
+        Transcript(text="said before the delete", final=True)
+    )
+    writer = harness.context._on_change.__self__
+    await asyncio.wait_for(writer.next_batch(), 5)
+
+
 async def _negotiated(harness: Any) -> None:
     """Wait until the forget sender's link has negotiated ``voice_forget``."""
     async with asyncio.timeout(2):
@@ -2237,6 +2247,7 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
         ) == 0
         assert not projection._voice_clear_reservations
 
+        await _offer(harness)
         assert await delete("browser_0123456789abcdef", 1) == "pending"
         assert harness.context.snapshot().messages == ()
         assert [event.kind for event in projection._events].count(
@@ -2244,6 +2255,7 @@ async def test_voice_delete_memory_close_failure_preserves_old_tail(
         ) == 1
         assert not projection._voice_clear_reservations
         # The pending delete never blocks the next one; the new conversation is cleared too.
+        await _offer(harness)
         assert await delete("browser_0123456789abcdef", 1) == "pending"
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
@@ -2311,6 +2323,7 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
         async with asyncio.timeout(2):
             while writer._written_version < writer._version:
                 await asyncio.sleep(0.01)
+        await _offer(harness)
         original_write = writer._write
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -2359,7 +2372,7 @@ async def test_cancelled_voice_delete_restarts_memory_and_fences_old_browser_gen
                 await asyncio.sleep(0.01)
         assert [event.kind for event in projection._events].count(
             "voice_conversation_cleared"
-        ) == (0 if successor_generation or projection_failure else 1)
+        ) == (0 if projection_failure else 1)  # a successor worker still sees the clear
         assert len(projection._voice_clear_reservations) == int(projection_failure)
         assert not typed_before_clear
         assert not microphone_before_clear
@@ -2612,6 +2625,32 @@ async def test_an_unreadable_delete_record_reports_unknown(
     try:
         await _negotiated(harness)
         assert harness.browser["voice_delete_status"]() == "unknown"
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_of_a_conversation_never_archived_reports_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.host import CompanionEndpoint
+
+    harness = _FullHostHarness(monkeypatch)
+    _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
+    endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
+    launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
+    await launcher.start()
+    try:
+        await _negotiated(harness)
+        # No batch ever left the host, so no companion can hold it: nothing to wait for.
+        assert await harness.browser["delete_voice_conversation"](
+            "browser_0123456789abcdef", 1
+        ) == "complete"
+        assert harness.browser["voice_delete_status"]() == "complete"
     finally:
         await launcher.close()
 

@@ -643,10 +643,13 @@ A backend outage never silences the voice.
   Deletion is logical, not physical: unmerged full-text index segments, unvacuumed SQLite
   pages, WAL frames, backups and sync copies remain. The companion runs inside the live
   gateway, and a full FTS optimize holds Hermes's write lock for seconds on a large store, so
-  physical erasure stays Hermes's own `hermes sessions optimize`, run with the gateway stopped. Hermes `/branch` copies are independent conversations the user may have
-  continued, so M3 never deletes them; while one still names a deleted session through its
-  `_branched_from` marker, the delete stays pending. A copy of a copy names only its own
-  source, so it is not tracked once that source copy is deleted. Evidence capture keeps its
+  physical erasure stays Hermes's own `hermes sessions optimize`, run with the gateway stopped. Hermes `/branch` copies and API forks are independent conversations the user may
+  have continued, so M3 never deletes them. Every copy that exists when the delete is captured
+  is frozen into the manifest, with its compression continuations and copies made from it,
+  and while any remains, or a `/branch` copy still names a chain session or frozen copy, the
+  delete stays pending. A copy made later from a frozen copy is tracked only while that source
+  exists. A delete for a conversation the companion never bound is refused, never completed;
+  one no archive batch ever left the host for completes on the host. Evidence capture keeps its
   own transcript copy, so the voice delete control is unavailable while capture is on; a spool
   an earlier capture-enabled run left is not detected.
   Hermes run records also remain; terminal records are pruned 24 hours after their last status
