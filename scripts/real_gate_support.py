@@ -7,7 +7,9 @@ import os
 import socket
 import subprocess
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Protocol
 
 # The owner-selected qualification baseline (#67, #159): a reference, not a version ceiling.
 HERMES_BASELINE = {"version": "0.21.0", "commit": "29112bef099274229cadff79cdff7bf7b99c4b77"}
@@ -20,34 +22,96 @@ PINNED_HERMES = (
 )
 
 
-def provision_pinned_hermes() -> Path:
+class SetupRunner(Protocol):
+    """Run one named setup command to completion within ``timeout``, or raise."""
+
+    def __call__(
+        self,
+        category: str,
+        argv: list[str],
+        *,
+        cwd: Path,
+        timeout: float,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
+def _checked_run(
+    category: str,
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    del category
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        env=None if env is None else dict(env),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def provision_pinned_hermes(run: SetupRunner = _checked_run) -> Path:
     """Install the baseline Hermes the way its installer does, reusing the cache when current.
 
     Returns the interpreter of its environment; the checkout is ``PINNED_HERMES / "source"``.
+    Every command is bounded and goes through ``run``, so a caller can name its failures.
     """
 
     source = PINNED_HERMES / "source"
     source.mkdir(parents=True, exist_ok=True)
     if not (source / ".git").exists():
-        _git(source, "init", "-q")
-        _git(source, "remote", "add", "origin", _UPSTREAM)
+        run("hermes_cache", ["git", "init", "-q"], cwd=source, timeout=60)
+        run("hermes_cache", ["git", "remote", "add", "origin", _UPSTREAM], cwd=source, timeout=60)
         # The documentation site is not runtime code and exceeds Windows path limits.
-        _git(source, "sparse-checkout", "set", "--no-cone", "/*", "!/website/")
-    head = subprocess.run(("git", "rev-parse", "HEAD"), cwd=source, capture_output=True, text=True)
-    if head.stdout.strip() != HERMES_BASELINE["commit"]:
-        _git(source, "fetch", "-q", "--depth", "1", "origin", HERMES_BASELINE["commit"])
-        _git(source, "checkout", "-q", "--detach", "FETCH_HEAD")
-    if _git(source, "rev-parse", "HEAD").strip() != HERMES_BASELINE["commit"]:
+        run(
+            "hermes_cache",
+            ["git", "sparse-checkout", "set", "--no-cone", "/*", "!/website/"],
+            cwd=source,
+            timeout=60,
+        )
+    if _cached_head(run, source) != HERMES_BASELINE["commit"]:
+        run(
+            "hermes_cache",
+            ["git", "fetch", "-q", "--depth", "1", "origin", HERMES_BASELINE["commit"]],
+            cwd=source,
+            timeout=600,
+        )
+        run(
+            "hermes_cache", ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
+            cwd=source, timeout=600,
+        )  # fmt: skip
+    if _cached_head(run, source) != HERMES_BASELINE["commit"]:
         raise RuntimeError("the Hermes cache is not at the pinned commit")
     venv = PINNED_HERMES / "venv"
-    subprocess.run(
-        ("uv", "sync", "--extra", "all", "--locked", "--python", "3.11", "--quiet"),
+    run(
+        "hermes_cache_sync",
+        ["uv", "sync", "--extra", "all", "--locked", "--python", "3.11", "--quiet"],
         cwd=source,
         env=os.environ | {"UV_PROJECT_ENVIRONMENT": str(venv)},
-        check=True,
-        capture_output=True,
+        timeout=1800,
     )
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _cached_head(run: SetupRunner, source: Path) -> str:
+    """The cache's HEAD commit, or "(initial)" before its first checkout; never an error."""
+
+    status = run(
+        "hermes_cache",
+        ["git", "status", "--porcelain=v2", "--branch", "--untracked-files=no"],
+        cwd=source,
+        timeout=60,
+    ).stdout
+    for line in status.splitlines():
+        if line.startswith("# branch.oid "):
+            return line.removeprefix("# branch.oid ").strip()
+    return ""
 
 
 def load_api_key(env_file: Path) -> str:
