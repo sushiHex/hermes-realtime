@@ -314,7 +314,8 @@ delete or a late event on any later connection; only incomplete deletions count 
 capacity. An owned start drops any archive binding an earlier build kept beside a completed
 deletion. A delete for a conversation the companion never bound is refused (`unbound`) and
 not fenced, never completed: the store cannot tell "never archived" from "archived in another
-profile". The page clear is keyed on the voice generation it clears, so a browser that
+profile". A conversation archived under another Hermes profile therefore stays pending until
+the profile that holds it serves the delete, which is the fail-closed outcome. The page clear is keyed on the voice generation it clears, so a browser that
 reconnected while the delete was pending still clears its transcript.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler

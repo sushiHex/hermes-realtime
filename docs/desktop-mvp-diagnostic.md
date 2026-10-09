@@ -84,6 +84,9 @@ Deletion is logical, not physical erasure. These remain, by design:
 - **Session sidecar files.** Completion verifies session absence in Hermes's database. Hermes
   removes sidecar files on a best-effort basis and can silently retain them if filesystem
   removal fails; completion is not a verified filesystem-erasure receipt.
+- **Another Hermes profile.** A conversation archived while the gateway ran another profile
+  stays **pending** after a profile switch: this profile's companion never held it and will
+  not claim it deleted. It completes once the profile that holds it serves the delete.
 
 For the acceptance session, use synthetic data: verify that a unique phrase disappears from
 the voice tail, each archive-chain session, every table of Hermes's `state.db` (FTS indexes
