@@ -536,12 +536,25 @@ script's own actions succeeding.
 - *A delegated task.* The result Hermes produced must appear in a background-result row.
 - *Cancel and restart.* A cancel must hang up the stand-in's stream. A restart needs work running
   through the crash, and that work stopped after settlement.
-- *Context.* Context carried over a reconnect or a restart means two things: the user's own
-  step-3 row stating the fact is among the rows the host keeps (its voice tail), and the model's
-  reply used it. The model's echo of the fact does not count. After a restart, the rows are the
-  ones the new host read, captured before it started. The host must also report restoring exactly
-  that many. Nothing restates the fact, so the bounded context window shows up as a `different`
+- *Context.* Context carried over a reconnect or a restart means two things.
+  - **The host kept the fact.** The user's own step-3 row stating it is among the rows the host
+    keeps (its voice tail). After a restart, these are the rows the new host read, captured
+    before it started, and the host must report restoring exactly that many.
+  - **The question's prompt carries it.** The host child counts, at the Ollama adapter
+    boundary, the user rows of that exact prompt that state the fact (`[rehearsal-prompt]`).
+
+  Losing the fact is `context_lost`. A kept fact missing from the prompt is
+  `context_not_in_prompt`. Both are host findings. The model's echo of the fact never counts.
+  Nothing restates the fact, so the bounded context window shows up as a `different`
   verdict.
+
+  Whether the model then names the bird is model quality, so it is a note, not a finding:
+  - **The answer** is recorded as `context_*_answered`.
+  - **The recall rate** is measured with `--recall-trials N`. The host child resends that exact
+    prompt N times after its reply and prints only the count of replies naming the fact
+    (`[rehearsal-recall]`).
+  - **The prompt size** is recorded too: `[ollama-prompt]` gives the size the host sent beside
+    Ollama's `prompt_eval_count` ([heard context window](heard-context-window.md)).
 - *Listeners.* The Hermes API, the companion and LiveKit signaling must listen on loopback only.
   Any other address fails the step, and nothing runs behind that listener.
 - *Reload inputs.* A step after the deletion spends a typed turn and an approval decision, reloads

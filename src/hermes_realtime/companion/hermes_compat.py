@@ -44,12 +44,7 @@ from hermes_realtime.companion.integrity import (
     project,
     voice_metadata,
 )
-from hermes_realtime.companion.review import (
-    MAX_REVIEW_BYTES,
-    MAX_REVIEW_ROWS,
-    MAX_REVIEW_TOKENS,
-    ReviewRequest,
-)
+from hermes_realtime.companion.review import ReviewRequest, review_snapshot_admitted
 from hermes_realtime.companion.store import (
     MAX_BOUND_CONVERSATIONS,
     ConversationRecord,
@@ -1470,12 +1465,7 @@ class HermesArchivePort:
                     if type(content) is not str or not content.strip():
                         raise ArchiveRefusal("mismatch")
                     snapshot.append({"role": role, "content": content})
-            if not 1 <= len(snapshot) <= MAX_REVIEW_ROWS:
-                raise ArchiveRefusal("window")
-            payload_bytes = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
-            # The snapshot itself has a conservative token bound (one token per
-            # UTF-8 byte). Hermes separately accounts for its prompt and schema.
-            if payload_bytes > MAX_REVIEW_BYTES or payload_bytes > MAX_REVIEW_TOKENS:
+            if not review_snapshot_admitted(snapshot):
                 raise ArchiveRefusal("window")
             token = prepare(parent)
             if token is None:

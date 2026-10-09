@@ -34,6 +34,23 @@ MAX_REVIEW_ROWS = 24
 MAX_REVIEW_BYTES = 65_536
 MAX_REVIEW_TOKENS = 16_384
 MAX_REVIEW_INTERVAL = 1000
+
+
+def review_snapshot_admitted(snapshot: list[dict[str, str]]) -> bool:
+    """Whether a review snapshot is within the rows and bytes this companion admits.
+
+    The snapshot itself has a conservative token bound (one token per UTF-8 byte).
+    Hermes separately accounts for its prompt and schema. Realtime chooses its review
+    windows to fit this same rule.
+    """
+    payload_bytes = len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+    return (
+        1 <= len(snapshot) <= MAX_REVIEW_ROWS
+        and payload_bytes <= MAX_REVIEW_BYTES
+        and payload_bytes <= MAX_REVIEW_TOKENS
+    )
+
+
 MAX_JOIN_SECONDS = 300.0
 _CLOSE_JOIN_SECONDS = 10.0
 _REVIEW_WALL_SECONDS = 300.0

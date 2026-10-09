@@ -7,10 +7,12 @@ import os
 import sys
 import tempfile
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from hermes_realtime.companion.review import review_snapshot_admitted
 from hermes_realtime.conversation import (
     ConversationContextStore,
     ConversationMessage,
@@ -124,7 +126,8 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
         b'"generation":0,"next_seq":4,"outbox":[{"gap_before":[1,1],"interrupted":false,'
         b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],'
         b'"review":{"close_reviewed":false,"close_targets":[],"cursor":null,'
-        b'"overflow":false,"pending":null,"reviewed_users":0,"rows":[],"users":0},'
+        b'"overflow":false,"pending":null,"recent":[],"reviewed_users":0,"rows":[],'
+        b'"users":0},'
         b'"settled":1},'
         b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
         b'{"interrupted":true,"role":"assistant","text":"Cut"}],'
@@ -156,7 +159,7 @@ async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
             users=1,
             pending=pending,
             close_targets=(1,),
-            rows=((0, True), (1, False)),
+            rows=((0, True, 40), (1, False, 40)),
         ),
     )
     valid = voice_tail_bytes(conversation, archive)
@@ -190,7 +193,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
                 users=3,
                 pending=pending,
                 close_targets=(2,),
-                rows=((0, True), (1, True), (3, True)),
+                rows=((0, True, 40), (1, True, 40), (3, True, 40)),
             ),
         )
         malformed_start, malformed_users = 2, 0
@@ -204,7 +207,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
             review=ReviewProgress(
                 users=3,
                 pending=pending,
-                rows=((0, True), (1, True), (2, True)),
+                rows=((0, True, 40), (1, True, 40), (2, True, 40)),
             ),
         )
         malformed_start, malformed_users = 1, 1
@@ -219,7 +222,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
 @pytest.mark.asyncio
 async def test_periodic_pending_cannot_cross_the_first_close_checkpoint(tmp_path: Path) -> None:
     conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(58, 74)))
-    retained = tuple((seq, True) for seq in range(50, 74))
+    retained = tuple((seq, True, 40) for seq in range(50, 74))
     archive = _archive(
         next_seq=74,
         settled=16,
@@ -259,15 +262,27 @@ async def test_periodic_pending_cannot_cross_the_first_close_checkpoint(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("review_cursor", "target", "canonical"),
+    ("review_cursor", "recent", "target", "canonical"),
     [
-        pytest.param(50, 74, 27, id="prior-actual-row"),
-        pytest.param(None, 24, 1, id="no-prior-row"),
+        # 24 retained 1,000-byte rows: the longest suffix within 16,384 bytes is 16 rows.
+        pytest.param(
+            50,
+            tuple((seq, seq % 2 == 0, 1000) for seq in range(27, 51)),
+            74,
+            35,
+            id="retained-suffix-within-budget",
+        ),
+        pytest.param(50, (), 74, 50, id="older-tail-replays-the-last-reviewed-row"),
+        pytest.param(None, (), 24, 24, id="no-prior-row"),
     ],
 )
 @pytest.mark.asyncio
 async def test_empty_closing_replay_start_is_exact(
-    tmp_path: Path, review_cursor: int | None, target: int, canonical: int
+    tmp_path: Path,
+    review_cursor: int | None,
+    recent: tuple[tuple[int, bool, int], ...],
+    target: int,
+    canonical: int,
 ) -> None:
     conversation = _rows(("user", "Later", False))
     pending = ReviewRange("conv", 0, canonical, target, int(review_cursor is not None), True)
@@ -281,7 +296,8 @@ async def test_empty_closing_replay_start_is_exact(
             reviewed_users=int(review_cursor is not None),
             pending=pending,
             close_targets=(target,),
-            rows=((target + 1, True),),
+            rows=((target + 1, True, 40),),
+            recent=recent,
         ),
     )
     valid = voice_tail_bytes(conversation, archive)
@@ -304,7 +320,7 @@ async def test_empty_closing_replay_start_is_exact(
                 await asyncio.gather(planning, return_exceptions=True)
             assert writer._review.pending is None
             assert not writer._review.close_reviewed
-            assert writer._review.rows == ((target + 1, True),)
+            assert writer._review.rows == ((target + 1, True, 40),)
         finally:
             await writer.close()
 
@@ -1572,7 +1588,7 @@ async def test_restored_empty_closing_pending_is_reconciled_without_losing_later
             users=3,
             pending=stale,
             close_targets=(0,),
-            rows=((1, True), (2, True), (3, True)),
+            rows=((1, True, 40), (2, True, 40), (3, True, 40)),
         ),
     )
     raw = voice_tail_bytes(conversation, archive)
@@ -2100,3 +2116,426 @@ async def test_a_restart_restores_the_frozen_batch_exactly_under_other_bounds(
         assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
     finally:
         await successor.close()
+
+
+# --- review windows within the companion's snapshot budget -------------------------------
+
+
+def _companion_snapshot_bytes(rows: list[tuple[str, str]]) -> int:
+    """What the companion measures before it admits a review window."""
+    snapshot = [{"role": role, "content": text} for role, text in rows]
+    return len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+
+
+def test_a_review_row_costs_exactly_its_share_of_the_companion_snapshot() -> None:
+    rows = [
+        ("user", "Plain question?"),
+        ("assistant", 'Quotes " and \\ and a control \x01 character.'),
+        ("assistant", "Accents é, ideographs 漢字 and a bird 🐦."),
+    ]
+    costs = [voice_tail_module.review_row_bytes(role, text) for role, text in rows]
+
+    assert 2 + sum(costs) + 2 * (len(rows) - 1) == _companion_snapshot_bytes(rows)
+    assert voice_tail_module.REVIEW_SNAPSHOT_BYTES == 16_384
+    assert voice_tail_module.review_row_bytes("user", "x" * 20_000) == 16_385
+
+
+def test_a_review_window_is_the_longest_prefix_within_the_budget_and_never_empty() -> None:
+    window = voice_tail_module._review_window
+    # Brackets, two rows and one ", " separator: exactly 16,384 bytes fits.
+    assert window([(0, True, 8190), (1, False, 8190)]) == [(0, True, 8190), (1, False, 8190)]
+    assert window([(0, True, 8190), (1, False, 8191)]) == [(0, True, 8190)]
+    assert window([(0, True, 16_385), (1, False, 1)]) == [(0, True, 16_385)]
+    assert window([(0, True, 10), (1, False, 10), (2, True, 16_360)]) == [
+        (0, True, 10),
+        (1, False, 10),
+    ]
+
+
+async def _archive_everything(writer: VoiceTailWriter) -> None:
+    while writer._outbox:
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+
+
+async def _review_store(path: Path) -> tuple[VoiceTailWriter, ConversationContextStore]:
+    writer = _archiver(path, max_outbox_rows=64, max_batch_rows=8)
+    store = ConversationContextStore(max_item_chars=1024, on_change=writer.update)
+    await writer.open(store)
+    return writer, store
+
+
+def _texts_by_seq(store: ConversationContextStore) -> dict[int, tuple[str, str]]:
+    view = store.durable_view()
+    return {
+        view.first + index: (message.role, message.text)
+        for index, message in enumerate(view.messages)
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_periodic_review_window_fits_the_companions_byte_budget(tmp_path: Path) -> None:
+    writer, store = await _review_store(tmp_path / "tail.json")
+    try:
+        for turn in range(10):
+            _say(store, f"Question {turn}?")
+            # Two UTF-8 bytes a character: a whole reply is about 2 KB in the snapshot.
+            _reply(store, "é" * 1000)
+        await _archive_everything(writer)
+        rows = _texts_by_seq(store)
+
+        first = await asyncio.wait_for(writer.next_review(10), 2)
+        window = [rows[seq] for seq in range(first.seq_from, first.seq_through + 1)]
+        # Twenty rows is within the 24-row limit; the bytes bound the window first.
+        assert (first.seq_from, first.closing) == (0, False)
+        assert _companion_snapshot_bytes(window) <= 16_384
+        assert _companion_snapshot_bytes([*window, rows[first.seq_through + 1]]) > 16_384
+        assert writer.acknowledge_review(first)
+
+        second = await asyncio.wait_for(writer.next_review(10), 2)
+        assert second.seq_from == first.seq_through + 1
+        window = [rows[seq] for seq in range(second.seq_from, second.seq_through + 1)]
+        assert _companion_snapshot_bytes(window) <= 16_384
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_closing_window_over_budget_is_not_final_until_it_covers_every_row(
+    tmp_path: Path,
+) -> None:
+    writer, store = await _review_store(tmp_path / "tail.json")
+    try:
+        # Eight turns, below the review interval: sixteen rows, over 16 KB in all.
+        for turn in range(8):
+            _say(store, f"Question {turn}?")
+            _reply(store, "é" * 1000)
+        await _archive_everything(writer)
+        writer.request_review_close()
+        rows = _texts_by_seq(store)
+        assert _companion_snapshot_bytes(list(rows.values())) > 16_384
+
+        partial = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (partial.seq_from, partial.closing) == (0, False)
+        assert partial.seq_through < 15
+        window = [rows[seq] for seq in range(partial.seq_from, partial.seq_through + 1)]
+        assert _companion_snapshot_bytes(window) <= 16_384
+        assert writer.acknowledge_review(partial)
+
+        final = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (final.seq_from, final.seq_through, final.closing) == (
+            partial.seq_through + 1,
+            15,
+            True,
+        )
+        assert writer.acknowledge_review(final)
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+
+def test_review_rows_an_older_build_retained_are_costed_as_the_largest_row() -> None:
+    conversation = _rows(("user", "Q0", False))
+    archive = _archive(
+        next_seq=1,
+        settled=1,
+        cursor=0,
+        review=ReviewProgress(users=1, rows=((0, True, 40),)),
+    )
+    document = json.loads(voice_tail_bytes(conversation, archive))
+    assert document["archive"]["review"]["rows"] == [[0, True, 40]]
+
+    document["archive"]["review"]["rows"] = [[0, True]]
+    tail = _parse(json.dumps(document).encode())
+    assert tail is not None and tail.archive is not None and tail.archive.review is not None
+    # The worst a 64-character row can cost: six bytes a character, plus its fields.
+    assert tail.archive.review.rows == ((0, True, 36 + 6 * 64),)
+
+    for cost in (0, 16_386, True, 1.0):
+        document["archive"]["review"]["rows"] = [[0, True, cost]]
+        assert _parse(json.dumps(document).encode()) is None
+
+
+# The heaviest text a row can hold under the companion's JSON: a control character is a
+# six-byte escape, an astral character four UTF-8 bytes, an ideograph three.
+_MAXIMAL_TEXTS = ("\x01", "\U0001f426", "漢")
+
+
+@pytest.mark.parametrize("character", _MAXIMAL_TEXTS)
+def test_one_maximal_row_of_the_default_store_always_fits_one_review(character: str) -> None:
+    # The at-least-one-row rule then never builds a window the companion refuses.
+    text = character * ConversationContextStore().max_item_chars
+    snapshot = [{"role": "assistant", "content": text}]
+
+    assert review_snapshot_admitted(snapshot)
+    assert 2 + voice_tail_module.review_row_bytes("assistant", text) <= (
+        voice_tail_module.REVIEW_SNAPSHOT_BYTES
+    )
+
+
+def _maximal_turns(store: ConversationContextStore, turns: int) -> dict[int, tuple[str, str]]:
+    """Say ``turns`` maximal user and reply rows; their text by seq."""
+    rows: dict[int, tuple[str, str]] = {}
+    for turn in range(turns):
+        user = _MAXIMAL_TEXTS[turn % 3] * store.max_item_chars
+        reply = _MAXIMAL_TEXTS[(turn + 1) % 3] * store.max_item_chars
+        _say(store, user)
+        _reply(store, reply)
+        rows[2 * turn], rows[2 * turn + 1] = ("user", user), ("assistant", reply)
+    return rows
+
+
+def _snapshot(rows: dict[int, tuple[str, str]], request: ReviewRange) -> list[dict[str, str]]:
+    """What the companion reads for ``request``: every archived row in its range."""
+    return [
+        {"role": role, "content": text}
+        for seq, (role, text) in sorted(rows.items())
+        if request.seq_from <= seq <= request.seq_through
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_main_path_window_of_maximal_rows_passes_the_companions_own_check(
+    tmp_path: Path,
+) -> None:
+    writer, store = await _review_store(tmp_path / "tail.json")
+    try:
+        rows = _maximal_turns(store, 12)
+        await _archive_everything(writer)
+        requests: list[ReviewRange] = []
+        # Periodic windows until ten users are reviewed, then the close covers the rest.
+        while writer._review.reviewed_users < 10:
+            requests.append(await asyncio.wait_for(writer.next_review(10), 2))
+            assert writer.acknowledge_review(requests[-1])
+        writer.request_review_close()
+        while writer._review.close_targets:
+            requests.append(await asyncio.wait_for(writer.next_review(10), 2))
+            assert writer.acknowledge_review(requests[-1])
+
+        assert requests[-1].closing and requests[-1].seq_through == 23
+        assert any(not request.closing and request.seq_from > 19 for request in requests)
+        for request in requests:
+            assert review_snapshot_admitted(_snapshot(rows, request))
+        # Together the windows cover every row exactly once.
+        assert [seq for request in requests for seq in
+                range(request.seq_from, request.seq_through + 1)] == list(range(24))
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_close_replays_the_longest_fitting_suffix_of_reviewed_maximal_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _review_store(path)
+    try:
+        rows = _maximal_turns(store, 6)
+        await _archive_everything(writer)
+        while writer._review.rows:
+            periodic = await asyncio.wait_for(writer.next_review(1), 2)
+            assert review_snapshot_admitted(_snapshot(rows, periodic))
+            assert writer.acknowledge_review(periodic)
+        assert [seq for seq, _, _ in writer._review.recent] == list(range(12))
+
+        # Every row is reviewed, so the close has nothing new: it replays.
+        writer.request_review_close()
+        replay = await asyncio.wait_for(writer.next_review(1), 2)
+        assert (replay.seq_through, replay.closing) == (11, True)
+        replayed = _snapshot(rows, replay)
+        assert review_snapshot_admitted(replayed)
+        one_more = replace(replay, seq_from=replay.seq_from - 1)
+        assert not review_snapshot_admitted(_snapshot(rows, one_more))
+        # The frozen replay survives a restart, checked against the retained costs.
+        archive = await _written(path, writer)
+        assert archive.review is not None and archive.review.pending == replay
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_reviews_retain_the_last_24_reviewed_rows_with_their_costs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _opened(path, max_outbox_rows=64, max_batch_rows=8)
+    try:
+        for index in range(30):
+            _say(store, f"Q{index}")
+        await _archive_everything(writer)
+        while writer._review.rows:
+            assert writer.acknowledge_review(await asyncio.wait_for(writer.next_review(1), 2))
+
+        recent = writer._review.recent
+        assert [seq for seq, _, _ in recent] == list(range(6, 30))
+        assert recent[-1] == (29, True, voice_tail_module.review_row_bytes("user", "Q29"))
+        assert writer._review.cursor == 29
+        assert (await _written(path, writer)).review == writer._review
+    finally:
+        await writer.close()
+
+
+def _recent_document(recent: object, cursor: int | None = 30) -> bytes:
+    archive = _archive(
+        next_seq=31,
+        settled=1,
+        cursor=30,
+        review=ReviewProgress(cursor=30, users=31, reviewed_users=31),
+    )
+    document = json.loads(voice_tail_bytes(_rows(("user", "Q30", False)), archive))
+    review = document["archive"]["review"]
+    review["recent"] = recent
+    review["cursor"] = cursor
+    if cursor is None:
+        review["users"] = review["reviewed_users"] = 0
+    return json.dumps(document).encode()
+
+
+def test_retained_review_rows_are_strict_and_end_at_the_review_cursor() -> None:
+    valid = _parse(_recent_document([[29, False, 40], [30, True, 41]]))
+    assert valid is not None and valid.archive is not None and valid.archive.review is not None
+    assert valid.archive.review.recent == ((29, False, 40), (30, True, 41))
+    assert _parse(_recent_document([[seq, True, 40] for seq in range(7, 31)])) is not None
+    assert _parse(_recent_document([], None)) is not None
+
+    for recent, cursor in (
+        ([[29, True, 40]], 30),  # ends before the cursor
+        ([[30, True, 40]], None),  # nothing reviewed
+        ([[30, True, 40], [29, True, 40]], 30),  # out of order
+        ([[30, True, 40], [30, True, 40]], 30),  # repeated
+        ([[30, True]], 30),  # no cost
+        ([[30, True, 0]], 30),
+        ([[30, True, 16_386]], 30),
+        ([[30, 1, 40]], 30),
+        ([[seq, True, 40] for seq in range(6, 31)], 30),  # 25 rows
+        ({"30": 40}, 30),
+    ):
+        assert _parse(_recent_document(recent, cursor)) is None, recent
+
+    # An older version-4 tail without retained rows still parses.
+    legacy = json.loads(_recent_document([]))
+    del legacy["archive"]["review"]["recent"]
+    tail = _parse(json.dumps(legacy).encode())
+    assert tail is not None and tail.archive is not None and tail.archive.review is not None
+    assert tail.archive.review.recent == ()
+
+
+# Written by main at e7f3d27's own VoiceTailWriter: 31 rows archived, every one reviewed,
+# then a close froze its empty replay as an older build does (24 positions back, no
+# retained costs) and the host stopped before the companion acknowledged it.
+_OLDER_EMPTY_CLOSE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "voice_tail_e7f3d27_empty_close.json"
+)
+
+
+@pytest.mark.asyncio
+async def test_an_older_builds_in_flight_empty_close_restores_and_resends_as_frozen(
+    tmp_path: Path,
+) -> None:
+    raw = _OLDER_EMPTY_CLOSE.read_bytes()
+    assert b'"recent"' not in raw
+    frozen = ReviewRange("conv0", 0, 7, 30, 31, True)
+    path = tmp_path / "tail.json"
+    path.write_bytes(raw)
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        # The conversation, its identity and the replay survive the upgrade unchanged.
+        assert writer.binding == ("conv0", 0)
+        assert len(store.durable_view().messages) == 16
+        assert writer._review.pending == frozen
+        assert await asyncio.wait_for(writer.next_review(1), 2) == frozen
+        assert writer.acknowledge_review(frozen)
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+
+def test_an_older_start_is_accepted_only_without_retained_rows() -> None:
+    document = json.loads(_OLDER_EMPTY_CLOSE.read_bytes())
+    review = document["archive"]["review"]
+    tail = parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    assert tail is not None and tail.archive is not None and tail.archive.review is not None
+    assert tail.archive.review.pending == ReviewRange("conv0", 0, 7, 30, 31, True)
+    # This build's own start for the same state is the last reviewed row.
+    review["pending"]["seq_from"] = 30
+    assert parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    for start in (6, 8, 29):
+        review["pending"]["seq_from"] = start
+        assert parse_voice_tail(
+            json.dumps(document).encode(), max_messages=32, max_item_chars=1024
+        ) is None
+    # With retained costs the tail is this build's: only the start derived from them holds.
+    review["recent"] = [[seq, True, 40] for seq in range(7, 31)]
+    review["pending"]["seq_from"] = 7
+    assert parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    review["recent"] = [[seq, True, 2000] for seq in range(7, 31)]
+    assert parse_voice_tail(
+        json.dumps(document).encode(), max_messages=32, max_item_chars=1024
+    ) is None
+
+
+def _frozen_periodic_tail(*, legacy: bool) -> bytes:
+    """Eight acknowledged user rows and a frozen periodic window over all of them."""
+    archive = _archive(
+        next_seq=8,
+        settled=8,
+        cursor=7,
+        review=ReviewProgress(
+            users=8,
+            pending=ReviewRange("conv", 0, 0, 7, 8, False),
+            rows=tuple((seq, True, 40) for seq in range(8)),
+        ),
+    )
+    conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(8)))
+    document = json.loads(voice_tail_bytes(conversation, archive))
+    if legacy:
+        # As an older build wrote it: rows without costs, no retained rows.
+        review = document["archive"]["review"]
+        review["rows"] = [row[:2] for row in review["rows"]]
+        del review["recent"]
+    return json.dumps(document).encode()
+
+
+@pytest.mark.asyncio
+async def test_an_older_pending_over_the_budget_by_its_costs_is_planned_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    path.write_bytes(_frozen_periodic_tail(legacy=True))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        # Eight rows at the worst cost of a 1,024-character row cannot fit one review.
+        assert writer.binding == ("conv", 0)
+        assert writer._review.pending is None
+        assert _markers(capsys.readouterr().out, _OUTBOX_MARKER) == [
+            '[voice-tail-outbox] {"replanned":"review_budget","version":1}'
+        ]
+        replanned = await asyncio.wait_for(writer.next_review(8), 2)
+        assert (replanned.seq_from, replanned.closing) == (0, False)
+        assert replanned.seq_through < 7
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pending_within_the_budget_is_restored_exactly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    path.write_bytes(_frozen_periodic_tail(legacy=False))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        frozen = ReviewRange("conv", 0, 0, 7, 8, False)
+        assert writer._review.pending == frozen
+        assert await asyncio.wait_for(writer.next_review(8), 2) == frozen
+        assert _markers(capsys.readouterr().out, _OUTBOX_MARKER) == []
+    finally:
+        await writer.close()

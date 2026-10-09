@@ -188,6 +188,74 @@ def test_ollama_buffers_sentence_punctuation_inside_open_emphasis() -> None:
     assert inference._extract_segments(source, final=False) == ([], source)
 
 
+@pytest.mark.asyncio
+async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bodies: list[dict[str, object]] = []
+
+    def open_request(request: Request, timeout: float) -> LineResponse:
+        del timeout
+        bodies.append(json.loads(cast(bytes, request.data)))
+        return LineResponse(
+            (
+                {"message": {"content": "Short reply."}, "done": False},
+                {"message": {"content": ""}, "done": True, "prompt_eval_count": 31},
+            )
+        )
+
+    default = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request
+    )
+    assert [segment async for segment in default.stream(_snapshot(), turn_id="turn_1")] == [
+        "Short reply."
+    ]
+    explicit = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
+        num_ctx=32_768,
+    )
+    assert [segment async for segment in explicit.stream(_snapshot(), turn_id="turn_2")] == [
+        "Short reply."
+    ]
+
+    assert [body["options"] for body in bodies] == [{"num_ctx": 16_384}, {"num_ctx": 32_768}]
+    sent = cast(list[dict[str, str]], bodies[0]["messages"])
+    content = "".join(message["content"] for message in sent)
+    reports = [
+        json.loads(line.removeprefix("[ollama-prompt] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-prompt] ")
+    ]
+    assert reports[0] == {
+        "messages": len(sent),
+        "num_ctx": 16_384,
+        "prompt_bytes": len(content.encode("utf-8")),
+        "prompt_chars": len(content),
+        "prompt_eval_count": 31,
+        "version": 1,
+    }
+    assert reports[1]["num_ctx"] == 32_768
+    assert len(reports) == 2
+
+
+@pytest.mark.parametrize(
+    ("num_ctx", "error"),
+    [(cast(int, True), TypeError), (cast(int, 16_384.0), TypeError), (2047, ValueError),
+     (262_145, ValueError)],
+)
+def test_ollama_context_window_is_an_exact_bounded_integer(
+    num_ctx: int, error: type[Exception]
+) -> None:
+    assert OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", num_ctx=2048
+    )._num_ctx == 2048
+    assert OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", num_ctx=262_144
+    )._num_ctx == 262_144
+    with pytest.raises(error, match="num_ctx"):
+        OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="model", num_ctx=num_ctx)
+
+
 def test_ollama_rejects_non_loopback_endpoint_before_request() -> None:
     with pytest.raises(ValueError, match="loopback"):
         OllamaStreamingInference(
