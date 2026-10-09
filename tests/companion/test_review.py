@@ -19,8 +19,34 @@ from hermes_realtime.companion.review import (
     ReviewQuiescenceError,
     ReviewRequest,
     VoiceReviewCoordinator,
+    review_snapshot_admitted,
 )
 from hermes_realtime.companion.store import CompanionStore
+
+
+def test_a_review_snapshot_is_admitted_within_24_rows_and_16384_bytes() -> None:
+    # Brackets plus one row of fields: '[{"role": "user", "content": "…"}]' is 33 bytes.
+    def snapshot(chars: int, rows: int = 1) -> list[dict[str, str]]:
+        return [{"role": "user", "content": "x" * chars}] * rows
+
+    assert review_snapshot_admitted(snapshot(16_384 - 33))
+    assert not review_snapshot_admitted(snapshot(16_384 - 32))
+    assert review_snapshot_admitted(snapshot(1, 24))
+    assert not review_snapshot_admitted(snapshot(1, 25))
+    assert not review_snapshot_admitted([])
+    # UTF-8 bytes count, not characters.
+    wide = (16_384 - 33) // 3 + 1
+    assert not review_snapshot_admitted([{"role": "user", "content": "漢" * wide}])
+    assert review_snapshot_admitted([{"role": "user", "content": "漢" * (wide - 1)}])
+
+
+def test_the_hermes_port_refuses_a_window_by_the_shared_admission_rule() -> None:
+    # Realtime trims its windows to this same rule; the port must not apply another.
+    import inspect
+
+    source = inspect.getsource(hermes_compat.HermesArchivePort.admit)
+    assert "if not review_snapshot_admitted(snapshot):" in source
+    assert "MAX_REVIEW" not in source
 
 
 def _batch() -> VoiceBatch:

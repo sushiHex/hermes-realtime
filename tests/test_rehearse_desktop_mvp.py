@@ -137,6 +137,209 @@ def test_the_context_checks_keep_the_ollama_prompt_marker() -> None:
     assert dropped == 0
 
 
+def test_the_prompt_observation_counts_only_user_rows_that_state_the_fact() -> None:
+    messages = [
+        {"role": "system", "content": "memory mentions the Hoopoe"},
+        {"role": "user", "content": "My favorite bird is the HOOPOE."},
+        {"role": "assistant", "content": "Hoopoe, noted."},
+        {"role": "user", "content": "What is my favorite bird?"},
+    ]
+
+    observed = rehearsal.prompt_observation(messages, "hoopoe")
+
+    assert observed == {
+        "chars": sum(len(message["content"]) for message in messages),
+        "fact_rows": 1,
+        "messages": 4,
+        "rows": 3,
+        "version": 1,
+    }
+    assert rehearsal.prompt_observation(messages[2:], "hoopoe")["fact_rows"] == 0
+    found, dropped = rehearsal.markers(
+        ["[rehearsal-prompt] " + json.dumps(observed, separators=(",", ":"), sort_keys=True)]
+    )
+    assert (len(found), dropped) == (1, 0)
+
+
+def test_recall_trials_count_replies_that_name_the_fact_and_errors_apart() -> None:
+    replies = iter(["The Hoopoe.", "A robin.", "hoopoe"])
+    sent: list[object] = []
+
+    def send(messages: list[dict[str, str]]) -> str:
+        sent.append(messages)
+        reply = next(replies, None)
+        if reply is None:
+            raise OSError("refused")
+        return reply
+
+    prompt = [{"role": "user", "content": "What is my favorite bird?"}]
+    result = rehearsal.recall_trials(prompt, "hoopoe", 4, send)
+
+    assert result == {"errors": 1, "hits": 2, "trials": 4, "version": 1}
+    assert sent == [prompt] * 4
+    found, dropped = rehearsal.markers(
+        ["[rehearsal-recall] " + json.dumps(result, separators=(",", ":"), sort_keys=True)]
+    )
+    assert (len(found), dropped) == (1, 0)
+
+
+def test_the_host_child_observes_exactly_the_prompt_the_adapter_sends(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+    from collections import deque
+    from urllib.request import Request
+
+    from hermes_realtime.conversation import ConversationContextSnapshot, ConversationMessage
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    # Restored by monkeypatch however the test ends.
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    monkeypatch.setenv("HERMES_REHEARSAL_RECALL_TRIALS", "0")
+    rehearsal._observe_prompts()
+
+    class Response:
+        def __init__(self) -> None:
+            payloads = [{"message": {"content": "Hoopoe. More."}, "done": True}]
+            self.lines = deque(json.dumps(payload).encode() + b"\n" for payload in payloads)
+            self.closed = False
+
+        def readline(self, limit: int = -1, /) -> bytes:
+            return self.lines.popleft() if self.lines else b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    responses: list[Response] = []
+    bodies: list[dict[str, object]] = []
+
+    def open_request(request: Request, timeout: float) -> Response:
+        bodies.append(json.loads(request.data))  # type: ignore[arg-type]
+        responses.append(Response())
+        return responses[-1]
+
+    adapter = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="m", open_request=open_request
+    )
+    snapshot = ConversationContextSnapshot(
+        revision=1,
+        messages=(
+            ConversationMessage("user", "My favorite bird is the hoopoe."),
+            ConversationMessage("user", rehearsal._BIRD_QUESTION),
+        ),
+        active_tasks=(),
+    )
+
+    async def first_segment_then_close() -> str:
+        stream = adapter.stream(snapshot, turn_id="turn_1")
+        segment = await anext(stream)
+        await stream.aclose()  # type: ignore[attr-defined]
+        # Closing the observed stream closes the adapter's response at once, as without the
+        # wrapper; not later, when the event loop finalizes abandoned generators.
+        assert responses[0].closed
+        return segment
+
+    assert asyncio.run(first_segment_then_close()) == "Hoopoe."
+    observed = [
+        json.loads(line.removeprefix("[rehearsal-prompt] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[rehearsal-prompt] ")
+    ]
+    assert observed == [
+        rehearsal.prompt_observation(bodies[0]["messages"], "hoopoe")  # type: ignore[arg-type]
+    ]
+    assert observed[0]["fact_rows"] == 1
+
+
+def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+    import io
+    from collections import deque
+    from urllib.request import Request
+
+    from hermes_realtime.conversation import ConversationContextSnapshot, ConversationMessage
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    monkeypatch.setenv("HERMES_REHEARSAL_RECALL_TRIALS", "3")
+    monkeypatch.setenv("HERMES_REHEARSAL_MODEL", "stand-in")
+    resent: list[dict[str, object]] = []
+
+    class Opener:
+        def open(self, request: Request, timeout: float) -> io.BytesIO:
+            resent.append(json.loads(request.data))  # type: ignore[arg-type]
+            reply = "Hoopoe." if len(resent) < 3 else "Robin."
+            return io.BytesIO(json.dumps({"message": {"content": reply}}).encode())
+
+    monkeypatch.setattr(rehearsal.urllib.request, "build_opener", lambda *_: Opener())
+    rehearsal._observe_prompts()
+
+    class Response:
+        def __init__(self) -> None:
+            payload = {"message": {"content": "Hoopoe."}, "done": True}
+            self.lines = deque([json.dumps(payload).encode() + b"\n"])
+
+        def readline(self, limit: int = -1, /) -> bytes:
+            return self.lines.popleft() if self.lines else b""
+
+        def close(self) -> None:
+            pass
+
+    bodies: list[dict[str, object]] = []
+
+    def open_request(request: Request, timeout: float) -> Response:
+        bodies.append(json.loads(request.data))  # type: ignore[arg-type]
+        return Response()
+
+    adapter = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="m", open_request=open_request
+    )
+
+    def snapshot(last: str) -> ConversationContextSnapshot:
+        return ConversationContextSnapshot(
+            revision=1,
+            messages=(
+                ConversationMessage("user", "My favorite bird is the hoopoe."),
+                ConversationMessage("user", last),
+            ),
+            active_tasks=(),
+        )
+
+    async def consume(last: str) -> None:
+        async for _ in adapter.stream(snapshot(last), turn_id="turn_1"):
+            pass
+
+    asyncio.run(consume("Something else?"))
+    asyncio.run(consume(rehearsal._BIRD_QUESTION))
+    import threading
+
+    for thread in threading.enumerate():
+        if thread.name == "rehearsal-recall":
+            thread.join(timeout=5)
+
+    assert len(bodies) == 2
+    assert resent == [
+        {
+            "messages": bodies[1]["messages"],
+            "model": "stand-in",
+            "options": {"num_ctx": 16_384},
+            "stream": False,
+        }
+    ] * 3
+    recalls = [
+        json.loads(line.removeprefix("[rehearsal-recall] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[rehearsal-recall] ")
+    ]
+    assert recalls == [{"errors": 0, "hits": 2, "trials": 3, "version": 1}]
+
+
 def test_markers_are_capped_and_the_rest_counted() -> None:
     lines = [f'[voice-archive-send] {{"n":{index}}}' for index in range(40)]
 
@@ -272,9 +475,12 @@ def test_deletion_passes_only_when_a_seeded_phrase_is_gone_everywhere() -> None:
 
 
 def test_context_and_work_verdicts() -> None:
+    # Losing the fact is a finding; a model not using a fact its prompt carries is not.
     assert rehearsal.context_verdict(True, True) == []
     assert rehearsal.context_verdict(False, True) == [("differ", "context_lost")]
-    assert rehearsal.context_verdict(True, False) == [("differ", "context_not_answered")]
+    assert rehearsal.context_verdict(False, None) == [("differ", "context_lost")]
+    assert rehearsal.context_verdict(True, False) == [("differ", "context_not_in_prompt")]
+    assert rehearsal.context_verdict(True, None) == [("differ", "no_prompt_observation")]
     assert rehearsal.cancel_work_verdict(0) == []
     assert rehearsal.cancel_work_verdict(1) == [("fail", "work_left_running")]
     assert rehearsal.restart_work_verdict(1, 1, 0) == []

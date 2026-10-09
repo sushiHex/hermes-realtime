@@ -38,7 +38,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from hermes_realtime.companion.integrity import validate_voice_row
-from hermes_realtime.companion.review import MAX_REVIEW_BYTES, MAX_REVIEW_TOKENS
+from hermes_realtime.companion.review import (
+    MAX_REVIEW_BYTES,
+    MAX_REVIEW_ROWS,
+    MAX_REVIEW_TOKENS,
+)
 from hermes_realtime.conversation import (
     ConversationContextStore,
     ConversationMessage,
@@ -93,6 +97,7 @@ _MAX_REVIEW_ROWS = 4096
 # past the budget, so a window is chosen within it.
 REVIEW_SNAPSHOT_BYTES = min(MAX_REVIEW_BYTES, MAX_REVIEW_TOKENS)
 _REVIEW_ROW_COST_CAP = REVIEW_SNAPSHOT_BYTES + 1
+_MAX_RECENT_ROWS = MAX_REVIEW_ROWS
 _REVIEW_PENDING_FIELDS = frozenset({"seq_from", "seq_through", "users", "closing"})
 _OUTBOX_FIELDS = frozenset({"gap_before", "interrupted", "role", "seq", "text", "ts"})
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -166,6 +171,9 @@ class ReviewProgress:
     # (seq, is_user, review snapshot bytes) for each acknowledged row not yet reviewed.
     rows: tuple[tuple[int, bool, int], ...] = ()
     overflow: bool = False
+    # The same for the last reviewed rows, at most 24, the newest ending at ``cursor``:
+    # an empty close replays within the budget from them.
+    recent: tuple[tuple[int, bool, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +209,7 @@ def max_voice_tail_bytes(
         # bit and a capped cost of at most 5 digits; an idle checkpoint has its own
         # identity, both with JSON punctuation.
         + _MAX_REVIEW_ROWS * (31 + 18)
+        + _MAX_RECENT_ROWS * 31
         + _ENVELOPE_OVERHEAD_BYTES
         + _ARCHIVE_OVERHEAD_BYTES
         + 128  # one bounded pending forget identity in version 4
@@ -273,6 +282,7 @@ def voice_tail_bytes(
                 "close_reviewed": (archive.review or ReviewProgress()).close_reviewed,
                 "rows": [list(row) for row in (archive.review or ReviewProgress()).rows],
                 "overflow": (archive.review or ReviewProgress()).overflow,
+                "recent": [list(row) for row in (archive.review or ReviewProgress()).recent],
             },
         },
         "messages": [
@@ -291,8 +301,18 @@ def _identity(value: object) -> bool:
     return type(value) is int and 0 <= value <= MAX_IDENTITY
 
 
-def _empty_close_replay_start(review_cursor: int | None, target: int) -> int:
-    return max(0, (review_cursor if review_cursor is not None else target) - 23)
+def _empty_close_replay_start(
+    review_cursor: int | None, recent: tuple[tuple[int, bool, int], ...], target: int
+) -> int:
+    """Where a close with no unreviewed row starts replaying, within the review budget.
+
+    It replays the longest suffix of the last reviewed rows that fits. Without their
+    costs (an older tail) it replays only the last reviewed row; with none reviewed, it
+    starts at the checkpoint itself.
+    """
+    if recent:
+        return _review_window(list(reversed(recent)))[-1][0]
+    return review_cursor if review_cursor is not None else target
 
 
 def _text(role: object, text: object, interrupted: object, max_item_chars: int) -> bool:
@@ -397,7 +417,11 @@ def _parse_archive(
     review = None
     if "review" in archive:
         raw_review = archive["review"]
-        if type(raw_review) is not dict or set(raw_review) != _REVIEW_FIELDS:
+        # A version-4 tail from before this build has no retained recent rows.
+        if type(raw_review) is not dict or set(raw_review) not in (
+            _REVIEW_FIELDS,
+            _REVIEW_FIELDS | {"recent"},
+        ):
             return None
         review_cursor = raw_review["cursor"]
         users, reviewed_users = raw_review["users"], raw_review["reviewed_users"]
@@ -464,6 +488,25 @@ def _parse_archive(
             is_user for _, is_user, _ in review_rows
         ):
             return None
+        raw_recent = raw_review.get("recent", [])
+        if type(raw_recent) is not list or len(raw_recent) > _MAX_RECENT_ROWS:
+            return None
+        recent: list[tuple[int, bool, int]] = []
+        for item in raw_recent:
+            if (
+                type(item) is not list
+                or len(item) != 3
+                or not _identity(item[0])
+                or type(item[1]) is not bool
+                or type(item[2]) is not int
+                or not 0 < item[2] <= _REVIEW_ROW_COST_CAP
+                or (recent and item[0] <= recent[-1][0])
+            ):
+                return None
+            recent.append((item[0], item[1], item[2]))
+        # The retained rows end exactly at the review cursor.
+        if recent and recent[-1][0] != review_cursor:
+            return None
         pending = None
         raw_pending = raw_review["pending"]
         if raw_pending is not None:
@@ -504,7 +547,7 @@ def _parse_archive(
             elif (
                 not closing
                 or pending_users != reviewed_users
-                or start != _empty_close_replay_start(review_cursor, end)
+                or start != _empty_close_replay_start(review_cursor, tuple(recent), end)
             ):
                 return None
             pending = ReviewRange(conversation_id, generation, start, end, pending_users, closing)
@@ -517,6 +560,7 @@ def _parse_archive(
             raw_review["close_reviewed"],
             tuple(review_rows),
             overflow,
+            tuple(recent),
         )
     return ArchiveOutbox(
         conversation_id, generation, next_seq, settled, cursor, tuple(rows), frozen, gap, review
@@ -1115,10 +1159,12 @@ class VoiceTailWriter:
                         if final:
                             through = progress.close_targets[0]
                     elif closing and progress.close_targets:
-                        # Replay up to 24 positions near prior coverage, then span
+                        # Replay the last reviewed rows that fit the budget, then span
                         # the empty gap to the exact close checkpoint.
                         through = progress.close_targets[0]
-                        start = _empty_close_replay_start(progress.cursor, through)
+                        start = _empty_close_replay_start(
+                            progress.cursor, progress.recent, through
+                        )
                         final = True
                     else:
                         await self._tick.wait()
@@ -1145,12 +1191,13 @@ class VoiceTailWriter:
         if progress.overflow:
             _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "review_capacity", "version": 1})
             return False
-        covered = [
-            seq for seq, _, _ in progress.rows if request.seq_from <= seq <= request.seq_through
-        ]
+        covered = tuple(
+            row for row in progress.rows if request.seq_from <= row[0] <= request.seq_through
+        )
         self._review = replace(
             progress,
-            cursor=covered[-1] if covered else progress.cursor,
+            cursor=covered[-1][0] if covered else progress.cursor,
+            recent=(progress.recent + covered)[-_MAX_RECENT_ROWS:],
             reviewed_users=request.users,
             pending=None,
             close_targets=progress.close_targets[1:] if request.closing else progress.close_targets,

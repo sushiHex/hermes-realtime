@@ -65,7 +65,7 @@ not on how a provider split it.
   per-sentence rows as they are, and those rows age out as new rows arrive. `seq` continues
   from the tail's `next_seq`, one per turn.
 - **Downgrade hazard.** An older build refuses a tail of more than 16 rows as malformed. It
-  also refuses review rows that carry a byte cost (below). In both cases it starts a fresh
+  also refuses review rows that carry a byte cost, and the retained `recent` rows (below). In both cases it starts a fresh
   voice conversation: the restored window is lost, though the Hermes archive keeps the rows.
   Don't run an older build against a tail this version wrote.
 
@@ -119,24 +119,39 @@ Codex.
 
 ## Review windows within the companion's byte budget
 
-The companion refuses a review window whose snapshot JSON exceeds `MAX_REVIEW_TOKENS` =
-16,384 bytes, the smaller of its two bounds (`MAX_REVIEW_BYTES` is 65,536). The refusal is
-`window`, which is not transient, so the sender stops reviewing that conversation. A
-24-row limit was enough for per-sentence rows. It is not enough for per-turn rows, so the
-tail now chooses each window within the byte budget.
+The companion admits a review window only if its snapshot has 1 to 24 rows and its JSON is
+at most `MAX_REVIEW_TOKENS` = 16,384 bytes, the smaller of its two byte bounds
+(`MAX_REVIEW_BYTES` is 65,536). That one check, `review_snapshot_admitted`, lives in
+`companion/review.py`, and the Hermes adapter applies it. Otherwise the refusal is
+`window`, which is not transient, so the sender stops reviewing that conversation. That is a
+deliberate fail-closed choice. A 24-row limit was enough for per-sentence rows. It is not
+enough for per-turn rows, so the tail now chooses every window within the byte budget, and
+a `window` refusal can no longer be reached.
+
+There is one rule for every window: it is trimmed to the budget from known per-row costs, and
+it always holds at least one row.
 
 - **Each row carries its cost.** When an archive batch is acknowledged, each row enters review
   bookkeeping with its exact snapshot cost: `[seq, is_user, bytes]`. The cost is capped one
   byte past the budget.
-- **Windows are chosen within the budget.** A window is the longest prefix of the eligible
-  rows (at most 24) whose snapshot fits 16,384 bytes, and it always holds at least one row. A
-  closing window is final only when it covers every eligible row. Otherwise it is an ordinary
-  window and the close follows.
-- **Older rows are costed at the worst case.** A row that a version-4 tail retained without
-  a cost is costed as the largest row the store can hold: `36 + 6 × max_item_chars` bytes,
-  which is 6,180 at 1,024. This fails closed: such rows are reviewed in smaller windows.
-  Version 4 accepts both shapes, so the tail version is unchanged.
-- **Residual: the empty-close replay is not bounded.** When a close finds no unreviewed rows,
-  it replays the 24 positions before the review cursor. Those rows were reviewed already, and
-  the tail no longer holds their costs. Long or non-ASCII replies can push that replay past
-  the budget. This is tracked separately.
+- **Periodic and closing windows.** A window is the longest prefix of the eligible rows (at
+  most 24) whose snapshot fits. A closing window is final only when it covers every eligible
+  row; otherwise it is an ordinary window and the close follows.
+- **The tail keeps the last reviewed rows.** When a review is acknowledged, the tail keeps the
+  costs of the last reviewed rows, at most 24, ending at the review cursor (`recent`).
+- **An empty close replays what fits.** A close that finds no unreviewed row replays the
+  longest suffix of those rows that fits, and then spans the empty gap to its checkpoint.
+  Parsing recomputes that start from the retained costs and refuses any other, so the format
+  checks itself.
+- **One maximal row always fits.** At the default `max_item_chars` of 1,024, the worst row is
+  1,024 control characters, each a 6-byte escape: 6,180 bytes, plus the list brackets. A test
+  holds this for control, astral and CJK text. It is why "at least one row" can never build a
+  window the companion refuses. A store with rows over about 2,700 characters would break it,
+  and the fix then is a lower `max_item_chars`.
+
+Older version-4 tails still parse, so the tail version is unchanged, and they fail closed:
+- **Rows without a cost** are costed as the largest row the store can hold:
+  `36 + 6 × max_item_chars`, which is 6,180 bytes at 1,024. They are reviewed in smaller
+  windows.
+- **A tail without retained rows** has its empty close replay only the last reviewed row.
+  With nothing reviewed yet, it starts at the checkpoint itself.
