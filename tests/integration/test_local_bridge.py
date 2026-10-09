@@ -28,6 +28,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     parse_event,
 )
+from tests.support import bridge_hello
 
 
 class ImmediateDispatcher:
@@ -182,18 +183,11 @@ async def test_a_0_3_peer_without_memory_keeps_dispatch() -> None:
     ) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
         try:
-            writer.write(json.dumps({
-                "token": "test-token-with-sufficient-entropy",
-                "participant_id": "participant_001",
-                "protocol_version": "0.3",
-                "capabilities": [],
-            }).encode("utf-8") + b"\n")
-            await writer.drain()
-            assert json.loads(await reader.readline()) == {
-                "ok": True,
-                "protocol_version": "0.3",
-                "capabilities": [],
-            }
+            welcome = await bridge_hello.authenticate(
+                reader, writer, "test-token-with-sufficient-entropy",
+                bridge_hello.hello("participant_001", ()),
+            )
+            assert welcome["capabilities"] == ["mutual_auth"]
             writer.write(request().model_dump_json().encode("utf-8") + b"\n")
             await writer.drain()
             acknowledgment = parse_event(await reader.readline())
