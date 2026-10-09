@@ -45,12 +45,14 @@ not on how a provider split it.
 | Bound | Default | Why |
 | --- | --- | --- |
 | `max_item_chars` | 1,024 | One row's text; unchanged. |
-| `max_window_chars` | 20 × `max_item_chars` = 20,480 | One full user row and one full reply row for each of 10 turns. |
-| `max_messages` | 32 | Hard cap: 20 full rows, plus room for short rows, rollovers and announcements. |
+| `max_window_chars` | 22 × `max_item_chars` = 22,528 | One full user row and one full reply row for each of 10 turns, plus the question being asked and a restart announcement. |
+| `max_messages` | 32 | Hard cap: 22 full rows, plus room for short rows, rollovers and announcements. |
 
 - **The lower bound is one review interval.** M2 reviews every `memory.nudge_interval` user
-  turns, which is 10 by Hermes's default. With replies within `max_item_chars`, the window
-  keeps at least that many complete turns. A reply that rolls over uses more of the budget.
+  turns, which is 10 by Hermes's default. With every row at full length, ten complete turns
+  still fit after a restart announcement and the next question; a test holds this. Twenty
+  rows alone would fill the budget exactly, and the next row would evict turn 1. A reply that
+  rolls over uses more of the budget.
 - **Older turns live elsewhere.** M4 memory is the long-term store the foreground sees, and
   the M1 archive keeps every row. The window is the short-term conversation, not the history.
 - **The window holds at least two full rows** (`max_window_chars >= 2 × max_item_chars`). A
@@ -61,13 +63,14 @@ not on how a provider split it.
 ### Restoring tails across versions
 
 - **Upgrade.** An older build's tail had at most 16 rows of at most 1,024 characters, which is
-  16,384 characters, within the 20,480-character budget. It restores whole, with its
+  16,384 characters, within the 22,528-character budget. It restores whole, with its
   per-sentence rows as they are, and those rows age out as new rows arrive. `seq` continues
-  from the tail's `next_seq`, one per turn.
+  from the tail's `next_seq`, one per turn. Review state it froze also restores (below).
 - **Downgrade hazard.** An older build refuses a tail of more than 16 rows as malformed. It
-  also refuses review rows that carry a byte cost, and the retained `recent` rows (below). In both cases it starts a fresh
-  voice conversation: the restored window is lost, though the Hermes archive keeps the rows.
-  Don't run an older build against a tail this version wrote.
+  also refuses review rows that carry a byte cost, and the retained `recent` rows (below). In
+  every case it starts a fresh voice conversation. The restored window is lost, and so are
+  the outbox rows not yet acknowledged by the archive; the archive keeps only what it had
+  already acknowledged. Don't run an older build against a tail this version wrote.
 
 ## Ollama `num_ctx`
 
@@ -89,24 +92,29 @@ adapter adds no system instructions of its own.
 
 | Part | Characters |
 | --- | --- |
-| Heard window | 20,480 |
+| Heard window | 22,528 |
 | Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
-| **Total** | **about 29,500** |
+| **Total** | **about 31,550** |
 
-- **Tokens.** At a conservative 3 characters per token, that is about 9,830 tokens. The chat
-  template adds about 6 tokens for each of 35 messages (about 210), for about 10,040 in all.
+- **Tokens.** At a conservative 3 characters per token, that is about 10,510 tokens. The chat
+  template adds about 6 tokens for each of 35 messages (about 210), for about 10,720 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Headroom.** `num_ctx` 16,384 leaves about 6,300 tokens for active-task and update system
+- **Headroom.** `num_ctx` 16,384 leaves about 5,650 tokens for active-task and update system
   messages and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
   token, which may need a larger `num_ctx`.
 - **The marker.** Every completed request prints `[ollama-prompt]` with the prompt's message
-  count, characters and UTF-8 bytes, `num_ctx`, and Ollama's `prompt_eval_count`. It carries
-  no text. An evaluated count near `num_ctx` means Ollama truncated the prompt. The desktop
-  rehearsal records the marker for each context check.
+  count, characters and UTF-8 bytes, the `num_ctx` requested, and Ollama's
+  `prompt_eval_count`. It carries no text. The desktop rehearsal records the marker for each
+  context check.
+- **It is a request, not a guarantee.** The server may cap it, for example at a model's
+  trained context length, and the marker shows only what was requested. So the evidence is
+  `prompt_eval_count`: a count near the context the model actually ran with means the prompt
+  was truncated. This removes the hardware-dependent default; it can't stretch a model's
+  context.
 - **The value overrides the model's own.** An explicit `num_ctx` also overrides a Modelfile's
   value, such as a `-32k` model variant's. The window was derived to fit 16,384.
 
@@ -149,9 +157,19 @@ it always holds at least one row.
   window the companion refuses. A store with rows over about 2,700 characters would break it,
   and the fix then is a lower `max_item_chars`.
 
-Tails written before this change still parse, so the tail version is unchanged, and they fail closed:
+Tails written before this change still parse, so the tail version is unchanged. They keep
+their conversation and fail closed:
 - **Rows without a cost** are costed as the largest row the store can hold:
   `36 + 6 × max_item_chars`, which is 6,180 bytes at 1,024. They are reviewed in smaller
   windows.
-- **A tail without retained rows** has its empty close replay only the last reviewed row.
+- **A tail without retained rows** has a new empty close replay only the last reviewed row.
   With nothing reviewed yet, it starts at the checkpoint itself.
+- **An empty-close replay an older build froze** (24 positions back) is accepted, but only
+  while no retained rows exist. It is resent exactly as frozen, because the companion
+  recognizes a review by its exact range; a different range would start a second review.
+  Its size can't be checked, since the reviewed rows' costs were never kept. It behaves as
+  it did before the upgrade.
+- **A pending window an older build froze** is planned again if its costs exceed the
+  budget. A window that large was refused as too large, so it was never reviewed, and
+  planning it again loses nothing. The tail prints `[voice-tail-outbox]
+  {"replanned":"review_budget"}` when it does.

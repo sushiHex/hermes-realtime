@@ -228,11 +228,13 @@ adversarial memory entry. A deterministic boundary is a separate decision in
 
 Memory in Codex and Ollama is labelled reference data. Ollama carries its labelled JSON
 in a system message, leaving conversation messages unchanged; placement and labelling do
-not establish model prompt-injection resistance. The adapter sends an explicit Ollama
-`num_ctx`, derived from the heard window and the memory byte cap, so the server's
-hardware-dependent default cannot silently truncate the prompt
-([heard context window](heard-context-window.md#ollama-num_ctx)). Adapter-boundary evidence includes the SHA-256 and UTF-8 byte length of
-canonical memory JSON, never the memory contents.
+not establish model prompt-injection resistance. The adapter requests an explicit Ollama
+`num_ctx`, derived from the heard window and the memory byte cap, in place of the server's
+hardware-dependent default. The server may still cap it, for example at a model's trained
+context length, so the `[ollama-prompt]` marker's `prompt_eval_count` is the evidence that
+the prompt fit ([heard context window](heard-context-window.md#ollama-num_ctx)).
+Adapter-boundary evidence includes the SHA-256 and UTF-8 byte length of canonical memory
+JSON, never the memory contents.
 
 **Freshness limits:** an open conversation refreshes after this companion's reviews report
 `finished`, not after failed or cancelled reviews. Memory written by other Hermes sessions,

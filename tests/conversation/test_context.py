@@ -1077,9 +1077,25 @@ def test_the_default_window_is_derived_from_the_item_bound() -> None:
     assert (context.max_messages, context.max_item_chars, context.max_window_chars) == (
         32,
         1024,
-        20 * 1024,
+        22 * 1024,
     )
-    assert ConversationContextStore(max_item_chars=256).max_window_chars == 20 * 256
+    assert ConversationContextStore(max_item_chars=256).max_window_chars == 22 * 256
+
+
+def test_ten_full_turns_survive_an_announcement_and_the_next_question() -> None:
+    # Hermes's default review interval is ten user turns; each row here is as long as allowed.
+    context = ConversationContextStore()
+    full = context.max_item_chars
+    for turn in range(10):
+        question = f"{turn:02d}" + "u" * (full - 2)
+        context.record_user_transcript(Transcript(text=question, final=True))
+        _confirm_assistant_text(context, "a" * full, chunk_id=f"reply_{turn}")
+    _confirm_assistant_text(context, "r" * full, chunk_id="announcement")
+    context.record_user_transcript(Transcript(text="q" * full, final=True))
+
+    texts = _texts(context)
+    assert texts[0] == "00" + "u" * (full - 2)
+    assert len(texts) == 22
 
 
 def test_the_window_must_hold_two_full_rows() -> None:

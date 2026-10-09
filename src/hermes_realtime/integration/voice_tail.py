@@ -318,6 +318,15 @@ def _empty_close_replay_start(
     return review_cursor if review_cursor is not None else target
 
 
+def _legacy_empty_close_replay_start(review_cursor: int | None, target: int) -> int:
+    """The start an older build froze: 24 positions back, with no retained costs.
+
+    A tail it wrote may hold such a replay in flight. It parses and is resent exactly as
+    frozen, because the companion recognizes a review by its exact range.
+    """
+    return max(0, (review_cursor if review_cursor is not None else target) - 23)
+
+
 def _text(role: object, text: object, interrupted: object, max_item_chars: int) -> bool:
     if type(role) is not str or type(text) is not str or type(interrupted) is not bool:
         return False
@@ -550,7 +559,12 @@ def _parse_archive(
             elif (
                 not closing
                 or pending_users != reviewed_users
-                or start != _empty_close_replay_start(review_cursor, tuple(recent), end)
+                or start
+                not in (
+                    _empty_close_replay_start(review_cursor, tuple(recent), end),
+                    # Only a tail without retained costs can come from an older build.
+                    *(() if recent else (_legacy_empty_close_replay_start(review_cursor, end),)),
+                )
             ):
                 return None
             pending = ReviewRange(conversation_id, generation, start, end, pending_users, closing)
@@ -1358,6 +1372,17 @@ class VoiceTailWriter:
         # v2 has no trustworthy review row metadata. Its cursor is the baseline;
         # only new acknowledgments enter M2's review coverage.
         self._review = archive.review or ReviewProgress(cursor=archive.cursor)
+        pending = self._review.pending
+        window = [
+            row
+            for row in self._review.rows
+            if pending is not None and pending.seq_from <= row[0] <= pending.seq_through
+        ]
+        if _review_window(window) != window:
+            # An older build froze it by row count alone. Over the budget by these costs,
+            # it is planned again: refused as too large, it was never reviewed.
+            self._review = replace(self._review, pending=None)
+            _marker(_OUTBOX_MARKER_PREFIX, {"replanned": "review_budget", "version": 1})
         self._frozen_version = self._written_version
         # A restored binding is the live one, should a delete be recorded before a retire.
         self._deletes = replace(self._deletes, live=(archive.conversation_id, archive.generation))

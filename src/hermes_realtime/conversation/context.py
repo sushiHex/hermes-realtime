@@ -18,9 +18,11 @@ _MAX_MESSAGES_LIMIT = 1024
 _MAX_ACTIVE_TASKS_LIMIT = 256
 _MAX_ITEM_CHARS_LIMIT = 65_536
 _MAX_WINDOW_CHARS_LIMIT = _MAX_MESSAGES_LIMIT * _MAX_ITEM_CHARS_LIMIT
-# The default window holds a full user row and a full reply row for each of ten turns:
-# Hermes's default review interval (memory.nudge_interval). Older turns live in memory.
-_DEFAULT_WINDOW_ITEMS = 20
+# The default window holds a full user row and a full reply row for each of ten turns,
+# Hermes's default review interval (memory.nudge_interval), plus the user row now being
+# asked and a restart announcement, so ten complete turns survive both. Older turns live
+# in memory.
+_DEFAULT_WINDOW_ITEMS = 22
 _MAX_TASK_INCARNATIONS_LIMIT = 4096
 _MAX_PENDING_ASSISTANT_ADMISSIONS_LIMIT = 256
 _MAX_REVISION_LIMIT = 2**63 - 1

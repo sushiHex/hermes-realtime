@@ -21,8 +21,9 @@ _MAX_ACTIVE_STREAMS = 16
 _MAX_RESPONSE_LINE_BYTES = 1_048_576
 # Render-time rendering of an interrupted row; stored context text never contains it.
 _INTERRUPTED_SPEECH_SUFFIX = " [speech interrupted]"
-# Sent with every request so the prompt is never silently truncated to a server default
-# that depends on the GPU (docs/hermes-bridge.md derives it from the context window).
+# Requested with every request in place of a server default that depends on the GPU
+# (docs/heard-context-window.md derives it). The server may cap it at the model's trained
+# context; prompt_eval_count in the [ollama-prompt] marker shows whether the prompt fit.
 DEFAULT_OLLAMA_NUM_CTX = 16_384
 _MIN_NUM_CTX = 2048
 _MAX_NUM_CTX = 262_144
@@ -493,7 +494,9 @@ class OllamaStreamingInference:
     def _report_prompt(self, messages: list[dict[str, str]], prompt_eval_count: object) -> None:
         """One content-free line: the prompt this adapter sent beside what Ollama evaluated.
 
-        An evaluated count near ``num_ctx`` means Ollama dropped the oldest messages.
+        ``num_ctx`` is what was requested; the server may cap it at the model's trained
+        context. An evaluated count near the context it ran with means Ollama dropped the
+        oldest messages.
         """
 
         content = "".join(message["content"] for message in messages)

@@ -2420,3 +2420,122 @@ def test_retained_review_rows_are_strict_and_end_at_the_review_cursor() -> None:
     tail = _parse(json.dumps(legacy).encode())
     assert tail is not None and tail.archive is not None and tail.archive.review is not None
     assert tail.archive.review.recent == ()
+
+
+# Written by main at e7f3d27's own VoiceTailWriter: 31 rows archived, every one reviewed,
+# then a close froze its empty replay as an older build does (24 positions back, no
+# retained costs) and the host stopped before the companion acknowledged it.
+_OLDER_EMPTY_CLOSE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "voice_tail_e7f3d27_empty_close.json"
+)
+
+
+@pytest.mark.asyncio
+async def test_an_older_builds_in_flight_empty_close_restores_and_resends_as_frozen(
+    tmp_path: Path,
+) -> None:
+    raw = _OLDER_EMPTY_CLOSE.read_bytes()
+    assert b'"recent"' not in raw
+    frozen = ReviewRange("conv0", 0, 7, 30, 31, True)
+    path = tmp_path / "tail.json"
+    path.write_bytes(raw)
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        # The conversation, its identity and the replay survive the upgrade unchanged.
+        assert writer.binding == ("conv0", 0)
+        assert len(store.durable_view().messages) == 16
+        assert writer._review.pending == frozen
+        assert await asyncio.wait_for(writer.next_review(1), 2) == frozen
+        assert writer.acknowledge_review(frozen)
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+
+def test_an_older_start_is_accepted_only_without_retained_rows() -> None:
+    document = json.loads(_OLDER_EMPTY_CLOSE.read_bytes())
+    review = document["archive"]["review"]
+    tail = parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    assert tail is not None and tail.archive is not None and tail.archive.review is not None
+    assert tail.archive.review.pending == ReviewRange("conv0", 0, 7, 30, 31, True)
+    # This build's own start for the same state is the last reviewed row.
+    review["pending"]["seq_from"] = 30
+    assert parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    for start in (6, 8, 29):
+        review["pending"]["seq_from"] = start
+        assert parse_voice_tail(
+            json.dumps(document).encode(), max_messages=32, max_item_chars=1024
+        ) is None
+    # With retained costs the tail is this build's: only the start derived from them holds.
+    review["recent"] = [[seq, True, 40] for seq in range(7, 31)]
+    review["pending"]["seq_from"] = 7
+    assert parse_voice_tail(json.dumps(document).encode(), max_messages=32, max_item_chars=1024)
+    review["recent"] = [[seq, True, 2000] for seq in range(7, 31)]
+    assert parse_voice_tail(
+        json.dumps(document).encode(), max_messages=32, max_item_chars=1024
+    ) is None
+
+
+def _frozen_periodic_tail(*, legacy: bool) -> bytes:
+    """Eight acknowledged user rows and a frozen periodic window over all of them."""
+    archive = _archive(
+        next_seq=8,
+        settled=8,
+        cursor=7,
+        review=ReviewProgress(
+            users=8,
+            pending=ReviewRange("conv", 0, 0, 7, 8, False),
+            rows=tuple((seq, True, 40) for seq in range(8)),
+        ),
+    )
+    conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(8)))
+    document = json.loads(voice_tail_bytes(conversation, archive))
+    if legacy:
+        # As an older build wrote it: rows without costs, no retained rows.
+        review = document["archive"]["review"]
+        review["rows"] = [row[:2] for row in review["rows"]]
+        del review["recent"]
+    return json.dumps(document).encode()
+
+
+@pytest.mark.asyncio
+async def test_an_older_pending_over_the_budget_by_its_costs_is_planned_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    path.write_bytes(_frozen_periodic_tail(legacy=True))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        # Eight rows at the worst cost of a 1,024-character row cannot fit one review.
+        assert writer.binding == ("conv", 0)
+        assert writer._review.pending is None
+        assert _markers(capsys.readouterr().out, _OUTBOX_MARKER) == [
+            '[voice-tail-outbox] {"replanned":"review_budget","version":1}'
+        ]
+        replanned = await asyncio.wait_for(writer.next_review(8), 2)
+        assert (replanned.seq_from, replanned.closing) == (0, False)
+        assert replanned.seq_through < 7
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_pending_within_the_budget_is_restored_exactly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    path.write_bytes(_frozen_periodic_tail(legacy=False))
+    writer = _writer(path)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    try:
+        frozen = ReviewRange("conv", 0, 0, 7, 8, False)
+        assert writer._review.pending == frozen
+        assert await asyncio.wait_for(writer.next_review(8), 2) == frozen
+        assert _markers(capsys.readouterr().out, _OUTBOX_MARKER) == []
+    finally:
+        await writer.close()
