@@ -45,6 +45,7 @@ EXECUTABLE_SHA256 = "4d60c4043c8c6ff34845727587c7a7f86946d92c390b879ea35ad3793fc
 DEVELOPMENT_KEYS = "devkey: local-" + "x" * 32 + "\n"
 _EXECUTABLE = "livekit-server.exe"
 _INSTALL = "run: uv run python -m scripts.local_livekit install"
+_REMOTE_INSTALL = "run: uv run python -m scripts.local_livekit install-remote"
 
 
 class LiveKitUnavailable(RuntimeError):
@@ -54,10 +55,20 @@ class LiveKitUnavailable(RuntimeError):
 def shared_path(environ: Mapping[str, str] | None = None) -> Path:
     """Where the one shared server lives: once per user, outside every checkout."""
 
+    return _profile_path(environ, f"livekit-{VERSION}")
+
+
+def remote_path(environ: Mapping[str, str] | None = None) -> Path:
+    """The separate per-user executable for the explicit tailnet profile."""
+
+    return _profile_path(environ, f"livekit-{VERSION}-tailnet")
+
+
+def _profile_path(environ: Mapping[str, str] | None, directory: str) -> Path:
     base = (os.environ if environ is None else environ).get("LOCALAPPDATA", "")
     if not base or not Path(base).is_absolute():
         raise LiveKitUnavailable("LOCALAPPDATA must name an absolute per-user directory")
-    return Path(base) / "hermes-realtime" / "tools" / f"livekit-{VERSION}" / _EXECUTABLE
+    return Path(base) / "hermes-realtime" / "tools" / directory / _EXECUTABLE
 
 
 def _file_sha256(path: Path) -> str:
@@ -71,11 +82,20 @@ def _file_sha256(path: Path) -> str:
 def verified_server(environ: Mapping[str, str] | None = None) -> Path:
     """The shared server, only once its bytes match the pin."""
 
-    path = shared_path(environ)
+    return _verified_at_path(shared_path(environ), _INSTALL, "the shared LiveKit server")
+
+
+def verified_remote_server(environ: Mapping[str, str] | None = None) -> Path:
+    """The separate tailnet server, only once its bytes match the same pin."""
+
+    return _verified_at_path(remote_path(environ), _REMOTE_INSTALL, "the remote LiveKit server")
+
+
+def _verified_at_path(path: Path, install_hint: str, label: str) -> Path:
     if not path.is_file():
-        raise LiveKitUnavailable(f"LiveKit {VERSION} is not installed; {_INSTALL}")
+        raise LiveKitUnavailable(f"LiveKit {VERSION} is not installed; {install_hint}")
     if _file_sha256(path) != EXECUTABLE_SHA256:
-        raise LiveKitUnavailable(f"the shared LiveKit server differs from its SHA-256; {_INSTALL}")
+        raise LiveKitUnavailable(f"{label} differs from its SHA-256; {install_hint}")
     return path
 
 
@@ -110,9 +130,26 @@ def install(
 ) -> Path:
     """Place the pinned server at the shared path; a verified copy is kept as it is."""
 
-    path = shared_path(environ)
+    return _install_at_path(shared_path(environ), _INSTALL, "the shared LiveKit server", fetch)
+
+
+def install_remote(
+    environ: Mapping[str, str] | None = None,
+    *,
+    fetch: Callable[[str], bytes] = _download,
+) -> Path:
+    """Place the same pinned bytes at the distinct tailnet path without launching them."""
+
+    return _install_at_path(
+        remote_path(environ), _REMOTE_INSTALL, "the remote LiveKit server", fetch
+    )
+
+
+def _install_at_path(
+    path: Path, install_hint: str, label: str, fetch: Callable[[str], bytes]
+) -> Path:
     with suppress(LiveKitUnavailable):
-        return verified_server(environ)
+        return _verified_at_path(path, install_hint, label)
     executable = _pinned_executable(fetch(ARCHIVE_URL))
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, staged = tempfile.mkstemp(dir=path.parent, prefix=".livekit-", suffix=".tmp")
@@ -126,7 +163,7 @@ def install(
         with suppress(FileNotFoundError):
             os.unlink(staged)
         raise
-    return verified_server(environ)
+    return _verified_at_path(path, install_hint, label)
 
 
 def server_command(executable: Path) -> list[str]:
@@ -154,12 +191,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser("install", help="download, verify and place the shared server")
     commands.add_parser("path", help="print the verified shared server")
     commands.add_parser("serve", help="run the shared server until Ctrl-C")
+    commands.add_parser("install-remote", help="install the separate verified tailnet server")
+    commands.add_parser("path-remote", help="print the verified tailnet server path")
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "install":
             print(install())
         elif arguments.command == "path":
             print(verified_server())
+        elif arguments.command == "install-remote":
+            print(install_remote())
+        elif arguments.command == "path-remote":
+            print(verified_remote_server())
         else:
             return serve()
     except LiveKitUnavailable as error:
