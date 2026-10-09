@@ -1,6 +1,7 @@
 import asyncio
 import struct
 from collections.abc import Callable
+from types import MethodType
 from typing import Any, cast
 
 import pytest
@@ -816,11 +817,9 @@ async def test_livekit_playback_preserves_confirmation_and_finish_failures() -> 
     messages = {str(error) for error in captured.value.exceptions}
     assert messages == {"confirmation failed", "finish failed"}
 
-    with pytest.raises(RuntimeError, match="already has an active chunk"):
-        await playback.play(_chunk(), is_valid=lambda: True)
-
+    # The failed hard stop is reported, not parked: the next chunk is not refused as
+    # "already has an active chunk", and fails only on its own confirmation.
     publisher.fail_finish = False
-    await playback.cancel("turn_001")
     with pytest.raises(RuntimeError, match="confirmation failed"):
         await playback.play(_marked_chunk("turn_002", "chunk_002", 1000), is_valid=lambda: True)
 
@@ -1105,3 +1104,75 @@ async def test_livekit_playback_clears_only_cancelled_active_turn_audio() -> Non
     confirmation.release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hard_stop_releases_the_chunk_as_undelivered() -> None:
+    from hermes_realtime.livekit import ReconnectSafeLiveKitAudioPublisher
+    from tests.livekit.test_reconnect_publisher import _peer_probe
+
+    gone, _ = _peer_probe()
+
+    async def failing_cancel(
+        self: Any, chunk: SpeechChunk, *, timeout_seconds: float = 10, finish_word: bool = False
+    ) -> None:
+        raise ConnectionError("room connection is gone")
+
+    gone.cancel_speech_chunk = MethodType(failing_cancel, gone)  # type: ignore[method-assign]
+    publisher = ReconnectSafeLiveKitAudioPublisher()
+    await publisher.bind(gone)
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+    task = asyncio.create_task(playback.play(_chunk(), is_valid=lambda: True))
+    await asyncio.wait_for(confirmation.started.wait(), timeout=1)
+
+    task.cancel()
+    # The failed stop is reported alongside the cancellation, and nothing is confirmed.
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await task
+    assert {type(error) for error in raised.value.exceptions} == {
+        asyncio.CancelledError,
+        ConnectionError,
+    }
+    assert confirmation.confirmed == []
+
+    # Released locally: the peer unbinds, and the next chunk plays on a new peer.
+    await publisher.unbind(gone)
+    fresh, _ = _peer_probe()
+    await publisher.bind(fresh)
+    confirmation.release.set()
+    await playback.play(_marked_chunk("turn_002", "chunk_002", 7), is_valid=lambda: True)
+    assert [chunk.turn_id for chunk in confirmation.confirmed] == ["turn_002"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_explicit_hard_stop_releases_the_chunk_as_undelivered() -> None:
+    from hermes_realtime.livekit import ReconnectSafeLiveKitAudioPublisher
+    from tests.livekit.test_reconnect_publisher import _peer_probe
+
+    gone, _ = _peer_probe()
+
+    async def failing_cancel(
+        self: Any, chunk: SpeechChunk, *, timeout_seconds: float = 10, finish_word: bool = False
+    ) -> None:
+        raise ConnectionError("room connection is gone")
+
+    gone.cancel_speech_chunk = MethodType(failing_cancel, gone)  # type: ignore[method-assign]
+    publisher = ReconnectSafeLiveKitAudioPublisher()
+    await publisher.bind(gone)
+    confirmation = BlockingConfirmation()
+    playback = LiveKitSpeechPlayback(publisher=publisher, confirmation=confirmation)
+    task = asyncio.create_task(playback.play(_chunk(), is_valid=lambda: True))
+    await asyncio.wait_for(confirmation.started.wait(), timeout=1)
+
+    with pytest.raises(ConnectionError, match="room connection is gone"):
+        await playback.cancel("turn_001")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert confirmation.confirmed == []
+
+    await publisher.unbind(gone)
+    fresh, _ = _peer_probe()
+    await publisher.bind(fresh)
+    await playback.play(_marked_chunk("turn_002", "chunk_002", 7), is_valid=lambda: True)
+    assert [chunk.turn_id for chunk in confirmation.confirmed] == ["turn_002"]

@@ -351,6 +351,9 @@ From the host:
   `late_ms` how far past the planned stop the cut landed, and `clamped` that the playout clock
   had run past the end of the chunk. A `late_ms` well above 20, or `clamped` on a stop you
   heard mid-word, means the playout clock drifted from the audio: record it.
+- `[binding-speech]`: `cause: resisted`, speech the page's binding started, such as the
+  readiness cue, did not stop within 10 s of the binding closing. The reload or reconnect that
+  closed it fails, and a retry tries again. It is a finding.
 - `[hermes-bridge-welcome]`: the host refused the companion's side of the bridge hello. The
   category is one of these:
   - `shape`: the welcome was a refusal, or was malformed or cut off;

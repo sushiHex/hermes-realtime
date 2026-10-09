@@ -146,3 +146,32 @@ async def test_cancelled_prepare_retains_exact_peer_authority_for_cleanup() -> N
     await publisher.cancel_speech_chunk(chunk)
     await publisher.unbind(peer)
     assert events == ["prepare-side-effect", "cancel"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hard_stop_releases_its_chunk_locally() -> None:
+    peer, events = _peer_probe()
+
+    async def failing_cancel(
+        self: LiveKitRoomPeer,
+        chunk: SpeechChunk,
+        *,
+        timeout_seconds: float = 10,
+        finish_word: bool = False,
+    ) -> None:
+        del self, chunk, timeout_seconds, finish_word
+        events.append("cancel-failed")
+        raise ConnectionError("room connection is gone")
+
+    peer.cancel_speech_chunk = MethodType(failing_cancel, peer)  # type: ignore[method-assign]
+    publisher = ReconnectSafeLiveKitAudioPublisher()
+    chunk = _chunk()
+    await publisher.bind(peer)
+    await publisher.prepare_speech_chunk(chunk)
+
+    # The failure is reported, and the chunk no longer pins the peer: nothing retries a
+    # hard stop, so keeping it would refuse every unbind until the host restarted.
+    with pytest.raises(ConnectionError, match="room connection is gone"):
+        await publisher.cancel_speech_chunk(chunk)
+    await publisher.unbind(peer)
+    assert events == ["prepare", "cancel-failed"]

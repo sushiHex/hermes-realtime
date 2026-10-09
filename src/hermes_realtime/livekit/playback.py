@@ -74,7 +74,9 @@ class LiveKitAudioPublisher(Protocol):
         *,
         timeout_seconds: float = 10,
         finish_word: bool = False,
-    ) -> None: ...
+    ) -> None:
+        """Stop the chunk. It is released even when this raises: nothing retries a stop."""
+        ...
 
 
 class ReconnectSafeLiveKitAudioPublisher:
@@ -176,17 +178,25 @@ class ReconnectSafeLiveKitAudioPublisher:
         trusted = _trusted_chunk(chunk)
         key = (trusted.turn_id, trusted.chunk_id)
         peer = await self._chunk_peer(trusted)
-        if cancel:
-            await peer.cancel_speech_chunk(
-                trusted,
-                timeout_seconds=timeout_seconds,
-                finish_word=finish_word,
-            )
-        else:
-            await peer.finish_speech_chunk(trusted, timeout_seconds=timeout_seconds)
-        async with self._lock:
-            if self._chunks.get(key) is peer:
-                del self._chunks[key]
+        released = False
+        try:
+            if cancel:
+                await peer.cancel_speech_chunk(
+                    trusted,
+                    timeout_seconds=timeout_seconds,
+                    finish_word=finish_word,
+                )
+            else:
+                await peer.finish_speech_chunk(trusted, timeout_seconds=timeout_seconds)
+            released = True
+        finally:
+            # A hard stop is the last thing anyone does to a chunk: nothing retries it.
+            # One that fails is still released here, undelivered, rather than pinning the
+            # peer and refusing every unbind until the host restarts; its error is raised.
+            if released or cancel:
+                async with self._lock:
+                    if self._chunks.get(key) is peer:
+                        del self._chunks[key]
 
     async def _chunk_peer(self, chunk: SpeechChunk) -> LiveKitRoomPeer:
         key = (chunk.turn_id, chunk.chunk_id)
@@ -556,6 +566,8 @@ class LiveKitSpeechPlayback:
             async with self._cleanup_lock:
                 external_cleanup_owned = token in self._cancelled
                 cleanup_errors: list[BaseException] = []
+                # Whether something is left that a later cancel() could still release.
+                retained = False
                 if operation_error is not None and not external_cleanup_owned:
                     try:
                         async with asyncio.timeout(self._confirmation_timeout_seconds):
@@ -563,12 +575,17 @@ class LiveKitSpeechPlayback:
                         self._confirmation_released.add(token)
                     except BaseException as error:
                         cleanup_errors.append(error)
+                        retained = True
                 try:
                     if operation_error is None:
-                        await self._publisher.finish_speech_chunk(
-                            trusted,
-                            timeout_seconds=self._publish_timeout_seconds,
-                        )
+                        try:
+                            await self._publisher.finish_speech_chunk(
+                                trusted,
+                                timeout_seconds=self._publish_timeout_seconds,
+                            )
+                        except BaseException:
+                            retained = True
+                            raise
                     elif not external_cleanup_owned:
                         # Only a barge-in's cancellation finishes the word; a
                         # transport failure stops at once.
@@ -576,21 +593,24 @@ class LiveKitSpeechPlayback:
                             self._finish_word_turn_id == trusted.turn_id
                             and not self._contains_non_cancellation(operation_error)
                         )
-                        await self._publisher.cancel_speech_chunk(
-                            trusted,
-                            timeout_seconds=self._publish_timeout_seconds,
-                            finish_word=finish_word,
-                        )
-                        self._publication_released.add(token)
+                        try:
+                            await self._publisher.cancel_speech_chunk(
+                                trusted,
+                                timeout_seconds=self._publish_timeout_seconds,
+                                finish_word=finish_word,
+                            )
+                        finally:
+                            # The publisher releases even a failed hard stop, undelivered.
+                            self._publication_released.add(token)
                 except BaseException as error:
                     cleanup_errors.append(error)
 
-                if cleanup_errors or (external_cleanup_owned and operation_error is not None):
+                if retained or (external_cleanup_owned and operation_error is not None):
                     async with self._lifecycle_lock:
                         if self._active == (trusted, token, play_task):
                             self._active = (trusted, token, None)
 
-                if not cleanup_errors and not external_cleanup_owned:
+                if not retained and not external_cleanup_owned:
                     async with self._lifecycle_lock:
                         if self._active == (trusted, token, play_task):
                             self._active = None
@@ -786,16 +806,21 @@ class LiveKitSpeechPlayback:
                         active_chunk,
                         timeout_seconds=self._publish_timeout_seconds,
                     )
-                    self._publication_released.add(claimed_token)
                 except BaseException as error:
                     cleanup_errors.append(error)
+                finally:
+                    # The publisher releases even a failed hard stop, undelivered.
+                    publication_released = True
+                    self._publication_released.add(claimed_token)
 
         # The play task may need the cleanup lock to observe this cancellation
         # claim and detach its completed owner, so never settle it while locked.
+        settle_errors: list[BaseException] = []
         if active_play_task is not None:
-            cleanup_errors.extend(await self._settle_play_task(active_play_task))
+            settle_errors = await self._settle_play_task(active_play_task)
+            cleanup_errors.extend(settle_errors)
 
-        if not cleanup_errors:
+        if confirmation_released and publication_released and not settle_errors:
             async with self._cleanup_lock, self._lifecycle_lock:
                 active = self._active
                 if active == (active_chunk, claimed_token, active_play_task) or active == (
