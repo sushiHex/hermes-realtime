@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import types
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -20,6 +22,7 @@ from aiohttp import web
 import hermes_realtime
 from hermes_realtime.companion.attestation import attest_runtime
 from hermes_realtime.protocol import BRIDGE_PROTOCOL_VERSION
+from tests.support import bridge_hello
 
 _GATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "real_hermes_api_gate.py"
 sys.path.insert(0, str(_GATE_PATH.parent))
@@ -328,20 +331,41 @@ class _Companion:
         self.hellos += 1
         if self.mode == "silent":
             await reader.read()
-        elif self.mode == "refuse" or hello["token"] != _COMPANION_TOKEN:
+        elif self.mode == "refuse":
             writer.write(b'{"ok": false}\n')
         else:
-            negotiated = sorted(set(hello["capabilities"]) & self.offered)
+            # The authenticated hello, signed with the companion's token: a gate configured
+            # with another token fails to verify it.
+            negotiated = sorted(set(hello["capabilities"]) & (self.offered | {"mutual_auth"}))
+            metadata: dict[str, object] = {}
+            if "voice_review" in negotiated:
+                metadata["review_interval"] = 8
+            if "runtime_attestation" in negotiated:
+                metadata["runtime"] = attest_runtime().model_dump(mode="json") | self.attested
+            covered: dict[str, Any] = {
+                "participant_id": hello["participant_id"],
+                "client_nonce": hello["client_nonce"],
+                "server_nonce": secrets.token_hex(32),
+                "requested": hello["capabilities"],
+                "negotiated": negotiated,
+                "metadata": metadata,
+            }
             welcome: dict[str, object] = {
                 "ok": True,
                 "protocol_version": BRIDGE_PROTOCOL_VERSION,
                 "capabilities": negotiated,
+                "server_nonce": covered["server_nonce"],
+                "proof": bridge_hello.proof(_COMPANION_TOKEN, "server", **covered),
+                **metadata,
             }
-            if "voice_review" in negotiated:
-                welcome["review_interval"] = 8
-            if "runtime_attestation" in negotiated:
-                welcome["runtime"] = attest_runtime().model_dump(mode="json") | self.attested
             writer.write(json.dumps(welcome).encode() + b"\n")
+            await writer.drain()
+            answer = await reader.readline()
+            if answer and json.loads(answer) == {
+                "proof": bridge_hello.proof(_COMPANION_TOKEN, "client", **covered)
+            }:
+                accepted = bridge_hello.proof(_COMPANION_TOKEN, "accept", **covered)
+                writer.write(json.dumps({"accepted": accepted}).encode() + b"\n")
         await writer.drain()
         writer.close()
 
