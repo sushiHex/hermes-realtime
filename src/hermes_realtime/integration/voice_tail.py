@@ -1269,6 +1269,7 @@ class VoiceTailWriter:
         # only new acknowledgments enter M2's review coverage.
         self._review = archive.review or ReviewProgress(cursor=archive.cursor)
         self._frozen_version = self._written_version
+        # A restored binding is the live one, should a delete be recorded before a retire.
         self._deletes = replace(self._deletes, live=(archive.conversation_id, archive.generation))
 
     def _restore(self, store: ConversationContextStore, raw: bytes) -> None:
