@@ -126,15 +126,19 @@ class _Handshake:
         ).hexdigest()
 
     def verifies(self, token: str, role: str, received: object) -> bool:
-        """Constant-time check of a received proof, refusing anything of another shape."""
+        """Constant-time check of a received proof, refusing anything of another shape.
 
-        return (
-            type(received) is str
-            and _NONCE_PATTERN.fullmatch(received) is not None
-            and hmac.compare_digest(
-                self.proof(token, role).encode("ascii"), received.encode("ascii")
-            )
-        )
+        Metadata nested too deeply to re-encode cannot be the metadata a proof covered, so it
+        fails the check like any other mismatch rather than escaping it as an exception.
+        """
+
+        if type(received) is not str or _NONCE_PATTERN.fullmatch(received) is None:
+            return False
+        try:
+            expected = self.proof(token, role)
+        except RecursionError:
+            return False
+        return hmac.compare_digest(expected.encode("ascii"), received.encode("ascii"))
 
 
 def _nonce() -> str:

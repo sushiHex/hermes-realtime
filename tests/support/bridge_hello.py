@@ -146,7 +146,8 @@ class FakeCompanion:
     proofs: ``capabilities``, ``review_interval`` and ``runtime`` go into the final
     acceptance, everything else into the welcome. ``sign`` may alter what the server proof
     covers and ``sign_accept`` what the acceptance proof covers, to splice a valid proof
-    onto another handshake; ``accept`` decides the final acceptance line.
+    onto another handshake; ``accept`` decides the final acceptance line, and ``accept_extra``
+    adds fields to it that no proof covers.
     """
 
     token: str
@@ -154,6 +155,7 @@ class FakeCompanion:
     sign: Callable[[dict[str, object]], dict[str, object]] = lambda covered: covered
     sign_accept: Callable[[dict[str, object]], dict[str, object]] = lambda covered: covered
     accept: str = "valid"
+    accept_extra: dict[str, object] = field(default_factory=dict)
     server_nonce: str | None = None
     received: list[object] = field(default_factory=list)
     server_nonces: list[str] = field(default_factory=list)
@@ -193,7 +195,7 @@ class FakeCompanion:
                     },
                 })
                 if self.accept == "valid":
-                    writer.write(json.dumps(final | {
+                    writer.write(json.dumps(final | self.accept_extra | {
                         "accepted": proof(self.token, "accept", **covered),  # type: ignore[arg-type]
                     }).encode() + b"\n")
                 elif self.accept == "forged":

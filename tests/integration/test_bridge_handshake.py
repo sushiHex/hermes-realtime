@@ -7,11 +7,12 @@ import contextlib
 import json
 import re
 import socket
+import sys
 from typing import Any
 
 import pytest
 
-from hermes_realtime.integration import BridgeAuthenticationError, LocalHermesBridgeClient
+from hermes_realtime.integration import BridgeAuthenticationError, LocalHermesBridgeClient, bridge
 from tests.integration.test_bridge_voice import (
     _ATTESTATION,
     _TOKEN,
@@ -155,6 +156,32 @@ async def test_an_acceptance_proof_spliced_from_another_handshake_is_refused(
     assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
         {"refusal": "acceptance", "version": 1}
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_signed_acceptance_with_a_field_no_proof_covers_is_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome, accept_extra={"x": 1})
+    server, port = await companion.start()
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await _connect(port)
+        await asyncio.sleep(0.05)
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": "acceptance", "version": 1}
+    ]
+
+
+def test_metadata_too_deep_to_re_encode_fails_the_proof_check_instead_of_raising() -> None:
+    deep: object = []
+    for _ in range(sys.getrecursionlimit() + 100):
+        deep = [deep]
+    handshake = bridge._Handshake(
+        "voice-review", "0" * 64, "1" * 64, frozenset({"mutual_auth", "runtime_attestation"})
+    ).accepting(frozenset({"mutual_auth", "runtime_attestation"}), {"runtime": deep})
+
+    assert handshake.verifies(_TOKEN, "accept", "2" * 64) is False
 
 
 @pytest.mark.asyncio

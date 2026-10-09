@@ -380,10 +380,12 @@ From the gateway (the companion runs inside it):
   copy remains), `refusal`, or `failure`.
 - `[hermes-bridge-hello]`: a hello was refused. The category is one of `shape`, `participant`,
   `version`, `capability`, `nonce`, `proof`, `abandoned` or `deadline`; the host's
-  `[hermes-bridge-welcome]` line above is the other side of the same handshake. `capability`
-  from a host on another release usually means the host and the companion were not upgraded
-  together. `proof` means the host's token is not the companion's. `abandoned` means the host
-  left before proving, as it does when it refuses the welcome.
+  `[hermes-bridge-welcome]` line above is the other side of the same handshake. `shape` from a
+  host on an earlier release, whose hello still carries the token, means the host and the
+  companion were not upgraded together. `abandoned` means the host left before proving, as it
+  does when it refuses the welcome: a token mismatch shows up here as `abandoned`, with the
+  host's `[hermes-bridge-welcome]` line saying `proof`. A companion `proof` means the host
+  answered with a proof that does not match the companion's token.
 
 The host also prints one plain line, not a marker, after a crash left runs behind:
 `NOTICE: a previous session left Hermes background work behind: ...`, with counts only.

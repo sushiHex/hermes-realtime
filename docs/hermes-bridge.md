@@ -176,7 +176,8 @@ transcript (sorted keys, no spaces, ASCII). The transcript holds:
 - both nonces;
 - the sorted requested capabilities;
 - `negotiated`, the sorted negotiated capabilities;
-- `metadata`: the acceptance's `review_interval` and `runtime`, exactly as sent.
+- `metadata`: an object holding exactly the acceptance's `review_interval` and `runtime` that
+  are present, exactly as sent, and `{}` when neither was negotiated.
 
 The `server` and `client` proofs come before anything is negotiated, so their `negotiated`
 and `metadata` are `null`. A proof therefore cannot be replayed into another handshake,
