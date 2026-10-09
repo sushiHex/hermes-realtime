@@ -187,17 +187,20 @@ async def test_connect_returns_only_after_an_authenticated_acceptance(
 
 
 @pytest.mark.asyncio
-async def test_the_client_handshake_has_a_deadline() -> None:
+async def test_the_client_handshake_has_a_deadline(capsys: pytest.CaptureFixture[str]) -> None:
     async def mute(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.read()
 
     server = await asyncio.start_server(mute, "127.0.0.1", 0)
     async with server:
         port = server.sockets[0].getsockname()[1]
-        started = asyncio.get_running_loop().time()
+        # The outer bound only keeps a missing deadline from hanging the suite: then the
+        # client is cancelled from outside and never reports its own deadline.
         with pytest.raises(TimeoutError):
-            await _connect(port, handshake_timeout=0.2)
-        assert asyncio.get_running_loop().time() - started < 2
+            await asyncio.wait_for(_connect(port, handshake_timeout=0.2), 2)
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": "deadline", "version": 1}
+    ]
 
 
 @pytest.mark.asyncio
