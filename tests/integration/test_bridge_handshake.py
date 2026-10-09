@@ -248,6 +248,27 @@ async def test_the_server_routes_nothing_until_the_client_proves_the_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stall", ["before-hello", "after-welcome"])
+async def test_the_server_marks_an_expired_authentication_deadline(
+    stall: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async with _server(voice=_Voice(), authentication_timeout=0.2) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        if stall == "after-welcome":
+            hello = bridge_hello.hello("voice-archive", ("voice_archive",))
+            writer.write(json.dumps(hello).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline())["ok"] is True
+        # The outer bound only keeps a missing server deadline from hanging the suite.
+        assert await asyncio.wait_for(reader.readline(), 2) == b""
+        writer.close()
+        await asyncio.sleep(0.05)
+    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == [
+        {"refusal": "deadline", "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_every_handshake_uses_fresh_random_nonces() -> None:
     companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome)
     server, port = await companion.start()

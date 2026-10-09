@@ -42,7 +42,7 @@ class _Dispatcher:
 
 
 def _server(
-    voice: Any = None, runtime: RuntimeAttestation | None = None
+    voice: Any = None, runtime: RuntimeAttestation | None = None, **options: Any
 ) -> LocalHermesBridgeServer:
     from datetime import UTC, datetime
 
@@ -65,6 +65,7 @@ def _server(
         token=_TOKEN,
         voice=voice,
         runtime=runtime,
+        **options,
     )
 
 

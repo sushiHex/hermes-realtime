@@ -203,7 +203,8 @@ hello leaves one `[hermes-bridge-hello]` marker on the server, with its rejectio
 - `capability`;
 - `nonce`;
 - `proof`, the client's proof failed;
-- `abandoned`, the client left before proving, as it does on refusing a welcome.
+- `abandoned`, the client left before proving, as it does on refusing a welcome;
+- `deadline`, the authentication timeout expired first.
 
 A refused welcome leaves one `[hermes-bridge-welcome]` marker on the client:
 - `shape`;
