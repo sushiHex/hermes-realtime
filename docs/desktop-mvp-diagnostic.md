@@ -351,6 +351,17 @@ From the host:
   `late_ms` how far past the planned stop the cut landed, and `clamped` that the playout clock
   had run past the end of the chunk. A `late_ms` well above 20, or `clamped` on a stop you
   heard mid-word, means the playout clock drifted from the audio: record it.
+- `[hermes-bridge-welcome]`: the host refused the companion's side of the bridge hello. The
+  category is one of these:
+  - `shape`: the welcome was a refusal, or was malformed or cut off;
+  - `proof`: the companion's proof failed, so its token is not the host's;
+  - `acceptance`: the final acceptance was forged, malformed or cut off;
+  - `runtime`: a verified acceptance carried an invalid attestation;
+  - `deadline`: the handshake timed out.
+
+  With `shape`, look for the companion's `[hermes-bridge-hello]` line below. A companion on an
+  older release refuses the hello outright, so the host and the companion must be upgraded
+  together.
 
 From the gateway (the companion runs inside it):
 
@@ -367,8 +378,14 @@ From the gateway (the companion runs inside it):
 - `[voice-forget]`: a delete stays pending, with the `stage` it reached and why: `category`
   (`review` while a review runs, `present` or `branch_copies` while a session or a `/branch`
   copy remains), `refusal`, or `failure`.
-- `[hermes-bridge-hello]`: a hello was refused: `shape`, `token`, `participant`, `version` or
-  `capability`.
+- `[hermes-bridge-hello]`: a hello was refused. The category is one of `shape`, `participant`,
+  `version`, `capability`, `nonce`, `proof`, `abandoned` or `deadline`; the host's
+  `[hermes-bridge-welcome]` line above is the other side of the same handshake. `shape` from a
+  host on an earlier release, whose hello still carries the token, means the host and the
+  companion were not upgraded together. `abandoned` means the host left before proving, as it
+  does when it refuses the welcome: a token mismatch shows up here as `abandoned`, with the
+  host's `[hermes-bridge-welcome]` line saying `proof`. A companion `proof` means the host
+  answered with a proof that does not match the companion's token.
 
 The host also prints one plain line, not a marker, after a crash left runs behind:
 `NOTICE: a previous session left Hermes background work behind: ...`, with counts only.
@@ -437,7 +454,7 @@ Next steps by category, from the gate's source:
 - `health`: the gateway did not answer the authenticated `/health/detailed` with its process.
   Check that the gateway runs, that `API_SERVER_KEY` matches, and that port 8642 answers.
 - `hello_refused`: a wrong companion token, or a gateway still running a plugin without runtime
-  attestation. Check the token, then restart the gateway.
+  attestation or the authenticated hello. Check the token, then restart the gateway.
 - `capability`: the companion does not offer every capability. Reinstall the candidate wheel
   (setup step 4) and restart the gateway.
 - `foreign_companion`: another process owns the companion, such as a Hermes CLI or cron process

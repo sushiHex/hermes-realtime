@@ -33,6 +33,7 @@ from hermes_realtime.integration.voice_tail import (
     voice_tail_bytes,
 )
 from hermes_realtime.speech import Transcript
+from tests.support.live_record import read_live_record
 
 _MARKER = "[voice-tail] "
 _LOCK_MARKER = "[voice-tail-lock] "
@@ -1220,7 +1221,9 @@ async def _written(path: Path, writer: VoiceTailWriter) -> ArchiveOutbox:
     """The archive the file holds after this version's write completes."""
     target = writer._version
     await _until(lambda: writer._written_version >= target and path.exists())
-    return _outbox(path.read_bytes())
+    raw = read_live_record(path)
+    assert raw is not None
+    return _outbox(raw)
 
 
 @pytest.mark.asyncio
