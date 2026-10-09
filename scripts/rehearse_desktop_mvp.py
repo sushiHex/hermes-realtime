@@ -2802,7 +2802,7 @@ def _observe_prompts() -> None:
             return str(json.loads(response.read())["message"]["content"])
 
     def observed(snapshot: Any) -> list[dict[str, str]]:
-        messages = render(snapshot)
+        messages: list[dict[str, str]] = render(snapshot)
         marker("rehearsal-prompt", prompt_observation(messages, phrase))
         # System notes (background work, updates) may follow the question.
         users = [message["content"] for message in messages if message["role"] == "user"]
