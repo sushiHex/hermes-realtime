@@ -28,6 +28,7 @@ The current baseline includes:
 - one-use browser bootstrap, short-lived microphone credentials, refresh, authenticated event polling, approval decisions, and stop;
 - a `hermes_agent.plugins` entry point exercised against a local Hermes v0.20 source surface for discovery and packaging compatibility;
 - authenticated Hermes run dispatch, exact task stop, request-bound approvals, and bounded concurrent run ownership;
+- a durable local voice tail and, when a voice companion is configured, bounded Hermes-owned voice archiving, native memory and skills review, memory readback, and archive deletion;
 - opt-in local speech providers and explicit Codex or Ollama inference selection;
 - synthetic browser, LiveKit, packaging, and installed-wheel release gates.
 
@@ -43,7 +44,9 @@ security hardening.
 
 ![Hermes Realtime architecture. The browser's microphone audio travels through a LiveKit room to the hermes-realtime host, which listens, converses with its own low-latency model, and speaks back through the room. Your speech interrupts playback without cancelling background work. The conversation remembers your final words, but only the replies confirmed delivered. Real work is delegated to a separate Hermes Agent process, whose results and approvals come back as bounded updates.](docs/assets/architecture.svg)
 
-The realtime host converses with its own low-latency model and hands real work to Hermes Agent, which runs it as a separate process. The conversation model receives compact context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events. [ADR 0003](docs/adr/0003-hermes-owned-conversation-continuity.md) describes the planned design for archiving voice conversations in Hermes and learning from them; today the conversation survives a restart through a local file.
+The realtime host converses with its own low-latency model and hands real work to Hermes Agent, which runs it as a separate process. The conversation model receives bounded, transport-confirmed context rather than Hermes's complete tool schema. Provider integrations remain replaceable, and task-state claims are emitted only from acknowledged Hermes events.
+
+The local voice tail restores that bounded context after a restart. With an enabled voice tail and a configured, ready Hermes-side companion, eligible voice rows are sent for archiving in a Hermes session and review by Hermes's native memory and skills machinery. A bounded, asynchronously refreshed memory snapshot can return to the foreground. The browser's **Delete this voice conversation** control clears the local tail and requests deletion of the voice archive chain; learned memory and skills and delegated-task sessions remain, and physical storage remnants may remain. [Accepted ADR 0003](docs/adr/0003-hermes-owned-conversation-continuity.md) records the design, qualification evidence on the pinned Hermes source, and its limits. See the [desktop MVP guide](docs/desktop-mvp-diagnostic.md#deleting-a-voice-conversation) for deletion status and support limits.
 
 ## Requirements
 
