@@ -54,7 +54,9 @@ A refused remote stop keeps Disconnect available for that same stop; a consumed
 one-shot launch requires a fresh launch. An admitted room's exact speech worker
 departure releases local audio and offers an explicit reconnect while preserving
 session and visible history. Newer lifecycle operations supersede older cleanup
-continuations, credential responses, and configuration responses. Terminal projection refusals retain
+continuations, credential responses, and configuration responses. Local cleanup
+retires event polling so worker loss cannot start an automatic projection reconnect.
+Terminal projection refusals retain
 the same safe guidance. The [mounted browser tests](../web/tests/connection-main.dom.test.ts)
 and [guidance tests](../web/tests/connection-recovery.dom.test.ts) exercise synthetic
 refusals and races; they do not establish the historical PCM consumer delay,

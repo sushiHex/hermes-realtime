@@ -1693,6 +1693,7 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
       });
       if (!response.ok) throw new Error("public event projection rejected");
       const batch = parseEventBatch(await response.json());
+      if (signal.aborted) return;
       for (const event of batch.events) {
         if (event.sequence !== eventSequence + 1) {
           throw new Error("public event sequence gap");
@@ -2303,11 +2304,10 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
   let superseded = false;
   try {
     const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
-    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+    if (signal.aborted || sessionStopVersion !== observedStopVersion) {
       superseded = true;
       return;
     }
-    if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
     setCredential(replacement);
     pendingRebindRequestId = null;
     clearCredentialRefresh();
@@ -2328,12 +2328,6 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
       return;
     }
     await connect(true);
-  } catch (error) {
-    if (!lifecycleAuthority.owns(recoveryGeneration)) {
-      superseded = true;
-      return;
-    }
-    throw error;
   } finally {
     if (superseded) recordSupersededRecovery("projection");
   }
@@ -3108,6 +3102,8 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
+  eventPolling?.abort();
+  eventPolling = null;
   microphoneVerificationGeneration += 1;
   voicePathState = "waiting";
   clearVoicePathReadinessTimer();

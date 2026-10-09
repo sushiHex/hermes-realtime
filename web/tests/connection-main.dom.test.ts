@@ -429,6 +429,62 @@ describe("mounted connection recovery", () => {
     expect(JSON.parse(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")!).identity).toBe(credential.participantIdentity);
   });
 
+  it("retires a pending terminal poll failure when the worker leaves", async () => {
+    let failPoll!: () => void;
+    let polls = 0;
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/events") {
+        if (++polls < 5) return Response.json({});
+        return new Promise<Response>((_, reject) => { failPoll = () => reject(new Error("synthetic late poll failure")); });
+      }
+      if (path === "/api/v1/projection-resync") return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rotated.token" });
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(failPoll).toBeDefined(), { timeout: 4000 });
+    const oldSignal = fetch.mock.calls.filter(([path]) => path === "/api/v1/events").at(-1)![1]!.signal!;
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    failPoll();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(oldSignal.aborted).toBe(true);
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/projection-resync")).toHaveLength(0);
+    expect(media.connect).toHaveBeenCalledTimes(1);
+    expect(toggle.textContent).toBe("Connect");
+    expect(recovery.dataset.stage).toBe("worker");
+  });
+
+  it.each([false, true])("ignores retired event JSON after worker departure with replacement %s", async (replace) => {
+    let answer!: () => void;
+    let polls = 0;
+    const { toggle, recovery } = await mount((path) => {
+      if (path === "/api/v1/events" && ++polls === 1) {
+        const response = Response.json({});
+        response.json = () => new Promise((resolve) => { answer = () => resolve({ version: 1, events: [{ sequence: 1, kind: "typed_input_admitted", monotonicMs: 12500, data: { inputSequence: 1 } }] }); });
+        return response;
+      }
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
+    if (replace) {
+      toggle.click();
+      await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false));
+      await vi.waitFor(() => expect(recovery.hidden).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const markers = dom.window.document.querySelector("#markers")!;
+    const before = markers.textContent;
+    answer();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(markers.textContent).toBe(before);
+    expect(markers.textContent).not.toContain("typed_input_admitted");
+    expect(toggle.textContent).toBe(replace ? "Disconnect" : "Connect");
+    expect(recovery.hidden).toBe(replace);
+  });
+
   it("ignores a resync rejection superseded by worker departure", async () => {
     let rejectResync!: () => void;
     const { toggle, recovery, fetch } = await mount((path) => {
