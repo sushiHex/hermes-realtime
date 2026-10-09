@@ -49,7 +49,7 @@
 
       <section class="toolbar" aria-label="Connection controls">
         <div class="connection-actions">
-          <button id="session-toggle" class="button primary" type="button">Connect</button>
+          <button id="session-toggle" class="button primary" type="button" aria-describedby="connection-recovery">Connect</button>
           <button id="stop-speaking" class="button secondary" type="button" disabled hidden>Stop speaking</button>
           <output id="speech-renderer-state" class="status" aria-live="polite" hidden>Speech idle</output>
         </div>
@@ -63,6 +63,7 @@
             <select id="voice" disabled><option value="">Unavailable</option></select>
           </label>
         </div>
+        <output id="connection-recovery" class="connection-recovery" role="status" aria-live="polite" hidden></output>
       </section>
 
       <section class="workspace">

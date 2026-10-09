@@ -397,7 +397,7 @@ async def test_system_chrome_typed_turn_advances_remote_audio_and_stops() -> Non
                         while await remote_audio.evaluate("element => element.currentTime") <= 0:
                             await asyncio.sleep(0.1)
                     assert console_errors == []
-                    await page.get_by_role("button", name="Stop session").click()
+                    await page.get_by_role("button", name="Disconnect").click()
                     await expect(page.locator("#typed-input")).to_be_disabled(timeout=15_000)
                     assert await remote_audio.evaluate("element => element.srcObject === null")
                 finally:

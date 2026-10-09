@@ -157,6 +157,7 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 580; letter-spacing: -0.012
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
   gap: 20px;
@@ -361,4 +362,11 @@ textarea::placeholder { color: var(--faint); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+.connection-recovery {
+  flex-basis: 100%;
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
 }

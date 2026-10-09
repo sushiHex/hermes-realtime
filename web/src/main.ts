@@ -88,6 +88,13 @@ import {
   mountEvidenceControls,
 } from "./evidence-controls";
 import { mountSearchEgressControls } from "./search-egress-controls";
+import {
+  connectionFailureCategory,
+  ConnectionRequestRejected,
+  renderConnectionRecovery,
+  type ConnectionFailure,
+  type ConnectionFailureStage,
+} from "./connection-recovery";
 import { mountTypedComposerEnterSubmission } from "./typed-composer";
 import { VoiceDeleteControls } from "./voice-delete-controls";
 import {
@@ -121,6 +128,7 @@ const microphoneActivity = element<HTMLButtonElement>("microphone-activity");
 const microphoneActivityLabel = element<HTMLSpanElement>("microphone-activity-label");
 const microphoneLevel = element<HTMLElement>("microphone-level");
 const sessionToggleButton = element<HTMLButtonElement>("session-toggle");
+const connectionRecovery = element<HTMLOutputElement>("connection-recovery");
 const stopSpeakingButton = element<HTMLButtonElement>("stop-speaking");
 const deleteVoiceButton = element<HTMLButtonElement>("delete-voice-conversation");
 const voiceDeleteStatus = element<HTMLOutputElement>("voice-delete-status");
@@ -318,6 +326,7 @@ let credential: BootstrapCredential | null = null;
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
+let connectionFailure: ConnectionFailure | null = null;
 let sessionStopVersion = 0;
 let room: Room | null = null;
 const admittedRooms = new WeakSet<Room>();
@@ -346,6 +355,7 @@ const microphoneReadinessAuthority = new MicrophoneReadinessAuthority<Room, Loca
 const reconnectMicrophoneQueue = new SerializedAsyncQueue();
 const audioDiagnosticQueue = new SerializedAsyncQueue();
 const microphoneEnumerationAuthority = new GenerationAuthority();
+const lifecycleAuthority = new GenerationAuthority();
 const eventPollFailurePolicy = new ForegroundPollFailurePolicy(5);
 const localMediaReleaseTimeoutMs = 1_000;
 const stopRequestTimeoutMs = 5_000;
@@ -1707,15 +1717,25 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
           if (signal.aborted) return;
           error = resyncError;
         }
+        const failureGeneration = lifecycleAuthority.issue();
         const observedStopVersion = sessionStopVersion;
-        if (eventPolling?.signal === signal) {
-          eventPolling.abort();
-          eventPolling = null;
+        let superseded = false;
+        try {
+          if (eventPolling?.signal === signal) {
+            eventPolling.abort();
+            eventPolling = null;
+          }
+          await disconnectLocal();
+          if (!lifecycleAuthority.owns(failureGeneration)) {
+            superseded = true;
+            return;
+          }
+          if (observedStopVersion !== sessionStopVersion) return;
+          controller.failed();
+          throw error;
+        } finally {
+          if (superseded) recordSupersededRecovery("projection");
         }
-        await disconnectLocal();
-        if (observedStopVersion !== sessionStopVersion) return;
-        controller.failed();
-        throw error;
       }
       addMarker("event_projection_retry");
       await new Promise<void>((resolve) =>
@@ -1941,6 +1961,7 @@ function renderConnectionPresentation(state = controller.state): void {
   connectionStatus.dataset.state = presentation.presentationState;
   readinessHeadline.textContent = presentation.headline;
   readinessDetail.textContent = presentation.detail;
+  renderConnectionRecovery(connectionRecovery, connectionFailure, canStartSession(), remoteStopRequired);
   voiceDeleteControls.render();
 }
 
@@ -2040,11 +2061,7 @@ function authorization(token: string): HeadersInit {
   };
 }
 
-class SessionRebindRejected extends Error {
-  constructor(readonly status: number) {
-    super("session rebind rejected");
-  }
-}
+class SessionRebindRejected extends ConnectionRequestRejected {}
 
 async function connectionFetch(
   input: RequestInfo | URL,
@@ -2082,13 +2099,17 @@ function setCredential(value: BootstrapCredential | null): void {
   }
 }
 
-async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredential> {
+async function bootstrapOrReload(
+  signal: AbortSignal,
+  onStage: (stage: ConnectionFailureStage) => void,
+): Promise<BootstrapCredential> {
   if (!stableLaunch) return bootstrap(signal);
   let reloaded = false;
   const result = await reloadOrBootstrap({
     storage: tabStorage(),
     newRequestId: () => `rebind_${crypto.randomUUID()}`,
     rebind: async (path, body) => {
+      onStage("rebind");
       const response = await connectionFetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2100,7 +2121,10 @@ async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredenti
       reloaded = response.ok;
       return response;
     },
-    bootstrap: () => bootstrap(signal),
+    bootstrap: () => {
+      onStage("bootstrap");
+      return bootstrap(signal);
+    },
     parse: parseBootstrapCredential,
   });
   if (reloaded) addMarker("session_reloaded");
@@ -2119,7 +2143,7 @@ async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
   }, signal);
   capability = null;
   if (!response.ok) {
-    throw new Error("bootstrap denied");
+    throw new ConnectionRequestRejected(response.status);
   }
   return parseBootstrapCredential(await response.json());
 }
@@ -2174,7 +2198,7 @@ async function announceMediaActivation(
       referrerPolicy: "no-referrer",
       signal: request.signal,
     });
-    if (!response.ok) throw new Error("media activation rejected");
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
   } finally {
     window.clearTimeout(timeout);
     signal?.removeEventListener("abort", abort);
@@ -2263,25 +2287,39 @@ async function projectionResyncBrowserCredential(
 async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
   const activeCredential = credential;
   if (activeCredential === null) throw new Error("active credential is unavailable");
+  const recoveryGeneration = lifecycleAuthority.issue();
   const observedStopVersion = sessionStopVersion;
-  const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
-  if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
-  setCredential(replacement);
-  pendingRebindRequestId = null;
-  clearCredentialRefresh();
-  eventSequence = 0;
-  resetSessionInputAuthority();
-  if (eventPolling?.signal === signal) eventPolling = null;
-  addMarker("event_projection_resynced");
-  await disconnectLocal();
-  if (
-    signal.aborted ||
-    sessionStopVersion !== observedStopVersion ||
-    controller.state !== "disconnected"
-  ) {
-    return;
+  let superseded = false;
+  try {
+    const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
+    setCredential(replacement);
+    pendingRebindRequestId = null;
+    clearCredentialRefresh();
+    eventSequence = 0;
+    resetSessionInputAuthority();
+    if (eventPolling?.signal === signal) eventPolling = null;
+    addMarker("event_projection_resynced");
+    await disconnectLocal();
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (
+      signal.aborted ||
+      sessionStopVersion !== observedStopVersion ||
+      controller.state !== "disconnected"
+    ) {
+      return;
+    }
+    await connect(true);
+  } finally {
+    if (superseded) recordSupersededRecovery("projection");
   }
-  await connect(true);
 }
 
 function resetSessionInputAuthority(): void {
@@ -2343,7 +2381,45 @@ async function submitAudioDiagnostic(
   });
 }
 
+function recordSupersededRecovery(stage: ConnectionFailureStage): void {
+  console.info(`[connection-recovery] ${JSON.stringify({ stage, category: "superseded" })}`);
+}
+
+async function handleWorkerDeparture(activeRoom: Room, participant: RemoteParticipant): Promise<void> {
+  let refused: ConnectionFailure | null = null;
+  let superseded = false;
+  let ignored = false;
+  try {
+    if (
+      room !== activeRoom ||
+      participant.identity !== credential?.workerIdentity ||
+      controller.state !== "connected"
+    ) {
+      ignored = true;
+      return;
+    }
+    const departureGeneration = lifecycleAuthority.issue();
+    await disconnectLocal();
+    // A user stop or a newer connection owns its own outcome.
+    if (!lifecycleAuthority.owns(departureGeneration)) {
+      superseded = true;
+      return;
+    }
+    refused = { stage: "worker", category: "request-failed" };
+    connectionFailure = refused;
+    renderConnectionPresentation();
+    addMarker("speech_worker_disconnected");
+  } finally {
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
+    if (superseded) recordSupersededRecovery("worker");
+    if (ignored) console.info(`[connection-recovery] ${JSON.stringify({ stage: "worker", category: "irrelevant-departure" })}`);
+  }
+}
+
 function bindRoomEvents(activeRoom: Room): void {
+  activeRoom.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+    void handleWorkerDeparture(activeRoom, participant);
+  });
   activeRoom.on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
     if (room !== activeRoom) return;
     if (terminalDisconnectIsAuthoritative(state, admittedRooms.has(activeRoom))) {
@@ -2675,6 +2751,8 @@ async function reverifyMicrophoneAfterNativeReconnect(
 }
 
 async function connect(projectionResync = false): Promise<void> {
+  const connectGeneration = lifecycleAuthority.issue();
+  connectionFailure = null;
   clearPartialTranscript();
   prepareMicrophoneSignalMonitor();
   const startingState = controller.state;
@@ -2732,6 +2810,9 @@ async function connect(projectionResync = false): Promise<void> {
   let attemptedRoom: Room | null = null;
   let attempt: ConnectionAttempt<Room> | null = null;
   let sessionReplaced = false;
+  let failureStage: ConnectionFailureStage = resuming ? "rebind" : "bootstrap";
+  let refused: ConnectionFailure | null = null;
+  let superseded = false;
   try {
     if (resuming) {
       const previousCredential = credential;
@@ -2776,6 +2857,7 @@ async function connect(projectionResync = false): Promise<void> {
             ) {
               throw retryError;
             }
+            failureStage = "bootstrap";
             setCredential(await bootstrap(localOperation.signal));
             sessionReplaced = true;
             resetSessionInputAuthority();
@@ -2786,7 +2868,9 @@ async function connect(projectionResync = false): Promise<void> {
         pendingRebindRequestId = null;
       }
     } else {
-      setCredential(await bootstrapOrReload(localOperation.signal));
+      setCredential(await bootstrapOrReload(localOperation.signal, (stage) => {
+        failureStage = stage;
+      }));
       pendingRebindRequestId = null;
       resetSessionInputAuthority();
       addMarker("bootstrap_complete", started);
@@ -2808,6 +2892,7 @@ async function connect(projectionResync = false): Promise<void> {
     room = activeRoom;
     microphoneEnumerationAuthority.invalidate();
     bindRoomEvents(activeRoom);
+    failureStage = "media";
     await activeRoom.connect(activeCredential.url, activeCredential.token, {
       autoSubscribe: true,
     });
@@ -2827,6 +2912,7 @@ async function connect(projectionResync = false): Promise<void> {
     );
     scheduleCredentialRefresh(activeCredential);
     const incarnation = nextMediaIncarnation();
+    failureStage = "microphone";
     const activation = await enableSelectedMicrophone(activeRoom, incarnation);
     const settled = await settleMicrophoneVerification(
       attempt.owns(connectionAttempt) &&
@@ -2856,6 +2942,7 @@ async function connect(projectionResync = false): Promise<void> {
       microphoneSignalMonitor.stop();
       clearVoicePathReadinessTimer();
     }
+    failureStage = "activation";
     const mediaCommitted = await settleMediaActivation(
       announceMediaActivation(activeCredential, incarnation, localOperation.signal),
       () =>
@@ -2885,9 +2972,10 @@ async function connect(projectionResync = false): Promise<void> {
         if (!eventPolling?.signal.aborted) addMarker("event_projection_failed");
       });
     }
+    failureStage = "configuration";
     await loadVoiceConfiguration();
     await loadModelConfiguration();
-  } catch {
+  } catch (error) {
     if (attempt !== null && !attempt.owns(connectionAttempt)) {
       await closeLocalRoom(attemptedRoom);
       return;
@@ -2897,9 +2985,16 @@ async function connect(projectionResync = false): Promise<void> {
     const detachedAttemptedRoom = room === attemptedRoom ? null : attemptedRoom;
     await disconnectLocal();
     if (detachedAttemptedRoom !== null) await closeLocalRoom(detachedAttemptedRoom);
+    if (!lifecycleAuthority.owns(connectGeneration)) {
+      superseded = true;
+      return;
+    }
     if (sessionStopVersion !== observedStopVersion) return;
+    refused = { stage: failureStage, category: connectionFailureCategory(error) };
+    connectionFailure = refused;
     if (resuming) {
       controller.disconnected();
+      renderConnectionPresentation();
       addMarker("media_reconnect_failed", started);
       return;
     }
@@ -2911,6 +3006,8 @@ async function connect(projectionResync = false): Promise<void> {
     controller.failed();
     addMarker("connection_failed", started);
   } finally {
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
+    if (superseded) recordSupersededRecovery(failureStage);
     if (attempt !== null && attempt.owns(connectionAttempt)) connectionAttempt = null;
     if (operation === localOperation) operation = null;
   }
@@ -3006,30 +3103,45 @@ async function disconnectLocal(): Promise<void> {
   locallySilencedSpeech = null;
   speechYieldPending = false;
   renderSpeechControl("idle");
-  await closeLocalRoom(activeRoom, authoritativeTrack);
+  const cleanup = closeLocalRoom(activeRoom, authoritativeTrack);
+  microphoneReady = null;
   if (["connecting", "preparing", "connected", "reconnecting"].includes(controller.state)) {
     controller.disconnected();
   }
-  microphoneReady = null;
   addMarker("media_disconnected");
+  // Room and microphone authority have already been released. Await only the captured
+  // room's cleanup; a newer connection must not be changed after this await.
+  await cleanup;
 }
 
 async function recoverTerminalMediaDisconnect(): Promise<void> {
+  const recoveryGeneration = lifecycleAuthority.issue();
   const observedStopVersion = sessionStopVersion;
-  await disconnectLocal();
-  if (
-    sessionStopVersion !== observedStopVersion ||
-    credential === null ||
-    controller.state !== "disconnected"
-  ) return;
-  addMarker("media_terminal_rebind_started");
-  await connect();
+  let superseded = false;
+  try {
+    await disconnectLocal();
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (
+      sessionStopVersion !== observedStopVersion ||
+      credential === null ||
+      controller.state !== "disconnected"
+    ) return;
+    addMarker("media_terminal_rebind_started");
+    await connect();
+  } finally {
+    if (superseded) recordSupersededRecovery("media");
+  }
 }
 
 async function stop(): Promise<void> {
   const activeCredential = credential;
   if (activeCredential === null) return;
   const rebindRequestId = pendingRebindRequestId;
+  lifecycleAuthority.invalidate();
+  connectionFailure = null;
   controller.beginStop();
   sessionStopVersion += 1;
   remoteStopRequired = true;
@@ -3038,6 +3150,7 @@ async function stop(): Promise<void> {
   await disconnectLocal();
   const stopRequest = new AbortController();
   const stopTimeout = window.setTimeout(() => stopRequest.abort(), stopRequestTimeoutMs);
+  let refused: ConnectionFailure | null = null;
   try {
     const response = await fetch("/api/v1/stop", {
       method: "POST",
@@ -3054,13 +3167,16 @@ async function stop(): Promise<void> {
       referrerPolicy: "no-referrer",
       signal: stopRequest.signal,
     });
-    if (!response.ok) throw new Error("session stop was rejected");
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
   } catch (error) {
+    refused = { stage: "stop", category: connectionFailureCategory(error) };
+    connectionFailure = refused;
     controller.stopFailed(false);
     addMarker("session_stop_failed");
     throw error;
   } finally {
     window.clearTimeout(stopTimeout);
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
   }
   remoteStopRequired = false;
   pendingRebindRequestId = null;

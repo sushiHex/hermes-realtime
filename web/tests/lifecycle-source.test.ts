@@ -29,7 +29,7 @@ describe("reloaded tab rebind wiring", () => {
     const stopBody = mainSource.slice(stop, mainSource.indexOf("\n}\n", stop));
     expect(stopBody.indexOf(forget)).toBeGreaterThan(stopBody.indexOf("} finally {"));
     expect(stopBody.indexOf("} finally {")).toBeGreaterThan(
-      stopBody.indexOf('if (!response.ok) throw new Error("session stop was rejected");'),
+      stopBody.indexOf("if (!response.ok) throw new ConnectionRequestRejected(response.status);"),
     );
   });
 
@@ -40,8 +40,8 @@ describe("reloaded tab rebind wiring", () => {
       mainSource.indexOf("    if (resuming) {", connectStart),
     );
     expect(freshPath).toBeGreaterThan(connectStart);
-    expect(mainSource.slice(freshPath, freshPath + 120)).toContain(
-      "setCredential(await bootstrapOrReload(localOperation.signal));",
+    expect(mainSource.slice(freshPath, freshPath + 200)).toContain(
+      "setCredential(await bootstrapOrReload(localOperation.signal, (stage) => {",
     );
     const reload = mainSource.indexOf("async function bootstrapOrReload(");
     const reloadEnd = mainSource.indexOf("\n}\n", reload);
