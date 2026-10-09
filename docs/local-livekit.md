@@ -367,10 +367,12 @@ the tab remembers. A rotation (2xx) remembers the new identity; when no session 
 the tab forgets the identity and bootstraps; an identity that is not the active one is refused
 (403) and forgotten, so a reload never replaces another tab's session. Every other outcome keeps
 the identity and its request ID for the next **Connect**, which replays the same request, so a
-rotation whose answer was lost is answered again instead of refused: a transient refusal (503,
-such as a reload during the readiness cue, refused until the host has settled that speech), a
-network error, or a failure later in connect. The server answers 409 for exactly "no session is
-active"; every other state refusal is 503. A leaving page never reconnects the session it is
+rotation whose answer was lost is answered again instead of refused: a transient refusal (503),
+a network error, or a failure later in connect. A reload during the readiness cue is not
+refused. The cue is the binding's own speech, so closing the binding first stops it through
+playback's usual hard stop, which releases its chunk. Before, the chunk still in flight made the
+audio publisher refuse at once to unbind the old connection. The server answers 409 for exactly
+"no session is active"; every other state refusal is 503. A leaving page never reconnects the session it is
 leaving: the LiveKit SDK's own page-leave disconnect is turned off, since the page would read it
 as a dropped connection and rebind, rotating the identity the reloaded tab is about to present.
 Only a stop that succeeded forgets the stored identity. A duplicated tab copies
