@@ -256,20 +256,25 @@ a dispatch whose resend also gets no response ends with its outcome unknown.
 
 ### Live context follows the same rule
 
-Live foreground context is heard-first. Assistant rows fill only from delivery-confirmed chunks:
-each generated segment has one row, holding the exact slice of the segment text through its
-latest confirmed chunk. Interruption is data, not text: a turn that ends abnormally after some of
-its speech was confirmed sets `interrupted` once on its last confirmed row, whose text stays
-exactly what was delivered. Providers render the flag deterministically, as an `"interrupted":
-true` field in the Codex snapshot and as a fixed suffix in Ollama's chat messages. Model text
-can never forge the flag. A turn with nothing confirmed writes no assistant row. A replay adds
-only newly confirmed text, as its own row. The undelivered remainder stays in the
-resumable-replay machinery. The Codex prompt's statement that earlier assistant messages
-"represent only speech confirmed delivered"
-([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801)) is therefore true, and
-the live context, the Hermes archive, and what the user experienced match by construction. A
-turn that completes normally closes its last row, so only speech still in progress can be
-cut off.
+Live foreground context is heard-first. One assistant row holds a turn's transport-confirmed
+chunks, including chunks from successive generated publications; the confirmed slices are joined
+with one space between publications. If the next confirmed chunk would exceed `max_item_chars`,
+the current row closes and a new row starts with that chunk. Thus only oversized replies roll
+over to multiple rows. A chunk that cannot be located in its publication adds no text. The
+window evicts oldest rows by its bounded text budget and hard row cap, rather than by the number
+of publications ([window contract](../heard-context-window.md)).
+
+Interruption is data, not text: a turn that ends abnormally after some speech was confirmed sets
+`interrupted` once on its last confirmed row, including after a rollover. Its text stays exactly
+the confirmed portion. A crash conservatively flags the open row in the durable voice tail.
+Providers render the flag deterministically, as an `"interrupted": true` field in the Codex
+snapshot and as a fixed suffix in Ollama's chat messages. Model text can never forge the flag.
+A turn with nothing confirmed writes no assistant row. A replay is a new turn and adds only
+newly confirmed text in its own row; the undelivered remainder stays in the resumable-replay
+machinery. The Codex prompt's statement that earlier assistant messages "represent only speech
+confirmed delivered" ([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801))
+therefore remains true. A turn that completes normally closes its last row without an
+interruption flag.
 
 A final user input becomes exactly one user row: an ordinary input through the turn it starts,
 and an explicit command, which starts no turn, before the command acts. Live speech settles
