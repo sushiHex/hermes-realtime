@@ -583,10 +583,28 @@ later step reconnects the page if it must, and the rehearsal continues. The fina
 counts what is left running by image name, and it must be empty. The exit code is 0 only when
 every step was `as_expected` and nothing was left.
 
+**One run at a time.** Before anything else, a run takes an exclusive lock:
+`rehearsal.lock` in the per-user `hermes-realtime\tools` directory that holds the shared
+LiveKit server. It keeps the lock until its process exits, and the operating system releases
+it even after a crash. While another run holds it, the script prints one `failed` preflight line
+with category `rehearsal_busy` and exits 1. Two runs can't overlap and share LiveKit and Ollama;
+they used to race past the port check below.
+
 **Preflight.** When a required piece is missing, the script prints one `not_run` preflight line
 and exits 0. The pieces are Windows, the pinned LiveKit binary, system Chrome, Playwright,
-Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880,
-such as an orphaned server, is a `failed` preflight with exit code 1.
+Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880 is
+a `failed` preflight with exit code 1. With the lock in place, that means a server no rehearsal
+started, such as an orphan.
+
+**Setup failures name their cause.**
+- **A failed setup command** (the candidate clone, wheel build or host install; the Hermes
+  clone, sync or wheel install) fails the `setup` step with a short category such as
+  `host_requirements`. The record carries the command's `exit_code`, and the last 64 KiB of
+  its stderr stay in the run directory as `logs/setup-<category>.stderr`.
+- **A run directory too long for the pinned Hermes checkout** is refused before the checkout,
+  as `run_dir_too_long`. The test is the checkout directory plus the commit's longest
+  checked-out path reaching Windows' 260-character limit, and the record carries
+  `path_chars`. The default directory under `%TEMP%` fits.
 
 **Differences from the operator's session.** Ctrl-C cannot reach a detached process, so:
 - The host runs as `<host env>/python <clone>/scripts/rehearse_desktop_mvp.py --host-child <stop
