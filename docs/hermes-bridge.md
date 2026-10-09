@@ -303,7 +303,8 @@ pending never blocks a later delete. The browser status is the first that applie
   companion verifies it;
 - `pending`: at least one recorded delete is not yet verified;
 - `unknown`: an earlier delete record could not be read, so its intents may be unfinished in
-  Hermes. It stays sticky: a later delete that completes never clears it;
+  Hermes. It is permanent by design: the lost identities cannot be verified later, and a
+  delete that completes proves only its own conversation, so nothing clears it;
 - `complete`: the newest verified delete is the conversation the current one replaced;
 - `idle`: none of the above; the control is offered and there is no delete to report.
 
