@@ -570,6 +570,28 @@ async def test_an_unreadable_record_restores_no_tail_and_keeps_the_loss_known(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sent", ["frozen_unacknowledged", "acknowledged_then_drained"])
+async def test_a_delete_after_any_batch_left_the_host_is_never_completed_locally(
+    sent: str, tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "a", "b")
+    store.record_user_transcript(Transcript(text="archived row", final=True))
+    batch = await asyncio.wait_for(writer.next_batch(), 5)
+    if sent == "acknowledged_then_drained":
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+        # Nothing is frozen any more; only the acknowledged cursor remembers the send.
+        assert writer._frozen == 0 and writer._cursor is not None
+
+    old = await writer.request_forget(store)
+
+    assert writer.pending_deletes == (old,) and writer.delete_outcome is None
+    await writer.close()
+
+
+@pytest.mark.asyncio
 async def test_a_delete_of_a_conversation_no_batch_ever_left_completes_locally(
     tmp_path: Path,
 ) -> None:
