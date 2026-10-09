@@ -21,6 +21,12 @@ _MAX_ACTIVE_STREAMS = 16
 _MAX_RESPONSE_LINE_BYTES = 1_048_576
 # Render-time rendering of an interrupted row; stored context text never contains it.
 _INTERRUPTED_SPEECH_SUFFIX = " [speech interrupted]"
+# Sent with every request so the prompt is never silently truncated to a server default
+# that depends on the GPU (docs/hermes-bridge.md derives it from the context window).
+DEFAULT_OLLAMA_NUM_CTX = 16_384
+_MIN_NUM_CTX = 2048
+_MAX_NUM_CTX = 262_144
+_PROMPT_MARKER_PREFIX = "[ollama-prompt] "
 
 
 class _LineResponse(Protocol):
@@ -58,6 +64,7 @@ class OllamaStreamingInference:
         request_timeout_seconds: float = 30.0,
         max_segment_chars: int = 1024,
         max_active_streams: int = 4,
+        num_ctx: int = DEFAULT_OLLAMA_NUM_CTX,
     ) -> None:
         if type(base_url) is not str:
             raise TypeError("base_url must be an exact built-in string")
@@ -93,6 +100,10 @@ class OllamaStreamingInference:
             raise TypeError("max_active_streams must be an exact integer")
         if not 1 <= max_active_streams <= _MAX_ACTIVE_STREAMS:
             raise ValueError("max_active_streams must be between 1 and 16")
+        if type(num_ctx) is not int:
+            raise TypeError("num_ctx must be an exact integer")
+        if not _MIN_NUM_CTX <= num_ctx <= _MAX_NUM_CTX:
+            raise ValueError("num_ctx must be between 2048 and 262144")
         if open_request is not None and not callable(open_request):
             raise TypeError("open_request must be callable")
 
@@ -105,6 +116,7 @@ class OllamaStreamingInference:
         self._request_timeout = float(request_timeout_seconds)
         self._max_segment_chars = max_segment_chars
         self._max_active_streams = max_active_streams
+        self._num_ctx = num_ctx
         self._openings: dict[str, asyncio.Task[_LineResponse]] = {}
         self._opening_cleanups: dict[str, asyncio.Task[None]] = {}
         self._responses: dict[str, _LineResponse] = {}
@@ -123,12 +135,14 @@ class OllamaStreamingInference:
     ) -> AsyncIterator[str]:
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
+        messages = self._messages(snapshot)
         request = Request(
             self._endpoint,
             data=json.dumps(
                 {
                     "model": self._model,
-                    "messages": self._messages(snapshot),
+                    "messages": messages,
+                    "options": {"num_ctx": self._num_ctx},
                     "stream": True,
                 },
                 ensure_ascii=False,
@@ -207,6 +221,7 @@ class OllamaStreamingInference:
                     for segment in segments:
                         yield segment
                 if done:
+                    self._report_prompt(messages, payload.get("prompt_eval_count"))
                     break
             segments, buffer = self._extract_segments(buffer, final=True)
             for segment in segments:
@@ -474,6 +489,32 @@ class OllamaStreamingInference:
                 }
             )
         return messages
+
+    def _report_prompt(self, messages: list[dict[str, str]], prompt_eval_count: object) -> None:
+        """One content-free line: the prompt this adapter sent beside what Ollama evaluated.
+
+        An evaluated count near ``num_ctx`` means Ollama dropped the oldest messages.
+        """
+
+        content = "".join(message["content"] for message in messages)
+        print(
+            _PROMPT_MARKER_PREFIX
+            + json.dumps(
+                {
+                    "messages": len(messages),
+                    "num_ctx": self._num_ctx,
+                    "prompt_bytes": len(content.encode("utf-8")),
+                    "prompt_chars": len(content),
+                    "prompt_eval_count": (
+                        prompt_eval_count if type(prompt_eval_count) is int else None
+                    ),
+                    "version": 1,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     @staticmethod
     def _payload(raw_line: object) -> dict[str, object]:

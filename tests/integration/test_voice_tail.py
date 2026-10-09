@@ -156,7 +156,7 @@ async def test_pending_closing_review_is_bound_to_first_checkpoint_on_restart(
             users=1,
             pending=pending,
             close_targets=(1,),
-            rows=((0, True), (1, False)),
+            rows=((0, True, 40), (1, False, 40)),
         ),
     )
     valid = voice_tail_bytes(conversation, archive)
@@ -190,7 +190,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
                 users=3,
                 pending=pending,
                 close_targets=(2,),
-                rows=((0, True), (1, True), (3, True)),
+                rows=((0, True, 40), (1, True, 40), (3, True, 40)),
             ),
         )
         malformed_start, malformed_users = 2, 0
@@ -204,7 +204,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
             review=ReviewProgress(
                 users=3,
                 pending=pending,
-                rows=((0, True), (1, True), (2, True)),
+                rows=((0, True, 40), (1, True, 40), (2, True, 40)),
             ),
         )
         malformed_start, malformed_users = 1, 1
@@ -219,7 +219,7 @@ def test_pending_review_cannot_omit_the_first_retained_row(closing: bool) -> Non
 @pytest.mark.asyncio
 async def test_periodic_pending_cannot_cross_the_first_close_checkpoint(tmp_path: Path) -> None:
     conversation = _rows(*(("user", f"Q{seq}", False) for seq in range(58, 74)))
-    retained = tuple((seq, True) for seq in range(50, 74))
+    retained = tuple((seq, True, 40) for seq in range(50, 74))
     archive = _archive(
         next_seq=74,
         settled=16,
@@ -281,7 +281,7 @@ async def test_empty_closing_replay_start_is_exact(
             reviewed_users=int(review_cursor is not None),
             pending=pending,
             close_targets=(target,),
-            rows=((target + 1, True),),
+            rows=((target + 1, True, 40),),
         ),
     )
     valid = voice_tail_bytes(conversation, archive)
@@ -304,7 +304,7 @@ async def test_empty_closing_replay_start_is_exact(
                 await asyncio.gather(planning, return_exceptions=True)
             assert writer._review.pending is None
             assert not writer._review.close_reviewed
-            assert writer._review.rows == ((target + 1, True),)
+            assert writer._review.rows == ((target + 1, True, 40),)
         finally:
             await writer.close()
 
@@ -1563,7 +1563,7 @@ async def test_restored_empty_closing_pending_is_reconciled_without_losing_later
             users=3,
             pending=stale,
             close_targets=(0,),
-            rows=((1, True), (2, True), (3, True)),
+            rows=((1, True, 40), (2, True, 40), (3, True, 40)),
         ),
     )
     raw = voice_tail_bytes(conversation, archive)
@@ -2091,3 +2091,143 @@ async def test_a_restart_restores_the_frozen_batch_exactly_under_other_bounds(
         assert await asyncio.wait_for(successor.next_batch(), timeout=2) == frozen
     finally:
         await successor.close()
+
+
+# --- review windows within the companion's snapshot budget -------------------------------
+
+
+def _companion_snapshot_bytes(rows: list[tuple[str, str]]) -> int:
+    """What the companion measures before it admits a review window."""
+    snapshot = [{"role": role, "content": text} for role, text in rows]
+    return len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8"))
+
+
+def test_a_review_row_costs_exactly_its_share_of_the_companion_snapshot() -> None:
+    rows = [
+        ("user", "Plain question?"),
+        ("assistant", 'Quotes " and \\ and a control \x01 character.'),
+        ("assistant", "Accents é, ideographs 漢字 and a bird 🐦."),
+    ]
+    costs = [voice_tail_module.review_row_bytes(role, text) for role, text in rows]
+
+    assert 2 + sum(costs) + 2 * (len(rows) - 1) == _companion_snapshot_bytes(rows)
+    assert voice_tail_module.REVIEW_SNAPSHOT_BYTES == 16_384
+    assert voice_tail_module.review_row_bytes("user", "x" * 20_000) == 16_385
+
+
+def test_a_review_window_is_the_longest_prefix_within_the_budget_and_never_empty() -> None:
+    window = voice_tail_module._review_window
+    # Brackets, two rows and one ", " separator: exactly 16,384 bytes fits.
+    assert window([(0, True, 8190), (1, False, 8190)]) == [(0, True, 8190), (1, False, 8190)]
+    assert window([(0, True, 8190), (1, False, 8191)]) == [(0, True, 8190)]
+    assert window([(0, True, 16_385), (1, False, 1)]) == [(0, True, 16_385)]
+    assert window([(0, True, 10), (1, False, 10), (2, True, 16_360)]) == [
+        (0, True, 10),
+        (1, False, 10),
+    ]
+
+
+async def _archive_everything(writer: VoiceTailWriter) -> None:
+    while writer._outbox:
+        batch = await asyncio.wait_for(writer.next_batch(), 2)
+        assert writer.acknowledge(
+            batch.conversation_id, batch.generation, batch.seq_from, batch.seq_through
+        )
+
+
+async def _review_store(path: Path) -> tuple[VoiceTailWriter, ConversationContextStore]:
+    writer = _archiver(path, max_outbox_rows=64, max_batch_rows=8)
+    store = ConversationContextStore(max_item_chars=1024, on_change=writer.update)
+    await writer.open(store)
+    return writer, store
+
+
+def _texts_by_seq(store: ConversationContextStore) -> dict[int, tuple[str, str]]:
+    view = store.durable_view()
+    return {
+        view.first + index: (message.role, message.text)
+        for index, message in enumerate(view.messages)
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_periodic_review_window_fits_the_companions_byte_budget(tmp_path: Path) -> None:
+    writer, store = await _review_store(tmp_path / "tail.json")
+    try:
+        for turn in range(10):
+            _say(store, f"Question {turn}?")
+            # Two UTF-8 bytes a character: a whole reply is about 2 KB in the snapshot.
+            _reply(store, "é" * 1000)
+        await _archive_everything(writer)
+        rows = _texts_by_seq(store)
+
+        first = await asyncio.wait_for(writer.next_review(10), 2)
+        window = [rows[seq] for seq in range(first.seq_from, first.seq_through + 1)]
+        # Twenty rows is within the 24-row limit; the bytes bound the window first.
+        assert (first.seq_from, first.closing) == (0, False)
+        assert _companion_snapshot_bytes(window) <= 16_384
+        assert _companion_snapshot_bytes([*window, rows[first.seq_through + 1]]) > 16_384
+        assert writer.acknowledge_review(first)
+
+        second = await asyncio.wait_for(writer.next_review(10), 2)
+        assert second.seq_from == first.seq_through + 1
+        window = [rows[seq] for seq in range(second.seq_from, second.seq_through + 1)]
+        assert _companion_snapshot_bytes(window) <= 16_384
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_closing_window_over_budget_is_not_final_until_it_covers_every_row(
+    tmp_path: Path,
+) -> None:
+    writer, store = await _review_store(tmp_path / "tail.json")
+    try:
+        # Eight turns, below the review interval: sixteen rows, over 16 KB in all.
+        for turn in range(8):
+            _say(store, f"Question {turn}?")
+            _reply(store, "é" * 1000)
+        await _archive_everything(writer)
+        writer.request_review_close()
+        rows = _texts_by_seq(store)
+        assert _companion_snapshot_bytes(list(rows.values())) > 16_384
+
+        partial = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (partial.seq_from, partial.closing) == (0, False)
+        assert partial.seq_through < 15
+        window = [rows[seq] for seq in range(partial.seq_from, partial.seq_through + 1)]
+        assert _companion_snapshot_bytes(window) <= 16_384
+        assert writer.acknowledge_review(partial)
+
+        final = await asyncio.wait_for(writer.next_review(10), 2)
+        assert (final.seq_from, final.seq_through, final.closing) == (
+            partial.seq_through + 1,
+            15,
+            True,
+        )
+        assert writer.acknowledge_review(final)
+        assert writer._review.close_targets == ()
+    finally:
+        await writer.close()
+
+
+def test_review_rows_an_older_build_retained_are_costed_as_the_largest_row() -> None:
+    conversation = _rows(("user", "Q0", False))
+    archive = _archive(
+        next_seq=1,
+        settled=1,
+        cursor=0,
+        review=ReviewProgress(users=1, rows=((0, True, 40),)),
+    )
+    document = json.loads(voice_tail_bytes(conversation, archive))
+    assert document["archive"]["review"]["rows"] == [[0, True, 40]]
+
+    document["archive"]["review"]["rows"] = [[0, True]]
+    tail = _parse(json.dumps(document).encode())
+    assert tail is not None and tail.archive is not None and tail.archive.review is not None
+    # The worst a 64-character row can cost: six bytes a character, plus its fields.
+    assert tail.archive.review.rows == ((0, True, 36 + 6 * 64),)
+
+    for cost in (0, 16_386, True, 1.0):
+        document["archive"]["review"]["rows"] = [[0, True, cost]]
+        assert _parse(json.dumps(document).encode()) is None

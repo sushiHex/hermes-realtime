@@ -541,7 +541,9 @@ script's own actions succeeding.
   reply used it. The model's echo of the fact does not count. After a restart, the rows are the
   ones the new host read, captured before it started. The host must also report restoring exactly
   that many. Nothing restates the fact, so the bounded context window shows up as a `different`
-  verdict.
+  verdict. Each check also records the question's `[ollama-prompt]` marker: the prompt size the
+  host sent beside the `prompt_eval_count` Ollama reported
+  ([heard context window](heard-context-window.md)).
 - *Listeners.* The Hermes API, the companion and LiveKit signaling must listen on loopback only.
   Any other address fails the step, and nothing runs behind that listener.
 - *Reload inputs.* A step after the deletion spends a typed turn and an approval decision, reloads

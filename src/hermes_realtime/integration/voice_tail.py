@@ -38,6 +38,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from hermes_realtime.companion.integrity import validate_voice_row
+from hermes_realtime.companion.review import MAX_REVIEW_BYTES, MAX_REVIEW_TOKENS
 from hermes_realtime.conversation import (
     ConversationContextStore,
     ConversationMessage,
@@ -87,6 +88,11 @@ _REVIEW_FIELDS = frozenset(
     }
 )
 _MAX_REVIEW_ROWS = 4096
+# The companion refuses a review window whose snapshot JSON exceeds this many bytes; the
+# refusal is not transient. A retained review row carries its exact cost, capped one byte
+# past the budget, so a window is chosen within it.
+REVIEW_SNAPSHOT_BYTES = min(MAX_REVIEW_BYTES, MAX_REVIEW_TOKENS)
+_REVIEW_ROW_COST_CAP = REVIEW_SNAPSHOT_BYTES + 1
 _REVIEW_PENDING_FIELDS = frozenset({"seq_from", "seq_through", "users", "closing"})
 _OUTBOX_FIELDS = frozenset({"gap_before", "interrupted", "role", "seq", "text", "ts"})
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -157,7 +163,8 @@ class ReviewProgress:
     pending: ReviewRange | None = None
     close_targets: tuple[int, ...] = ()
     close_reviewed: bool = False
-    rows: tuple[tuple[int, bool], ...] = ()
+    # (seq, is_user, review snapshot bytes) for each acknowledged row not yet reviewed.
+    rows: tuple[tuple[int, bool, int], ...] = ()
     overflow: bool = False
 
 
@@ -191,8 +198,9 @@ def max_voice_tail_bytes(
         max_messages * (_ROW_OVERHEAD_BYTES + _MAX_BYTES_PER_CHAR * max_item_chars)
         + max_outbox_rows * (_OUTBOX_ROW_OVERHEAD_BYTES + _MAX_BYTES_PER_CHAR * max_item_chars)
         # One identity can need 16 decimal digits. Each retained row has a role
-        # bit; an idle checkpoint has its own identity, both with JSON punctuation.
-        + _MAX_REVIEW_ROWS * (25 + 18)
+        # bit and a capped cost of at most 5 digits; an idle checkpoint has its own
+        # identity, both with JSON punctuation.
+        + _MAX_REVIEW_ROWS * (31 + 18)
         + _ENVELOPE_OVERHEAD_BYTES
         + _ARCHIVE_OVERHEAD_BYTES
         + 128  # one bounded pending forget identity in version 4
@@ -202,6 +210,25 @@ def max_voice_tail_bytes(
 def row_wire_bound(text: str) -> int:
     """An upper bound on one row's bytes in a ``voice_archive`` line."""
     return _WIRE_ROW_OVERHEAD_BYTES + _MAX_WIRE_BYTES_PER_CHAR * len(text)
+
+
+def review_row_bytes(role: str, text: str) -> int:
+    """One row's exact bytes in the companion's review snapshot, capped past the budget."""
+    row = json.dumps({"role": role, "content": text}, ensure_ascii=False)
+    return min(len(row.encode("utf-8")), _REVIEW_ROW_COST_CAP)
+
+
+def _review_window(rows: list[tuple[int, bool, int]]) -> list[tuple[int, bool, int]]:
+    """The longest prefix whose snapshot fits the companion's budget; never empty.
+
+    The snapshot is one JSON list: its brackets, each row, and ``", "`` between rows.
+    """
+    size = 2
+    for count, (_, _, cost) in enumerate(rows):
+        size += cost + (2 if count else 0)
+        if count and size > REVIEW_SNAPSHOT_BYTES:
+            return rows[:count]
+    return rows
 
 
 def voice_tail_bytes(
@@ -405,12 +432,15 @@ def _parse_archive(
         raw_review_rows = raw_review["rows"]
         if type(raw_review_rows) is not list or len(raw_review_rows) > _MAX_REVIEW_ROWS:
             return None
-        review_rows: list[tuple[int, bool]] = []
+        review_rows: list[tuple[int, bool, int]] = []
         prior = review_cursor if review_cursor is not None else -1
+        # A row an earlier build retained has no cost; it is costed as the largest row
+        # this store holds.
+        unknown_cost = review_row_bytes("assistant", "\x01" * max_item_chars)
         for item in raw_review_rows:
             if (
                 type(item) is not list
-                or len(item) != 2
+                or len(item) not in (2, 3)
                 or not _identity(item[0])
                 or type(item[1]) is not bool
                 or item[0] <= prior
@@ -418,8 +448,11 @@ def _parse_archive(
                 or item[0] > cursor
             ):
                 return None
+            cost = item[2] if len(item) == 3 else unknown_cost
+            if type(cost) is not int or not 0 < cost <= _REVIEW_ROW_COST_CAP:
+                return None
             prior = item[0]
-            review_rows.append((item[0], item[1]))
+            review_rows.append((item[0], item[1], cost))
         overflow = raw_review["overflow"]
         if type(overflow) is not bool:
             return None
@@ -427,7 +460,9 @@ def _parse_archive(
             return None
         if review_rows and review_rows[-1][0] != cursor and not overflow:
             return None
-        if not overflow and users - reviewed_users != sum(is_user for _, is_user in review_rows):
+        if not overflow and users - reviewed_users != sum(
+            is_user for _, is_user, _ in review_rows
+        ):
             return None
         pending = None
         raw_pending = raw_review["pending"]
@@ -463,7 +498,7 @@ def _parse_archive(
                     window[0][0] != start
                     or (window[-1][0] != end and not closing)
                     or len(window) > 24
-                    or pending_users != reviewed_users + sum(is_user for _, is_user in window)
+                    or pending_users != reviewed_users + sum(is_user for _, is_user, _ in window)
                 ):
                     return None
             elif (
@@ -912,7 +947,10 @@ class VoiceTailWriter:
             return False
         del self._outbox[: self._frozen]
         users = sum(row.role == "user" for row in batch.rows)
-        retained = self._review.rows + tuple((row.seq, row.role == "user") for row in batch.rows)
+        retained = self._review.rows + tuple(
+            (row.seq, row.role == "user", review_row_bytes(row.role, row.text))
+            for row in batch.rows
+        )
         overflow = self._review.overflow or len(retained) > _MAX_REVIEW_ROWS
         if len(retained) > _MAX_REVIEW_ROWS:
             # Preserve the old unmet range. There is no bounded accurate plan for
@@ -1006,7 +1044,7 @@ class VoiceTailWriter:
                     and progress.cursor is None
                     and cursor is not None
                     and cursor >= progress.close_targets[0]
-                    and not any(seq <= progress.close_targets[0] for seq, _ in progress.rows)
+                    and not any(seq <= progress.close_targets[0] for seq, _, _ in progress.rows)
                     and (
                         progress.pending is None
                         or (
@@ -1040,7 +1078,7 @@ class VoiceTailWriter:
                     next_threshold = (progress.reviewed_users // interval + 1) * interval
                     available = progress.reviewed_users + sum(
                         is_user
-                        for seq, is_user in progress.rows
+                        for seq, is_user, _ in progress.rows
                         if seq <= progress.close_targets[0]
                     )
                     periodic = periodic and available >= next_threshold
@@ -1055,11 +1093,11 @@ class VoiceTailWriter:
                         if (not progress.close_targets or row[0] <= progress.close_targets[0])
                     ]
                     if eligible:
-                        window = eligible[:24]
+                        window = _review_window(eligible[:24])
                         if not closing:
                             needed = interval - (progress.reviewed_users % interval)
                             users_in_window = 0
-                            for index, (_, is_user) in enumerate(window):
+                            for index, (_, is_user, _) in enumerate(window):
                                 if is_user:
                                     users_in_window += 1
                                 if (
@@ -1071,8 +1109,9 @@ class VoiceTailWriter:
                                     break
                         start = window[0][0]
                         through = window[-1][0]
-                        # Only the final window carries the closing identity.
-                        final = closing and len(eligible) <= 24
+                        # Only the final window, holding every eligible row, carries
+                        # the closing identity.
+                        final = closing and len(window) == len(eligible)
                         if final:
                             through = progress.close_targets[0]
                     elif closing and progress.close_targets:
@@ -1089,7 +1128,7 @@ class VoiceTailWriter:
                         self._generation,
                         start,
                         through,
-                        progress.reviewed_users + sum(is_user for _, is_user in window)
+                        progress.reviewed_users + sum(is_user for _, is_user, _ in window)
                         if eligible
                         else progress.reviewed_users,
                         final,
@@ -1107,7 +1146,7 @@ class VoiceTailWriter:
             _marker(_OUTBOX_MARKER_PREFIX, {"refusal": "review_capacity", "version": 1})
             return False
         covered = [
-            seq for seq, _ in progress.rows if request.seq_from <= seq <= request.seq_through
+            seq for seq, _, _ in progress.rows if request.seq_from <= seq <= request.seq_through
         ]
         self._review = replace(
             progress,

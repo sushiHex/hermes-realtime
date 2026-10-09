@@ -228,9 +228,10 @@ adversarial memory entry. A deterministic boundary is a separate decision in
 
 Memory in Codex and Ollama is labelled reference data. Ollama carries its labelled JSON
 in a system message, leaving conversation messages unchanged; placement and labelling do
-not establish model prompt-injection resistance. Ollama's `num_ctx` is not set by this
-adapter, so the configured model/server context window may truncate input despite the
-memory byte cap. Adapter-boundary evidence includes the SHA-256 and UTF-8 byte length of
+not establish model prompt-injection resistance. The adapter sends an explicit Ollama
+`num_ctx`, derived from the heard window and the memory byte cap, so the server's
+hardware-dependent default cannot silently truncate the prompt
+([heard context window](heard-context-window.md#ollama-num_ctx)). Adapter-boundary evidence includes the SHA-256 and UTF-8 byte length of
 canonical memory JSON, never the memory contents.
 
 **Freshness limits:** an open conversation refreshes after this companion's reviews report
@@ -351,7 +352,10 @@ Hermes admission token under the same database write transaction. A mismatch qua
 the conversation. Review text comes exclusively from archived rows; realtime sends
 identities and flags, not a second copy of the conversation. Each request is bounded to
 24 archived messages and the companion also bounds snapshot size. An oversized snapshot
-is refused rather than passed to Hermes's routed-history digest.
+is refused rather than passed to Hermes's routed-history digest. Realtime chooses each
+window within that byte budget from per-row costs it keeps in the tail; see
+[heard context window](heard-context-window.md#review-windows-within-the-companions-byte-budget),
+including the one replay path that is not yet bounded.
 
 The parent belongs to the archive's profile, never runs a foreground turn, and uses
 `skip_memory=True` with the built-in memory and skills toolsets. Each spawn checks the

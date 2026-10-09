@@ -81,7 +81,7 @@ _KNOWN_MARKERS = frozenset(
         "voice-archive-lease", "voice-review", "hermes-bridge-hello", "voice-memory",
         "voice-memory-receive", "voice-memory-stream", "voice-forget", "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
-        "speech-stop",
+        "speech-stop", "ollama-prompt",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
@@ -2336,6 +2336,10 @@ class Rehearsal:
         answered = await self._ask_phrase()
         step.notes[name] = carried
         step.notes[f"{name}_answered"] = answered
+        # The question's own prompt: what the adapter sent beside what Ollama evaluated.
+        sent = [line for line in step.lines("host") if line.startswith("[ollama-prompt] ")]
+        prompt, _ = markers(sent[-1:])
+        step.notes[f"{name}_prompt"] = json.loads(prompt[0].split("] ", 1)[1]) if prompt else None
         step.apply(context_verdict(carried, answered))
 
     def _tail_bytes(self) -> bytes:

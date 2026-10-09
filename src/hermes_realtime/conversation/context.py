@@ -17,6 +17,10 @@ from hermes_realtime.speech import (
 _MAX_MESSAGES_LIMIT = 1024
 _MAX_ACTIVE_TASKS_LIMIT = 256
 _MAX_ITEM_CHARS_LIMIT = 65_536
+_MAX_WINDOW_CHARS_LIMIT = _MAX_MESSAGES_LIMIT * _MAX_ITEM_CHARS_LIMIT
+# The default window holds a full user row and a full reply row for each of ten turns:
+# Hermes's default review interval (memory.nudge_interval). Older turns live in memory.
+_DEFAULT_WINDOW_ITEMS = 20
 _MAX_TASK_INCARNATIONS_LIMIT = 4096
 _MAX_PENDING_ASSISTANT_ADMISSIONS_LIMIT = 256
 _MAX_REVISION_LIMIT = 2**63 - 1
@@ -112,7 +116,7 @@ AssistantTextAdmission = SpeechDeliveryAdmission
 
 @dataclass(frozen=True, slots=True, eq=False)
 class AssistantSegmentKey:
-    """Opaque identity of one generated segment's heard-text context row."""
+    """Opaque identity of one heard-text context row: a turn's reply, or part of a long one."""
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -228,14 +232,20 @@ class ConversationContextStore:
     mutation of the message rows and whenever ``prior_work`` flips, so a caller
     can mirror it off the voice path. It must be cheap; a failure is a
     programming error and propagates.
+
+    The heard window evicts its oldest rows once their text exceeds
+    ``max_window_chars``, so how much it retains does not depend on how a reply
+    was split; ``max_messages`` stays a hard row cap. The window holds at least
+    two full rows, so a row always survives the push that closes it.
     """
 
     def __init__(
         self,
         *,
-        max_messages: int = 16,
+        max_messages: int = 32,
         max_active_tasks: int = 8,
         max_item_chars: int = 1024,
+        max_window_chars: int | None = None,
         max_task_incarnations: int = 1024,
         max_pending_assistant_admissions: int = 16,
         on_change: Callable[[DurableConversation], None] | None = None,
@@ -258,6 +268,15 @@ class ConversationContextStore:
             "max_item_chars",
             _MAX_ITEM_CHARS_LIMIT,
         )
+        self._max_window_chars = self._bounded_positive_integer(
+            _DEFAULT_WINDOW_ITEMS * self._max_item_chars
+            if max_window_chars is None
+            else max_window_chars,
+            "max_window_chars",
+            _MAX_WINDOW_CHARS_LIMIT,
+        )
+        if self._max_window_chars < 2 * self._max_item_chars:
+            raise ValueError("max_window_chars must hold at least two full rows")
         self._max_task_incarnations = self._bounded_positive_integer(
             max_task_incarnations,
             "max_task_incarnations",
@@ -268,7 +287,9 @@ class ConversationContextStore:
             "max_pending_assistant_admissions",
             _MAX_PENDING_ASSISTANT_ADMISSIONS_LIMIT,
         )
-        self._messages: deque[ConversationMessage] = deque(maxlen=self._max_messages)
+        self._messages: deque[ConversationMessage] = deque()
+        # The total text of the retained rows, bounded by max_window_chars.
+        self._window_chars = 0
         self._active_tasks: dict[str, _ActiveTaskRecord] = {}
         self._task_ids_by_run_id: dict[str, str] = {}
         self._seen_task_ids: set[str] = set()
@@ -309,6 +330,12 @@ class ConversationContextStore:
 
         return self._max_messages
 
+    @property
+    def max_window_chars(self) -> int:
+        """Return the configured retained-text budget."""
+
+        return self._max_window_chars
+
     def record_user_transcript(self, transcript: Transcript) -> None:
         if type(transcript) is not Transcript:
             raise TypeError("transcript must be an exact Transcript value")
@@ -328,7 +355,7 @@ class ConversationContextStore:
         """Validate and bind one chunk before admitting it to playback.
 
         ``text`` is the exact chunk the ledger must confirm. ``heard_text`` is
-        the segment's heard text through the end of this chunk; confirmed
+        the row's heard text through the end of this chunk; confirmed
         delivery upserts it as ``segment``'s single context row. ``None``
         records nothing because no heard text could be located.
         """
@@ -390,7 +417,9 @@ class ConversationContextStore:
         if heard_text is not None:
             message = ConversationMessage(role=ConversationRole.ASSISTANT.value, text=heard_text)
             if replaces_open_row:
+                self._window_chars += len(message.text) - len(self._messages[-1].text)
                 self._messages[-1] = message
+                self._evict_to_budget()
             else:
                 self._push(message)
             self._open_assistant_segment = (segment, message)
@@ -493,7 +522,11 @@ class ConversationContextStore:
                 raise ValueError("restored message is invalid") from error
             self._validate_text(row.text)
             rows.append(row)
+        window_chars = sum(len(row.text) for row in rows)
+        if window_chars > self._max_window_chars:
+            raise ValueError("restored messages exceed max_window_chars")
         self._messages.extend(rows)
+        self._window_chars = window_chars
         if view.prior_work:
             self._end_prior_work()
         self._revision = 1
@@ -503,6 +536,7 @@ class ConversationContextStore:
         """Start a new heard conversation without changing live task authority."""
 
         self._messages.clear()
+        self._window_chars = 0
         self._evicted = 0
         self._open_assistant_segment = None
         self._assistant_admissions_by_object_id.clear()
@@ -704,9 +738,18 @@ class ConversationContextStore:
         self._notify_change()
 
     def _push(self, message: ConversationMessage) -> None:
-        if len(self._messages) == self._max_messages:
-            self._evicted += 1
         self._messages.append(message)
+        self._window_chars += len(message.text)
+        self._evict_to_budget()
+
+    def _evict_to_budget(self) -> None:
+        # The newest row alone always fits: it holds at most half the window.
+        while (
+            len(self._messages) > self._max_messages
+            or self._window_chars > self._max_window_chars
+        ):
+            self._window_chars -= len(self._messages.popleft().text)
+            self._evicted += 1
 
     def _notify_change(self) -> None:
         on_change = self._on_change
