@@ -301,14 +301,17 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
         base_url="http://127.0.0.1:11434", model="m", open_request=open_request
     )
 
+    from hermes_realtime.conversation import ActiveTaskSummary
+
     def snapshot(last: str) -> ConversationContextSnapshot:
+        # Active work renders as a system message after the question, as in the rehearsal.
         return ConversationContextSnapshot(
             revision=1,
             messages=(
                 ConversationMessage("user", "My favorite bird is the hoopoe."),
                 ConversationMessage("user", last),
             ),
-            active_tasks=(),
+            active_tasks=(ActiveTaskSummary(task_id="task_rehearsal", objective="Keep going"),),
         )
 
     async def consume(last: str) -> None:
@@ -324,6 +327,7 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
             thread.join(timeout=5)
 
     assert len(bodies) == 2
+    assert bodies[1]["messages"][-1]["role"] == "system"  # type: ignore[index]
     assert resent == [
         {
             "messages": bodies[1]["messages"],

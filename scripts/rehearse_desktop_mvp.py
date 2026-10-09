@@ -142,7 +142,7 @@ _RESTARTED = "I restarted, so background work from before will not resume."
 # The context checks' question; the host child recognizes its prompt by it.
 _BIRD_QUESTION = "What is my favorite bird? Answer with one word."
 # How long a context check waits for the host child's recall trials.
-_RECALL_SECONDS = 600.0
+_RECALL_SECONDS = 300.0
 _PRIVATE_ID = re.compile(r"\b(?:run|deleg)_[A-Za-z0-9]")
 _DELETE_STATES = {
     "Starting deletion…": "starting",
@@ -2389,10 +2389,13 @@ class Rehearsal:
         step.notes[f"{name}_prompt"] = self._last_marker(step, "rehearsal-prompt")
         step.notes[f"{name}_ollama"] = self._last_marker(step, "ollama-prompt")
         if self.recall_trials:
+            # A measurement, never a verdict: a missing one is recorded as null.
             step.stage = f"{name}_recall"
-            async with asyncio.timeout(_RECALL_SECONDS):
-                while (recall := self._last_marker(step, "rehearsal-recall")) is None:
-                    await asyncio.sleep(1)
+            deadline = time.monotonic() + _RECALL_SECONDS
+            while (
+                recall := self._last_marker(step, "rehearsal-recall")
+            ) is None and time.monotonic() < deadline:
+                await asyncio.sleep(1)
             step.notes[f"{name}_recall"] = recall
         prompt = step.notes[f"{name}_prompt"]
         in_prompt = None if type(prompt) is not dict else prompt.get("fact_rows", 0) > 0
@@ -2801,11 +2804,9 @@ def _observe_prompts() -> None:
     def observed(snapshot: Any) -> list[dict[str, str]]:
         messages = render(snapshot)
         marker("rehearsal-prompt", prompt_observation(messages, phrase))
-        question[:] = (
-            [messages]
-            if trials and messages[-1:] == [{"role": "user", "content": _BIRD_QUESTION}]
-            else []
-        )
+        # System notes (background work, updates) may follow the question.
+        users = [message["content"] for message in messages if message["role"] == "user"]
+        question[:] = [messages] if trials and users[-1:] == [_BIRD_QUESTION] else []
         return messages
 
     async def observed_stream(self: Any, snapshot: Any, *, turn_id: str) -> AsyncIterator[str]:
