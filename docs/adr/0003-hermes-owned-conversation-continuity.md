@@ -1,6 +1,6 @@
 # ADR 0003: Realtime converses; Hermes keeps the turns
 
-Status: Proposed for review (revised; owner-agreed direction). Work items:
+Status: Accepted (owner decision, 2026-10-09). Work items:
 [#77](https://github.com/sushiHex/hermes-realtime/issues/77),
 [#80](https://github.com/sushiHex/hermes-realtime/issues/80), and
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159).
@@ -15,8 +15,48 @@ rejection of an in-process plugin writer. The sections below are edited in place
 
 Reviewed upstream source: Hermes Agent
 [`v0.21.0` at `29112bef`](https://github.com/NousResearch/hermes-agent/commit/29112bef099274229cadff79cdff7bf7b99c4b77),
-the owner's qualification baseline rather than a compatibility ceiling. This record does not
-claim that the design is implemented.
+the owner's qualification baseline rather than a compatibility ceiling. Acceptance covers
+the design and the demonstrated integration below, within its stated limits; it is not a
+release approval or a claim of compatibility with unqualified Hermes versions.
+
+## Acceptance evidence and boundary
+
+The owner accepted this design after M0–M4 and the deletion and context-window corrections
+landed. Each linked PR owns its exact candidate, qualification results, mutations and review
+record. This table is an evidence map, not a second work tracker.
+
+| Contract | Implementation and qualification evidence |
+| --- | --- |
+| Dispatch identity, heard-first context and crash settlement | [#187](https://github.com/sushiHex/hermes-realtime/pull/187); [durable voice tail, #189](https://github.com/sushiHex/hermes-realtime/pull/189) |
+| M0: native storage, integrity, leases and quarantine (criteria 2, 3, 5, 12) | [#191](https://github.com/sushiHex/hermes-realtime/pull/191), including its corrected real-Hermes and mutation witnesses |
+| M1: archive fidelity and no negative reads (criteria 1, 4) | [#198](https://github.com/sushiHex/hermes-realtime/pull/198), including real plugin discovery and cross-process ownership |
+| M2: confined review, coverage, attribution, corrections and no speech (criteria 6–9, 11) | [#201](https://github.com/sushiHex/hermes-realtime/pull/201), using pinned Hermes and a declared stand-in model |
+| M4: bounded, profile-bound memory readback (criteria 13–18) | [#204](https://github.com/sushiHex/hermes-realtime/pull/204), including non-ASCII recall after restart and a simulated 25-hour gap, no turn-path reads, and the forced-tool differential |
+| M3: archive deletion and owner succession (criterion 10) | [#207](https://github.com/sushiHex/hermes-realtime/pull/207), corrected by [#216](https://github.com/sushiHex/hermes-realtime/pull/216): durable intent independent of the tail, permanent fences, truthful status, copies and succession |
+| Integrated reconnect, restart and context retention | [#217 qualification and rehearsal](https://github.com/sushiHex/hermes-realtime/pull/217#issuecomment-6074132419) at `256aaa6`: M0–M4 passed; the installed rehearsal observed recall in 20/20 trials at each context check |
+
+The acceptance evidence includes the corrected M3
+[qualification](https://github.com/sushiHex/hermes-realtime/pull/216#issuecomment-6073071656)
+and [installed deletion rehearsal](https://github.com/sushiHex/hermes-realtime/pull/216#issuecomment-6073275770).
+That rehearsal's restart-recall step failed; it is not counted as a full pass. The subsequent
+#217 evidence separates prompt retention from a model's answer and records the corrected
+candidate. M2's [main push failure](https://github.com/sushiHex/hermes-realtime/pull/201#issuecomment-5988658102)
+also remains a failure: the unrelated event-loss race was fixed in
+[#202](https://github.com/sushiHex/hermes-realtime/pull/202), whose main push passed.
+
+These witnesses establish storage, lifecycle and integration behavior on the pinned Hermes.
+Stand-in-model review qualifies the execution boundary and correction plumbing, not general
+production-model attribution, learning quality or prompt-injection resistance. The finite
+#217 recall measurements are observations, not a perpetual-recall guarantee. Physical voice
+acceptance and release gates remain separate under
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159).
+
+The limits below remain part of the accepted decision: bounded foreground context and review
+windows, transport confirmation rather than proof of hearing, no task resumption, asynchronous
+memory refresh, and archive deletion without unlearning or physical erasure. Memory adds no
+authority; existing model-initiated dispatch and cancellation still have the independent
+policy decision in [#205](https://github.com/sushiHex/hermes-realtime/issues/205). Neither that
+decision nor later companion authentication hardening is claimed implemented by acceptance.
 
 ## Context
 
