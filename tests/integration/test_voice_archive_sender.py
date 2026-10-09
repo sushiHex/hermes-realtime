@@ -11,7 +11,6 @@ import pytest
 
 from hermes_realtime.conversation import ConversationContextStore
 from hermes_realtime.integration.bridge import BridgeProtocolError
-from hermes_realtime.integration.run_record import read_run_record
 from hermes_realtime.integration.voice_archive import VoiceArchiveSender
 from hermes_realtime.integration.voice_tail import VoiceTailWriter, parse_voice_tail
 from hermes_realtime.protocol import (
@@ -21,6 +20,7 @@ from hermes_realtime.protocol import (
     parse_voice_event,
 )
 from hermes_realtime.speech import Transcript
+from tests.support.live_record import read_live_record
 
 _MARKER = "[voice-archive-send] "
 
@@ -123,7 +123,7 @@ def _say(store: ConversationContextStore, *texts: str) -> None:
 
 
 def _cursor(tmp_path: Path) -> object:
-    raw = read_run_record(tmp_path / "tail.json", 1 << 20)
+    raw = read_live_record(tmp_path / "tail.json")
     if raw is None:
         return "no tail yet"
     tail = parse_voice_tail(raw, max_messages=16, max_item_chars=64, max_outbox_rows=16)
@@ -300,7 +300,7 @@ async def test_archiving_never_blocks_speech_or_the_tail(tmp_path: Path) -> None
         assert len(store.snapshot().messages) == 11
 
         def tail_holds_everything() -> bool:
-            raw = read_run_record(tmp_path / "tail.json", 1 << 20)
+            raw = read_live_record(tmp_path / "tail.json")
             tail = parse_voice_tail(
                 raw or b"", max_messages=16, max_item_chars=64, max_outbox_rows=16
             )
