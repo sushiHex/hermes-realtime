@@ -51,7 +51,7 @@ def test_the_unguarded_read_fails_on_a_refusal_the_live_read_waits_out(
 
 
 def test_a_refusal_that_never_clears_raises_after_a_bounded_number_of_opens(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = tmp_path / "tail.json"
     write_run_record(path, b"record")
@@ -61,6 +61,24 @@ def test_a_refusal_that_never_clears_raises_after_a_bounded_number_of_opens(
     with pytest.raises(PermissionError):
         read_live_record(path)
     assert opens == [DENIED_ATTEMPTS]
+    markers = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("[live-record")
+    ]
+    assert markers == [
+        f'[live-record-refused] {{"refusals": {DENIED_ATTEMPTS}, "kind": "PermissionError"}}'
+    ]
+
+
+def test_a_refusal_that_clears_leaves_no_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "tail.json"
+    write_run_record(path, b"record")
+    monkeypatch.setattr(live_record, "DENIED_PAUSE_SECONDS", 0.0)
+    _deny_opens(monkeypatch, path, DENIED_ATTEMPTS - 1, _sharing_violation())
+
+    assert read_live_record(path) == b"record"
+    assert "[live-record" not in capsys.readouterr().out
 
 
 def test_only_a_refusal_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
