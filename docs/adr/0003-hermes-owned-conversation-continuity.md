@@ -1,6 +1,6 @@
 # ADR 0003: Realtime converses; Hermes keeps the turns
 
-Status: Proposed for review (revised; owner-agreed direction). Work items:
+Status: Accepted (owner decision, 2026-10-09). Work items:
 [#77](https://github.com/sushiHex/hermes-realtime/issues/77),
 [#80](https://github.com/sushiHex/hermes-realtime/issues/80), and
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159).
@@ -15,8 +15,48 @@ rejection of an in-process plugin writer. The sections below are edited in place
 
 Reviewed upstream source: Hermes Agent
 [`v0.21.0` at `29112bef`](https://github.com/NousResearch/hermes-agent/commit/29112bef099274229cadff79cdff7bf7b99c4b77),
-the owner's qualification baseline rather than a compatibility ceiling. This record does not
-claim that the design is implemented.
+the owner's qualification baseline rather than a compatibility ceiling. Acceptance covers
+the design and the demonstrated integration below, within its stated limits; it is not a
+release approval or a claim of compatibility with unqualified Hermes versions.
+
+## Acceptance evidence and boundary
+
+The owner accepted this design after M0–M4 and the deletion and context-window corrections
+landed. Each linked PR owns its exact candidate, qualification results, mutations and review
+record. This table is an evidence map, not a second work tracker.
+
+| Contract | Implementation and qualification evidence |
+| --- | --- |
+| Dispatch identity, heard-first context and crash settlement | [#187](https://github.com/sushiHex/hermes-realtime/pull/187); [durable voice tail, #189](https://github.com/sushiHex/hermes-realtime/pull/189) |
+| M0: native storage, integrity, leases and quarantine (criteria 2, 3, 5, 12) | [#191](https://github.com/sushiHex/hermes-realtime/pull/191), including its corrected real-Hermes and mutation witnesses |
+| M1: archive fidelity and no negative reads (criteria 1, 4) | [#198](https://github.com/sushiHex/hermes-realtime/pull/198), including real plugin discovery and cross-process ownership |
+| M2: confined review, coverage, attribution, corrections and no speech (criteria 6–9, 11) | [#201](https://github.com/sushiHex/hermes-realtime/pull/201), using pinned Hermes and a declared stand-in model |
+| M4: bounded, profile-bound memory readback (criteria 13–18) | [#204](https://github.com/sushiHex/hermes-realtime/pull/204), including non-ASCII recall after restart and a simulated 25-hour gap, no turn-path reads, and the forced-tool differential |
+| M3: archive deletion and owner succession (criterion 10) | [#207](https://github.com/sushiHex/hermes-realtime/pull/207), corrected by [#216](https://github.com/sushiHex/hermes-realtime/pull/216): durable intent independent of the tail, permanent fences, truthful status, copies and succession |
+| Integrated reconnect, restart and context retention | [#217 qualification and rehearsal](https://github.com/sushiHex/hermes-realtime/pull/217#issuecomment-6074132419) at `256aaa6`: M0–M4 passed; the installed rehearsal observed recall in 20/20 trials at each context check |
+
+The acceptance evidence includes the corrected M3
+[qualification](https://github.com/sushiHex/hermes-realtime/pull/216#issuecomment-6073071656)
+and [installed deletion rehearsal](https://github.com/sushiHex/hermes-realtime/pull/216#issuecomment-6073275770).
+That rehearsal's restart-recall step failed; it is not counted as a full pass. The subsequent
+#217 evidence separates prompt retention from a model's answer and records the corrected
+candidate. M2's [main push failure](https://github.com/sushiHex/hermes-realtime/pull/201#issuecomment-5988658102)
+also remains a failure: the unrelated event-loss race was fixed in
+[#202](https://github.com/sushiHex/hermes-realtime/pull/202), whose main push passed.
+
+These witnesses establish storage, lifecycle and integration behavior on the pinned Hermes.
+Stand-in-model review qualifies the execution boundary and correction plumbing, not general
+production-model attribution, learning quality or prompt-injection resistance. The finite
+#217 recall measurements are observations, not a perpetual-recall guarantee. Physical voice
+acceptance and release gates remain separate under
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159).
+
+The limits below remain part of the accepted decision: bounded foreground context and review
+windows, transport confirmation rather than proof of hearing, no task resumption, asynchronous
+memory refresh, and archive deletion without unlearning or physical erasure. Memory adds no
+authority; existing model-initiated dispatch and cancellation still have the independent
+policy decision in [#205](https://github.com/sushiHex/hermes-realtime/issues/205). Neither that
+decision nor later companion authentication hardening is claimed implemented by acceptance.
 
 ## Context
 
@@ -172,8 +212,9 @@ entry:
 - **Admitted:** the run's Hermes ID, which also names its session. Never the private protocol
   ID, never the objective.
 
-The record is versioned, bounded by the active-run capacity, and, with the durable voice tail
-below, one of only two persisted realtime files. It is owned by one host at a time: a host
+The record is versioned and bounded by the active-run capacity. Realtime also persists the
+durable voice tail and its separate deletion-intent record, described below. The binding
+record is owned by one host at a time: a host
 holds an exclusive lock on it from before it
 settles the record until after its final write, and a second host fails to start rather than
 stop runs it does not own. #77 item 4 admits exactly this kind of bounded transient reference.
@@ -215,20 +256,25 @@ a dispatch whose resend also gets no response ends with its outcome unknown.
 
 ### Live context follows the same rule
 
-Live foreground context is heard-first. Assistant rows fill only from delivery-confirmed chunks:
-each generated segment has one row, holding the exact slice of the segment text through its
-latest confirmed chunk. Interruption is data, not text: a turn that ends abnormally after some of
-its speech was confirmed sets `interrupted` once on its last confirmed row, whose text stays
-exactly what was delivered. Providers render the flag deterministically, as an `"interrupted":
-true` field in the Codex snapshot and as a fixed suffix in Ollama's chat messages. Model text
-can never forge the flag. A turn with nothing confirmed writes no assistant row. A replay adds
-only newly confirmed text, as its own row. The undelivered remainder stays in the
-resumable-replay machinery. The Codex prompt's statement that earlier assistant messages
-"represent only speech confirmed delivered"
-([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801)) is therefore true, and
-the live context, the Hermes archive, and what the user experienced match by construction. A
-turn that completes normally closes its last row, so only speech still in progress can be
-cut off.
+Live foreground context is heard-first. One assistant row holds a turn's transport-confirmed
+chunks, including chunks from successive generated publications; the confirmed slices are joined
+with one space between publications. If the next confirmed chunk would exceed `max_item_chars`,
+the current row closes and a new row starts with that chunk. Thus only oversized replies roll
+over to multiple rows. A chunk that cannot be located in its publication adds no text. The
+window evicts oldest rows by its bounded text budget and hard row cap, rather than by the number
+of publications ([window contract](../heard-context-window.md)).
+
+Interruption is data, not text: a turn that ends abnormally after some speech was confirmed sets
+`interrupted` once on its last confirmed row, including after a rollover. Its text stays exactly
+the confirmed portion. A crash conservatively flags the open row in the durable voice tail.
+Providers render the flag deterministically, as an `"interrupted": true` field in the Codex
+snapshot and as a fixed suffix in Ollama's chat messages. Model text can never forge the flag.
+A turn with nothing confirmed writes no assistant row. A replay is a new turn and adds only
+newly confirmed text in its own row; the undelivered remainder stays in the resumable-replay
+machinery. The Codex prompt's statement that earlier assistant messages "represent only speech
+confirmed delivered" ([prompt](../../src/hermes_realtime/providers/codex_app_server.py#L2801))
+therefore remains true. A turn that completes normally closes its last row without an
+interruption flag.
 
 A final user input becomes exactly one user row: an ordinary input through the turn it starts,
 and an explicit command, which starts no turn, before the command acts. Live speech settles
