@@ -24,6 +24,7 @@ from tests.integration.test_bridge_voice import (
     _server,
     _Voice,
 )
+from tests.support import bridge_hello
 
 
 class MemoryVoice(_Voice):
@@ -106,17 +107,13 @@ async def test_a_0_3_peer_without_memory_keeps_archive_and_review() -> None:
     async with _server(voice) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
         try:
-            writer.write(json.dumps({
-                "token": _TOKEN,
-                "participant_id": "old-peer",
-                "protocol_version": "0.3",
-                "capabilities": ["voice_archive", "voice_review", "voice_memory"],
-            }).encode("utf-8") + b"\n")
-            await writer.drain()
-            assert json.loads(await reader.readline()) == {
+            welcome = await bridge_hello.authenticate(reader, writer, _TOKEN, bridge_hello.hello(
+                "old-peer", ("voice_archive", "voice_review", "voice_memory"),
+            ))
+            assert {k: v for k, v in welcome.items() if k not in {"server_nonce", "proof"}} == {
                 "ok": True,
                 "protocol_version": "0.3",
-                "capabilities": ["voice_archive", "voice_review"],
+                "capabilities": ["mutual_auth", "voice_archive", "voice_review"],
                 "review_interval": 10,
             }
             archive = _batch()

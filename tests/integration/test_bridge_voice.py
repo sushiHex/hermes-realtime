@@ -28,6 +28,7 @@ from hermes_realtime.protocol import (
     VoiceReviewEvent,
     VoiceReviewRefusedEvent,
 )
+from tests.support import bridge_hello
 
 _TOKEN = "correct-test-token-with-sufficient-entropy"
 
@@ -41,7 +42,7 @@ class _Dispatcher:
 
 
 def _server(
-    voice: Any = None, runtime: RuntimeAttestation | None = None
+    voice: Any = None, runtime: RuntimeAttestation | None = None, **options: Any
 ) -> LocalHermesBridgeServer:
     from datetime import UTC, datetime
 
@@ -64,6 +65,7 @@ def _server(
         token=_TOKEN,
         voice=voice,
         runtime=runtime,
+        **options,
     )
 
 
@@ -146,14 +148,29 @@ async def _hello(server: LocalHermesBridgeServer, hello: dict[str, object]) -> o
 
 
 def _valid_hello(**overrides: object) -> dict[str, object]:
-    hello: dict[str, object] = {
-        "token": _TOKEN,
-        "participant_id": "voice-archive",
-        "protocol_version": "0.3",
-        "capabilities": ["voice_archive"],
-    }
-    hello.update(overrides)
+    """A well-formed hello; a capability list given here gets ``mutual_auth`` added."""
+    capabilities = overrides.pop("capabilities", ["voice_archive"])
+    hello = bridge_hello.hello("voice-archive", (), **overrides)
+    hello["capabilities"] = (
+        [*capabilities, "mutual_auth"] if type(capabilities) is list else capabilities
+    )
     return hello
+
+
+def _without_auth() -> dict[str, object]:
+    return _valid_hello() | {"capabilities": ["voice_archive"]}
+
+
+async def _authenticated(
+    server: LocalHermesBridgeServer, hello: dict[str, object]
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, dict[str, object]]:
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    welcome = await bridge_hello.authenticate(reader, writer, _TOKEN, hello)
+    return reader, writer, welcome
+
+
+def _unsigned(welcome: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in welcome.items() if key not in {"server_nonce", "proof"}}
 
 
 @pytest.mark.asyncio
@@ -198,7 +215,11 @@ async def test_the_hello_negotiates_voice_archive_only_when_the_companion_offers
         pytest.param(_valid_hello(capabilities=["voice_archive", "voice_archive"]), id="repeated"),
         pytest.param(_valid_hello(capabilities="voice_archive"), id="capabilities-not-a-list"),
         pytest.param(_valid_hello(extra=1), id="extra-key"),
-        pytest.param(_valid_hello(token="wrong-token-wrong-token-wrong"), id="wrong-token"),
+        # The 0.3 hello carries no token; one that still does is refused, never checked.
+        pytest.param(_valid_hello(token=_TOKEN), id="a-token-in-the-hello"),
+        pytest.param(_without_auth(), id="without-mutual-auth"),
+        pytest.param(_valid_hello(client_nonce="0" * 63), id="short-nonce"),
+        pytest.param(_valid_hello(client_nonce="G" * 64), id="non-hex-nonce"),
     ],
 )
 async def test_every_malformed_hello_is_refused(hello: dict[str, object]) -> None:
@@ -221,7 +242,9 @@ _BRIDGE_MARKER = "[hermes-bridge-hello] "
             id="repeated",
         ),
         pytest.param({"token": _TOKEN, "participant_id": "p1"}, "shape", id="shape"),
-        pytest.param(_valid_hello(token="wrong-token-wrong-token-wrong"), "token", id="token"),
+        pytest.param(_valid_hello(token=_TOKEN), "shape", id="token-in-hello"),
+        pytest.param(_without_auth(), "capability", id="without-auth"),
+        pytest.param(_valid_hello(client_nonce="0" * 63), "nonce", id="nonce"),
     ],
 )
 async def test_a_refused_hello_leaves_one_marker_with_its_category_only(
@@ -244,16 +267,17 @@ async def test_a_refused_hello_leaves_one_marker_with_its_category_only(
 @pytest.mark.asyncio
 async def test_the_welcome_names_the_version_and_the_offered_capabilities() -> None:
     async with _server(voice=_Voice()) as server:
-        assert await _hello(server, _valid_hello()) == {
-            "ok": True,
-            "protocol_version": "0.3",
-            "capabilities": ["voice_archive"],
-        }
-        assert await _hello(server, _valid_hello(capabilities=[])) == {
-            "ok": True,
-            "protocol_version": "0.3",
-            "capabilities": [],
-        }
+        for hello, capabilities in (
+            (_valid_hello(), ["mutual_auth", "voice_archive"]),
+            (_valid_hello(capabilities=[]), ["mutual_auth"]),
+        ):
+            _reader, writer, welcome = await _authenticated(server, hello)
+            writer.close()
+            assert _unsigned(welcome) == {
+                "ok": True,
+                "protocol_version": "0.3",
+                "capabilities": capabilities,
+            }
 
 
 @pytest.mark.asyncio
@@ -348,10 +372,8 @@ async def test_review_without_negotiated_capability_never_reaches_companion() ->
 async def test_raw_unnegotiated_review_is_rejected_before_service() -> None:
     voice = _ReviewVoice()
     async with _server(voice=voice) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
-        writer.write(json.dumps(_valid_hello(capabilities=[])).encode() + b"\n")
-        await writer.drain()
-        assert json.loads(await reader.readline())["capabilities"] == []
+        reader, writer, welcome = await _authenticated(server, _valid_hello(capabilities=[]))
+        assert welcome["capabilities"] == ["mutual_auth"]
         event = VoiceReviewEvent(
             protocol_version="0.3",
             type="voice_review",
@@ -424,10 +446,8 @@ async def test_an_unknown_outcome_closes_the_connection_without_a_reply() -> Non
 async def test_a_voice_event_without_the_negotiated_capability_closes_the_connection() -> None:
     voice = _Voice()
     async with _server(voice=voice) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
-        writer.write(json.dumps(_valid_hello(capabilities=[])).encode("utf-8") + b"\n")
-        await writer.drain()
-        assert json.loads(await reader.readline())["ok"] is True
+        reader, writer, welcome = await _authenticated(server, _valid_hello(capabilities=[]))
+        assert welcome["ok"] is True
         writer.write(_batch().model_dump_json().encode("utf-8") + b"\n")
         await writer.drain()
         assert await reader.readline() == b""
@@ -452,16 +472,9 @@ async def test_the_client_never_sends_a_voice_event_the_companion_did_not_offer(
             await client.close()
 
 
-async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        await reader.readline()
-        writer.write(json.dumps(welcome).encode("utf-8") + b"\n")
-        await writer.drain()
-        await reader.read()
-        writer.close()
-
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    return server, server.sockets[0].getsockname()[1]
+async def _fake_companion(welcome: dict[str, object]) -> tuple[asyncio.Server, int]:
+    """A companion whose welcome is correctly signed, so only its own defect refuses it."""
+    return await bridge_hello.FakeCompanion(_TOKEN, lambda _hello: dict(welcome)).start()
 
 
 @pytest.mark.asyncio
@@ -470,19 +483,30 @@ async def _fake_companion(welcome: object) -> tuple[asyncio.Server, int]:
     [
         pytest.param({"ok": True}, id="a-0.1-welcome"),
         pytest.param(
-            {"ok": True, "protocol_version": "0.4", "capabilities": []}, id="wrong-version"
+            {"ok": True, "protocol_version": "0.4", "capabilities": ["mutual_auth"]},
+            id="wrong-version",
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]},
+            {
+                "ok": True, "protocol_version": "0.3",
+                "capabilities": ["mutual_auth", "voice_archive"],
+            },
             id="unrequested-capability",
         ),
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": [], "x": 1}, id="extra-key"
+            {"ok": True, "protocol_version": "0.3", "capabilities": ["mutual_auth"], "x": 1},
+            id="extra-key",
         ),
         pytest.param({"ok": False}, id="refused"),
+        pytest.param(
+            {"ok": True, "protocol_version": "0.3", "capabilities": []},
+            id="without-mutual-auth",
+        ),
     ],
 )
-async def test_the_client_refuses_a_welcome_it_did_not_ask_for(welcome: object) -> None:
+async def test_the_client_refuses_a_welcome_it_did_not_ask_for(
+    welcome: dict[str, object],
+) -> None:
     server, port = await _fake_companion(welcome)
     async with server:
         with pytest.raises(BridgeAuthenticationError):
@@ -498,7 +522,7 @@ async def test_review_welcome_refuses_unverified_interval(interval: object) -> N
         {
             "ok": True,
             "protocol_version": "0.3",
-            "capabilities": ["voice_review"],
+            "capabilities": ["mutual_auth", "voice_review"],
             "review_interval": interval,
         }
     )
@@ -526,16 +550,22 @@ _ATTESTATION = RuntimeAttestation(
 @pytest.mark.asyncio
 async def test_the_welcome_attests_the_runtime_only_when_asked() -> None:
     async with _server(voice=_ReviewVoice(), runtime=_ATTESTATION) as server:
-        asked = await _hello(server, _valid_hello(capabilities=["runtime_attestation"]))
-        unasked = await _hello(server, _valid_hello())
+        _reader, asked_writer, asked = await _authenticated(
+            server, _valid_hello(capabilities=["runtime_attestation"])
+        )
+        _reader, unasked_writer, unasked = await _authenticated(server, _valid_hello())
+        asked_writer.close()
+        unasked_writer.close()
 
-    assert asked == {
+    assert _unsigned(asked) == {
         "ok": True,
         "protocol_version": "0.3",
-        "capabilities": ["runtime_attestation"],
+        "capabilities": ["mutual_auth", "runtime_attestation"],
         "runtime": _ATTESTATION.model_dump(mode="json"),
     }
-    assert unasked == {"ok": True, "protocol_version": "0.3", "capabilities": ["voice_archive"]}
+    assert _unsigned(unasked) == {
+        "ok": True, "protocol_version": "0.3", "capabilities": ["mutual_auth", "voice_archive"],
+    }
 
 
 @pytest.mark.asyncio
@@ -575,14 +605,17 @@ async def test_the_client_holds_the_attested_runtime() -> None:
     "welcome",
     [
         pytest.param(
-            {"ok": True, "protocol_version": "0.3", "capabilities": ["runtime_attestation"]},
+            {
+                "ok": True, "protocol_version": "0.3",
+                "capabilities": ["mutual_auth", "runtime_attestation"],
+            },
             id="negotiated-without-runtime",
         ),
         pytest.param(
             {
                 "ok": True,
                 "protocol_version": "0.3",
-                "capabilities": [],
+                "capabilities": ["mutual_auth"],
                 "runtime": _ATTESTATION.model_dump(mode="json"),
             },
             id="runtime-not-negotiated",
@@ -591,14 +624,16 @@ async def test_the_client_holds_the_attested_runtime() -> None:
             {
                 "ok": True,
                 "protocol_version": "0.3",
-                "capabilities": ["runtime_attestation"],
+                "capabilities": ["mutual_auth", "runtime_attestation"],
                 "runtime": _ATTESTATION.model_dump(mode="json") | {"pid": "1"},
             },
             id="malformed-runtime",
         ),
     ],
 )
-async def test_the_client_refuses_an_unverified_attestation(welcome: object) -> None:
+async def test_the_client_refuses_an_unverified_attestation(
+    welcome: dict[str, object],
+) -> None:
     server, port = await _fake_companion(welcome)
     async with server:
         with pytest.raises(BridgeAuthenticationError):

@@ -122,7 +122,7 @@ The refusal categories:
 - `no_companion`: the `.env` names no companion endpoint.
 - `health`: `/health/detailed` did not name the gateway's process.
 - `hello_refused`: a wrong token, or a gateway still running a plugin without runtime
-  attestation: restart the gateway.
+  attestation or the authenticated hello: restart the gateway.
 - `capability`: the companion does not offer every capability the gate asks for.
 - `foreign_companion`: another process, not the gateway, owns the companion.
 - `restart_gateway`: the gateway is still running what it loaded before an update, a
@@ -153,33 +153,98 @@ versions: `29112bef` tracks such paths, and Windows can hold only one of each.
 
 ## Protocol 0.3: the hello, voice archive, review, memory and deletion
 
-The hello is exactly
-`{"token", "participant_id", "protocol_version": "0.3", "capabilities": [...]}`. The server
-answers `{"ok": true, "protocol_version": "0.3", "capabilities": [...]}` with the requested
-capabilities it offers, or `{"ok": false}`. A hello of another version, with an unknown or
-repeated capability, or with any other key, is refused. The voice capabilities are
+The hello authenticates both sides, the bridge token never crosses the wire, and neither side
+discloses anything but proofs before both have proved the token:
+
+1. The client sends `{"participant_id", "protocol_version": "0.3", "capabilities": [...],
+   "client_nonce"}`, with nothing secret in it.
+2. The server answers `{"ok": true, "protocol_version": "0.3", "server_nonce", "proof"}`, or
+   `{"ok": false}`. The welcome carries nothing else: no capabilities and no metadata.
+3. The client checks the server's proof in constant time, and sends nothing more until it
+   verifies. It then sends `{"proof"}`.
+4. The server checks the client's proof and routes nothing on the connection, and tells it
+   nothing more, before it verifies. It then sends the final acceptance:
+   `{"accepted", "capabilities": [...]}` with the requested capabilities it offers, plus the
+   metadata those capabilities carry. `accepted` is a third proof that binds them.
+   `connect` returns only after that proof verifies, and the client believes nothing the
+   acceptance carries, `runtime` included, before then.
+
+Each proof is the lowercase hex HMAC-SHA256, keyed by the token, of one canonical JSON
+transcript (sorted keys, no spaces, ASCII). The transcript holds:
+- the `role`: `server`, `client` or `accept`;
+- the protocol version and the participant;
+- both nonces;
+- the sorted requested capabilities;
+- `negotiated`, the sorted negotiated capabilities;
+- `metadata`: an object holding exactly the acceptance's `review_interval` and `runtime` that
+  are present, exactly as sent, and `{}` when neither was negotiated.
+
+The `server` and `client` proofs come before anything is negotiated, so their `negotiated`
+and `metadata` are `null`. A proof therefore cannot be replayed into another handshake,
+reflected into another role, or spliced onto an acceptance whose capabilities or metadata
+were changed. Nonces are 32 bytes from the `secrets` module, as 64 lowercase hex characters,
+and are fresh for every handshake. Each side bounds the handshake inside it: the client with
+`handshake_timeout` (10 seconds by default), the server with its authentication timeout.
+
+`mutual_auth` is a required capability: it is in every hello and every acceptance, and either
+side refuses a peer without it. There is no fallback to the token hello: any fallback would
+put the token back on the wire, so both sides of the bridge upgrade together. A hello that
+still carries a `token` key is refused as `shape`. A hello of another version, with an
+unknown or repeated capability, or with any other key, is refused too.
+
+The handshake authenticates the peers, not the connection after it. A process that could
+relay the loopback connection between the two real peers could read or alter the frames
+that follow, so the bridge claims no channel integrity or confidentiality beyond the hello.
+This is hardening inside the trusted single-user boundary in [SECURITY.md](../SECURITY.md).
+The realtime host's bearer for the Hermes API server has the token-in-the-request shape
+the hello used to have. Changing it needs support on the Hermes side, so it remains a
+boundary limit. The voice capabilities are
 `voice_archive`, `voice_review`, `voice_memory` and `voice_forget`, offered by the ready companion.
 Memory is an additive 0.3 capability, not a new wire version; peers without it keep
-dispatch, archive and review on their existing connections. A welcome that
+dispatch, archive and review on their existing connections. An acceptance that
 negotiates review also carries its profile's bounded `review_interval`. Realtime
-sends no voice event on a connection whose welcome did not list it, and the server closes a
-connection that sends one anyway. A voice connection carries voice events only. A refused
-hello leaves one `[hermes-bridge-hello]` marker with its rejection category (`shape`,
-`token`, `participant`, `version` or `capability`), never the token or the participant.
+sends no voice event on a connection whose acceptance did not list it, and the server closes
+a connection that sends one anyway. A voice connection carries voice events only.
+
+A failed handshake leaves one marker on each side that refused, naming what actually
+happened. The category is set where the failure is decided, never ahead of it, and a side's
+own cancellation is no refusal: a caller cancelling `connect`, or the server closing
+mid-handshake, leaves no marker. On the server, `[hermes-bridge-hello]` has one of these:
+- `shape`: no well-formed hello arrived. It was malformed or too long, or the client left
+  before sending one.
+- `participant`;
+- `version`;
+- `capability`;
+- `nonce`;
+- `proof`: the client's answer was no valid proof. It was wrong, malformed or too long.
+- `abandoned`: the client left after the welcome, before proving or before the acceptance
+  reached it, as it does when it refuses a welcome.
+- `deadline`: the authentication timeout expired first.
+
+On the client, `[hermes-bridge-welcome]` has one of these:
+- `shape`: no well-formed welcome arrived. It was a refusal, malformed or too long, or it
+  was cut off.
+- `proof`: the server's proof failed.
+- `acceptance`: no valid authenticated acceptance arrived. It was forged, malformed, or
+  carried a capability that was not requested; or it, or the client's proof, was cut off.
+- `runtime`: a verified acceptance carried an invalid attestation.
+- `deadline`: the handshake timed out.
+
+Markers never carry the token, a nonce, a proof or the participant.
 
 `runtime_attestation` is offered by a companion the plugin built, which captured what its
-process loaded once, when Hermes loaded the plugin. A welcome that negotiates it carries
+process loaded once, when Hermes loaded the plugin. An acceptance that negotiates it carries
 `runtime{pid, hermes_version, hermes_commit, realtime_version, realtime_install,
-realtime_record}`, and a welcome that does not must not. `hermes_commit` is the checkout's
+realtime_record}`, and an acceptance that does not must not. `hermes_commit` is the checkout's
 detached commit read from `.git/HEAD`, or `unknown`. `realtime_install` is `wheel` when
 `hermes_realtime` was imported from exactly the install `venv`'s
 `site-packages/hermes_realtime/__init__.py`, else `elsewhere`; `realtime_record` is then the
 SHA-256 of that wheel's single installed `RECORD`, else `unknown`. A process whose install
 cannot be read attests every field as `unknown` or `elsewhere`. The model is strict: exact
 types, `pid` in `[1, 2^53 - 1]`, versions of 1 to 64 characters of `[0-9A-Za-z.+_-]`, lowercase
-hex hashes, and no other field; the client refuses a welcome that breaks it. The capability is
-additive, so existing clients and servers are unchanged; a plugin that predates it refuses the
-hello, since the capability is unknown to it.
+hex hashes, and no other field; the client refuses an acceptance that breaks it. The
+capability is additive, so existing clients and servers are unchanged; a plugin that predates
+it refuses the hello, since the capability is unknown to it.
 
 Versions are mixed on purpose: the hello and every voice event name `protocol_version`
 `"0.3"` explicitly (a voice event without it is refused), while the work events

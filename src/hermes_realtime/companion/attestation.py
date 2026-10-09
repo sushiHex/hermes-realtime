@@ -1,4 +1,4 @@
-"""What a process running the plugin loaded, for the companion's welcome to attest.
+"""What a process running the plugin loaded, for the companion's acceptance to attest.
 
 The plugin captures it once, when Hermes loads it, so a gateway that kept running across an
 update or reinstall still attests what it actually imported. Anything that cannot be named
