@@ -759,6 +759,41 @@ def _readiness_cue_chunk(
     )
 
 
+async def _play_readiness_cue(
+    *,
+    conversation: ReconnectSafeConversationWorker,
+    playback: SpeechPlayback,
+    chunk: SpeechChunk,
+    participant_identity: str,
+    generation: int,
+    is_valid: Callable[[], bool],
+) -> None:
+    """Play the readiness cue with this binding's audio input suppressed.
+
+    The cue is the binding's speech: closing the binding cancels it through playback's
+    own hard stop, so a page that has gone can rebind at once instead of waiting out
+    delivery confirmation for audio no one hears.
+    """
+
+    token = await conversation.suppress_audio_input(
+        participant_identity=participant_identity,
+        session_generation=generation,
+        speech=asyncio.current_task(),
+    )
+    try:
+        await playback.play(chunk, is_valid=is_valid)
+    finally:
+        resume_task = asyncio.create_task(
+            conversation.resume_audio_input(token),
+            name=f"readiness-resume:{chunk.turn_id}",
+        )
+        try:
+            await asyncio.shield(resume_task)
+        except asyncio.CancelledError:
+            await asyncio.gather(resume_task, return_exceptions=True)
+            raise
+
+
 class _ReadinessCueAuthority:
     def __init__(self) -> None:
         self._owner: tuple[int, int] | None = None
@@ -2330,25 +2365,14 @@ def build_local_host_launcher(
                     media_incarnation,
                 ):
                     return
-                token = await conversation.suppress_audio_input(
+                await _play_readiness_cue(
+                    conversation=conversation,
+                    playback=playback,
+                    chunk=chunk,
                     participant_identity=participant_identity,
-                    session_generation=generation,
+                    generation=generation,
+                    is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
                 )
-                try:
-                    await playback.play(
-                        chunk,
-                        is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
-                    )
-                finally:
-                    resume_task = asyncio.create_task(
-                        conversation.resume_audio_input(token),
-                        name=f"readiness-resume:{generation}:{media_incarnation}",
-                    )
-                    try:
-                        await asyncio.shield(resume_task)
-                    except asyncio.CancelledError:
-                        await asyncio.gather(resume_task, return_exceptions=True)
-                        raise
 
         readiness_cue_tasks.create(
             play_with_suppressed_input(),

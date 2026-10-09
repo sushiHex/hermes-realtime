@@ -44,6 +44,8 @@ _MAX_RESPONSE_OPERATIONS = 64
 _MAX_TYPED_TRANSCRIPT_CHARS = 4096
 _DEFAULT_MAX_BUFFERED_AUDIO_BYTES = 256 * 1024
 _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
+# How long closing a binding waits for the speech it started to stop.
+_BINDING_SPEECH_SETTLE_SECONDS = 10.0
 _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
@@ -1199,7 +1201,10 @@ class ReconnectSafeConversationWorker:
         self._media_track_name: str | None = None
         self._binding: ConversationSessionWorker | None = None
         self._generation = 0
-        self._audio_input_suppression: tuple[int, str, object, bool] | None = None
+        # (generation, participant, token, typed too, the speech it fences input for)
+        self._audio_input_suppression: (
+            tuple[int, str, object, bool, asyncio.Task[Any] | None] | None
+        ) = None
         self._binding_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
         self._closed = False
@@ -1214,52 +1219,79 @@ class ReconnectSafeConversationWorker:
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
-        async with self._binding_lock:
-            if self._closed:
-                raise RuntimeError("reconnect-safe conversation worker is closed")
-            previous = self._binding
-            if previous is not None:
-                await previous.close_binding()
-                if self._binding is previous:
-                    self._binding = None
-            if self._generation >= _MAX_SESSION_GENERATION:
-                raise RuntimeError("session generation capacity exhausted")
-            self._generation += 1
-            binding = self._binding_factory(
-                participant_identity,
-                self._generation,
-                self._actions,
-            )
-            if type(binding) is not ConversationSessionWorker:
-                raise TypeError("binding_factory must return an exact session worker")
-            if binding._actions is not self._actions:
-                raise PermissionError("binding_factory replaced the action authority")
-            if binding.session_generation != self._generation:
-                raise ValueError("binding_factory returned a contradictory generation")
-            if binding.participant_identity != participant_identity:
-                raise PermissionError("binding_factory replaced the participant identity")
-            binding.start()
-            self._binding = binding
-            self._media_incarnation = None
-            self._media_track_name = None
-            self._audio_input_suppression = None
-            return self._generation
-
-    async def close_binding(self) -> None:
-        """Settle only the current media/STT generation before transport replacement."""
-
-        async with self._binding_lock:
-            if self._closed:
-                raise RuntimeError("reconnect-safe conversation worker is closed")
-            binding = self._binding
-            if binding is None:
-                return
-            await binding.close_binding()
-            if self._binding is binding:
-                self._binding = None
+        speech = None
+        try:
+            async with self._binding_lock:
+                if self._closed:
+                    raise RuntimeError("reconnect-safe conversation worker is closed")
+                speech = self._take_binding_speech_locked()
+                previous = self._binding
+                if previous is not None:
+                    await previous.close_binding()
+                    if self._binding is previous:
+                        self._binding = None
+                if self._generation >= _MAX_SESSION_GENERATION:
+                    raise RuntimeError("session generation capacity exhausted")
+                self._generation += 1
+                binding = self._binding_factory(
+                    participant_identity,
+                    self._generation,
+                    self._actions,
+                )
+                if type(binding) is not ConversationSessionWorker:
+                    raise TypeError("binding_factory must return an exact session worker")
+                if binding._actions is not self._actions:
+                    raise PermissionError("binding_factory replaced the action authority")
+                if binding.session_generation != self._generation:
+                    raise ValueError("binding_factory returned a contradictory generation")
+                if binding.participant_identity != participant_identity:
+                    raise PermissionError("binding_factory replaced the participant identity")
+                binding.start()
+                self._binding = binding
                 self._media_incarnation = None
                 self._media_track_name = None
-                self._audio_input_suppression = None
+                return self._generation
+        finally:
+            await self._settle_binding_speech(speech)
+
+    async def close_binding(self) -> None:
+        """Settle only the current media/STT generation before transport replacement.
+
+        Speech the binding started (see ``suppress_audio_input``) ends with it, so a
+        transport unbound next never waits on audio for a page that has gone.
+        """
+
+        speech = None
+        try:
+            async with self._binding_lock:
+                if self._closed:
+                    raise RuntimeError("reconnect-safe conversation worker is closed")
+                speech = self._take_binding_speech_locked()
+                binding = self._binding
+                if binding is not None:
+                    await binding.close_binding()
+                    if self._binding is binding:
+                        self._binding = None
+                        self._media_incarnation = None
+                        self._media_track_name = None
+        finally:
+            await self._settle_binding_speech(speech)
+
+    def _take_binding_speech_locked(self) -> asyncio.Task[Any] | None:
+        suppression = self._audio_input_suppression
+        self._audio_input_suppression = None
+        return None if suppression is None else suppression[4]
+
+    @staticmethod
+    async def _settle_binding_speech(speech: asyncio.Task[Any] | None) -> None:
+        """Cancel the binding's speech through its own cleanup, outside the binding lock."""
+
+        if speech is None:
+            return
+        speech.cancel()
+        _, pending = await asyncio.wait({speech}, timeout=_BINDING_SPEECH_SETTLE_SECONDS)
+        if pending:
+            raise RuntimeError("binding speech resisted cancellation")
 
     async def quiesce_for_delete(
         self, *, participant_identity: str, session_generation: int
@@ -1318,8 +1350,14 @@ class ReconnectSafeConversationWorker:
         participant_identity: str,
         session_generation: int,
         suppress_typed: bool = False,
+        speech: asyncio.Task[Any] | None = None,
     ) -> object:
-        """Fence exact-session input until the returned authority token resumes it."""
+        """Fence exact-session input until the returned authority token resumes it.
+
+        ``speech`` is the task playing to this binding while its input is fenced. It is
+        the binding's speech: closing or replacing the binding cancels it and waits for
+        its own cleanup, so the binding never outlives its audio.
+        """
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
@@ -1327,6 +1365,8 @@ class ReconnectSafeConversationWorker:
             raise TypeError("session_generation must be an exact integer")
         if type(suppress_typed) is not bool:
             raise TypeError("suppress_typed must be an exact boolean")
+        if speech is not None and type(speech) is not asyncio.Task:
+            raise TypeError("speech must be an exact asyncio Task or None")
         async with self._binding_lock:
             binding = self._binding
             if (
@@ -1344,6 +1384,7 @@ class ReconnectSafeConversationWorker:
                 participant_identity,
                 token,
                 suppress_typed,
+                speech,
             )
             return token
 
@@ -1606,7 +1647,7 @@ class ReconnectSafeConversationWorker:
     async def _close_owned(self) -> None:
         async with self._binding_lock:
             self._closed = True
-            self._audio_input_suppression = None
+            speech = self._take_binding_speech_locked()
             binding = self._binding
             errors: list[BaseException] = []
             if binding is not None:
@@ -1621,7 +1662,11 @@ class ReconnectSafeConversationWorker:
                 await self._actions.close()
             except BaseException as error:
                 errors.append(error)
-            if len(errors) == 1:
-                raise errors[0]
-            if errors:
-                raise BaseExceptionGroup("reconnect-safe worker close failed", errors)
+        try:
+            await self._settle_binding_speech(speech)
+        except BaseException as error:
+            errors.append(error)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("reconnect-safe worker close failed", errors)
