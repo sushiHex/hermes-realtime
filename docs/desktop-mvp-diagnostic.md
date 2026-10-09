@@ -586,7 +586,7 @@ microphone, and wait for **Listening — speak naturally**. Then:
 
 ### 7. Reconnect the browser
 
-- **Do:** press **Stop session**, then **Connect** again. Separately, reload the page without
+- **Do:** press **Disconnect**, then **Connect** again. Separately, reload the page without
   stopping and press **Connect**: the reloaded tab rebinds its own session (see
   [Local LiveKit](local-livekit.md#remote-full-host-activation-seam)). A refused **Connect** after a reload is a finding.
 - **Observe:** the session returns to **Listening**, without stale audio or duplicated
@@ -639,7 +639,7 @@ it as a separate observation.
 
 ### 10. Cleanup
 
-- **Do:** press **Stop session**, then `Ctrl-C` in terminal B (host), C (gateway) and A
+- **Do:** press **Disconnect**, then `Ctrl-C` in terminal B (host), C (gateway) and A
   (LiveKit). Check that nothing is left running:
 
   ```powershell

@@ -106,11 +106,11 @@ describe("session toggle presentation", () => {
     ["stopped", "Connect", false, "connect"],
     ["bootstrapping", "Connecting…", true, "connect"],
     ["connecting", "Connecting…", true, "connect"],
-    ["preparing", "Stop session", false, "stop"],
-    ["connected", "Stop session", false, "stop"],
-    ["reconnecting", "Stop session", false, "stop"],
+    ["preparing", "Disconnect", false, "stop"],
+    ["connected", "Disconnect", false, "stop"],
+    ["reconnecting", "Disconnect", false, "stop"],
     ["error", "Connect", false, "connect"],
-    ["stopping", "Stopping…", true, "stop"],
+    ["stopping", "Disconnecting…", true, "stop"],
   ] as const)("maps %s to one unambiguous action", (state, label, disabled, action) => {
     expect(sessionTogglePresentation(state)).toEqual({ label, disabled, action });
   });
@@ -128,9 +128,9 @@ describe("session toggle presentation", () => {
     });
   });
 
-  it("keeps Stop session available after a rejected remote stop disconnects locally", () => {
+  it("keeps Disconnect available after a rejected remote stop disconnects locally", () => {
     expect(sessionTogglePresentation("disconnected", true, true)).toEqual({
-      label: "Stop session",
+      label: "Disconnect",
       disabled: false,
       action: "stop",
     });
