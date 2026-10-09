@@ -765,12 +765,12 @@ Perform these checks in order. Stop on the first contradiction.
    does not exist; the purpose is approval routing, not a filesystem change. Never approve
    a command targeting an existing path during this gate.
 9. Force a transient transport interruption while leaving the connected page open and without
-   pressing **Stop session**. Restore the same endpoint and credentials, wait for automatic
+   pressing **Disconnect**. Restore the same endpoint and credentials, wait for automatic
    reconnect, and require the same browser lease and still-live microphone track to resume without
    stale audio, duplicate transcripts, cross-participant media, replayed approval actions, or a
    second `getUserMedia` call. Reapply the user's mute choice before accepting recovered media.
 10. Stay connected beyond the original bearer lifetime, exercise typed fallback once more,
-   then press **Stop session**. Require terminal stopped state and complete worker/provider cleanup.
+   then press **Disconnect**. Require terminal stopped state and complete worker/provider cleanup.
    Finally press `Ctrl-C` in terminal B and then terminal A.
 
 Retain raw monotonic first-token, first-audio, microphone-onset-to-attenuation, and
