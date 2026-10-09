@@ -81,7 +81,7 @@ _KNOWN_MARKERS = frozenset(
         "voice-archive-lease", "voice-review", "hermes-bridge-hello", "voice-memory",
         "voice-memory-receive", "voice-memory-stream", "voice-forget", "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
-        "speech-stop",
+        "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
@@ -139,6 +139,10 @@ _TOGGLES = frozenset(
     {"Connect", "Connecting…", "Stopping…", "Stop session", "Fresh launch required"}
 )
 _RESTARTED = "I restarted, so background work from before will not resume."
+# The context checks' question; the host child recognizes its prompt by it.
+_BIRD_QUESTION = "What is my favorite bird? Answer with one word."
+# How long a context check waits for the host child's recall trials.
+_RECALL_SECONDS = 300.0
 _PRIVATE_ID = re.compile(r"\b(?:run|deleg)_[A-Za-z0-9]")
 _DELETE_STATES = {
     "Starting deletion…": "starting",
@@ -915,15 +919,51 @@ def restored_fact(loaded: list[tuple[str, str]] | None, restored: object, phrase
     )
 
 
-def context_verdict(in_kept_context: bool, answered: bool) -> list[Finding]:
-    """Was the earlier fact still in the context the host keeps, and was it used?"""
+def context_verdict(in_kept_context: bool, in_prompt: bool | None) -> list[Finding]:
+    """Was the earlier fact kept, and did the question's prompt carry it?
 
-    findings: list[Finding] = []
+    Losing it is a host finding. Whether the model then uses a fact its prompt carries is
+    model quality: the answer and the measured recall rate are notes, never a finding.
+    """
+
     if not in_kept_context:
-        findings.append(("differ", "context_lost"))
-    if not answered:
-        findings.append(("differ", "context_not_answered"))
-    return findings
+        return [("differ", "context_lost")]
+    if in_prompt is None:
+        return [("differ", "no_prompt_observation")]
+    return [] if in_prompt else [("differ", "context_not_in_prompt")]
+
+
+def prompt_observation(messages: list[dict[str, str]], phrase: str) -> dict[str, int]:
+    """Counts only, at the adapter boundary: how many user rows of the prompt state the fact."""
+
+    folded = phrase.casefold()
+    return {
+        "chars": sum(len(message["content"]) for message in messages),
+        "fact_rows": sum(
+            message["role"] == "user" and folded in message["content"].casefold()
+            for message in messages
+        ),
+        "messages": len(messages),
+        "rows": sum(message["role"] in ("user", "assistant") for message in messages),
+        "version": 1,
+    }
+
+
+def recall_trials(
+    messages: list[dict[str, str]],
+    phrase: str,
+    trials: int,
+    send: Callable[[list[dict[str, str]]], str],
+) -> dict[str, int]:
+    """Send one exact prompt ``trials`` times; count the replies that name the fact."""
+
+    hits = errors = 0
+    for _ in range(trials):
+        try:
+            hits += phrase.casefold() in send(messages).casefold()
+        except (OSError, ValueError, KeyError, TypeError):
+            errors += 1
+    return {"errors": errors, "hits": hits, "trials": trials, "version": 1}
 
 
 def restart_work_verdict(
@@ -1383,9 +1423,10 @@ def preflight(model: str | None) -> list[str]:
 
 
 class Rehearsal:
-    def __init__(self, run_dir: Path, model: str) -> None:
+    def __init__(self, run_dir: Path, model: str, recall_trials: int = 0) -> None:
         self.run_dir = run_dir
         self.model = model
+        self.recall_trials = recall_trials
         self.home = run_dir / "home"
         self.logs_dir = run_dir / "logs"
         self.state_dir = run_dir / "state"
@@ -1944,6 +1985,12 @@ class Rehearsal:
                 key: value
                 for key, value in os.environ.items()
                 if key not in {"PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
+            }
+            | {
+                # For the host child's content-free observation of each prompt.
+                "HERMES_REHEARSAL_PHRASE": self.phrase,
+                "HERMES_REHEARSAL_MODEL": self.model,
+                "HERMES_REHEARSAL_RECALL_TRIALS": str(self.recall_trials),
             },
             cwd=self.candidate,
             log=log,
@@ -2321,22 +2368,44 @@ class Rehearsal:
     async def _ask_phrase(self) -> bool:
         before = await self.snapshot()
         await self.mark()
-        await self.type("What is my favorite bird? Answer with one word.")
+        await self.type(_BIRD_QUESTION)
         await self.reply(before)
         return await self.turn_has_phrase()
 
     async def _context_check(self, step: Step, name: str, carried: bool) -> None:
-        """Is the step-3 fact still in the context the host keeps, and was it used?
+        """Is the step-3 fact still in the context the host keeps, and in the question's prompt?
 
         Nothing restates it: when the host's bounded window has dropped it, the verdict says
-        so. The caller judges ``carried`` from the rows the host keeps, never from a raw count.
+        so. The caller judges ``carried`` from the rows the host keeps, never from a raw count;
+        the host child counts the prompt's fact rows at the adapter boundary. The model's
+        answer, and with ``--recall-trials`` its rate on that exact prompt, are notes.
         """
 
         step.stage = name
         answered = await self._ask_phrase()
         step.notes[name] = carried
         step.notes[f"{name}_answered"] = answered
-        step.apply(context_verdict(carried, answered))
+        # The question's own prompt: what the adapter sent beside what Ollama evaluated.
+        step.notes[f"{name}_prompt"] = self._last_marker(step, "rehearsal-prompt")
+        step.notes[f"{name}_ollama"] = self._last_marker(step, "ollama-prompt")
+        if self.recall_trials:
+            # A measurement, never a verdict: a missing one is recorded as null.
+            step.stage = f"{name}_recall"
+            deadline = time.monotonic() + _RECALL_SECONDS
+            while (
+                recall := self._last_marker(step, "rehearsal-recall")
+            ) is None and time.monotonic() < deadline:
+                await asyncio.sleep(1)
+            step.notes[f"{name}_recall"] = recall
+        prompt = step.notes[f"{name}_prompt"]
+        in_prompt = None if type(prompt) is not dict else prompt.get("fact_rows", 0) > 0
+        step.apply(context_verdict(carried, in_prompt))
+
+    @staticmethod
+    def _last_marker(step: Step, name: str) -> dict[str, Any] | None:
+        sent = [line for line in step.lines("host") if line.startswith(f"[{name}] ")]
+        found, _ = markers(sent[-1:])
+        return json.loads(found[0].split("] ", 1)[1]) if found else None
 
     def _tail_bytes(self) -> bytes:
         tail = self.state_dir / "voice-tail-v1.json"
@@ -2624,8 +2693,8 @@ async def _synthesize_clips() -> dict[str, str]:
     return clips
 
 
-async def _rehearse(run_dir: Path, model: str) -> int:
-    rehearsal = Rehearsal(run_dir, model)
+async def _rehearse(run_dir: Path, model: str, recall_trials: int = 0) -> int:
+    rehearsal = Rehearsal(run_dir, model, recall_trials)
     for directory in (rehearsal.home, rehearsal.logs_dir, rehearsal.state_dir):
         directory.mkdir(parents=True, exist_ok=True)
     left: dict[str, object] = {}
@@ -2687,8 +2756,79 @@ def _host_child(stop_file: Path, arguments: list[str]) -> int:
         _thread.interrupt_main(signal.SIGINT)
 
     threading.Thread(target=watch, name="rehearsal-stop", daemon=True).start()
+    _observe_prompts()
     sys.argv = ["hermes-realtime-host", *arguments]
     return int(host_main())
+
+
+def _observe_prompts() -> None:
+    """Report, without content, whether each Ollama prompt carries the step-3 fact.
+
+    It wraps the adapter's own rendering, so the counts are of exactly what is sent. With
+    recall trials, the context question's exact prompt is sent again that many times once
+    its own reply has finished, and only the count of replies naming the fact is printed.
+    """
+
+    import threading
+
+    from hermes_realtime.providers.ollama import DEFAULT_OLLAMA_NUM_CTX, OllamaStreamingInference
+
+    phrase = os.environ.get("HERMES_REHEARSAL_PHRASE", "")
+    if not phrase:
+        return
+    trials = int(os.environ.get("HERMES_REHEARSAL_RECALL_TRIALS", "0"))
+    model = os.environ.get("HERMES_REHEARSAL_MODEL", "")
+    render = OllamaStreamingInference._messages
+    stream = OllamaStreamingInference.stream
+    question: list[list[dict[str, str]]] = []
+
+    def marker(name: str, value: Mapping[str, object]) -> None:
+        print(f"[{name}] " + json.dumps(value, separators=(",", ":"), sort_keys=True), flush=True)
+
+    def send(messages: list[dict[str, str]]) -> str:
+        body = {
+            "model": model,
+            "messages": messages,
+            "options": {"num_ctx": DEFAULT_OLLAMA_NUM_CTX},
+            "stream": False,
+        }
+        request = urllib.request.Request(
+            f"{_OLLAMA}/api/chat",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=120) as response:
+            return str(json.loads(response.read())["message"]["content"])
+
+    def observed(snapshot: Any) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = render(snapshot)
+        marker("rehearsal-prompt", prompt_observation(messages, phrase))
+        # System notes (background work, updates) may follow the question.
+        users = [message["content"] for message in messages if message["role"] == "user"]
+        question[:] = [messages] if trials and users[-1:] == [_BIRD_QUESTION] else []
+        return messages
+
+    async def observed_stream(self: Any, snapshot: Any, *, turn_id: str) -> AsyncIterator[str]:
+        inner = stream(self, snapshot, turn_id=turn_id)
+        try:
+            async for segment in inner:
+                yield segment
+        finally:
+            # Closing this stream closes the adapter's, exactly as without the wrapper.
+            await inner.aclose()
+        if question:
+            messages = question.pop()
+            threading.Thread(
+                target=lambda: marker(
+                    "rehearsal-recall", recall_trials(messages, phrase, trials, send)
+                ),
+                name="rehearsal-recall",
+                daemon=True,
+            ).start()
+
+    OllamaStreamingInference._messages = staticmethod(observed)
+    OllamaStreamingInference.stream = observed_stream
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2698,6 +2838,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--ollama-model", help="the host's foreground model, from ollama list")
     parser.add_argument("--run-dir", type=Path, help="where to keep the run (default: temp)")
+    parser.add_argument(
+        "--recall-trials",
+        type=int,
+        choices=range(0, 101),
+        default=0,
+        metavar="N",
+        help="resend each context question's exact prompt N times and count recall (0-100)",
+    )
     args = parser.parse_args(arguments)
     missing = preflight(args.ollama_model)
     if missing:
@@ -2716,7 +2864,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if occupied else 0
     run_dir = args.run_dir or Path(tempfile.mkdtemp(prefix="hermes-mvp-rehearsal-"))
     run_dir.mkdir(parents=True, exist_ok=True)
-    return asyncio.run(_rehearse(run_dir.resolve(), args.ollama_model))
+    return asyncio.run(_rehearse(run_dir.resolve(), args.ollama_model, args.recall_trials))
 
 
 if __name__ == "__main__":

@@ -1615,6 +1615,14 @@ class StreamingSpeechLoop:
         replay_skip_counts: dict[int, int],
         evidence_lease: EvidenceTurnLease | None,
     ) -> None:
+        # Heard context for this turn is one row: the exact heard slice of each
+        # publication, joined by one space. A row that would outgrow max_item_chars
+        # ends at the previous chunk and a new row starts at this one; pushing the new
+        # row closes the old. A replay is its own turn, starting after the chunks the
+        # original turn already confirmed.
+        segment = AssistantSegmentKey()
+        row_text = ""
+        max_row_chars = self._context.max_item_chars
         while True:
             publication = await self._next_publication_or_done(producer_done)
             if publication is None:
@@ -1638,10 +1646,7 @@ class StreamingSpeechLoop:
                 raise
             iteration_error: BaseException | None = None
             text_cursor = 0
-            # Heard context for this segment is one row: the exact slice of its
-            # text from heard_start through the latest located chunk. A replay
-            # starts after the chunks the original turn already confirmed.
-            segment = AssistantSegmentKey()
+            row_prefix = row_text
             heard_start = 0
             try:
                 while True:
@@ -1672,7 +1677,21 @@ class StreamingSpeechLoop:
                             replay_skip_counts[publication.sequence] = confirmed_prefix - 1
                             heard_start = text_cursor
                             continue
-                        heard_text = publication.text[heard_start:text_cursor]
+                        heard = publication.text[heard_start:text_cursor]
+                        # Only a located chunk extends the row, so only one can outgrow it.
+                        candidate = (
+                            row_prefix
+                            if not heard
+                            else heard
+                            if not row_prefix
+                            else f"{row_prefix} {heard}"
+                        )
+                        if len(candidate) > max_row_chars:
+                            segment = AssistantSegmentKey()
+                            row_prefix = ""
+                            heard_start = text_offset
+                            candidate = publication.text[heard_start:text_cursor]
+                        row_text = candidate
                         await output.put(
                             _PrefetchedSpeech(
                                 publication=publication,
@@ -1680,7 +1699,7 @@ class StreamingSpeechLoop:
                                 segment_text_offset_utf16=segment_text_offset_utf16,
                                 synthesis_attempt_id=synthesis_attempt_id,
                                 segment=segment,
-                                heard_text=heard_text if heard_text.strip() else None,
+                                heard_text=row_text or None,
                             )
                         )
                         slot_owned = False

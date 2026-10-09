@@ -265,10 +265,10 @@ async def test_streaming_loop_confirms_livekit_pcm_before_inference_completes() 
                 "First audible answer.",
                 "Second audible answer.",
             ]
+            # Both confirmed chunks are one turn's reply: one heard row.
             assert [message.text for message in context.snapshot().messages] == [
                 "Can you hear this?",
-                "First audible answer.",
-                "Second audible answer.",
+                "First audible answer. Second audible answer.",
             ]
             assert ledger.pending() == ()
             assert ledger.retained_chunk_count == 0

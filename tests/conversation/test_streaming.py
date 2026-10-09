@@ -1969,23 +1969,201 @@ async def test_multi_chunk_segment_upserts_one_row_equal_to_the_exact_segment_sl
 
 
 @pytest.mark.asyncio
-async def test_normal_completion_records_each_heard_segment_without_marker() -> None:
+async def test_normal_completion_records_one_heard_row_per_turn_without_marker() -> None:
     context = ConversationContextStore()
+    playback = ContextProbePlayback(context)
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer."),
+        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
         synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    # Each sentence is its own publication; the turn's heard text grows one row.
+    assert playback.context_at_play == [
+        ["Question?"],
+        ["Question?", "First answer."],
+        ["Question?", "First answer. Second answer."],
+    ]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer. Second answer. Third answer.", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_restart_announcement_row_counts_against_the_window_budget() -> None:
+    context = ConversationContextStore(max_item_chars=16, max_window_chars=32)
+    context.record_user_transcript(Transcript(text="x" * 16, final=True))
+    context.record_user_transcript(Transcript(text="y" * 10, final=True))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=PerTurnInference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    assert await loop.announce("restart_notice", "Back online now.") is True
+
+    # 16 + 10 + 16 passes 32: the announcement is heard context like any reply.
+    view = context.durable_view()
+    assert [message.text for message in view.messages] == ["y" * 10, "Back online now."]
+    assert (view.first, view.unsettled) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_not_located_in_a_later_publication_leaves_the_row_unchanged() -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context)
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("Located.", "Not located."),
+        synthesizer=_FirstLocatedSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert [chunk.text for chunk in playback.chunks] == ["Located.", "Elsewhere."]
+    assert _context_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "Located.", False),
+    ]
+
+
+class _FirstLocatedSynthesizer(SegmentSynthesizer):
+    """Speak the first publication as written and every later one as unrelated text."""
+
+    async def _synthesize(self, text: str, turn_id: str) -> AsyncIterator[SpeechChunk]:
+        self.texts.append(text)
+        yield SpeechChunk(
+            turn_id=turn_id,
+            chunk_id=f"located_{len(self.texts)}",
+            text=text if len(self.texts) == 1 else "Elsewhere.",
+            audio=AudioFrame(pcm=b"\x01\x00", sample_rate_hz=16_000, channels=1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_long_turn_rolls_over_to_a_new_row_at_a_chunk_boundary_and_never_raises() -> None:
+    context = ConversationContextStore(max_item_chars=32)
+    observed: list[tuple[str, dict[str, str | int | bool | None]]] = []
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference(
+            "One two three.", "Four five six.", "Seven eight nine. Ten eleven."
+        ),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        observer=lambda kind, data: observed.append((kind, data)),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    # "One two three. Four five six." is 29 characters; adding the next chunk would
+    # pass 32, so the row closes and the next starts exactly at that chunk.
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "One two three. Four five six.", False),
+        ("assistant", "Seven eight nine. Ten eleven.", False),
+    ]
+    assert observed[-1][0] == "assistant_turn_completed"
+
+
+@pytest.mark.asyncio
+async def test_a_rollover_inside_one_publication_starts_at_its_chunk() -> None:
+    context = ConversationContextStore(max_item_chars=28)
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("One two three.", "Four five.  Six seven."),
+        synthesizer=SentenceSliceSynthesizer(),
         playback=RecordingPlayback(),
         ledger=DeliveredSpeechLedger(),
     )
 
     await loop.respond("turn_001", Transcript(text="Question?", final=True))
 
-    assert _context_rows(context) == [
+    # The second publication's first chunk still fits the row; its second does not.
+    # The gap before the rolled-over chunk belongs to neither row.
+    assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer.", False),
-        ("assistant", "Second answer.", False),
+        ("assistant", "One two three. Four five.", False),
+        ("assistant", "Six seven.", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_rolled_over_turn_flags_only_its_last_row() -> None:
+    context = ConversationContextStore(max_item_chars=32)
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_3_2"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference(
+            "One two three.", "Four five six.", "Seven eight nine. Ten eleven."
+        ),
+        synthesizer=SentenceSliceSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "One two three. Four five six.", False),
+        ("assistant", "Seven eight nine.", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_multi_sentence_turn_is_one_flagged_row_and_its_replay_one_more(
+) -> None:
+    context = ConversationContextStore()
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_3"),))
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        synthesizer=SegmentSynthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(playback.blocked.wait(), timeout=1)
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer. Second answer.", True),
+    ]
+
+    assert await loop.resume_interrupted() is True
+
+    assert _durable_rows(context) == [
+        ("user", "Question?", False),
+        ("assistant", "First answer. Second answer.", True),
+        ("assistant", "Third answer.", False),
     ]
 
 
@@ -2365,10 +2543,10 @@ async def test_resume_interrupted_replays_unconfirmed_suffix_without_new_inferen
         "First answer.",
         "Second answer.",
     ]
+    # Nothing was heard before the interruption; the replay is one turn, so one row.
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First answer.",
-        "Second answer.",
+        "First answer. Second answer.",
     ]
 
 
@@ -2754,8 +2932,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
     ]
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First answer.",
-        "Second answer.",
+        "First answer. Second answer.",
     ]
     assert foreground.active_task_count == 0
     assert ledger.retained_chunk_count == 0
@@ -4487,8 +4664,7 @@ async def test_a_completed_turn_closes_its_heard_row_so_a_restart_would_not_flag
 
     assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer.", False),
-        ("assistant", "Second answer.", False),
+        ("assistant", "First answer. Second answer.", False),
     ]
 
 

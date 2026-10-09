@@ -452,6 +452,7 @@ def test_task_summary_inputs_are_strict_and_bounded_before_mutation() -> None:
         "max_messages",
         "max_active_tasks",
         "max_item_chars",
+        "max_window_chars",
         "max_task_incarnations",
         "max_pending_assistant_admissions",
     ],
@@ -1069,6 +1070,149 @@ def test_durable_view_numbers_rows_across_eviction() -> None:
     view = context.durable_view()
     assert (view.first, view.unsettled) == (2, 1)
     assert [message.text for message in view.messages] == ["Row 2", "Row 3"]
+
+
+def test_the_default_window_is_derived_from_the_item_bound() -> None:
+    context = ConversationContextStore()
+    assert (context.max_messages, context.max_item_chars, context.max_window_chars) == (
+        32,
+        1024,
+        22 * 1024,
+    )
+    assert ConversationContextStore(max_item_chars=256).max_window_chars == 22 * 256
+
+
+def test_ten_full_turns_survive_an_announcement_and_the_next_question() -> None:
+    # Hermes's default review interval is ten user turns; each row here is as long as allowed.
+    context = ConversationContextStore()
+    full = context.max_item_chars
+    for turn in range(10):
+        question = f"{turn:02d}" + "u" * (full - 2)
+        context.record_user_transcript(Transcript(text=question, final=True))
+        _confirm_assistant_text(context, "a" * full, chunk_id=f"reply_{turn}")
+    _confirm_assistant_text(context, "r" * full, chunk_id="announcement")
+    context.record_user_transcript(Transcript(text="q" * full, final=True))
+
+    texts = _texts(context)
+    assert texts[0] == "00" + "u" * (full - 2)
+    assert len(texts) == 22
+
+
+def test_the_window_must_hold_two_full_rows() -> None:
+    assert ConversationContextStore(max_item_chars=8, max_window_chars=16).max_window_chars == 16
+    with pytest.raises(ValueError, match="two full rows"):
+        ConversationContextStore(max_item_chars=8, max_window_chars=15)
+    with pytest.raises(ValueError, match="positive"):
+        ConversationContextStore(max_window_chars=cast(int, True))
+
+
+def test_the_window_evicts_by_text_budget_not_row_count() -> None:
+    context = ConversationContextStore(max_messages=32, max_item_chars=8, max_window_chars=20)
+    for text in ("aaaaaaaa", "bbbbbbbb", "cccc"):
+        context.record_user_transcript(Transcript(text=text, final=True))
+    assert _texts(context) == ["aaaaaaaa", "bbbbbbbb", "cccc"]
+    assert context.durable_view().first == 0
+
+    # 25 characters would pass the 20-character budget: the oldest row goes.
+    context.record_user_transcript(Transcript(text="ddddd", final=True))
+    assert _texts(context) == ["bbbbbbbb", "cccc", "ddddd"]
+    assert context.durable_view().first == 1
+
+
+def test_the_row_cap_still_bounds_a_window_of_short_rows() -> None:
+    context = ConversationContextStore(max_messages=3, max_item_chars=8)
+    for text in ("a", "b", "c", "d"):
+        context.record_user_transcript(Transcript(text=text, final=True))
+    assert _texts(context) == ["b", "c", "d"]
+    assert context.durable_view().first == 1
+
+
+def test_a_growing_open_row_evicts_the_oldest_rows_but_never_itself() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(
+        max_messages=32, max_item_chars=8, max_window_chars=18, on_change=changes.append
+    )
+    context.record_user_transcript(Transcript(text="question", final=True))
+    context.record_user_transcript(Transcript(text="more", final=True))
+    segment = AssistantSegmentKey()
+    _confirm_assistant_text(context, "Yes.", chunk_id="chunk_001", segment=segment)
+    _confirm_assistant_text(
+        context, "Ok", chunk_id="chunk_002", segment=segment, heard_text="Yes. Ok"
+    )
+
+    # 8 + 4 + 7 = 19 passes 18: the row grew in place and the oldest row went.
+    view = context.durable_view()
+    assert [message.text for message in view.messages] == ["more", "Yes. Ok"]
+    assert (view.first, view.unsettled) == (1, 1)
+    assert changes[-1] == view
+    _confirm_assistant_text(
+        context, ".", chunk_id="chunk_003", segment=segment, heard_text="Yes. Ok."
+    )
+    assert _texts(context) == ["more", "Yes. Ok."]
+
+
+def test_a_closed_row_survives_the_push_that_closes_it_at_the_tightest_window() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(
+        max_messages=32, max_item_chars=8, max_window_chars=16, on_change=changes.append
+    )
+    context.record_user_transcript(Transcript(text="q" * 8, final=True))
+    _confirm_assistant_text(context, "a" * 8, chunk_id="chunk_001")
+    # A long reply's next row: pushing it closes the full row before it.
+    _confirm_assistant_text(context, "b" * 8, chunk_id="chunk_002")
+
+    view = changes[-1]
+    assert [message.text for message in view.messages] == ["a" * 8, "b" * 8]
+    assert (view.first, view.unsettled) == (1, 1)
+
+
+def test_restore_refuses_a_tail_over_the_window_budget() -> None:
+    changes: list[DurableConversation] = []
+    context = ConversationContextStore(
+        max_messages=4, max_item_chars=8, max_window_chars=16, on_change=changes.append
+    )
+    tail = _view(
+        ConversationMessage("user", "x" * 8),
+        ConversationMessage("assistant", "y" * 8),
+        ConversationMessage("user", "z"),
+    )
+
+    with pytest.raises(ValueError, match="max_window_chars"):
+        context.restore(tail)
+
+    assert context.snapshot().messages == ()
+    assert changes == []
+    context.restore(_view(*tail.messages[1:]))
+    assert _texts(context) == ["y" * 8, "z"]
+
+
+def test_restored_rows_count_against_the_budget_and_age_out() -> None:
+    # An older build's per-sentence rows restore as they are, then age out by budget.
+    context = ConversationContextStore(max_messages=32, max_item_chars=8, max_window_chars=16)
+    context.restore(
+        _view(
+            ConversationMessage("user", "q" * 8),
+            ConversationMessage("assistant", "One."),
+            ConversationMessage("assistant", "Two."),
+        )
+    )
+
+    context.record_user_transcript(Transcript(text="next", final=True))
+
+    assert _texts(context) == ["One.", "Two.", "next"]
+    assert context.durable_view().first == 1
+
+
+def test_clearing_voice_history_resets_the_budget() -> None:
+    context = ConversationContextStore(max_messages=32, max_item_chars=8, max_window_chars=16)
+    for text in ("a" * 8, "b" * 8):
+        context.record_user_transcript(Transcript(text=text, final=True))
+
+    context.clear_voice_history()
+    for text in ("c" * 8, "d" * 8):
+        context.record_user_transcript(Transcript(text=text, final=True))
+
+    assert _texts(context) == ["c" * 8, "d" * 8]
 
 
 @pytest.mark.parametrize(
