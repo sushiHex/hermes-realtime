@@ -37,6 +37,19 @@ def _deletes_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.deletes{path.suffix}")
 
 
+async def _offer(writer: VoiceTailWriter, store: ConversationContextStore) -> None:
+    """Let one batch leave the host, so the companion may hold this binding."""
+    store.record_user_transcript(Transcript(text="said before the delete", final=True))
+    await asyncio.wait_for(writer.next_batch(), 5)
+
+
+async def _forget(
+    writer: VoiceTailWriter, store: ConversationContextStore
+) -> tuple[str, int]:
+    await _offer(writer, store)
+    return await writer.request_forget(store)
+
+
 def _markers(output: str, prefix: str) -> list[dict[str, object]]:
     return [
         json.loads(line.removeprefix(prefix))
@@ -53,7 +66,7 @@ async def test_a_pending_delete_survives_any_tail_reset(
     path = tmp_path / "voice-tail.json"
     writer, store = await _open(path, "old", "new")
     store.record_user_transcript(Transcript(text="a" * 40, final=True))
-    old = await writer.request_forget(store)
+    old = await _forget(writer, store)
     store.record_user_transcript(Transcript(text="b" * 40, final=True))
     await writer.close()
     if reset == "corrupt":
@@ -120,8 +133,8 @@ async def test_an_unreadable_delete_record_reads_as_unknown_never_idle(
 async def test_a_pending_delete_never_blocks_a_later_one(tmp_path: Path) -> None:
     writer, store = await _open(tmp_path / "voice-tail.json", "a", "b", "c")
 
-    first = await writer.request_forget(store)
-    second = await writer.request_forget(store)
+    first = await _forget(writer, store)
+    second = await _forget(writer, store)
 
     assert writer.pending_deletes == (first, second) == (("a", 0), ("b", 1))
     await writer.close()
@@ -133,11 +146,11 @@ async def test_pending_deletes_are_bounded(tmp_path: Path) -> None:
     writer, store = await _open(tmp_path / "voice-tail.json", *names)
     for _ in range(MAX_PENDING_DELETES):
         # A request waits for its durable write; a write that keeps failing fails the test.
-        await asyncio.wait_for(writer.request_forget(store), 5)
+        await asyncio.wait_for(_forget(writer, store), 5)
     binding = writer.binding
 
     with pytest.raises(RuntimeError, match="capacity"):
-        await asyncio.wait_for(writer.request_forget(store), 5)
+        await asyncio.wait_for(_forget(writer, store), 5)
 
     assert writer.binding == binding and len(writer.pending_deletes) == MAX_PENDING_DELETES
     await writer.close()
@@ -149,8 +162,8 @@ async def test_a_completed_delete_is_scoped_to_the_conversation_it_retired(
 ) -> None:
     path = tmp_path / "voice-tail.json"
     writer, store = await _open(path, "a", "b", "c")
-    first = await writer.request_forget(store)
-    second = await writer.request_forget(store)
+    first = await _forget(writer, store)
+    second = await _forget(writer, store)
 
     assert writer.acknowledge_forget(first) is True
     assert writer.acknowledge_forget(first) is False
@@ -181,7 +194,7 @@ async def test_an_intent_in_a_version_4_tail_moves_into_the_record(tmp_path: Pat
     assert reopened.pending_deletes == (("old", 0),) and reopened.binding == ("new", 1)
     await reopened.close()
     assert parse_voice_deletes(_deletes_path(path).read_bytes()) == VoiceDeletes(
-        pending=(("old", 0),)
+        pending=(("old", 0),), live=("new", 1)
     )
 
 
@@ -228,6 +241,14 @@ async def _until(predicate) -> None:  # type: ignore[no-untyped-def]
     raise AssertionError("condition never held")
 
 
+def _recorded(path: Path) -> VoiceDeletes:
+    if not _deletes_path(path).exists():
+        return VoiceDeletes()
+    recorded = parse_voice_deletes(_deletes_path(path).read_bytes())
+    assert recorded is not None
+    return recorded
+
+
 async def _crash(writer: VoiceTailWriter, *tasks: asyncio.Task[object]) -> None:
     """Stop the writer as a killed process would: no final write, the lock released."""
     assert writer._task is not None and writer._owner is not None
@@ -244,11 +265,12 @@ async def _delete_with_the_tail_unwritable(
     store = ConversationContextStore(on_change=writer.update)
     await writer.open(store)
     store.record_user_transcript(Transcript(text="a deleted phrase", final=True))
+    await _offer(writer, store)
     await _until(lambda: path.exists() and b"a deleted phrase" in path.read_bytes())
     writer.fail = True
     request = asyncio.create_task(writer.request_forget(store))
     # The record lands; the cleared tail does not.
-    await _until(lambda: _deletes_path(path).exists())
+    await _until(lambda: _recorded(path).pending == (("old", 0),))
     return writer, request
 
 
@@ -282,7 +304,7 @@ async def test_a_tail_the_record_knows_as_deleted_is_never_restored(
         assert writer.acknowledge_forget(("old", 0)) is True
         await _until(
             lambda: parse_voice_deletes(_deletes_path(path).read_bytes())
-            == VoiceDeletes(outcome=("old", 0))
+            == VoiceDeletes(outcome=("old", 0), live=("new", 1))
         )
     assert b"a deleted phrase" in path.read_bytes()
     await _crash(writer, request)
@@ -335,6 +357,10 @@ async def test_a_version_4_intent_already_completed_is_not_pending_again(
     document["archive"]["generation"] = 1
     document |= {"version": 4, "pending_forget": ["old", 0], "forget_complete": False}
     path.write_bytes(json.dumps(document).encode())
+    # This build named the live binding before the older build wrote its tail.
+    _deletes_path(path).write_bytes(
+        voice_deletes_bytes(VoiceDeletes(outcome=("old", 0), live=("new", 1)))
+    )
 
     reopened, _store = await _open(path)
     assert reopened.pending_deletes == () and reopened.deleted_previous is True
@@ -344,8 +370,8 @@ async def test_a_version_4_intent_already_completed_is_not_pending_again(
 @pytest.mark.asyncio
 async def test_an_older_delete_settling_late_keeps_the_newer_outcome(tmp_path: Path) -> None:
     writer, store = await _open(tmp_path / "voice-tail.json", "a", "b", "c")
-    first = await writer.request_forget(store)
-    second = await writer.request_forget(store)
+    first = await _forget(writer, store)
+    second = await _forget(writer, store)
 
     assert writer.acknowledge_forget(second) is True
     assert writer.acknowledge_forget(first) is True
@@ -368,10 +394,157 @@ async def test_a_version_4_intent_moves_in_even_when_the_record_is_full(
     document["archive"]["generation"] = 1
     document |= {"version": 4, "pending_forget": ["old", 0], "forget_complete": False}
     path.write_bytes(json.dumps(document).encode())
+    _deletes_path(path).write_bytes(
+        voice_deletes_bytes(VoiceDeletes(pending=full, live=("new", 1)))
+    )
 
     reopened, _store = await _open(path)
     await asyncio.wait_for(reopened.close(), 5)
 
     recorded = parse_voice_deletes(_deletes_path(path).read_bytes())
-    assert recorded == VoiceDeletes(pending=(*full, ("old", 0)))
+    assert recorded == VoiceDeletes(pending=(*full, ("old", 0)), live=("new", 1))
     assert json.loads(path.read_bytes())["version"] == 3
+
+
+def _version_1_tail(path: Path, text: str) -> None:
+    """A tail from a version-1 build: rows and no conversation identity."""
+    path.write_bytes(json.dumps({
+        "version": 1,
+        "prior_work": False,
+        "messages": [{"role": "user", "text": text, "interrupted": False}],
+    }).encode())
+
+
+@pytest.mark.asyncio
+async def test_a_version_1_tail_is_never_restored_once_a_delete_is_recorded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    _version_1_tail(path, "a deleted phrase")
+    writer = _TailWriteFails(path, conversation_ids=_ids("old", "new"))
+    writer.fail = True
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    assert [message.text for message in store.snapshot().messages] == ["a deleted phrase"]
+    request = asyncio.create_task(writer.request_forget(store))
+    await _until(lambda: _recorded(path).holds_deletes)
+    await _crash(writer, request)
+    # The version-1 tail is still on disk; it carries no identity the record could clear.
+    assert b"a deleted phrase" in path.read_bytes()
+
+    reopened, reopened_store = await _open(path, "fresh")
+
+    assert reopened_store.snapshot().messages == ()
+    assert reopened.binding == ("fresh", 0)
+    await reopened.close()
+    assert b"a deleted phrase" not in path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_a_version_1_tail_is_still_restored_when_no_delete_was_ever_recorded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    _version_1_tail(path, "kept history")
+
+    writer, store = await _open(path, "conv")
+
+    assert [message.text for message in store.snapshot().messages] == ["kept history"]
+    await writer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("found", ["malformed", "refused", "missing"])
+async def test_a_pending_delete_waits_for_a_fresh_tail_whatever_the_open_found(
+    found: str, tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "old")
+    store.record_user_transcript(Transcript(text="a deleted phrase that is long", final=True))
+    await writer.close()
+    _deletes_path(path).write_bytes(
+        voice_deletes_bytes(VoiceDeletes(pending=(("gone", 3),), live=("old", 0)))
+    )
+    if found == "malformed":
+        path.write_bytes(b"{not json")
+    elif found == "missing":
+        path.unlink()
+    reopened = _TailWriteFails(path, conversation_ids=_ids("new"))
+    reopened.fail = True
+    options = {"max_item_chars": 20} if found == "refused" else {}
+    await reopened.open(ConversationContextStore(on_change=reopened.update, **options))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(reopened.next_deletes(), 0.3)
+
+    reopened.fail = False
+    assert await asyncio.wait_for(reopened.next_deletes(), 5) == (("gone", 3),)
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_tail_of_any_earlier_deleted_conversation_is_never_restored(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "a", "b", "c")
+    store.record_user_transcript(Transcript(text="said in a", final=True))
+    await _offer(writer, store)
+    stale = path.read_bytes()
+    first = await writer.request_forget(store)
+    second = await _forget(writer, store)
+    assert writer.acknowledge_forget(second) and writer.acknowledge_forget(first)
+    await writer.close()
+    # The outcome now names only "b"; a backup of "a"'s tail comes back beside it.
+    assert _recorded(path).outcome == ("b", 1)
+    path.write_bytes(stale)
+
+    reopened, reopened_store = await _open(path, "fresh")
+
+    assert reopened_store.snapshot().messages == ()
+    assert reopened.binding == ("fresh", 1)
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        b"\x00garbage",
+        b'{"live":null,"outcome":null,"pending":[["old",0]],"version":2}',
+        b'{"extra":1,"live":null,"outcome":null,"pending":[["old",0]],"version":1}',
+    ],
+)
+async def test_an_unreadable_record_restores_no_tail_and_keeps_the_loss_known(
+    unreadable: bytes, tmp_path: Path
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, request = await _delete_with_the_tail_unwritable(path)
+    await _crash(writer, request)
+    _deletes_path(path).write_bytes(unreadable)
+
+    reopened, reopened_store = await _open(path, "fresh")
+
+    assert reopened_store.snapshot().messages == ()
+    assert reopened.delete_outcome == "unknown"
+    await reopened.close()
+    assert b"a deleted phrase" not in path.read_bytes()
+    # Rewritten as a known loss, never as an empty record.
+    assert _recorded(path) == VoiceDeletes(outcome="unknown", live=("fresh", 1))
+
+
+@pytest.mark.asyncio
+async def test_a_delete_of_a_conversation_no_batch_ever_left_completes_locally(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "a", "b")
+    # Rows were queued, but none was frozen into a batch, so none was ever sent.
+    store.record_user_transcript(Transcript(text="never archived", final=True))
+
+    old = await writer.request_forget(store)
+
+    assert writer.pending_deletes == () and writer.delete_outcome == old
+    assert writer.deleted_previous is True
+    await writer.close()
+    assert _recorded(path) == VoiceDeletes(outcome=("a", 0), live=("b", 1))

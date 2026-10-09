@@ -841,10 +841,17 @@ class VoiceTailWriter:
             or new_id == old[0]
         ):
             raise ValueError("replacement conversation id is invalid")
+        # A batch is frozen durably before it is sent, so with no frozen batch and no
+        # acknowledgment none ever left this host: the companion never held this binding.
+        offered = self._cursor is not None or self._frozen > 0
         # All changes before the first suspension run on the event loop as one transition.
         store.clear_voice_history()
         self._retire(new_id, old[1] + 1)
-        self._deletes = replace(self._deletes, pending=(*self._deletes.pending, old))
+        if offered:
+            self._deletes = replace(self._deletes, pending=(*self._deletes.pending, old))
+        else:
+            # Nothing of it can be in Hermes, so it is complete once the clear is durable.
+            self._deletes = replace(self._deletes, outcome=self._newest_outcome(old))
         self._on_durable_clear = on_durable_clear
         self._changed()
         self._forget_version = self._version
@@ -856,6 +863,8 @@ class VoiceTailWriter:
         """Start the next binding with an empty outbox and fresh review progress."""
         self._conversation_id = new_id
         self._generation = generation
+        # The record names the live binding before any tail carries it.
+        self._deletes = replace(self._deletes, live=(new_id, generation))
         self._seq_base = self._next_seq = 0
         self._cursor = self._gap = None
         self._outbox = []
@@ -890,13 +899,17 @@ class VoiceTailWriter:
 
         if type(binding) is not tuple or binding not in self._deletes.pending:
             return False
-        outcome = self._deletes.outcome
-        self._deletes = VoiceDeletes(
+        self._deletes = replace(
+            self._deletes,
             pending=tuple(item for item in self._deletes.pending if item != binding),
-            outcome=outcome if type(outcome) is tuple and outcome[1] > binding[1] else binding,
+            outcome=self._newest_outcome(binding),
         )
         self._changed()
         return True
+
+    def _newest_outcome(self, binding: tuple[str, int]) -> tuple[str, int]:
+        outcome = self._deletes.outcome
+        return outcome if type(outcome) is tuple and outcome[1] > binding[1] else binding
 
     def _batch(self) -> ArchiveBatch:
         rows = tuple(self._outbox[: self._frozen])
@@ -1201,7 +1214,12 @@ class VoiceTailWriter:
                 self._fresh()
             else:
                 self._restore(store, raw)
-            if self._deletes != self._written_deletes:
+            if self._deletes.pending:
+                # Whatever the open restored, retired or could not read, a pending delete
+                # is handed out only after a fresh tail write has replaced the file.
+                self._changed()
+                self._forget_version = self._version
+            elif self._deletes.holds_deletes and self._deletes != self._written_deletes:
                 self._dirty = True
         except BaseException:
             self._archiving = False
@@ -1251,6 +1269,7 @@ class VoiceTailWriter:
         # only new acknowledgments enter M2's review coverage.
         self._review = archive.review or ReviewProgress(cursor=archive.cursor)
         self._frozen_version = self._written_version
+        self._deletes = replace(self._deletes, live=(archive.conversation_id, archive.generation))
 
     def _restore(self, store: ConversationContextStore, raw: bytes) -> None:
         # Counts or a refusal category only; never row text.
@@ -1265,25 +1284,26 @@ class VoiceTailWriter:
             try:
                 if tail is None:
                     raise ValueError("voice tail is malformed")
+                # Once any delete was recorded (or its record is unreadable), only the live
+                # binding the record names is provably not deleted; anything else, a
+                # version-1 tail with no identity included, is retired, never restored.
+                binding = (
+                    None if tail.archive is None
+                    else (tail.archive.conversation_id, tail.archive.generation)
+                )
+                unproven = self._deletes.holds_deletes and binding != self._deletes.live
                 pending = self._deletes.pending
-                outcome = self._deletes.outcome
                 if tail.pending_forget is not None and tail.pending_forget not in (
-                    *pending, outcome
+                    *pending, self._deletes.outcome
                 ):
                     # A version-4 tail held its one intent itself; the record holds it now,
                     # in the slot it keeps beyond MAX_PENDING_DELETES for exactly this.
                     pending = (*pending, tail.pending_forget)
                     self._deletes = replace(self._deletes, pending=pending)
-                known = {binding[0] for binding in pending}
-                if type(outcome) is tuple:
-                    known.add(outcome[0])
-                if tail.archive is not None and tail.archive.conversation_id in known:
-                    # The record knows this conversation as deleted, pending or complete:
-                    # whatever order the files landed in, it is never restored.
-                    self._retire(self._new_id(), tail.archive.generation + 1)
-                    # Nothing is handed to the companion before this retirement is durable.
-                    self._changed()
-                    self._forget_version = self._version
+                if unproven:
+                    self._retire(
+                        self._new_id(), 0 if binding is None else binding[1] + 1
+                    )
                     evidence = {"retired": 1, "version": 1}
                     return
                 if tail.archive is None:
@@ -1346,7 +1366,8 @@ class VoiceTailWriter:
             self._dirty = False
             try:
                 # The record first: a durable tail never runs ahead of the deletes it implies.
-                if deletes != self._written_deletes:
+                # Until a delete is recorded there is nothing to prove, so none is written.
+                if deletes.holds_deletes and deletes != self._written_deletes:
                     await asyncio.to_thread(
                         write_run_record, self._deletes_path, voice_deletes_bytes(deletes)
                     )

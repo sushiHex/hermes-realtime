@@ -26,6 +26,12 @@ from hermes_realtime.protocol import (
 from hermes_realtime.speech import Transcript
 
 
+async def _offer(writer: VoiceTailWriter, context: ConversationContextStore) -> None:
+    """Let one batch leave the host, so the companion may hold this binding."""
+    context.record_user_transcript(Transcript(text="said before the delete", final=True))
+    await asyncio.wait_for(writer.next_batch(), 5)
+
+
 @pytest.mark.asyncio
 async def test_delete_intent_is_durable_and_stale_archive_ack_is_fenced(tmp_path: Path) -> None:
     path = tmp_path / "voice-tail.json"
@@ -115,7 +121,9 @@ async def test_a_stuck_delete_never_holds_up_a_later_one(tmp_path: Path) -> None
     )
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
+    await _offer(writer, context)
     stuck = await writer.request_forget(context)
+    await _offer(writer, context)
     later = await writer.request_forget(context)
 
     class Link:
@@ -193,6 +201,7 @@ async def test_sender_retains_pending_until_exact_complete(tmp_path: Path) -> No
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("a", "b")).__next__)
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
+    await _offer(writer, context)
     old = await writer.request_forget(context)
     requests: list[VoiceForgetEvent] = []
 
@@ -238,6 +247,7 @@ async def test_sender_waits_for_durable_delete_intent(
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("a", "b")).__next__)
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
+    await _offer(writer, context)
     entered = threading.Event()
     release = threading.Event()
     original_write = voice_tail_module.write_run_record
@@ -312,6 +322,7 @@ async def test_cancelled_delete_request_still_publishes_durable_clear(tmp_path: 
     writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=iter(("old", "new")).__next__)
     context = ConversationContextStore(on_change=writer.update)
     await writer.open(context)
+    await _offer(writer, context)
     entered = asyncio.Event()
     release = asyncio.Event()
     original_write = writer._write

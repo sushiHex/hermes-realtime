@@ -9,6 +9,10 @@ outcome, is retired when it opens.
 The record holds every pending delete, so a delete that stays pending never blocks a later
 one, and an outcome: the newest binding verified complete, or ``unknown`` when an earlier
 record could not be read and its intents are lost.
+
+It also names the live binding, written ahead of every tail that carries it. Once the
+record holds any delete, a tail is restored only when it is that live binding: a positive
+proof that covers every deleted binding, not only the ones the record still lists.
 """
 
 from __future__ import annotations
@@ -29,7 +33,8 @@ _CONVERSATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_IDENTITY = 2**53 - 1
 # A binding is at most 64 id characters and 16 digits, with JSON punctuation.
 _MAX_BINDING_BYTES = 96
-MAX_VOICE_DELETES_BYTES = (_MAX_RECORDED + 1) * _MAX_BINDING_BYTES + 128
+# Every pending binding, the outcome and the live binding.
+MAX_VOICE_DELETES_BYTES = (_MAX_RECORDED + 2) * _MAX_BINDING_BYTES + 128
 
 Binding = tuple[str, int]
 Outcome = Binding | Literal["unknown"] | None
@@ -39,6 +44,12 @@ Outcome = Binding | Literal["unknown"] | None
 class VoiceDeletes:
     pending: tuple[Binding, ...] = ()
     outcome: Outcome = None
+    live: Binding | None = None
+
+    @property
+    def holds_deletes(self) -> bool:
+        """Whether any delete, settled, pending or lost, was ever recorded here."""
+        return bool(self.pending) or self.outcome is not None
 
 
 def _binding(value: object) -> Binding | None:
@@ -65,7 +76,7 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
         return None
     if (
         type(document) is not dict
-        or set(document) != {"outcome", "pending", "version"}
+        or set(document) != {"live", "outcome", "pending", "version"}
         or type(document["version"]) is not int
         or document["version"] != _VERSION
         or type(document["pending"]) is not list
@@ -84,7 +95,14 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
         return None
     if outcome in pending:
         return None
-    return VoiceDeletes(tuple(item for item in pending if item is not None), outcome)
+    raw_live = document["live"]
+    live = None if raw_live is None else _binding(raw_live)
+    if raw_live is not None and live is None:
+        return None
+    # The live binding is never one the record deletes.
+    if live is not None and (live in pending or live == outcome):
+        return None
+    return VoiceDeletes(tuple(item for item in pending if item is not None), outcome, live)
 
 
 def voice_deletes_bytes(deletes: VoiceDeletes) -> bytes:
@@ -94,6 +112,7 @@ def voice_deletes_bytes(deletes: VoiceDeletes) -> bytes:
         raise ValueError("too many pending voice deletes")
     outcome = deletes.outcome
     document = {
+        "live": None if deletes.live is None else list(deletes.live),
         "outcome": list(outcome) if type(outcome) is tuple else outcome,
         "pending": [list(binding) for binding in deletes.pending],
         "version": _VERSION,
