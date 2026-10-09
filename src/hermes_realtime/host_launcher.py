@@ -771,8 +771,9 @@ async def _play_readiness_cue(
     """Play the readiness cue with this binding's audio input suppressed.
 
     The cue is the binding's speech: closing the binding cancels it through playback's
-    own hard stop, so a page that has gone can rebind at once instead of waiting out
-    delivery confirmation for audio no one hears.
+    own hard stop, which releases its chunk. The binding's connection can then be unbound,
+    and the page rebound, at once; a chunk still in flight would make the publisher refuse
+    that unbind.
     """
 
     token = await conversation.suppress_audio_input(
