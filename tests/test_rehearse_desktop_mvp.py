@@ -126,6 +126,14 @@ def test_the_interrupt_step_keeps_the_speech_stop_marker() -> None:
     assert dropped == 0
 
 
+def test_a_binding_speech_settlement_failure_is_kept() -> None:
+    line = '[binding-speech] {"cause":"resisted","version":1}'
+    found, dropped = rehearsal.markers([line])
+
+    assert found == [line]
+    assert dropped == 0
+
+
 def test_both_sides_of_a_refused_bridge_hello_are_kept() -> None:
     # The companion marks a refused hello; the host marks a refused welcome.
     lines = [

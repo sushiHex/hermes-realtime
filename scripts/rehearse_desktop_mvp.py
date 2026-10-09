@@ -90,7 +90,7 @@ _KNOWN_MARKERS = frozenset(
         "voice-memory", "voice-memory-receive", "voice-memory-stream", "voice-forget",
         "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
-        "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall",
+        "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall", "binding-speech",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")

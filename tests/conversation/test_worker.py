@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import threading
 from types import MethodType, SimpleNamespace
 from typing import Any, cast
@@ -3024,3 +3025,506 @@ async def test_confirmed_playback_speech_admits_final_only_transcriber_final() -
     assert len(responses) == 1
     assert responses[0][1] == Transcript(text="Chapter 3.", final=True)
     await worker.close()
+
+
+# --- speech a binding started ends with the binding ------------------------------------
+
+
+def _suppressing_worker() -> ReconnectSafeConversationWorker:
+    executor, _, _ = action_executor_probe()
+
+    def binding_factory(
+        participant_identity: str, generation: int, actions: ConversationUpdateExecutor
+    ) -> ConversationSessionWorker:
+        return ConversationSessionWorker(
+            participant_identity=participant_identity,
+            session_generation=generation,
+            vad=ScriptedVad(VoiceActivity.SPEECH_STARTED),
+            stt=CapturingTranscriber(),
+            actions=actions,
+        )
+
+    return ReconnectSafeConversationWorker(actions=executor, binding_factory=binding_factory)
+
+
+async def _binding_speech(
+    worker: ReconnectSafeConversationWorker, generation: int, events: list[str]
+) -> tuple[asyncio.Task[None], object]:
+    """Speech fencing the binding's input, which resumes it in its own cleanup."""
+
+    suppressed = asyncio.Event()
+    token: list[object] = []
+
+    async def speak() -> None:
+        token.append(
+            await worker.suppress_audio_input(
+                participant_identity="browser_user",
+                session_generation=generation,
+                speech=asyncio.current_task(),
+            )
+        )
+        suppressed.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append(f"resumed:{await worker.resume_audio_input(token[0])}")
+
+    task = asyncio.create_task(speak())
+    await asyncio.wait_for(suppressed.wait(), timeout=2)
+    return task, token[0]
+
+
+@pytest.mark.parametrize("closing", ["close_binding", "bind", "close"])
+@pytest.mark.asyncio
+async def test_closing_or_replacing_a_binding_ends_the_speech_it_started(closing: str) -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    events: list[str] = []
+    speech, _ = await _binding_speech(worker, generation, events)
+
+    if closing == "close_binding":
+        await worker.close_binding()
+    elif closing == "bind":
+        assert await worker.bind("browser_user") == generation + 1
+    else:
+        await worker.close()
+
+    # Cancelled, and its cleanup ran before the binding call returned; that cleanup could
+    # still take the binding lock, and released its own fence, which the binding kept
+    # until its speech had settled.
+    assert speech.cancelled()
+    assert events == ["resumed:True"]
+    if closing != "close":
+        await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_that_resumed_input_is_no_longer_the_bindings() -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    events: list[str] = []
+    speech, token = await _binding_speech(worker, generation, events)
+    assert await worker.resume_audio_input(token) is True
+
+    await worker.close_binding()
+
+    assert not speech.done()
+    speech.cancel()
+    await asyncio.gather(speech, return_exceptions=True)
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_a_new_binding_starts_with_its_input_unfenced() -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    # A fence with no speech behind it, as a durable clear takes: nothing resumes it.
+    await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=generation
+    )
+
+    rebound = await worker.bind("browser_user")
+
+    # The old fence went with its binding; the new one can take its own.
+    token = await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=rebound
+    )
+    assert await worker.resume_audio_input(token) is True
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_that_resists_cancellation_fails_the_binding_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 0.05)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    release = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def stubborn() -> None:
+        await worker.suppress_audio_input(
+            participant_identity="browser_user",
+            session_generation=generation,
+            speech=asyncio.current_task(),
+        )
+        suppressed.set()
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+
+    speech = asyncio.create_task(stubborn())
+    await asyncio.wait_for(suppressed.wait(), timeout=2)
+
+    try:
+        with pytest.raises(RuntimeError, match="resisted cancellation"):
+            await worker.close_binding()
+    finally:
+        release.set()
+        await speech
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_speech_must_be_an_exact_task() -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+
+    with pytest.raises(TypeError, match="exact asyncio Task"):
+        await worker.suppress_audio_input(
+            participant_identity="browser_user",
+            session_generation=generation,
+            speech=cast(Any, object()),
+        )
+    await worker.close()
+
+
+async def _stubborn_speech(
+    worker: ReconnectSafeConversationWorker, generation: int, release: asyncio.Event
+) -> asyncio.Task[None]:
+    """Binding speech that ignores cancellation until ``release`` is set."""
+
+    suppressed = asyncio.Event()
+
+    async def stubborn() -> None:
+        token = await worker.suppress_audio_input(
+            participant_identity="browser_user",
+            session_generation=generation,
+            speech=asyncio.current_task(),
+        )
+        suppressed.set()
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+        await worker.resume_audio_input(token)
+
+    speech = asyncio.create_task(stubborn())
+    await asyncio.wait_for(suppressed.wait(), timeout=2)
+    return speech
+
+
+@pytest.mark.parametrize("closing", ["close_binding", "close"])
+@pytest.mark.asyncio
+async def test_a_retried_close_still_owns_speech_that_resisted(
+    closing: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 0.05)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    release = asyncio.Event()
+    speech = await _stubborn_speech(worker, generation, release)
+    close = worker.close_binding if closing == "close_binding" else worker.close
+
+    try:
+        for _attempt in range(2):
+            # The retry still sees the speech: it never reports a close the speech outlived.
+            with pytest.raises(RuntimeError, match="resisted cancellation"):
+                await close()
+    finally:
+        release.set()
+        await speech
+    await close()
+    if closing != "close":
+        await worker.close()
+    markers = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[binding-speech] ")
+    ]
+    assert markers == ['[binding-speech] {"cause":"resisted","version":1}'] * 2
+
+
+@pytest.mark.parametrize("closing", ["close_binding", "bind"])
+@pytest.mark.asyncio
+async def test_caller_cancellation_waits_for_the_binding_speech_to_settle(closing: str) -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def speak() -> None:
+        await worker.suppress_audio_input(
+            participant_identity="browser_user",
+            session_generation=generation,
+            speech=asyncio.current_task(),
+        )
+        suppressed.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+
+    speech = asyncio.create_task(speak())
+    await asyncio.wait_for(suppressed.wait(), timeout=2)
+    closer = asyncio.create_task(
+        worker.close_binding() if closing == "close_binding" else worker.bind("browser_user")
+    )
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        closer.cancel()
+        await asyncio.sleep(0.05)
+        # The caller's cancellation does not abandon the speech's own cleanup.
+        assert not closer.done()
+    finally:
+        finish_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closer, timeout=2)
+    assert speech.done()
+    # Nothing was committed on the cancelled call: the next bind is the very next one.
+    assert await worker.bind("browser_user") == generation + 1
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_a_settle_failure_never_masks_the_callers_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 0.2)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    release = asyncio.Event()
+    speech = await _stubborn_speech(worker, generation, release)
+    closer = asyncio.create_task(worker.close_binding())
+    await asyncio.sleep(0.05)
+    closer.cancel()
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await closer
+    finally:
+        release.set()
+        await speech
+    assert [type(error) for error in raised.value.exceptions] == [
+        asyncio.CancelledError,
+        RuntimeError,
+    ]
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_the_worker_reports_both_the_settle_and_the_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 0.05)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    release = asyncio.Event()
+    speech = await _stubborn_speech(worker, generation, release)
+    binding = worker._binding
+    assert binding is not None
+
+    async def failing_close() -> None:
+        raise OSError("binding close failed")
+
+    binding.close_binding = failing_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await worker.close()
+    finally:
+        release.set()
+        await speech
+    assert {type(error) for error in raised.value.exceptions} == {RuntimeError, OSError}
+
+
+@pytest.mark.asyncio
+async def test_the_fence_holds_until_the_binding_close_succeeds() -> None:
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    # A durable clear's fence, typed input included, with no speech behind it.
+    await worker.suppress_audio_input(
+        participant_identity="browser_user", session_generation=generation, suppress_typed=True
+    )
+    binding = worker._binding
+    assert binding is not None
+    close = binding.close_binding
+    failures = [OSError("binding close failed")]
+
+    async def failing_once() -> None:
+        if failures:
+            raise failures.pop()
+        await close()
+
+    binding.close_binding = failing_once  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="binding close failed"):
+        await worker.close_binding()
+    # The binding is still installed, and still fenced.
+    with pytest.raises(RuntimeError, match="already suppressed"):
+        await worker.suppress_audio_input(
+            participant_identity="browser_user", session_generation=generation
+        )
+    await worker.close_binding()
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_that_closes_its_own_binding_does_not_wait_for_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 5.0)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+
+    async def speak_then_close() -> None:
+        await worker.suppress_audio_input(
+            participant_identity="browser_user",
+            session_generation=generation,
+            speech=asyncio.current_task(),
+        )
+        await worker.close_binding()
+
+    await asyncio.wait_for(asyncio.create_task(speak_then_close()), timeout=2)
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_bind_settles_the_previous_speech_before_committing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_realtime.conversation.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_BINDING_SPEECH_SETTLE_SECONDS", 0.05)
+    worker = _suppressing_worker()
+    generation = await worker.bind("browser_user")
+    release = asyncio.Event()
+    speech = await _stubborn_speech(worker, generation, release)
+
+    try:
+        with pytest.raises(RuntimeError, match="resisted cancellation"):
+            await worker.bind("browser_user")
+    finally:
+        release.set()
+        await speech
+    # The failed bind committed nothing: the old binding still holds its generation.
+    assert await worker.bind("browser_user") == generation + 1
+    await worker.close()
+
+
+def _speech_peer(name: str, events: list[str], published: asyncio.Event) -> Any:
+    """A room peer that accepts speech but, like a page that has gone, never answers."""
+
+    from hermes_realtime.livekit import LiveKitRoomPeer
+
+    peer = object.__new__(LiveKitRoomPeer)
+
+    def bind_remote_identity(self: Any, participant_identity: str) -> None:
+        events.append(f"bind:{name}")
+
+    async def connect(self: Any, room_name: str, *, timeout_seconds: float = 10) -> None:
+        events.append(f"connect:{name}")
+
+    async def disconnect(self: Any, *, timeout_seconds: float = 10) -> None:
+        events.append(f"disconnect:{name}")
+
+    async def receive_participant_audio(self: Any, *, timeout_seconds: float) -> Any:
+        await asyncio.Event().wait()
+
+    async def prepare(self: Any, chunk: Any, *, timeout_seconds: float = 10) -> str:
+        events.append(f"prepare:{name}")
+        return f"track_{name}"
+
+    async def publish(self: Any, chunk: Any, *, timeout_seconds: float = 10) -> None:
+        events.append(f"publish:{name}")
+        published.set()
+
+    async def finish(self: Any, chunk: Any, *, timeout_seconds: float = 10) -> None:
+        events.append(f"finish:{name}")
+
+    async def cancel(
+        self: Any, chunk: Any, *, timeout_seconds: float = 10, finish_word: bool = False
+    ) -> None:
+        events.append(f"cancel:{name}:finish_word={finish_word}")
+
+    for attribute, method in (
+        ("bind_remote_identity", bind_remote_identity),
+        ("connect", connect),
+        ("disconnect", disconnect),
+        ("receive_participant_audio", receive_participant_audio),
+        ("prepare_speech_chunk", prepare),
+        ("publish_speech_chunk", publish),
+        ("finish_speech_chunk", finish),
+        ("cancel_speech_chunk", cancel),
+    ):
+        setattr(peer, attribute, MethodType(method, peer))
+    return peer
+
+
+class _SilentReceiver:
+    """A confirmation source that never returns audio, keeping the cue's chunk in flight.
+
+    In the host the cue's confirmation comes from the host's own verifier peer, not the
+    page. What matters here is only that the chunk is still active when the page rebinds.
+    """
+
+    async def prepare_receive_speech_chunk(
+        self, chunk: Any, stream_identity: str, *, timeout_seconds: float = 10
+    ) -> None:
+        return None
+
+    async def receive_audio(self, *, timeout_seconds: float) -> AudioFrame:
+        await asyncio.sleep(timeout_seconds)
+        raise TimeoutError("no audio")
+
+
+@pytest.mark.asyncio
+async def test_a_page_rebinds_at_once_while_its_readiness_cue_is_still_playing() -> None:
+    from hermes_realtime.host_launcher import _play_readiness_cue
+    from hermes_realtime.livekit import (
+        LiveKitConversationWorker,
+        LiveKitPCMDeliveryConfirmation,
+        LiveKitSpeechPlayback,
+        ReconnectSafeLiveKitAudioPublisher,
+    )
+    from hermes_realtime.speech import SpeechChunk
+
+    worker = _suppressing_worker()
+    publisher = ReconnectSafeLiveKitAudioPublisher()
+    playback = LiveKitSpeechPlayback(
+        publisher=publisher,
+        confirmation=LiveKitPCMDeliveryConfirmation(_SilentReceiver(), timeout_seconds=60),
+        confirmation_timeout_seconds=60,
+    )
+    livekit = LiveKitConversationWorker(runtime=worker, publisher=publisher)
+    events: list[str] = []
+    published = asyncio.Event()
+    first = _speech_peer("first", events, published)
+    second = _speech_peer("second", events, asyncio.Event())
+    generation = await livekit.connect(first, room_name="room", participant_identity="page")
+    cue = asyncio.create_task(
+        _play_readiness_cue(
+            conversation=worker,
+            playback=playback,
+            chunk=SpeechChunk(
+                turn_id="readiness_1_1",
+                chunk_id="readiness_1_1",
+                text="Listening.",
+                audio=AudioFrame(pcm=b"\x10\x27" * 4800, sample_rate_hz=48_000, channels=1),
+            ),
+            participant_identity="page",
+            generation=generation,
+            is_valid=lambda: True,
+        )
+    )
+    await asyncio.wait_for(published.wait(), timeout=5)
+
+    # The page left and came back while the cue still played to it: the rebind is
+    # immediate, and the cue stopped through playback's own hard-stop path.
+    async with asyncio.timeout(5):
+        rebound = await livekit.reconnect(second, room_name="room", participant_identity="page")
+
+    assert rebound == generation + 1
+    assert cue.cancelled()
+    assert events.index("cancel:first:finish_word=False") < events.index("disconnect:first")
+    assert "finish:first" not in events
+    await livekit.close()
