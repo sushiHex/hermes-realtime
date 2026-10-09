@@ -43,8 +43,7 @@ export function sessionTogglePresentation(
     throw new TypeError("remoteStopRequired must be a boolean");
   }
   if (
-    state === "bootstrapping" || state === "connecting" ||
-    state === "preparing" || state === "reconnecting"
+    state === "bootstrapping" || state === "connecting"
   ) {
     return { label: "Connecting…", disabled: true, action: "connect" };
   }
@@ -52,7 +51,9 @@ export function sessionTogglePresentation(
     return { label: "Disconnecting…", disabled: true, action: "stop" };
   }
   if (
+    state === "preparing" ||
     state === "connected" ||
+    state === "reconnecting" ||
     remoteStopRequired
   ) {
     return { label: "Disconnect", disabled: false, action: "stop" };

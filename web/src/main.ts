@@ -2410,7 +2410,7 @@ async function handleWorkerDeparture(activeRoom: Room, participant: RemotePartic
     if (
       room !== activeRoom ||
       participant.identity !== credential?.workerIdentity ||
-      controller.state !== "connected"
+      !admittedRooms.has(activeRoom)
     ) {
       ignored = true;
       return;
@@ -2830,6 +2830,12 @@ async function connect(projectionResync = false): Promise<void> {
   let failureStage: ConnectionFailureStage = resuming ? "rebind" : "bootstrap";
   let refused: ConnectionFailure | null = null;
   let superseded = false;
+  const commitCredential = (candidate: BootstrapCredential): void => {
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) {
+      throw new Error("connection superseded");
+    }
+    setCredential(candidate);
+  };
   try {
     if (resuming) {
       const previousCredential = credential;
@@ -2846,7 +2852,7 @@ async function connect(projectionResync = false): Promise<void> {
         eventPolling?.abort();
         eventPolling = null;
         try {
-          setCredential(
+          commitCredential(
             await rebindBrowserCredential(
               previousCredential,
               localOperation.signal,
@@ -2857,7 +2863,7 @@ async function connect(projectionResync = false): Promise<void> {
         } catch (error) {
           if (localOperation.signal.aborted) throw error;
           try {
-            setCredential(
+            commitCredential(
               await rebindBrowserCredential(
                 previousCredential,
                 localOperation.signal,
@@ -2875,7 +2881,7 @@ async function connect(projectionResync = false): Promise<void> {
               throw retryError;
             }
             failureStage = "bootstrap";
-            setCredential(await bootstrap(localOperation.signal));
+            commitCredential(await bootstrap(localOperation.signal));
             sessionReplaced = true;
             resetSessionInputAuthority();
             addMarker("session_replaced", started);
@@ -2885,7 +2891,7 @@ async function connect(projectionResync = false): Promise<void> {
         pendingRebindRequestId = null;
       }
     } else {
-      setCredential(await bootstrapOrReload(localOperation.signal, (stage) => {
+      commitCredential(await bootstrapOrReload(localOperation.signal, (stage) => {
         failureStage = stage;
       }));
       pendingRebindRequestId = null;
@@ -2998,6 +3004,10 @@ async function connect(projectionResync = false): Promise<void> {
   } catch (error) {
     if (attempt !== null && !attempt.owns(connectionAttempt)) {
       await closeLocalRoom(attemptedRoom);
+      return;
+    }
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) {
+      superseded = true;
       return;
     }
     if (controller.state === "stopping") return;

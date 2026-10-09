@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const media = vi.hoisted(() => ({
   connect: vi.fn<() => Promise<void>>(),
   disconnect: vi.fn<() => Promise<void>>(),
+  microphone: vi.fn<() => Promise<undefined>>(),
   rooms: [] as Array<{ emit: (event: string, participant: { identity: string } | string) => void }>,
 }));
 vi.mock("livekit-client", async (original) => ({
@@ -12,7 +13,7 @@ vi.mock("livekit-client", async (original) => ({
   Room: class {
     localParticipant = {
       trackPublications: new Map(),
-      setMicrophoneEnabled: async () => undefined,
+      setMicrophoneEnabled: media.microphone,
     };
     handlers = new Map<string, (participant: { identity: string } | string) => void>();
     constructor() { media.rooms.push(this); }
@@ -37,6 +38,7 @@ async function mount(request: (path: string) => Response | Promise<Response>, re
   vi.resetModules();
   media.connect.mockReset().mockResolvedValue();
   media.disconnect.mockReset().mockResolvedValue();
+  media.microphone.mockReset().mockResolvedValue(undefined);
   media.rooms.length = 0;
   dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
     url: "http://localhost/", pretendToBeVisual: true,
@@ -131,19 +133,143 @@ describe("mounted connection recovery", () => {
   });
 
   it("ignores worker departure before connection admission completes", async () => {
-    let activate!: () => void;
-    const { toggle, recovery } = await mount((path) => path === "/api/v1/media"
-      ? new Promise<Response>((resolve) => { activate = () => resolve(Response.json({ version: 1 })); })
-      : normalRequest(path));
+    const { toggle, recovery } = await mount(normalRequest);
+    let admit!: () => void;
+    media.connect.mockReturnValueOnce(new Promise<void>((resolve) => { admit = resolve; }));
     toggle.click();
-    await vi.waitFor(() => expect(activate).toBeDefined());
+    await vi.waitFor(() => expect(media.connect).toHaveBeenCalledTimes(1));
     media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(media.disconnect).not.toHaveBeenCalled();
     expect(recovery.hidden).toBe(true);
     expect(toggle.disabled).toBe(true);
-    activate();
+    admit();
     await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+  });
+
+  it.each(["microphone", "media"] as const)("handles admitted worker departure during pending %s activation", async (phase) => {
+    let activateMedia!: () => void;
+    let releaseMicrophone!: () => void;
+    const { toggle, recovery, fetch } = await mount((path) => phase === "media" && path === "/api/v1/media"
+      ? new Promise<Response>((resolve) => { activateMedia = () => resolve(Response.json({ version: 1 })); })
+      : normalRequest(path));
+    if (phase === "microphone") {
+      media.microphone.mockReturnValueOnce(new Promise<undefined>((resolve) => { releaseMicrophone = () => resolve(undefined); }));
+    }
+    toggle.click();
+    if (phase === "media") await vi.waitFor(() => expect(activateMedia).toBeDefined());
+    else await vi.waitFor(() => expect(media.microphone).toHaveBeenCalledTimes(1));
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("preparing");
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("worker"));
+    expect(toggle.textContent).toBe("Connect");
+    expect(media.disconnect).toHaveBeenCalledTimes(1);
+    if (phase === "media") activateMedia();
+    else releaseMicrophone();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("disconnected");
+    expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(true);
+    expect(recovery.dataset.stage).toBe("worker");
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/models" || path === "/api/v1/voices")).toHaveLength(0);
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stable-rebind")).toHaveLength(0);
+  });
+
+  it("allows Disconnect while microphone permission is pending and rejects late activation", async () => {
+    const { toggle, recovery, fetch } = await mount(normalRequest);
+    let release!: () => void;
+    media.microphone.mockReturnValueOnce(new Promise<undefined>((resolve) => { release = () => resolve(undefined); }));
+    toggle.click();
+    await vi.waitFor(() => expect(media.microphone).toHaveBeenCalledTimes(1));
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("preparing");
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(toggle.disabled).toBe(false);
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/stop")).toHaveLength(1));
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped"));
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/media")).toHaveLength(0);
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped");
+    expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(true);
+    expect(recovery.hidden).toBe(true);
+  });
+
+  it("allows Disconnect during native reconnect and ignores its late return", async () => {
+    const { toggle, recovery, fetch } = await mount(normalRequest);
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/models")).toHaveLength(1));
+    const activeRoom = media.rooms[0]!;
+    activeRoom.emit("connectionStateChanged", "reconnecting");
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("reconnecting");
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(toggle.disabled).toBe(false);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped"));
+    const requestsBefore = fetch.mock.calls.length;
+    activeRoom.emit("connectionStateChanged", "connected");
+    activeRoom.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetch.mock.calls.length).toBe(requestsBefore);
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped");
+    expect(toggle.textContent).toBe("Connect");
+    expect(recovery.hidden).toBe(true);
+  });
+
+  it.each(["rebind", "bootstrap"] as const)("rejects a late %s answer after reconnect is stopped", async (phase) => {
+    let answer!: () => void;
+    let bootstraps = 0;
+    const replacement = { ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.late.token" };
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/stable-rebind") return phase === "bootstrap"
+        ? new Response(null, { status: 409 })
+        : new Promise<Response>((resolve) => { answer = () => resolve(Response.json(replacement)); });
+      if (path === "/api/v1/stable-bootstrap" && ++bootstraps > 1) {
+        return new Promise<Response>((resolve) => { answer = () => resolve(Response.json(replacement)); });
+      }
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/models")).toHaveLength(1));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(toggle.disabled).toBe(false);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped"));
+    const requestsBefore = fetch.mock.calls.length;
+    answer();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(media.rooms).toHaveLength(1);
+    expect(fetch.mock.calls.length).toBe(requestsBefore);
+    expect(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")).toBeNull();
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped");
+    expect(recovery.hidden).toBe(true);
+  });
+
+  it("preserves a newer connection when an older stopped rebind rejects", async () => {
+    let rejectOld!: () => void;
+    const { toggle, recovery, fetch } = await mount((path) => path === "/api/v1/stable-rebind"
+      ? new Promise<Response>((_, reject) => { rejectOld = () => reject(new Error("synthetic late refusal")); })
+      : normalRequest(path));
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/models")).toHaveLength(1));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("worker"));
+    toggle.click();
+    await vi.waitFor(() => expect(rejectOld).toBeDefined());
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe("stopped"));
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/models")).toHaveLength(2));
+    const disconnectsBefore = media.disconnect.mock.calls.length;
+    rejectOld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.disabled).toBe(false);
+    expect(media.disconnect.mock.calls.length).toBe(disconnectsBefore);
+    expect(recovery.hidden).toBe(true);
   });
 
   it("ignores departure of another participant", async () => {

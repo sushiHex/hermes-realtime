@@ -106,9 +106,9 @@ describe("session toggle presentation", () => {
     ["stopped", "Connect", false, "connect"],
     ["bootstrapping", "Connecting…", true, "connect"],
     ["connecting", "Connecting…", true, "connect"],
-    ["preparing", "Connecting…", true, "connect"],
+    ["preparing", "Disconnect", false, "stop"],
     ["connected", "Disconnect", false, "stop"],
-    ["reconnecting", "Connecting…", true, "connect"],
+    ["reconnecting", "Disconnect", false, "stop"],
     ["error", "Connect", false, "connect"],
     ["stopping", "Disconnecting…", true, "stop"],
   ] as const)("maps %s to one unambiguous action", (state, label, disabled, action) => {

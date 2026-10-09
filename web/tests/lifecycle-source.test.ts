@@ -41,7 +41,7 @@ describe("reloaded tab rebind wiring", () => {
     );
     expect(freshPath).toBeGreaterThan(connectStart);
     expect(mainSource.slice(freshPath, freshPath + 200)).toContain(
-      "setCredential(await bootstrapOrReload(localOperation.signal, (stage) => {",
+      "commitCredential(await bootstrapOrReload(localOperation.signal, (stage) => {",
     );
     const reload = mainSource.indexOf("async function bootstrapOrReload(");
     const reloadEnd = mainSource.indexOf("\n}\n", reload);
