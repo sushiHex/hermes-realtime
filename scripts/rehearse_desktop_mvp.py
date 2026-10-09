@@ -64,8 +64,10 @@ from real_gate_support import (
 )
 
 _PREFIX = "[desktop-mvp-rehearsal] "
-# Windows refuses a path of 260 characters or more (MAX_PATH, terminator included).
+# Windows refuses a path of 260 UTF-16 units or more (MAX_PATH, terminator included), and a
+# directory whose path leaves no room for an 8.3 file name (12 units) inside it.
 _MAX_PATH = 260
+_DIRECTORY_RESERVE = 12
 # The installer layout leaves these out of the Hermes checkout, as the installer does.
 _SPARSE_EXCLUDED = ("website/",)
 # The tail of a failed setup command's stderr, kept in the run directory.
@@ -699,17 +701,23 @@ def listener_verdict(name: str, addresses: list[str]) -> list[Finding]:
     return [] if _loopback_only(addresses) else [("fail", f"{name}_not_loopback")]
 
 
+def _utf16_units(text: str) -> int:
+    """A path's length as Windows counts it: a character outside the BMP is two units."""
+
+    return len(text.encode("utf-16-le")) // 2
+
+
 class SetupFailure(RuntimeError):
     """Setup stopped for a named reason; ``notes`` carry its counts, never text."""
 
-    def __init__(self, category: str, **notes: int) -> None:
+    def __init__(self, category: str, **notes: int | bool) -> None:
         super().__init__(category)
         self.category = category
         self.notes = notes
 
 
-def acquire_rehearsal_lock(environ: Mapping[str, str] | None = None) -> bool:
-    """Hold the one lock every rehearsal of this user takes; False when another run has it.
+def take_rehearsal_lock(environ: Mapping[str, str] | None = None) -> str | None:
+    """Hold the one lock every rehearsal of this user takes; None once held, otherwise why not.
 
     It is a lock file beside the shared LiveKit server. A run holds it from before its
     preflight until its process exits, so two runs can never share LiveKit and Ollama; the
@@ -722,9 +730,13 @@ def acquire_rehearsal_lock(environ: Mapping[str, str] | None = None) -> bool:
     try:
         path = local_livekit.shared_path(environ).parents[1] / "rehearsal"
     except local_livekit.LiveKitUnavailable:
-        return True
-    # The descriptor is never closed: the lock lasts exactly as long as this process.
-    return lock_run_record(path) is not None
+        return None
+    try:
+        # The descriptor is never closed: the lock lasts exactly as long as this process.
+        held = lock_run_record(path)
+    except OSError:
+        return "rehearsal_lock_unavailable"
+    return None if held is not None else "rehearsal_busy"
 
 
 def _run(
@@ -752,8 +764,9 @@ def _run(
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_tree(process.pid)
-        process.communicate()
-        raise
+        # What the command said before it was ended travels with the timeout.
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from None
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
@@ -1685,7 +1698,7 @@ class Rehearsal:
             started = time.monotonic()
             step.notes["candidate"] = await asyncio.to_thread(self._candidate)
             step.time("candidate_s", started)
-            cache_python = await asyncio.to_thread(provision_pinned_hermes)
+            cache_python = await asyncio.to_thread(provision_pinned_hermes, self._required)
             del cache_python
             checkout = self.home / "hermes-agent"
             await asyncio.to_thread(self._clone, checkout)
@@ -1737,10 +1750,14 @@ class Rehearsal:
             "hermes_clone",
             ["git", "-C", str(checkout), "ls-tree", "-r", "-z", "--name-only", commit],
         ).stdout.split("\0")
+        kept = [name for name in names if name and not name.startswith(_SPARSE_EXCLUDED)]
+        # A directory must leave room for an 8.3 file name inside it: 12 more units.
         longest = max(
-            (len(name) for name in names if not name.startswith(_SPARSE_EXCLUDED)), default=0
+            [_utf16_units(name) for name in kept]
+            + [_utf16_units(name.rpartition("/")[0]) + _DIRECTORY_RESERVE for name in kept],
+            default=0,
         )
-        path_chars = len(str(checkout)) + 1 + longest
+        path_chars = _utf16_units(str(checkout)) + 1 + longest
         if path_chars >= _MAX_PATH:
             raise SetupFailure("run_dir_too_long", path_chars=path_chars)
         self._required("hermes_checkout", ["git", "-C", str(checkout), "checkout", "-q",
@@ -1752,15 +1769,27 @@ class Rehearsal:
     def _required(
         self, category: str, argv: list[str], **options: Any
     ) -> subprocess.CompletedProcess[str]:
-        """Run one setup command; when it fails, keep its stderr's tail and name its exit."""
+        """Run one setup command; when it fails or times out, keep its stderr's tail and name
+        its exit, so every setup failure is diagnosable without a rerun."""
 
-        completed = _run(argv, **options)
+        try:
+            completed = _run(argv, **options)
+        except subprocess.TimeoutExpired as expired:
+            kept = self._keep_stderr(category, expired.stderr or "")
+            raise SetupFailure(category, timed_out=True, stderr_bytes=kept) from None
         if completed.returncode != 0:
-            kept = completed.stderr.encode("utf-8")[-_MAX_KEPT_STDERR:]
-            self.logs_dir.mkdir(parents=True, exist_ok=True)
-            (self.logs_dir / f"setup-{category}.stderr").write_bytes(kept)
-            raise SetupFailure(category, exit_code=completed.returncode, stderr_bytes=len(kept))
+            kept = self._keep_stderr(category, completed.stderr)
+            raise SetupFailure(category, exit_code=completed.returncode, stderr_bytes=kept)
         return completed
+
+    def _keep_stderr(self, category: str, stderr: str | bytes) -> int:
+        """Keep at most the last 64 KiB of ``stderr``, cut on a character boundary."""
+
+        text = stderr if isinstance(stderr, str) else stderr.decode("utf-8", "replace")
+        kept = text.encode("utf-8")[-_MAX_KEPT_STDERR:].decode("utf-8", "ignore").encode("utf-8")
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        (self.logs_dir / f"setup-{category}.stderr").write_bytes(kept)
+        return len(kept)
 
     def _hermes(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         completed = _run(
@@ -1832,7 +1861,8 @@ class Rehearsal:
         )  # fmt: skip
         for category, argv in steps:
             self._required(category, argv, env=clean_env, cwd=self.candidate, timeout=1800)
-        located = _run(
+        located = self._required(
+            "host_import",
             [str(self.host_python), "-I", "-c",
              "import hermes_realtime; print(hermes_realtime.__file__)"],
             env=clean_env,
@@ -2916,10 +2946,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     # A second run refuses rather than racing the port check below, which stays as a
     # diagnostic for a server no rehearsal started.
-    if not acquire_rehearsal_lock():
+    refusal = take_rehearsal_lock()
+    if refusal is not None:
         _emit(
             {
-                "category": "rehearsal_busy",
+                "category": refusal,
                 "name": "preflight",
                 "notes": {},
                 "outcome": "failed",

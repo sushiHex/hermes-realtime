@@ -1030,7 +1030,7 @@ def test_one_rehearsal_holds_the_lock_and_a_second_refuses_as_busy(tmp_path: Pat
         "spec = importlib.util.spec_from_file_location('rehearsal', sys.argv[1])\n"
         "module = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(module)\n"
-        "print('held' if module.acquire_rehearsal_lock() else 'busy', flush=True)\n"
+        "print(module.take_rehearsal_lock() or 'held', flush=True)\n"
         "sys.stdin.read()\n",
         encoding="utf-8",
     )
@@ -1081,3 +1081,224 @@ def test_one_rehearsal_holds_the_lock_and_a_second_refuses_as_busy(tmp_path: Pat
     _, records = second()
     assert [record.get("category") for record in records] != ["rehearsal_busy"]
     assert records and records[0]["step"] == "preflight"
+
+
+# --- #219 review: one bounded runner for every setup subprocess ---------------------------
+
+
+def test_provisioning_runs_every_command_through_the_bounded_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import real_gate_support as support
+
+    monkeypatch.setattr(support, "PINNED_HERMES", tmp_path)
+    commit = support.HERMES_BASELINE["commit"]
+    calls: list[tuple[str, list[str], float]] = []
+
+    def run(
+        category: str, argv: list[str], *, cwd: Path, timeout: float, env: object = None
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((category, argv[:2], timeout))
+        stdout = ""
+        if argv[:2] == ["git", "status"]:
+            checked_out = any(call[1] == ["git", "checkout"] for call in calls)
+            stdout = f"# branch.oid {commit if checked_out else '(initial)'}\n"
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    python = support.provision_pinned_hermes(run)
+
+    assert python.parent.parent == tmp_path / "venv"
+    assert [argv for _, argv, _ in calls] == [
+        ["git", "init"],
+        ["git", "remote"],
+        ["git", "sparse-checkout"],
+        ["git", "status"],
+        ["git", "fetch"],
+        ["git", "checkout"],
+        ["git", "status"],
+        ["uv", "sync"],
+    ]
+    assert {category for category, _, _ in calls} == {"hermes_cache", "hermes_cache_sync"}
+    assert all(0 < timeout <= 1800 for _, _, timeout in calls)
+
+
+def test_the_rehearsal_provisions_through_its_own_setup_runner() -> None:
+    assert "provision_pinned_hermes, self._required" in inspect.getsource(
+        rehearsal.Rehearsal.setup
+    )
+
+
+def test_the_default_provisioning_runner_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    import real_gate_support as support
+
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        seen.update(options)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(support.subprocess, "run", fake_run)
+    support._checked_run("hermes_cache", ["git", "status"], cwd=Path("."), timeout=60)
+
+    assert (seen["timeout"], seen["check"]) == (60, True)
+
+
+def test_the_cached_head_reads_an_empty_and_a_checked_out_repository(tmp_path: Path) -> None:
+    import real_gate_support as support
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _git("init", "-q", cwd=source)
+    assert support._cached_head(support._checked_run, source) == "(initial)"
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x",
+         cwd=source)  # fmt: skip
+    assert support._cached_head(support._checked_run, source) == _git(
+        "rev-parse", "HEAD", cwd=source
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ends the process tree with taskkill")
+def test_a_timed_out_command_keeps_what_it_wrote_to_stderr() -> None:
+    import subprocess
+
+    script = "import sys, time; sys.stderr.write('started\\n'); sys.stderr.flush(); time.sleep(60)"
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        rehearsal._run([sys.executable, "-c", script], timeout=3)
+
+    assert raised.value.stderr == "started\n"
+
+
+def test_a_timed_out_setup_command_is_named_with_its_kept_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    run = rehearsal.Rehearsal(tmp_path / "run", "m")
+
+    def timed_out(argv: list[str], **_: object) -> object:
+        raise subprocess.TimeoutExpired(argv, 1800, output="", stderr="resolving...\n")
+
+    monkeypatch.setattr(rehearsal, "_run", timed_out)
+
+    with pytest.raises(rehearsal.SetupFailure) as raised:
+        run._required("hermes_cache_sync", ["uv", "sync"], timeout=1800)
+
+    assert raised.value.category == "hermes_cache_sync"
+    assert raised.value.notes == {"timed_out": True, "stderr_bytes": 13}
+    assert (run.logs_dir / "setup-hermes_cache_sync.stderr").read_text(encoding="utf-8") == (
+        "resolving...\n"
+    )
+
+
+def test_the_kept_stderr_tail_starts_on_a_whole_character(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = rehearsal.Rehearsal(tmp_path / "run", "m")
+    # Two-byte characters at even offsets, then one odd byte: the byte cut lands mid-character.
+    stderr = "é" * 40_000 + "a"
+    monkeypatch.setattr(rehearsal, "_run", lambda argv, **_: _completed(1, stderr))
+
+    with pytest.raises(rehearsal.SetupFailure):
+        run._required("host_venv", ["uv", "venv"])
+
+    kept = (run.logs_dir / "setup-host_venv.stderr").read_bytes()
+    assert stderr.endswith(kept.decode("utf-8"))  # strict decode: no partial character
+    assert len(kept) == rehearsal._MAX_KEPT_STDERR - 1
+
+
+def test_a_lock_directory_that_cannot_be_made_is_refused_with_its_own_category(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    environment = {"LOCALAPPDATA": str(blocker)}
+
+    assert rehearsal.take_rehearsal_lock(environment) == "rehearsal_lock_unavailable"
+    completed = subprocess.run(
+        [sys.executable, str(_PATH), "--ollama-model", "none"],
+        env=os.environ | environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 1
+    assert "Traceback" not in completed.stderr
+    assert [
+        json.loads(line.removeprefix(rehearsal._PREFIX))["category"]
+        for line in completed.stdout.splitlines()
+        if line.startswith(rehearsal._PREFIX)
+    ] == ["rehearsal_lock_unavailable"]
+
+
+@pytest.mark.parametrize(("spare", "refused"), [(0, True), (1, False)])
+def test_a_long_directory_needs_room_for_a_short_name_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spare: int, refused: bool
+) -> None:
+    directory = "d" * 40
+    commit = _pinned_source(tmp_path, (f"{directory}/a.py", "short.py"))
+    monkeypatch.setattr(rehearsal, "PINNED_HERMES", tmp_path)
+    monkeypatch.setattr(rehearsal, "HERMES_BASELINE", {"commit": commit})
+    run = rehearsal.Rehearsal(tmp_path / "run", "m")
+    checkout = run.home / "hermes-agent"
+    # The directory, not its 4-character file, sets the limit: 40 + 12 reserved units.
+    limit = len(str(checkout)) + 1 + len(directory) + 12
+    monkeypatch.setattr(rehearsal, "_MAX_PATH", limit + spare)
+
+    if refused:
+        with pytest.raises(rehearsal.SetupFailure) as raised:
+            run._clone(checkout)
+        assert raised.value.notes == {"path_chars": limit}
+    else:
+        run._clone(checkout)
+        assert (checkout / directory / "a.py").exists()
+
+
+def test_path_lengths_count_utf16_units_as_windows_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One character outside the BMP is two units; counting characters would fit it.
+    name = "x" * 40 + "\U0001f426.py"
+    commit = _pinned_source(tmp_path, (name,))
+    monkeypatch.setattr(rehearsal, "PINNED_HERMES", tmp_path)
+    monkeypatch.setattr(rehearsal, "HERMES_BASELINE", {"commit": commit})
+    run = rehearsal.Rehearsal(tmp_path / "run", "m")
+    checkout = run.home / "hermes-agent"
+    units = len(str(checkout)) + 1 + len(name) + 1
+    monkeypatch.setattr(rehearsal, "_MAX_PATH", units)
+
+    with pytest.raises(rehearsal.SetupFailure) as raised:
+        run._clone(checkout)
+    assert raised.value.notes == {"path_chars": units}
+
+
+def test_the_host_import_check_fails_setup_with_its_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    run = rehearsal.Rehearsal(tmp_path / "run", "m")
+
+    def fake_run(argv: list[str], **_: object) -> object:
+        if argv[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(argv, 0, "a" * 40, "")
+        if argv[:2] == ["uv", "build"]:
+            dist = run.run_dir / "dist"
+            dist.mkdir(parents=True, exist_ok=True)
+            (dist / "hermes_realtime-0-py3-none-any.whl").write_bytes(b"")
+        if argv[1:3] == ["-I", "-c"]:
+            return _completed(1, "ModuleNotFoundError: No module named 'hermes_realtime'\n")
+        return _completed(0)
+
+    monkeypatch.setattr(rehearsal, "_run", fake_run)
+
+    with pytest.raises(rehearsal.SetupFailure) as raised:
+        run._candidate()
+    assert raised.value.category == "host_import"
+    assert raised.value.notes["exit_code"] == 1

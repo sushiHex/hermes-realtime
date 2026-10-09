@@ -588,7 +588,8 @@ every step was `as_expected` and nothing was left.
 LiveKit server. It keeps the lock until its process exits, and the operating system releases
 it even after a crash. While another run holds it, the script prints one `failed` preflight line
 with category `rehearsal_busy` and exits 1. Two runs can't overlap and share LiveKit and Ollama;
-they used to race past the port check below.
+they used to race past the port check below. If the lock's directory can't be created, the
+line's category is `rehearsal_lock_unavailable`.
 
 **Preflight.** When a required piece is missing, the script prints one `not_run` preflight line
 and exits 0. The pieces are Windows, the pinned LiveKit binary, system Chrome, Playwright,
@@ -596,15 +597,20 @@ Kokoro, git, uv, and a running Ollama with the named model. A listener already o
 a `failed` preflight with exit code 1. With the lock in place, that means a server no rehearsal
 started, such as an orphan.
 
-**Setup failures name their cause.**
-- **A failed setup command** (the candidate clone, wheel build or host install; the Hermes
-  clone, sync or wheel install) fails the `setup` step with a short category such as
-  `host_requirements`. The record carries the command's `exit_code`, and the last 64 KiB of
-  its stderr stay in the run directory as `logs/setup-<category>.stderr`.
+**Setup failures name their cause.** Every setup command runs through one bounded runner. That
+covers the pinned Hermes cache (git and `uv sync`), the candidate clone, wheel build, host
+install and its import check, and the Hermes clone, sync and wheel install.
+- **A command that fails** ends the `setup` step with a short category, such as
+  `host_requirements`, and the record carries its `exit_code`.
+- **A command that times out** records `timed_out` instead, and its process tree is ended.
+- **Either way, its stderr is kept.** The last 64 KiB stay in the run directory as
+  `logs/setup-<category>.stderr`, cut on a character boundary.
 - **A run directory too long for the pinned Hermes checkout** is refused before the checkout,
-  as `run_dir_too_long`. The test is the checkout directory plus the commit's longest
-  checked-out path reaching Windows' 260-character limit, and the record carries
-  `path_chars`. The default directory under `%TEMP%` fits.
+  as `run_dir_too_long`, and the record carries `path_chars`.
+  - The test adds the checkout directory to the longest thing the checkout creates: a file, or
+    a directory plus the 12 units Windows reserves for a short name inside it.
+  - Lengths count UTF-16 units, as Windows does, against its 260-unit limit.
+  - The default directory under `%TEMP%` fits.
 
 **Differences from the operator's session.** Ctrl-C cannot reach a detached process, so:
 - The host runs as `<host env>/python <clone>/scripts/rehearse_desktop_mvp.py --host-child <stop
