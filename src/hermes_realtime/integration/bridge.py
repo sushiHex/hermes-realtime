@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import ipaddress
 import json
 import logging
+import math
 import re
+import secrets
 import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
@@ -20,6 +23,7 @@ from pydantic import ValidationError
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    MUTUAL_AUTH_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_EVENT_TYPES,
@@ -57,15 +61,84 @@ from .session import SessionBinding
 
 _MAX_LINE_BYTES = 64 * 1024
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-_HELLO_FIELDS = frozenset({"token", "participant_id", "protocol_version", "capabilities"})
-_WELCOME_FIELDS = frozenset({"ok", "protocol_version", "capabilities"})
+# The hello carries no secret: each side proves the token with an HMAC over the handshake.
+_HELLO_FIELDS = frozenset({"participant_id", "protocol_version", "capabilities", "client_nonce"})
+_WELCOME_FIELDS = frozenset({"ok", "protocol_version", "capabilities", "server_nonce", "proof"})
 # A welcome field that accompanies exactly one negotiated capability.
 _WELCOME_EXTRAS = {
     "review_interval": VOICE_REVIEW_CAPABILITY,
     "runtime": RUNTIME_ATTESTATION_CAPABILITY,
 }
+# 32 random bytes from ``secrets``, lowercase hex; an HMAC-SHA256 proof has the same shape.
+_NONCE_PATTERN = re.compile(r"[0-9a-f]{64}")
 _HELLO_MARKER = "[hermes-bridge-hello] "
+_WELCOME_MARKER = "[hermes-bridge-welcome] "
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _Handshake:
+    """Everything one handshake's proofs bind, so no part can be downgraded or spliced."""
+
+    participant_id: str
+    client_nonce: str
+    server_nonce: str
+    requested: frozenset[str]
+    negotiated: frozenset[str]
+    # The welcome's metadata exactly as sent: ``review_interval`` and ``runtime``.
+    metadata: dict[str, object]
+
+    def proof(self, token: str, role: str) -> str:
+        """The proof of one role: ``server`` (welcome), ``client`` or ``accept`` (final)."""
+
+        transcript = json.dumps(
+            {
+                "client_nonce": self.client_nonce,
+                "metadata": self.metadata,
+                "negotiated": sorted(self.negotiated),
+                "participant_id": self.participant_id,
+                "protocol_version": BRIDGE_PROTOCOL_VERSION,
+                "requested": sorted(self.requested),
+                "role": role,
+                "server_nonce": self.server_nonce,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("ascii")
+        return hmac.new(
+            token.encode("utf-8", errors="surrogatepass"), transcript, hashlib.sha256
+        ).hexdigest()
+
+    def verifies(self, token: str, role: str, received: object) -> bool:
+        """Constant-time check of a received proof, refusing anything of another shape."""
+
+        return (
+            type(received) is str
+            and _NONCE_PATTERN.fullmatch(received) is not None
+            and hmac.compare_digest(
+                self.proof(token, role).encode("ascii"), received.encode("ascii")
+            )
+        )
+
+
+def _nonce() -> str:
+    return secrets.token_hex(32)
+
+
+async def _read_handshake_line(reader: asyncio.StreamReader) -> Any:
+    """One handshake line as JSON; a closed or garbled peer fails authentication."""
+
+    try:
+        return json.loads(await reader.readline())
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as error:
+        raise BridgeAuthenticationError("bridge authentication failed") from error
+
+
+def _marker(prefix: str, refusal: str) -> None:
+    """The rejection category only: never the token, a nonce, a proof or the participant."""
+    print(prefix + json.dumps({"refusal": refusal, "version": 1}, separators=(",", ":")),
+          flush=True)
 
 
 class VoiceArchiveHandler(Protocol):
@@ -210,6 +283,8 @@ class LocalHermesBridgeServer:
         if (getattr(voice, "forget_available", False) is True
                 and callable(getattr(voice, "forget", None))):
             self._offered |= frozenset({VOICE_FORGET_CAPABILITY})
+        # Required, never merely offered: a hello without it is refused.
+        self._offered |= frozenset({MUTUAL_AUTH_CAPABILITY})
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe_completion: Callable[[], None] | None = None
         self._completion_tasks: set[asyncio.Task[WorkCompletedEvent | None]] = set()
@@ -678,7 +753,11 @@ class LocalHermesBridgeServer:
         reader: asyncio.StreamReader,
         connection: _Connection,
     ) -> tuple[str, frozenset[str]]:
-        """Check the 0.2 hello; answer with the capabilities both sides hold."""
+        """Prove the token first, then require the client's proof before routing anything.
+
+        The welcome carries the server's proof over the whole handshake; the client answers
+        with its own, and only then does the server send its final authenticated acceptance.
+        """
 
         refusal: str | None = None
         try:
@@ -686,20 +765,16 @@ class LocalHermesBridgeServer:
             try:
                 hello = json.loads(raw)
                 if type(hello) is not dict or set(hello) != _HELLO_FIELDS:
-                    raise TypeError("the hello must carry exactly the 0.2 fields")
-                token = hello["token"]
+                    # A hello that still carries a token is refused here, unanswered by it.
+                    raise TypeError("the hello must carry exactly the 0.3 fields")
                 participant_id = hello["participant_id"]
             except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:
                 refusal = "shape"
                 await self._send_json(connection, {"ok": False})
                 raise BridgeAuthenticationError("invalid bridge handshake") from exc
             requested = _capabilities(hello["capabilities"])
-            if not isinstance(token, str) or not hmac.compare_digest(
-                token.encode("utf-8", errors="surrogatepass"),
-                self._token.encode("utf-8", errors="surrogatepass"),
-            ):
-                refusal = "token"
-            elif (
+            client_nonce = hello["client_nonce"]
+            if (
                 not isinstance(participant_id, str)
                 or _IDENTIFIER_PATTERN.fullmatch(participant_id) is None
             ):
@@ -709,29 +784,53 @@ class LocalHermesBridgeServer:
                 or hello["protocol_version"] != BRIDGE_PROTOCOL_VERSION
             ):
                 refusal = "version"
-            elif requested is None:
+            elif requested is None or MUTUAL_AUTH_CAPABILITY not in requested:
                 refusal = "capability"
+            elif type(client_nonce) is not str or _NONCE_PATTERN.fullmatch(client_nonce) is None:
+                refusal = "nonce"
             if refusal is not None:
                 await self._send_json(connection, {"ok": False})
                 raise BridgeAuthenticationError("bridge authentication failed")
+            assert requested is not None  # Refused above otherwise.
+            negotiated = requested & self._offered
+            metadata: dict[str, object] = {}
+            if VOICE_REVIEW_CAPABILITY in negotiated:
+                metadata["review_interval"] = self._review_interval
+            if RUNTIME_ATTESTATION_CAPABILITY in negotiated:
+                assert self._runtime is not None  # Offered only with an attestation.
+                metadata["runtime"] = self._runtime.model_dump(mode="json")
+            handshake = _Handshake(
+                participant_id, client_nonce, _nonce(), requested, negotiated, metadata
+            )
+            await self._send_json(connection, {
+                "ok": True,
+                "protocol_version": BRIDGE_PROTOCOL_VERSION,
+                "capabilities": sorted(negotiated),
+                "server_nonce": handshake.server_nonce,
+                "proof": handshake.proof(self._token, "server"),
+                **metadata,
+            })
+            raw = await reader.readline()
+            if not raw:
+                # The client walked away, as one does on refusing the welcome.
+                refusal = "abandoned"
+                raise BridgeAuthenticationError("bridge authentication was abandoned")
+            try:
+                answer = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+                answer = None
+            if (
+                type(answer) is not dict
+                or set(answer) != {"proof"}
+                or not handshake.verifies(self._token, "client", answer["proof"])
+            ):
+                # Nothing is routed for a client that cannot prove the token.
+                refusal = "proof"
+                raise BridgeAuthenticationError("bridge authentication failed")
+            await self._send_json(connection, {"accepted": handshake.proof(self._token, "accept")})
         finally:
-            # The rejection category only: never the token, the participant or the hello.
             if refusal is not None:
-                evidence = json.dumps({"refusal": refusal, "version": 1}, separators=(",", ":"))
-                print(_HELLO_MARKER + evidence, flush=True)
-        assert requested is not None  # Refused above otherwise.
-        negotiated = requested & self._offered
-        welcome: dict[str, object] = {
-            "ok": True,
-            "protocol_version": BRIDGE_PROTOCOL_VERSION,
-            "capabilities": sorted(negotiated),
-        }
-        if VOICE_REVIEW_CAPABILITY in negotiated:
-            welcome["review_interval"] = self._review_interval
-        if RUNTIME_ATTESTATION_CAPABILITY in negotiated:
-            assert self._runtime is not None  # Offered only with an attestation.
-            welcome["runtime"] = self._runtime.model_dump(mode="json")
-        await self._send_json(connection, welcome)
+                _marker(_HELLO_MARKER, refusal)
         return participant_id, negotiated
 
     async def _route_voice(
@@ -901,65 +1000,124 @@ class LocalHermesBridgeClient:
         token: str,
         participant_id: str,
         capabilities: tuple[str, ...] = (),
+        handshake_timeout: float = 10.0,
     ) -> LocalHermesBridgeClient:
+        """Connect, and return only after both sides proved the token and the server accepted.
+
+        The token never crosses the wire. Nothing is sent after the hello, and nothing the
+        welcome carries is accepted, until the server's proof over the whole handshake
+        verifies; the server's final acceptance is itself a proof.
+        """
+
         if not ipaddress.ip_address(host).is_loopback:
             raise ValueError("Hermes bridge client must connect to loopback")
         requested = _capabilities(list(capabilities)) if type(capabilities) is tuple else None
         if requested is None:
             raise ValueError("capabilities must be a tuple of distinct known capabilities")
-        reader, writer = await asyncio.open_connection(
-            host,
-            port,
-            limit=_MAX_LINE_BYTES,
-        )
-        client = cls(reader, writer)
+        if (
+            type(handshake_timeout) not in (int, float)
+            or not math.isfinite(handshake_timeout)
+            or handshake_timeout <= 0
+        ):
+            raise ValueError("handshake_timeout must be a positive finite number")
+        requested |= frozenset({MUTUAL_AUTH_CAPABILITY})
+        client: LocalHermesBridgeClient | None = None
+        refusal: str | None = None
         try:
-            await client._send_json(
-                {
-                    "token": token,
-                    "participant_id": participant_id,
-                    "protocol_version": BRIDGE_PROTOCOL_VERSION,
-                    "capabilities": sorted(requested),
-                }
-            )
-            response = json.loads(await reader.readline())
-            fields = frozenset(response) if type(response) is dict else frozenset()
-            offered = (
-                _capabilities(response["capabilities"]) if "capabilities" in fields else None
-            )
-            # Each extra is present exactly when its capability was negotiated.
-            expected = (
-                None
-                if offered is None
-                else _WELCOME_FIELDS
-                | {extra for extra, capability in _WELCOME_EXTRAS.items() if capability in offered}
-            )
-            interval = response.get("review_interval") if type(response) is dict else None
-            if (
-                offered is None
-                or fields != expected
-                or response["ok"] is not True
-                or response["protocol_version"] != BRIDGE_PROTOCOL_VERSION
-                or not offered <= requested
-                or (
-                    VOICE_REVIEW_CAPABILITY in offered
-                    and (type(interval) is not int or not 1 <= interval <= 1000)
+            async with asyncio.timeout(handshake_timeout):
+                reader, writer = await asyncio.open_connection(
+                    host,
+                    port,
+                    limit=_MAX_LINE_BYTES,
                 )
-            ):
-                raise BridgeAuthenticationError("bridge authentication failed")
-            runtime = None
-            if RUNTIME_ATTESTATION_CAPABILITY in offered:
-                try:
-                    runtime = RuntimeAttestation.model_validate(response["runtime"])
-                except ValidationError as error:
-                    raise BridgeAuthenticationError("bridge authentication failed") from error
-            client._capabilities = offered
+                client = cls(reader, writer)
+                client_nonce = _nonce()
+                await client._send_json(
+                    {
+                        "participant_id": participant_id,
+                        "protocol_version": BRIDGE_PROTOCOL_VERSION,
+                        "capabilities": sorted(requested),
+                        "client_nonce": client_nonce,
+                    }
+                )
+                refusal = "shape"
+                response = await _read_handshake_line(reader)
+                fields = frozenset(response) if type(response) is dict else frozenset()
+                offered = (
+                    _capabilities(response["capabilities"]) if "capabilities" in fields else None
+                )
+                # Each extra is present exactly when its capability was negotiated.
+                extras = (
+                    frozenset()
+                    if offered is None
+                    else frozenset(
+                        extra for extra, capability in _WELCOME_EXTRAS.items()
+                        if capability in offered
+                    )
+                )
+                interval = response.get("review_interval") if type(response) is dict else None
+                if (
+                    offered is None
+                    or fields != _WELCOME_FIELDS | extras
+                    or response["ok"] is not True
+                    or response["protocol_version"] != BRIDGE_PROTOCOL_VERSION
+                    or not offered <= requested
+                    or MUTUAL_AUTH_CAPABILITY not in offered
+                    or type(response["server_nonce"]) is not str
+                    or _NONCE_PATTERN.fullmatch(response["server_nonce"]) is None
+                    or (
+                        VOICE_REVIEW_CAPABILITY in offered
+                        and (type(interval) is not int or not 1 <= interval <= 1000)
+                    )
+                ):
+                    raise BridgeAuthenticationError("bridge authentication failed")
+                handshake = _Handshake(
+                    participant_id,
+                    client_nonce,
+                    response["server_nonce"],
+                    requested,
+                    offered,
+                    {extra: response[extra] for extra in sorted(extras)},
+                )
+                refusal = "proof"
+                if not handshake.verifies(token, "server", response["proof"]):
+                    raise BridgeAuthenticationError("bridge authentication failed")
+                # Only now is anything the welcome carries believed.
+                refusal = "runtime"
+                runtime = None
+                if RUNTIME_ATTESTATION_CAPABILITY in offered:
+                    try:
+                        runtime = RuntimeAttestation.model_validate(response["runtime"])
+                    except ValidationError as error:
+                        raise BridgeAuthenticationError(
+                            "bridge authentication failed"
+                        ) from error
+                await client._send_json({"proof": handshake.proof(token, "client")})
+                refusal = "acceptance"
+                accepted = await _read_handshake_line(reader)
+                if (
+                    type(accepted) is not dict
+                    or set(accepted) != {"accepted"}
+                    or not handshake.verifies(token, "accept", accepted["accepted"])
+                ):
+                    raise BridgeAuthenticationError("bridge authentication failed")
+                refusal = None
+            client._capabilities = offered - {MUTUAL_AUTH_CAPABILITY}
             client._review_interval = interval
             client._runtime = runtime
             return client
-        except Exception:
-            await client.close()
+        except TimeoutError:
+            refusal = "deadline"
+            if client is not None:
+                await client.close()
             raise
+        except Exception:
+            if client is not None:
+                await client.close()
+            raise
+        finally:
+            if refusal is not None:
+                _marker(_WELCOME_MARKER, refusal)
 
     async def archive(
         self, event: VoiceArchiveEvent

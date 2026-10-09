@@ -305,10 +305,13 @@ VOICE_MEMORY_CAPABILITY = "voice_memory"
 VOICE_FORGET_CAPABILITY = "voice_forget"
 # A welcome that negotiates it carries ``runtime``: what the serving process loaded.
 RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
+# Required on every hello: both sides prove the shared token without sending it.
+MUTUAL_AUTH_CAPABILITY = "mutual_auth"
 BRIDGE_CAPABILITIES = frozenset({
     VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, VOICE_MEMORY_CAPABILITY,
     VOICE_FORGET_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
+    MUTUAL_AUTH_CAPABILITY,
 })
 VOICE_MAX_BATCH_ROWS = 256
 VOICE_MAX_TEXT_CHARS = 65_536

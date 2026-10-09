@@ -75,7 +75,7 @@ def test_the_bridge_stays_at_version_0_3_and_memory_is_a_capability() -> None:
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
     assert (
         frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation",
-                   "voice_forget"})
+                   "voice_forget", "mutual_auth"})
         == BRIDGE_CAPABILITIES
     )
 

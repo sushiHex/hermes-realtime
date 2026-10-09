@@ -1010,11 +1010,12 @@ async def _guards(home: Path) -> dict[str, object]:
 
             reader, raw_writer = await asyncio.open_connection(server.host, server.port)
             try:
+                # A well-formed authenticated hello, refused only for its unknown capability.
                 raw_writer.write(json.dumps({
-                    "token": os.environ["M4_BRIDGE_TOKEN"],
                     "participant_id": "voice-memory-unknown",
                     "protocol_version": BRIDGE_PROTOCOL_VERSION,
-                    "capabilities": ["voice_memory_unknown"],
+                    "capabilities": ["mutual_auth", "voice_memory_unknown"],
+                    "client_nonce": secrets.token_hex(32),
                 }, separators=(",", ":")).encode("utf-8") + b"\n")
                 await raw_writer.drain()
                 unknown_reply = json.loads(await asyncio.wait_for(reader.readline(), 5))
