@@ -17,6 +17,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | --- | --- |
 | Desktop MVP setup and diagnostic session | [Desktop MVP](desktop-mvp-diagnostic.md) |
 | Host, browser, and media composition | [Local LiveKit and full-host setup](local-livekit.md) |
+| Frozen desktop candidate and operator acceptance | [Desktop MVP acceptance](desktop-mvp-acceptance.md) |
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Dependency upgrades, security assessment, and serial landing | [Dependency maintenance](dependency-maintenance.md) |
 | Conversation continuity: realtime converses, Hermes keeps the turns | [Accepted continuity design and qualification evidence](adr/0003-hermes-owned-conversation-continuity.md) |
