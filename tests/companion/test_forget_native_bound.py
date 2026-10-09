@@ -108,9 +108,85 @@ def test_a_branch_copy_is_found_even_after_hermes_orphaned_it(
     session_db = _native_db(connection, tmp_path)
     monkeypatch.setattr(hermes_compat, "resolve", lambda name: session_db)
     try:
-        assert hermes_compat.branch_copies_absent(session_db(), ("voice",)) is False
+        assert hermes_compat.copies_absent(session_db(), ("voice",), ()) is False
         connection.execute("DELETE FROM sessions WHERE id = 'copy'")
-        assert hermes_compat.branch_copies_absent(session_db(), ("voice",)) is True
+        assert hermes_compat.copies_absent(session_db(), ("voice",), ()) is True
+    finally:
+        connection.close()
+
+
+def _copies_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Any]:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, "
+        "model_config TEXT, end_reason TEXT)"
+    )
+    session_db = _native_db(connection, tmp_path)
+    monkeypatch.setattr(hermes_compat, "resolve", lambda name: session_db)
+    return connection, session_db()
+
+
+def _orphan(connection: sqlite3.Connection, session_id: str) -> None:
+    """Hermes's single-row delete: the row goes, its children lose their parent link."""
+    connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    connection.execute(
+        "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+        (session_id,),
+    )
+
+
+def test_an_api_fork_is_frozen_as_a_copy_and_keeps_the_delete_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    connection, db = _copies_db(monkeypatch, tmp_path)
+    try:
+        connection.executemany("INSERT INTO sessions VALUES (?, ?, ?, ?, ?)", [
+            ("voice", None, "voice", None, "branched"),
+            # POST /api/sessions/{id}/fork: a parent link and no marker.
+            ("fork", "voice", "api_server", None, None),
+            # A delegated task of the voice session is a task, not a copy.
+            ("task", "voice", "tool", None, None),
+        ])
+
+        copies = hermes_compat.capture_copies(db, ("voice",))
+        assert copies == ("fork",)
+
+        _orphan(connection, "voice")
+        assert hermes_compat.copies_absent(db, ("voice",), copies) is False
+        _orphan(connection, "fork")
+        assert hermes_compat.copies_absent(db, ("voice",), copies) is True
+    finally:
+        connection.close()
+
+
+def test_a_copy_compression_chain_and_copies_of_copies_are_frozen_with_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    connection, db = _copies_db(monkeypatch, tmp_path)
+    try:
+        connection.executemany("INSERT INTO sessions VALUES (?, ?, ?, ?, ?)", [
+            ("voice", None, "voice", None, None),
+            ("copy_root", "voice", "tui", '{"_branched_from": "voice"}', "compression"),
+            # A compression continuation inherits no marker, only the parent link.
+            ("copy_cont", "copy_root", "tui", '{"max_iterations": 90}', None),
+            # A /branch copy Hermes already orphaned, and a copy made from it.
+            ("orphan", None, "cli", '{"_branched_from": "voice"}', None),
+            ("grand", None, "cli", '{"_branched_from": "orphan"}', None),
+        ])
+
+        copies = hermes_compat.capture_copies(db, ("voice",))
+        assert set(copies) == {"copy_root", "copy_cont", "orphan", "grand"}
+
+        _orphan(connection, "voice")
+        # The user deletes the copy with Hermes's own single-row delete.
+        _orphan(connection, "copy_root")
+        _orphan(connection, "orphan")
+        assert hermes_compat.copies_absent(db, ("voice",), copies) is False
+        _orphan(connection, "copy_cont")
+        assert hermes_compat.copies_absent(db, ("voice",), copies) is False
+        _orphan(connection, "grand")
+        assert hermes_compat.copies_absent(db, ("voice",), copies) is True
     finally:
         connection.close()
 

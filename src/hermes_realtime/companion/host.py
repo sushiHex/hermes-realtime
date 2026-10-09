@@ -155,7 +155,8 @@ class VoiceCompanionService:
                 archive._retire_owned,
             )
             if all(callable(getattr(port, name, None)) for name in
-                   ("capture_delete_targets", "delete_target", "absent", "branch_copies_absent"))
+                   ("capture_delete_targets", "delete_target", "absent", "capture_copies",
+                    "copies_absent"))
             else None
         )
         self._forget_tasks: set[asyncio.Task[str]] = set()

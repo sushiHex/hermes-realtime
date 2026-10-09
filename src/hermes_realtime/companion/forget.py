@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Literal, Protocol, TypeVar
 
 from hermes_realtime.companion.integrity import ArchiveRefusal, validate_conversation_id
-from hermes_realtime.companion.store import CompanionStore, DeleteTarget
+from hermes_realtime.companion.store import CompanionStore, DeleteTarget, DeletionRecord
 
 
 class DeletePort(Protocol):
@@ -21,7 +21,9 @@ class DeletePort(Protocol):
 
     def absent(self, session_ids: tuple[str, ...]) -> bool: ...
 
-    def branch_copies_absent(self, session_ids: tuple[str, ...]) -> bool: ...
+    def capture_copies(self, session_ids: tuple[str, ...]) -> tuple[str, ...]: ...
+
+    def copies_absent(self, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool: ...
 
 
 _T = TypeVar("_T")
@@ -75,6 +77,13 @@ class VoiceForgetReconciler:
     ) -> Literal["pending", "complete"]:
         validate_conversation_id(conversation_id)
         async with self._conversation(conversation_id):
+            # A store that never bound the conversation cannot tell "never archived" from
+            # "archived elsewhere", so it neither fences nor completes it.
+            if (
+                self._store.read(conversation_id) is None
+                and self._store.deletion(conversation_id) is None
+            ):
+                raise ArchiveRefusal("unbound")
             self._store.tombstone(conversation_id, generation)
             if self._on_tombstone is not None:
                 self._on_tombstone(conversation_id)
@@ -106,11 +115,7 @@ class VoiceForgetReconciler:
         evidence: dict[str, str | int] | None = None
         stage = "verify"
         try:
-            if (
-                deletion.complete
-                and deletion.targets is not None
-                and await self._remaining(deletion.targets) is None
-            ):
+            if deletion.complete and await self._remaining(deletion) is None:
                 return "complete"
             stage = "defer"
             if self._review_admitted(conversation_id):
@@ -119,22 +124,29 @@ class VoiceForgetReconciler:
             if deletion.targets is None:
                 stage = "capture"
                 binding = self._store.read(conversation_id)
-                voice_id = None if binding is None else binding.session_id
+                if binding is None:
+                    # Nothing proves what this store's Hermes holds of it: never complete.
+                    raise ArchiveRefusal("unbound")
                 allow_missing_voice = (
-                    binding is not None and binding.committed is None
+                    binding.committed is None
                     and binding.pending is not None and binding.pending.fingerprint.count == 0
                 )
                 targets = await self._call(
-                    self._port.capture_delete_targets, voice_id, allow_missing_voice,
+                    self._port.capture_delete_targets, binding.session_id, allow_missing_voice,
                 )
-                self._store.set_delete_manifest(conversation_id, targets)
+                # Copies are frozen before the chain goes: Hermes's delete orphans them.
+                copies = await self._call(
+                    self._port.capture_copies,
+                    tuple(target.session_id for target in targets),
+                )
+                self._store.set_delete_manifest(conversation_id, targets, copies)
                 deletion = self._store.deletion(conversation_id)
                 assert deletion is not None and deletion.targets is not None
             stage = "delete"
             for target in deletion.targets:
                 await self._call(self._port.delete_target, target)
             stage = "verify"
-            remaining = await self._remaining(deletion.targets)
+            remaining = await self._remaining(deletion)
             if remaining is not None:
                 evidence = {"category": remaining}
                 return "pending"
@@ -152,17 +164,20 @@ class VoiceForgetReconciler:
             if evidence is not None:
                 _marker(evidence | {"stage": stage, "version": 1})
 
-    async def _remaining(self, targets: tuple[DeleteTarget, ...]) -> str | None:
+    async def _remaining(self, deletion: DeletionRecord) -> str | None:
         """What of the generation is left: None when nothing is, else its category.
 
-        Hermes's delete keeps the copies ``/branch`` made of a chain session as
-        independent conversations; while any remains, the delete is not complete.
+        Hermes's delete keeps copies of a chain session (``/branch`` copies, API forks
+        and their compression continuations) as independent conversations; while any
+        remains, the delete is not complete.
         """
 
-        ids = tuple(target.session_id for target in targets)
+        if deletion.targets is None:
+            return "present"
+        ids = tuple(target.session_id for target in deletion.targets)
         if not await self._call(self._port.absent, ids):
             return "present"
-        if not await self._call(self._port.branch_copies_absent, ids):
+        if not await self._call(self._port.copies_absent, ids, deletion.copies):
             return "branch_copies"
         return None
 

@@ -143,6 +143,8 @@ class DeletionRecord:
     generation: int
     targets: tuple[DeleteTarget, ...] | None
     complete: bool
+    # Copies of the chain frozen with the manifest; completion requires them gone too.
+    copies: tuple[str, ...] = ()
 
 
 def _progress(count: Any, chain: Any, generation: Any, seq: Any) -> Progress | None:
@@ -246,15 +248,25 @@ class CompanionStore:
             document = row[2]
             if document is not None and (
                 type(document) is not str
-                or len(document) > MAX_BOUND_CONVERSATIONS * 131 + 2
+                or len(document) > 2 * MAX_BOUND_CONVERSATIONS * 131 + 32
             ):
                 raise ValueError("manifest document invalid")
             raw_manifest = None if document is None else json.loads(document)
+            # The first release wrote the targets alone, as a list; copies came later.
+            raw_copies: object = []
+            if type(raw_manifest) is dict:
+                if set(raw_manifest) != {"copies", "targets"}:
+                    raise ValueError("manifest keys invalid")
+                raw_copies = raw_manifest["copies"]
+                raw_manifest = raw_manifest["targets"]
             if raw_manifest is not None and type(raw_manifest) is not list:
                 raise ValueError("manifest must be a list")
+            if type(raw_copies) is not list:
+                raise ValueError("manifest copies must be a list")
             targets = None if raw_manifest is None else tuple(
                 DeleteTarget(item) for item in raw_manifest
             )
+            copies = CompanionStore._delete_ids(tuple(raw_copies))
             if targets is not None:
                 if len(targets) > MAX_BOUND_CONVERSATIONS:
                     raise ValueError("too many targets")
@@ -266,7 +278,7 @@ class CompanionStore:
         except (TypeError, KeyError, ValueError):
             # Its existence still fences the conversation; nothing else depends on it.
             raise ArchiveRefusal("quarantined") from None
-        return DeletionRecord(row[0], row[1], targets, bool(row[3]))
+        return DeletionRecord(row[0], row[1], targets, bool(row[3]), copies)
 
     def deletion(self, conversation_id: str) -> DeletionRecord | None:
         validate_conversation_id(conversation_id)
@@ -341,23 +353,29 @@ class CompanionStore:
         return self._step(conversation_id, action)  # type: ignore[no-any-return]
 
     def set_delete_manifest(
-        self, conversation_id: str, targets: tuple[DeleteTarget, ...]
+        self,
+        conversation_id: str,
+        targets: tuple[DeleteTarget, ...],
+        copies: tuple[str, ...] = (),
     ) -> None:
         if type(targets) is not tuple:
             raise ValueError("targets must be bounded")
         if any(type(target) is not DeleteTarget for target in targets):
             raise TypeError("targets must be exact DeleteTarget values")
-        self._delete_ids(tuple(target.session_id for target in targets))
+        ids = self._delete_ids(tuple(target.session_id for target in targets))
+        self._delete_ids(copies)
+        if set(ids) & set(copies):
+            raise ValueError("a copy cannot also be a delete target")
         document = json.dumps(
-            [target.session_id for target in targets],
-            separators=(",", ":"),
+            {"copies": list(copies), "targets": list(ids)},
+            separators=(",", ":"), sort_keys=True,
         )
         def action(_row: Any) -> None:
             current = self.deletion(conversation_id)
             if current is None:
                 raise ArchiveRefusal("unbound")
             if current.targets is not None:
-                if current.targets != targets:
+                if current.targets != targets or current.copies != copies:
                     raise ArchiveRefusal("stale")
                 return
             self._connection.execute(

@@ -41,6 +41,7 @@ _EXPECTED = {
         "next_history_phrase": 0,
         "foreground_cleared": 1,
         "branch_copy_pending": 1,
+        "fork_copy_pending": 1,
         "state_db_scanned": 1,
         "state_db_phrase": 0,
         "optimized_phrase": 0,
@@ -439,6 +440,11 @@ async def _core(home: Path) -> dict[str, object]:
                 model_config={"_branched_from": grandchild},
             )
             worker.db.append_message(branch, "user", phrase)
+            # An API-server fork of the same segment (POST /api/sessions/{id}/fork):
+            # a parent link and no marker, which Hermes's delete orphans.
+            fork = "m3_api_fork"
+            worker.db.create_session(fork, "api_server", parent_session_id=grandchild)
+            worker.db.append_message(fork, "user", phrase)
             # An unrelated native delegated task belongs to Hermes, outside
             # the voice archive's deletion set.
             task_parent, task_child = "m3_task_parent", "m3_task_delegate"
@@ -491,6 +497,14 @@ async def _core(home: Path) -> dict[str, object]:
                 and worker.store.deletion(retired[0]).complete is False
             )
             worker.db.delete_session(branch)
+            # The orphaned fork was frozen as a copy, so it still keeps the delete pending.
+            await asyncio.sleep(0.5)
+            fork_pending = int(
+                retired in writer.pending_deletes
+                and not worker.port.absent((fork,))
+                and worker.store.deletion(retired[0]).complete is False
+            )
+            worker.db.delete_session(fork)
             await until(lambda: not writer.pending_deletes)
             stale_forget_ack = not writer.acknowledge_forget(retired)
             tail_after_complete = (home / "tail.json").read_text(encoding="utf-8")
@@ -567,6 +581,11 @@ async def _core(home: Path) -> dict[str, object]:
             unsupported_context = ConversationContextStore(on_change=unsupported_writer.update)
             await unsupported_writer.open(unsupported_context)
             try:
+                # One batch leaves the host, so a companion may hold it: the delete must wait.
+                unsupported_context.record_user_transcript(
+                    Transcript(text="synthetic unsupported row", final=True)
+                )
+                await asyncio.wait_for(unsupported_writer.next_batch(), 5)
                 unsupported_old = await unsupported_writer.request_forget(unsupported_context)
                 async with m4._bridge(None) as unsupported_bridge:
                     unsupported_sender = VoiceForgetSender(
@@ -600,6 +619,7 @@ async def _core(home: Path) -> dict[str, object]:
                     "next_history_phrase": int(_has_phrase(next_history, phrase)),
                     "foreground_cleared": foreground_cleared,
                     "branch_copy_pending": branch_pending,
+                    "fork_copy_pending": fork_pending,
                     # The scanner sees the phrase before the delete (so it can), in
                     # every readable table, and in no table or FTS index after it.
                     "state_db_scanned": int(

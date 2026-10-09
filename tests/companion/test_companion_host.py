@@ -32,6 +32,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveRow,
     VoiceForgetAckEvent,
     VoiceForgetEvent,
+    VoiceForgetRefusedEvent,
     VoiceMemoryEvent,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
@@ -123,9 +124,8 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
     )
-    hermes.branch_copies_absent = (  # type: ignore[attr-defined]
-        lambda _ids: True
-    )
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
     store = CompanionStore(tmp_path / "companion.db")
     review = _AcceptingReview()
     service = VoiceCompanionService(
@@ -158,6 +158,30 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
 
 
 @pytest.mark.asyncio
+async def test_a_delete_this_companion_never_bound_is_refused_never_complete(
+    tmp_path: Path,
+) -> None:
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
+    hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
+    hermes.absent = lambda _ids: True  # type: ignore[attr-defined]
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
+    service, store = _service(tmp_path, hermes)
+    try:
+        await service.start()
+        reply = await service.forget(VoiceForgetEvent(
+            protocol_version="0.3", type="voice_forget",
+            conversation_id="elsewhere", generation=0,
+        ))
+        assert type(reply) is VoiceForgetRefusedEvent and reply.category == "unbound"
+        assert store.deletion("elsewhere") is None
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_an_owned_start_keeps_completed_fences_and_drops_their_bindings(
     tmp_path: Path,
 ) -> None:
@@ -168,7 +192,8 @@ async def test_an_owned_start_keeps_completed_fences_and_drops_their_bindings(
     hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
     hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
     hermes.absent = lambda _ids: True  # type: ignore[attr-defined]
-    hermes.branch_copies_absent = lambda _ids: True  # type: ignore[attr-defined]
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
     service, store = _service(tmp_path, hermes)
     try:
         store.bind("legacy", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
@@ -178,15 +203,20 @@ async def test_an_owned_start_keeps_completed_fences_and_drops_their_bindings(
         store._connection.execute(
             "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = 'legacy'"
         )
-        # Completed during this start's own reconciliation.
+        # Bound, so this start's own reconciliation completes it.
+        store.bind("open", "voice_2", Progress(genesis(EXPECTED_HEADER), None))
         store.tombstone("open", 0)
+        # An earlier build's unbound tombstone: nothing proves it, so it never completes.
+        store.tombstone("unproven", 0)
 
         await service.start()
 
         for conversation in ("legacy", "open"):
             deletion = store.deletion(conversation)
             assert deletion is not None and deletion.complete
-        assert store.read("legacy") is None
+        assert store.read("legacy") is None and store.read("open") is None
+        unproven = store.deletion("unproven")
+        assert unproven is not None and not unproven.complete
     finally:
         await service.close()
         store.close()
@@ -208,9 +238,8 @@ async def test_review_end_reconciles_only_after_natural_thread_exit(tmp_path: Pa
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
     )
-    hermes.branch_copies_absent = (  # type: ignore[attr-defined]
-        lambda _ids: True
-    )
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
 
     class Review:
         alive = True

@@ -61,8 +61,21 @@ class FakeDeletePort:
     def absent(self, session_ids: tuple[str, ...]) -> bool:
         return all(sid not in self.sessions for sid in session_ids)
 
-    def branch_copies_absent(self, session_ids: tuple[str, ...]) -> bool:
-        return not any(source in session_ids for source in self.branches.values())
+    def capture_copies(self, session_ids: tuple[str, ...]) -> tuple[str, ...]:
+        found: list[str] = []
+        frontier = list(session_ids)
+        while frontier:
+            source = frontier.pop(0)
+            for copy, copied_from in self.branches.items():
+                if copied_from == source and copy not in found and copy not in session_ids:
+                    found.append(copy)
+                    frontier.append(copy)
+        return tuple(found)
+
+    def copies_absent(self, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool:
+        return all(copy not in self.sessions for copy in copies) and not any(
+            source in (*session_ids, *copies) for source in self.branches.values()
+        )
 
 
 @pytest.fixture
@@ -132,7 +145,7 @@ def test_tombstone_schema_rejects_invalid_generation(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "document", ['{"voice_1": 0}', '"voice_1"', " " * 600_000 + "[]"],
+    "document", ['{"voice_1": 0}', '"voice_1"', " " * 1_200_000 + "[]"],
     ids=["object", "string", "oversized"],
 )
 def test_persisted_delete_manifest_requires_bounded_list(
@@ -391,6 +404,61 @@ async def test_branch_copies_keep_a_delete_pending_until_they_are_gone(
     assert deletion is not None and not deletion.complete
     del port.sessions["copy_1"], port.branches["copy_1"]
     assert await reconciler.reconcile("conv") == "complete"
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_copy_keeps_the_delete_pending_after_its_link_is_gone(
+    store: CompanionStore,
+) -> None:
+    store.bind("conv", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
+    port = FakeDeletePort()
+    port.sessions = {"voice_1": None, "fork_1": None}
+    port.branches = {"fork_1": "voice_1"}
+    reconciler = VoiceForgetReconciler(store, port, lambda _conversation: False)
+
+    assert await reconciler.forget("conv", 0) == "pending"
+    deletion = store.deletion("conv")
+    assert deletion is not None and deletion.copies == ("fork_1",)
+    # Hermes's delete orphaned the fork: nothing links it to the chain any more.
+    del port.branches["fork_1"]
+
+    assert await reconciler.reconcile("conv") == "pending"
+    del port.sessions["fork_1"]
+    assert await reconciler.reconcile("conv") == "complete"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_for_a_conversation_this_store_never_bound_is_refused_unfenced(
+    store: CompanionStore,
+) -> None:
+    port = FakeDeletePort()
+    reconciler = VoiceForgetReconciler(store, port, lambda _conversation: False)
+
+    with pytest.raises(ArchiveRefusal, match="unbound"):
+        await reconciler.forget("elsewhere", 0)
+
+    # Not fenced, so a binding that arrives later is still deleted by a resend.
+    assert store.deletion("elsewhere") is None
+    store.bind("elsewhere", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
+    port.sessions = {"voice_1": None}
+    assert await reconciler.forget("elsewhere", 0) == "complete"
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_tombstone_never_completes(
+    store: CompanionStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An earlier build fenced a conversation this store never bound.
+    store.tombstone("elsewhere", 0)
+    reconciler = VoiceForgetReconciler(store, FakeDeletePort(), lambda _conversation: False)
+
+    assert await reconciler.reconcile("elsewhere") == "pending"
+
+    assert _forget_markers(capsys.readouterr().out) == [
+        '[voice-forget] {"refusal": "unbound", "stage": "capture", "version": 1}'
+    ]
+    deletion = store.deletion("elsewhere")
+    assert deletion is not None and not deletion.complete
 
 
 @pytest.mark.asyncio
