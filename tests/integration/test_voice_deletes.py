@@ -118,15 +118,38 @@ async def test_an_unreadable_delete_record_reads_as_unknown_never_idle(
     writer, _store = await _open(path, "conv")
 
     assert writer.pending_deletes == ()
-    assert writer.delete_outcome == "unknown"
+    assert writer.deletes_lost is True and writer.delete_outcome is None
     assert _markers(capsys.readouterr().out, "[voice-deletes] ") == [
         {"refusal": "malformed", "version": 1}
     ]
     await writer.close()
     # The finding is kept durably, so a restart cannot forget it.
     reopened, _store = await _open(path, "conv2")
-    assert reopened.delete_outcome == "unknown"
+    assert reopened.deletes_lost is True
     await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_by", ["companion", "host"])
+async def test_a_lost_delete_record_stays_known_after_later_deletes_complete(
+    settled_by: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "voice-tail.json"
+    _deletes_path(path).write_bytes(b"garbage")
+    writer, store = await _open(path, "a", "b", "c")
+
+    if settled_by == "companion":
+        old = await _forget(writer, store)
+        assert writer.acknowledge_forget(old) is True
+    else:
+        # Never archived, so the host itself completes it.
+        old = await writer.request_forget(store)
+
+    # The newer delete is complete, yet the lost intents may still be unfinished in Hermes.
+    assert writer.delete_outcome == old and writer.deleted_previous is True
+    assert writer.deletes_lost is True
+    await writer.close()
+    assert _recorded(path).lost is True
 
 
 @pytest.mark.asyncio
@@ -254,7 +277,7 @@ async def test_no_delete_record_is_written_until_a_delete_is_recorded(tmp_path: 
 def test_a_delete_record_round_trips() -> None:
     deletes = VoiceDeletes(pending=(("a", 0), ("b", 3)), outcome=("c", 1))
     assert parse_voice_deletes(voice_deletes_bytes(deletes)) == deletes
-    unknown = VoiceDeletes(outcome="unknown")
+    unknown = VoiceDeletes(outcome=("c", 1), lost=True)
     assert parse_voice_deletes(voice_deletes_bytes(unknown)) == unknown
 
 
@@ -562,11 +585,11 @@ async def test_an_unreadable_record_restores_no_tail_and_keeps_the_loss_known(
     reopened, reopened_store = await _open(path, "fresh")
 
     assert reopened_store.snapshot().messages == ()
-    assert reopened.delete_outcome == "unknown"
+    assert reopened.deletes_lost is True
     await reopened.close()
     assert b"a deleted phrase" not in path.read_bytes()
     # Rewritten as a known loss, never as an empty record.
-    assert _recorded(path) == VoiceDeletes(outcome="unknown", live=("fresh", 1))
+    assert _recorded(path) == VoiceDeletes(lost=True, live=("fresh", 1))
 
 
 @pytest.mark.asyncio

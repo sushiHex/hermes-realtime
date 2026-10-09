@@ -2618,12 +2618,20 @@ async def test_an_unreadable_delete_record_reports_unknown(
 
     harness = _FullHostHarness(monkeypatch)
     _recording_sender(monkeypatch, harness.events)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", _DeleteConversationStub
+    )
     (tmp_path / "voice-tail-v1.deletes.json").write_bytes(b"garbage")
     endpoint = CompanionEndpoint(port=8766, token="companion-token-with-enough-entropy")
     launcher = harness.build(voice_tail=tmp_path / "voice-tail-v1.json", voice_companion=endpoint)
     await launcher.start()
     try:
         await _negotiated(harness)
+        assert harness.browser["voice_delete_status"]() == "unknown"
+        # A later delete that completes never hides that earlier intents were lost.
+        assert await harness.browser["delete_voice_conversation"](
+            "browser_0123456789abcdef", 1
+        ) == "complete"
         assert harness.browser["voice_delete_status"]() == "unknown"
     finally:
         await launcher.close()

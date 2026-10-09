@@ -2685,7 +2685,7 @@ def build_local_host_launcher(
             return "unavailable"
         if writer.pending_deletes:
             return "pending"
-        if writer.delete_outcome == "unknown":
+        if writer.deletes_lost:
             return "unknown"
         # Complete names only the conversation the current one replaced.
         return "complete" if writer.deleted_previous else "idle"

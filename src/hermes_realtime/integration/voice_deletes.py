@@ -7,8 +7,9 @@ cleared (write-ahead), so a tail still bound to a recorded intent, or to the com
 outcome, is retired when it opens.
 
 The record holds every pending delete, so a delete that stays pending never blocks a later
-one, and an outcome: the newest binding verified complete, or ``unknown`` when an earlier
-record could not be read and its intents are lost.
+one, the outcome (the newest binding verified complete), and whether an earlier record
+could not be read. That loss is sticky: no later completion clears it, since the lost
+intents may still be unfinished in Hermes.
 
 It also names the live binding, written ahead of every tail that carries it. Once the
 record holds any delete, a tail is restored only when it is that live binding: a positive
@@ -20,7 +21,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Literal
 
 from hermes_realtime.integration.run_record import strict_object
 
@@ -37,19 +37,19 @@ _MAX_BINDING_BYTES = 96
 MAX_VOICE_DELETES_BYTES = (_MAX_RECORDED + 2) * _MAX_BINDING_BYTES + 128
 
 Binding = tuple[str, int]
-Outcome = Binding | Literal["unknown"] | None
 
 
 @dataclass(frozen=True, slots=True)
 class VoiceDeletes:
     pending: tuple[Binding, ...] = ()
-    outcome: Outcome = None
+    outcome: Binding | None = None
     live: Binding | None = None
+    lost: bool = False
 
     @property
     def holds_deletes(self) -> bool:
         """Whether any delete, settled, pending or lost, was ever recorded here."""
-        return bool(self.pending) or self.outcome is not None
+        return bool(self.pending) or self.outcome is not None or self.lost
 
 
 def _binding(value: object) -> Binding | None:
@@ -76,7 +76,8 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
         return None
     if (
         type(document) is not dict
-        or set(document) != {"live", "outcome", "pending", "version"}
+        or set(document) != {"live", "lost", "outcome", "pending", "version"}
+        or type(document["lost"]) is not bool
         or type(document["version"]) is not int
         or document["version"] != _VERSION
         or type(document["pending"]) is not list
@@ -87,10 +88,7 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
     if any(item is None for item in pending) or len(set(pending)) != len(pending):
         return None
     raw_outcome = document["outcome"]
-    outcome: Outcome = (
-        raw_outcome if raw_outcome is None or raw_outcome == "unknown"
-        else _binding(raw_outcome)
-    )
+    outcome = None if raw_outcome is None else _binding(raw_outcome)
     if raw_outcome is not None and outcome is None:
         return None
     if outcome in pending:
@@ -102,7 +100,10 @@ def parse_voice_deletes(raw: bytes) -> VoiceDeletes | None:
     # The live binding is never one the record deletes.
     if live is not None and (live in pending or live == outcome):
         return None
-    return VoiceDeletes(tuple(item for item in pending if item is not None), outcome, live)
+    return VoiceDeletes(
+        tuple(item for item in pending if item is not None), outcome, live,
+        document["lost"],
+    )
 
 
 def voice_deletes_bytes(deletes: VoiceDeletes) -> bytes:
@@ -113,7 +114,8 @@ def voice_deletes_bytes(deletes: VoiceDeletes) -> bytes:
     outcome = deletes.outcome
     document = {
         "live": None if deletes.live is None else list(deletes.live),
-        "outcome": list(outcome) if type(outcome) is tuple else outcome,
+        "lost": deletes.lost,
+        "outcome": None if outcome is None else list(outcome),
         "pending": [list(binding) for binding in deletes.pending],
         "version": _VERSION,
     }

@@ -40,7 +40,8 @@ from durable intent, which survives a corrupt or reset voice tail; a voice tail 
 record names is never restored, whatever order a crash left the files in. A pending delete
 never blocks deleting the next conversation. **Complete** refers only to the
 conversation the current one replaced. **Unknown** means an earlier delete record could not
-be read: check that conversation with Hermes's own session controls.
+be read: check that conversation with Hermes's own session controls. It stays even after
+later deletes complete, since the unreadable deletes may still be unfinished in Hermes.
 
 The control is unavailable while the companion does not offer `voice_forget`, and while
 evidence capture is on, because the evidence spool keeps its own copy of the transcript; use

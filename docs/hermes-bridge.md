@@ -302,7 +302,8 @@ pending never blocks a later delete. The browser status is the first that applie
   use fails; a delete made in that window stays `pending`, never `complete`, until a capable
   companion verifies it;
 - `pending`: at least one recorded delete is not yet verified;
-- `unknown`: an earlier delete record could not be read, so its outcome is not known;
+- `unknown`: an earlier delete record could not be read, so its intents may be unfinished in
+  Hermes. It stays sticky: a later delete that completes never clears it;
 - `complete`: the newest verified delete is the conversation the current one replaced;
 - `idle`: none of the above; the control is offered and there is no delete to report.
 

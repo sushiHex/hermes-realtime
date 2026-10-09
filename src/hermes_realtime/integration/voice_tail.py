@@ -36,7 +36,6 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
 
 from hermes_realtime.companion.integrity import validate_voice_row
 from hermes_realtime.conversation import (
@@ -796,9 +795,14 @@ class VoiceTailWriter:
         return self._deletes.pending
 
     @property
-    def delete_outcome(self) -> tuple[str, int] | Literal["unknown"] | None:
-        """The binding the last settled delete completed, or ``unknown`` if one was lost."""
+    def delete_outcome(self) -> tuple[str, int] | None:
+        """The newest binding a settled delete completed."""
         return self._deletes.outcome
+
+    @property
+    def deletes_lost(self) -> bool:
+        """Whether an earlier delete record could not be read; no completion clears it."""
+        return self._deletes.lost
 
     @property
     def deleted_previous(self) -> bool:
@@ -909,7 +913,7 @@ class VoiceTailWriter:
 
     def _newest_outcome(self, binding: tuple[str, int]) -> tuple[str, int]:
         outcome = self._deletes.outcome
-        return outcome if type(outcome) is tuple and outcome[1] > binding[1] else binding
+        return outcome if outcome is not None and outcome[1] > binding[1] else binding
 
     def _batch(self) -> ArchiveBatch:
         rows = tuple(self._outbox[: self._frozen])
@@ -1242,7 +1246,7 @@ class VoiceTailWriter:
         if parsed is None:
             # Its intents cannot be read back, so nothing may claim they completed.
             _marker(_DELETES_MARKER_PREFIX, {"refusal": "malformed", "version": 1})
-            self._deletes = VoiceDeletes(outcome="unknown")
+            self._deletes = VoiceDeletes(lost=True)
             return None
         self._deletes = parsed
         return parsed
