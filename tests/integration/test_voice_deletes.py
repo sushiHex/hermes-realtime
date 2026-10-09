@@ -202,17 +202,53 @@ async def test_an_intent_in_a_version_4_tail_moves_into_the_record(tmp_path: Pat
     "raw",
     [
         b"{}",
-        b'{"outcome":null,"pending":[],"version":2}',
-        b'{"outcome":null,"pending":[],"version":true}',
-        b'{"outcome":null,"pending":[["a",0],["a",0]],"version":1}',
-        b'{"outcome":["a",0],"pending":[["a",0]],"version":1}',
-        b'{"outcome":"done","pending":[],"version":1}',
-        b'{"outcome":null,"pending":[["a",-1]],"version":1}',
-        b'{"outcome":null,"pending":[["a b",0]],"version":1}',
+        b'{"outcome":null,"pending":[],"version":1}',
+        b'{"live":null,"outcome":null,"pending":[],"version":2}',
+        b'{"live":null,"outcome":null,"pending":[],"version":true}',
+        b'{"live":null,"outcome":null,"pending":[["a",0],["a",0]],"version":1}',
+        b'{"live":null,"outcome":["a",0],"pending":[["a",0]],"version":1}',
+        b'{"live":null,"outcome":"done","pending":[],"version":1}',
+        b'{"live":null,"outcome":null,"pending":[["a",-1]],"version":1}',
+        b'{"live":null,"outcome":null,"pending":[["a b",0]],"version":1}',
+        b'{"live":["a",0],"outcome":null,"pending":[["a",0]],"version":1}',
+        b'{"live":["a",0],"outcome":["a",0],"pending":[],"version":1}',
+        b'{"live":["a"],"outcome":null,"pending":[],"version":1}',
     ],
 )
 def test_a_malformed_delete_record_is_refused(raw: bytes) -> None:
     assert parse_voice_deletes(raw) is None
+
+
+@pytest.mark.asyncio
+async def test_the_live_conversation_after_a_delete_is_restored(tmp_path: Path) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "old", "new")
+    await _forget(writer, store)
+    store.record_user_transcript(Transcript(text="said after the delete", final=True))
+    await writer.close()
+
+    reopened, reopened_store = await _open(path)
+
+    # Failing closed never costs the conversation the record names as live.
+    assert [message.text for message in reopened_store.snapshot().messages] == [
+        "said after the delete"
+    ]
+    assert reopened.binding == ("new", 1)
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_no_delete_record_is_written_until_a_delete_is_recorded(tmp_path: Path) -> None:
+    path = tmp_path / "voice-tail.json"
+    writer, store = await _open(path, "conv")
+    store.record_user_transcript(Transcript(text="kept history", final=True))
+    await _until(lambda: path.exists() and b"kept history" in path.read_bytes())
+    await writer.close()
+
+    assert not _deletes_path(path).exists()
+    reopened, reopened_store = await _open(path)
+    assert [message.text for message in reopened_store.snapshot().messages] == ["kept history"]
+    await reopened.close()
 
 
 def test_a_delete_record_round_trips() -> None:
