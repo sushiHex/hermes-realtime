@@ -303,6 +303,80 @@ describe("mounted connection recovery", () => {
     expect(JSON.parse(dom.window.sessionStorage.getItem("hermes-realtime.stable-session.v1")!).identity).toBe(credential.participantIdentity);
   });
 
+  it("ignores a resync rejection superseded by worker departure", async () => {
+    let rejectResync!: () => void;
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path.startsWith("/api/v1/events")) return Response.json({});
+      if (path === "/api/v1/projection-resync") return new Promise<Response>((_, reject) => {
+        rejectResync = () => reject(new Error("synthetic resync failure"));
+      });
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(rejectResync).toBeDefined(), { timeout: 4000 });
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("worker"));
+    const stateBefore = dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state;
+    const requestsBefore = fetch.mock.calls.length;
+    const disconnectsBefore = media.disconnect.mock.calls.length;
+    rejectResync();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dom.window.document.querySelector<HTMLElement>("#connection-status")!.dataset.state).toBe(stateBefore);
+    expect(recovery.dataset.stage).toBe("worker");
+    expect(toggle.textContent).toBe("Connect");
+    expect(fetch.mock.calls.length).toBe(requestsBefore);
+    expect(media.disconnect.mock.calls.length).toBe(disconnectsBefore);
+  });
+
+  it("shows safe projection refusal after terminal polling recovery fails", async () => {
+    const { toggle, recovery } = await mount((path) => {
+      if (path.startsWith("/api/v1/events")) return Response.json({});
+      if (path === "/api/v1/projection-resync") return new Response(null, { status: 503 });
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("projection"), { timeout: 4000 });
+    expect(recovery.dataset.category).toBe("service-unavailable");
+    expect(recovery.hidden).toBe(false);
+    expect(recovery.textContent).toBe("Conversation updates unavailable. Host refused the request (503). Select Connect to retry. If it persists, ask the host operator to check recovery; a restart may be needed.");
+    expect(toggle.textContent).toBe("Connect");
+  });
+
+  it.each(["voices", "models"] as const)("preserves the new %s catalog when an older response settles", async (catalog) => {
+    let answerOld!: () => void;
+    let requests = 0;
+    const payload = (old: boolean) => catalog === "voices"
+      ? { version: 1, voices: [old ? "af_old" : "af_current"], selectedVoice: old ? "af_old" : "af_current" }
+      : {
+        version: 1, selectedModel: old ? "synthetic-old" : "synthetic-current", selectedEffort: "high",
+        models: [{ model: old ? "synthetic-old" : "synthetic-current", displayName: "Synthetic model",
+          description: "Synthetic catalog", defaultEffort: "high", supportedEfforts: ["high"] }],
+      };
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === `/api/v1/${catalog}`) {
+        if (++requests === 1) return new Promise<Response>((resolve) => {
+          answerOld = () => resolve(Response.json(payload(true)));
+        });
+        return Response.json(payload(false));
+      }
+      return normalRequest(path);
+    });
+    toggle.click();
+    await vi.waitFor(() => expect(answerOld).toBeDefined());
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(recovery?.dataset.stage).toBe("worker"));
+    toggle.click();
+    const select = dom.window.document.querySelector<HTMLSelectElement>(catalog === "voices" ? "#voice" : "#model-select")!;
+    await vi.waitFor(() => expect(select.value).toBe(catalog === "voices" ? "af_current" : "synthetic-current"));
+    const requestsBefore = fetch.mock.calls.length;
+    answerOld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(select.value).toBe(catalog === "voices" ? "af_current" : "synthetic-current");
+    expect(fetch.mock.calls.length).toBe(requestsBefore);
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(recovery.hidden).toBe(true);
+  });
+
   it("retries an unconfirmed stop before allowing Connect and preserves history", async () => {
     let stopRequests = 0;
     const { toggle, recovery, fetch } = await mount((path) => {

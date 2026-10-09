@@ -1720,6 +1720,7 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
         const failureGeneration = lifecycleAuthority.issue();
         const observedStopVersion = sessionStopVersion;
         let superseded = false;
+        let refused: ConnectionFailure | null = null;
         try {
           if (eventPolling?.signal === signal) {
             eventPolling.abort();
@@ -1731,9 +1732,12 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
             return;
           }
           if (observedStopVersion !== sessionStopVersion) return;
+          refused = { stage: "projection", category: connectionFailureCategory(error) };
+          connectionFailure = refused;
           controller.failed();
           throw error;
         } finally {
+          if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
           if (superseded) recordSupersededRecovery("projection");
         }
       }
@@ -1833,9 +1837,10 @@ function renderModelSelection(
   effortSelect.value = selectedEffort;
 }
 
-async function loadModelConfiguration(): Promise<void> {
-  const activeCredential = credential;
-  if (activeCredential === null) return;
+async function loadModelConfiguration(
+  activeCredential: BootstrapCredential,
+  connectGeneration: object,
+): Promise<boolean> {
   const response = await fetch("/api/v1/models", {
     method: "POST",
     headers: authorization(activeCredential.token),
@@ -1844,21 +1849,24 @@ async function loadModelConfiguration(): Promise<void> {
     credentials: "omit",
     referrerPolicy: "no-referrer",
   });
-  if (!response.ok) {
+  const configuration = response.ok ? parseModelCatalog(await response.json()) : null;
+  if (!lifecycleAuthority.owns(connectGeneration)) return false;
+  if (configuration === null) {
     selectableModels = null;
     modelSelectionState.textContent = "Live selection is unavailable for this provider.";
     modelSelectionState.dataset.state = "error";
     setInteractive(controller.state === "connected");
     addMarker("model_catalog_unavailable");
-    return;
+    return true;
   }
-  selectableModels = parseModelCatalog(await response.json());
+  selectableModels = configuration;
   renderModelSelection(selectableModels);
   modelSelectionState.textContent =
     "Selected-model Codex options. Ultra is the highest provider effort.";
   modelSelectionState.dataset.state = "ready";
   setInteractive(controller.state === "connected");
   addMarker(`model_catalog_loaded_${selectableModels.models.length}`);
+  return true;
 }
 
 async function changeModelConfiguration(model: string, effort: string): Promise<void> {
@@ -1901,9 +1909,10 @@ async function changeModelConfiguration(model: string, effort: string): Promise<
   }
 }
 
-async function loadVoiceConfiguration(): Promise<void> {
-  const activeCredential = credential;
-  if (activeCredential === null) return;
+async function loadVoiceConfiguration(
+  activeCredential: BootstrapCredential,
+  connectGeneration: object,
+): Promise<boolean> {
   const response = await fetch("/api/v1/voices", {
     method: "POST",
     headers: authorization(activeCredential.token),
@@ -1914,6 +1923,7 @@ async function loadVoiceConfiguration(): Promise<void> {
   });
   if (!response.ok) throw new Error("voice configuration rejected");
   const configuration = parseVoiceConfiguration(await response.json());
+  if (!lifecycleAuthority.owns(connectGeneration)) return false;
   voiceSelect.replaceChildren();
   for (const voice of configuration.voices) {
     const option = document.createElement("option");
@@ -1925,6 +1935,7 @@ async function loadVoiceConfiguration(): Promise<void> {
   if (selectedVoice !== null) voiceSelect.value = selectedVoice;
   voiceSelect.disabled = selectedVoice === null || controller.state !== "connected";
   addMarker(`voice_catalog_loaded_${configuration.voices.length}`);
+  return true;
 }
 
 async function changeVoice(voice: string): Promise<void> {
@@ -2276,7 +2287,7 @@ async function projectionResyncBrowserCredential(
     credentials: "omit",
     referrerPolicy: "no-referrer",
   }, signal);
-  if (!response.ok) throw new Error("public event projection resync rejected");
+  if (!response.ok) throw new ConnectionRequestRejected(response.status);
   const replacement = parseBootstrapCredential(await response.json());
   if (replacement.participantIdentity === activeCredential.participantIdentity) {
     throw new Error("public event projection resync did not rotate credential authority");
@@ -2317,6 +2328,12 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
       return;
     }
     await connect(true);
+  } catch (error) {
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    throw error;
   } finally {
     if (superseded) recordSupersededRecovery("projection");
   }
@@ -2973,8 +2990,11 @@ async function connect(projectionResync = false): Promise<void> {
       });
     }
     failureStage = "configuration";
-    await loadVoiceConfiguration();
-    await loadModelConfiguration();
+    if (!await loadVoiceConfiguration(activeCredential, connectGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (!await loadModelConfiguration(activeCredential, connectGeneration)) superseded = true;
   } catch (error) {
     if (attempt !== null && !attempt.owns(connectionAttempt)) {
       await closeLocalRoom(attemptedRoom);

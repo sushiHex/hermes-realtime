@@ -44,15 +44,16 @@ unavailable while evidence capture is on; the
 
 ## Qualification producer status
 
-Browser connection recovery, reviewed separately at commit
-[`5f519f2361e1ffe62ffb233583022eb9b814f97e`](https://github.com/sushiHex/hermes-realtime/commit/5f519f2361e1ffe62ffb233583022eb9b814f97e),
+Browser connection recovery (introduced at commit
+[`5f519f2361e1ffe62ffb233583022eb9b814f97e`](https://github.com/sushiHex/hermes-realtime/commit/5f519f2361e1ffe62ffb233583022eb9b814f97e))
 uses one state-derived Connect / Disconnect control, disables pending transitions,
 and retains fixed failure categories and safe retry guidance beside the control.
 A refused remote stop keeps Disconnect available for that same stop; a consumed
 one-shot launch requires a fresh launch. An admitted room's exact speech worker
 departure releases local audio and offers an explicit reconnect while preserving
 session and visible history. Newer lifecycle operations supersede older cleanup
-continuations. The [mounted browser tests](../web/tests/connection-main.dom.test.ts)
+continuations and configuration responses. Terminal projection refusals retain
+the same safe guidance. The [mounted browser tests](../web/tests/connection-main.dom.test.ts)
 and [guidance tests](../web/tests/connection-recovery.dom.test.ts) exercise synthetic
 refusals and races; they do not establish the historical PCM consumer delay,
 post-stop Connect cause, or physical recovery. Those limits remain tracked in
