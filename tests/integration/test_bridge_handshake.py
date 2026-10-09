@@ -269,6 +269,45 @@ async def test_the_server_marks_an_expired_authentication_deadline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit", "category"),
+    [
+        # A line past the bound fails the read itself, before any refusal is decided.
+        pytest.param("oversized-hello", "shape", id="oversized-hello"),
+        pytest.param("oversized-answer", "abandoned", id="oversized-answer"),
+        pytest.param("closed-after-welcome", "abandoned", id="closed-after-welcome"),
+        pytest.param("accepted", None, id="accepted"),
+    ],
+)
+async def test_every_server_handshake_exit_but_acceptance_leaves_exactly_one_marker(
+    exit: str, category: str | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    oversized = b"x" * (64 * 1024 + 1) + b"\n"
+    async with _server(voice=_Voice()) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        if exit == "accepted":
+            await bridge_hello.authenticate(reader, writer, _TOKEN, bridge_hello.hello())
+        elif exit == "oversized-hello":
+            writer.write(oversized)
+        else:
+            hello = bridge_hello.hello("voice-archive", ("voice_archive",))
+            writer.write(json.dumps(hello).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline())["ok"] is True
+            if exit == "oversized-answer":
+                writer.write(oversized)
+            else:
+                writer.write_eof()
+        await writer.drain()
+        if exit != "accepted":
+            assert await asyncio.wait_for(reader.read(), 2) == b""
+        writer.close()
+        await asyncio.sleep(0.05)
+    expected = [] if category is None else [{"refusal": category, "version": 1}]
+    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == expected
+
+
+@pytest.mark.asyncio
 async def test_every_handshake_uses_fresh_random_nonces() -> None:
     companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome)
     server, port = await companion.start()

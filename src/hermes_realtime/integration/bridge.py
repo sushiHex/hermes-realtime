@@ -756,7 +756,9 @@ class LocalHermesBridgeServer:
         with its own, and only then does the server send its final authenticated acceptance.
         """
 
-        refusal: str | None = None
+        # The category of the stage in progress: every exit short of acceptance, whatever
+        # raised it, leaves exactly one marker with it from the ``finally`` below.
+        refusal: str | None = "shape"
         try:
             async with asyncio.timeout(self._authentication_timeout):
                 raw = await reader.readline()
@@ -767,31 +769,34 @@ class LocalHermesBridgeServer:
                         raise TypeError("the hello must carry exactly the 0.3 fields")
                     participant_id = hello["participant_id"]
                 except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:
-                    refusal = "shape"
                     await self._send_json(connection, {"ok": False})
                     raise BridgeAuthenticationError("invalid bridge handshake") from exc
                 requested = _capabilities(hello["capabilities"])
                 client_nonce = hello["client_nonce"]
+                rejected: str | None = None
                 if (
                     not isinstance(participant_id, str)
                     or _IDENTIFIER_PATTERN.fullmatch(participant_id) is None
                 ):
-                    refusal = "participant"
+                    rejected = "participant"
                 elif (
                     type(hello["protocol_version"]) is not str
                     or hello["protocol_version"] != BRIDGE_PROTOCOL_VERSION
                 ):
-                    refusal = "version"
+                    rejected = "version"
                 elif requested is None or MUTUAL_AUTH_CAPABILITY not in requested:
-                    refusal = "capability"
+                    rejected = "capability"
                 elif (
                     type(client_nonce) is not str
                     or _NONCE_PATTERN.fullmatch(client_nonce) is None
                 ):
-                    refusal = "nonce"
-                if refusal is not None:
+                    rejected = "nonce"
+                if rejected is not None:
+                    refusal = rejected
                     await self._send_json(connection, {"ok": False})
                     raise BridgeAuthenticationError("bridge authentication failed")
+                # From here the client has only to prove the token.
+                refusal = "abandoned"
                 assert requested is not None  # Refused above otherwise.
                 negotiated = requested & self._offered
                 metadata: dict[str, object] = {}
@@ -814,7 +819,6 @@ class LocalHermesBridgeServer:
                 raw = await reader.readline()
                 if not raw:
                     # The client walked away, as one does on refusing the welcome.
-                    refusal = "abandoned"
                     raise BridgeAuthenticationError("bridge authentication was abandoned")
                 try:
                     answer = json.loads(raw)
@@ -831,6 +835,7 @@ class LocalHermesBridgeServer:
                 await self._send_json(
                     connection, {"accepted": handshake.proof(self._token, "accept")}
                 )
+                refusal = None
         except TimeoutError:
             refusal = "deadline"
             raise

@@ -196,14 +196,16 @@ dispatch, archive and review on their existing connections. A welcome that
 negotiates review also carries its profile's bounded `review_interval`. Realtime
 sends no voice event on a connection whose welcome did not list it, and the server closes a
 connection that sends one anyway. A voice connection carries voice events only. A refused
-hello leaves one `[hermes-bridge-hello]` marker on the server, with its rejection category:
-- `shape`;
+hello leaves one `[hermes-bridge-hello]` marker on the server, with its rejection category.
+Every exit short of the final acceptance leaves exactly one, whatever ended it:
+- `shape`, the hello was unreadable or malformed;
 - `participant`;
 - `version`;
 - `capability`;
 - `nonce`;
 - `proof`, the client's proof failed;
-- `abandoned`, the client left before proving, as it does on refusing a welcome;
+- `abandoned`, the client left or sent nothing readable before proving, as it leaves on
+  refusing a welcome;
 - `deadline`, the authentication timeout expired first.
 
 A refused welcome leaves one `[hermes-bridge-welcome]` marker on the client:
