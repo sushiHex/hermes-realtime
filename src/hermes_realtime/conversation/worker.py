@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol, cast
 
 from hermes_realtime.evidence import (
@@ -44,6 +45,9 @@ _MAX_RESPONSE_OPERATIONS = 64
 _MAX_TYPED_TRANSCRIPT_CHARS = 4096
 _DEFAULT_MAX_BUFFERED_AUDIO_BYTES = 256 * 1024
 _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
+# How long closing a binding waits for the speech it started to stop.
+_BINDING_SPEECH_SETTLE_SECONDS = 10.0
+_BINDING_SPEECH_MARKER = "[binding-speech] "
 _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
@@ -1199,7 +1203,10 @@ class ReconnectSafeConversationWorker:
         self._media_track_name: str | None = None
         self._binding: ConversationSessionWorker | None = None
         self._generation = 0
-        self._audio_input_suppression: tuple[int, str, object, bool] | None = None
+        # (generation, participant, token, typed too, the speech it fences input for)
+        self._audio_input_suppression: (
+            tuple[int, str, object, bool, asyncio.Task[Any] | None] | None
+        ) = None
         self._binding_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
         self._closed = False
@@ -1214,7 +1221,7 @@ class ReconnectSafeConversationWorker:
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
-        async with self._binding_lock:
+        async with self._binding_lock_with_speech_settled():
             if self._closed:
                 raise RuntimeError("reconnect-safe conversation worker is closed")
             previous = self._binding
@@ -1246,9 +1253,13 @@ class ReconnectSafeConversationWorker:
             return self._generation
 
     async def close_binding(self) -> None:
-        """Settle only the current media/STT generation before transport replacement."""
+        """Settle only the current media/STT generation before transport replacement.
 
-        async with self._binding_lock:
+        Speech the binding started (see ``suppress_audio_input``) ends first, so a
+        transport unbound next is never refused for a chunk still playing to it.
+        """
+
+        async with self._binding_lock_with_speech_settled():
             if self._closed:
                 raise RuntimeError("reconnect-safe conversation worker is closed")
             binding = self._binding
@@ -1260,6 +1271,65 @@ class ReconnectSafeConversationWorker:
                 self._media_incarnation = None
                 self._media_track_name = None
                 self._audio_input_suppression = None
+
+    @contextlib.asynccontextmanager
+    async def _binding_lock_with_speech_settled(self) -> AsyncIterator[None]:
+        """Hold the binding lock once no speech the binding started is still live.
+
+        The binding keeps its speech, and the fence that names it, until that speech is
+        done: a close that cannot prove it fails, and a retried close finds it again. The
+        speech's own cleanup may take the binding lock, so it is settled outside it.
+        """
+
+        while True:
+            async with self._binding_lock:
+                speech = self._live_binding_speech_locked()
+                if speech is None:
+                    yield
+                    return
+            await self._settle_binding_speech(speech)
+
+    def _live_binding_speech_locked(self) -> asyncio.Task[Any] | None:
+        suppression = self._audio_input_suppression
+        speech = None if suppression is None else suppression[4]
+        # Speech that closes its own binding cannot wait for itself.
+        if speech is None or speech.done() or speech is asyncio.current_task():
+            return None
+        return speech
+
+    @staticmethod
+    async def _settle_binding_speech(speech: asyncio.Task[Any]) -> None:
+        """Cancel the binding's speech and wait, bounded, for its own cleanup.
+
+        The wait continues through the caller's cancellation, which is raised once the
+        speech is done, together with the bound's failure if it expired first.
+        """
+
+        speech.cancel()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BINDING_SPEECH_SETTLE_SECONDS
+        errors: list[BaseException] = []
+        while not speech.done() and (remaining := deadline - loop.time()) > 0:
+            try:
+                await asyncio.wait({speech}, timeout=remaining)
+            except asyncio.CancelledError as error:
+                if not errors:
+                    errors.append(error)
+        resisted = not speech.done()
+        try:
+            if resisted:
+                errors.append(RuntimeError("binding speech resisted cancellation"))
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("binding speech did not settle", errors)
+        finally:
+            if resisted:
+                print(
+                    _BINDING_SPEECH_MARKER
+                    + json.dumps({"cause": "resisted", "version": 1}, separators=(",", ":")),
+                    flush=True,
+                )
 
     async def quiesce_for_delete(
         self, *, participant_identity: str, session_generation: int
@@ -1318,8 +1388,14 @@ class ReconnectSafeConversationWorker:
         participant_identity: str,
         session_generation: int,
         suppress_typed: bool = False,
+        speech: asyncio.Task[Any] | None = None,
     ) -> object:
-        """Fence exact-session input until the returned authority token resumes it."""
+        """Fence exact-session input until the returned authority token resumes it.
+
+        ``speech`` is the task playing to this binding while its input is fenced. It is
+        the binding's speech: closing or replacing the binding cancels it and waits for
+        its own cleanup, so the binding never outlives its audio.
+        """
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
@@ -1327,6 +1403,8 @@ class ReconnectSafeConversationWorker:
             raise TypeError("session_generation must be an exact integer")
         if type(suppress_typed) is not bool:
             raise TypeError("suppress_typed must be an exact boolean")
+        if speech is not None and type(speech) is not asyncio.Task:
+            raise TypeError("speech must be an exact asyncio Task or None")
         async with self._binding_lock:
             binding = self._binding
             if (
@@ -1344,6 +1422,7 @@ class ReconnectSafeConversationWorker:
                 participant_identity,
                 token,
                 suppress_typed,
+                speech,
             )
             return token
 
@@ -1604,11 +1683,18 @@ class ReconnectSafeConversationWorker:
         await asyncio.shield(operation)
 
     async def _close_owned(self) -> None:
+        errors: list[BaseException] = []
         async with self._binding_lock:
+            # Closed first, so no new speech can claim the binding while this one settles.
             self._closed = True
-            self._audio_input_suppression = None
+            speech = self._live_binding_speech_locked()
+        if speech is not None:
+            try:
+                await self._settle_binding_speech(speech)
+            except BaseException as error:
+                errors.append(error)
+        async with self._binding_lock:
             binding = self._binding
-            errors: list[BaseException] = []
             if binding is not None:
                 try:
                     await binding.close_binding()
@@ -1617,11 +1703,14 @@ class ReconnectSafeConversationWorker:
                 else:
                     if self._binding is binding:
                         self._binding = None
+            # A retried close must still find speech that has not settled.
+            if self._binding is None and self._live_binding_speech_locked() is None:
+                self._audio_input_suppression = None
             try:
                 await self._actions.close()
             except BaseException as error:
                 errors.append(error)
-            if len(errors) == 1:
-                raise errors[0]
-            if errors:
-                raise BaseExceptionGroup("reconnect-safe worker close failed", errors)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("reconnect-safe worker close failed", errors)

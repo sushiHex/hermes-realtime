@@ -64,6 +64,14 @@ from real_gate_support import (
 )
 
 _PREFIX = "[desktop-mvp-rehearsal] "
+# Windows refuses a path of 260 UTF-16 units or more (MAX_PATH, terminator included), and a
+# directory whose path leaves no room for an 8.3 file name (12 units) inside it.
+_MAX_PATH = 260
+_DIRECTORY_RESERVE = 12
+# The installer layout leaves these out of the Hermes checkout, as the installer does.
+_SPARSE_EXCLUDED = ("website/",)
+# The tail of a failed setup command's stderr, kept in the run directory.
+_MAX_KEPT_STDERR = 64 * 1024
 _REPOSITORY = Path(__file__).resolve().parents[1]
 _UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
 _OLLAMA = "http://127.0.0.1:11434"
@@ -78,10 +86,11 @@ _KNOWN_MARKERS = frozenset(
         "voice-review-send", "voice-review-close", "hermes-run-record-lock",
         "hermes-restart-settlement", "hermes-dispatch-recovery", "codex-session-auth",
         "codex-tool-refusal", "voice-companion", "voice-archive-open", "voice-archive",
-        "voice-archive-lease", "voice-review", "hermes-bridge-hello", "voice-memory",
-        "voice-memory-receive", "voice-memory-stream", "voice-forget", "voice-forget-send",
+        "voice-archive-lease", "voice-review", "hermes-bridge-hello", "hermes-bridge-welcome",
+        "voice-memory", "voice-memory-receive", "voice-memory-stream", "voice-forget",
+        "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
-        "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall",
+        "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall", "binding-speech",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
@@ -693,6 +702,44 @@ def listener_verdict(name: str, addresses: list[str]) -> list[Finding]:
     return [] if _loopback_only(addresses) else [("fail", f"{name}_not_loopback")]
 
 
+def _utf16_units(text: str) -> int:
+    """A path's length as Windows counts it: a character outside the BMP is two units."""
+
+    return len(text.encode("utf-16-le")) // 2
+
+
+class SetupFailure(RuntimeError):
+    """Setup stopped for a named reason; ``notes`` carry its counts, never text."""
+
+    def __init__(self, category: str, **notes: int | bool) -> None:
+        super().__init__(category)
+        self.category = category
+        self.notes = notes
+
+
+def take_rehearsal_lock(environ: Mapping[str, str] | None = None) -> str | None:
+    """Hold the one lock every rehearsal of this user takes; None once held, otherwise why not.
+
+    It is a lock file beside the shared LiveKit server. A run holds it from before its
+    preflight until its process exits, so two runs can never share LiveKit and Ollama; the
+    operating system releases it even after a crash. With no per-user tools directory there
+    is nothing to lock, and the preflight names what is missing.
+    """
+
+    from hermes_realtime.integration.run_record import lock_run_record
+
+    try:
+        path = local_livekit.shared_path(environ).parents[1] / "rehearsal"
+    except local_livekit.LiveKitUnavailable:
+        return None
+    try:
+        # The descriptor is never closed: the lock lasts exactly as long as this process.
+        held = lock_run_record(path)
+    except OSError:
+        return "rehearsal_lock_unavailable"
+    return None if held is not None else "rehearsal_busy"
+
+
 def _run(
     argv: list[str],
     *,
@@ -718,8 +765,9 @@ def _run(
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_tree(process.pid)
-        process.communicate()
-        raise
+        # What the command said before it was ended travels with the timeout.
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from None
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
@@ -1464,7 +1512,11 @@ class Rehearsal:
         try:
             yield step
         except Exception as error:  # A failed step is a finding; the rehearsal continues.
-            step.fail(type(error).__name__)
+            if isinstance(error, SetupFailure):
+                step.fail(error.category)
+                step.notes.update(error.notes)
+            else:
+                step.fail(type(error).__name__)
             step.notes["failed_at"] = step.stage
             if self.page is not None:
                 with contextlib.suppress(Exception):
@@ -1647,20 +1699,19 @@ class Rehearsal:
             started = time.monotonic()
             step.notes["candidate"] = await asyncio.to_thread(self._candidate)
             step.time("candidate_s", started)
-            cache_python = await asyncio.to_thread(provision_pinned_hermes)
+            cache_python = await asyncio.to_thread(provision_pinned_hermes, self._required)
             del cache_python
             checkout = self.home / "hermes-agent"
             await asyncio.to_thread(self._clone, checkout)
             step.time("install_s", started)
-            synced = await asyncio.to_thread(
-                _run,
+            await asyncio.to_thread(
+                self._required,
+                "hermes_sync",
                 ["uv", "sync", "--extra", "all", "--locked", "--python", "3.11", "--quiet"],
                 env=os.environ | {"UV_PROJECT_ENVIRONMENT": str(checkout / "venv")},
                 cwd=checkout,
                 timeout=1800,
             )
-            if synced.returncode != 0:
-                raise RuntimeError("the installer-layout environment did not sync")
             step.time("environment_s", started)
             base_url = await self.stand_in.start()
             config = {
@@ -1688,15 +1739,58 @@ class Rehearsal:
         source = PINNED_HERMES / "source"
         commit = HERMES_BASELINE["commit"]
         checkout.parent.mkdir(parents=True, exist_ok=True)
+        excluded = [f"!/{prefix}" for prefix in _SPARSE_EXCLUDED]
         for argv in (
             ["git", "clone", "-q", "--no-checkout", str(source), str(checkout)],
             ["git", "-C", str(checkout), "config", "core.autocrlf", "false"],
-            ["git", "-C", str(checkout), "sparse-checkout", "set", "--no-cone", "/*", "!/website/"],
-            ["git", "-C", str(checkout), "checkout", "-q", "--detach", commit],
-            ["git", "-C", str(checkout), "remote", "set-url", "origin", _UPSTREAM],
+            ["git", "-C", str(checkout), "sparse-checkout", "set", "--no-cone", "/*", *excluded],
         ):
-            if _run(argv).returncode != 0:
-                raise RuntimeError("the installer-layout checkout failed")
+            self._required("hermes_clone", argv)
+        # The pinned commit's longest checked-out path decides whether this directory fits.
+        names = self._required(
+            "hermes_clone",
+            ["git", "-C", str(checkout), "ls-tree", "-r", "-z", "--name-only", commit],
+        ).stdout.split("\0")
+        kept = [name for name in names if name and not name.startswith(_SPARSE_EXCLUDED)]
+        # A directory must leave room for an 8.3 file name inside it: 12 more units.
+        longest = max(
+            [_utf16_units(name) for name in kept]
+            + [_utf16_units(name.rpartition("/")[0]) + _DIRECTORY_RESERVE for name in kept],
+            default=0,
+        )
+        path_chars = _utf16_units(str(checkout)) + 1 + longest
+        if path_chars >= _MAX_PATH:
+            raise SetupFailure("run_dir_too_long", path_chars=path_chars)
+        self._required("hermes_checkout", ["git", "-C", str(checkout), "checkout", "-q",
+                                           "--detach", commit])  # fmt: skip
+        self._required(
+            "hermes_clone", ["git", "-C", str(checkout), "remote", "set-url", "origin", _UPSTREAM]
+        )
+
+    def _required(
+        self, category: str, argv: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one setup command; when it fails or times out, keep its stderr's tail and name
+        its exit, so every setup failure is diagnosable without a rerun."""
+
+        try:
+            completed = _run(argv, **options)
+        except subprocess.TimeoutExpired as expired:
+            kept = self._keep_stderr(category, expired.stderr or "")
+            raise SetupFailure(category, timed_out=True, stderr_bytes=kept) from None
+        if completed.returncode != 0:
+            kept = self._keep_stderr(category, completed.stderr)
+            raise SetupFailure(category, exit_code=completed.returncode, stderr_bytes=kept)
+        return completed
+
+    def _keep_stderr(self, category: str, stderr: str | bytes) -> int:
+        """Keep at most the last 64 KiB of ``stderr``, cut on a character boundary."""
+
+        text = stderr if isinstance(stderr, str) else stderr.decode("utf-8", "replace")
+        kept = text.encode("utf-8")[-_MAX_KEPT_STDERR:].decode("utf-8", "ignore").encode("utf-8")
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        (self.logs_dir / f"setup-{category}.stderr").write_bytes(kept)
+        return len(kept)
 
     def _hermes(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         completed = _run(
@@ -1724,47 +1818,52 @@ class Rehearsal:
         which commit that is and whether the tree it was taken from was clean.
         """
 
-        commit = _run(["git", "rev-parse", "HEAD"], cwd=_REPOSITORY).stdout.strip()
-        tracked = _run(
-            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=_REPOSITORY
+        commit = self._required(
+            "candidate_commit", ["git", "rev-parse", "HEAD"], cwd=_REPOSITORY
+        ).stdout.strip()
+        tracked = self._required(
+            "candidate_commit",
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=_REPOSITORY,
         ).stdout
         if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
-            raise RuntimeError("the candidate commit could not be read")
+            raise SetupFailure("candidate_commit")
         for argv in (
             ["git", "clone", "-q", "--no-checkout", "--no-hardlinks", str(_REPOSITORY),
              str(self.candidate)],
             ["git", "-C", str(self.candidate), "checkout", "-q", "--detach", commit],
         ):  # fmt: skip
-            if _run(argv).returncode != 0:
-                raise RuntimeError("the candidate clone failed")
+            self._required("candidate_clone", argv)
         clean_env = {
             key: value
             for key, value in os.environ.items()
             if key not in {"PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
         }
-        built = _run(
+        self._required(
+            "candidate_wheel",
             ["uv", "build", "--wheel", "--out-dir", str(self.run_dir / "dist")],
             env=clean_env,
             cwd=self.candidate,
         )
         wheels = sorted((self.run_dir / "dist").glob("hermes_realtime-*-py3-none-any.whl"))
-        if built.returncode != 0 or len(wheels) != 1:
-            raise RuntimeError("the candidate wheel did not build")
+        if len(wheels) != 1:
+            raise SetupFailure("candidate_wheel", wheels=len(wheels))
         self.wheel = wheels[0]
         requirements = self.run_dir / "host-requirements.txt"
         steps = (
-            ["uv", "export", "--frozen", "--no-dev", "--extra", "local", "--no-emit-project",
-             "--no-hashes", "--quiet", "-o", str(requirements)],
-            ["uv", "venv", "--quiet", "--python", "3.11", str(self.host_env)],
-            ["uv", "pip", "install", "--quiet", "--python", str(self.host_python), "-r",
-             str(requirements)],
-            ["uv", "pip", "install", "--quiet", "--no-deps", "--python", str(self.host_python),
-             str(self.wheel)],
+            ("host_export", ["uv", "export", "--frozen", "--no-dev", "--extra", "local",
+                             "--no-emit-project", "--no-hashes", "--quiet", "-o",
+                             str(requirements)]),
+            ("host_venv", ["uv", "venv", "--quiet", "--python", "3.11", str(self.host_env)]),
+            ("host_requirements", ["uv", "pip", "install", "--quiet", "--python",
+                                   str(self.host_python), "-r", str(requirements)]),
+            ("host_wheel", ["uv", "pip", "install", "--quiet", "--no-deps", "--python",
+                            str(self.host_python), str(self.wheel)]),
         )  # fmt: skip
-        for argv in steps:
-            if _run(argv, env=clean_env, cwd=self.candidate, timeout=1800).returncode != 0:
-                raise RuntimeError("the candidate host environment did not install")
-        located = _run(
+        for category, argv in steps:
+            self._required(category, argv, env=clean_env, cwd=self.candidate, timeout=1800)
+        located = self._required(
+            "host_import",
             [str(self.host_python), "-I", "-c",
              "import hermes_realtime; print(hermes_realtime.__file__)"],
             env=clean_env,
@@ -1779,15 +1878,14 @@ class Rehearsal:
     async def _install_wheel(self, step: Step) -> dict[str, object]:
         python = str(self.hermes_python)
         before = await asyncio.to_thread(_run, ["uv", "pip", "freeze", "--python", python])
-        installed = await asyncio.to_thread(
-            _run,
+        await asyncio.to_thread(
+            self._required,
+            "hermes_wheel",
             [
                 "uv", "pip", "install", "--reinstall-package", "hermes-realtime",
                 "--python", python, str(self.wheel),
             ],
         )
-        if installed.returncode != 0:
-            raise RuntimeError("the candidate wheel did not install")
         after = await asyncio.to_thread(_run, ["uv", "pip", "freeze", "--python", python])
         old = {line for line in before.stdout.splitlines() if "hermes-realtime" not in line}
         new = {line for line in after.stdout.splitlines() if "hermes-realtime" not in line}
@@ -2847,6 +2945,21 @@ def main(argv: list[str] | None = None) -> int:
         help="resend each context question's exact prompt N times and count recall (0-100)",
     )
     args = parser.parse_args(arguments)
+    # A second run refuses rather than racing the port check below, which stays as a
+    # diagnostic for a server no rehearsal started.
+    refusal = take_rehearsal_lock()
+    if refusal is not None:
+        _emit(
+            {
+                "category": refusal,
+                "name": "preflight",
+                "notes": {},
+                "outcome": "failed",
+                "step": "preflight",
+                "version": 1,
+            }
+        )
+        return 1
     missing = preflight(args.ollama_model)
     if missing:
         # A listener already on 7880, such as an orphaned server, is a failure, not a skip.

@@ -367,10 +367,12 @@ the tab remembers. A rotation (2xx) remembers the new identity; when no session 
 the tab forgets the identity and bootstraps; an identity that is not the active one is refused
 (403) and forgotten, so a reload never replaces another tab's session. Every other outcome keeps
 the identity and its request ID for the next **Connect**, which replays the same request, so a
-rotation whose answer was lost is answered again instead of refused: a transient refusal (503,
-such as a reload during the readiness cue, refused until the host has settled that speech), a
-network error, or a failure later in connect. The server answers 409 for exactly "no session is
-active"; every other state refusal is 503. A leaving page never reconnects the session it is
+rotation whose answer was lost is answered again instead of refused: a transient refusal (503),
+a network error, or a failure later in connect. A reload during the readiness cue is not
+refused. The cue is the binding's own speech, so closing the binding first stops it through
+playback's usual hard stop, which releases its chunk. Before, the chunk still in flight made the
+audio publisher refuse at once to unbind the old connection. The server answers 409 for exactly
+"no session is active"; every other state refusal is 503. A leaving page never reconnects the session it is
 leaving: the LiveKit SDK's own page-leave disconnect is turned off, since the page would read it
 as a dropped connection and rebind, rotating the identity the reloaded tab is about to present.
 Only a stop that succeeded forgets the stored identity. A duplicated tab copies
@@ -583,10 +585,34 @@ later step reconnects the page if it must, and the rehearsal continues. The fina
 counts what is left running by image name, and it must be empty. The exit code is 0 only when
 every step was `as_expected` and nothing was left.
 
+**One run at a time.** Before anything else, a run takes an exclusive lock:
+`rehearsal.lock` in the per-user `hermes-realtime\tools` directory that holds the shared
+LiveKit server. It keeps the lock until its process exits, and the operating system releases
+it even after a crash. While another run holds it, the script prints one `failed` preflight line
+with category `rehearsal_busy` and exits 1. Two runs can't overlap and share LiveKit and Ollama;
+they used to race past the port check below. If the lock's directory can't be created, the
+line's category is `rehearsal_lock_unavailable`.
+
 **Preflight.** When a required piece is missing, the script prints one `not_run` preflight line
 and exits 0. The pieces are Windows, the pinned LiveKit binary, system Chrome, Playwright,
-Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880,
-such as an orphaned server, is a `failed` preflight with exit code 1.
+Kokoro, git, uv, and a running Ollama with the named model. A listener already on port 7880 is
+a `failed` preflight with exit code 1. With the lock in place, that means a server no rehearsal
+started, such as an orphan.
+
+**Setup failures name their cause.** Every setup command runs through one bounded runner. That
+covers the pinned Hermes cache (git and `uv sync`), the candidate clone, wheel build, host
+install and its import check, and the Hermes clone, sync and wheel install.
+- **A command that fails** ends the `setup` step with a short category, such as
+  `host_requirements`, and the record carries its `exit_code`.
+- **A command that times out** records `timed_out` instead, and its process tree is ended.
+- **Either way, its stderr is kept.** The last 64 KiB stay in the run directory as
+  `logs/setup-<category>.stderr`, cut on a character boundary.
+- **A run directory too long for the pinned Hermes checkout** is refused before the checkout,
+  as `run_dir_too_long`, and the record carries `path_chars`.
+  - The test adds the checkout directory to the longest thing the checkout creates: a file, or
+    a directory plus the 12 units Windows reserves for a short name inside it.
+  - Lengths count UTF-16 units, as Windows does, against its 260-unit limit.
+  - The default directory under `%TEMP%` fits.
 
 **Differences from the operator's session.** Ctrl-C cannot reach a detached process, so:
 - The host runs as `<host env>/python <clone>/scripts/rehearse_desktop_mvp.py --host-child <stop
