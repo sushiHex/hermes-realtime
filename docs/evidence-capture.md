@@ -142,7 +142,9 @@ Host state is outside evidence capture and purge. `HermesRealtime/state/` under
 `%LOCALAPPDATA%` (else `$XDG_STATE_HOME`, else `~/.local/state`) holds plaintext user data: the
 Hermes run record and the voice tail, which keeps the recent delivery-confirmed voice
 conversation so a restarted host can resume it. No evidence recorder receives voice tail content.
-Until a forget operation exists, delete the voice tail file while the host is stopped.
+The voice delete control is unavailable while capture is on, because the spool keeps its own
+copy of the transcript; revoke consent and erase removes that copy. Without a voice companion,
+delete the voice tail file while the host is stopped.
 
 VACUUM and byte-absence checks are not SSD forensic erasure, and Python strings are not securely zeroized.
 Restart is required for stronger clearing of process memory. Process-crash and SQLite

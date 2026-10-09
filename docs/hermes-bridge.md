@@ -277,9 +277,48 @@ to speech or task dispatch.
 
 The browser's confirmed **Delete this voice conversation** action clears the live tail,
 fences the old archive/review outbox and stale acknowledgments, advances the generation with
-a fresh conversation identity, and drops the memory snapshot. The pending old identity is
-retained in the existing atomic tail file across restart. The UI stays pending until an
-exact complete receipt arrives; there is no voice deletion command.
+a fresh conversation identity, and drops the memory snapshot. The old identity is recorded in
+a delete record beside the tail (`<tail>.deletes.json`), which the tail writer persists before
+every tail write. Nothing that resets the tail touches it: a corrupt tail, a tail an older
+build rewrote, or a restore the store refuses all keep the intent. The record also names the
+live binding, written ahead of every tail that carries it. Once it holds any delete, or
+cannot be read, the open fails closed: only a tail bound to that live binding is restored,
+and any other tail (a deleted conversation's, whatever order a crash left the files in, or a
+version-1 tail with no identity) is retired. A pending delete reaches the companion only after
+a fresh tail write has replaced whatever the open found, so both the record and the cleared
+tail are durable. A version-4 tail's intent moves into the record, which keeps one slot beyond
+the 64 a request may fill for it. An unreadable record is reported as `unknown`, with a
+`[voice-deletes]` marker, never as idle, and is rewritten as that known loss, never as empty.
+A delete of a conversation no archive batch ever left the host for completes locally, since
+no companion can hold it. There is no voice deletion command.
+
+The record holds up to 64 pending deletes and the newest one verified complete. The sender
+holds its companion link open and resends every pending delete each round, so one that stays
+pending never blocks a later delete. The browser status is the first that applies of:
+
+- `unavailable`: no held link has negotiated `voice_forget`, or evidence capture is on. A
+  recorded delete stays in the record and resumes once a capable link is back. The bridge is
+  request and reply, so a link the companion dropped while idle still counts until its next
+  use fails; a delete made in that window stays `pending`, never `complete`, until a capable
+  companion verifies it;
+- `pending`: at least one recorded delete is not yet verified;
+- `unknown`: an earlier delete record could not be read, so its intents may be unfinished in
+  Hermes. It is permanent by design: the lost identities cannot be verified later, and a
+  delete that completes proves only its own conversation, so nothing clears it;
+- `complete`: the newest verified delete is the conversation the current one replaced;
+- `idle`: none of the above; the control is offered and there is no delete to report.
+
+The control is offered whenever the status is not `unavailable`, including while a delete is
+pending. A page that saw a delete pending keeps polling while the status reads `unavailable`.
+
+The companion keeps a completed deletion's tombstone for good, as the fence against a resent
+delete or a late event on any later connection; only incomplete deletions count toward its
+capacity. An owned start drops any archive binding an earlier build kept beside a completed
+deletion. A delete for a conversation the companion never bound is refused (`unbound`) and
+not fenced, never completed: the store cannot tell "never archived" from "archived in another
+profile". A conversation archived under another Hermes profile therefore stays pending until
+the profile that holds it serves the delete, which is the fail-closed outcome. The page clear is keyed on the voice generation it clears, so a browser that
+reconnected while the delete was pending still clears its transcript.
 
 The companion persists a tombstone before native deletion. A single idempotent reconciler
 runs on the tombstone, natural review-thread completion and owned startup. An admitted or
@@ -291,15 +330,32 @@ continues to detect a non-gateway owner.
 
 What Hermes learned from it (memories and skills) stays and may still shape replies. There is
 no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own
-session controls. No run-session IDs are included in the delete request. Deletion is logical:
-Hermes run records, unvacuumed SQLite pages,
-backups and sync copies remain. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
+session controls. No run-session IDs are included in the delete request. A copy of a chain
+session (a `/branch` copy with its `_branched_from` marker, or an API-server fork, which has
+only a parent link) is an independent conversation Hermes keeps (native deletion orphans it),
+and it may hold the user's own later work, so the companion never deletes it. Before the
+chain goes, the companion freezes every copy into the manifest, with each copy's compression
+continuations and any copy made from a copy; while any frozen copy, or any `/branch` copy
+that still names a chain session or a frozen copy, remains, the delete stays pending, and it
+completes once the user deletes them in Hermes. A copy made later from a frozen copy is
+tracked only while its source exists. With evidence capture on, the spool keeps its own copy of the
+transcript, so the control is unavailable; **Revoke consent and erase** removes that copy. The
+check covers only the current run's capture setting, so a spool an earlier capture-enabled run
+left keeps its contents until its retention expiry or a full `--purge-evidence`. Deletion is logical: Hermes run records, unmerged full-text index segments,
+unvacuumed SQLite pages and WAL frames, backups and sync copies remain. Hermes's own
+`hermes sessions optimize` (FTS merge, then VACUUM, with the gateway stopped) erases the
+segments, pages and frames. See the [diagnostic guide](desktop-mvp-diagnostic.md#deleting-a-voice-conversation)
 for the exact support limits and [ADR 0003](adr/0003-hermes-owned-conversation-continuity.md)
 for the qualification contract.
 
 `uv run python scripts/qualify_voice_delete.py` exercises pinned Hermes with synthetic data
 and a stand-in model: chain deletion, late-event fences, running-review pending status,
-crash recovery, owner succession and retained learned memory. The succession witness runs
+crash recovery, owner succession and retained learned memory. It scans every table of
+`state.db`, FTS shadow tables included, with an FTS `MATCH` per index: no row or match holds
+the phrase after the delete, a `/branch` copy and then an orphaned API fork each keep it
+pending until removed, and after
+Hermes's `SessionDB.vacuum()` (the `hermes sessions optimize` path) no table, segment or raw
+byte of the database or its WAL holds it. The succession witness runs
 the real companion host in two labelled processes, not the complete Hermes CLI and API
 server entrypoints. Exact candidate receipts belong to the implementation PR and #77.
 

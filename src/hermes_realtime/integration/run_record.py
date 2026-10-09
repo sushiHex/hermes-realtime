@@ -105,6 +105,54 @@ def lock_run_record(path: Path) -> int | None:
     return descriptor
 
 
+def wait_for_run_record_lock(path: Path) -> int:
+    """Block until this caller holds the record's lock; the OS wakes it on release.
+
+    It cannot be interrupted, so call it from a thread that may be abandoned. The lock is
+    the same one-byte region ``lock_run_record`` takes, so the two exclude each other.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class Overlapped(ctypes.Structure):
+                _fields_ = [
+                    ("internal", ctypes.c_void_p),
+                    ("internal_high", ctypes.c_void_p),
+                    ("offset", wintypes.DWORD),
+                    ("offset_high", wintypes.DWORD),
+                    ("event", wintypes.HANDLE),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            lock_file_ex = kernel32.LockFileEx
+            lock_file_ex.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, ctypes.POINTER(Overlapped),
+            ]
+            lock_file_ex.restype = wintypes.BOOL
+            # Without LOCKFILE_FAIL_IMMEDIATELY, a synchronous handle waits for the lock.
+            exclusive = 0x2
+            if not lock_file_ex(
+                msvcrt.get_osfhandle(descriptor), exclusive, 0, 1, 0,
+                ctypes.byref(Overlapped()),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def unlock_run_record(descriptor: int) -> None:
     try:
         if sys.platform == "win32":

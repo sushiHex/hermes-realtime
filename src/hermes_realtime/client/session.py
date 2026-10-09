@@ -1630,9 +1630,6 @@ class BrowserSessionDirector:
             operation = self._delete_voice_conversation
             if operation is None:
                 raise RuntimeError("voice delete is unavailable")
-            status = self._voice_delete_status
-            if status is not None and status() == "pending":
-                return "pending"
             self._projection.ensure_capacity()
             state = await operation(identity, generation)
             if type(state) is not str or state not in {"pending", "complete"}:
@@ -1651,7 +1648,7 @@ class BrowserSessionDirector:
             status = self._voice_delete_status
             state = "unavailable" if status is None else status()
             if type(state) is not str or state not in {
-                "unavailable", "idle", "pending", "complete"
+                "unavailable", "idle", "pending", "complete", "unknown"
             }:
                 raise RuntimeError("voice delete status is invalid")
             self._touch_activity()

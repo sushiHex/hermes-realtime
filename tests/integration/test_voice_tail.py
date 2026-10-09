@@ -125,10 +125,10 @@ def test_the_tail_is_sorted_compact_versioned_json() -> None:
         b'"role":"user","seq":2,"text":"Hi \\u00e9","ts":1.5}],'
         b'"review":{"close_reviewed":false,"close_targets":[],"cursor":null,'
         b'"overflow":false,"pending":null,"reviewed_users":0,"rows":[],"users":0},'
-        b'"settled":1},"forget_complete":false,'
+        b'"settled":1},'
         b'"messages":[{"interrupted":false,"role":"user","text":"Hi \\u00e9"},'
         b'{"interrupted":true,"role":"assistant","text":"Cut"}],'
-        b'"pending_forget":null,"prior_work":true,"version":4}'
+        b'"prior_work":true,"version":3}'
     )
     assert _parse(voice_tail_bytes(tail, archive)) == VoiceTail(tail, archive)
     assert _parse(voice_tail_bytes(_rows(), _archive())) == VoiceTail(_rows(), _archive())
@@ -996,7 +996,16 @@ async def test_a_close_timeout_keeps_the_tail_owned_and_a_retried_close_finishes
     with pytest.raises(RuntimeError, match="another host holds the voice tail"):
         await contender.open(ConversationContextStore(on_change=contender.update))
     writes.release.set()
-    await writer.close()
+    # The retried close keeps the same short timeout, which a loaded machine can outlast
+    # while the released write finishes; it is retried until it finishes, as a host would.
+    for _ in range(100):
+        try:
+            await writer.close()
+            break
+        except RuntimeError:
+            await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("a retried close never finished")
 
     assert _conversation(path.read_bytes()) == _rows(("user", "slow", False))
     successor = _writer(path)

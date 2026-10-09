@@ -125,11 +125,12 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
     assert [event.kind for event in director._projection._events].count(
         "voice_conversation_cleared"
     ) == 1
+    # A pending delete never blocks the next one: the new conversation is deletable too.
     again = await app.handle(
         method="POST", path="/api/v1/delete-voice-conversation", headers=headers, body=b""
     )
     assert json.loads(again.body)["state"] == "pending"
-    assert len(observed) == 1
+    assert len(observed) == 2
     for rejected_headers, rejected_body in (
         (headers | {"content-type": "application/json"}, b""),
         (headers | {"content-length": "2"}, b"{}"),
@@ -139,14 +140,14 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
                 method="POST", path="/api/v1/delete-voice-conversation",
                 headers=rejected_headers, body=rejected_body,
             )
-    assert len(observed) == 1
+    assert len(observed) == 2
     status_response = await app.handle(
         method="POST", path="/api/v1/voice-delete-status", headers=headers, body=b""
     )
     assert json.loads(status_response.body) == {"state": "pending", "version": 1}
     assert [event.kind for event in director._projection._events].count(
         "voice_conversation_cleared"
-    ) == 1
+    ) == 2
     with pytest.raises(PermissionError):
         await app.handle(
             method="POST",
@@ -154,4 +155,45 @@ async def test_delete_control_requires_current_bearer_and_reports_pending() -> N
             headers=headers | {"authorization": "Bearer invalid"},
             body=b"",
         )
-    assert len(observed) == 1
+    assert len(observed) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "accepted"),
+    [("unknown", True), ("complete", True), ("idle", True), ("lost", False)],
+)
+async def test_status_passes_only_the_known_delete_states(state: str, accepted: bool) -> None:
+    connection = LiveKitConnection(
+        "wss://livekit.test", "test-key", "synthetic-browser-bootstrap-secret-32-bytes"
+    )
+
+    async def provision(_identity: str) -> int:
+        return 3
+
+    async def submit(*_args: object) -> None:
+        pass
+
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="hermes-local",
+            identity_factory=lambda: "browser_0123456789abcdef",
+        ),
+        provision=provision,
+        submit=submit,
+        stop=submit,
+        approval=submit,
+        projection=BrowserEventProjection(),
+        voice_delete_status=lambda: state,
+    )
+    credential = await director.start()
+    if accepted:
+        assert await director.current_voice_delete_status(
+            participant_identity=credential.participant_identity
+        ) == state
+    else:
+        with pytest.raises(RuntimeError, match="invalid"):
+            await director.current_voice_delete_status(
+                participant_identity=credential.participant_identity
+            )

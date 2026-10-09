@@ -51,8 +51,17 @@ from hermes_realtime.integration.run_record import (
     unlock_run_record,
     write_run_record,
 )
+from hermes_realtime.integration.voice_deletes import (
+    MAX_PENDING_DELETES,
+    MAX_VOICE_DELETES_BYTES,
+    VoiceDeletes,
+    parse_voice_deletes,
+    voice_deletes_bytes,
+)
 
-_VERSION = 4
+# Version 4 also held a delete intent; that intent now lives in the delete record, so a
+# version-4 tail is read only to move its intent there, and every write is version 3.
+_FORGET_VERSION = 4
 _REVIEW_VERSION = 3
 _ARCHIVE_VERSION = 2
 _LEGACY_VERSION = 1
@@ -60,6 +69,7 @@ _MARKER_PREFIX = "[voice-tail] "
 _LOCK_MARKER_PREFIX = "[voice-tail-lock] "
 _OUTBOX_MARKER_PREFIX = "[voice-tail-outbox] "
 _REVIEW_CLOSE_MARKER_PREFIX = "[voice-review-close] "
+_DELETES_MARKER_PREFIX = "[voice-deletes] "
 # ASCII-escaped JSON spends at most twelve bytes on one str character (an astral
 # character becomes a surrogate-pair escape), plus a fixed per-row and envelope cost.
 _MAX_BYTES_PER_CHAR = 12
@@ -204,12 +214,7 @@ def row_wire_bound(text: str) -> int:
     return _WIRE_ROW_OVERHEAD_BYTES + _MAX_WIRE_BYTES_PER_CHAR * len(text)
 
 
-def voice_tail_bytes(
-    view: DurableConversation,
-    archive: ArchiveOutbox,
-    pending_forget: tuple[str, int] | None = None,
-    forget_complete: bool = False,
-) -> bytes:
+def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes:
     document = {
         "archive": {
             "conversation_id": archive.conversation_id,
@@ -253,9 +258,7 @@ def voice_tail_bytes(
             for message in view.messages
         ],
         "prior_work": view.prior_work,
-        "pending_forget": None if pending_forget is None else list(pending_forget),
-        "forget_complete": forget_complete,
-        "version": _VERSION,
+        "version": _REVIEW_VERSION,
     }
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -506,19 +509,19 @@ def parse_voice_tail(
         return None
     version = document.get("version")
     if type(version) is not int or version not in (
-        _LEGACY_VERSION, _ARCHIVE_VERSION, _REVIEW_VERSION, _VERSION
+        _LEGACY_VERSION, _ARCHIVE_VERSION, _REVIEW_VERSION, _FORGET_VERSION
     ):
         return None
     required_fields = (
         _LEGACY_FIELDS if version == _LEGACY_VERSION
-        else _FORGET_DOCUMENT_FIELDS if version == _VERSION
+        else _FORGET_DOCUMENT_FIELDS if version == _FORGET_VERSION
         else _DOCUMENT_FIELDS
     )
     if set(document) != required_fields:
         return None
     pending_forget = None
     forget_complete = False
-    if version == _VERSION:
+    if version == _FORGET_VERSION:
         forget_complete = document["forget_complete"]
         if type(forget_complete) is not bool:
             return None
@@ -550,7 +553,7 @@ def parse_voice_tail(
             return None
         messages.append(ConversationMessage(role=role, text=text, interrupted=interrupted))
     archive = None
-    if version in (_ARCHIVE_VERSION, _REVIEW_VERSION, _VERSION):
+    if version in (_ARCHIVE_VERSION, _REVIEW_VERSION, _FORGET_VERSION):
         archive = _parse_archive(
             document["archive"], len(messages), max_item_chars, max_outbox_rows
         )
@@ -645,8 +648,11 @@ class VoiceTailWriter:
         self._frozen = 0
         self._gap: tuple[int, int] | None = None
         self._review = ReviewProgress()
-        self._pending_forget: tuple[str, int] | None = None
-        self._forget_complete = False
+        # The delete record beside the tail: no reset of the tail ever touches it.
+        self._deletes_path = path.with_name(f"{path.stem}.deletes{path.suffix}")
+        self._deletes = VoiceDeletes()
+        # What the record durably holds; None when it is unreadable and must be rewritten.
+        self._written_deletes: VoiceDeletes | None = VoiceDeletes()
         self._forget_version = 0
         self._on_durable_clear: Callable[[], None] | None = None
         self._review_frozen_version = 0
@@ -784,12 +790,29 @@ class VoiceTailWriter:
         return self._conversation_id, self._generation
 
     @property
-    def pending_forget(self) -> tuple[str, int] | None:
-        return self._pending_forget
+    def pending_deletes(self) -> tuple[tuple[str, int], ...]:
+        """Every delete recorded and not yet verified complete, oldest first."""
+        return self._deletes.pending
 
     @property
-    def forget_complete(self) -> bool:
-        return self._forget_complete
+    def delete_outcome(self) -> tuple[str, int] | None:
+        """The newest binding a settled delete completed."""
+        return self._deletes.outcome
+
+    @property
+    def deletes_lost(self) -> bool:
+        """Whether an earlier delete record could not be read; no completion clears it."""
+        return self._deletes.lost
+
+    @property
+    def deleted_previous(self) -> bool:
+        """Whether the last completed delete retired the conversation before this one.
+
+        A delete always replaces its conversation with the next generation, so the
+        completed binding is the immediate predecessor exactly when its generation is.
+        """
+        outcome = self._deletes.outcome
+        return type(outcome) is tuple and outcome[1] + 1 == self._generation
 
     async def request_forget(
         self,
@@ -797,7 +820,12 @@ class VoiceTailWriter:
         *,
         on_durable_clear: Callable[[], None] | None = None,
     ) -> tuple[str, int]:
-        """Retire the current binding and durably record its delete intent."""
+        """Retire the current binding and durably record its delete intent.
+
+        The writer persists the delete record before the tail on every pass, so the
+        cleared tail is never durable without the intent. A tail still holding a
+        recorded binding (the record landed, the tail did not) is retired when it opens.
+        """
 
         if type(store) is not ConversationContextStore:
             raise TypeError("forget store must be an exact ConversationContextStore")
@@ -805,8 +833,8 @@ class VoiceTailWriter:
             raise TypeError("durable clear callback must be callable")
         if self._owner is None:
             raise RuntimeError("voice tail is not open")
-        if self._pending_forget is not None:
-            raise RuntimeError("a voice delete is already pending")
+        if len(self._deletes.pending) >= MAX_PENDING_DELETES:
+            raise RuntimeError("voice delete capacity is exhausted")
         if self._generation >= MAX_IDENTITY:
             raise RuntimeError("voice generation capacity is exhausted")
         old = self.binding
@@ -817,18 +845,17 @@ class VoiceTailWriter:
             or new_id == old[0]
         ):
             raise ValueError("replacement conversation id is invalid")
+        # A batch is frozen durably before it is sent, so with no frozen batch and no
+        # acknowledgment none ever left this host: the companion never held this binding.
+        offered = self._cursor is not None or self._frozen > 0
         # All changes before the first suspension run on the event loop as one transition.
         store.clear_voice_history()
-        self._conversation_id = new_id
-        self._generation = old[1] + 1
-        self._seq_base = self._next_seq = 0
-        self._cursor = self._gap = None
-        self._outbox = []
-        self._frozen = 0
-        self._review = ReviewProgress()
-        self._review_frozen_version = 0
-        self._pending_forget = old
-        self._forget_complete = False
+        self._retire(new_id, old[1] + 1)
+        if offered:
+            self._deletes = replace(self._deletes, pending=(*self._deletes.pending, old))
+        else:
+            # Nothing of it can be in Hermes, so it is complete once the clear is durable.
+            self._deletes = replace(self._deletes, outcome=self._newest_outcome(old))
         self._on_durable_clear = on_durable_clear
         self._changed()
         self._forget_version = self._version
@@ -836,26 +863,57 @@ class VoiceTailWriter:
             await self._tick.wait()
         return old
 
-    async def next_forget(self) -> tuple[str, int]:
-        """Return only an intent already present in the durable tail."""
+    def _retire(self, new_id: str, generation: int) -> None:
+        """Start the next binding with an empty outbox and fresh review progress."""
+        self._conversation_id = new_id
+        self._generation = generation
+        # The record names the live binding before any tail carries it.
+        self._deletes = replace(self._deletes, live=(new_id, generation))
+        self._seq_base = self._next_seq = 0
+        self._cursor = self._gap = None
+        self._outbox = []
+        self._frozen = 0
+        self._review = ReviewProgress()
+        self._review_frozen_version = 0
+
+    async def next_deletes(self) -> tuple[tuple[str, int], ...]:
+        """Every pending delete, once the tail write that retired its binding is durable.
+
+        The record lands before the tail in every pass, so that write holds the record
+        too. The record alone would let the companion delete, and acknowledge, a
+        conversation whose tail is still on disk.
+        """
 
         while True:
-            pending = self._pending_forget
+            pending = self._deletes.pending
             if (
                 self._owner is not None
-                and pending is not None
+                and pending
                 and self._written_version >= self._forget_version
             ):
                 return pending
             await self._tick.wait()
 
     def acknowledge_forget(self, binding: tuple[str, int]) -> bool:
-        if type(binding) is not tuple or binding != self._pending_forget:
+        """Settle one delete the companion verified complete; others stay pending.
+
+        The outcome keeps the newest completed generation, so an older delete settling
+        late never hides that the conversation this one replaced was deleted.
+        """
+
+        if type(binding) is not tuple or binding not in self._deletes.pending:
             return False
-        self._pending_forget = None
-        self._forget_complete = True
+        self._deletes = replace(
+            self._deletes,
+            pending=tuple(item for item in self._deletes.pending if item != binding),
+            outcome=self._newest_outcome(binding),
+        )
         self._changed()
         return True
+
+    def _newest_outcome(self, binding: tuple[str, int]) -> tuple[str, int]:
+        outcome = self._deletes.outcome
+        return outcome if outcome is not None and outcome[1] > binding[1] else binding
 
     def _batch(self) -> ArchiveBatch:
         rows = tuple(self._outbox[: self._frozen])
@@ -1148,6 +1206,8 @@ class VoiceTailWriter:
             raise RuntimeError("another host holds the voice tail")
         try:
             remove_orphaned_temporaries(self._path)
+            remove_orphaned_temporaries(self._deletes_path)
+            self._written_deletes = await self._read_deletes()
             raw = await asyncio.to_thread(
                 read_run_record,
                 self._path,
@@ -1158,6 +1218,13 @@ class VoiceTailWriter:
                 self._fresh()
             else:
                 self._restore(store, raw)
+            if self._deletes.pending:
+                # Whatever the open restored, retired or could not read, a pending delete
+                # is handed out only after a fresh tail write has replaced the file.
+                self._changed()
+                self._forget_version = self._version
+            elif self._deletes.holds_deletes and self._deletes != self._written_deletes:
+                self._dirty = True
         except BaseException:
             self._archiving = False
             unlock_run_record(owner)
@@ -1166,19 +1233,32 @@ class VoiceTailWriter:
         self._task = asyncio.create_task(self._mirror(), name="voice-tail-writer")
         self._notify()
 
-    def _fresh(self) -> None:
-        self._conversation_id = self._conversation_ids()
-        if type(self._conversation_id) is not str or not _CONVERSATION_ID.fullmatch(
-            self._conversation_id
-        ):
+    async def _read_deletes(self) -> VoiceDeletes | None:
+        """Adopt the delete record; an unreadable one becomes the ``unknown`` outcome."""
+
+        raw = await asyncio.to_thread(
+            read_run_record, self._deletes_path, MAX_VOICE_DELETES_BYTES
+        )
+        if raw is None:
+            self._deletes = VoiceDeletes()
+            return self._deletes
+        parsed = parse_voice_deletes(raw)
+        if parsed is None:
+            # Its intents cannot be read back, so nothing may claim they completed.
+            _marker(_DELETES_MARKER_PREFIX, {"refusal": "malformed", "version": 1})
+            self._deletes = VoiceDeletes(lost=True)
+            return None
+        self._deletes = parsed
+        return parsed
+
+    def _new_id(self) -> str:
+        conversation_id = self._conversation_ids()
+        if type(conversation_id) is not str or not _CONVERSATION_ID.fullmatch(conversation_id):
             raise ValueError("a conversation id must be 1-64 characters of [A-Za-z0-9_-]")
-        self._generation = self._seq_base = self._next_seq = 0
-        self._cursor = self._gap = None
-        self._outbox = []
-        self._frozen = 0
-        self._review = ReviewProgress()
-        self._pending_forget = None
-        self._forget_complete = False
+        return conversation_id
+
+    def _fresh(self) -> None:
+        self._retire(self._new_id(), 0)
 
     def _load(self, archive: ArchiveOutbox) -> None:
         self._conversation_id = archive.conversation_id
@@ -1193,6 +1273,8 @@ class VoiceTailWriter:
         # only new acknowledgments enter M2's review coverage.
         self._review = archive.review or ReviewProgress(cursor=archive.cursor)
         self._frozen_version = self._written_version
+        # A restored binding is the live one, should a delete be recorded before a retire.
+        self._deletes = replace(self._deletes, live=(archive.conversation_id, archive.generation))
 
     def _restore(self, store: ConversationContextStore, raw: bytes) -> None:
         # Counts or a refusal category only; never row text.
@@ -1207,12 +1289,32 @@ class VoiceTailWriter:
             try:
                 if tail is None:
                     raise ValueError("voice tail is malformed")
+                # Once any delete was recorded (or its record is unreadable), only the live
+                # binding the record names is provably not deleted; anything else, a
+                # version-1 tail with no identity included, is retired, never restored.
+                binding = (
+                    None if tail.archive is None
+                    else (tail.archive.conversation_id, tail.archive.generation)
+                )
+                unproven = self._deletes.holds_deletes and binding != self._deletes.live
+                pending = self._deletes.pending
+                if tail.pending_forget is not None and tail.pending_forget not in (
+                    *pending, self._deletes.outcome
+                ):
+                    # A version-4 tail held its one intent itself; the record holds it now,
+                    # in the slot it keeps beyond MAX_PENDING_DELETES for exactly this.
+                    pending = (*pending, tail.pending_forget)
+                    self._deletes = replace(self._deletes, pending=pending)
+                if unproven:
+                    self._retire(
+                        self._new_id(), 0 if binding is None else binding[1] + 1
+                    )
+                    evidence = {"retired": 1, "version": 1}
+                    return
                 if tail.archive is None:
                     self._fresh()
                 else:
                     self._load(tail.archive)
-                self._pending_forget = tail.pending_forget
-                self._forget_complete = tail.forget_complete
                 store.restore(tail.conversation)
             except ValueError:
                 # A refused restore mutated nothing; only a loaded archive must be dropped.
@@ -1223,7 +1325,7 @@ class VoiceTailWriter:
                 evidence = {
                     "outbox": len(self._outbox),
                     "restored": len(tail.conversation.messages),
-                    "tail_version": _LEGACY_VERSION if tail.archive is None else _VERSION,
+                    "tail_version": _LEGACY_VERSION if tail.archive is None else _REVIEW_VERSION,
                     "version": 1,
                 }
         finally:
@@ -1264,12 +1366,17 @@ class VoiceTailWriter:
                 self._wake.clear()
                 continue
             version = self._version
-            data = voice_tail_bytes(
-                self._latest, self._archive_state(), self._pending_forget,
-                self._forget_complete,
-            )
+            deletes = self._deletes
+            data = voice_tail_bytes(self._latest, self._archive_state())
             self._dirty = False
             try:
+                # The record first: a durable tail never runs ahead of the deletes it implies.
+                # Until a delete is recorded there is nothing to prove, so none is written.
+                if deletes.holds_deletes and deletes != self._written_deletes:
+                    await asyncio.to_thread(
+                        write_run_record, self._deletes_path, voice_deletes_bytes(deletes)
+                    )
+                    self._written_deletes = deletes
                 await self._write(data)
             except Exception as error:
                 # The latest snapshot, whichever it is by now, is still unwritten.

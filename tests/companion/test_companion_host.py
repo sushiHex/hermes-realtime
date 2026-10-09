@@ -32,6 +32,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveRow,
     VoiceForgetAckEvent,
     VoiceForgetEvent,
+    VoiceForgetRefusedEvent,
     VoiceMemoryEvent,
     VoiceReviewAckEvent,
     VoiceReviewEvent,
@@ -123,7 +124,13 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
     )
-    service, store = _service(tmp_path, hermes)
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
+    store = CompanionStore(tmp_path / "companion.db")
+    review = _AcceptingReview()
+    service = VoiceCompanionService(
+        VoiceArchive(store, hermes, lease_ttl_seconds=30.0), store, hermes, review,  # type: ignore[arg-type]
+    )
     try:
         await service.start()
         await service._ensure_open("conv")
@@ -137,6 +144,79 @@ async def test_forget_completes_after_native_absence_and_retires_archive_lease(
         assert hermes.lease == {}
         assert service._archive.ready("conv") is False
         assert store.deletion("conv") is not None
+        # Completion drops the binding; the fence still answers every late event.
+        late_review = await service.review(_review_event("conv"))
+        assert type(late_review) is VoiceReviewRefusedEvent
+        assert late_review.category == "tombstoned"
+        late_archive = await service.archive(_event([_row(0)], conversation="conv"))
+        assert type(late_archive) is VoiceArchiveRefusedEvent
+        assert late_archive.category == "tombstoned"
+        assert review.requests == []
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_this_companion_never_bound_is_refused_never_complete(
+    tmp_path: Path,
+) -> None:
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
+    hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
+    hermes.absent = lambda _ids: True  # type: ignore[attr-defined]
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
+    service, store = _service(tmp_path, hermes)
+    try:
+        await service.start()
+        reply = await service.forget(VoiceForgetEvent(
+            protocol_version="0.3", type="voice_forget",
+            conversation_id="elsewhere", generation=0,
+        ))
+        assert type(reply) is VoiceForgetRefusedEvent and reply.category == "unbound"
+        assert store.deletion("elsewhere") is None
+    finally:
+        await service.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_owned_start_keeps_completed_fences_and_drops_their_bindings(
+    tmp_path: Path,
+) -> None:
+    from hermes_realtime.companion.integrity import EXPECTED_HEADER, genesis
+    from hermes_realtime.companion.store import Progress
+
+    hermes = FakeHermes()
+    hermes.capture_delete_targets = lambda _voice, _missing: ()  # type: ignore[attr-defined]
+    hermes.delete_target = lambda _target: True  # type: ignore[attr-defined]
+    hermes.absent = lambda _ids: True  # type: ignore[attr-defined]
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
+    service, store = _service(tmp_path, hermes)
+    try:
+        store.bind("legacy", "voice_1", Progress(genesis(EXPECTED_HEADER), None))
+        store.tombstone("legacy", 0)
+        store.set_delete_manifest("legacy", ())
+        # The previous release marked completion and kept the binding.
+        store._connection.execute(
+            "UPDATE voice_deletion SET complete = 1 WHERE conversation_id = 'legacy'"
+        )
+        # Bound, so this start's own reconciliation completes it.
+        store.bind("open", "voice_2", Progress(genesis(EXPECTED_HEADER), None))
+        store.tombstone("open", 0)
+        # An earlier build's unbound tombstone: nothing proves it, so it never completes.
+        store.tombstone("unproven", 0)
+
+        await service.start()
+
+        for conversation in ("legacy", "open"):
+            deletion = store.deletion(conversation)
+            assert deletion is not None and deletion.complete
+        assert store.read("legacy") is None and store.read("open") is None
+        unproven = store.deletion("unproven")
+        assert unproven is not None and not unproven.complete
     finally:
         await service.close()
         store.close()
@@ -158,6 +238,8 @@ async def test_review_end_reconciles_only_after_natural_thread_exit(tmp_path: Pa
     hermes.absent = (  # type: ignore[attr-defined]
         lambda ids: all(session_id not in hermes.sessions for session_id in ids)
     )
+    hermes.capture_copies = lambda _ids: ()  # type: ignore[attr-defined]
+    hermes.copies_absent = lambda _ids, _copies: True  # type: ignore[attr-defined]
 
     class Review:
         alive = True
@@ -213,6 +295,9 @@ class _AcceptingReview:
             "vr_synthetic", "accepted", request.conversation_id, request.generation,
             request.seq_from, request.seq_through, request.closing,
         )
+
+    def admitted(self, _conversation_id: str) -> bool:
+        return False
 
 
 def _review_event(conversation_id: str) -> VoiceReviewEvent:
@@ -704,6 +789,40 @@ def test_waiting_owner_takes_over_after_profile_lock_released(tmp_path: Path) ->
         host.close()
 
 
+def test_a_waiting_owner_blocks_on_the_lock_instead_of_polling_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_realtime.companion import host as host_module
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    attempts: list[Path] = []
+    original = host_module.lock_run_record
+
+    def counted(path: Path) -> int | None:
+        attempts.append(path)
+        return original(path)
+
+    monkeypatch.setattr(host_module, "lock_run_record", counted)
+    store_path = tmp_path / "companion.db"
+    descriptor = lock_run_record(store_path)
+    assert descriptor is not None
+    host = _host(tmp_path, FakeHermes(), [])
+    try:
+        assert host.start() is True
+        assert host.wait_ready(0.5) is False
+        # One non-blocking attempt, then the OS wakes the waiter: no 100 ms polling.
+        assert len(attempts) == 1
+        started = time.monotonic()
+        unlock_run_record(descriptor)
+        descriptor = None
+        assert host.wait_ready(5.0) is True
+        assert time.monotonic() - started < 1.0
+    finally:
+        if descriptor is not None:
+            unlock_run_record(descriptor)
+        host.close()
+
+
 def test_waiting_owner_stops_without_opening_profile_on_unload(tmp_path: Path) -> None:
     from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
 
@@ -721,6 +840,9 @@ def test_waiting_owner_stops_without_opening_profile_on_unload(tmp_path: Path) -
         time.sleep(0.2)
         assert hermes.calls == []
         assert not any(thread.name == "voice-companion" for thread in threading.enumerate())
+        # The abandoned waiter took the released lock and gave it straight back.
+        descriptor = lock_run_record(store_path)
+        assert descriptor is not None
     finally:
         if descriptor is not None:
             unlock_run_record(descriptor)

@@ -149,7 +149,9 @@ class VoiceReviewCoordinator:
         self._cancel_tasks: dict[str, asyncio.Task[None]] = {}
         self._owned_releases: dict[int, tuple[Any, Any]] = {}
         self._release_tasks: dict[int, asyncio.Task[None]] = {}
-        self._store.recover_reviews()
+        quarantined = self._store.recover_reviews()
+        if quarantined:
+            _marker({"count": quarantined, "refusal": "quarantined", "version": 1})
 
     @property
     def review_interval(self) -> int:
