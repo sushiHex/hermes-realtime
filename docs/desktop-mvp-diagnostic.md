@@ -437,7 +437,7 @@ Next steps by category, from the gate's source:
 - `health`: the gateway did not answer the authenticated `/health/detailed` with its process.
   Check that the gateway runs, that `API_SERVER_KEY` matches, and that port 8642 answers.
 - `hello_refused`: a wrong companion token, or a gateway still running a plugin without runtime
-  attestation. Check the token, then restart the gateway.
+  attestation or the authenticated hello. Check the token, then restart the gateway.
 - `capability`: the companion does not offer every capability. Reinstall the candidate wheel
   (setup step 4) and restart the gateway.
 - `foreign_companion`: another process owns the companion, such as a Hermes CLI or cron process

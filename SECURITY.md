@@ -32,7 +32,10 @@ Hermes Realtime:
 
 - runs third-party provider and plugin code in process;
 - uses short-lived LiveKit and browser credentials but is not a sandbox;
-- assumes loopback runs on a trusted single-user workstation;
+- assumes loopback runs on a trusted single-user workstation. The bridge hello between the
+  realtime host and the Hermes companion authenticates both sides without sending its token,
+  but it gives the frames after the hello no integrity or confidentiality
+  ([details](docs/hermes-bridge.md#protocol-03-the-hello-voice-archive-review-memory-and-deletion));
 - can dispatch Hermes work that mutates local or remote state;
 - treats external source text as untrusted evidence, not instructions.
 
