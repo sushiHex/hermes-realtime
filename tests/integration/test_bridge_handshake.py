@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
+import socket
 from typing import Any
 
 import pytest
 
 from hermes_realtime.integration import BridgeAuthenticationError, LocalHermesBridgeClient
-from tests.integration.test_bridge_voice import _ATTESTATION, _TOKEN, _batch, _server, _Voice
+from tests.integration.test_bridge_voice import (
+    _ATTESTATION,
+    _TOKEN,
+    _batch,
+    _ReviewVoice,
+    _server,
+    _Voice,
+)
 from tests.support import bridge_hello
 
 _HELLO_MARKER = "[hermes-bridge-hello] "
@@ -100,19 +109,17 @@ def _splice(field: str, value: object) -> Any:
     return lambda covered: covered | {field: value}
 
 
+_OPENING_SPLICES = [
+    pytest.param(_splice("participant_id", "someone-else"), id="participant"),
+    pytest.param(_splice("client_nonce", "0" * 64), id="replayed-client-nonce"),
+    pytest.param(_splice("server_nonce", "1" * 64), id="server-nonce"),
+    pytest.param(_splice("requested", ["mutual_auth"]), id="requested"),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "sign",
-    [
-        pytest.param(_splice("participant_id", "someone-else"), id="participant"),
-        pytest.param(_splice("client_nonce", "0" * 64), id="replayed-client-nonce"),
-        pytest.param(_splice("server_nonce", "1" * 64), id="server-nonce"),
-        pytest.param(_splice("negotiated", ["mutual_auth"]), id="negotiated"),
-        pytest.param(_splice("requested", ["mutual_auth"]), id="requested"),
-        pytest.param(_splice("metadata", {"review_interval": 999}), id="metadata"),
-    ],
-)
-async def test_a_proof_spliced_from_another_handshake_is_refused(
+@pytest.mark.parametrize("sign", _OPENING_SPLICES)
+async def test_a_server_proof_spliced_from_another_handshake_is_refused(
     sign: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome, sign=sign)
@@ -125,6 +132,52 @@ async def test_a_proof_spliced_from_another_handshake_is_refused(
     assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
         {"refusal": "proof", "version": 1}
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sign_accept",
+    [
+        *_OPENING_SPLICES,
+        pytest.param(_splice("negotiated", ["mutual_auth"]), id="negotiated"),
+        pytest.param(_splice("metadata", {"review_interval": 999}), id="metadata"),
+    ],
+)
+async def test_an_acceptance_proof_spliced_from_another_handshake_is_refused(
+    sign_accept: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome, sign_accept=sign_accept)
+    server, port = await companion.start()
+    async with server:
+        with pytest.raises(BridgeAuthenticationError):
+            await _connect(port)
+        await asyncio.sleep(0.05)
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": "acceptance", "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_welcome_discloses_nothing_but_a_nonce_and_a_proof() -> None:
+    sent = bytearray()
+    async with _server(voice=_ReviewVoice(), runtime=_ATTESTATION) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        hello = bridge_hello.hello(
+            "voice-review", ("voice_archive", "voice_review", "runtime_attestation")
+        )
+        writer.write(json.dumps(hello).encode() + b"\n")
+        await writer.drain()
+        line = await reader.readline()
+        sent.extend(line)
+        welcome = json.loads(line)
+        assert set(welcome) == {"ok", "protocol_version", "server_nonce", "proof"}
+        # A peer without the token proves nothing and is told nothing more.
+        writer.write(json.dumps({"proof": "0" * 64}).encode() + b"\n")
+        await writer.drain()
+        sent.extend(await asyncio.wait_for(reader.read(), 2))
+        writer.close()
+    assert b"runtime" not in sent and b"review_interval" not in sent
+    assert b"capabilities" not in sent and _ATTESTATION.hermes_commit.encode() not in sent
 
 
 @pytest.mark.asyncio
@@ -204,6 +257,133 @@ async def test_the_client_handshake_has_a_deadline(capsys: pytest.CaptureFixture
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_connect_is_no_refusal_and_closes_its_socket(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closes: list[LocalHermesBridgeClient] = []
+    close = LocalHermesBridgeClient.close
+
+    async def recording_close(self: LocalHermesBridgeClient) -> None:
+        closes.append(self)
+        await close(self)
+
+    monkeypatch.setattr(LocalHermesBridgeClient, "close", recording_close)
+
+    async def mute(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(ConnectionError):
+            await reader.read()
+
+    server = await asyncio.start_server(mute, "127.0.0.1", 0)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        # The caller's own bound cancels the connect from outside its handshake deadline.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_connect(port, handshake_timeout=10), 0.2)
+    # Closed by the handshake itself, not left for garbage collection to find.
+    assert len(closes) == 1
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "welcome",
+    [
+        pytest.param(b'{"ok": 1' + b"0" * 5000 + b"}\n", id="huge-integer"),
+        pytest.param(b"[" * 5000 + b"]" * 5000 + b"\n", id="deep-nesting"),
+        pytest.param(b"x" * (64 * 1024 + 1) + b"\n", id="oversized"),
+    ],
+)
+async def test_an_unreadable_welcome_is_refused_with_one_true_marker(
+    welcome: bytes, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def companion(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readline()
+        writer.write(welcome)
+        with contextlib.suppress(ConnectionError):
+            await writer.drain()
+            await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(companion, "127.0.0.1", 0)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        with pytest.raises(BridgeAuthenticationError):
+            await _connect(port)
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": "shape", "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "category"),
+    [
+        ("before-welcome", "shape"),
+        ("after-welcome", "acceptance"),
+        ("after-proof", "acceptance"),
+    ],
+)
+async def test_a_companion_reset_mid_handshake_leaves_one_true_marker(
+    stage: str, category: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop = asyncio.get_running_loop()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.setblocking(False)
+
+    async def companion() -> None:
+        sock, _ = await loop.sock_accept(listener)
+        sock.setblocking(False)
+        hello = json.loads(await bridge_hello.raw_line(sock))
+        if stage != "before-welcome":
+            server_nonce = "2" * 64
+            opening = {
+                "participant_id": hello["participant_id"],
+                "client_nonce": hello["client_nonce"],
+                "server_nonce": server_nonce,
+                "requested": hello["capabilities"],
+            }
+            welcome = {
+                "ok": True, "protocol_version": "0.3", "server_nonce": server_nonce,
+                "proof": bridge_hello.proof(_TOKEN, "server", **opening),
+            }
+            await loop.sock_sendall(sock, json.dumps(welcome).encode() + b"\n")
+            if stage == "after-proof":
+                await bridge_hello.raw_line(sock)
+            else:
+                await asyncio.sleep(0.05)
+        bridge_hello.reset(sock)
+
+    task = asyncio.create_task(companion())
+    try:
+        with pytest.raises((BridgeAuthenticationError, ConnectionError)):
+            await _connect(listener.getsockname()[1])
+        await task
+    finally:
+        listener.close()
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": category, "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_connection_dropped_after_the_welcome_is_refused_as_the_acceptance(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    companion = bridge_hello.FakeCompanion(_TOKEN, _review_welcome, accept="dropped")
+    server, port = await companion.start()
+    async with server:
+        with pytest.raises((BridgeAuthenticationError, ConnectionError)):
+            await _connect(port)
+    # Whether the client's proof send or its read of the acceptance meets the drop, the
+    # failure is that no authenticated acceptance arrived.
+    assert _markers(capsys.readouterr().out, _WELCOME_MARKER) == [
+        {"refusal": "acceptance", "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf"), True, "1"])
 async def test_the_handshake_deadline_must_be_a_positive_finite_number(timeout: object) -> None:
     with pytest.raises(ValueError, match="handshake_timeout"):
@@ -268,43 +448,102 @@ async def test_the_server_marks_an_expired_authentication_deadline(
     ]
 
 
+# Lines whose read or parse fails before any refusal is decided: past the line bound, an
+# integer past Python's digit limit (a plain ValueError), and nesting past the recursion limit.
+_UNREADABLE = {
+    "oversized": b"x" * (64 * 1024 + 1) + b"\n",
+    "huge-integer": b'{"proof": 1' + b"0" * 5000 + b"}\n",
+    "deep-nesting": b"[" * 5000 + b"]" * 5000 + b"\n",
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exit", "category"),
+    ("stage", "ending", "category"),
     [
-        # A line past the bound fails the read itself, before any refusal is decided.
-        pytest.param("oversized-hello", "shape", id="oversized-hello"),
-        pytest.param("oversized-answer", "abandoned", id="oversized-answer"),
-        pytest.param("closed-after-welcome", "abandoned", id="closed-after-welcome"),
-        pytest.param("accepted", None, id="accepted"),
+        *[
+            pytest.param("hello", line, "shape", id=f"{line}-hello")
+            for line in _UNREADABLE
+        ],
+        *[
+            pytest.param("answer", line, "proof", id=f"{line}-answer")
+            for line in _UNREADABLE
+        ],
+        pytest.param("answer", "closed", "abandoned", id="closed-after-welcome"),
+        pytest.param("accepted", None, None, id="accepted"),
     ],
 )
-async def test_every_server_handshake_exit_but_acceptance_leaves_exactly_one_marker(
-    exit: str, category: str | None, capsys: pytest.CaptureFixture[str]
+async def test_every_server_handshake_exit_but_acceptance_leaves_one_true_marker(
+    stage: str, ending: str | None, category: str | None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    oversized = b"x" * (64 * 1024 + 1) + b"\n"
     async with _server(voice=_Voice()) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
-        if exit == "accepted":
+        if stage == "accepted":
             await bridge_hello.authenticate(reader, writer, _TOKEN, bridge_hello.hello())
-        elif exit == "oversized-hello":
-            writer.write(oversized)
+            writer.close()
         else:
+            if stage == "answer":
+                hello = bridge_hello.hello("voice-archive", ("voice_archive",))
+                writer.write(json.dumps(hello).encode() + b"\n")
+                await writer.drain()
+                assert json.loads(await reader.readline())["ok"] is True
+            if ending == "closed":
+                writer.write_eof()
+            else:
+                assert ending is not None
+                writer.write(_UNREADABLE[ending])
+            await writer.drain()
+            assert await asyncio.wait_for(reader.read(), 2) in (b"", b'{"ok":false}\n')
+            writer.close()
+        await asyncio.sleep(0.1)
+    expected = [] if category is None else [{"refusal": category, "version": 1}]
+    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "category"), [("before-hello", "shape"), ("after-welcome", "abandoned")]
+)
+async def test_a_client_reset_mid_handshake_leaves_one_true_marker(
+    stage: str, category: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async with _server(voice=_Voice()) as server:
+        sock = await bridge_hello.raw_connect(server.host, server.port)
+        if stage == "after-welcome":
+            hello = bridge_hello.hello("voice-archive", ("voice_archive",))
+            await asyncio.get_running_loop().sock_sendall(sock, json.dumps(hello).encode() + b"\n")
+            assert json.loads(await bridge_hello.raw_line(sock))["ok"] is True
+        else:
+            await asyncio.sleep(0.05)
+        bridge_hello.reset(sock)
+        await asyncio.sleep(0.1)
+    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == [
+        {"refusal": category, "version": 1}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before-hello", "after-welcome"])
+async def test_closing_the_server_mid_handshake_is_no_refusal(
+    stage: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server = _server(voice=_Voice())
+    await server.start()
+    try:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        if stage == "after-welcome":
             hello = bridge_hello.hello("voice-archive", ("voice_archive",))
             writer.write(json.dumps(hello).encode() + b"\n")
             await writer.drain()
             assert json.loads(await reader.readline())["ok"] is True
-            if exit == "oversized-answer":
-                writer.write(oversized)
-            else:
-                writer.write_eof()
-        await writer.drain()
-        if exit != "accepted":
-            assert await asyncio.wait_for(reader.read(), 2) == b""
-        writer.close()
-        await asyncio.sleep(0.05)
-    expected = [] if category is None else [{"refusal": category, "version": 1}]
-    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == expected
+        else:
+            await asyncio.sleep(0.05)
+    finally:
+        await server.close()
+    assert await asyncio.wait_for(reader.read(), 2) == b""
+    writer.close()
+    await asyncio.sleep(0.05)
+    assert _markers(capsys.readouterr().out, _HELLO_MARKER) == []
 
 
 @pytest.mark.asyncio

@@ -342,30 +342,31 @@ class _Companion:
                 metadata["review_interval"] = 8
             if "runtime_attestation" in negotiated:
                 metadata["runtime"] = attest_runtime().model_dump(mode="json") | self.attested
-            covered: dict[str, Any] = {
+            opening: dict[str, Any] = {
                 "participant_id": hello["participant_id"],
                 "client_nonce": hello["client_nonce"],
                 "server_nonce": secrets.token_hex(32),
                 "requested": hello["capabilities"],
-                "negotiated": negotiated,
-                "metadata": metadata,
             }
             welcome: dict[str, object] = {
                 "ok": True,
                 "protocol_version": BRIDGE_PROTOCOL_VERSION,
-                "capabilities": negotiated,
-                "server_nonce": covered["server_nonce"],
-                "proof": bridge_hello.proof(_COMPANION_TOKEN, "server", **covered),
-                **metadata,
+                "server_nonce": opening["server_nonce"],
+                "proof": bridge_hello.proof(_COMPANION_TOKEN, "server", **opening),
             }
             writer.write(json.dumps(welcome).encode() + b"\n")
             await writer.drain()
             answer = await reader.readline()
             if answer and json.loads(answer) == {
-                "proof": bridge_hello.proof(_COMPANION_TOKEN, "client", **covered)
+                "proof": bridge_hello.proof(_COMPANION_TOKEN, "client", **opening)
             }:
-                accepted = bridge_hello.proof(_COMPANION_TOKEN, "accept", **covered)
-                writer.write(json.dumps({"accepted": accepted}).encode() + b"\n")
+                accepted = bridge_hello.proof(
+                    _COMPANION_TOKEN, "accept", **opening,
+                    negotiated=negotiated, metadata=metadata,
+                )
+                writer.write(json.dumps({
+                    "accepted": accepted, "capabilities": negotiated, **metadata,
+                }).encode() + b"\n")
         await writer.drain()
         writer.close()
 

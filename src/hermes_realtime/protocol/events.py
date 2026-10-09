@@ -303,7 +303,7 @@ VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
 VOICE_MEMORY_CAPABILITY = "voice_memory"
 VOICE_FORGET_CAPABILITY = "voice_forget"
-# A welcome that negotiates it carries ``runtime``: what the serving process loaded.
+# An acceptance that negotiates it carries ``runtime``: what the serving process loaded.
 RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
 # Required on every hello: both sides prove the shared token without sending it.
 MUTUAL_AUTH_CAPABILITY = "mutual_auth"
