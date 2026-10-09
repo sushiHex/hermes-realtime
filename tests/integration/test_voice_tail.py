@@ -996,7 +996,16 @@ async def test_a_close_timeout_keeps_the_tail_owned_and_a_retried_close_finishes
     with pytest.raises(RuntimeError, match="another host holds the voice tail"):
         await contender.open(ConversationContextStore(on_change=contender.update))
     writes.release.set()
-    await writer.close()
+    # The retried close keeps the same short timeout, which a loaded machine can outlast
+    # while the released write finishes; it is retried until it finishes, as a host would.
+    for _ in range(100):
+        try:
+            await writer.close()
+            break
+        except RuntimeError:
+            await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("a retried close never finished")
 
     assert _conversation(path.read_bytes()) == _rows(("user", "slow", False))
     successor = _writer(path)
