@@ -174,9 +174,9 @@ and peer scope before remote use.
 
 ### Implementation slices
 
-Keep implementation under #214, after this design is reviewed. First update the
-branch against main after #220 lands; the existing launcher remains authoritative
-until the integration slice is qualified.
+Keep implementation under #214, after this design is reviewed, and build against
+current main. The existing launcher remains authoritative until the integration
+slice is qualified.
 
 1. Extend `scripts/local_livekit.py` with an explicit remote profile that reuses
    its pinned archive and executable verification. Add a pure configuration
