@@ -134,6 +134,18 @@ def test_a_binding_speech_settlement_failure_is_kept() -> None:
     assert dropped == 0
 
 
+def test_both_sides_of_a_refused_bridge_hello_are_kept() -> None:
+    # The companion marks a refused hello; the host marks a refused welcome.
+    lines = [
+        '[hermes-bridge-hello] {"refusal":"proof","version":1}',
+        '[hermes-bridge-welcome] {"refusal":"acceptance","version":1}',
+    ]
+    found, dropped = rehearsal.markers(lines)
+
+    assert found == lines
+    assert dropped == 0
+
+
 def test_the_context_checks_keep_the_ollama_prompt_marker() -> None:
     line = (
         '[ollama-prompt] {"messages":9,"num_ctx":16384,"prompt_bytes":812,'

@@ -78,8 +78,9 @@ _KNOWN_MARKERS = frozenset(
         "voice-review-send", "voice-review-close", "hermes-run-record-lock",
         "hermes-restart-settlement", "hermes-dispatch-recovery", "codex-session-auth",
         "codex-tool-refusal", "voice-companion", "voice-archive-open", "voice-archive",
-        "voice-archive-lease", "voice-review", "hermes-bridge-hello", "voice-memory",
-        "voice-memory-receive", "voice-memory-stream", "voice-forget", "voice-forget-send",
+        "voice-archive-lease", "voice-review", "hermes-bridge-hello", "hermes-bridge-welcome",
+        "voice-memory", "voice-memory-receive", "voice-memory-stream", "voice-forget",
+        "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
         "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall", "binding-speech",
     }

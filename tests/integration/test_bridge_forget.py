@@ -1,7 +1,6 @@
 """Deletion is a negotiated private request, never a work or speech event."""
 
 import asyncio
-import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +15,7 @@ from hermes_realtime.protocol import (
     parse_voice_event,
 )
 from tests.integration.test_bridge_voice import _TOKEN, _batch, _ReviewVoice, _server, _Voice
+from tests.support import bridge_hello
 
 
 class ForgetVoice(_Voice):
@@ -136,15 +136,14 @@ async def test_old_0_3_peer_keeps_archive_review_without_forget() -> None:
     async with _server(AllVoice()) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
         try:
-            writer.write(json.dumps(dict(
-                token=_TOKEN, participant_id="older-peer", protocol_version="0.3",
-                capabilities=["voice_archive", "voice_review"],
-            )).encode() + b"\n")
-            await writer.drain()
-            hello = json.loads(await reader.readline())
-            assert hello == dict(ok=True, protocol_version="0.3",
-                                 capabilities=["voice_archive", "voice_review"],
-                                 review_interval=10)
+            welcome = await bridge_hello.authenticate(reader, writer, _TOKEN, bridge_hello.hello(
+                "older-peer", ("voice_archive", "voice_review"),
+            ))
+            assert {k: v for k, v in welcome.items() if k not in {"server_nonce", "proof"}} == dict(
+                ok=True, protocol_version="0.3",
+                capabilities=["mutual_auth", "voice_archive", "voice_review"],
+                review_interval=10,
+            )
             writer.write(_batch().model_dump_json().encode() + b"\n")
             await writer.drain()
             assert type(parse_voice_event(await reader.readline())) is VoiceArchiveAckEvent
