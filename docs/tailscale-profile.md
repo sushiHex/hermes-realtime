@@ -172,6 +172,38 @@ and peer scope before remote use.
 
 ## Acceptance evidence
 
+### Implementation slices
+
+Keep implementation under #214, after this design is reviewed. First update the
+branch against main after #220 lands; the existing launcher remains authoritative
+until the integration slice is qualified.
+
+1. Extend `scripts/local_livekit.py` with an explicit remote profile that reuses
+   its pinned archive and executable verification. Add a pure configuration
+   renderer and desired firewall-rule specification. Test path separation, pin
+   mismatch, exact ports/address restrictions, and refusal of development keys;
+   this slice must neither launch a service nor edit Windows policy.
+2. Add the explicit owner-run setup, inspection and rollback entry points.
+   Keep policy observation separate from mutation, and serialize setup/rollback
+   so two invocations cannot both claim the same rules or process. Exercise
+   same-name collisions, stale adapter/profile information, effective Block and
+   broader Allow rules, partial creation, process-launch failure, and incomplete
+   rollback. Each new guard needs its own failing mutation. Synthetic policy
+   fixtures do not establish that the machine's effective firewall is correct.
+3. Integrate the verified remote profile with the existing launcher and browser
+   authorization, then run the real-device procedure below. Bind its record to
+   the candidate and actual device/software versions. Keep public evidence to
+   outcomes, categories and counts, without credentials, addresses, device
+   identities, transcript text or audio. A passing desktop or synthetic test
+   cannot substitute for this remote transport acceptance.
+
+The implementation must retain a bounded record of its exact owned resources
+and make repeated setup and rollback safe. No service installer, automatic
+startup, generalized firewall manager or additional remote-access mode is part
+of these slices.
+
+### Real-device procedure
+
 From an authorized real device on the tailnet, with a candidate-specific record:
 
 1. Confirm trusted HTTPS and `wss://` connections, and reject an unauthorized
