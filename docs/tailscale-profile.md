@@ -15,6 +15,12 @@ before launch. The existing `shared_path()`, `path`, and `serve` contracts remai
 loopback profile; the remote CLI will have explicit, separately named operations.
 There must be no checkout-relative fallback and no unverified executable override.
 
+The first implementation slice provides `remote_path()`, `verified_remote_server()`,
+`install_remote()`, and the explicit `path-remote` and `install-remote` CLI operations.
+Both install operations use the same pinned download, bounded archive inspection, and
+staged placement. `path-remote` checks the executable hash before printing its path.
+There is no remote serve operation in this slice.
+
 The distinct path gives Windows Firewall a separate program identity and keeps
 the two launch configurations apart, even though the bytes are identical. The
 loopback path has inbound Block rules created when its Windows Firewall prompt was
@@ -60,6 +66,14 @@ rtc:
 
 The placeholders are replaced locally, never committed with a real address. No
 `rtc.port_range_start` or `rtc.port_range_end` is set when `rtc.udp_port` is used.
+`scripts/tailnet_livekit_profile.py` now renders these fixed network fields only,
+accepting one canonical IPv4 address within `100.64.0.0/10`. Its credential validator
+uses the existing remote launcher bounds and rejects the loopback development values;
+credentials remain outside the rendered configuration. Its immutable desired-rule
+specification records the two exact names and every field in the table below. This
+pure specification derives its program path from the same remote resolver, but does
+not verify the binary; a future setup must verify it before using the specification.
+It neither reads adapter or firewall state nor applies policy.
 The pinned [LiveKit sample configuration](https://github.com/livekit/livekit/blob/v1.13.4/config-sample.yaml)
 defines these fields, and the [port reference](https://docs.livekit.io/transport/self-hosting/ports-firewall/)
 distinguishes signaling TCP 7880, ICE/TCP 7881, and UDP mux 7882. Keep signaling
