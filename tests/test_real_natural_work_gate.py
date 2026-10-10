@@ -12,7 +12,7 @@ from typing import cast
 
 import pytest
 
-from hermes_realtime.conversation import WorkCancelResult, WorkStartResult
+from hermes_realtime.conversation import ConversationContextStore, WorkCancelResult, WorkStartResult
 from hermes_realtime.providers.codex_app_server import _CodexTransportClosed
 
 _GATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "real_natural_work_gate.py"
@@ -123,6 +123,328 @@ def _sample(
         thread_to_first_delta_ms=thread_to_delta_ms,
         first_delta_to_speakable_ms=delta_to_speakable_ms,
     )
+
+
+class _ExactCancelHandler(_FakeWorkHandler):
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str]] = []
+
+    async def cancel_work(self, *, task_id: str, invocation_id: str) -> object:
+        self.calls.append((task_id, invocation_id))
+        return self.result
+
+
+class _CancelResultSubclass(WorkCancelResult):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_routes_frozen_task_without_model_and_records_ack(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    delegate = _ExactCancelHandler(
+        WorkCancelResult(accepted=True, state="cancelling", task_id="task_public")
+    )
+    clock = iter((1.25, 1.5, 1.75))
+    handler = RecordingWorkHandler(delegate, clock=lambda: next(clock))
+    context = ConversationContextStore()
+    events: list[tuple[str, dict[str, object]]] = []
+    admitted_at = await _GATE._explicit_cancel_task(
+        handler=handler, context=context, task_id="task_public",
+        observer=lambda kind, data: events.append((kind, data)), clock=lambda: next(clock),
+    )
+    assert admitted_at == 1.25
+    assert delegate.calls == [("task_public", "command_natural_gate_cancel")]
+    assert context.snapshot().messages[-1].text == "cancel task: task_public"
+    assert handler.last_cancel_acknowledged_at == 1.75
+    assert handler.cancel_acknowledgement_ms == (250.0,)
+    assert handler.last_accepted_cancel_task_id == "task_public"
+    assert events == [("task_state", {"status": "cancelling", "taskId": "task_public"})]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    _CancelResultSubclass(accepted=True, state="cancelling", task_id="task_public"),
+    WorkCancelResult(accepted=False, state="rejected", task_id="task_public", reason="rejected"),
+    WorkCancelResult(accepted=True, state="cancelling", task_id="task_other"),
+])
+async def test_explicit_cancel_refuses_unbound_ack(
+    result: object, capsys: pytest.CaptureFixture[str],
+) -> None:
+    handler = RecordingWorkHandler(_ExactCancelHandler(result))
+    with pytest.raises(RuntimeError, match="explicit cancellation"):
+        await _GATE._explicit_cancel_task(
+            handler=handler, context=ConversationContextStore(), task_id="task_public",
+            observer=lambda kind, data: None,
+        )
+    marker = capsys.readouterr().out.strip()
+    assert marker == '[natural-gate-cancel] {"category":"ack_rejected","attempts":1}'
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cancel_attempts", 2), ("accepted_cancel_calls", 0),
+    ("last_cancel_was_exactly_accepted", False),
+    ("last_accepted_cancel_task_id", "task_other"),
+    ("model_cancel_requests", 1),
+])
+def test_explicit_cancel_evidence_rejects_each_changed_binding(field: str, value: object) -> None:
+    evidence = dict(cancel_attempts=1, accepted_cancel_calls=1,
+                    last_cancel_was_exactly_accepted=True,
+                    last_accepted_cancel_task_id="task_public", model_cancel_requests=0)
+    evidence[field] = value
+    with pytest.raises(RuntimeError, match="exactly accepted"):
+        _GATE._validate_explicit_cancel_evidence(task_id="task_public", **evidence)
+
+
+def test_explicit_cancel_evidence_accepts_exact_ack_and_zero_model_calls(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _GATE._validate_explicit_cancel_evidence(
+        task_id="task_public", cancel_attempts=1, accepted_cancel_calls=1,
+        last_cancel_was_exactly_accepted=True,
+        last_accepted_cancel_task_id="task_public", model_cancel_requests=0,
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_explicit_cancel_evidence_marker(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(RuntimeError, match="exactly accepted"):
+        _GATE._validate_explicit_cancel_evidence(
+            task_id="task_public", cancel_attempts=1, accepted_cancel_calls=1,
+            last_cancel_was_exactly_accepted=True,
+            last_accepted_cancel_task_id="task_public", model_cancel_requests=1,
+        )
+    assert capsys.readouterr().out.strip() == (
+        '[natural-gate-cancel] {"category":"evidence_rejected","attempts":1,'
+        '"model_cancel_requests":1}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_refuses_unrouted_command(capsys: pytest.CaptureFixture[str]) -> None:
+    handler = RecordingWorkHandler(_ExactCancelHandler(None))
+    with pytest.raises(RuntimeError, match="not acknowledged"):
+        await _GATE._explicit_cancel_task(
+            handler=handler, context=ConversationContextStore(), task_id="invalid",
+            observer=lambda kind, data: None,
+        )
+    assert handler.cancel_attempts == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1] == (
+        '[natural-gate-cancel] {"category":"ack_rejected","attempts":0}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_ack_deadline_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    class WedgedHandler(_ExactCancelHandler):
+        async def cancel_work(self, *, task_id: str, invocation_id: str) -> object:
+            await asyncio.Event().wait()
+            return None
+
+    handler = RecordingWorkHandler(WedgedHandler(None))
+    monkeypatch.setattr(_GATE, "_TIMED_TURN_TIMEOUT_SECONDS", 0.01)
+    # Outer timeout makes deletion of the inner deadline fail alone without hanging pytest.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(_GATE._explicit_cancel_task(
+            handler=handler, context=ConversationContextStore(), task_id="task_public",
+            observer=lambda kind, data: None,
+        ), timeout=0.1)
+    assert capsys.readouterr().out.strip() == (
+        '[natural-gate-cancel] {"category":"timeout","attempts":1}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_uses_actual_shared_surface() -> None:
+    from hermes_realtime.conversation import ConversationWorkControlSurface, TaskCancelOutcome
+
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_public", run_id="deleg_synthetic", objective="Synthetic work",
+    )
+    cancellations: list[tuple[str, str | None]] = []
+
+    async def cancel(task_id: str, *, reason: str | None = None) -> TaskCancelOutcome:
+        cancellations.append((task_id, reason))
+        return TaskCancelOutcome(task_id=task_id, accepted=True)
+
+    surface = ConversationWorkControlSurface(
+        controller=SimpleNamespace(dispatch=lambda **kw: None, request_cancel=cancel),
+        context=context, observer=lambda kind, data: None,
+        reserve_observer_capacity=lambda: None,
+    )
+    try:
+        handler = RecordingWorkHandler(surface)
+        await _GATE._explicit_cancel_task(
+            handler=handler, context=context, task_id="task_public",
+            observer=lambda kind, data: None,
+        )
+        assert cancellations == [("task_public", "user requested task cancellation")]
+        assert handler.accepted_cancel_calls == 1
+        assert handler.last_accepted_cancel_task_id == "task_public"
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("work_activity", [False, True])
+async def test_old_task_continuation_allows_model_response_but_no_work(work_activity: bool) -> None:
+    activity = WorkActivityObserver()
+
+    class ConversationalInference:
+        async def stream(self, snapshot: object, *, turn_id: str) -> object:
+            activity.observe_send({"id": 1, "method": "turn/start", "params": {}})
+            if work_activity:
+                activity.observe_receive({"method": "item/tool/call", "params": {
+                    "tool": "start_work", "arguments": {},
+                }})
+            yield "The cancelled task cannot be continued."
+
+    arm = SimpleNamespace(inference=ConversationalInference(), activity=activity,
+                          observed_activity_total=0)
+    operation = _GATE._untimed_truthful_turn(
+        arm=arm, context=ConversationContextStore(), text="Continue the task you just canceled.",
+        turn_id="continuation",
+    )
+    if work_activity:
+        with pytest.raises(RuntimeError, match="work-tool activity"):
+            await operation
+    else:
+        assert await operation == ("The cancelled task cannot be continued.",)
+        assert activity.turn_start_requests == 1
+
+
+def test_interrupted_task_identity_must_match_exact_cancel_ack() -> None:
+    with pytest.raises(RuntimeError, match="terminal task did not match"):
+        _validate_completion_task_evidence(
+            accepted_task_id="task_public", active_task_ids=(), terminal_task_id="task_other",
+        )
+
+
+@pytest.mark.parametrize("tool", ["cancel_work", "cancel_active_work"])
+def test_wire_observer_counts_both_model_cancel_names(tool: str) -> None:
+    observer = WorkActivityObserver()
+    observer.observe_receive({"method": "item/tool/call", "params": {"tool": tool}})
+    assert observer.cancel_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_boundary_gate_explicit_cancellation_preserves_latency_and_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.conversation import TaskCancelOutcome, TaskDispatchOutcome
+
+    class Adapter:
+        async def connect(self) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            pass
+
+    class Controller:
+        def __init__(self, *, context: object, **kwargs: object) -> None:
+            self.context = context
+            self.terminals: asyncio.Queue[object] = asyncio.Queue()
+            self.starts = 0
+
+        async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome:
+            self.starts += 1
+            task_id = f"task_synthetic_{self.starts}"
+            self.context.record_task_accepted(
+                task_id=task_id, run_id=f"deleg_synthetic_{self.starts}", objective=objective,
+            )
+            return TaskDispatchOutcome(task_id=task_id, accepted=True)
+
+        def finish(self, task_id: str, status: str) -> None:
+            self.context.record_task_completed(
+                task_id=task_id, run_id=f"deleg_synthetic_{self.starts}",
+            )
+            self.terminals.put_nowait(SimpleNamespace(
+                task_id=task_id, status=status, summary=None, reason=None,
+            ))
+
+        async def request_cancel(
+            self, task_id: str, *, reason: str | None = None,
+        ) -> TaskCancelOutcome:
+            return TaskCancelOutcome(task_id=task_id, accepted=True)
+
+        async def next_completion(self) -> object:
+            self.finish(f"task_synthetic_{self.starts}",
+                        "completed" if self.starts == 1 else "interrupted")
+            return await self.terminals.get()
+
+        async def close(self) -> None:
+            pass
+
+    class Session:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+    class Inference:
+        def bind_work_tools(self, handler: object) -> None:
+            self.handler = handler
+
+        async def stream(self, snapshot: object, *, turn_id: str) -> object:
+            arm.activity.observe_send({"method": "turn/start"})
+            text = snapshot.messages[-1].text
+            if text.startswith("Start background work"):
+                arm.activity.observe_receive({"method": "item/tool/call", "params": {
+                    "tool": "start_work",
+                }})
+                await self.handler.start_work(objective=text, invocation_id=turn_id)
+            yield "Acknowledged."
+
+    async def close() -> None:
+        pass
+
+    probe = SimpleNamespace(begin=lambda **kw: None, mark_first_speakable=lambda: None,
+                            sample=lambda: _sample(transcript_to_thread_ms=0,
+                                                   thread_to_delta_ms=0, delta_to_speakable_ms=0))
+    arm = SimpleNamespace(inference=Inference(), probe=probe,
+                          activity=WorkActivityObserver(), observed_activity_total=0,
+                          close_for_cleanup=close)
+    monkeypatch.setitem(sys.modules, "gateway.config", SimpleNamespace(
+        PlatformConfig=lambda **kwargs: None,
+    ))
+    monkeypatch.setitem(sys.modules, "gateway.platforms.api_server", SimpleNamespace(
+        APIServerAdapter=lambda config: Adapter(),
+    ))
+    monkeypatch.setattr(_GATE, "ConversationTaskController", Controller)
+    monkeypatch.setattr(_GATE, "HermesApiTaskSession", Session)
+    monkeypatch.setattr(_GATE._InferenceArm, "create", lambda **kwargs: arm)
+    expected_cancel_ms: list[float] = []
+    actual_explicit_cancel = _GATE._explicit_cancel_task
+
+    async def observe_cancel(**kwargs: object) -> float:
+        admitted_at = await actual_explicit_cancel(**kwargs)
+        expected_cancel_ms.append(
+            (kwargs["handler"].last_cancel_acknowledged_at - admitted_at) * 1000.0,
+        )
+        return admitted_at
+
+    monkeypatch.setattr(_GATE, "_explicit_cancel_task", observe_cancel)
+    report, request_ms, handler_ms = await _GATE._run_boundary_gate(
+        key="synthetic" * 4, model="synthetic", effort="low",
+        executable="synthetic", environment={},
+    )
+    assert report["passed"] is True
+    assert report["evidence_version"] == 2
+    assert report["cancellation_route"] == "explicit_command"
+    assert report["observed_cancel_tool_requests"] == 0
+    assert report["accepted_cancel_calls"] == 1
+    assert len(request_ms) == len(handler_ms) == 3
+    assert request_ms[-1] >= handler_ms[-1]
+    assert request_ms[-1] == expected_cancel_ms[0]
+    assert report["cancel_acknowledgement"]["samples_ms"] == [_GATE._rounded(request_ms[-1])]
+    # Preflight, two starts, old-task continuation, ordinary conversation; no model cancellation.
+    assert arm.activity.turn_start_requests == 5
 
 
 def test_task_acknowledgement_sample_separates_model_and_handler_time() -> None:
@@ -494,7 +816,7 @@ def test_transport_activity_observer_counts_malformed_pre_handler_attempts() -> 
             "method": "thread/start",
             "params": {
                 "dynamicTools": _GATE.CodexAppServerStreamingInference._dynamic_tools(
-                    1024, include_cancel=False
+                    1024
                 )
             },
         }

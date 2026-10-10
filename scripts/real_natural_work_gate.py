@@ -25,6 +25,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 if TYPE_CHECKING:
@@ -36,11 +37,13 @@ else:
 
 from hermes_realtime.conversation import (
     ConversationContextStore,
+    ConversationTaskCommandRouter,
     ConversationTaskController,
     ConversationWorkControlSurface,
     WorkCancelResult,
     WorkStartResult,
 )
+from hermes_realtime.conversation.tasks import TaskCancelOutcome
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
@@ -470,7 +473,7 @@ class WorkActivityObserver:
             tool = params.get("tool") if type(params) is dict else None
             if tool == "start_work":
                 self._start_requests += 1
-            elif tool == "cancel_active_work":
+            elif tool in ("cancel_active_work", "cancel_work"):
                 self._cancel_requests += 1
             return
         if message.get("method") not in ("item/started", "item/completed"):
@@ -1161,10 +1164,6 @@ async def _untimed_truthful_turn(
     if activity_before != arm.observed_activity_total:
         raise RuntimeError("work-tool activity arrived between conversational turns")
     private_before = arm.activity.private_authority_messages
-    wire_before = (
-        arm.activity.thread_start_requests,
-        arm.activity.turn_start_requests,
-    )
     context.record_user_transcript(Transcript(text=text, final=True))
     segments: list[str] = []
     async with asyncio.timeout(_TIMED_TURN_TIMEOUT_SECONDS):
@@ -1177,15 +1176,92 @@ async def _untimed_truthful_turn(
         raise RuntimeError("truthful continuation turn emitted work-tool activity")
     if arm.last_private_authority_delta:
         raise RuntimeError("Codex protocol output disclosed private authority")
-    if (
-        arm.activity.thread_start_requests,
-        arm.activity.turn_start_requests,
-    ) != wire_before:
-        raise RuntimeError("truthful continuation turn reached Codex wire transport")
     if not segments:
         raise RuntimeError("truthful continuation turn produced no speakable output")
     validate_public_report(segments)
     return tuple(segments)
+
+
+async def _explicit_cancel_task(
+    *,
+    handler: RecordingWorkHandler,
+    context: ConversationContextStore,
+    task_id: str,
+    observer: Callable[[str, dict[str, str | int | bool | None]], None],
+    clock: Callable[[], float] = time.perf_counter,
+) -> float:
+    """Route a trusted explicit command through the shared exact-task work surface."""
+
+    admitted_at = 0.0
+    category = "ack_rejected"
+    accepted = False
+    acknowledged = False
+
+    async def record(text: str) -> None:
+        nonlocal admitted_at
+        admitted_at = clock()
+        context.record_user_transcript(Transcript(text=text, final=True))
+
+    async def cancel(target: str, *, reason: str | None = None) -> TaskCancelOutcome:
+        nonlocal acknowledged
+        del reason
+        result = await handler.cancel_work(
+            task_id=target, invocation_id="command_natural_gate_cancel",
+        )
+        if (
+            type(result) is not WorkCancelResult
+            or result.accepted is not True
+            or result.task_id != task_id
+        ):
+            raise RuntimeError("explicit cancellation lacked an exact accepted acknowledgement")
+        acknowledged = True
+        return TaskCancelOutcome(task_id=result.task_id, accepted=True)
+
+    router = ConversationTaskCommandRouter(
+        # Only the fixed cancellation command is routed; dispatch is never invoked.
+        controller=SimpleNamespace(dispatch=handler.start_work, request_cancel=cancel),
+        observer=observer, reserve_observer_capacity=lambda: None,
+        validate_user_input=context.validate_user_text, record_user_input=record,
+    )
+    try:
+        async with asyncio.timeout(_TIMED_TURN_TIMEOUT_SECONDS):
+            await router.route(f"cancel task: {task_id}")
+            if not acknowledged:
+                raise RuntimeError("explicit cancellation command was not acknowledged")
+        accepted = True
+        return admitted_at
+    except TimeoutError:
+        category = "timeout"
+        raise
+    finally:
+        if not accepted:
+            print('[natural-gate-cancel] ' + json.dumps(
+                {"category": category, "attempts": handler.cancel_attempts}, separators=(",", ":"),
+            ))
+
+
+def _validate_explicit_cancel_evidence(
+    *, task_id: str, cancel_attempts: int, accepted_cancel_calls: int,
+    last_cancel_was_exactly_accepted: bool, last_accepted_cancel_task_id: str | None,
+    model_cancel_requests: int,
+) -> None:
+    category = "evidence_rejected"
+    try:
+        if (
+            cancel_attempts != 1
+            or accepted_cancel_calls != 1
+            or not last_cancel_was_exactly_accepted
+            or last_accepted_cancel_task_id != task_id
+            or model_cancel_requests != 0
+        ):
+            raise RuntimeError("explicit cancellation was not exactly accepted")
+        category = "accepted"
+    finally:
+        if category != "accepted":
+            print('[natural-gate-cancel] ' + json.dumps(
+                {"category": category, "attempts": cancel_attempts,
+                 "model_cancel_requests": model_cancel_requests}, separators=(",", ":"),
+            ))
 
 
 def _public_terminal(outcome: Any) -> dict[str, object]:
@@ -1384,27 +1460,28 @@ async def _run_boundary_gate(
             or handler.last_accepted_start_task_id != cancellation_active_tasks[0].task_id
         ):
             raise RuntimeError("natural cancellation setup did not start exactly one task")
-        await _timed_turn(
-            arm=arm,
-            context=context,
-            text="Stop that background task.",
-            turn_id="turn_natural_gate_cancel",
+        cancel_admitted_at = await _explicit_cancel_task(
+            handler=handler, context=context, task_id=cancellation_active_tasks[0].task_id,
+            observer=lambda kind, data: events.append((kind, dict(data))),
         )
-        if arm.last_transcript_at is None or handler.last_cancel_acknowledged_at is None:
+        if handler.last_cancel_acknowledged_at is None:
             raise RuntimeError("natural cancellation acknowledgement was not observed")
         cancel_request_acknowledgement_ms = (
-            handler.last_cancel_acknowledged_at - arm.last_transcript_at
+            handler.last_cancel_acknowledged_at - cancel_admitted_at
         ) * 1000.0
         acknowledgement_ms.append(cancel_request_acknowledgement_ms)
-        if (
-            handler.cancel_attempts != 1
-            or handler.accepted_cancel_calls != 1
-            or arm.activity.cancel_requests != 1
-            or not handler.last_cancel_was_exactly_accepted
-            or handler.last_accepted_cancel_task_id != cancellation_active_tasks[0].task_id
-        ):
-            raise RuntimeError("natural cancellation was not exactly accepted")
+        _validate_explicit_cancel_evidence(
+            task_id=cancellation_active_tasks[0].task_id, cancel_attempts=handler.cancel_attempts,
+            accepted_cancel_calls=handler.accepted_cancel_calls,
+            last_cancel_was_exactly_accepted=handler.last_cancel_was_exactly_accepted,
+            last_accepted_cancel_task_id=handler.last_accepted_cancel_task_id,
+            model_cancel_requests=arm.activity.cancel_requests,
+        )
         interrupted = await asyncio.wait_for(controller.next_completion(), timeout=90)
+        _validate_completion_task_evidence(
+            accepted_task_id=handler.last_accepted_cancel_task_id,
+            active_task_ids=(), terminal_task_id=interrupted.task_id,
+        )
         if interrupted.status != "interrupted" or context.snapshot().active_tasks:
             raise RuntimeError("natural cancellation lacked interrupted terminal evidence")
         interrupted_public = _public_terminal(interrupted)
@@ -1459,10 +1536,12 @@ async def _run_boundary_gate(
             and interrupted.status == "interrupted"
             and arm.last_activity_delta == 0
             and arm.activity.start_requests == 2
-            and arm.activity.cancel_requests == 1
+            and arm.activity.cancel_requests == 0
             and arm.activity.private_authority_messages == 0
         )
         report = {
+            "evidence_version": 2,
+            "cancellation_route": "explicit_command",
             "start_attempts": handler.start_attempts,
             "accepted_start_calls": handler.accepted_start_calls,
             "cancel_attempts": handler.cancel_attempts,
@@ -1524,7 +1603,7 @@ async def _run_boundary_gate(
             and report is not None
             and (
                 arm.activity.start_requests != 2
-                or arm.activity.cancel_requests != 1
+                or arm.activity.cancel_requests != 0
                 or arm.activity.private_authority_messages != 0
             )
         ):
@@ -1685,7 +1764,7 @@ class _CodexFingerprint:
 
 
 def _idle_start_schema_sha256() -> str:
-    tools = CodexAppServerStreamingInference._dynamic_tools(1024, include_cancel=False)
+    tools = CodexAppServerStreamingInference._dynamic_tools(1024)
     encoded = json.dumps(
         tools,
         ensure_ascii=False,

@@ -551,8 +551,8 @@ Hermes task authority. The deterministic `task:` and `cancel task:` commands use
 surface, so explicit fallback and natural routing share validation, acknowledgment, projection,
 replay, and cancellation behavior.
 
-Natural work routing is experimental and disabled by default. Enable it only with the exact
-Codex app-server provider:
+Natural task starts are experimental and disabled by default. Enable them with the exact
+Codex app-server or Ollama provider:
 
 ```powershell
 hermes-realtime-host `
@@ -562,9 +562,10 @@ hermes-realtime-host `
 ```
 
 `--no-natural-work-tools`, or omitting both natural-work flags, leaves only the explicit-prefix
-path enabled. `--natural-work-tools` with Ollama is rejected during composition; Ollama and
-disabled Codex sessions remain tool-less. The unsandboxed-task acknowledgment is required in
-either mode.
+path enabled. With the flag, the model can request `start_work`; it cannot cancel tasks or
+grant approvals. Explicit commands and task-specific Cancel controls retain cancellation.
+The unsandboxed-task acknowledgment is required in either mode. See
+[ADR 0004](adr/0004-model-action-authority.md) for the model-trust limit and qualification.
 
 Source-backed foreground knowledge is a separate authority plane. It is disabled unless the host
 operator passes `--enable-public-search`, and each active browser binding must separately consent.
@@ -576,11 +577,11 @@ neither grants bridge, task, cancellation, approval, or tool authority. See
 [`source-backed-latency.md`](source-backed-latency.md).
 Retrieved source text is untrusted evidence, never an instruction, and cannot authorize work.
 
-The host starts and attests the Hermes API session, then runs the Codex readiness turn with no
-work tools; the deterministic `search_knowledge` tool may be present. It binds exactly the two work
-tools only after inference and TTS preflight both succeed and before the browser can admit a user
-turn. Binding requires the exact
-`CodexAppServerStreamingInference` and `ConversationWorkControlSurface` types. Provider drift,
+The host starts and attests the Hermes API session, then runs the provider readiness turn with no
+work tools; Codex's deterministic `search_knowledge` tool may be present. It binds the start
+tool only after inference and TTS preflight both succeed and before the browser can admit a user
+turn. Binding requires exact `CodexAppServerStreamingInference` or `OllamaStreamingInference`
+and `ConversationWorkControlSurface` types. Provider drift,
 preflight failure, an unsupported provider, a second bind, or an incompatible capability fails
 closed without exposing work authority to the readiness prompt or browser.
 

@@ -147,7 +147,11 @@ gate with the exact release model, effort, Codex executable, Hermes source tree,
 and Hermes API credential that will be used by the host. The gate starts a
 loopback-only authenticated API adapter and performs two benign real Hermes runs:
 one must complete authoritatively and one deliberately long run must be stopped
-through natural cancellation. An ordinary conversational turn must create no run.
+through the explicit user command `cancel task: <public task ID>`. The existing
+command router delegates to the shared exact-task work surface; cancellation
+never enters model inference. The accepted cancellation and interrupted terminal
+must match that frozen task ID. Ordinary conversation and an old-task continuation
+response must create no run or work-tool activity.
 Codex completes one tool-less preflight turn before the measured requests. The gate provider has
 no knowledge lookup, so unlike the production host it exposes no `search_knowledge` tool. This
 preflight keeps app-server initialization from contaminating acknowledgement timing before the
@@ -183,7 +187,7 @@ enforces a minimum of 30; the release command uses 125 after a preserved
 100-pair run showed unstable remote-service p95 variance. Every
 pair uses the same bounded conversational prompt. Acceptance requires the
 present-but-unused foreground p95 regression to remain within the greater of
-100 ms or 10% of the absent-arm p95. Every natural start or cancellation is
+100 ms or 10% of the absent-arm p95. Every natural start or explicit cancellation is
 timed from transcript acceptance until the installed Hermes handler returns its
 accepted result; every sample must remain below the explicitly configured
 task-acknowledgement budget. `8000` ms is the current candidate budget,
@@ -202,6 +206,13 @@ name, canonical schema SHA-256, observed thread-start count, and zero-active-tas
 under `present_arm_configuration`. Invalid sample counts, warmups, and
 acknowledgement budgets are bounded above and below before credentials or real
 runs are touched. Runtime failures emit only a bounded diagnostic code on stderr.
+
+The boundary report uses `evidence_version: 2` and
+`cancellation_route: "explicit_command"`. `observed_cancel_tool_requests` must
+be exactly zero, including shutdown; the explicit command still produces one
+accepted handler cancellation and one request-to-acknowledgment latency sample.
+Earlier evidence that required a model cancellation tool call is incompatible
+with this start-only model policy and must be regenerated.
 
 The JSON contains only the model, effort, Codex version and binary SHA-256,
 sanitized observed counters, terminal-state classifications, and timing

@@ -172,6 +172,15 @@ def test_natural_work_evaluator_rejects_fixture_schema_drift(tmp_path: Path) -> 
         load_corpus(drifted)
 
 
+def test_natural_work_evaluator_refuses_model_cancel_as_a_positive(tmp_path: Path) -> None:
+    document = json.loads(_NATURAL_WORK_CORPUS.read_text(encoding="utf-8"))
+    document["cases"][20]["expected_tool"] = "cancel_active_work"
+    drifted = tmp_path / "drifted.json"
+    drifted.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="safety-negative"):
+        load_corpus(drifted)
+
+
 def test_natural_work_evaluator_supplies_active_context_for_quoted_cancel_cases() -> None:
     corpus = load_corpus(_NATURAL_WORK_CORPUS)
     cases = {case.case_id: case for case in corpus.cases}
@@ -192,7 +201,7 @@ def test_natural_work_evaluator_supplies_active_context_for_quoted_cancel_cases(
     ),
 )
 @pytest.mark.asyncio
-async def test_codex_routes_non_work_after_terminal_history_without_work_authority(
+async def test_codex_preserves_inactive_authority_without_classifying_current_user_intent(
     utterance: str,
 ) -> None:
     transport = FakeCodexTransport()
@@ -218,7 +227,7 @@ async def test_codex_routes_non_work_after_terminal_history_without_work_authori
     assert "Only active_tasks establish active background work" in prompt
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
     advertised = {tool["name"] for tool in thread_request["params"]["dynamicTools"]}
-    assert "start_work" not in advertised
+    assert advertised == {"start_work"}
     await inference.close()
 
 
@@ -262,7 +271,7 @@ def test_natural_work_shadow_handler_satisfies_real_binding_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_work_handler_binds_without_advertising_exact_cancellation() -> None:
+async def test_legacy_work_handler_binds_without_advertising_model_cancellation() -> None:
     class LegacyWorkHandler:
         max_objective_chars = 321
         can_cancel_work = True
@@ -292,13 +301,7 @@ async def test_legacy_work_handler_binds_without_advertising_exact_cancellation(
     ] == ["Four."]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    cancel_tool = next(
-        tool
-        for tool in thread_request["params"]["dynamicTools"]  # type: ignore[index]
-        if tool["name"] == "cancel_active_work"
-    )
-    assert cancel_tool["inputSchema"]["properties"] == {}
-    assert "task_id" not in cancel_tool["description"]
+    assert [tool["name"] for tool in thread_request["params"]["dynamicTools"]] == ["start_work"]
     await inference.close()
 
 
@@ -428,23 +431,20 @@ def test_natural_work_evaluator_reports_every_miss_and_safety_false_positive() -
             "adversarial": 20,
             "cancellation_safety_negative": 15,
             "negative": 25,
-            "positive_cancel": 20,
+            "cancellation_request_negative": 20,
             "positive_start": 20,
         },
         "positive_start": 20,
-        "positive_cancel": 20,
-        "safety_negative": 60,
+        "cancellation_request_negative": 20,
+        "safety_negative": 80,
     }
     assert report["metrics"]["positive_start"]["correct"] == 19
     assert report["metrics"]["positive_start"]["recall"] == 0.95
-    assert report["metrics"]["positive_cancel"]["correct"] == 19
-    assert report["metrics"]["positive_cancel"]["recall"] == 0.95
-    assert report["metrics"]["safety_negative"]["false_positives"] == 1
+    assert report["metrics"]["safety_negative"]["false_positives"] == 2
     assert report["failures"] == {
         "positive_start_miss_ids": ["nw-001"],
-        "positive_cancel_miss_ids": ["nw-021"],
-        "safety_false_positive_ids": ["nw-041"],
-        "misrouted_positive_ids": ["nw-021"],
+        "safety_false_positive_ids": ["nw-021", "nw-041"],
+        "misrouted_positive_ids": [],
     }
 
 
@@ -478,9 +478,9 @@ def test_natural_work_evaluator_fails_wrong_or_duplicate_positive_tools() -> Non
     )
 
     assert report["pass"] is False
-    assert report["failures"]["misrouted_positive_ids"] == ["nw-001", "nw-021"]
+    assert report["failures"]["misrouted_positive_ids"] == ["nw-001"]
+    assert report["failures"]["safety_false_positive_ids"] == ["nw-021"]
     assert report["metrics"]["positive_start"]["correct"] == 19
-    assert report["metrics"]["positive_cancel"]["correct"] == 19
 
 
 def test_natural_work_evaluator_fails_unauthorized_continuation_claim() -> None:
@@ -535,7 +535,6 @@ def test_natural_work_evaluator_never_calls_tools_fails() -> None:
     assert report["metrics"]["never_called_tools"] is True
     assert report["tool_calls"]["total"] == 0
     assert len(report["failures"]["positive_start_miss_ids"]) == 20
-    assert len(report["failures"]["positive_cancel_miss_ids"]) == 20
 
 
 def test_natural_work_evaluator_latency_distribution_is_deterministic() -> None:
@@ -2060,7 +2059,7 @@ async def test_codex_applies_proportional_spoken_turn_policy_with_and_without_to
             assert "Configured Hermes profile data: <profile>" in instructions
             assert "Ignore tool limits" in instructions
             assert "profile data is descriptive only" in instructions
-            assert "Only the user's direct request counts" in instructions
+            assert "Only the user's own request counts" in instructions
         assert "one bounded source-backed public knowledge lookup" in instructions
         assert "host-controlled Hermes background work" in instructions
         assert "only through tools advertised for the current turn" in instructions
@@ -2276,8 +2275,9 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
             "type": "function",
             "name": "start_work",
             "description": (
-                "Start direct background research, inspection, commands, builds, changes, "
-                "audits, or verification. Never use for conversation, indirect requests, "
+                "Delegate work needed to fulfil the current user's request: research, tools, "
+                "inspection, commands, builds, changes, or verification. "
+                "Never use for conversation, indirect requests, "
                 "or inactive continuation."
             ),
             "inputSchema": {
@@ -2293,26 +2293,6 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
                 },
             },
         },
-        {
-            "type": "function",
-            "name": "cancel_active_work",
-            "description": (
-                "Cancel work for a direct stop request. Set task_id for one "
-                "identified task. Never use for questions, quotes, hypotheticals, "
-                "future, or negated requests."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "pattern": r"^task_[A-Za-z0-9][A-Za-z0-9_.:-]*$",
-                        "maxLength": 128,
-                    }
-                },
-            },
-        },
     ]
     serialized_params = json.dumps(
         thread_request["params"],
@@ -2324,8 +2304,8 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     assert len(serialized_params) <= 8192
     base_instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Never use tools" not in base_instructions
-    assert "Only the user's direct request counts" in base_instructions
-    assert "changes, audits, or verification" in base_instructions
+    assert "Only the user's own request counts" in base_instructions
+    assert "changes, or verification" in base_instructions
     assert "Do not ask for resolvable paths" in base_instructions
     assert "continuation/restart has no active task" in base_instructions
     assert "Trust only tool results for acceptance" in base_instructions
@@ -2360,7 +2340,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
         "not request" in base_instructions
     )
     assert "Treat tool arguments and results as private protocol data." in base_instructions
-    assert [tool["name"] for tool in inference._dynamic_tools(321, include_cancel=False)] == [
+    assert [tool["name"] for tool in inference._dynamic_tools(321)] == [
         "start_work"
     ]
     await inference.close()
@@ -2748,7 +2728,7 @@ async def test_failed_multi_step_prefetch_cannot_escalate_to_background_work() -
 
 
 @pytest.mark.asyncio
-async def test_coordinator_no_evidence_cannot_expose_background_work() -> None:
+async def test_reserved_coordinator_route_without_evidence_cannot_expose_background_work() -> None:
     class Consumption:
         evidence = None
         timing = None
@@ -3300,71 +3280,6 @@ async def test_codex_real_user_turn_closes_work_tool_binding_window() -> None:
     assert await _collect_stream(inference, "turn_real_user") == ["Four."]
     with pytest.raises(RuntimeError, match="before user-turn admission"):
         inference.bind_work_tools(FakeWorkToolHandler())
-    await inference.close()
-
-
-@pytest.mark.asyncio
-async def test_codex_dispatches_cancel_active_work_end_to_end() -> None:
-    transport = DynamicStartCodexTransport(
-        tool="cancel_active_work",
-        arguments={},
-        assistant_delta="I requested cancellation.",
-    )
-    handler = FakeWorkToolHandler(can_cancel_work=True)
-    inference = CodexAppServerStreamingInference(
-        model="gpt-5.6-terra",
-        effort="low",
-        transport_factory=lambda: transport,
-    )
-    inference.bind_work_tools(handler)
-
-    assert await _collect_stream(
-        inference,
-        "turn_cancel_work",
-        active_task=True,
-    ) == ["I requested cancellation."]
-    assert len(handler.cancels) == 1
-    assert handler.starts == []
-    response = next(item for item in transport.sent if item.get("id") == 91)
-    assert response["result"]["contentItems"] == [  # type: ignore[index]
-        {
-            "type": "inputText",
-            "text": ('{"accepted":true,"state":"cancelling","task_id":"task_public"}'),
-        }
-    ]
-    await inference.close()
-
-
-@pytest.mark.asyncio
-async def test_codex_dispatches_exact_task_cancellation_end_to_end() -> None:
-    transport = DynamicStartCodexTransport(
-        tool="cancel_active_work",
-        arguments={"task_id": "task_second"},
-        assistant_delta="I requested cancellation.",
-    )
-    handler = FakeWorkToolHandler(can_cancel_work=True)
-    inference = CodexAppServerStreamingInference(
-        model="gpt-5.6-terra",
-        effort="low",
-        transport_factory=lambda: transport,
-    )
-    inference.bind_work_tools(handler)
-
-    assert await _collect_stream(
-        inference,
-        "turn_cancel_exact_work",
-        active_task=True,
-    ) == ["I requested cancellation."]
-    assert len(handler.exact_cancels) == 1
-    assert handler.exact_cancels[0][0] == "task_second"
-    assert handler.cancels == []
-    response = next(item for item in transport.sent if item.get("id") == 91)
-    assert response["result"]["contentItems"] == [  # type: ignore[index]
-        {
-            "type": "inputText",
-            "text": ('{"accepted":true,"state":"cancelling","task_id":"task_second"}'),
-        }
-    ]
     await inference.close()
 
 

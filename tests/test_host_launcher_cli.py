@@ -55,7 +55,41 @@ from hermes_realtime.providers.codex_app_server import (
     CodexModelOption,
     CodexTokenUsage,
 )
+from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.speech import AudioFrame, SpeechChunk
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_natural_work_binds_exact_ollama_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    bound: list[object] = []
+    monkeypatch.setattr(
+        OllamaStreamingInference, "bind_work_tools",
+        lambda self, surface: bound.append(surface), raising=False,
+    )
+    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test")
+    surface = _work_surface()
+    _bind_natural_work_tools(inference=inference, surface=surface, enabled=enabled)
+    assert bound == ([surface] if enabled else [])
+
+
+def test_natural_work_rejects_ollama_subclass(monkeypatch: pytest.MonkeyPatch) -> None:
+    bound: list[object] = []
+    monkeypatch.setattr(
+        OllamaStreamingInference, "bind_work_tools",
+        lambda self, surface: bound.append(surface), raising=False,
+    )
+
+    class Subclass(OllamaStreamingInference):
+        pass
+
+    with pytest.raises(TypeError):
+        _bind_natural_work_tools(
+            inference=Subclass(base_url="http://127.0.0.1:11434", model="test"),
+            surface=_work_surface(), enabled=True,
+        )
+    assert bound == []
 
 
 def test_host_launcher_imports_first_from_candidate_source_root() -> None:
