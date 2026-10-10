@@ -1329,8 +1329,8 @@ def _bind_natural_work_tools(
         raise TypeError("natural_work_tools must be an exact boolean")
     if not enabled:
         return
-    if type(inference) is not CodexAppServerStreamingInference:
-        raise TypeError("natural work tools require exact Codex app-server inference")
+    if type(inference) not in (CodexAppServerStreamingInference, OllamaStreamingInference):
+        raise TypeError("natural work tools require exact Codex or Ollama inference")
     if type(surface) is not ConversationWorkControlSurface:
         raise TypeError("natural work tools require an exact work-control surface")
     inference.bind_work_tools(surface)
@@ -1372,7 +1372,7 @@ async def _run_full_host_preflight(
     surface: ConversationWorkControlSurface,
     natural_work_tools: bool,
 ) -> SpeechChunk:
-    """Warm tool-less dependencies, then grant the exact Codex instance work authority."""
+    """Warm tool-less dependencies, then bind the exact provider's work surface."""
 
     await task_session.start()
     if type(task_session) is HermesApiTaskSession:
@@ -1963,8 +1963,6 @@ def build_local_host_launcher(
         )
     if type(natural_work_tools) is not bool:
         raise TypeError("natural_work_tools must be an exact boolean")
-    if natural_work_tools and inference_provider != "codex":
-        raise ValueError("--natural-work-tools requires --inference-provider codex")
     if type(public_search) is not bool:
         raise TypeError("public_search must be an exact boolean")
     if public_search and inference_provider != "codex":
@@ -3434,7 +3432,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--natural-work-tools",
         action="store_true",
         dest="natural_work_tools",
-        help="enable experimental natural Hermes work routing for Codex app-server",
+        help="enable automatic Hermes task starts; cancellation stays an explicit user action",
     )
     natural_work_group.add_argument(
         "--no-natural-work-tools",
