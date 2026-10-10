@@ -2892,6 +2892,7 @@ def _observe_prompts() -> None:
             "model": model,
             "messages": messages,
             "options": {"num_ctx": DEFAULT_OLLAMA_NUM_CTX},
+            "shift": False,
             "stream": False,
         }
         request = urllib.request.Request(

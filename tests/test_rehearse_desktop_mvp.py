@@ -356,13 +356,13 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
         return Response()
 
     adapter = OllamaStreamingInference(
-        base_url="http://127.0.0.1:11434", model="m", open_request=open_request
+        base_url="http://127.0.0.1:11434", model="stand-in", open_request=open_request
     )
 
     from hermes_realtime.conversation import ActiveTaskSummary
 
     def snapshot(last: str) -> ConversationContextSnapshot:
-        # Active work renders as a system message after the question, as in the rehearsal.
+        # Active work renders in the leading policy/reference message.
         return ConversationContextSnapshot(
             revision=1,
             messages=(
@@ -386,14 +386,7 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
 
     assert len(bodies) == 2
     assert bodies[1]["messages"][-1]["role"] == "user"  # type: ignore[index]
-    assert resent == [
-        {
-            "messages": bodies[1]["messages"],
-            "model": "stand-in",
-            "options": {"num_ctx": 16_384},
-            "stream": False,
-        }
-    ] * 3
+    assert resent == [{**bodies[1], "stream": False}] * 3
     recalls = [
         json.loads(line.removeprefix("[rehearsal-recall] "))
         for line in capsys.readouterr().out.splitlines()
