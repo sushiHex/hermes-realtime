@@ -99,6 +99,18 @@ and a suffix; it can cut policy or reference text inside the rendered prompt. Th
 overflow limit also applied to the previous separate system messages. Request assembly
 does not establish which complete sections the model evaluated.
 
+**Explicit overflow refusal.** The adapter now sends top-level `shift: false`, retaining
+`num_ctx` and normal conversational-row trimming. At the pinned 0.34.4 GGUF source, the
+[`Shift` request field](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/api/types.go#L160-L166)
+sets the runner's context-shift configuration, and the residual token-overflow path above
+returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
+propagates an opening refusal without a reply or automatic retry. This is source-based
+qualification; the changed option has not yet been qualified against the running backend.
+Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
+can also end generation at the context limit; it does not reserve reply tokens or prove
+model obedience. A change to this flag can
+[`reload an already loaded runner`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/sched.go#L1422-L1427).
+
 **The derivation.** These are the steady-state prompt parts, in characters. The Ollama
 adapter now prepends one shared communication-policy message with labelled reference JSON,
 followed by the unchanged ordered conversational rows. Reference text adds no work authority.

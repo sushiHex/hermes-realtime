@@ -5,6 +5,7 @@ import json
 import threading
 from collections import deque
 from typing import cast
+from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request
 
 import pytest
@@ -254,6 +255,8 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
     ]
 
     assert [body["options"] for body in bodies] == [{"num_ctx": 16_384}, {"num_ctx": 32_768}]
+    assert all(body.get("shift") is False for body in bodies)
+    assert all("truncate" not in body for body in bodies)
     sent = cast(list[dict[str, str]], bodies[0]["messages"])
     content = "".join(message["content"] for message in sent)
     reports = [
@@ -272,6 +275,53 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
     }
     assert reports[1]["num_ctx"] == 32_768
     assert len(reports) == 2
+
+
+@pytest.mark.asyncio
+async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requests: list[Request] = []
+    refusal = HTTPError(
+        "http://127.0.0.1:11434/api/chat", 400,
+        "the prompt is longer than the context window", {}, None,
+    )
+    response = LineResponse((
+        {"message": {"content": "Next turn reply."}, "done": True},
+    ))
+
+    def open_request(request: Request, timeout: float) -> LineResponse:
+        del timeout
+        requests.append(request)
+        if len(requests) == 1:
+            raise refusal
+        return response
+
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
+        max_active_streams=1,
+    )
+    emitted: list[str] = []
+    with pytest.raises(HTTPError) as caught:
+        async for segment in inference.stream(_snapshot(), turn_id="turn_refused"):
+            emitted.append(segment)
+    assert caught.value is refusal
+    assert emitted == []
+    assert len(requests) == 1
+    assert capsys.readouterr().out == ""
+
+    # Let the failed iterator's scheduled cleanup take its next loop turn.
+    await asyncio.sleep(0)
+    assert inference._openings == {}
+    assert inference._opening_cleanups == {}
+    assert inference._responses == {}
+    assert inference._cancelled_turns == set()
+    assert [part async for part in inference.stream(_snapshot(), turn_id="turn_next")] == [
+        "Next turn reply."
+    ]
+    assert len(requests) == 2
+    assert response.closed
+    await inference.close()
 
 
 @pytest.mark.parametrize(

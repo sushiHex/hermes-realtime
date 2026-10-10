@@ -150,6 +150,7 @@ class OllamaStreamingInference:
                     "model": self._model,
                     "messages": messages,
                     "options": {"num_ctx": self._num_ctx},
+                    "shift": False,
                     "stream": True,
                 },
                 ensure_ascii=False,
@@ -502,8 +503,8 @@ class OllamaStreamingInference:
         """One content-free line: the prompt this adapter sent beside what Ollama evaluated.
 
         ``num_ctx`` is what was requested; the server may cap it at the model's trained
-        context. An evaluated count near the context it ran with means Ollama dropped the
-        oldest messages.
+        context. An evaluated count near that context may indicate conversational-row
+        trimming; it does not prove retention of any particular row or reference section.
         """
 
         content = "".join(message["content"] for message in messages)
