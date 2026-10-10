@@ -18,6 +18,7 @@ from hermes_realtime.conversation.output_style import communication_policy, requ
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
+from hermes_realtime.providers._work_claims import has_background_work_claim
 
 _MAX_MODEL_CHARS = 256
 _MAX_SEGMENT_CHARS = 4096
@@ -361,6 +362,8 @@ class OllamaStreamingInference:
                         self._work_unavailable("cancelled_after_admission", attempts=1)
                     if self._responses.get(turn_id) is not response:
                         self._work_unavailable("ownership_after_admission", attempts=1)
+            elif handler is not None and has_background_work_claim(buffer):
+                self._refuse_work("unverified_claim")
             segments, buffer = self._extract_segments(buffer, final=True)
             for segment in segments:
                 yield segment

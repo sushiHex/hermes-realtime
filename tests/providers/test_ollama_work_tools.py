@@ -125,6 +125,42 @@ async def test_normal_prose_retains_segmentation_without_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", [
+    ["I've started that background task."],
+    ["An ordinary sentence. I've sta", "rted that background task."],
+    ["I\u2019ve started that background task."],
+], ids=["single_chunk", "split_claim", "curly_apostrophe"])
+async def test_no_call_background_claim_refuses_before_any_speech(chunks, capsys) -> None:
+    inference, handler, _, response = adapter([
+        {"message": {"content": content}, "done": index == len(chunks) - 1}
+        for index, content in enumerate(chunks)
+    ])
+    spoken = []
+    with pytest.raises(ValueError, match="unverified_claim"):
+        async for segment in inference.stream(request(), turn_id="turn_test"):
+            spoken.append(segment)
+    assert spoken == []
+    assert handler.calls == []
+    assert response.closed
+    evidence = [json.loads(line.removeprefix("[ollama-work] "))
+                for line in capsys.readouterr().out.splitlines()
+                if line.startswith("[ollama-work] ")]
+    assert evidence == [{"category": "unverified_claim", "kind": "start", "attempts": 0}]
+
+
+@pytest.mark.asyncio
+async def test_unbound_conversation_retains_existing_prose_behavior() -> None:
+    response = Response([
+        {"message": {"content": "I've started that background task"}, "done": True}
+    ])
+    inference = ollama.OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="test",
+        open_request=lambda request, timeout: response,
+    )
+    assert await collect(inference) == ["I've started that background task"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot", [
     ConversationContextSnapshot(revision=1, messages=request().messages, active_tasks=()),
     ConversationInferenceRequest(revision=1, messages=(), active_tasks=()),

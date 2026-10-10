@@ -29,6 +29,7 @@ from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
+from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.current_facts import (
     CurrentFactEvidence,
     CurrentFactLookup,
@@ -168,13 +169,6 @@ _OVERSIZED_TOOL_RESULT = {
     "reason": "work control returned an oversized result",
 }
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
-_UNVERIFIED_BACKGROUND_WORK_CLAIM = re.compile(
-    r"\b(?:i(?:'|’)ll|i\s+will|let\s+me)\s+"
-    r"(?:look\s+into|investigate|research|inspect|analy[sz]e)\b|"
-    r"\bi(?:'|’)ve\s+(?:started|launched)\b|"
-    r"\bi\s+(?:started|launched)\s+(?:a|the)\s+(?:background\s+)?(?:task|work|analysis)\b",
-    re.IGNORECASE,
-)
 _KNOWLEDGE_LOOKUP_CLAIM = re.compile(
     r"\b(?:lookup|search)(?:\s+results?)?\s+"
     r"(?:timed\s+out|failed|did\s+not|didn't)\b|"
@@ -1395,7 +1389,7 @@ class CodexAppServerStreamingInference:
     ) -> None:
         if (
             self._work_tool_handler is None
-            or _UNVERIFIED_BACKGROUND_WORK_CLAIM.search(segment) is None
+            or not has_background_work_claim(segment)
         ):
             return
         routing = self._turn_routing.get((thread_id, turn_id))
