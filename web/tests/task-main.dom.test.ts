@@ -183,9 +183,12 @@ describe("mounted task controls", () => {
   it.each(["success", "failure"])("does not disconnect a replacement binding on late old input %s", async (outcome) => {
     let release!: (response: Response) => void;
     let reject!: (error: Error) => void;
-    const { requests, task, cancel, toggle } = await mount(() => new Promise((resolve, refuse) => {
-      release = resolve; reject = refuse;
-    }));
+    let first = true;
+    const { requests, task, cancel, toggle, submit } = await mount(() => {
+      if (!first) return Promise.resolve(Response.json({ version: 1 }));
+      first = false;
+      return new Promise((resolve, refuse) => { release = resolve; reject = refuse; });
+    });
     await task("task_fixture", "active");
     cancel().click();
     await vi.waitFor(() => expect(requests).toHaveLength(1));
@@ -193,12 +196,39 @@ describe("mounted task controls", () => {
     await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
     toggle.click();
     await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
+    expect(JSON.parse(rebind[1]!.body as string)).toMatchObject({ freshView: true });
     if (outcome === "success") release(Response.json({ version: 1 }));
     else reject(new Error("synthetic old acknowledgment failure"));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(toggle.textContent).toBe("Disconnect");
-    expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("Input acknowledgment was lost.");
+    expect(dom.window.document.querySelectorAll('[data-operation="input-control"]')).toHaveLength(1);
     expect(dom.window.document.querySelector("#markers")!.textContent).not.toContain("typed_input_admitted");
+    submit("Synthetic input after unknown admission and reconnect");
+    await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 1]));
+    expect(toggle.textContent).toBe("Disconnect");
+  });
+
+  it("retains remote stop retry authority after late uncertain input failure", async () => {
+    let reject!: (error: Error) => void;
+    const { requests, submit, toggle } = await mount(() => new Promise((_resolve, refuse) => { reject = refuse; }));
+    const dispatch = vi.mocked(fetch).getMockImplementation()!;
+    let stops = 0;
+    vi.mocked(fetch).mockImplementation(async (path, options) => {
+      if (path === "/api/v1/stop") return Response.json({ version: 1 }, { status: ++stops === 1 ? 503 : 200 });
+      return dispatch(path, options);
+    });
+    submit("Synthetic input before stop");
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("session_stop_failed"));
+    reject(new Error("synthetic late lost acknowledgment"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toggle.textContent).toBe("Disconnect");
+    toggle.click();
+    await vi.waitFor(() => expect(stops).toBe(2));
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    expect(dom.window.document.querySelectorAll('[data-operation="input-control"]')).toHaveLength(0);
   });
 
   it("requires a fresh launch after uncertain input in a one-shot session", async () => {

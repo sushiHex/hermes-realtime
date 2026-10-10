@@ -3185,7 +3185,10 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
+  const uncertainInputCredential = typedSubmissionAbort !== null && !remoteStopRequired
+    ? credential : null;
   invalidateTypedSubmissions();
+  if (uncertainInputCredential !== null) retireUncertainInputCredential();
   eventPolling?.abort();
   eventPolling = null;
   microphoneVerificationGeneration += 1;
@@ -3382,19 +3385,7 @@ async function submitTyped(text: string): Promise<void> {
         // a replacement binding, so a late old response cannot retire it.
         if (credential?.participantIdentity === activeCredential.participantIdentity) {
           refusal = "acknowledgment-uncertain";
-          const cleanup = disconnectLocal();
-          clearCredentialRefresh();
-          setCredential(null);
-          renderSessionToggle();
-          const notice = document.createElement("li");
-          notice.dataset.role = "operation";
-          notice.dataset.operation = "input-control";
-          notice.setAttribute("role", "status");
-          notice.textContent = stableLaunch
-            ? "Input acknowledgment was lost. Reconnect before sending more input. The previous command may have been admitted."
-            : "Input acknowledgment was lost. Open a fresh launch before sending more input. The previous command may have been admitted.";
-          admitOperationCard(notice);
-          await cleanup;
+          await disconnectLocal();
         }
         throw error;
       } finally {
@@ -3416,6 +3407,20 @@ async function submitTyped(text: string): Promise<void> {
 function invalidateTypedSubmissions(): void {
   typedSubmissionGeneration = Object.freeze({});
   typedSubmissionAbort?.abort();
+}
+
+function retireUncertainInputCredential(): void {
+  clearCredentialRefresh();
+  setCredential(null);
+  renderSessionToggle();
+  const notice = document.createElement("li");
+  notice.dataset.role = "operation";
+  notice.dataset.operation = "input-control";
+  notice.setAttribute("role", "status");
+  notice.textContent = stableLaunch
+    ? "Input acknowledgment was lost. Reconnect before sending more input. The previous command may have been admitted."
+    : "Input acknowledgment was lost. Open a fresh launch before sending more input. The previous command may have been admitted.";
+  admitOperationCard(notice);
 }
 
 async function requestVoiceDeleteWire(
