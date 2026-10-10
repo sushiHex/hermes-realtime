@@ -1127,6 +1127,7 @@ class CodexAppServerStreamingInference:
                     "You are a concise realtime conversational assistant. Never use tools. "
                     + representative_policy
                     + communication_policy(style)
+                    + "\n\n"
                     + knowledge_policy
                     + _TRANSCRIPT_INTERPRETATION_POLICY
                     + "Respond only to the supplied conversation snapshot."
@@ -1194,6 +1195,7 @@ class CodexAppServerStreamingInference:
                     "Be a curious informal voice assistant. Match energy; mark hunches. "
                     + representative_policy
                     + communication_policy(style)
+                    + "\n\n"
                     + _NATIVE_AGENT_TOOL_POLICY
                     + knowledge_policy
                     + tool_policy

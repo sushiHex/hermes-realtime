@@ -24,6 +24,7 @@ from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import (
     OUTPUT_STYLES,
     OutputStyleSelection,
+    communication_policy,
 )
 from hermes_realtime.conversation.streaming import (
     ConversationInferenceRequest,
@@ -69,6 +70,31 @@ async def test_codex_output_style_is_captured_before_waiting_for_turn(style) -> 
     next_request = [row for row in transport.sent if row.get("method") == "thread/start"][-1]
     assert f"Output style: {selection.get()}.\n" in next_request["params"]["baseInstructions"]
     await inference.close()
+
+
+@pytest.mark.parametrize("style", OUTPUT_STYLES)
+@pytest.mark.parametrize("with_tools", (False, True))
+@pytest.mark.asyncio
+async def test_codex_style_policy_has_explicit_separator_before_next_policy(
+    style, with_tools,
+) -> None:
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        output_style=lambda: style,
+    )
+    if with_tools:
+        inference.bind_work_tools(FakeWorkToolHandler())
+    try:
+        await _collect_stream(inference, "turn_style_separator")
+    finally:
+        await inference.close()
+    request = next(row for row in transport.sent if row.get("method") == "thread/start")
+    instructions = request["params"]["baseInstructions"]
+    policy = communication_policy(style)
+    _, assembled_policy, following = instructions.partition(policy)
+    assert assembled_policy == policy
+    assert following[:2] == "\n\n"
 
 _EVALUATOR_PATH = Path(__file__).parents[2] / "scripts" / "evaluate_natural_work_routing.py"
 

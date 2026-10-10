@@ -82,10 +82,22 @@ server's default applies, and that depends on the machine.
 
 - **The default context loaded at 32,768.**
 - **A 10,052-token prompt was silently truncated.** With `num_ctx` 4,096 or 8,192, Ollama
-  evaluated 4,026 or 8,034 tokens. It dropped the oldest messages and returned no error, and
+  evaluated 4,026 or 8,034 tokens. It dropped older conversational rows and returned no error, and
   the early fact went unanswered.
 - **Smaller GPUs get a smaller default.** Ollama picks the default by available VRAM, so the
   same prompt can be truncated on a smaller GPU.
+
+**What Ollama preserves.** At the measured version's immutable source commit,
+[`chatPrompt`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/prompt.go#L20-L86)
+keeps all system messages and the latest message while trimming older conversational rows.
+The leading policy/reference message therefore survives that message-level trimming.
+If the system messages plus the latest message still exceed the effective context, they
+reach a separate
+[token-level truncation path](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/llm/llama_server.go#L282-L321).
+With context shifting enabled, that path preserves only the configured prefix token count
+and a suffix; it can cut policy or reference text inside the rendered prompt. This extreme
+overflow limit also applied to the previous separate system messages. Request assembly
+does not establish which complete sections the model evaluated.
 
 **The derivation.** These are the steady-state prompt parts, in characters. The Ollama
 adapter now prepends one shared communication-policy message with labelled reference JSON,
@@ -100,10 +112,10 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
 | Foreground communication/style policy and work-state framing | about 2,200 |
 | **Total** | **about 33,750** |
 
-- **Tokens.** At a conservative 3 characters per token, that is about 11,250 tokens. The chat
+- **Tokens.** At an estimated 3 characters per token, that is about 11,250 tokens. The chat
   template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
   sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
@@ -117,10 +129,12 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
 - **It is a request, not a guarantee.** The server may cap it, for example at a model's
   trained context length, and the marker shows only what was requested. So the evidence is
   `prompt_eval_count`: a count near the context the model actually ran with means the prompt
-  was truncated. This removes the hardware-dependent default; it can't stretch a model's
+  may have been truncated. The count does not prove retention of any particular row or
+  reference section. This removes the hardware-dependent default; it can't stretch a model's
   context.
 - **The value overrides the model's own.** An explicit `num_ctx` also overrides a Modelfile's
-  value, such as a `-32k` model variant's. The window was derived to fit 16,384.
+  value, such as a `-32k` model variant's. The window estimate targets 16,384; it is not an
+  exact token bound or a guarantee for every supported model and input.
 
 ## Codex
 
