@@ -541,6 +541,11 @@ class ConversationWorkControlSurface:
             admission.operation.add_done_callback(
                 lambda operation: self._report_deferred_failure(operation, kind=kind)
             )
+        if admission.operation.done() and (
+            admission.operation.cancelled() or admission.operation.exception() is not None
+        ):
+            self._mark_uncertain_locked()
+            return WorkCommandAdmission.UNAVAILABLE
         return (
             WorkCommandAdmission.ADMITTED
             if admission.command_admitted
@@ -550,9 +555,6 @@ class ConversationWorkControlSurface:
     def _report_deferred_failure(self, operation: asyncio.Task[Any], *, kind: str) -> None:
         if not operation.cancelled() and operation.exception() is None:
             return
-        # A done callback has no await: this health update and the synchronous
-        # projection cannot interleave with admission or create another owner.
-        self._mark_uncertain_locked()
         category = "acknowledgment-uncertain"
         try:
             self._reserve()
@@ -827,12 +829,28 @@ class ConversationWorkControlSurface:
         name: str,
     ) -> asyncio.Task[_ResultT]:
         operation = asyncio.create_task(
-            coroutine,
+            self._run_owned_operation(coroutine),
             name=name,
         )
         self._owned_operations.add(operation)
         operation.add_done_callback(self._consume_operation)
         return operation
+
+    async def _run_owned_operation(
+        self, coroutine: Coroutine[Any, Any, _ResultT]
+    ) -> _ResultT:
+        try:
+            return await coroutine
+        except BaseException:
+            operation = asyncio.current_task()
+            if any(
+                binding.operation is operation and binding.deferred_observed
+                for binding in self._bindings.values()
+            ):
+                # No await separates failure from this health transition. The
+                # owned task cannot become terminal with command admission open.
+                self._mark_uncertain_locked()
+            raise
 
     def _consume_operation(self, operation: asyncio.Task[Any]) -> None:
         self._owned_operations.discard(operation)
