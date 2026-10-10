@@ -438,6 +438,8 @@ command may already have been admitted. It never retries that command automatica
 **Connect** on a stable launch to restore a fresh authoritative view and input counters;
 a one-use launch requires a fresh launch from the host. Cancellation feedback keeps the
 last authoritative task state until a real task update arrives.
+Stable recovery retains its bounded public identity and request record in memory even
+when browser storage is unavailable. An unresolved input can retire only its own binding.
 An ordinary media reconnect keeps the admitted typed-input and approval counters;
 only a fresh view or a new session starts those counters again.
 

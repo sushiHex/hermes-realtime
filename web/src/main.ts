@@ -47,6 +47,7 @@ import {
   reloadOrBootstrap,
   reloadRebindIsSettled,
   rememberSession,
+  rememberedSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -325,6 +326,22 @@ const responseLatency = new ResponseLatencyStatistics();
 let capability: string | null = null;
 let stableLaunch = false;
 let credential: BootstrapCredential | null = null;
+// One bounded public identity/request record owns recovery in this page.
+// Browser persistence is optional; the existing parser validates its initial value.
+const initiallyRememberedSession = rememberedSession(tabStorage());
+let sessionRecord = initiallyRememberedSession === null
+  ? null : JSON.stringify(initiallyRememberedSession);
+const sessionRecoveryStorage = {
+  getItem: () => sessionRecord,
+  setItem: (key: string, value: string): void => {
+    sessionRecord = value;
+    tabStorage()?.setItem(key, value);
+  },
+  removeItem: (key: string): void => {
+    sessionRecord = null;
+    tabStorage()?.removeItem(key);
+  },
+};
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
@@ -360,7 +377,10 @@ const typedSubmissionQueue = new SerializedAsyncQueue();
 const maxTypedSubmissions = 8;
 let typedSubmissionCount = 0;
 let typedSubmissionGeneration: object = Object.freeze({});
-let typedSubmissionAbort: AbortController | null = null;
+let activeTypedSubmission: {
+  readonly abort: AbortController;
+  readonly participantIdentity: string;
+} | null = null;
 const microphoneEnumerationAuthority = new GenerationAuthority();
 const lifecycleAuthority = new GenerationAuthority();
 const eventPollFailurePolicy = new ForegroundPollFailurePolicy(5);
@@ -2169,7 +2189,7 @@ function setCredential(value: BootstrapCredential | null): void {
   credential = value;
   for (const view of taskCardViews.values()) view.cancellation.refresh();
   if (stableLaunch && value !== null) {
-    rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });
+    rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });
   }
 }
 
@@ -2180,7 +2200,7 @@ async function bootstrapOrReload(
   if (!stableLaunch) return bootstrap(signal);
   let reloaded = false;
   const result = await reloadOrBootstrap({
-    storage: tabStorage(),
+    storage: sessionRecoveryStorage,
     newRequestId: () => `rebind_${crypto.randomUUID()}`,
     rebind: async (path, body) => {
       onStage("rebind");
@@ -2903,7 +2923,7 @@ async function connect(projectionResync = false): Promise<void> {
     clearCredentialRefresh();
     setCredential(null);
     pendingRebindRequestId = null;
-    if (stableLaunch) rememberSession(tabStorage(), null);
+    if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
     return true;
   };
   try {
@@ -3185,7 +3205,8 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
-  const uncertainInputCredential = typedSubmissionAbort !== null && !remoteStopRequired
+  const uncertainInputCredential = activeTypedSubmission !== null && !remoteStopRequired &&
+    activeTypedSubmission.participantIdentity === credential?.participantIdentity
     ? credential : null;
   invalidateTypedSubmissions();
   if (uncertainInputCredential !== null) retireUncertainInputCredential();
@@ -3298,7 +3319,7 @@ async function stop(): Promise<void> {
   microphoneSignalMonitor.stop();
   setCredential(null);
   // The remote stop succeeded: the session is gone, so the tab forgets it.
-  if (stableLaunch) rememberSession(tabStorage(), null);
+  if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;
@@ -3356,7 +3377,7 @@ async function submitTyped(text: string): Promise<void> {
       requireCurrent();
       const sequence = inputSequence + 1;
       const abort = new AbortController();
-      typedSubmissionAbort = abort;
+      activeTypedSubmission = { abort, participantIdentity: activeCredential.participantIdentity };
       const timeout = window.setTimeout(() => abort.abort(), stopRequestTimeoutMs);
       try {
         const response = await fetch("/api/v1/input", {
@@ -3390,7 +3411,7 @@ async function submitTyped(text: string): Promise<void> {
         throw error;
       } finally {
         window.clearTimeout(timeout);
-        typedSubmissionAbort = null;
+        activeTypedSubmission = null;
       }
     });
   } catch (error) {
@@ -3406,7 +3427,7 @@ async function submitTyped(text: string): Promise<void> {
 
 function invalidateTypedSubmissions(): void {
   typedSubmissionGeneration = Object.freeze({});
-  typedSubmissionAbort?.abort();
+  activeTypedSubmission?.abort.abort();
 }
 
 function retireUncertainInputCredential(): void {

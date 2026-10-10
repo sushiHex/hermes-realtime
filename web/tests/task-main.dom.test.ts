@@ -23,7 +23,7 @@ const credential = {
 };
 let dom: JSDOM;
 
-async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 }), oneShot = false) {
+async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 }), oneShot = false, storageFailure?: "getter" | "write") {
   vi.resetModules();
   media.rooms.length = 0;
   dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
@@ -35,6 +35,8 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   vi.stubGlobal("navigator", { mediaDevices: { enumerateDevices: async () => [] } });
   vi.spyOn(dom.window.HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   dom.window.HTMLElement.prototype.scrollIntoView = () => {};
+  if (storageFailure === "getter") vi.spyOn(dom.window, "sessionStorage", "get").mockImplementation(() => { throw new Error("synthetic storage unavailable"); });
+  if (storageFailure === "write") vi.spyOn(dom.window.Storage.prototype, "setItem").mockImplementation(() => { throw new Error("synthetic storage write unavailable"); });
   vi.spyOn(console, "info").mockImplementation(() => {});
   let refreshCredential: (() => void) | null = null;
   const setTimeout = dom.window.setTimeout.bind(dom.window);
@@ -46,14 +48,25 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   let sequence = 0;
   const requests: Array<{ sequence: number; text: string }> = [];
   const approvals: Array<{ sequence: number; approvalId: string; decision: string }> = [];
+  let sessionActive = false;
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
-    if (path === "/api/v1/stable-bootstrap" || path === "/api/v1/bootstrap") return Response.json(credential);
+    if (path === "/api/v1/stable-bootstrap" || path === "/api/v1/bootstrap") {
+      if (sessionActive) return new Response(null, { status: 503 });
+      sessionActive = true;
+      return Response.json(credential);
+    }
     if (path === "/api/v1/stable-rebind") {
+      if (!sessionActive) return new Response(null, { status: 409 });
       if (JSON.parse(options.body as string).freshView === true) sequence = 0;
       return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });
     }
     if (path === "/api/v1/refresh") return Response.json({ ...credential, token: "synthetic.rotated.token" });
-    if (path === "/api/v1/media" || path === "/api/v1/stop") return Response.json({ version: 1 });
+    if (path === "/api/v1/projection-resync") {
+      sequence = 0;
+      return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.resynced.token" });
+    }
+    if (path === "/api/v1/stop") { sessionActive = false; return Response.json({ version: 1 }); }
+    if (path === "/api/v1/media") return Response.json({ version: 1 });
     if (path === "/api/v1/approval") {
       approvals.push(JSON.parse(options.body as string));
       return Response.json({ version: 1 });
@@ -94,7 +107,15 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.value = text;
     dom.window.document.querySelector<HTMLFormElement>("#typed-form")!.dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
   };
-  return { requests, approvals, approval, task, card, cancel, submit, toggle, refresh: () => refreshCredential!() };
+  const poisonProjection = async () => {
+    for (let index = 0; index < 5; index += 1) {
+      await vi.waitFor(() => expect(emit).not.toBeNull(), { timeout: 2000 });
+      const dispatch = emit!;
+      emit = null;
+      dispatch([{}]);
+    }
+  };
+  return { requests, approvals, approval, task, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -104,6 +125,54 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it("forgets in-memory recovery after confirmed stop without browser storage", async () => {
+    const { toggle } = await mount(undefined, false, "getter");
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/api/v1/stable-bootstrap")).toHaveLength(2);
+    expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/api/v1/stable-rebind")).toHaveLength(0);
+  });
+
+  it.each(["getter", "write"] as const)("recovers spent input sequence with unavailable session storage %s", async (storageFailure) => {
+    let first = true;
+    const { requests, submit, toggle } = await mount(async () => {
+      if (first) { first = false; throw new Error("synthetic lost acknowledgment after sequence admission"); }
+      return Response.json({ version: 1 });
+    }, false, storageFailure);
+    submit("Synthetic server-admitted input");
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
+    expect(JSON.parse(rebind[1]!.body as string)).toMatchObject({ participantIdentity: credential.participantIdentity, freshView: true });
+    expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/api/v1/stable-bootstrap")).toHaveLength(1);
+    submit("Synthetic input after authority reset");
+    await vi.waitFor(() => expect(requests.map((request) => request.sequence)).toEqual([1, 1]));
+  });
+
+  it("preserves a confirmed one-shot projection-resync binding while old input is unresolved", async () => {
+    let release!: (response: Response) => void;
+    let first = true;
+    const { requests, submit, toggle, poisonProjection } = await mount(() => {
+      if (!first) return Promise.resolve(Response.json({ version: 1 }));
+      first = false;
+      return new Promise((resolve) => { release = resolve; });
+    }, true);
+    submit("Synthetic unresolved old input");
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    await poisonProjection();
+    await vi.waitFor(() => expect(media.rooms).toHaveLength(2), { timeout: 4000 });
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    release(Response.json({ version: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(dom.window.document.querySelectorAll('[data-operation="input-control"]')).toHaveLength(0);
+    submit("Synthetic input after resync");
+    await vi.waitFor(() => expect(requests.map((request) => request.sequence)).toEqual([1, 1]));
+  });
+
   it("preserves admitted typed sequence across ordinary browser rebind", async () => {
     const { requests, submit, toggle } = await mount();
     submit("Synthetic input before rebind");
