@@ -82,13 +82,38 @@ server's default applies, and that depends on the machine.
 
 - **The default context loaded at 32,768.**
 - **A 10,052-token prompt was silently truncated.** With `num_ctx` 4,096 or 8,192, Ollama
-  evaluated 4,026 or 8,034 tokens. It dropped the oldest messages and returned no error, and
+  evaluated 4,026 or 8,034 tokens. It dropped older conversational rows and returned no error, and
   the early fact went unanswered.
 - **Smaller GPUs get a smaller default.** Ollama picks the default by available VRAM, so the
   same prompt can be truncated on a smaller GPU.
 
+**What Ollama preserves.** At the measured version's immutable source commit,
+[`chatPrompt`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/prompt.go#L20-L86)
+keeps all system messages and the latest message while trimming older conversational rows.
+The leading policy/reference message therefore survives that message-level trimming.
+If the system messages plus the latest message still exceed the effective context, they
+reach a separate
+[token-level truncation path](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/llm/llama_server.go#L282-L321).
+With context shifting enabled, that path preserves only the configured prefix token count
+and a suffix; it can cut policy or reference text inside the rendered prompt. This extreme
+overflow limit also applied to the previous separate system messages. Request assembly
+does not establish which complete sections the model evaluated.
+
+**Explicit overflow refusal.** The adapter now sends top-level `shift: false`, retaining
+`num_ctx` and normal conversational-row trimming. At the pinned 0.34.4 GGUF source, the
+[`Shift` request field](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/api/types.go#L160-L166)
+sets the runner's context-shift configuration, and the residual token-overflow path above
+returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
+propagates an opening refusal without a reply or automatic retry. This is source-based
+qualification; the changed option has not yet been qualified against the running backend.
+Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
+can also end generation at the context limit; it does not reserve reply tokens or prove
+model obedience. A change to this flag can
+[`reload an already loaded runner`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/sched.go#L1422-L1427).
+
 **The derivation.** These are the steady-state prompt parts, in characters. The Ollama
-adapter adds no system instructions of its own.
+adapter now prepends one shared communication-policy message with labelled reference JSON,
+followed by the unchanged ordered conversational rows. Reference text adds no work authority.
 
 | Part | Characters |
 | --- | --- |
@@ -96,27 +121,32 @@ adapter adds no system instructions of its own.
 | Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
-| **Total** | **about 31,550** |
+| Foreground communication/style policy and work-state framing | about 2,200 |
+| **Total** | **about 33,750** |
 
-- **Tokens.** At a conservative 3 characters per token, that is about 10,510 tokens. The chat
-  template adds about 6 tokens for each of 35 messages (about 210), for about 10,720 in all.
+- **Tokens.** At an estimated 3 characters per token, that is about 11,250 tokens. The chat
+  template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Headroom.** `num_ctx` 16,384 leaves about 5,650 tokens for active-task and update system
-  messages and for the reply.
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+  sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
   token, which may need a larger `num_ctx`.
 - **The marker.** Every completed request prints `[ollama-prompt]` with the prompt's message
   count, characters and UTF-8 bytes, the `num_ctx` requested, and Ollama's
-  `prompt_eval_count`. It carries no text. The desktop rehearsal records the marker for each
-  context check.
+  `prompt_eval_count`, plus the captured output-style enum and actual rendered reference-section
+  kinds (`memory`, `active_work`, `updates`). It carries no text. The desktop rehearsal records
+  those kinds for each context check; one combined system message is no longer a count of notes.
+  Conversation-context equality evidence remains separate and does not bind the selected style.
 - **It is a request, not a guarantee.** The server may cap it, for example at a model's
   trained context length, and the marker shows only what was requested. So the evidence is
   `prompt_eval_count`: a count near the context the model actually ran with means the prompt
-  was truncated. This removes the hardware-dependent default; it can't stretch a model's
+  may have been truncated. The count does not prove retention of any particular row or
+  reference section. This removes the hardware-dependent default; it can't stretch a model's
   context.
 - **The value overrides the model's own.** An explicit `num_ctx` also overrides a Modelfile's
-  value, such as a `-32k` model variant's. The window was derived to fit 16,384.
+  value, such as a `-32k` model variant's. The window estimate targets 16,384; it is not an
+  exact token bound or a guarantee for every supported model and input.
 
 ## Codex
 

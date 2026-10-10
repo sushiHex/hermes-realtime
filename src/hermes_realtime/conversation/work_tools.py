@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from .context import (
     ActiveTaskIdentityError,
@@ -30,6 +31,13 @@ _DUPLICATE_OBJECTIVE_REASON = "matching work is already active"
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _StartProjectionGate = Callable[["WorkStartResult"], Awaitable[None]]
+_CommandRefusalCategory = Literal[
+    "duplicate_objective",
+    "capacity_exhausted",
+    "stale_target",
+    "no_active_task",
+    "ambiguous_active_tasks",
+]
 
 
 class WorkControlHealth(StrEnum):
@@ -38,6 +46,14 @@ class WorkControlHealth(StrEnum):
     OPEN = "open"
     UNCERTAIN = "uncertain"
     CLOSED = "closed"
+
+
+class WorkCommandAdmission(StrEnum):
+    """Command intake only; no member claims a task acknowledgment."""
+
+    ADMITTED = "admitted"
+    REFUSED = "refused"
+    UNAVAILABLE = "unavailable"
 
 
 def _validate_exact_text(value: str, field: str, *, maximum: int) -> None:
@@ -149,10 +165,12 @@ class _PendingStart:
     task_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _InvocationBinding:
     semantics: tuple[str, ...]
     operation: asyncio.Task[Any]
+    refusal_category: _CommandRefusalCategory | None = None
+    deferred_observed: bool = False
 
 
 _ResultT = TypeVar("_ResultT", WorkStartResult, WorkCancelResult)
@@ -224,6 +242,12 @@ class ConversationWorkControlSurface:
         return self._context.max_item_chars
 
     @property
+    def active_task_ids(self) -> tuple[str, ...]:
+        """Public identities frozen synchronously for an explicit current command."""
+
+        return tuple(task.task_id for task in self._context.snapshot().active_tasks)
+
+    @property
     def can_cancel_work(self) -> bool:
         return bool(self._pending_starts) or bool(self._context.snapshot().active_tasks)
 
@@ -244,6 +268,20 @@ class ConversationWorkControlSurface:
         objective: str,
         invocation_id: str,
     ) -> WorkStartResult:
+        admission = await self._admit_start_work(objective=objective, invocation_id=invocation_id)
+        if isinstance(admission, _InvocationBinding):
+            return self._copy_start(await asyncio.shield(admission.operation))
+        return self._copy_start(admission)
+
+    async def submit_start_command(
+        self, *, objective: str, invocation_id: str
+    ) -> WorkCommandAdmission:
+        admission = await self._admit_start_work(objective=objective, invocation_id=invocation_id)
+        return self._submit_command_admission(admission, kind="start")
+
+    async def _admit_start_work(
+        self, *, objective: str, invocation_id: str
+    ) -> _InvocationBinding | WorkStartResult:
         self._validate_objective(objective)
         _validate_identifier(invocation_id, "invocation_id")
         semantics = ("start", objective)
@@ -256,7 +294,7 @@ class ConversationWorkControlSurface:
                 if existing.semantics != semantics:
                     self._mark_uncertain_locked()
                     return self._unavailable_start()
-                operation = cast(asyncio.Task[WorkStartResult], existing.operation)
+                binding = existing
             else:
                 if not self._admit_binding_locked():
                     return self._unavailable_start()
@@ -269,7 +307,9 @@ class ConversationWorkControlSurface:
                     pending.objective_identity == objective_identity
                     for pending in self._pending_starts.values()
                 )
+                refusal_category: _CommandRefusalCategory | None = None
                 if matching_work:
+                    refusal_category = "duplicate_objective"
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -288,6 +328,7 @@ class ConversationWorkControlSurface:
                     )
                     >= self._context.max_active_tasks
                 ):
+                    refusal_category = "capacity_exhausted"
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -317,11 +358,13 @@ class ConversationWorkControlSurface:
                         ),
                         name=f"conversation-work-start:{invocation_id}",
                     )
-                self._bindings[invocation_id] = _InvocationBinding(
+                binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
+                    refusal_category=refusal_category,
                 )
-        return self._copy_start(await asyncio.shield(operation))
+                self._bindings[invocation_id] = binding
+        return binding
 
     async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
         _validate_identifier(invocation_id, "invocation_id")
@@ -350,6 +393,24 @@ class ConversationWorkControlSurface:
             reason=reason,
             semantic_kind="cancel_exact",
         )
+
+    async def submit_cancel_command(
+        self,
+        *,
+        task_id: str,
+        invocation_id: str,
+        reason: str = "user requested task cancellation",
+    ) -> WorkCommandAdmission:
+        _validate_task_id(task_id)
+        _validate_identifier(invocation_id, "invocation_id")
+        _validate_reason(reason)
+        admission = await self._admit_cancel_work(
+            invocation_id=invocation_id,
+            expected_task_id=task_id,
+            reason=reason,
+            semantic_kind="cancel_exact",
+        )
+        return self._submit_command_admission(admission, kind="cancel")
 
     async def close(self) -> None:
         operation = self._close_operation
@@ -382,6 +443,24 @@ class ConversationWorkControlSurface:
         reason: str,
         semantic_kind: str,
     ) -> WorkCancelResult:
+        admission = await self._admit_cancel_work(
+            invocation_id=invocation_id,
+            expected_task_id=expected_task_id,
+            reason=reason,
+            semantic_kind=semantic_kind,
+        )
+        if isinstance(admission, _InvocationBinding):
+            return self._copy_cancel(await asyncio.shield(admission.operation))
+        return self._copy_cancel(admission)
+
+    async def _admit_cancel_work(
+        self,
+        *,
+        invocation_id: str,
+        expected_task_id: str | None,
+        reason: str,
+        semantic_kind: str,
+    ) -> _InvocationBinding | WorkCancelResult:
         semantics = (
             semantic_kind,
             "" if expected_task_id is None else expected_task_id,
@@ -396,17 +475,19 @@ class ConversationWorkControlSurface:
                 if existing.semantics != semantics:
                     self._mark_uncertain_locked()
                     return self._unavailable_cancel()
-                operation = cast(asyncio.Task[WorkCancelResult], existing.operation)
+                binding = existing
             else:
                 if not self._admit_binding_locked():
                     return self._unavailable_cancel()
                 active_tasks = self._context.snapshot().active_tasks
                 pending_starts = tuple(self._pending_starts.values())
+                refusal_category: _CommandRefusalCategory | None = None
                 if expected_task_id is not None:
                     matching = tuple(
                         task for task in active_tasks if task.task_id == expected_task_id
                     )
                     if not matching:
+                        refusal_category = "stale_target"
                         operation = self._new_cancel_rejection_locked(
                             invocation_id,
                             task_id=expected_task_id,
@@ -419,18 +500,21 @@ class ConversationWorkControlSurface:
                             name=f"conversation-work-cancel:{invocation_id}",
                         )
                 elif self._logical_work_count(active_tasks, pending_starts) == 0:
+                    refusal_category = "no_active_task"
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
                         reason=_NO_ACTIVE_REASON,
                     )
                 elif self._logical_work_count(active_tasks, pending_starts) > 1:
+                    refusal_category = "ambiguous_active_tasks"
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
                         reason=_AMBIGUOUS_ACTIVE_REASON,
                     )
                 elif pending_starts:
+                    self._reserve()
                     pending = pending_starts[0]
                     pending.cancel_after_ack = True
                     operation = self._create_operation_locked(
@@ -444,11 +528,75 @@ class ConversationWorkControlSurface:
                         self._settle_cancel(task_id=task_id, reason=reason),
                         name=f"conversation-work-cancel:{invocation_id}",
                     )
-                self._bindings[invocation_id] = _InvocationBinding(
+                binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
+                    refusal_category=refusal_category,
                 )
-        return self._copy_cancel(await asyncio.shield(operation))
+                self._bindings[invocation_id] = binding
+        return binding
+
+    def _submit_command_admission(
+        self,
+        admission: _InvocationBinding | WorkStartResult | WorkCancelResult,
+        *,
+        kind: str,
+    ) -> WorkCommandAdmission:
+        if not isinstance(admission, _InvocationBinding):
+            return WorkCommandAdmission.UNAVAILABLE
+        if not admission.deferred_observed:
+            admission.deferred_observed = True
+            admission.operation.add_done_callback(
+                lambda operation: self._report_deferred_failure(operation, kind=kind)
+            )
+        if admission.operation.done() and (
+            admission.operation.cancelled() or admission.operation.exception() is not None
+        ):
+            self._mark_uncertain_locked()
+            return WorkCommandAdmission.UNAVAILABLE
+        if admission.refusal_category is None:
+            return WorkCommandAdmission.ADMITTED
+        try:
+            return WorkCommandAdmission.REFUSED
+        finally:
+            print(
+                "[task-command-refused] "
+                + json.dumps(
+                    {"kind": kind, "count": 1, "category": admission.refusal_category},
+                    separators=(",", ":"),
+                )
+            )
+
+    def _report_deferred_failure(self, operation: asyncio.Task[Any], *, kind: str) -> None:
+        if not operation.cancelled() and operation.exception() is None:
+            return
+        category = "acknowledgment-uncertain"
+        try:
+            self._reserve()
+            self._observer(
+                "task_state",
+                {
+                    "status": "rejected",
+                    "taskId": None,
+                    "reason": (
+                        "Task command acknowledgment is uncertain. "
+                        "Check task status before trying again."
+                    ),
+                },
+            )
+        except BaseException:
+            category = "uncertainty-projection-failed"
+        finally:
+            print(
+                "[task-command-settlement] "
+                + json.dumps(
+                    {
+                        "kind": kind,
+                        "category": category,
+                    },
+                    separators=(",", ":"),
+                )
+            )
 
     async def _settle_start(
         self,
@@ -544,6 +692,11 @@ class ConversationWorkControlSurface:
                             task_id=dispatch.task_id,
                         )
                     )
+                start_result = await self._project_accepted_start(dispatch.task_id)
+                # Establish the live card before attaching cancellation feedback.
+                # A later active projection would clear that feedback in the UI.
+                await self._project_cancel(cancel_result)
+                return start_result
             return await self._project_accepted_start(dispatch.task_id)
         except _ProjectionRolledBack as rolled_back:
             raise rolled_back.error from None
@@ -696,12 +849,28 @@ class ConversationWorkControlSurface:
         name: str,
     ) -> asyncio.Task[_ResultT]:
         operation = asyncio.create_task(
-            coroutine,
+            self._run_owned_operation(coroutine),
             name=name,
         )
         self._owned_operations.add(operation)
         operation.add_done_callback(self._consume_operation)
         return operation
+
+    async def _run_owned_operation(
+        self, coroutine: Coroutine[Any, Any, _ResultT]
+    ) -> _ResultT:
+        try:
+            return await coroutine
+        except BaseException:
+            operation = asyncio.current_task()
+            if any(
+                binding.operation is operation and binding.deferred_observed
+                for binding in self._bindings.values()
+            ):
+                # No await separates failure from this health transition. The
+                # owned task cannot become terminal with command admission open.
+                self._mark_uncertain_locked()
+            raise
 
     def _consume_operation(self, operation: asyncio.Task[Any]) -> None:
         self._owned_operations.discard(operation)

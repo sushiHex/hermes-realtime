@@ -196,9 +196,13 @@ class BrowserEventProjection:
 
     @staticmethod
     def _open_key(kind: str, data: dict[str, PublicValue]) -> tuple[str, str] | None:
-        """The open-state entry an event sets, or None when it settles or concerns none."""
+        """The retained lifecycle entry touched by an event, if any."""
 
-        if kind == "task_state" and type(data.get("taskId")) is str:
+        if (
+            kind == "task_state"
+            and data.get("status") != "rejected"
+            and type(data.get("taskId")) is str
+        ):
             return (kind, cast(str, data["taskId"]))
         if kind == "approval_state" and type(data.get("approvalId")) is str:
             return (kind, cast(str, data["approvalId"]))

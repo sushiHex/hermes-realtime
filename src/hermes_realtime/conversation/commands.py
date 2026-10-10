@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable
@@ -18,12 +19,14 @@ from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
 
 from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
-from .work_tools import WorkCancelResult, WorkStartResult
+from .work_tools import WorkCommandAdmission
 
 _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _MAX_OBJECTIVE_CHARS = 1024
+_SPOKEN_START = re.compile(r"start task(?:\s+(.*)|[.!?])?\Z", re.IGNORECASE | re.DOTALL)
+_SPOKEN_CANCEL = re.compile(r"cancel task[.!?]?\Z", re.IGNORECASE)
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _CommandAcceptedHook = Callable[[CommandAdmissionAuthorityV1], CommandDisposition]
@@ -44,20 +47,23 @@ class _WorkControlSurface(Protocol):
     @property
     def max_objective_chars(self) -> int: ...
 
-    async def start_work(
+    @property
+    def active_task_ids(self) -> tuple[str, ...]: ...
+
+    async def submit_start_command(
         self,
         *,
         objective: str,
         invocation_id: str,
-    ) -> WorkStartResult: ...
+    ) -> WorkCommandAdmission: ...
 
-    async def cancel_work(
+    async def submit_cancel_command(
         self,
         *,
         task_id: str,
         invocation_id: str,
         reason: str = "user requested task cancellation",
-    ) -> WorkCancelResult: ...
+    ) -> WorkCommandAdmission: ...
 
 
 class ConversationTaskCommandRouter:
@@ -67,7 +73,9 @@ class ConversationTaskCommandRouter:
     the user row before the command acts; every other final input becomes a
     user row through the turn it starts. ``validate_user_input`` is the store's
     pure check: only its refusal makes a command invalid. A recording failure
-    propagates exactly as it would for an ordinary turn.
+    propagates exactly as it would for an ordinary turn. Surface commands await
+    bounded admission only; accepted routing consumes input authority but does
+    not claim a task acknowledgment. The owned surface settles and projects it.
     """
 
     def __init__(
@@ -94,10 +102,10 @@ class ConversationTaskCommandRouter:
         if surface is None and not callable(getattr(controller, "request_cancel", None)):
             raise TypeError("controller must provide request_cancel()")
         if surface is not None:
-            if not callable(getattr(surface, "start_work", None)):
-                raise TypeError("surface must provide start_work()")
-            if not callable(getattr(surface, "cancel_work", None)):
-                raise TypeError("surface must provide cancel_work()")
+            if not callable(getattr(surface, "submit_start_command", None)):
+                raise TypeError("surface must provide submit_start_command()")
+            if not callable(getattr(surface, "submit_cancel_command", None)):
+                raise TypeError("surface must provide submit_cancel_command()")
         if not callable(observer):
             raise TypeError("observer must be callable")
         if not callable(reserve_observer_capacity):
@@ -158,13 +166,44 @@ class ConversationTaskCommandRouter:
             raise TypeError("command text must be an exact built-in string")
         stripped = text.strip()
         folded = stripped.casefold()
-        if folded.startswith(("task:", "cancel task:")) and not await self._recorded(text):
+        spoken_start = _SPOKEN_START.fullmatch(stripped)
+        spoken_cancel = _SPOKEN_CANCEL.fullmatch(stripped) is not None
+        start_command = folded.startswith("task:") or spoken_start is not None
+        cancel_command = folded.startswith(("cancel task:", "cancel task ")) or spoken_cancel
+        # Freeze before even the history recording await. Never resolve a later
+        # active task after the original work has finished or been replaced.
+        candidates = (
+            self._surface.active_task_ids if spoken_cancel and self._surface is not None else ()
+        )
+        task_id = candidates[0] if len(candidates) == 1 else None
+        if (start_command or cancel_command) and not await self._recorded(text):
             self._publish_invalid()
             return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
-        if folded.startswith("task:"):
-            objective = stripped[len("task:") :].strip()
+        if spoken_cancel and task_id is None:
+            self._publish_invalid(
+                reason=(
+                    "No active task to cancel."
+                    if not candidates
+                    else "Several tasks are active. Use Cancel on the task you want to stop."
+                ),
+                category="no-active-task" if not candidates else "ambiguous-task",
+                candidate_count=len(candidates),
+            )
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.REJECTED)
+        if start_command:
+            objective = (
+                (spoken_start.group(1) or "").strip()
+                if spoken_start is not None
+                else stripped[len("task:") :].strip()
+            )
             if not self._valid_objective(objective):
-                self._publish_invalid()
+                self._publish_invalid(
+                    reason=(
+                        "Provide an objective after Start task."
+                        if spoken_start is not None and not objective
+                        else "invalid explicit task command"
+                    )
+                )
                 return self._closed_nonaccepted_result(
                     authority,
                     CommandRoutingOutcome.INVALID,
@@ -173,14 +212,11 @@ class ConversationTaskCommandRouter:
             if type(token) is not str or _COMMAND_TOKEN.fullmatch(token) is None:
                 raise RuntimeError("command utterance identifier factory returned an invalid value")
             if self._surface is not None:
-                start_result = await self._surface.start_work(
+                admission = await self._surface.submit_start_command(
                     objective=objective,
                     invocation_id=f"command_{token}",
                 )
-                if type(start_result) is not WorkStartResult:
-                    raise TypeError("work surface returned the wrong start result")
-                accepted_result = self._accepted_result(authority)
-                return True if accepted_result is None else accepted_result
+                return self._surface_admission_result(admission, authority)
             self._reserve()
             controller = self._controller
             if controller is None:
@@ -229,8 +265,12 @@ class ConversationTaskCommandRouter:
                     CommandRoutingOutcome.REJECTED,
                 )
             return True
-        if folded.startswith("cancel task:"):
-            task_id = stripped[len("cancel task:") :].strip()
+        if cancel_command:
+            if not spoken_cancel:
+                prefix = "cancel task:" if folded.startswith("cancel task:") else "cancel task "
+                task_id = stripped[len(prefix) :].strip()
+            if task_id is None:
+                raise RuntimeError("explicit cancellation has no frozen task identity")
             if _TASK_ID.fullmatch(task_id) is None or _PRIVATE_AUTHORITY.search(task_id):
                 self._publish_invalid()
                 return self._closed_nonaccepted_result(
@@ -243,20 +283,12 @@ class ConversationTaskCommandRouter:
                     raise RuntimeError(
                         "command invocation identifier factory returned an invalid value"
                     )
-                cancel_result = await self._surface.cancel_work(
+                admission = await self._surface.submit_cancel_command(
                     task_id=task_id,
                     invocation_id=f"command_{token}",
                     reason="user requested task cancellation",
                 )
-                if type(cancel_result) is not WorkCancelResult:
-                    raise TypeError("work surface returned the wrong cancel result")
-                if not cancel_result.accepted:
-                    return self._closed_nonaccepted_result(
-                        authority,
-                        CommandRoutingOutcome.REJECTED,
-                    )
-                accepted_result = self._accepted_result(authority)
-                return True if accepted_result is None else accepted_result
+                return self._surface_admission_result(admission, authority)
             self._reserve()
             controller = self._controller
             if controller is None:
@@ -307,6 +339,23 @@ class ConversationTaskCommandRouter:
             user_turn_authority=owner.decline_to_user(authority),
         )
 
+    def _surface_admission_result(
+        self,
+        admission: WorkCommandAdmission,
+        authority: FinalInputAuthorityV1 | None,
+    ) -> bool | CommandRoutingResultV1:
+        if type(admission) is not WorkCommandAdmission:
+            raise TypeError("work surface returned the wrong command admission")
+        if admission is WorkCommandAdmission.UNAVAILABLE:
+            self._publish_invalid(
+                reason="Task control is unavailable. Restart the session before trying again.",
+                category="work-control-unavailable",
+            )
+        if admission is not WorkCommandAdmission.ADMITTED:
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.REJECTED)
+        accepted_result = self._accepted_result(authority)
+        return True if accepted_result is None else accepted_result
+
     def _accepted_result(
         self,
         authority: FinalInputAuthorityV1 | None,
@@ -351,16 +400,30 @@ class ConversationTaskCommandRouter:
             objective and len(objective) <= maximum and _PRIVATE_AUTHORITY.search(objective) is None
         )
 
-    def _publish_invalid(self) -> None:
-        self._reserve()
-        self._observer(
-            "task_state",
-            {
-                "reason": "invalid explicit task command",
-                "status": "rejected",
-                "taskId": None,
-            },
-        )
+    def _publish_invalid(
+        self,
+        *,
+        reason: str = "invalid explicit task command",
+        category: str = "invalid-command",
+        candidate_count: int = 0,
+    ) -> None:
+        try:
+            self._reserve()
+            self._observer(
+                "task_state",
+                {"reason": reason, "status": "rejected", "taskId": None},
+            )
+        finally:
+            print(
+                "[task-command-refusal] "
+                + json.dumps(
+                    {
+                        "kind": "explicit-command",
+                        "category": category,
+                        "candidate_count": candidate_count,
+                    }
+                )
+            )
 
 
 __all__ = ["ConversationTaskCommandRouter"]

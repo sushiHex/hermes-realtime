@@ -75,6 +75,7 @@ from hermes_realtime.conversation import (
     UpdatePolicyInput,
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
+from hermes_realtime.conversation.output_style import OutputStyleSelection
 from hermes_realtime.evidence import (
     CaptureState,
     ConsentDisposition,
@@ -1282,6 +1283,7 @@ def _build_streaming_inference(
     knowledge_timing_observer: Callable[[dict[str, _PublicValue]], None] | None = None,
     knowledge_coordinator: KnowledgePrefetchCoordinator | None = None,
     hermes_context: HermesRepresentativeContext | None = None,
+    output_style: Callable[[], str] | None = None,
 ) -> OllamaStreamingInference | CodexAppServerStreamingInference:
     if type(inference_provider) is not str:
         raise TypeError("inference_provider must be an exact built-in string")
@@ -1292,6 +1294,7 @@ def _build_streaming_inference(
             base_url=ollama_base_url,
             model=ollama_model,
             request_timeout_seconds=60.0,
+            output_style=output_style,
         )
     if inference_provider == "codex":
         knowledge_lookup: CurrentFactLookup | None
@@ -1301,6 +1304,7 @@ def _build_streaming_inference(
             knowledge_lookup = current_fact_lookup
         codex_options: dict[str, object] = {
             "model": codex_model,
+            "output_style": output_style,
             "effort": codex_effort,
             "codex_executable": codex_executable,
             "token_usage_observer": token_usage_observer,
@@ -2250,6 +2254,7 @@ def build_local_host_launcher(
         )
     )
 
+    output_style_selection = OutputStyleSelection()
     inference = (
         cast(
             OllamaStreamingInference | CodexAppServerStreamingInference,
@@ -2268,6 +2273,7 @@ def build_local_host_launcher(
             knowledge_timing_observer=lambda data: observe("knowledge_timing", data),
             knowledge_coordinator=knowledge_coordinator,
             hermes_context=hermes_context,
+            output_style=output_style_selection.get,
         )
     )
     synthesizer = (
@@ -2754,6 +2760,7 @@ def build_local_host_launcher(
         projection=projection,
         voice_configuration=voice_configuration,
         select_voice=select_voice,
+        select_output_style=output_style_selection.select,
         evidence_consent=(
             (
                 lambda binding, request: _reserve_host_evidence_consent(

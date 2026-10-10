@@ -1,3 +1,4 @@
+import { OutputStyleControls } from "./output-style";
 import {
   ConnectionState,
   RemoteAudioTrack,
@@ -48,6 +49,7 @@ import {
   reloadOrBootstrap,
   reloadRebindIsSettled,
   rememberSession,
+  rememberedSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -98,6 +100,7 @@ import {
   type ConnectionFailureStage,
 } from "./connection-recovery";
 import { mountTypedComposerEnterSubmission } from "./typed-composer";
+import { mountTaskCancelControl } from "./task-controls";
 import { VoiceDeleteControls } from "./voice-delete-controls";
 import {
   parseBootstrapCredential,
@@ -137,6 +140,11 @@ const voiceDeleteStatus = element<HTMLOutputElement>("voice-delete-status");
 const speechRendererState = element<HTMLOutputElement>("speech-renderer-state");
 const muteButton = microphoneActivity;
 const microphoneSelect = element<HTMLSelectElement>("microphone");
+const outputStyleControls = new OutputStyleControls(
+  element<HTMLSelectElement>("output-style"),
+  element<HTMLOutputElement>("output-style-status"),
+  () => window.localStorage,
+);
 const voiceSelect = element<HTMLSelectElement>("voice");
 const modelSelect = element<HTMLSelectElement>("model-select");
 const effortSelect = element<HTMLSelectElement>("effort-select");
@@ -326,6 +334,22 @@ const responseLatency = new ResponseLatencyStatistics();
 let capability: string | null = null;
 let stableLaunch = false;
 let credential: BootstrapCredential | null = null;
+// One bounded public identity/request record owns recovery in this page.
+// Browser persistence is optional; the existing parser validates its initial value.
+const initiallyRememberedSession = rememberedSession(tabStorage());
+let sessionRecord = initiallyRememberedSession === null
+  ? null : JSON.stringify(initiallyRememberedSession);
+const sessionRecoveryStorage = {
+  getItem: () => sessionRecord,
+  setItem: (key: string, value: string): void => {
+    sessionRecord = value;
+    tabStorage()?.setItem(key, value);
+  },
+  removeItem: (key: string): void => {
+    sessionRecord = null;
+    tabStorage()?.removeItem(key);
+  },
+};
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
@@ -357,6 +381,14 @@ let microphoneMutePending = false;
 const microphoneReadinessAuthority = new MicrophoneReadinessAuthority<Room, LocalTrack>();
 const reconnectMicrophoneQueue = new SerializedAsyncQueue();
 const audioDiagnosticQueue = new SerializedAsyncQueue();
+const typedSubmissionQueue = new SerializedAsyncQueue();
+const maxTypedSubmissions = 8;
+let typedSubmissionCount = 0;
+let typedSubmissionGeneration: object = Object.freeze({});
+let activeTypedSubmission: {
+  readonly abort: AbortController;
+  readonly participantIdentity: string;
+} | null = null;
 const microphoneEnumerationAuthority = new GenerationAuthority();
 const lifecycleAuthority = new GenerationAuthority();
 const eventPollFailurePolicy = new ForegroundPollFailurePolicy(5);
@@ -464,6 +496,9 @@ interface TaskCardView {
   readonly item: HTMLLIElement;
   readonly status: HTMLParagraphElement;
   readonly meta: HTMLSpanElement;
+  readonly feedback: HTMLParagraphElement;
+  readonly cancellation: ReturnType<typeof mountTaskCancelControl>;
+  participantIdentity: string | null;
   readonly startedBrowserMs: number;
   readonly startedServerMs: number;
   currentStatus: string;
@@ -506,6 +541,7 @@ function forgetEvictedOperationCard(item: HTMLLIElement): void {
   const view = taskCardViews.get(taskId);
   if (view?.item === item) {
     if (view.timer !== null) window.clearInterval(view.timer);
+    view.cancellation.dispose();
     conversationHistory.forget(item);
     taskCardViews.delete(taskId);
   }
@@ -556,6 +592,24 @@ function projectTaskStateCard(event: PublicEvent): void {
   const data = event.data;
   const taskId = data.taskId;
   const status = data.status;
+  if (status === "rejected" && taskId === null) {
+    const knownReasons = new Set([
+      "No active task to cancel.",
+      "Several tasks are active. Use Cancel on the task you want to stop.",
+      "Provide an objective after Start task.",
+      "Task command acknowledgment is uncertain. Check task status before trying again.",
+      "Task control is unavailable. Restart the session before trying again.",
+      "invalid explicit task command",
+    ]);
+    const notice = document.createElement("li");
+    notice.dataset.role = "operation";
+    notice.dataset.operation = "task-command";
+    notice.setAttribute("role", "status");
+    notice.textContent = typeof data.reason === "string" && knownReasons.has(data.reason)
+      ? data.reason : "Task command was refused.";
+    admitOperationCard(notice);
+    return;
+  }
   if (
     typeof taskId !== "string" ||
     !/^task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}$/.test(taskId) ||
@@ -568,7 +622,9 @@ function projectTaskStateCard(event: PublicEvent): void {
   }
   let view = taskCardViews.get(taskId);
   // A cancellation refusal is command feedback, not a new task lifecycle.
-  if (status === "rejected" && view !== undefined && conversationHistory.isActive(view.item)) {
+  if (status === "rejected" && view !== undefined) {
+    view.feedback.textContent = "Cancellation was refused. The task status has not changed.";
+    refreshOperationCard(view.item);
     return;
   }
   const live = status === "active" || status === "cancelling";
@@ -592,6 +648,7 @@ function projectTaskStateCard(event: PublicEvent): void {
       }
     }
   }
+
   if (view === undefined || !view.item.isConnected) {
     const item = document.createElement("li");
     item.dataset.role = "operation";
@@ -608,11 +665,35 @@ function projectTaskStateCard(event: PublicEvent): void {
     const meta = document.createElement("span");
     meta.className = "operation-meta";
     meta.textContent = "You can keep talking while this runs.";
-    item.append(label, title, state, meta);
+    const controls = document.createElement("div");
+    controls.className = "operation-controls";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "button danger";
+    cancel.textContent = "Cancel";
+    const feedback = document.createElement("p");
+    feedback.className = "operation-detail";
+    feedback.setAttribute("role", "status");
+    controls.append(cancel);
+    item.append(label, title, state, meta, controls, feedback);
+    const cancellation = mountTaskCancelControl(cancel, {
+      taskId,
+      canCancel: () => controller.state === "connected" &&
+        view?.currentStatus === "active" &&
+        view.participantIdentity === credential?.participantIdentity,
+      submit: submitTyped,
+      onFailure: () => {
+        feedback.textContent = "Cancellation was not confirmed. Check task status.";
+        refreshOperationCard(item);
+      },
+    });
     view = {
       item,
       status: state,
       meta,
+      feedback,
+      cancellation,
+      participantIdentity: credential?.participantIdentity ?? null,
       startedBrowserMs: performance.now(),
       startedServerMs: event.monotonicMs,
       currentStatus: status,
@@ -631,6 +712,9 @@ function projectTaskStateCard(event: PublicEvent): void {
   }
   view.item.dataset.status = status;
   view.currentStatus = status;
+  view.participantIdentity = credential?.participantIdentity ?? null;
+  view.feedback.textContent = "";
+  view.cancellation.refresh();
   const render = (): void => {
     const elapsedMs =
       view!.currentStatus === "active" || view!.currentStatus === "cancelling"
@@ -1999,6 +2083,29 @@ async function changeModelConfiguration(model: string, effort: string): Promise<
   }
 }
 
+async function applyOutputStyle(
+  activeCredential: BootstrapCredential,
+  current: () => boolean,
+): Promise<void> {
+  await outputStyleControls.sync(async style => {
+    const styleCredential = credential;
+    if (styleCredential === null || styleCredential.participantIdentity !== activeCredential.participantIdentity) {
+      throw new Error("style session is stale");
+    }
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), 5_000);
+    try {
+      const response = await fetch("/api/v1/output-style", {
+        method: "POST",
+        headers: {...authorization(styleCredential.token), "Content-Type": "application/json"},
+        body: JSON.stringify({style}), cache: "no-store", credentials: "omit",
+        referrerPolicy: "no-referrer", signal: abort.signal,
+      });
+      return response.ok ? await response.json() : null;
+    } finally { window.clearTimeout(timer); }
+  }, () => current() && credential?.participantIdentity === activeCredential.participantIdentity);
+}
+
 async function loadVoiceConfiguration(
   activeCredential: BootstrapCredential,
   connectGeneration: object,
@@ -2128,6 +2235,7 @@ controller.subscribe((state) => {
   renderConnectionPresentation(state);
   renderSessionToggle(state);
   setInteractive(state === "connected");
+  for (const view of taskCardViews.values()) view.cancellation.refresh();
 });
 
 async function loadMicrophones(): Promise<void> {
@@ -2194,9 +2302,11 @@ function tabStorage(): Storage | null {
 // Clearing the in-memory credential never forgets it: only a definitive verdict does (the
 // stop that succeeded, or a rebind answered 403 or 409).
 function setCredential(value: BootstrapCredential | null): void {
+  invalidateTypedSubmissions();
   credential = value;
+  for (const view of taskCardViews.values()) view.cancellation.refresh();
   if (stableLaunch && value !== null) {
-    rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });
+    rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });
   }
 }
 
@@ -2207,7 +2317,7 @@ async function bootstrapOrReload(
   if (!stableLaunch) return bootstrap(signal);
   let reloaded = false;
   const result = await reloadOrBootstrap({
-    storage: tabStorage(),
+    storage: sessionRecoveryStorage,
     newRequestId: () => `rebind_${crypto.randomUUID()}`,
     rebind: async (path, body) => {
       onStage("rebind");
@@ -2541,6 +2651,7 @@ function bindRoomEvents(activeRoom: Room): void {
       microphoneReadinessAuthority.invalidate();
       microphoneEnumerationAuthority.invalidate();
       microphoneReady = null;
+      invalidateTypedSubmissions();
       controller.reconnecting();
       addMarker("media_reconnecting");
     } else if (
@@ -2929,7 +3040,7 @@ async function connect(projectionResync = false): Promise<void> {
     clearCredentialRefresh();
     setCredential(null);
     pendingRebindRequestId = null;
-    if (stableLaunch) rememberSession(tabStorage(), null);
+    if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
     return true;
   };
   try {
@@ -2988,9 +3099,11 @@ async function connect(projectionResync = false): Promise<void> {
             addMarker("session_replaced", started);
           }
         }
+        // Ordinary rebind retains the server's input and approval counters.
+        // Transfer retained card bindings without changing captured submission owners.
         if (!sessionReplaced) {
           resetBindingInputAuthority();
-          for (const view of approvalCardViews.values()) {
+          for (const view of [...taskCardViews.values(), ...approvalCardViews.values()]) {
             if (view.participantIdentity === previousCredential.participantIdentity) {
               view.participantIdentity = credential!.participantIdentity;
             }
@@ -3009,6 +3122,8 @@ async function connect(projectionResync = false): Promise<void> {
     }
     const activeCredential = credential;
     if (activeCredential === null) throw new Error("active credential is unavailable");
+    await applyOutputStyle(activeCredential, () => lifecycleAuthority.owns(connectGeneration));
+    if (!lifecycleAuthority.owns(connectGeneration)) { superseded = true; return; }
     // No SDK disconnect on page leave: it would read as a dropped connection, and the
     // leaving page would rebind, rotating the identity a reloaded tab is about to present.
     const activeRoom = new Room({
@@ -3216,6 +3331,12 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
+  outputStyleControls.reset();
+  const uncertainInputCredential = activeTypedSubmission !== null && !remoteStopRequired &&
+    activeTypedSubmission.participantIdentity === credential?.participantIdentity
+    ? credential : null;
+  invalidateTypedSubmissions();
+  if (uncertainInputCredential !== null) retireUncertainInputCredential();
   eventPolling?.abort();
   eventPolling = null;
   microphoneVerificationGeneration += 1;
@@ -3325,7 +3446,7 @@ async function stop(): Promise<void> {
   microphoneSignalMonitor.stop();
   setCredential(null);
   // The remote stop succeeded: the session is gone, so the tab forgets it.
-  if (stableLaunch) rememberSession(tabStorage(), null);
+  if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;
@@ -3353,23 +3474,96 @@ async function stop(): Promise<void> {
 
 async function submitTyped(text: string): Promise<void> {
   const activeCredential = credential;
-  if (activeCredential === null) throw new Error("no active credential");
-  const sequence = inputSequence + 1;
-  const response = await fetch("/api/v1/input", {
-    method: "POST",
-    headers: {
-      ...authorization(activeCredential.token),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ sequence, text }),
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-  });
-  if (!response.ok) throw new Error("typed input rejected");
-  inputSequence = sequence;
-  projectUserTranscript("typed-admission", text);
-  addMarker("typed_input_admitted");
+  const activeRoom = room;
+  const generation = typedSubmissionGeneration;
+  let refusal: string | null = null;
+  let admitted = false;
+  try {
+    if (activeCredential === null || activeRoom === null || controller.state !== "connected") {
+      refusal = "disconnected";
+      throw new Error("input requires a connected session");
+    }
+    if (typedSubmissionCount >= maxTypedSubmissions) {
+      refusal = "capacity";
+      throw new Error("input submission capacity exhausted");
+    }
+    typedSubmissionCount += 1;
+    admitted = true;
+    const requireCurrent = (): void => {
+      if (generation !== typedSubmissionGeneration) {
+        refusal = "stale";
+        throw new Error("input belongs to a stale connection");
+      }
+    };
+    await typedSubmissionQueue.run(async () => {
+      requireCurrent();
+      const sequence = inputSequence + 1;
+      const abort = new AbortController();
+      activeTypedSubmission = { abort, participantIdentity: activeCredential.participantIdentity };
+      const timeout = window.setTimeout(() => abort.abort(), stopRequestTimeoutMs);
+      try {
+        const response = await fetch("/api/v1/input", {
+          method: "POST",
+          headers: {
+            ...authorization(activeCredential.token),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ sequence, text }),
+          cache: "no-store",
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          signal: abort.signal,
+        });
+        requireCurrent();
+        if (!response.ok) {
+          refusal = "admission-refused";
+          throw new Error("typed input rejected");
+        }
+        inputSequence = sequence;
+        projectUserTranscript("typed-admission", text);
+        addMarker("typed_input_admitted");
+      } catch (error) {
+        // HTTP error statuses classify exceptions across dispatch and projection;
+        // none proves that the command had no effect. A rotated participant owns
+        // a replacement binding, so a late old response cannot retire it.
+        if (credential?.participantIdentity === activeCredential.participantIdentity) {
+          refusal = "acknowledgment-uncertain";
+          await disconnectLocal();
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeout);
+        activeTypedSubmission = null;
+      }
+    });
+  } catch (error) {
+    refusal ??= "request-failed";
+    throw error;
+  } finally {
+    if (admitted) typedSubmissionCount -= 1;
+    if (refusal !== null) console.info(`[input-control-refusal] ${JSON.stringify({
+      kind: "typed-input", category: refusal, pending_count: typedSubmissionCount,
+    })}`);
+  }
+}
+
+function invalidateTypedSubmissions(): void {
+  typedSubmissionGeneration = Object.freeze({});
+  activeTypedSubmission?.abort.abort();
+}
+
+function retireUncertainInputCredential(): void {
+  clearCredentialRefresh();
+  setCredential(null);
+  renderSessionToggle();
+  const notice = document.createElement("li");
+  notice.dataset.role = "operation";
+  notice.dataset.operation = "input-control";
+  notice.setAttribute("role", "status");
+  notice.textContent = stableLaunch
+    ? "Input acknowledgment was lost. Reconnect before sending more input. The previous command may have been admitted."
+    : "Input acknowledgment was lost. Open a fresh launch before sending more input. The previous command may have been admitted.";
+  admitOperationCard(notice);
 }
 
 async function requestVoiceDeleteWire(

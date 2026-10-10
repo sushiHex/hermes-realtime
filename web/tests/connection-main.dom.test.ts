@@ -61,6 +61,28 @@ async function mount(request: (path: string) => Response | Promise<Response>, re
   return { toggle, recovery, fetch: vi.mocked(fetch) };
 }
 
+it.each([false, true])("applies stored output style before media admission (remembered: %s)", async (remembered) => {
+  let acknowledge!: () => void;
+  const { toggle, fetch } = await mount(path => {
+    if (path === "/api/v1/output-style") return new Promise<Response>(resolve => {
+      acknowledge = () => resolve(Response.json({version:1, selectedStyle:"learning"}));
+    });
+    return normalRequest(path);
+  }, remembered);
+  const style = dom.window.document.querySelector<HTMLSelectElement>("#output-style")!;
+  style.value = "learning";
+  style.dispatchEvent(new dom.window.Event("change"));
+  toggle.click();
+  await vi.waitFor(() => expect(acknowledge).toBeDefined());
+  expect(media.connect).not.toHaveBeenCalled();
+  acknowledge();
+  await vi.waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+  const selection = fetch.mock.calls.find(([path]) => path === "/api/v1/output-style")!;
+  expect(JSON.parse(selection[1]?.body as string)).toEqual({style:"learning"});
+  const token = remembered ? "synthetic.rebound.token" : credential.token;
+  expect(selection[1]?.headers).toMatchObject({Authorization:`Bearer ${token}`});
+});
+
 function normalRequest(path: string): Response | Promise<Response> {
   if (path === "/api/v1/stable-bootstrap") return Response.json(credential);
   if (path === "/api/v1/stable-rebind") return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });

@@ -110,6 +110,25 @@ def _reply(topic: int) -> str:
     return " ".join(f"Topic {topic} has detail {index}." for index in range(1, 6))
 
 
+@pytest.mark.asyncio
+async def test_idle_speech_cancel_preserves_active_work_reference_in_next_prompt() -> None:
+    store = ConversationContextStore()
+    store.record_user_transcript(Transcript(text="Synthetic earlier topic.", final=True))
+    store.record_task_accepted(task_id="task_1", run_id="deleg_1", objective="Synthetic objective.")
+    ollama = _FakeOllama(["Synthetic answer."])
+    loop = _loop(store, ollama)
+    await loop.cancel()  # Nothing is playing; speech scope cannot clear named-task context.
+    await loop.respond(
+        "turn_after_cancel", Transcript(text="Synthetic current question.", final=True),
+    )
+    await loop.close()
+    messages = cast(list[dict[str, str]], ollama.bodies[0]["messages"])
+    sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
+    assert sections["active_work"] == [{"task_id": "task_1", "objective": "Synthetic objective."}]
+    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == ["active_work"]
+    assert messages[-1] == {"role": "user", "content": "Synthetic current question."}
+
+
 def _tail(path: Path) -> tuple[DurableConversation, ArchiveOutbox]:
     tail = parse_voice_tail(path.read_bytes(), max_messages=32, max_item_chars=1024)
     assert tail is not None and tail.archive is not None

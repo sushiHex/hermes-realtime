@@ -157,6 +157,43 @@ def test_the_context_checks_keep_the_ollama_prompt_marker() -> None:
     assert dropped == 0
 
 
+def test_rehearsal_keeps_the_bounded_output_style_acknowledgment() -> None:
+    marker = '[output-style] {"accepted":true,"version":1}'
+    assert rehearsal.markers([marker]) == ([marker], 0)
+
+
+def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
+    from hermes_realtime.conversation.context import ActiveTaskSummary, ConversationMessage
+    from hermes_realtime.conversation.streaming import (
+        ConversationInferenceRequest,
+        ConversationPromptUpdate,
+    )
+    from hermes_realtime.memory import BuiltinMemorySnapshot
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    request = ConversationInferenceRequest(
+        revision=1, messages=(ConversationMessage("user", "Synthetic question."),),
+        active_tasks=(ActiveTaskSummary("task_1", "Synthetic objective."),),
+        memory=BuiltinMemorySnapshot(memory="Synthetic memory.", user="Synthetic user."),
+        updates=(ConversationPromptUpdate(sequence=1, task_id="task_2", status="completed",
+                                          text="Synthetic result."),),
+    )
+    messages = OllamaStreamingInference._messages(request, output_style="learning")
+    observed = rehearsal.prompt_observation(messages, "hoopoe")
+    assert observed["reference_kinds"] == ["memory", "active_work", "updates"]
+    assert observed["output_style"] == "learning"
+    assert "Synthetic" not in json.dumps(observed)
+    sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
+    del sections["updates"]
+    header = messages[0]["content"].split("\n\nReference data:\n", 1)[0]
+    messages[0]["content"] = header + "\n\nReference data:\n" + json.dumps(sections)
+    assert rehearsal.prompt_observation(messages, "hoopoe")["reference_kinds"] == [
+        "memory", "active_work",
+    ]
+    marker = "[rehearsal-prompt] " + json.dumps(observed, separators=(",", ":"), sort_keys=True)
+    assert rehearsal.markers([marker]) == ([marker], 0)
+
+
 def test_the_prompt_observation_counts_only_user_rows_that_state_the_fact() -> None:
     messages = [
         {"role": "system", "content": "memory mentions the Hoopoe"},
@@ -168,6 +205,7 @@ def test_the_prompt_observation_counts_only_user_rows_that_state_the_fact() -> N
     observed = rehearsal.prompt_observation(messages, "hoopoe")
 
     assert observed == {
+        "output_style": "unavailable", "reference_kinds": [],
         "chars": sum(len(message["content"]) for message in messages),
         "fact_rows": 1,
         "messages": 4,
@@ -318,13 +356,13 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
         return Response()
 
     adapter = OllamaStreamingInference(
-        base_url="http://127.0.0.1:11434", model="m", open_request=open_request
+        base_url="http://127.0.0.1:11434", model="stand-in", open_request=open_request
     )
 
     from hermes_realtime.conversation import ActiveTaskSummary
 
     def snapshot(last: str) -> ConversationContextSnapshot:
-        # Active work renders as a system message after the question, as in the rehearsal.
+        # Active work renders in the leading policy/reference message.
         return ConversationContextSnapshot(
             revision=1,
             messages=(
@@ -347,15 +385,8 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
             thread.join(timeout=5)
 
     assert len(bodies) == 2
-    assert bodies[1]["messages"][-1]["role"] == "system"  # type: ignore[index]
-    assert resent == [
-        {
-            "messages": bodies[1]["messages"],
-            "model": "stand-in",
-            "options": {"num_ctx": 16_384},
-            "stream": False,
-        }
-    ] * 3
+    assert bodies[1]["messages"][-1]["role"] == "user"  # type: ignore[index]
+    assert resent == [{**bodies[1], "stream": False}] * 3
     recalls = [
         json.loads(line.removeprefix("[rehearsal-recall] "))
         for line in capsys.readouterr().out.splitlines()

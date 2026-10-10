@@ -692,6 +692,7 @@ def test_host_inference_selection_is_explicit_without_fallback(
             "codex",
             {
                 "model": "gpt-5.6-terra",
+                "output_style": None,
                 "effort": "low",
                 "codex_executable": "C:/tools/codex.exe",
                 "hermes_context": HermesRepresentativeContext(

@@ -18,6 +18,25 @@ The guide links to the detailed references rather than repeating them:
 [`hermes-bridge.md`](hermes-bridge.md) for the installed-runtime gate and the bridge protocol,
 and the [README](../README.md) for building from source.
 
+## Output style
+
+The browser offers **Default**, **Proactive**, **Concise**, **Explanatory** and **Learning**
+for foreground responses. The accepted choice applies from the next response; an already
+running response retains its captured choice. Default favors concise natural speech, and
+every style asks for manageable spoken chunks. These are communication preferences, separate
+from model, effort and voice; they grant no dispatch, cancellation or approval authority.
+
+The preference persists in local browser storage for the same browser profile and origin.
+Reconnects and host/browser restarts reapply it through the authenticated current session
+before input readiness. A different browser, profile or origin starts with Default. Corrupt
+storage falls back to Default; blocked storage is labelled **not saved**. An unsupported or
+failed style endpoint is labelled **unavailable** and leaves conversation usable.
+
+This preference does not change Hermes's global personality, background tasks, voice review
+or memory. Both foreground providers share current-user and spoken-response policy. Synthetic
+request tests prove the selected policy reaches the provider; they do not establish model
+obedience, resolve the historical older-topic reply cause or qualify conversational quality.
+
 ## Deleting a voice conversation
 
 Use the browser's **Delete this voice conversation** control and confirm the action.

@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.evidence.models import (
     parse_evidence_consent_request,
     parse_evidence_revoke_request,
@@ -20,7 +21,7 @@ from hermes_realtime.search_egress import (
 
 from .bootstrap import BrowserJoinCredential, BrowserTokenVerifier, OneTimeBootstrapCapability
 from .loopback import LoopbackPeerAddress, LoopbackPeerAuthorizer
-from .session import BrowserAudioDiagnostic, BrowserSessionDirector
+from .session import BrowserAudioDiagnostic, BrowserSessionDirector, NoBrowserSession
 from .tailnet import TailnetPeerAddress, TailnetPeerAuthorizer
 
 StablePeerAddress = LoopbackPeerAddress | TailnetPeerAddress
@@ -130,6 +131,42 @@ class BrowserBootstrapApplication:
     ) -> BrowserBootstrapResponse:
         """Validate, claim, provision, then expose one browser credential."""
 
+        if type(path) is not str or path != "/api/v1/output-style":
+            return await self._handle(
+                method=method, path=path, headers=headers, body=body, peer=peer,
+            )
+        stage = ["malformed_input"]
+        accepted = False
+        try:
+            response = await self._handle(
+                method=method, path=path, headers=headers, body=body, peer=peer,
+                output_style_stage=stage,
+            )
+            accepted = True
+            return response
+        except PermissionError:
+            stage[0] = "authentication_or_binding"
+            raise
+        except NoBrowserSession:
+            stage[0] = "absent_session"
+            raise
+        finally:
+            evidence: dict[str, object] = {"accepted": accepted}
+            if not accepted:
+                evidence["category"] = stage[0]
+            evidence["version"] = 1
+            print("[output-style] " + json.dumps(evidence, separators=(",", ":")), flush=True)
+
+    async def _handle(
+        self,
+        *,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        peer: StablePeerAddress | None = None,
+        output_style_stage: list[str] | None = None,
+    ) -> BrowserBootstrapResponse:
         if type(method) is not str or type(path) is not str:
             raise TypeError("method and path must be exact built-in strings")
         if type(headers) is not dict:
@@ -147,6 +184,7 @@ class BrowserBootstrapApplication:
             "/api/v1/media",
             "/api/v1/model",
             "/api/v1/models",
+            "/api/v1/output-style",
             "/api/v1/projection-resync",
             "/api/v1/rebind",
             "/api/v1/refresh",
@@ -618,6 +656,28 @@ class BrowserBootstrapApplication:
                 effort=effort,
             )
             payload = catalog.public_data()
+            status = 200
+        elif path == "/api/v1/output-style":
+            if not 1 <= len(body) <= 256:
+                raise ValueError("style body must contain 1 to 256 bytes")
+            if headers.get("content-type") != "application/json":
+                raise ValueError("style content-type must be application/json")
+            identity = self._verifier.verify(bearer)
+            try:
+                decoded = json.loads(
+                    body.decode("utf-8"), object_pairs_hook=_strict_json_object,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("style body must be strict UTF-8 JSON") from None
+            if type(decoded) is not dict or set(decoded) != {"style"}:
+                raise ValueError("style request must contain the exact style field")
+            style = require_output_style(decoded["style"])
+            if output_style_stage is not None:
+                output_style_stage[0] = "unavailable_or_selection_failure"
+            selected = await self._sessions.change_output_style(
+                participant_identity=identity, style=style,
+            )
+            payload = {"selectedStyle": selected, "version": 1}
             status = 200
         elif path == "/api/v1/voice":
             if not 1 <= len(body) <= 256:
