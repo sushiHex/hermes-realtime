@@ -1685,7 +1685,7 @@ class _CodexFingerprint:
 
 
 def _idle_start_schema_sha256() -> str:
-    tools = CodexAppServerStreamingInference._dynamic_tools(1024, include_cancel=False)
+    tools = CodexAppServerStreamingInference._dynamic_tools(1024)
     encoded = json.dumps(
         tools,
         ensure_ascii=False,

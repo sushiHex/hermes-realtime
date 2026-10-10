@@ -944,24 +944,16 @@ async def test_uncertain_http_failure_blocks_later_work_admission(
 
 
 @pytest.mark.asyncio
-async def test_natural_cancel_stops_exact_run_once_and_waits_for_terminal() -> None:
+async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> None:
     runtime = await _runtime()
     try:
         await runtime.invoke("Please inspect the release evidence.")
         await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
 
-        spoken, transport = await runtime.invoke(
-            "Stop that background work.",
-            tool="cancel_active_work",
-            arguments={},
-        )
-
-        assert spoken == ["I requested cancellation."]
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": True,
-            "state": "cancelling",
-            "task_id": "task_cross1",
-        }
+        result = await runtime.surface.cancel_active_work(invocation_id="direct_cancel")
+        assert result.accepted is True
+        assert result.state == "cancelling"
+        assert result.task_id == "task_cross1"
         assert runtime.stub.stop_calls == 1
         assert len(runtime.context.snapshot().active_tasks) == 1
 
@@ -975,14 +967,13 @@ async def test_natural_cancel_stops_exact_run_once_and_waits_for_terminal() -> N
         assert runtime.context.snapshot().active_tasks == ()
         assert runtime.stub.stop_calls == 1
 
-        with pytest.raises(RuntimeError, match="Codex app-server reader failed"):
-            await runtime.invoke(
-                "Continue that canceled task.",
-                allow_unadvertised_tool=True,
-            )
-        assert len(runtime.stub.posts) == 1
+        await runtime.invoke(
+            "What changed in the current release?",
+            arguments={"objective": "Research current release changes."},
+        )
+        assert len(runtime.stub.posts) == 2
         assert runtime.stub.stop_calls == 1
-        assert runtime.context.snapshot().active_tasks == ()
+        assert len(runtime.context.snapshot().active_tasks) == 1
     finally:
         await runtime.close()
 
@@ -1006,11 +997,7 @@ async def test_cancel_while_dispatch_pending_settles_after_late_ack(
         start_task = asyncio.create_task(runtime.invoke("Please inspect the release evidence."))
         await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=1)
         cancel_task = asyncio.create_task(
-            runtime.invoke(
-                "Cancel that work.",
-                tool="cancel_active_work",
-                arguments={},
-            )
+            runtime.surface.cancel_active_work(invocation_id="direct_pending_cancel")
         )
 
         async def wait_for_pending_cancel() -> None:
@@ -1024,20 +1011,16 @@ async def test_cancel_while_dispatch_pending_settles_after_late_ack(
         assert runtime.stub.stop_calls == 0
 
         runtime.stub.create_gate.set()
-        (
-            (start_spoken, start_transport),
-            (
-                cancel_spoken,
-                cancel_transport,
-            ),
-        ) = await asyncio.gather(start_task, cancel_task)
+        (start_spoken, start_transport), cancel_result = await asyncio.gather(
+            start_task, cancel_task,
+        )
 
         start_payload = _tool_payload(start_transport.tool_responses[0])
-        cancel_payload = _tool_payload(cancel_transport.tool_responses[0])
+        cancel_payload = {"state": cancel_result.state, "accepted": cancel_result.accepted}
         assert start_payload["state"] == expected_start_state
         assert cancel_payload["state"] == expected_start_state
         assert runtime.stub.stop_calls == expected_stop_calls
-        assert "started" not in " ".join(start_spoken + cancel_spoken).lower()
+        assert "started" not in " ".join(start_spoken).lower()
         if mode == "accepted":
             assert start_payload["accepted"] is True
             assert cancel_payload["accepted"] is True
@@ -1088,18 +1071,12 @@ async def test_exact_cancel_of_second_task_preserves_first_task_authority() -> N
             arguments={"objective": "Audit the dependency licenses."},
         )
 
-        spoken, transport = await runtime.invoke(
-            "Cancel the dependency-license audit.",
-            tool="cancel_active_work",
-            arguments={"task_id": "task_cross3"},
+        result = await runtime.surface.cancel_work(
+            task_id="task_cross3", invocation_id="direct_exact_cancel",
         )
-
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": True,
-            "state": "cancelling",
-            "task_id": "task_cross3",
-        }
-        assert spoken == ["I requested cancellation."]
+        assert result.accepted is True
+        assert result.state == "cancelling"
+        assert result.task_id == "task_cross3"
         assert runtime.stub.stopped_run_ids == [_SECOND_API_RUN_ID]
         assert {task.task_id for task in runtime.context.snapshot().active_tasks} == {
             "task_cross1",
@@ -1390,11 +1367,9 @@ async def test_stale_codex_evidence_cannot_route_through_replacement_runtime() -
     fresh: NaturalWorkRuntime | None = None
     try:
         _old_start_spoken, old_start_transport = await old.invoke("Start the old runtime work.")
-        _old_cancel_spoken, old_cancel_transport = await old.invoke(
-            "Cancel the old runtime work.",
-            tool="cancel_active_work",
-            arguments={},
-        )
+        old_cancel = await old.surface.cancel_active_work(invocation_id="old_direct_cancel")
+        assert old_cancel.accepted
+        old_cancel_transport = old_start_transport
         old.stub.complete(status="cancelled")
         old_terminal = await asyncio.wait_for(old.controller.next_completion(), timeout=1)
         assert old_terminal.status == "interrupted"

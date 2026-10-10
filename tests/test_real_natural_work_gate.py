@@ -494,7 +494,7 @@ def test_transport_activity_observer_counts_malformed_pre_handler_attempts() -> 
             "method": "thread/start",
             "params": {
                 "dynamicTools": _GATE.CodexAppServerStreamingInference._dynamic_tools(
-                    1024, include_cancel=False
+                    1024
                 )
             },
         }
