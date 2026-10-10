@@ -967,13 +967,20 @@ async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> No
         assert runtime.context.snapshot().active_tasks == ()
         assert runtime.stub.stop_calls == 1
 
-        await runtime.invoke(
+        # The first run's terminal event must not terminate the independent new run.
+        runtime.stub.terminal_ready.clear()
+        _, transport = await runtime.invoke(
             "What changed in the current release?",
             arguments={"objective": "Research current release changes."},
         )
         assert len(runtime.stub.posts) == 2
         assert runtime.stub.stop_calls == 1
         assert len(runtime.context.snapshot().active_tasks) == 1
+        new_task_id = runtime.context.snapshot().active_tasks[0].task_id
+        assert new_task_id != terminal.task_id
+        assert _tool_payload(transport.tool_responses[0]) == {
+            "accepted": True, "state": "active", "task_id": new_task_id,
+        }
     finally:
         await runtime.close()
 
