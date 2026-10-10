@@ -9432,7 +9432,6 @@ def assert_task_5d_single_winner_consent_resume(
                             failures.append("pipe_close")
             exits.append({
                 "category": "unreaped" if code is None else "zero" if code == 0 else "nonzero",
-                "returncode": code,
             })
             if code is not None and code != 0:
                 failures.append("nonzero_exit")

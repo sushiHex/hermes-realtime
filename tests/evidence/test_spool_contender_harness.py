@@ -130,7 +130,7 @@ def test_missing_terminal_preserves_primary_and_cleans_every_owner(monkeypatch, 
     report = json.loads(output.split("[task-5d-contender-cleanup] ")[1])
     assert report == {
         "children": 2,
-        "exits": [{"category": "nonzero", "returncode": 1}, {"category": "zero", "returncode": 0}],
+        "exits": [{"category": "nonzero"}, {"category": "zero"}],
         "failures": ["send", "nonzero_exit"],
         "primaryFailure": True,
     }
@@ -298,8 +298,8 @@ def test_cleanup_errors_never_skip_later_owners(monkeypatch, tmp_path, capsys, k
     if kind == "reap":
         assert report["failures"] == ["wait", "reap", "stdout_unreaped"]
         assert report["exits"] == [
-            {"category": "unreaped", "returncode": None},
-            {"category": "zero", "returncode": 0},
+            {"category": "unreaped"},
+            {"category": "zero"},
         ]
     assert "PRIVATE-CHILD-CONTENT" not in json.dumps(report)
 
@@ -540,3 +540,18 @@ def test_unreaped_stdout_never_blocks_later_cleanup(monkeypatch, tmp_path, capsy
     assert kernel.CloseHandle.calls == 1
     report = json.loads(capsys.readouterr().out.split("[task-5d-contender-cleanup] ")[1])
     assert report["failures"] == ["wait", "reap", "stdout_unreaped"]
+
+
+def test_cleanup_evidence_contains_only_exact_exit_categories(monkeypatch, tmp_path, capsys):
+    children = [Child(frames(0, False), exit_code=123), Child(frames(1))]
+    kernel, run = invoke(monkeypatch, tmp_path, children)
+    with pytest.raises(pytest.fail.Exception, match="terminal-0 exited before its protocol frame"):
+        run()
+    assert_closed(children, kernel)
+    report = json.loads(capsys.readouterr().out.split("[task-5d-contender-cleanup] ")[1])
+    assert report == {
+        "children": 2,
+        "exits": [{"category": "nonzero"}, {"category": "zero"}],
+        "failures": ["nonzero_exit"],
+        "primaryFailure": True,
+    }
