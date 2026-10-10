@@ -9,7 +9,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 from .context import (
     ActiveTaskIdentityError,
@@ -31,6 +31,13 @@ _DUPLICATE_OBJECTIVE_REASON = "matching work is already active"
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _StartProjectionGate = Callable[["WorkStartResult"], Awaitable[None]]
+_CommandRefusalCategory = Literal[
+    "duplicate_objective",
+    "capacity_exhausted",
+    "stale_target",
+    "no_active_task",
+    "ambiguous_active_tasks",
+]
 
 
 class WorkControlHealth(StrEnum):
@@ -162,7 +169,7 @@ class _PendingStart:
 class _InvocationBinding:
     semantics: tuple[str, ...]
     operation: asyncio.Task[Any]
-    command_admitted: bool = True
+    refusal_category: _CommandRefusalCategory | None = None
     deferred_observed: bool = False
 
 
@@ -300,9 +307,9 @@ class ConversationWorkControlSurface:
                     pending.objective_identity == objective_identity
                     for pending in self._pending_starts.values()
                 )
-                command_admitted = True
+                refusal_category: _CommandRefusalCategory | None = None
                 if matching_work:
-                    command_admitted = False
+                    refusal_category = "duplicate_objective"
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -321,7 +328,7 @@ class ConversationWorkControlSurface:
                     )
                     >= self._context.max_active_tasks
                 ):
-                    command_admitted = False
+                    refusal_category = "capacity_exhausted"
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -354,7 +361,7 @@ class ConversationWorkControlSurface:
                 binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
-                    command_admitted=command_admitted,
+                    refusal_category=refusal_category,
                 )
                 self._bindings[invocation_id] = binding
         return binding
@@ -474,13 +481,13 @@ class ConversationWorkControlSurface:
                     return self._unavailable_cancel()
                 active_tasks = self._context.snapshot().active_tasks
                 pending_starts = tuple(self._pending_starts.values())
-                command_admitted = True
+                refusal_category: _CommandRefusalCategory | None = None
                 if expected_task_id is not None:
                     matching = tuple(
                         task for task in active_tasks if task.task_id == expected_task_id
                     )
                     if not matching:
-                        command_admitted = False
+                        refusal_category = "stale_target"
                         operation = self._new_cancel_rejection_locked(
                             invocation_id,
                             task_id=expected_task_id,
@@ -493,14 +500,14 @@ class ConversationWorkControlSurface:
                             name=f"conversation-work-cancel:{invocation_id}",
                         )
                 elif self._logical_work_count(active_tasks, pending_starts) == 0:
-                    command_admitted = False
+                    refusal_category = "no_active_task"
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
                         reason=_NO_ACTIVE_REASON,
                     )
                 elif self._logical_work_count(active_tasks, pending_starts) > 1:
-                    command_admitted = False
+                    refusal_category = "ambiguous_active_tasks"
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
@@ -523,7 +530,7 @@ class ConversationWorkControlSurface:
                 binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
-                    command_admitted=command_admitted,
+                    refusal_category=refusal_category,
                 )
                 self._bindings[invocation_id] = binding
         return binding
@@ -546,14 +553,17 @@ class ConversationWorkControlSurface:
         ):
             self._mark_uncertain_locked()
             return WorkCommandAdmission.UNAVAILABLE
-        if admission.command_admitted:
+        if admission.refusal_category is None:
             return WorkCommandAdmission.ADMITTED
         try:
             return WorkCommandAdmission.REFUSED
         finally:
             print(
                 "[task-command-refused] "
-                + json.dumps({"kind": kind, "count": 1}, separators=(",", ":"))
+                + json.dumps(
+                    {"kind": kind, "count": 1, "category": admission.refusal_category},
+                    separators=(",", ":"),
+                )
             )
 
     def _report_deferred_failure(self, operation: asyncio.Task[Any], *, kind: str) -> None:

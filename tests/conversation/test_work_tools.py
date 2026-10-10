@@ -155,31 +155,44 @@ async def test_command_admission_preserves_final_order_before_acknowledgments() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refusal", ("duplicate", "capacity", "stale-cancel"))
-async def test_command_admission_refuses_known_rejection_before_ack(refusal: str, capsys) -> None:
+@pytest.mark.parametrize(
+    ("refusal", "category"),
+    (
+        ("duplicate", "duplicate_objective"),
+        ("capacity", "capacity_exhausted"),
+        ("stale-cancel", "stale_target"),
+    ),
+)
+@pytest.mark.parametrize("replay", (False, True))
+async def test_command_admission_refuses_known_rejection_before_ack(
+    refusal: str, category: str, replay: bool, capsys,
+) -> None:
     context = ConversationContextStore(max_active_tasks=1)
     context.record_task_accepted(
         task_id="task_existing", run_id="deleg_fixture", objective="Synthetic work"
     )
     surface, controller, events = _surface(context=context)
-    if refusal == "stale-cancel":
-        result = await surface.submit_cancel_command(
-            task_id="task_stale", invocation_id="command_fixture"
-        )
-    else:
-        result = await surface.submit_start_command(
-            objective="Synthetic work" if refusal == "duplicate" else "Synthetic other work",
-            invocation_id="command_fixture",
-        )
-    assert result is WorkCommandAdmission.REFUSED
+    for _ in range(2 if replay else 1):
+        if refusal == "stale-cancel":
+            result = await surface.submit_cancel_command(
+                task_id="task_stale", invocation_id="command_fixture"
+            )
+        else:
+            result = await surface.submit_start_command(
+                objective="Synthetic work" if refusal == "duplicate" else "Synthetic other work",
+                invocation_id="command_fixture",
+            )
+        assert result is WorkCommandAdmission.REFUSED
+        if replay:
+            await asyncio.sleep(0)
     await surface.close()
     assert controller.dispatches == []
     assert controller.cancellations == []
     assert [data["status"] for _, data in events] == ["rejected"]
     kind = "cancel" if refusal == "stale-cancel" else "start"
     assert capsys.readouterr().out == (
-        '[task-command-refused] {"kind":"' + kind + '","count":1}\n'
-    )
+        '[task-command-refused] {"kind":"' + kind + '","count":1,"category":"' + category + '"}\n'
+    ) * (2 if replay else 1)
 
 
 @pytest.mark.asyncio
