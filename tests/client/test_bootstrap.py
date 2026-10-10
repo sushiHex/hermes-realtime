@@ -2423,7 +2423,7 @@ async def test_a_refused_decision_spends_no_authority_sequence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_fresh_view_resends_open_tasks_and_approvals_and_drops_settled_ones() -> None:
+async def test_fresh_view_replays_open_controls_not_acknowledged_settlements() -> None:
     projection = BrowserEventProjection()
     director, _, _ = _counting_director(projection)
     first = await director.start()
@@ -2449,6 +2449,7 @@ async def test_a_fresh_view_resends_open_tasks_and_approvals_and_drops_settled_o
         "approval_state",
         {"actionable": False, "approvalId": "approval_fedcba9876543210", "state": "reject"},
     )
+    projection.acknowledge_through(projection.events_after(0)[-1].sequence)
 
     await director.rebind(
         participant_identity=first.participant_identity,
@@ -2460,6 +2461,169 @@ async def test_a_fresh_view_resends_open_tasks_and_approvals_and_drops_settled_o
     assert [kind for kind, _ in events] == ["session_ready", "task_state", "approval_state"]
     assert events[1][1] == open_task
     assert events[2][1] == open_approval
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ("start", "fresh_view"))
+@pytest.mark.parametrize("acknowledged_state", (False, True))
+async def test_browser_recovery_replays_unacknowledged_durable_settlements(
+    recovery: str,
+    acknowledged_state: bool,
+) -> None:
+    projection = BrowserEventProjection()
+    director, _, _ = _counting_director(projection)
+    first = await director.start()
+    projection.publish("task_state", {"taskId": "task_done", "status": "active"})
+    projection.publish("task_state", {"taskId": "task_running", "status": "active"})
+    projection.publish(
+        "approval_state",
+        {
+            "approvalId": "approval_0123456789abcdef",
+            "actionable": True,
+            "state": "pending",
+        },
+    )
+    projection.acknowledge_through(projection.events_after(0)[-1].sequence)
+    if recovery == "start":
+        await director.stop(participant_identity=first.participant_identity)
+    terminal = {"taskId": "task_done", "status": "completed"}
+    state = projection.publish("task_state", dict(terminal))
+    if acknowledged_state:
+        projection.acknowledge_through(state.sequence)
+    result = dict(terminal, text="Synthetic durable result")
+    settled_approval = {
+        "approvalId": "approval_0123456789abcdef",
+        "actionable": False,
+        "state": "approve",
+    }
+    projection.publish("task_result", dict(result))
+    projection.publish("approval_state", dict(settled_approval))
+    projection.publish("assistant_text_generated", {"text": "Synthetic unheard speech"})
+    projection.publish("transcript_final", {"text": "Synthetic voice history"})
+    if recovery == "start":
+        await director.start()
+    else:
+        await director.rebind(
+            participant_identity=first.participant_identity,
+            request_id="rebind_0123456789abcdef",
+            fresh_view=True,
+        )
+    events = [(event.kind, dict(event.data)) for event in projection.events_after(0)]
+    assert events[0][0] == "session_ready"
+    assert events[1:] == (
+        ([] if acknowledged_state else [("task_state", terminal)])
+        + [
+            ("task_result", result),
+            ("approval_state", settled_approval),
+            ("task_state", {"taskId": "task_running", "status": "active"}),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ("start", "fresh_view", "resync"))
+@pytest.mark.parametrize("late", (False, True))
+async def test_replay_capacity_refusal_keeps_binding_and_terminal_evidence(
+    recovery: str,
+    late: bool,
+) -> None:
+    projection = BrowserEventProjection(capacity=4 if late else 2)
+    director, _, _ = _counting_director(projection)
+    first = await director.start()
+    if late:
+        projection.publish("task_state", {"taskId": "task_running", "status": "active"})
+    projection.acknowledge_through(projection.events_after(0)[-1].sequence)
+    if recovery == "start":
+        await director.stop(participant_identity=first.participant_identity)
+        projection.acknowledge_through(projection.events_after(0)[-1].sequence)
+    terminal = {"taskId": "task_done", "status": "completed"}
+    projection.publish("task_state", dict(terminal))
+    if not late:
+        projection.publish("task_result", dict(terminal, text="Synthetic result"))
+    calls = []
+    stops = []
+
+    async def provision(identity: str) -> int:
+        calls.append(identity)
+        if identity != first.participant_identity:
+            projection.publish("task_state", {"taskId": "task_late", "status": "completed"})
+            projection.publish(
+                "task_result",
+                {
+                    "taskId": "task_late",
+                    "status": "completed",
+                    "text": "Synthetic late result",
+                },
+            )
+        return len(calls) + 1
+
+    async def stop(identity: str, generation: int) -> None:
+        stops.append((identity, generation))
+
+    director._provision = provision
+    director._reprovision = provision
+    director._stop = stop
+    with pytest.raises(RuntimeError, match="capacity"):
+        if recovery == "start":
+            await director.start()
+        elif recovery == "fresh_view":
+            await director.rebind(participant_identity=first.participant_identity, fresh_view=True)
+        else:
+            await director.projection_resync(participant_identity=first.participant_identity)
+    assert [
+        dict(event.data) for event in projection.events_after(0) if event.kind == "task_state"
+    ] == (
+        ([] if late and recovery == "start" else [terminal])
+        + ([{"taskId": "task_late", "status": "completed"}] if late else [])
+    )
+    assert not any(event.kind == "session_ready" for event in projection.events_after(0))
+    if not late:
+        assert calls == []
+    elif recovery == "start":
+        assert len(calls) == 1
+        assert stops == [(calls[0], 2)]
+    else:
+        assert len(calls) == 2
+        assert calls[1] == first.participant_identity
+        assert director.active_generation == 3
+    assert director.active_identity == (None if recovery == "start" else first.participant_identity)
+    if late and recovery == "start":
+        projection.acknowledge_through(projection.events_after(0)[-1].sequence)
+        projection.reset()
+        projection.republish_open_state()
+        assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+            ("task_state", terminal),
+            ("task_state", {"taskId": "task_running", "status": "active"}),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_failed_provision_retry_keeps_unacknowledged_task_state_and_result() -> None:
+    projection = BrowserEventProjection()
+    director, _, _ = _counting_director(projection)
+    first = await director.start()
+    projection.acknowledge_through(projection.events_after(0)[-1].sequence)
+    await director.stop(participant_identity=first.participant_identity)
+    terminal = {"taskId": "task_done", "status": "completed"}
+    result = dict(terminal, text="Synthetic offline result")
+    projection.publish("task_state", dict(terminal))
+    projection.publish("task_result", dict(result))
+    calls = 0
+
+    async def provision(_identity: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic provision failure")
+        return calls
+
+    director._provision = provision
+    with pytest.raises(RuntimeError, match="provision failure"):
+        await director.start()
+    await director.start()
+    events = [(event.kind, dict(event.data)) for event in projection.events_after(0)]
+    assert events[0][0] == "session_ready"
+    assert events[1:] == [("task_state", terminal), ("task_result", result)]
 
 
 @pytest.mark.asyncio

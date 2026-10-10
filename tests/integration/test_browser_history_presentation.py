@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -395,6 +397,55 @@ def test_persistent_session_stop_preserves_tasks_until_authoritative_completion(
       text:'Authoritative durable task completion'})""")
     assert page.locator(".active-task-stack [data-task-id]").count() == 0
     assert page.locator('#transcript > [data-task-id="task_session_stop"] details').count() == 1
+
+
+def test_new_lease_replay_releases_original_card_completed_while_browser_stopped(page) -> None:
+    from hermes_realtime.client import BrowserEventProjection
+    from tests.client.test_bootstrap import _counting_director
+
+    async def reconnect_events():
+        projection = BrowserEventProjection()
+        director, _, _ = _counting_director(projection)
+        credential = await director.start()
+        active = projection.publish("task_state", {"taskId": "task_offline", "status": "active"})
+        projection.publish("task_state", {"taskId": "task_still_running", "status": "active"})
+        projection.acknowledge_through(active.sequence + 1)
+        await director.stop(participant_identity=credential.participant_identity)
+        projection.publish("task_state", {"taskId": "task_offline", "status": "completed"})
+        projection.publish("task_result", {
+            "taskId": "task_offline", "status": "completed", "text": "Synthetic offline result",
+        })
+        await director.start()
+        return [(event.kind, dict(event.data)) for event in projection.events_after(0)]
+
+    page.evaluate("""() => {
+      task('task_offline'); task('task_still_running');
+      for(let i=0;i<30;i++)
+        project('transcript_final',{role:'assistant',text:'Synthetic connected history ' + i});
+      window.offlineCard=document.querySelector('[data-task-id="task_offline"]');
+      window.runningCard=document.querySelector('[data-task-id="task_still_running"]');
+    }""")
+    playwright.expect(page.locator(".active-task-stack [data-task-id]")).to_have_count(2)
+    page.evaluate("historyFixture.stopPersistentSession()")
+    assert page.locator(".active-task-stack [data-task-id]").count() == 2
+    # Playwright's synchronous API owns an event loop in this thread.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        events = executor.submit(lambda: asyncio.run(reconnect_events())).result()
+    page.evaluate("events => events.forEach(([kind,data]) => project(kind,data))", events)
+    assert page.locator('.active-task-stack [data-task-id="task_offline"]').count() == 0
+    assert page.locator('.active-task-stack [data-task-id="task_still_running"]').count() == 1
+    assert page.locator('[data-task-id="task_offline"]').count() == 1
+    assert page.locator('[data-task-id="task_still_running"]').count() == 1
+    assert page.locator('#transcript > [data-task-id="task_offline"]').evaluate(
+        "card => card === window.offlineCard",
+    )
+    assert page.locator('[data-task-id="task_still_running"]').evaluate(
+        "card => card === window.runningCard",
+    )
+    page.locator('[data-task-id="task_offline"] details summary').click()
+    assert page.locator('[data-task-id="task_offline"] details').inner_text().endswith(
+        "Synthetic offline result",
+    )
 
 
 def test_voice_clear_preserves_live_cards_and_anchors_until_exact_terminal_results(page) -> None:
