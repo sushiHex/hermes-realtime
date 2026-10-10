@@ -14,6 +14,7 @@ from hermes_realtime.conversation import (
     TaskCancelOutcome,
     TaskDispatchOutcome,
     WorkCancelResult,
+    WorkCommandAdmission,
     WorkStartResult,
 )
 
@@ -103,6 +104,275 @@ def test_context_exposes_configured_work_limits_read_only() -> None:
 
     assert context.max_item_chars == 37
     assert context.max_active_tasks == 3
+
+
+@pytest.mark.asyncio
+async def test_command_admission_retains_one_owned_operation_and_close_joins_it(capsys) -> None:
+    release = asyncio.Event()
+    surface, controller, events = _surface(dispatch_gate=release, max_invocations=1)
+    assert await surface.submit_start_command(
+        objective="Synthetic work", invocation_id="command_first"
+    ) is WorkCommandAdmission.ADMITTED
+    assert await surface.submit_start_command(
+        objective="Synthetic work", invocation_id="command_first"
+    ) is WorkCommandAdmission.ADMITTED
+    assert await surface.submit_start_command(
+        objective="Synthetic other work", invocation_id="command_second"
+    ) is WorkCommandAdmission.UNAVAILABLE
+    await controller.dispatch_started.wait()
+    assert len(surface._owned_operations) == 1
+    assert len(surface._pending_starts) == 1
+    assert events == []
+    close = asyncio.create_task(surface.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+    release.set()
+    await close
+    assert surface._owned_operations == set()
+    assert surface._pending_starts == {}
+    assert len(controller.dispatches) == 1
+    assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+async def test_command_admission_preserves_final_order_before_acknowledgments() -> None:
+    release = asyncio.Event()
+    surface, controller, events = _surface(accepted=False, dispatch_gate=release)
+    for number in ("first", "second"):
+        assert await surface.submit_start_command(
+            objective=f"Synthetic {number} work", invocation_id=f"command_{number}"
+        ) is WorkCommandAdmission.ADMITTED
+    await asyncio.sleep(0)
+    assert [objective for objective, _ in controller.dispatches] == [
+        "Synthetic first work", "Synthetic second work",
+    ]
+    assert len(surface._owned_operations) == 2
+    assert events == []
+    release.set()
+    await surface.close()
+    assert [data["status"] for _, data in events] == ["rejected", "rejected"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ("duplicate", "capacity", "stale-cancel"))
+async def test_command_admission_refuses_known_rejection_before_ack(refusal: str, capsys) -> None:
+    context = ConversationContextStore(max_active_tasks=1)
+    context.record_task_accepted(
+        task_id="task_existing", run_id="deleg_fixture", objective="Synthetic work"
+    )
+    surface, controller, events = _surface(context=context)
+    if refusal == "stale-cancel":
+        result = await surface.submit_cancel_command(
+            task_id="task_stale", invocation_id="command_fixture"
+        )
+    else:
+        result = await surface.submit_start_command(
+            objective="Synthetic work" if refusal == "duplicate" else "Synthetic other work",
+            invocation_id="command_fixture",
+        )
+    assert result is WorkCommandAdmission.REFUSED
+    await surface.close()
+    assert controller.dispatches == []
+    assert controller.cancellations == []
+    assert [data["status"] for _, data in events] == ["rejected"]
+    kind = "cancel" if refusal == "stale-cancel" else "start"
+    assert capsys.readouterr().out == (
+        '[task-command-refused] {"kind":"' + kind + '","count":1}\n'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("start", "cancel", "cancelled-cancel"))
+async def test_deferred_command_failure_is_once_safe_and_fail_closed(
+    failure_kind: str, capsys,
+) -> None:
+    context = ConversationContextStore()
+    if failure_kind != "start":
+        context.record_task_accepted(
+            task_id="task_release_check", run_id="deleg_fixture", objective="Synthetic work"
+        )
+    surface, controller, events = _surface(context=context)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def fail(*_args: Any, **_kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        if failure_kind == "cancelled-cancel":
+            raise asyncio.CancelledError()
+        raise RuntimeError("synthetic exception content must never appear in guidance")
+
+    if failure_kind == "start":
+        controller.dispatch = fail  # type: ignore[method-assign]
+        async def submit():
+            return await surface.submit_start_command(
+                objective="Synthetic work", invocation_id="command_failure"
+            )
+    else:
+        controller.request_cancel = fail  # type: ignore[method-assign]
+        async def submit():
+            return await surface.submit_cancel_command(
+                task_id="task_release_check", invocation_id="command_failure"
+            )
+    assert await submit() is WorkCommandAdmission.ADMITTED
+    assert await submit() is WorkCommandAdmission.ADMITTED
+    await started.wait()
+    release.set()
+    await asyncio.gather(*surface._owned_operations, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert surface.health == "uncertain"
+    assert events == [("task_state", {
+        "status": "rejected", "taskId": None,
+        "reason": ("Task command acknowledgment is uncertain. "
+                   "Check task status before trying again."),
+    })]
+    assert capsys.readouterr().out == (
+        '[task-command-settlement] {"kind":"' + ("start" if failure_kind == "start" else "cancel")
+        + '","category":"acknowledgment-uncertain"}\n'
+    )
+    assert await surface.submit_start_command(
+        objective="Synthetic later work", invocation_id="command_later"
+    ) is WorkCommandAdmission.UNAVAILABLE
+    await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_projection_failure_keeps_rollback_and_bounded_failure_evidence(
+    capsys,
+) -> None:
+    def fail_projection(_kind: str, _data: Any) -> None:
+        raise RuntimeError("synthetic projection exception content")
+    surface, controller, _ = _surface(observer=fail_projection)
+    assert await surface.submit_start_command(
+        objective="Synthetic work", invocation_id="command_projection"
+    ) is WorkCommandAdmission.ADMITTED
+    await asyncio.gather(*surface._owned_operations, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert controller.cancellations == [("task_release_check", "task state projection failed")]
+    assert surface.health == "uncertain"
+    assert capsys.readouterr().out == (
+        '[task-command-settlement] {"kind":"start","category":"uncertainty-projection-failed"}\n'
+    )
+    await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", (
+    "cancelled-cancel", "duplicate-projection", "capacity-projection",
+    "stale-projection", "refused-cancel-projection", "accepted-start-rollback",
+))
+async def test_command_failure_closes_admission_before_done_callbacks(failure_kind: str) -> None:
+    context = ConversationContextStore(
+        max_active_tasks=1 if failure_kind == "capacity-projection" else 2
+    )
+    if failure_kind != "accepted-start-rollback":
+        context.record_task_accepted(
+            task_id="task_release_check", run_id="deleg_fixture", objective="Synthetic work"
+        )
+
+    def fail_projection(_kind: str, _data: Any) -> None:
+        raise RuntimeError("synthetic projection failure")
+
+    surface, controller, _ = _surface(
+        context=context,
+        observer=None if failure_kind == "cancelled-cancel" else fail_projection,
+    )
+    if failure_kind == "cancelled-cancel":
+        async def cancelled(*_args: Any, **_kwargs: Any) -> Any:
+            raise asyncio.CancelledError()
+        controller.request_cancel = cancelled  # type: ignore[method-assign]
+    elif failure_kind == "refused-cancel-projection":
+        controller.cancel_outcome = TaskCancelOutcome(task_id="task_release_check", accepted=False)
+    try:
+        if failure_kind in (
+            "duplicate-projection", "capacity-projection", "accepted-start-rollback"
+        ):
+            initial = await surface.submit_start_command(
+                objective=("Synthetic other work" if failure_kind == "capacity-projection"
+                           else "Synthetic work"),
+                invocation_id="command_failure",
+            )
+        else:
+            initial = await surface.submit_cancel_command(
+                task_id=("task_stale" if failure_kind == "stale-projection"
+                         else "task_release_check"),
+                invocation_id="command_failure",
+            )
+        assert initial is (
+            WorkCommandAdmission.REFUSED
+            if failure_kind in ("duplicate-projection", "capacity-projection", "stale-projection")
+            else WorkCommandAdmission.ADMITTED
+        )
+        operation = surface._bindings["command_failure"].operation
+        await asyncio.sleep(0)
+        assert operation.done()
+        before = list(controller.dispatches)
+        assert await surface.submit_start_command(
+            objective="Synthetic later work", invocation_id="command_later"
+        ) is WorkCommandAdmission.UNAVAILABLE
+        assert surface.health == "uncertain"
+        assert controller.dispatches == before
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("projection", "cancelled-cancel"))
+async def test_failed_model_binding_command_replay_is_synchronously_unavailable(
+    failure_kind: str,
+) -> None:
+    def fail_projection(_kind: str, _data: Any) -> None:
+        raise RuntimeError("synthetic projection failure")
+    surface, controller, _ = _surface(observer=fail_projection)
+    if failure_kind == "projection":
+        with pytest.raises(RuntimeError, match="synthetic projection failure"):
+            await surface.start_work(objective="Synthetic work", invocation_id="shared_invocation")
+        async def submit():
+            return await surface.submit_start_command(
+                objective="Synthetic work", invocation_id="shared_invocation"
+            )
+    else:
+        surface._context.record_task_accepted(
+            task_id="task_release_check", run_id="deleg_fixture", objective="Synthetic work"
+        )
+        async def cancelled(*_args: Any, **_kwargs: Any) -> Any:
+            raise asyncio.CancelledError()
+        controller.request_cancel = cancelled  # type: ignore[method-assign]
+        with pytest.raises(asyncio.CancelledError):
+            await surface.cancel_work(
+                task_id="task_release_check", invocation_id="shared_invocation"
+            )
+        async def submit():
+            return await surface.submit_cancel_command(
+                task_id="task_release_check", invocation_id="shared_invocation"
+            )
+    assert surface.health == "open"
+    try:
+        assert await submit() is WorkCommandAdmission.UNAVAILABLE
+        assert surface.health == "uncertain"
+        assert len(controller.dispatches) == (1 if failure_kind == "projection" else 0)
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_model_operation_does_not_inherit_another_command_observer() -> None:
+    failed = False
+    def observer(_kind: str, _data: Any) -> None:
+        if failed:
+            raise RuntimeError("synthetic model projection failure")
+    surface, controller, _ = _surface(observer=observer)
+    assert await surface.submit_start_command(
+        objective="Synthetic command work", invocation_id="command_first"
+    ) is WorkCommandAdmission.ADMITTED
+    await asyncio.gather(*surface._owned_operations)
+    failed = True
+    controller.dispatch_outcome = TaskDispatchOutcome(task_id="task_model_fixture", accepted=True)
+    with pytest.raises(RuntimeError, match="synthetic model projection failure"):
+        await surface.start_work(objective="Synthetic model work", invocation_id="model_second")
+    assert surface.health == "open"
+    assert controller.cancellations == [("task_model_fixture", "task state projection failed")]
+    await surface.close()
 
 
 def test_results_are_frozen_exact_and_private_safe() -> None:

@@ -2335,6 +2335,35 @@ def _counting_director(
 
 
 @pytest.mark.asyncio
+async def test_lost_input_response_requires_fresh_view_of_the_retained_server_session() -> None:
+    director, typed, _ = _counting_director(BrowserEventProjection())
+    first = await director.start()
+    # The server admitted the request; the browser never received its response.
+    await director.submit_text(
+        participant_identity=first.participant_identity,
+        sequence=1, text="Synthetic admitted command",
+    )
+    with pytest.raises(RuntimeError, match="already active"):
+        await director.start()
+    with pytest.raises(RuntimeError, match="next expected"):
+        await director.submit_text(
+            participant_identity=first.participant_identity,
+            sequence=1, text="Synthetic different command",
+        )
+    replacement = await director.rebind(
+        participant_identity=first.participant_identity,
+        request_id="rebind_0123456789abcdef", fresh_view=True,
+    )
+    await director.submit_text(
+        participant_identity=replacement.participant_identity,
+        sequence=1, text="Synthetic input after reset",
+    )
+    assert [(sequence, text) for _, sequence, text in typed] == [
+        (1, "Synthetic admitted command"), (1, "Synthetic input after reset"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_reloaded_page_types_and_decides_again_from_sequence_one() -> None:
     projection = BrowserEventProjection()
     director, typed, approvals = _counting_director(projection)

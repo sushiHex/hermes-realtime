@@ -2942,6 +2942,114 @@ async def test_explicit_task_command_bypasses_foreground_inference() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command_kind", ("start", "cancel"))
+async def test_held_task_acknowledgment_does_not_hold_pcm_consumption(command_kind: str) -> None:
+    from hermes_realtime.conversation import (
+        ConversationContextStore,
+        ConversationTaskCommandRouter,
+        ConversationWorkControlSurface,
+        TaskCancelOutcome,
+        TaskDispatchOutcome,
+    )
+
+    context = ConversationContextStore()
+    if command_kind == "cancel":
+        context.record_task_accepted(
+            task_id="task_fixture", run_id="deleg_fixture", objective="Synthetic work"
+        )
+    acknowledgment_started, release_acknowledgment = asyncio.Event(), asyncio.Event()
+    projected = []
+
+    class Controller:
+        async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome:
+            del utterance_id
+            acknowledgment_started.set()
+            await release_acknowledgment.wait()
+            context.record_task_accepted(
+                task_id="task_fixture", run_id="deleg_fixture", objective=objective
+            )
+            return TaskDispatchOutcome(task_id="task_fixture", accepted=True)
+
+        async def request_cancel(
+            self, task_id: str, *, reason: str | None = None
+        ) -> TaskCancelOutcome:
+            del reason
+            acknowledgment_started.set()
+            await release_acknowledgment.wait()
+            return TaskCancelOutcome(task_id=task_id, accepted=True)
+
+    class Transcriber:
+        push_calls = 0
+
+        async def push(self, frame: AudioFrame) -> tuple[Transcript, ...]:
+            del frame
+            self.push_calls += 1
+            return ()
+
+        async def finish_utterance(self) -> Transcript:
+            return Transcript(
+                text="start task Synthetic work" if command_kind == "start" else "cancel task",
+                final=True,
+            )
+
+        async def cancel(self) -> None:
+            return None
+
+    surface = ConversationWorkControlSurface(
+        controller=Controller(),
+        context=context,
+        observer=lambda kind, data: projected.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+    )
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda kind, data: projected.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+    )
+    executor, _, responses = action_executor_probe()
+    transcriber = Transcriber()
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user",
+        session_generation=1,
+        vad=ScriptedVad(
+            VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_ENDED, VoiceActivity.SPEECH_STARTED
+        ),
+        stt=transcriber,
+        actions=executor,
+        command_router=router,
+    )
+    worker.start()
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    await worker.receive_audio("browser_user", 1, frame)
+    endpoint = asyncio.create_task(worker.receive_audio("browser_user", 1, frame))
+    subsequent = None
+    try:
+        await asyncio.wait_for(acknowledgment_started.wait(), 0.2)
+        subsequent = asyncio.create_task(worker.receive_audio("browser_user", 1, frame))
+        await asyncio.wait_for(asyncio.shield(subsequent), 0.1)
+        assert endpoint.done()
+        assert transcriber.push_calls == 3
+        assert projected == []
+        assert responses == []
+    finally:
+        release_acknowledgment.set()
+        await endpoint
+        if subsequent is not None:
+            await subsequent
+        await surface.close()
+        await worker.close()
+    assert projected == [
+        (
+            "task_state",
+            {
+                "status": "active" if command_kind == "start" else "cancelling",
+                "taskId": "task_fixture",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_supervisor_rejects_stale_typed_transcript_before_admission() -> None:
     executor, _, responses = action_executor_probe()
 
