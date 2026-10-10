@@ -64,7 +64,7 @@ describe("output style preference", () => {
     view.choose("proactive");
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(view.select.value).toBe("learning");
-    expect(view.status.textContent).toContain("failed");
+    expect(view.status.textContent).toBe("Selection not confirmed. Reconnect to reapply the saved preference.");
     expect(view.dom.window.localStorage.getItem(OUTPUT_STYLE_KEY)).toBe("learning");
   });
 

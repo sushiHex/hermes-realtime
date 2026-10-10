@@ -91,7 +91,7 @@ export class OutputStyleControls {
       if (operation !== this.revision || !current()) return;
       if (previous !== null) {
         this.selected = previous;
-        this.render("Selection failed; previous preference retained.");
+        this.render("Selection not confirmed. Reconnect to reapply the saved preference.");
       } else {
         this.submit = null;
         this.current = null;
