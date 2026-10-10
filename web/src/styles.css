@@ -226,7 +226,7 @@ select {
 .conversation-panel:has(li[data-partial-transcript="true"]) .wave i:nth-child(2) { animation-delay: -180ms; }
 .conversation-panel:has(li[data-partial-transcript="true"]) .wave i:nth-child(3) { animation-delay: -330ms; }
 
-.conversation-scroll { position: relative; min-height: 0; overflow-y: auto; scrollbar-color: #30323a transparent; scrollbar-width: thin; }
+.conversation-scroll { position: relative; min-height: 0; overflow-y: auto; overflow-anchor: none; scrollbar-color: #30323a transparent; scrollbar-width: thin; }
 .conversation-scroll::-webkit-scrollbar { width: 10px; }
 .conversation-scroll::-webkit-scrollbar-track { background: rgba(255,255,255,.018); }
 .conversation-scroll::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #3b3e48; background-clip: padding-box; }
@@ -308,6 +308,15 @@ textarea::placeholder { color: var(--faint); }
 .timeline li[data-role="operation"] { align-self: stretch; width: auto; max-width: min(88%, 760px); padding: 14px; border-color: rgba(115,120,255,.2); background: linear-gradient(145deg, rgba(115,120,255,.08), var(--surface) 62%); }
 .timeline li[data-operation="approval"] { border-color: rgba(241,184,107,.32); background: linear-gradient(145deg, rgba(241,184,107,.09), var(--surface) 62%); }
 .timeline li[data-operation="approval"] > strong { color: var(--warning); }
+.active-task-dock { position: sticky; top: 0; height: 0; z-index: 2; }
+.active-task-stack { min-height: 0; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 0 20px; background: var(--panel); scrollbar-width: thin; }
+.active-task-stack:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: -2px; }
+.timeline li.task-history-slot { flex: 0 0 auto; width: 100%; max-width: none; padding: 0; border: 0; background: none; animation: none; }
+.timeline li[data-operation="task"][data-status="active"], .timeline li[data-operation="task"][data-status="cancelling"] { animation: task-pulse 2600ms ease-in-out infinite; }
+.task-result { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.task-result summary { cursor: pointer; color: var(--text); font-size: 12px; }
+.task-result p { margin-top: 8px; white-space: pre-wrap; }
+.history-capacity-notice { max-width: 260px; color: var(--warning); font-size: 10px; }
 .operation-title { display: block; margin: 4px 0 7px; color: var(--text); font-size: 13px; font-weight: 620; }
 .operation-detail { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
 .operation-command { display: block; margin-top: 9px; padding: 8px 9px; border: 1px solid rgba(255,255,255,.06); border-radius: 7px; background: rgba(0,0,0,.2); color: #d8d9df; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -327,6 +336,7 @@ textarea::placeholder { color: var(--faint); }
 @keyframes message-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes caret { 0%,48% { opacity: 1; } 49%,100% { opacity: 0; } }
 @keyframes waveform { from { transform: scaleY(.45); opacity: .55; } to { transform: scaleY(1.15); opacity: 1; } }
+@keyframes task-pulse { 0%,100% { border-color: rgba(115,120,255,.2); } 50% { border-color: rgba(115,120,255,.44); } }
 
 @media (max-width: 920px) {
   .workspace { height: auto; grid-template-columns: 1fr; overflow-y: auto; }
@@ -352,6 +362,7 @@ textarea::placeholder { color: var(--faint); }
   .panel-header { min-height: 62px; padding: 12px 14px; }
   .feature-badge { padding: 5px 7px; font-size: 9px; }
   .timeline { padding: 16px 12px 22px; }
+  .active-task-stack { padding: 0 12px; }
   .timeline li { max-width: 88%; }
   .empty-state { padding: 24px; }
   .composer-shell { padding: 10px; }
@@ -361,6 +372,7 @@ textarea::placeholder { color: var(--faint); }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .timeline li[data-operation="task"] { animation: none !important; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 

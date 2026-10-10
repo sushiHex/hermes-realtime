@@ -9,6 +9,7 @@ import {
   type RemoteTrack,
   type RemoteTrackPublication,
 } from "livekit-client";
+import { ConversationHistory } from "./conversation-history";
 
 import {
   ApprovalDecisionController,
@@ -144,6 +145,7 @@ const typedForm = element<HTMLFormElement>("typed-form");
 const typedInput = element<HTMLTextAreaElement>("typed-input");
 const sendButton = element<HTMLButtonElement>("send");
 const transcript = element<HTMLOListElement>("transcript");
+const conversationHistory = new ConversationHistory(transcript.parentElement!);
 const transcriptEmpty = element<HTMLDivElement>("transcript-empty");
 const readinessHeadline = element<HTMLHeadingElement>("readiness-headline");
 const readinessDetail = element<HTMLParagraphElement>("readiness-detail");
@@ -425,19 +427,29 @@ function addTranscript(
   item.append(label, document.createTextNode(text));
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
-function addBackgroundResult(text: string): void {
-  closeActiveUserTurn();
-  const item = document.createElement("li");
-  item.dataset.role = "task-result";
-  const label = document.createElement("strong");
-  label.textContent = "Background result: ";
-  item.append(label, document.createTextNode(text));
-  appendTranscriptBounded(item);
-  syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+function projectTaskResult(event: PublicEvent): void {
+  const { taskId, text } = event.data;
+  if (typeof taskId !== "string" || typeof text !== "string" || !text.trim()) return;
+  projectTaskStateCard(event);
+  const view = taskCardViews.get(taskId);
+  if (view === undefined) return;
+  if (view.result === null) {
+    const disclosure = document.createElement("details");
+    disclosure.className = "task-result";
+    const summary = document.createElement("summary");
+    summary.textContent = "Task result";
+    const content = document.createElement("p");
+    content.className = "operation-detail";
+    disclosure.append(summary, content);
+    view.item.append(disclosure);
+    view.result = content;
+    disclosure.addEventListener("toggle", () => conversationHistory.refresh());
+  }
+  view.result.textContent = text;
+  refreshOperationCard(view.item);
 }
 
 interface TaskCardView {
@@ -448,6 +460,7 @@ interface TaskCardView {
   readonly startedServerMs: number;
   currentStatus: string;
   timer: number | null;
+  result: HTMLParagraphElement | null;
 }
 
 interface ApprovalCardView {
@@ -478,6 +491,7 @@ function forgetEvictedTaskCard(item: HTMLLIElement): void {
   const view = taskCardViews.get(taskId);
   if (view?.item === item) {
     if (view.timer !== null) window.clearInterval(view.timer);
+    conversationHistory.forget(item);
     taskCardViews.delete(taskId);
   }
 }
@@ -501,11 +515,13 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
 
 function appendTranscriptBounded(item: HTMLLIElement): void {
   transcript.append(item);
+  if (conversationHistory.isActive(item)) return;
   disposeTranscriptEvictions(transcriptRetention.admit(item, retainedDomCost(item)));
 }
 
 function updateTranscriptBounded(item: HTMLLIElement): boolean {
   if (!item.isConnected) return false;
+  if (conversationHistory.isActive(item)) return true;
   disposeTranscriptEvictions(transcriptRetention.update(item, retainedDomCost(item)));
   return item.isConnected;
 }
@@ -514,11 +530,11 @@ function admitOperationCard(item: HTMLLIElement): void {
   closeActiveUserTurn();
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function refreshOperationCard(item: HTMLLIElement): void {
-  if (updateTranscriptBounded(item)) item.scrollIntoView({ block: "nearest" });
+  if (updateTranscriptBounded(item)) conversationHistory.follow();
 }
 
 function projectTaskStateCard(event: PublicEvent): void {
@@ -536,6 +552,31 @@ function projectTaskStateCard(event: PublicEvent): void {
     return;
   }
   let view = taskCardViews.get(taskId);
+  // A cancellation refusal is command feedback, not a new task lifecycle.
+  if (status === "rejected" && view !== undefined && conversationHistory.isActive(view.item)) {
+    return;
+  }
+  const live = status === "active" || status === "cancelling";
+  if (live && (view === undefined || !conversationHistory.isActive(view.item))) {
+    const activeCount = [...taskCardViews.values()].filter((card) =>
+      conversationHistory.isActive(card.item),
+    ).length;
+    if (activeCount >= 256) {
+      try {
+        let notice = document.querySelector<HTMLElement>(".history-capacity-notice");
+        if (notice === null) {
+          notice = document.createElement("span");
+          notice.className = "history-capacity-notice";
+          notice.setAttribute("role", "status");
+          transcript.closest(".conversation-panel")?.querySelector(".panel-header")?.append(notice);
+        }
+        notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
+        return;
+      } finally {
+        console.info(`[history-capacity] ${JSON.stringify({ activeCount, limit: 256, category: "active_task_capacity" })}`);
+      }
+    }
+  }
   if (view === undefined || !view.item.isConnected) {
     const item = document.createElement("li");
     item.dataset.role = "operation";
@@ -561,9 +602,17 @@ function projectTaskStateCard(event: PublicEvent): void {
       startedServerMs: event.monotonicMs,
       currentStatus: status,
       timer: null,
+      result: null,
     };
     taskCardViews.set(taskId, view);
+    conversationHistory.setActive(item, live);
     admitOperationCard(item);
+  }
+  const wasLive = conversationHistory.isActive(view.item);
+  conversationHistory.setActive(view.item, live);
+  if (live) transcriptRetention.remove(view.item);
+  else if (wasLive) {
+    disposeTranscriptEvictions(transcriptRetention.admit(view.item, retainedDomCost(view.item)));
   }
   view.item.dataset.status = status;
   view.currentStatus = status;
@@ -709,7 +758,7 @@ function addUserTranscript(text: string): void {
   updateTranscriptBounded(view.item);
   if (!view.item.isConnected) activeUserTurn = null;
   syncTranscriptEmptyState();
-  view.item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function projectUserTranscript(source: UserTranscriptProjectionSource, text: string): void {
@@ -755,7 +804,7 @@ function updatePartialTranscript(role: "user" | "assistant", text: string): void
   const value = document.createElement("em");
   value.textContent = text;
   partialTranscriptItem.replaceChildren(label, value);
-  partialTranscriptItem.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 interface AssistantSegmentView {
@@ -952,7 +1001,7 @@ function renderAssistantTurnState(view: AssistantTurnView): void {
       snapshot.state === "interrupted" && unspoken.has(chunkId),
     );
   }
-  if (refreshAssistantRetention(view)) view.item.scrollIntoView({ block: "nearest" });
+  if (refreshAssistantRetention(view)) conversationHistory.follow();
 }
 
 function admitAssistantSegment(event: PublicEvent, text: string): boolean {
@@ -1495,7 +1544,6 @@ function maybeStartKaraoke(streamId: string): void {
       current?.classList.remove("karaoke-pending");
       current?.classList.add("karaoke-active");
       projectKaraokeGaps(segment, index);
-      current?.scrollIntoView({ block: "nearest", inline: "nearest" });
       activeKaraokeIndex = index;
     }
     activeKaraokeFrame = window.requestAnimationFrame(tick);
@@ -1663,10 +1711,7 @@ function projectPublicEvent(event: PublicEvent): void {
   } else if (event.kind === "task_state") {
     projectTaskStateCard(event);
   } else if (event.kind === "task_result") {
-    const text = event.data.text;
-    if (typeof text === "string" && text.trim().length > 0) {
-      addBackgroundResult(text);
-    }
+    projectTaskResult(event);
   } else if (event.kind === "approval_state") {
     projectApprovalCard(event.data);
   }
@@ -3239,7 +3284,8 @@ async function stop(): Promise<void> {
     view.status.textContent = "Session stopped before a decision.";
   }
   approvalCardViews.clear();
-  taskCardViews.clear();
+  // Media disconnect leaves durable work alive. Preserve exact-card identity
+  // for the task state/result replay when the browser next connects.
   speechFields.forEach((field, index) => {
     field.textContent = index % 2 === 0 ? "Awaiting session" : "—";
   });
