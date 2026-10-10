@@ -546,11 +546,15 @@ class ConversationWorkControlSurface:
         ):
             self._mark_uncertain_locked()
             return WorkCommandAdmission.UNAVAILABLE
-        return (
-            WorkCommandAdmission.ADMITTED
-            if admission.command_admitted
-            else WorkCommandAdmission.REFUSED
-        )
+        if admission.command_admitted:
+            return WorkCommandAdmission.ADMITTED
+        try:
+            return WorkCommandAdmission.REFUSED
+        finally:
+            print(
+                "[task-command-refused] "
+                + json.dumps({"kind": kind, "count": 1}, separators=(",", ":"))
+            )
 
     def _report_deferred_failure(self, operation: asyncio.Task[Any], *, kind: str) -> None:
         if not operation.cancelled() and operation.exception() is None:

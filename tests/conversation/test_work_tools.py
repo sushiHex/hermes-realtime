@@ -156,7 +156,7 @@ async def test_command_admission_preserves_final_order_before_acknowledgments() 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refusal", ("duplicate", "capacity", "stale-cancel"))
-async def test_command_admission_refuses_known_rejection_before_ack(refusal: str) -> None:
+async def test_command_admission_refuses_known_rejection_before_ack(refusal: str, capsys) -> None:
     context = ConversationContextStore(max_active_tasks=1)
     context.record_task_accepted(
         task_id="task_existing", run_id="deleg_fixture", objective="Synthetic work"
@@ -176,6 +176,10 @@ async def test_command_admission_refuses_known_rejection_before_ack(refusal: str
     assert controller.dispatches == []
     assert controller.cancellations == []
     assert [data["status"] for _, data in events] == ["rejected"]
+    kind = "cancel" if refusal == "stale-cancel" else "start"
+    assert capsys.readouterr().out == (
+        '[task-command-refused] {"kind":"' + kind + '","count":1}\n'
+    )
 
 
 @pytest.mark.asyncio
