@@ -47,13 +47,16 @@ async def request(app, token, body, **changes):
 
 
 @pytest.mark.asyncio
-async def test_output_style_authenticated_selection_has_no_work_side_effect() -> None:
+async def test_output_style_authenticated_selection_has_no_work_side_effect(capsys) -> None:
     selection, director, app = setup()
     credential = await director.start()
     reply = await request(app, credential.token, b'{"style":"learning"}')
     assert json.loads(reply.body) == {"version": 1, "selectedStyle": "learning"}
     assert selection.get() == "learning"
     assert director._active_generation == 1
+    assert capsys.readouterr().out.splitlines() == [
+        '[output-style] {"accepted":true,"version":1}'
+    ]
     await director.stop(participant_identity=credential.participant_identity)
 
 
@@ -61,12 +64,34 @@ async def test_output_style_authenticated_selection_has_no_work_side_effect() ->
     b'{"style":"concise","authority":true}', b'{"style":"default","style":"concise"}',
     b'{}', b'[]', b'\xff', b'x' * 257, b'', b' ' * 257 + b'{"style":"default"}'])
 @pytest.mark.asyncio
-async def test_output_style_refuses_invalid_requests(body) -> None:
+async def test_output_style_refuses_invalid_requests(body, capsys) -> None:
     selection, director, app = setup()
     credential = await director.start()
     with pytest.raises((ValueError, TypeError)):
         await request(app, credential.token, body)
     assert selection.get() == "default"
+    assert capsys.readouterr().out.splitlines() == [
+        '[output-style] {"accepted":false,"category":"malformed_input","version":1}'
+    ]
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.parametrize("path", ["/api/v1/refresh", "/api/v1/voice"])
+@pytest.mark.asyncio
+async def test_output_style_evidence_does_not_mark_unrelated_requests(path, capsys) -> None:
+    _selection, director, app = setup()
+    credential = await director.start()
+    headers = {
+        "origin": "http://127.0.0.1:8765", "authorization": f"Bearer {credential.token}",
+        "content-length": "0",
+    }
+    if path == "/api/v1/voice":
+        with pytest.raises(ValueError):
+            await app.handle(method="POST", path=path, headers=headers, body=b"")
+    else:
+        reply = await app.handle(method="POST", path=path, headers=headers, body=b"")
+        assert reply.status == 200
+    assert capsys.readouterr().out == ""
     await director.stop(participant_identity=credential.participant_identity)
 
 
@@ -103,14 +128,67 @@ async def test_output_style_requires_exact_participant_identity() -> None:
     await director.stop(participant_identity=credential.participant_identity)
 
 
-@pytest.mark.parametrize("changes", [{"origin":"http://other.test"},
-                                     {"authorization":"Bearer invalid"},
-                                     {"content-type":"text/plain"}])
+@pytest.mark.parametrize(("changes", "category"), [
+    ({"origin":"http://other.test"}, "authentication_or_binding"),
+    ({"authorization":"Bearer invalid"}, "authentication_or_binding"),
+    ({"authorization":"invalid"}, "authentication_or_binding"),
+    ({"content-type":"text/plain"}, "malformed_input"),
+    ({"content-length":"999"}, "malformed_input"),
+])
 @pytest.mark.asyncio
-async def test_output_style_requires_authenticated_same_origin_json(changes) -> None:
+async def test_output_style_requires_authenticated_same_origin_json(
+    changes, category, capsys,
+) -> None:
     selection, director, app = setup()
     credential = await director.start()
     with pytest.raises((ValueError, PermissionError)):
         await request(app, credential.token, b'{"style":"concise"}', **changes)
     assert selection.get() == "default"
+    assert capsys.readouterr().out.splitlines() == [
+        '[output-style] ' + json.dumps(
+            {"accepted": False, "category": category, "version": 1}, separators=(",", ":"),
+        )
+    ]
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.parametrize(("failure", "category", "error"), [
+    ("binding", "authentication_or_binding", PermissionError),
+    ("absent_identity", "absent_session", RuntimeError),
+    ("absent_generation", "absent_session", RuntimeError),
+    ("unavailable", "unavailable_or_selection_failure", RuntimeError),
+    ("selector_value_error", "unavailable_or_selection_failure", ValueError),
+])
+@pytest.mark.asyncio
+async def test_output_style_session_refusals_emit_only_bounded_category(
+    failure, category, error, capsys,
+) -> None:
+    selection, director, app = setup()
+    credential = await director.start()
+    identity, generation, selector = (
+        director._active_identity, director._active_generation, director._select_output_style,
+    )
+    if failure == "binding":
+        director._active_identity = "browser_fedcba9876543210"
+    elif failure == "absent_identity":
+        director._active_identity = None
+    elif failure == "absent_generation":
+        director._active_generation = None
+    elif failure == "unavailable":
+        director._select_output_style = None
+    else:
+        def refuse(_style):
+            raise ValueError("Synthetic private reason must not be emitted")
+        director._select_output_style = refuse
+    with pytest.raises(error):
+        await request(app, credential.token, b'{"style":"concise"}')
+    assert selection.get() == "default"
+    assert capsys.readouterr().out.splitlines() == [
+        '[output-style] ' + json.dumps(
+            {"accepted": False, "category": category, "version": 1}, separators=(",", ":"),
+        )
+    ]
+    director._active_identity, director._active_generation, director._select_output_style = (
+        identity, generation, selector,
+    )
     await director.stop(participant_identity=credential.participant_identity)
