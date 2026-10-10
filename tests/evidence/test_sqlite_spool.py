@@ -9281,28 +9281,7 @@ def assert_task_5d_single_winner_consent_resume(
     start_event = create_event(None, True, False, start_event_name)
     if not start_event:
         raise ctypes.WinError(ctypes.get_last_error())
-    contenders = [
-        subprocess.Popen(
-            [
-                str(executable),
-                "-I",
-                str(worker),
-                "--case-root",
-                str(case_root),
-                "--marker-only-contender",
-                str(contender_id),
-                "--start-event",
-                start_event_name,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            env=environment,
-        )
-        for contender_id in range(2)
-    ]
+    contenders: list[subprocess.Popen[str]] = []
 
     def bounded_line(process: subprocess.Popen[str], label: str) -> str:
         stdout = process.stdout
@@ -9327,7 +9306,7 @@ def assert_task_5d_single_winner_consent_resume(
             )
         return line
 
-    def frame(process: subprocess.Popen[str], label: str) -> dict[str, object]:
+    def frame(process: subprocess.Popen[str], label: str, expected_id: int) -> dict[str, object]:
         try:
             decoded = json.loads(bounded_line(process, label))
         except json.JSONDecodeError:
@@ -9340,18 +9319,61 @@ def assert_task_5d_single_winner_consent_resume(
                 f"Task 5D contender {label} emitted a non-object protocol frame",
                 pytrace=False,
             )
+        if decoded.get("state") == "FAILED":
+            from spool_crash_worker import CONTENDER_FAILURE_CATEGORIES, CONTENDER_FAILURE_STAGES
+
+            if not (
+                set(decoded) == {"contenderId", "protocolVersion", "state", "stage", "category"}
+                and type(decoded["contenderId"]) is int
+                and decoded["contenderId"] == expected_id
+                and type(decoded["protocolVersion"]) is int
+                and decoded["protocolVersion"] == 1
+                and type(decoded["stage"]) is str
+                and decoded["stage"] in CONTENDER_FAILURE_STAGES
+                and type(decoded["category"]) is str
+                and decoded["category"] in CONTENDER_FAILURE_CATEGORIES
+            ):
+                pytest.fail("Task 5D contender emitted an invalid failure frame", pytrace=False)
+            pytest.fail(
+                f"Task 5D contender failed at {decoded['stage']} ({decoded['category']})",
+                pytrace=False,
+            )
         return cast(dict[str, object], decoded)
 
     try:
-        ready = [frame(process, f"ready-{index}") for index, process in enumerate(contenders)]
+        for contender_id in range(2):
+            contenders.append(
+                subprocess.Popen(
+                    [
+                        str(executable),
+                        "-I",
+                        str(worker),
+                        "--case-root",
+                        str(case_root),
+                        "--marker-only-contender",
+                        str(contender_id),
+                        "--start-event",
+                        start_event_name,
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    env=environment,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+            )
+        ready = [
+            frame(process, f"ready-{index}", index) for index, process in enumerate(contenders)
+        ]
         assert ready == [
-            {"contenderId": index, "protocolVersion": 1, "state": "ARMED"}
-            for index in range(2)
+            {"contenderId": index, "protocolVersion": 1, "state": "ARMED"} for index in range(2)
         ]
         if not set_event(start_event):
             raise ctypes.WinError(ctypes.get_last_error())
         terminal = [
-            frame(process, f"terminal-{index}") for index, process in enumerate(contenders)
+            frame(process, f"terminal-{index}", index) for index, process in enumerate(contenders)
         ]
         outcomes: list[tuple[str, bool]] = []
         for item in terminal:
@@ -9360,31 +9382,83 @@ def assert_task_5d_single_winner_consent_resume(
             assert type(item["ownershipRefusal"]) is bool
             assert item["protocolVersion"] == 1
             assert item["state"] == "TERMINAL"
-            outcomes.append(
-                (cast(str, item["disposition"]), cast(bool, item["ownershipRefusal"]))
-            )
+            outcomes.append((cast(str, item["disposition"]), cast(bool, item["ownershipRefusal"])))
         assert sorted(item["contenderId"] for item in terminal) == [0, 1]
         assert sorted(outcomes) == [("committed", False), ("faulted", True)]
     finally:
-        # Idempotently release any child that reached the shared boundary before
-        # an earlier protocol assertion failed, so cleanup never strands it.
-        set_event(start_event)
-        for process in contenders:
-            if process.poll() is None and process.stdin is not None:
-                process.stdin.write("CLOSE\n")
-                process.stdin.flush()
+        # Poll is not a writable-pipe guarantee. One owner attempts every resource
+        # even when an earlier close fails, without replacing the protocol failure.
+        primary_failure = sys.exc_info()[0] is not None
+        failures: list[str] = []
+        exits: list[dict[str, object]] = []
+        try:
+            if not set_event(start_event):
+                failures.append("release")
+        except Exception:
+            failures.append("release")
         for process in contenders:
             try:
-                assert process.wait(timeout=10) == 0
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
-                pytest.fail(
-                    "Task 5D contender did not reap within its bounded close",
-                    pytrace=False,
+                if process.poll() is None and process.stdin is not None:
+                    process.stdin.write("CLOSE\n")
+                    process.stdin.flush()
+            except Exception:
+                failures.append("send")
+        for process in contenders:
+            code = None
+            try:
+                code = process.wait(timeout=10)
+            except Exception as error:
+                failures.append(
+                    "wait_timeout" if isinstance(error, subprocess.TimeoutExpired) else "wait"
                 )
-        if not close_handle(start_event):
-            raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    process.kill()
+                except Exception:
+                    failures.append("kill")
+                try:
+                    code = process.wait(timeout=10)
+                except Exception:
+                    failures.append("reap")
+            finally:
+                for pipe in (process.stdin, process.stdout):
+                    if pipe is not None:
+                        if pipe is process.stdout and code is None:
+                            # Its daemon reader may own the buffered read lock.
+                            failures.append("stdout_unreaped")
+                            continue
+                        try:
+                            pipe.close()
+                        except Exception:
+                            failures.append("pipe_close")
+            exits.append({
+                "category": "unreaped" if code is None else "zero" if code == 0 else "nonzero",
+                "returncode": code,
+            })
+            if code is not None and code != 0:
+                failures.append("nonzero_exit")
+        try:
+            if not close_handle(start_event):
+                failures.append("handle_close")
+        except Exception:
+            failures.append("handle_close")
+        try:
+            print(
+                "[task-5d-contender-cleanup] "
+                + json.dumps(
+                    {
+                        "children": len(contenders),
+                        "exits": exits,
+                        "failures": failures,
+                        "primaryFailure": primary_failure,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        except (OSError, ValueError):
+            failures.append("report")
+        if failures and not primary_failure:
+            pytest.fail("Task 5D contender cleanup failed", pytrace=False)
 
     assert marker.read_bytes() == original_marker
     assert storage_security.parse_root_marker(marker.read_bytes()) == original_root_id
