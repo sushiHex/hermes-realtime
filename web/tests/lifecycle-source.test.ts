@@ -19,10 +19,10 @@ describe("reloaded tab rebind wiring", () => {
     const body = mainSource.slice(setter, setterEnd);
     expect(body).toContain("if (stableLaunch && value !== null) {");
     expect(body).toContain(
-      "rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });",
+      "rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });",
     );
     // Transient failures retain the remembered identity; definitive rebind and stop clear it.
-    const forget = "if (stableLaunch) rememberSession(tabStorage(), null);";
+    const forget = "if (stableLaunch) rememberSession(sessionRecoveryStorage, null);";
     expect(mainSource.split(forget)).toHaveLength(3);
     expect(mainSource.match(/rememberSession\(/g)).toHaveLength(3);
     const stop = mainSource.indexOf("async function stop(");
@@ -49,7 +49,7 @@ describe("reloaded tab rebind wiring", () => {
     // The verdict rules live in reloadOrBootstrap, tested behaviorally in controller.test.ts.
     expect(body).toContain("if (!stableLaunch) return bootstrap(signal);");
     expect(body).toContain("const result = await reloadOrBootstrap({");
-    expect(body).toContain("storage: tabStorage(),");
+    expect(body).toContain("storage: sessionRecoveryStorage,");
   });
 
   it("never lets a leaving page reconnect the session it is leaving", () => {
@@ -220,7 +220,13 @@ describe("browser lifecycle wiring", () => {
     const reconnectStart = mainSource.indexOf("const rebindRequestId =");
     const reconnectEnd = mainSource.indexOf("pendingRebindRequestId = null;", reconnectStart);
     const reconnect = mainSource.slice(reconnectStart, reconnectEnd);
-    expect(reconnect).toContain("if (!sessionReplaced) resetSessionInputAuthority();");
+    // Ordinary rebind renews search/media authority while retaining session counters.
+    expect(reconnect).toContain("if (!sessionReplaced) resetBindingInputAuthority();");
+    const bindingResetStart = mainSource.indexOf("function resetBindingInputAuthority(");
+    const bindingReset = mainSource.slice(
+      bindingResetStart, mainSource.indexOf("\n}\n", bindingResetStart),
+    );
+    expect(bindingReset).toContain("searchEgressControls.reset()");
     expect(mainSource).toContain("async function submitSearchEgressControl(");
     const submitStart = mainSource.indexOf("async function submitSearchEgressControl(");
     const submitEnd = mainSource.indexOf("\n}\n", submitStart);
