@@ -47,6 +47,91 @@ async def request(app, token, body, **changes):
 
 
 @pytest.mark.asyncio
+async def test_fresh_session_resets_style_before_provision() -> None:
+    selection, director, _app = setup()
+    observed = []
+
+    async def provision(_identity):
+        observed.append(selection.get())
+        return len(observed)
+
+    director._provision = provision
+    selection.select("learning")
+    first = await director.start()
+    assert observed == ["default"]
+    await director.change_output_style(participant_identity=first.participant_identity,
+                                       style="learning")
+    await director.stop(participant_identity=first.participant_identity)
+    second = await director.start()
+    assert observed == ["default", "default"]
+    assert selection.get() == "default"
+    await director.stop(participant_identity=second.participant_identity)
+
+
+@pytest.mark.asyncio
+async def test_active_start_refusal_and_ordinary_rebind_preserve_style() -> None:
+    selection, director, _app = setup()
+    identities = iter(("browser_0123456789abcdef", "browser_fedcba9876543210"))
+    director._issuer._identity_factory = lambda: next(identities)
+
+    async def reprovision(_identity):
+        assert selection.get() == "learning"
+        return 2
+
+    director._reprovision = reprovision
+    first = await director.start()
+    await director.change_output_style(participant_identity=first.participant_identity,
+                                       style="learning")
+    with pytest.raises(RuntimeError, match="already active"):
+        await director.start()
+    assert selection.get() == "learning"
+    rebound = await director.rebind(participant_identity=first.participant_identity,
+                                    request_id="rebind_0123456789abcdef")
+    assert selection.get() == "learning"
+    await director.stop(participant_identity=rebound.participant_identity)
+
+
+@pytest.mark.asyncio
+async def test_fresh_style_reset_failure_refuses_before_worker_and_emits_category(capsys) -> None:
+    selection, director, _app = setup()
+    provisioned = []
+
+    async def provision(identity):
+        provisioned.append(identity)
+        return 1
+
+    def refuse(_style):
+        raise ValueError("Synthetic private reset failure")
+
+    director._provision = provision
+    director._select_output_style = refuse
+    with pytest.raises(ValueError):
+        await director.start()
+    assert provisioned == []
+    assert director.active_identity is None
+    assert director.active_generation is None
+    assert capsys.readouterr().out.splitlines() == [
+        '[output-style] {"accepted":false,"category":"unavailable_or_selection_failure",'
+        '"version":1}'
+    ]
+    director._select_output_style = selection.select
+    credential = await director.start()
+    assert len(provisioned) == 1
+    assert selection.get() == "default"
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.asyncio
+async def test_fresh_session_without_optional_style_selector_still_starts(capsys) -> None:
+    _selection, director, _app = setup()
+    director._select_output_style = None
+    credential = await director.start()
+    assert director.active_generation == 1
+    assert capsys.readouterr().out == ""
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.asyncio
 async def test_output_style_authenticated_selection_has_no_work_side_effect(capsys) -> None:
     selection, director, app = setup()
     credential = await director.start()

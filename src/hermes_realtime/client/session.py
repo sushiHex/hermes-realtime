@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import re
@@ -833,6 +834,18 @@ class BrowserSessionDirector:
             )
             self._touch_activity()
             credential = self._issuer.issue()
+            selector = self._select_output_style
+            if selector is not None:
+                style_reset = False
+                try:
+                    selector("default")
+                    style_reset = True
+                finally:
+                    if not style_reset:
+                        print("[output-style] " + json.dumps(
+                            {"accepted": False, "category": "unavailable_or_selection_failure",
+                             "version": 1}, separators=(",", ":"),
+                        ), flush=True)
             generation = await self._provision(credential.participant_identity)
             if type(generation) is not int:
                 raise TypeError("provision must return an exact integer generation")
