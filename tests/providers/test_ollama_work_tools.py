@@ -416,3 +416,46 @@ async def test_cancel_after_local_enqueue_before_shared_handler_entry_preserves_
         await result
     assert len(handler.calls) == 1
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["closed", "cancelled", "ownership"])
+async def test_each_before_admission_ownership_guard_blocks_dispatch_independently(state) -> None:
+    inference, handler, _, _ = adapter([
+        {"message": {"tool_calls": [call()]}, "done": True}])
+
+    def retire_after_read(messages, count):
+        if state == "closed":
+            inference._closed = True
+        elif state == "cancelled":
+            inference._cancelled_turns.add("turn_test")
+        else:
+            inference._responses.pop("turn_test")
+
+    inference._report_prompt = retire_after_read
+    with pytest.raises(RuntimeError, match="before_admission"):
+        await collect(inference)
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["closed", "cancelled"])
+async def test_each_after_admission_cancellation_guard_suppresses_speech_independently(
+    state
+) -> None:
+    inference, handler, _, _ = adapter([
+        {"message": {"tool_calls": [call()]}, "done": True}])
+    start = handler.start_work
+
+    async def retire_after_start(**kwargs):
+        result = await start(**kwargs)
+        if state == "closed":
+            inference._closed = True
+        else:
+            inference._cancelled_turns.add("turn_test")
+        return result
+
+    handler.start_work = retire_after_start
+    with pytest.raises(RuntimeError, match="after_admission"):
+        await collect(inference)
+    assert len(handler.calls) == 1
+
