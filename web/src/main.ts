@@ -9,6 +9,7 @@ import {
   type RemoteTrack,
   type RemoteTrackPublication,
 } from "livekit-client";
+import { ConversationHistory } from "./conversation-history";
 
 import {
   ApprovalDecisionController,
@@ -144,6 +145,7 @@ const typedForm = element<HTMLFormElement>("typed-form");
 const typedInput = element<HTMLTextAreaElement>("typed-input");
 const sendButton = element<HTMLButtonElement>("send");
 const transcript = element<HTMLOListElement>("transcript");
+const conversationHistory = new ConversationHistory(transcript.parentElement!);
 const transcriptEmpty = element<HTMLDivElement>("transcript-empty");
 const readinessHeadline = element<HTMLHeadingElement>("readiness-headline");
 const readinessDetail = element<HTMLParagraphElement>("readiness-detail");
@@ -364,11 +366,19 @@ const connectionRequestTimeoutMs = 10_000;
 const approvalController = new ApprovalDecisionController(
   async (sequence, approvalId, decision) => {
     const activeCredential = credential;
-    if (activeCredential === null) throw new Error("browser session is not connected");
+    const view = approvalCardViews.get(approvalId);
+    if (view === undefined || !approvalCardHasAuthority(view) ||
+      view.pendingDecision?.participantIdentity !== activeCredential?.participantIdentity) {
+      try {
+        throw new Error("approval connection authority is unavailable");
+      } finally {
+        console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "connection_changed" })}`);
+      }
+    }
     const response = await fetch("/api/v1/approval", {
       method: "POST",
       headers: {
-        ...authorization(activeCredential.token),
+        ...authorization(activeCredential!.token),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ approvalId, decision, sequence }),
@@ -425,19 +435,29 @@ function addTranscript(
   item.append(label, document.createTextNode(text));
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
-function addBackgroundResult(text: string): void {
-  closeActiveUserTurn();
-  const item = document.createElement("li");
-  item.dataset.role = "task-result";
-  const label = document.createElement("strong");
-  label.textContent = "Background result: ";
-  item.append(label, document.createTextNode(text));
-  appendTranscriptBounded(item);
-  syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+function projectTaskResult(event: PublicEvent): void {
+  const { taskId, text } = event.data;
+  if (typeof taskId !== "string" || typeof text !== "string" || !text.trim()) return;
+  projectTaskStateCard(event);
+  const view = taskCardViews.get(taskId);
+  if (view === undefined) return;
+  if (view.result === null) {
+    const disclosure = document.createElement("details");
+    disclosure.className = "task-result";
+    const summary = document.createElement("summary");
+    summary.textContent = "Task result";
+    const content = document.createElement("p");
+    content.className = "operation-detail";
+    disclosure.append(summary, content);
+    view.item.append(disclosure);
+    view.result = content;
+    disclosure.addEventListener("toggle", () => conversationHistory.refresh());
+  }
+  view.result.textContent = text;
+  refreshOperationCard(view.item);
 }
 
 interface TaskCardView {
@@ -448,6 +468,7 @@ interface TaskCardView {
   readonly startedServerMs: number;
   currentStatus: string;
   timer: number | null;
+  result: HTMLParagraphElement | null;
 }
 
 interface ApprovalCardView {
@@ -456,6 +477,9 @@ interface ApprovalCardView {
   readonly status: HTMLParagraphElement;
   readonly approve: HTMLButtonElement;
   readonly reject: HTMLButtonElement;
+  actionable: boolean;
+  participantIdentity: string | null;
+  pendingDecision: { readonly participantIdentity: string } | null;
 }
 
 const taskCardViews = new Map<string, TaskCardView>();
@@ -467,17 +491,22 @@ const approvalCardViews = new Map<string, ApprovalCardView>();
 
 function actionableApprovalCard(item: HTMLLIElement): boolean {
   for (const view of approvalCardViews.values()) {
-    if (view.item === item) return true;
+    if (view.item === item && view.actionable) return true;
   }
   return false;
 }
 
-function forgetEvictedTaskCard(item: HTMLLIElement): void {
+function forgetEvictedOperationCard(item: HTMLLIElement): void {
+  const approvalId = item.dataset.approvalId;
+  if (approvalId !== undefined && approvalCardViews.get(approvalId)?.item === item) {
+    approvalCardViews.delete(approvalId);
+  }
   const taskId = item.dataset.taskId;
   if (taskId === undefined) return;
   const view = taskCardViews.get(taskId);
   if (view?.item === item) {
     if (view.timer !== null) window.clearInterval(view.timer);
+    conversationHistory.forget(item);
     taskCardViews.delete(taskId);
   }
 }
@@ -494,18 +523,20 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
       pending.push(...transcriptRetention.admit(obsolete, retainedDomCost(obsolete)));
       continue;
     }
-    forgetEvictedTaskCard(obsolete);
+    forgetEvictedOperationCard(obsolete);
     obsolete.remove();
   }
 }
 
 function appendTranscriptBounded(item: HTMLLIElement): void {
   transcript.append(item);
+  if (conversationHistory.isActive(item)) return;
   disposeTranscriptEvictions(transcriptRetention.admit(item, retainedDomCost(item)));
 }
 
 function updateTranscriptBounded(item: HTMLLIElement): boolean {
   if (!item.isConnected) return false;
+  if (conversationHistory.isActive(item)) return true;
   disposeTranscriptEvictions(transcriptRetention.update(item, retainedDomCost(item)));
   return item.isConnected;
 }
@@ -514,11 +545,11 @@ function admitOperationCard(item: HTMLLIElement): void {
   closeActiveUserTurn();
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function refreshOperationCard(item: HTMLLIElement): void {
-  if (updateTranscriptBounded(item)) item.scrollIntoView({ block: "nearest" });
+  if (updateTranscriptBounded(item)) conversationHistory.follow();
 }
 
 function projectTaskStateCard(event: PublicEvent): void {
@@ -536,6 +567,31 @@ function projectTaskStateCard(event: PublicEvent): void {
     return;
   }
   let view = taskCardViews.get(taskId);
+  // A cancellation refusal is command feedback, not a new task lifecycle.
+  if (status === "rejected" && view !== undefined && conversationHistory.isActive(view.item)) {
+    return;
+  }
+  const live = status === "active" || status === "cancelling";
+  if (live && (view === undefined || !conversationHistory.isActive(view.item))) {
+    const activeCount = [...taskCardViews.values()].filter((card) =>
+      conversationHistory.isActive(card.item),
+    ).length;
+    if (activeCount >= 256) {
+      try {
+        let notice = document.querySelector<HTMLElement>(".history-capacity-notice");
+        if (notice === null) {
+          notice = document.createElement("span");
+          notice.className = "history-capacity-notice";
+          notice.setAttribute("role", "status");
+          transcript.closest(".conversation-panel")?.querySelector(".panel-header")?.append(notice);
+        }
+        notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
+        return;
+      } finally {
+        console.info(`[history-capacity] ${JSON.stringify({ activeCount, limit: 256, category: "active_task_capacity" })}`);
+      }
+    }
+  }
   if (view === undefined || !view.item.isConnected) {
     const item = document.createElement("li");
     item.dataset.role = "operation";
@@ -561,9 +617,17 @@ function projectTaskStateCard(event: PublicEvent): void {
       startedServerMs: event.monotonicMs,
       currentStatus: status,
       timer: null,
+      result: null,
     };
     taskCardViews.set(taskId, view);
+    conversationHistory.setActive(item, live);
     admitOperationCard(item);
+  }
+  const wasLive = conversationHistory.isActive(view.item);
+  conversationHistory.setActive(view.item, live);
+  if (live) transcriptRetention.remove(view.item);
+  else if (wasLive) {
+    disposeTranscriptEvictions(transcriptRetention.admit(view.item, retainedDomCost(view.item)));
   }
   view.item.dataset.status = status;
   view.currentStatus = status;
@@ -594,7 +658,8 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   if (!actionable) {
     const view = approvalCardViews.get(approvalId);
     if (view === undefined) return;
-    approvalCardViews.delete(approvalId);
+    view.actionable = false;
+    view.pendingDecision = null;
     view.approve.disabled = true;
     view.reject.disabled = true;
     view.item.dataset.status = state;
@@ -617,11 +682,19 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   }
 
   const existing = approvalCardViews.get(approvalId);
-  if (existing !== undefined && existing.item.isConnected) return;
+  if (existing !== undefined && existing.item.isConnected) {
+    if (!approvalController.isSubmittingApproval(approvalId)) existing.pendingDecision = null;
+    existing.actionable = true;
+    existing.participantIdentity = credential?.participantIdentity ?? null;
+    existing.item.dataset.status = state;
+    renderApprovalCardAuthority(existing);
+    return;
+  }
 
   const item = document.createElement("li");
   item.dataset.role = "operation";
   item.dataset.operation = "approval";
+  item.dataset.approvalId = approvalId;
   item.dataset.status = state;
   const label = document.createElement("strong");
   label.textContent = "Approval required";
@@ -649,7 +722,10 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   reject.textContent = "Reject";
   controls.append(approve, reject);
   item.append(label, title, status, commandView, meta, controls);
-  const view = { approvalId, item, status, approve, reject };
+  const view: ApprovalCardView = {
+    approvalId, item, status, approve, reject, actionable: true,
+    participantIdentity: credential?.participantIdentity ?? null, pendingDecision: null,
+  };
   approvalCardViews.set(approvalId, view);
   // Disable this card's controls for the whole round trip. Without this a
   // double-click, or Approve immediately followed by Reject, issues two
@@ -660,17 +736,29 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
     reject.disabled = true;
     void submitApproval(approvalId, decision).catch(() => {
       addMarker("approval_failed");
-      // A failed decision consumes no sequence, so it may be retried. Restore
-      // the controls only while this request is still awaiting a decision.
-      if (approvalCardViews.get(approvalId) === view) {
-        approve.disabled = false;
-        reject.disabled = false;
-      }
     });
   };
   approve.addEventListener("click", () => submitDecision("approve"));
   reject.addEventListener("click", () => submitDecision("reject"));
+  renderApprovalCardAuthority(view);
   admitOperationCard(item);
+}
+
+function approvalCardHasAuthority(view: ApprovalCardView): boolean {
+  return view.actionable && controller.state === "connected" &&
+    view.participantIdentity === credential?.participantIdentity;
+}
+
+function renderApprovalCardAuthority(view: ApprovalCardView): void {
+  const enabled = approvalCardHasAuthority(view) && view.pendingDecision === null;
+  view.approve.disabled = !enabled;
+  view.reject.disabled = !enabled;
+  if (view.actionable) {
+    view.status.textContent = !approvalCardHasAuthority(view)
+      ? "Reconnect to review this approval."
+      : view.pendingDecision !== null ? "Submitting decision…"
+      : "Review the requested command before continuing.";
+  }
 }
 
 let partialTranscriptItem: HTMLLIElement | null = null;
@@ -709,7 +797,7 @@ function addUserTranscript(text: string): void {
   updateTranscriptBounded(view.item);
   if (!view.item.isConnected) activeUserTurn = null;
   syncTranscriptEmptyState();
-  view.item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function projectUserTranscript(source: UserTranscriptProjectionSource, text: string): void {
@@ -755,7 +843,7 @@ function updatePartialTranscript(role: "user" | "assistant", text: string): void
   const value = document.createElement("em");
   value.textContent = text;
   partialTranscriptItem.replaceChildren(label, value);
-  partialTranscriptItem.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 interface AssistantSegmentView {
@@ -817,7 +905,10 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
   request: requestVoiceDeleteWire,
   clear: () => {
     clearPartialTranscript();
-    transcript.replaceChildren();
+    for (const item of conversationHistory.clearTranscript(transcript, actionableApprovalCard)) {
+      transcriptRetention.remove(item);
+      forgetEvictedOperationCard(item);
+    }
     assistantTurns.clear();
     syncTranscriptEmptyState();
   },
@@ -952,7 +1043,7 @@ function renderAssistantTurnState(view: AssistantTurnView): void {
       snapshot.state === "interrupted" && unspoken.has(chunkId),
     );
   }
-  if (refreshAssistantRetention(view)) view.item.scrollIntoView({ block: "nearest" });
+  if (refreshAssistantRetention(view)) conversationHistory.follow();
 }
 
 function admitAssistantSegment(event: PublicEvent, text: string): boolean {
@@ -1495,7 +1586,6 @@ function maybeStartKaraoke(streamId: string): void {
       current?.classList.remove("karaoke-pending");
       current?.classList.add("karaoke-active");
       projectKaraokeGaps(segment, index);
-      current?.scrollIntoView({ block: "nearest", inline: "nearest" });
       activeKaraokeIndex = index;
     }
     activeKaraokeFrame = window.requestAnimationFrame(tick);
@@ -1663,10 +1753,7 @@ function projectPublicEvent(event: PublicEvent): void {
   } else if (event.kind === "task_state") {
     projectTaskStateCard(event);
   } else if (event.kind === "task_result") {
-    const text = event.data.text;
-    if (typeof text === "string" && text.trim().length > 0) {
-      addBackgroundResult(text);
-    }
+    projectTaskResult(event);
   } else if (event.kind === "approval_state") {
     projectApprovalCard(event.data);
   }
@@ -1756,6 +1843,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function setInteractive(connected: boolean): void {
+  for (const view of approvalCardViews.values()) renderApprovalCardAuthority(view);
   muteButton.disabled = !connected || activeMicrophoneTrack === null || microphoneMutePending;
   typedInput.disabled = !connected;
   sendButton.disabled = !connected;
@@ -2336,8 +2424,12 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
 
 function resetSessionInputAuthority(): void {
   inputSequence = 0;
-  microphoneProcessingEvidence = null;
   approvalController.reset();
+  resetBindingInputAuthority();
+}
+
+function resetBindingInputAuthority(): void {
+  microphoneProcessingEvidence = null;
   evidenceControls.reset();
   searchEgressControls.reset();
 }
@@ -2896,7 +2988,14 @@ async function connect(projectionResync = false): Promise<void> {
             addMarker("session_replaced", started);
           }
         }
-        if (!sessionReplaced) resetSessionInputAuthority();
+        if (!sessionReplaced) {
+          resetBindingInputAuthority();
+          for (const view of approvalCardViews.values()) {
+            if (view.participantIdentity === previousCredential.participantIdentity) {
+              view.participantIdentity = credential!.participantIdentity;
+            }
+          }
+        }
         pendingRebindRequestId = null;
       }
     } else {
@@ -3233,13 +3332,8 @@ async function stop(): Promise<void> {
   microphoneMutePending = false;
   renderMicrophoneMute();
   typedInput.value = "";
-  for (const view of approvalCardViews.values()) {
-    view.approve.disabled = true;
-    view.reject.disabled = true;
-    view.status.textContent = "Session stopped before a decision.";
-  }
-  approvalCardViews.clear();
-  taskCardViews.clear();
+  // Media disconnect leaves durable work alive. Preserve exact-card identity
+  // for the task state/result replay when the browser next connects.
   speechFields.forEach((field, index) => {
     field.textContent = index % 2 === 0 ? "Awaiting session" : "—";
   });
@@ -3398,19 +3492,20 @@ async function submitApproval(
   if (view === undefined) {
     throw new Error("no approval is actionable");
   }
-  view.approve.disabled = true;
-  view.reject.disabled = true;
-  view.status.textContent = "Submitting decision…";
+  const pending = { participantIdentity: credential!.participantIdentity };
+  view.pendingDecision = pending;
+  renderApprovalCardAuthority(view);
   try {
     await approvalController.submit(approvalId, decision);
     addMarker(`approval_${decision}`);
+    if (view.pendingDecision === pending && approvalCardHasAuthority(view)) {
+      view.status.textContent = "Decision submitted. Waiting for task update.";
+    }
   } catch (error) {
-    // Leave the card actionable so the operator can retry this exact request;
-    // the authoritative resolution event is what removes it from the map.
-    if (approvalCardViews.get(approvalId) === view) {
-      view.approve.disabled = false;
-      view.reject.disabled = false;
-      view.status.textContent = "Decision failed. Try again.";
+    if (view.pendingDecision === pending) {
+      view.pendingDecision = null;
+      renderApprovalCardAuthority(view);
+      if (approvalCardHasAuthority(view)) view.status.textContent = "Decision failed. Try again.";
     }
     throw error;
   }

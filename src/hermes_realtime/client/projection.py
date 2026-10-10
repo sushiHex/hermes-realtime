@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -95,30 +96,103 @@ class BrowserEventProjection:
         # The latest event of every task still running and every approval still actionable,
         # in first-published order, so a page that kept nothing can be shown them again.
         self._open_state: dict[tuple[str, str], dict[str, PublicValue]] = {}
+        self._pending_replay: dict[tuple[str, str], dict[str, PublicValue]] = {}
 
-    def reset(self) -> None:
+    def reset(self, *, initial_slots: int = 0) -> None:
         """Begin a fresh browser lease with sequence authority restarting at one.
 
-        Open tasks and approvals are not part of the lease: they stay until they settle.
+        Open controls and unacknowledged settlements outlive a media lease. Pending
+        replay consumes ordinary projection capacity until it is published again.
         """
 
+        pending = self._replay_after_reset(initial_slots)
+        # State precedes results even after a partially published replay is retried.
+        priority = {"task_state": 0, "task_result": 1, "approval_state": 2}
+        self._pending_replay = dict(sorted(pending.items(), key=lambda item: priority[item[0][0]]))
         self._events.clear()
         self._sequence = 0
         self._overflowed = False
         self._capture_status_reservations.clear()
         self._voice_clear_reservations.clear()
 
+    def ensure_replay_capacity(self, *, initial_slots: int) -> None:
+        """Refuse a fresh view before changing binding or event authority."""
+
+        self._replay_after_reset(initial_slots)
+
+    def _replay_after_reset(
+        self,
+        initial_slots: int,
+    ) -> dict[tuple[str, str], dict[str, PublicValue]]:
+        if type(initial_slots) is not int:
+            raise TypeError("initial projection slot count must be an exact integer")
+        if not 0 <= initial_slots <= self._capacity:
+            raise ValueError("initial projection slot count is outside the capacity bound")
+        pending = dict(self._pending_replay)
+        for event in self._events:
+            key = self._settlement_key(event.kind, event.data)
+            if key is not None:
+                pending[key] = dict(event.data)
+        if len(pending) + len(self._open_state) + initial_slots > self._capacity:
+            try:
+                raise RuntimeError("public event replay capacity was exceeded")
+            finally:
+                print(
+                    "[projection-replay-refusal] "
+                    + json.dumps(
+                        {
+                            "kind": "durable-state",
+                            "category": "capacity",
+                            "settled_count": len(pending),
+                            "open_count": len(self._open_state),
+                            "initial_slots": initial_slots,
+                        }
+                    )
+                )
+        return pending
+
     @property
     def open_state_count(self) -> int:
         return len(self._open_state)
 
     def republish_open_state(self) -> None:
-        """Publish again every task still running and every approval still actionable."""
+        """Reconcile undelivered settlements, then the latest actionable controls."""
 
         if self._open_state:
             self.ensure_capacity(len(self._open_state))
+        for key, data in list(self._pending_replay.items()):
+            del self._pending_replay[key]
+            try:
+                self.publish(key[0], dict(data))
+            except BaseException:
+                self._pending_replay[key] = data
+                raise
         for (kind, _), data in list(self._open_state.items()):
             self.publish(kind, dict(data))
+
+    @staticmethod
+    def _settlement_key(
+        kind: str,
+        data: Mapping[str, PublicValue],
+    ) -> tuple[str, str] | None:
+        if (
+            kind in {"task_state", "task_result"}
+            and data.get("status")
+            in {
+                "completed",
+                "failed",
+                "interrupted",
+            }
+            and type(data.get("taskId")) is str
+        ):
+            return kind, cast(str, data["taskId"])
+        if (
+            kind == "approval_state"
+            and data.get("actionable") is False
+            and type(data.get("approvalId")) is str
+        ):
+            return kind, cast(str, data["approvalId"])
+        return None
 
     @staticmethod
     def _open_key(kind: str, data: dict[str, PublicValue]) -> tuple[str, str] | None:
@@ -182,8 +256,11 @@ class BrowserEventProjection:
             raise ValueError("capture status slot count must be between one and four")
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations)
-            + len(self._voice_clear_reservations) + slots
+            or len(self._events)
+            + len(self._pending_replay)
+            + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations)
+            + slots
             > self._capacity
         ):
             self._overflowed = True
@@ -243,8 +320,11 @@ class BrowserEventProjection:
             raise ValueError("projection slot count is outside the capacity bound")
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations)
-            + len(self._voice_clear_reservations) + slots
+            or len(self._events)
+            + len(self._pending_replay)
+            + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations)
+            + slots
             > self._capacity
         ):
             self._overflowed = True
@@ -507,8 +587,11 @@ class BrowserEventProjection:
         # permanently killing the projection this method promises never to fail.
         if (
             self._overflowed
-            or len(self._events) + len(self._capture_status_reservations)
-            + len(self._voice_clear_reservations) + 1
+            or len(self._events)
+            + len(self._pending_replay)
+            + len(self._capture_status_reservations)
+            + len(self._voice_clear_reservations)
+            + 1
             > self._capacity
         ):
             return None

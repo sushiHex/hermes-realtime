@@ -382,15 +382,29 @@ def test_browser_self_acceptance_retains_captured_observation_output() -> None:
 
     # Without -s pytest captures the observation and replays it only on failure, so a
     # passing run retains no healthy marker sequence to compare a recurrence against.
-    assert (
-        "uv run --frozen --group dev --extra browser-acceptance pytest -q -s"
-    ) in browser_step
+    assert ("uv run --frozen --group dev --extra browser-acceptance pytest -q -s") in browser_step
 
     browser_source = (
         Path(__file__).resolve().parent / "integration" / "test_browser_self_acceptance.py"
     ).read_text(encoding="utf-8")
     assert '_BROWSER_OBSERVATION_PREFIX = "[browser-acceptance] "' in browser_source
     assert "_browser_observation(" in browser_source
+
+
+def test_native_browser_step_requires_history_geometry_and_web_dependencies() -> None:
+    native_job = _release_workflow().split("  native-livekit:", maxsplit=1)[1]
+    step = native_job.split("      - name: Run real-browser self-acceptance gate", maxsplit=1)[
+        1
+    ].split("\n      - name:", maxsplit=1)[0]
+    install = "npm ci --ignore-scripts --prefix web"
+    command = next(line.strip() for line in step.splitlines() if "pytest -q" in line)
+    test_files = [token for token in command.split() if token.startswith("tests/")]
+    assert test_files == [
+        "tests/integration/test_browser_self_acceptance.py",
+        "tests/integration/test_browser_history_presentation.py",
+    ]
+    assert step.index(install) < step.index(command)
+    assert 'throw "Browser layout dependency install failed"' in step
 
 
 def test_browser_observation_is_captured_before_the_page_is_torn_down() -> None:

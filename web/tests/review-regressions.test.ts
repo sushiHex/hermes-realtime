@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApprovalDecisionController,
@@ -8,7 +8,66 @@ import {
   SpeechTimingRegistry,
 } from "../src/controller";
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("approval decision concurrency", () => {
+  it("reset refuses a late success and keeps a new same-ID submission owned", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    let releaseOld!: () => void;
+    let releaseNew!: () => void;
+    const sends: number[] = [];
+    const approvals = new ApprovalDecisionController(async (sequence) => {
+      sends.push(sequence);
+      await new Promise<void>((resolve) => {
+        if (sends.length === 1) releaseOld = resolve;
+        else releaseNew = resolve;
+      });
+    });
+    const old = approvals.submit("approval_0123456789abcdef", "approve");
+    const oldOutcome = old.then(() => "accepted", () => "retired");
+    await Promise.resolve();
+    approvals.reset();
+    const current = approvals.submit("approval_0123456789abcdef", "reject");
+    await Promise.resolve();
+    releaseOld();
+    expect(await oldOutcome).toBe("retired");
+    expect(approvals.lastSequence).toBe(0);
+    expect(approvals.isSubmittingApproval("approval_0123456789abcdef")).toBe(true);
+    releaseNew();
+    await current;
+    expect(sends).toEqual([1, 1]);
+    expect(approvals.lastSequence).toBe(1);
+    expect(approvals.isSubmitting).toBe(false);
+    expect(info.mock.calls).toEqual([
+      ['[approval-decision-refused] {"count":1,"category":"sequence_reset"}'],
+    ]);
+  });
+
+  it("reset refuses old queued decisions before sending them", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    let release!: () => void;
+    const sends: Array<[number, string]> = [];
+    const approvals = new ApprovalDecisionController(async (sequence, approvalId) => {
+      sends.push([sequence, approvalId]);
+      if (sends.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+    });
+    const old = approvals.submit("approval_1111111111111111", "approve");
+    const oldOutcome = old.then(() => "accepted", () => "retired");
+    await Promise.resolve();
+    const queued = approvals.submit("approval_2222222222222222", "approve");
+    const queuedOutcome = queued.then(() => "accepted", () => "retired");
+    approvals.reset();
+    release();
+    expect(await oldOutcome).toBe("retired");
+    expect(await queuedOutcome).toBe("retired");
+    await approvals.submit("approval_3333333333333333", "reject");
+    expect(sends).toEqual([[1, "approval_1111111111111111"], [1, "approval_3333333333333333"]]);
+    expect(info.mock.calls).toEqual([
+      ['[approval-decision-refused] {"count":1,"category":"sequence_reset"}'],
+      ['[approval-decision-refused] {"count":1,"category":"sequence_reset"}'],
+    ]);
+  });
+
   it("refuses a concurrent decision instead of reusing an unsent sequence", async () => {
     // Regression: submit() computed next = sequence + 1 before awaiting and
     // committed only afterwards, so a double-click, or Approve immediately
