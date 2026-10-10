@@ -366,11 +366,19 @@ const connectionRequestTimeoutMs = 10_000;
 const approvalController = new ApprovalDecisionController(
   async (sequence, approvalId, decision) => {
     const activeCredential = credential;
-    if (activeCredential === null) throw new Error("browser session is not connected");
+    const view = approvalCardViews.get(approvalId);
+    if (view === undefined || !approvalCardHasAuthority(view) ||
+      view.pendingDecision?.participantIdentity !== activeCredential?.participantIdentity) {
+      try {
+        throw new Error("approval connection authority is unavailable");
+      } finally {
+        console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "connection_changed" })}`);
+      }
+    }
     const response = await fetch("/api/v1/approval", {
       method: "POST",
       headers: {
-        ...authorization(activeCredential.token),
+        ...authorization(activeCredential!.token),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ approvalId, decision, sequence }),
@@ -469,6 +477,9 @@ interface ApprovalCardView {
   readonly status: HTMLParagraphElement;
   readonly approve: HTMLButtonElement;
   readonly reject: HTMLButtonElement;
+  actionable: boolean;
+  participantIdentity: string | null;
+  pendingDecision: { readonly participantIdentity: string } | null;
 }
 
 const taskCardViews = new Map<string, TaskCardView>();
@@ -480,12 +491,16 @@ const approvalCardViews = new Map<string, ApprovalCardView>();
 
 function actionableApprovalCard(item: HTMLLIElement): boolean {
   for (const view of approvalCardViews.values()) {
-    if (view.item === item) return true;
+    if (view.item === item && view.actionable) return true;
   }
   return false;
 }
 
-function forgetEvictedTaskCard(item: HTMLLIElement): void {
+function forgetEvictedOperationCard(item: HTMLLIElement): void {
+  const approvalId = item.dataset.approvalId;
+  if (approvalId !== undefined && approvalCardViews.get(approvalId)?.item === item) {
+    approvalCardViews.delete(approvalId);
+  }
   const taskId = item.dataset.taskId;
   if (taskId === undefined) return;
   const view = taskCardViews.get(taskId);
@@ -508,7 +523,7 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
       pending.push(...transcriptRetention.admit(obsolete, retainedDomCost(obsolete)));
       continue;
     }
-    forgetEvictedTaskCard(obsolete);
+    forgetEvictedOperationCard(obsolete);
     obsolete.remove();
   }
 }
@@ -643,7 +658,8 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   if (!actionable) {
     const view = approvalCardViews.get(approvalId);
     if (view === undefined) return;
-    approvalCardViews.delete(approvalId);
+    view.actionable = false;
+    view.pendingDecision = null;
     view.approve.disabled = true;
     view.reject.disabled = true;
     view.item.dataset.status = state;
@@ -666,11 +682,19 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   }
 
   const existing = approvalCardViews.get(approvalId);
-  if (existing !== undefined && existing.item.isConnected) return;
+  if (existing !== undefined && existing.item.isConnected) {
+    if (!approvalController.isSubmittingApproval(approvalId)) existing.pendingDecision = null;
+    existing.actionable = true;
+    existing.participantIdentity = credential?.participantIdentity ?? null;
+    existing.item.dataset.status = state;
+    renderApprovalCardAuthority(existing);
+    return;
+  }
 
   const item = document.createElement("li");
   item.dataset.role = "operation";
   item.dataset.operation = "approval";
+  item.dataset.approvalId = approvalId;
   item.dataset.status = state;
   const label = document.createElement("strong");
   label.textContent = "Approval required";
@@ -698,7 +722,10 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   reject.textContent = "Reject";
   controls.append(approve, reject);
   item.append(label, title, status, commandView, meta, controls);
-  const view = { approvalId, item, status, approve, reject };
+  const view: ApprovalCardView = {
+    approvalId, item, status, approve, reject, actionable: true,
+    participantIdentity: credential?.participantIdentity ?? null, pendingDecision: null,
+  };
   approvalCardViews.set(approvalId, view);
   // Disable this card's controls for the whole round trip. Without this a
   // double-click, or Approve immediately followed by Reject, issues two
@@ -709,17 +736,29 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
     reject.disabled = true;
     void submitApproval(approvalId, decision).catch(() => {
       addMarker("approval_failed");
-      // A failed decision consumes no sequence, so it may be retried. Restore
-      // the controls only while this request is still awaiting a decision.
-      if (approvalCardViews.get(approvalId) === view) {
-        approve.disabled = false;
-        reject.disabled = false;
-      }
     });
   };
   approve.addEventListener("click", () => submitDecision("approve"));
   reject.addEventListener("click", () => submitDecision("reject"));
+  renderApprovalCardAuthority(view);
   admitOperationCard(item);
+}
+
+function approvalCardHasAuthority(view: ApprovalCardView): boolean {
+  return view.actionable && controller.state === "connected" &&
+    view.participantIdentity === credential?.participantIdentity;
+}
+
+function renderApprovalCardAuthority(view: ApprovalCardView): void {
+  const enabled = approvalCardHasAuthority(view) && view.pendingDecision === null;
+  view.approve.disabled = !enabled;
+  view.reject.disabled = !enabled;
+  if (view.actionable) {
+    view.status.textContent = !approvalCardHasAuthority(view)
+      ? "Reconnect to review this approval."
+      : view.pendingDecision !== null ? "Submitting decision…"
+      : "Review the requested command before continuing.";
+  }
 }
 
 let partialTranscriptItem: HTMLLIElement | null = null;
@@ -868,7 +907,7 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
     clearPartialTranscript();
     for (const item of conversationHistory.clearTranscript(transcript, actionableApprovalCard)) {
       transcriptRetention.remove(item);
-      forgetEvictedTaskCard(item);
+      forgetEvictedOperationCard(item);
     }
     assistantTurns.clear();
     syncTranscriptEmptyState();
@@ -1804,6 +1843,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function setInteractive(connected: boolean): void {
+  for (const view of approvalCardViews.values()) renderApprovalCardAuthority(view);
   muteButton.disabled = !connected || activeMicrophoneTrack === null || microphoneMutePending;
   typedInput.disabled = !connected;
   sendButton.disabled = !connected;
@@ -2384,8 +2424,12 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
 
 function resetSessionInputAuthority(): void {
   inputSequence = 0;
-  microphoneProcessingEvidence = null;
   approvalController.reset();
+  resetBindingInputAuthority();
+}
+
+function resetBindingInputAuthority(): void {
+  microphoneProcessingEvidence = null;
   evidenceControls.reset();
   searchEgressControls.reset();
 }
@@ -2944,7 +2988,14 @@ async function connect(projectionResync = false): Promise<void> {
             addMarker("session_replaced", started);
           }
         }
-        if (!sessionReplaced) resetSessionInputAuthority();
+        if (!sessionReplaced) {
+          resetBindingInputAuthority();
+          for (const view of approvalCardViews.values()) {
+            if (view.participantIdentity === previousCredential.participantIdentity) {
+              view.participantIdentity = credential!.participantIdentity;
+            }
+          }
+        }
         pendingRebindRequestId = null;
       }
     } else {
@@ -3281,12 +3332,6 @@ async function stop(): Promise<void> {
   microphoneMutePending = false;
   renderMicrophoneMute();
   typedInput.value = "";
-  for (const view of approvalCardViews.values()) {
-    view.approve.disabled = true;
-    view.reject.disabled = true;
-    view.status.textContent = "Session stopped before a decision.";
-  }
-  approvalCardViews.clear();
   // Media disconnect leaves durable work alive. Preserve exact-card identity
   // for the task state/result replay when the browser next connects.
   speechFields.forEach((field, index) => {
@@ -3447,19 +3492,20 @@ async function submitApproval(
   if (view === undefined) {
     throw new Error("no approval is actionable");
   }
-  view.approve.disabled = true;
-  view.reject.disabled = true;
-  view.status.textContent = "Submitting decision…";
+  const pending = { participantIdentity: credential!.participantIdentity };
+  view.pendingDecision = pending;
+  renderApprovalCardAuthority(view);
   try {
     await approvalController.submit(approvalId, decision);
     addMarker(`approval_${decision}`);
+    if (view.pendingDecision === pending && approvalCardHasAuthority(view)) {
+      view.status.textContent = "Decision submitted. Waiting for task update.";
+    }
   } catch (error) {
-    // Leave the card actionable so the operator can retry this exact request;
-    // the authoritative resolution event is what removes it from the map.
-    if (approvalCardViews.get(approvalId) === view) {
-      view.approve.disabled = false;
-      view.reject.disabled = false;
-      view.status.textContent = "Decision failed. Try again.";
+    if (view.pendingDecision === pending) {
+      view.pendingDecision = null;
+      renderApprovalCardAuthority(view);
+      if (approvalCardHasAuthority(view)) view.status.textContent = "Decision failed. Try again.";
     }
     throw error;
   }

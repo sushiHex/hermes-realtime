@@ -591,6 +591,7 @@ const APPROVAL_ID = /^approval_[A-Za-z0-9_-]{8,128}$/;
 
 export class ApprovalDecisionController {
   private sequence = 0;
+  private sequenceEpoch: object = {};
   private readonly inFlight = new Set<string>();
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -611,6 +612,7 @@ export class ApprovalDecisionController {
   }
 
   reset(): void {
+    this.sequenceEpoch = {};
     this.sequence = 0;
     this.inFlight.clear();
     this.tail = Promise.resolve();
@@ -629,27 +631,41 @@ export class ApprovalDecisionController {
       throw new Error("an approval decision is already in flight");
     }
     this.inFlight.add(approvalId);
+    const sequenceEpoch = this.sequenceEpoch;
     // Concurrent runs can each hold a pending approval, and the server resolves
     // them by exact id in any order. Different approvals may therefore be decided
     // concurrently, but sequence allocation is serialised: the number is computed
     // only once the previous send has settled, so two in-flight decisions cannot
     // claim the same sequence. A failed send still commits nothing and may retry.
     const run = this.tail.then(
-      () => this.#dispatch(approvalId, decision),
-      () => this.#dispatch(approvalId, decision),
+      () => this.#dispatch(approvalId, decision, sequenceEpoch),
+      () => this.#dispatch(approvalId, decision, sequenceEpoch),
     );
     this.tail = run.catch(() => undefined);
     try {
       await run;
     } finally {
-      this.inFlight.delete(approvalId);
+      if (this.sequenceEpoch === sequenceEpoch) this.inFlight.delete(approvalId);
     }
   }
 
-  async #dispatch(approvalId: string, decision: ApprovalDecision): Promise<void> {
+  async #dispatch(
+    approvalId: string, decision: ApprovalDecision, sequenceEpoch: object,
+  ): Promise<void> {
+    this.#requireSequenceEpoch(sequenceEpoch);
     const next = this.sequence + 1;
     await this.send(next, approvalId, decision);
+    this.#requireSequenceEpoch(sequenceEpoch);
     this.sequence = next;
+  }
+
+  #requireSequenceEpoch(sequenceEpoch: object): void {
+    if (this.sequenceEpoch === sequenceEpoch) return;
+    try {
+      throw new Error("approval sequence authority reset");
+    } finally {
+      console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "sequence_reset" })}`);
+    }
   }
 }
 

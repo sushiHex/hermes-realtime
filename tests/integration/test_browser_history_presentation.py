@@ -53,7 +53,8 @@ def browser_script(tmp_path_factory: pytest.TempPathFactory) -> str:
       },
       advanceKaraoke: (time) => { remoteAudio.currentTime = time; },
       historyAccounting: () => ({retainedRows:transcriptRetention.size,
-        retainedCost:transcriptRetention.cost,taskViews:taskCardViews.size}),
+        retainedCost:transcriptRetention.cost,taskViews:taskCardViews.size,
+        approvalViews:approvalCardViews.size}),
       prepareApprovalControls: () => {
         setCredential({version:1,url:'wss://livekit.test',roomName:'synthetic-room',
           participantIdentity:'browser_0123456789abcdef',workerIdentity:'worker_hermes_browser',
@@ -471,6 +472,7 @@ def test_voice_clear_preserves_live_cards_and_anchors_until_exact_terminal_resul
         "retainedRows": 0,
         "retainedCost": 0,
         "taskViews": 2,
+        "approvalViews": 0,
     }
     page.evaluate("""() => {
       task('task_clear_pinned'); task('task_clear_future','cancelling');
@@ -490,6 +492,24 @@ def test_voice_clear_preserves_live_cards_and_anchors_until_exact_terminal_resul
     assert page.evaluate("""clearCards.every(card => card.parentElement.id === 'transcript' &&
       card === document.querySelector('[data-task-id="' + card.dataset.taskId + '"]'))""")
     assert page.evaluate("historyFixture.historyAccounting().retainedRows") == 2
+
+
+def test_settled_approval_identity_is_forgotten_on_bounded_history_eviction(page) -> None:
+    page.evaluate("""() => {
+      historyFixture.prepareApprovalControls();
+      project('approval_state',{approvalId:'approval_eviction_fixture',taskId:'task_fixture',
+        state:'pending',actionable:true,command:'synthetic command',
+        description:'Synthetic approval'});
+      window.evictedApproval=document.querySelector('[data-operation="approval"]');
+      project('approval_state',{approvalId:'approval_eviction_fixture',state:'approve',actionable:false});
+    }""")
+    assert page.evaluate("historyFixture.historyAccounting().approvalViews") == 1
+    page.evaluate("""() => {
+      for(let i=0;i<140;i++) project('transcript_final',{
+        role:'assistant',text:'Synthetic history line '+i});
+    }""")
+    assert page.evaluate("window.evictedApproval.isConnected") is False
+    assert page.evaluate("historyFixture.historyAccounting().approvalViews") == 0
 
 
 def test_voice_clear_preserves_actionable_approval_controls_and_removes_settled_cards(page) -> None:
