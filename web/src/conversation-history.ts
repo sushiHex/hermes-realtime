@@ -32,14 +32,17 @@ export class ConversationHistory {
   }
 
   /** Voice deletion preserves durable work and its exact positions in history. */
-  clearTranscript(transcript: HTMLOListElement): readonly HTMLLIElement[] {
+  clearTranscript(
+    transcript: HTMLOListElement,
+    preserve: (item: HTMLLIElement) => boolean,
+  ): readonly HTMLLIElement[] {
     const preserved = new Set<HTMLLIElement>();
     for (const [item, anchor] of this.active) {
       preserved.add(item);
       if (anchor !== null) preserved.add(anchor);
     }
     const removed = (Array.from(transcript.children) as HTMLLIElement[])
-      .filter((item) => !preserved.has(item));
+      .filter((item) => !preserved.has(item) && !preserve(item));
     for (const item of removed) item.remove();
     this.refresh();
     return removed;
@@ -79,7 +82,8 @@ export class ConversationHistory {
     for (const [item, anchor] of this.active) {
       if (anchor !== null) {
         anchor.style.height = `${item.getBoundingClientRect().height}px`;
-      } else if (item.isConnected && item.getBoundingClientRect().top <= top) {
+      } else if (item.isConnected && item.getBoundingClientRect().top <=
+        Math.max(top, this.stack.getBoundingClientRect().bottom)) {
         const placeholder = item.ownerDocument.createElement("li");
         placeholder.className = "task-history-slot";
         placeholder.setAttribute("aria-hidden", "true");
@@ -89,6 +93,7 @@ export class ConversationHistory {
         // Map insertion order is original admission order, including cards which
         // reach the top together after a large wheel/scrollbar movement.
         this.stack.append(item);
+        this.dock.hidden = false;
       }
     }
     this.dock.hidden = this.stack.childElementCount === 0;

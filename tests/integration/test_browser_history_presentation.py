@@ -52,6 +52,18 @@ def browser_script(tmp_path_factory: pytest.TempPathFactory) -> str:
       advanceKaraoke: (time) => { remoteAudio.currentTime = time; },
       historyAccounting: () => ({retainedRows:transcriptRetention.size,
         retainedCost:transcriptRetention.cost,taskViews:taskCardViews.size}),
+      prepareApprovalControls: () => {
+        setCredential({version:1,url:'wss://livekit.test',roomName:'synthetic-room',
+          participantIdentity:'browser_0123456789abcdef',workerIdentity:'worker_hermes_browser',
+          expiresInSeconds:60,token:'synthetic.token.value'});
+        controller.beginConnect(); controller.bootstrapReady();
+        controller.preparingMicrophone(); controller.connected();
+        window.approvalRequests=[];
+        window.fetch=async (path,options) => {
+          if(path==='/api/v1/approval') approvalRequests.push(JSON.parse(options.body));
+          return new Response('{}',{status:200});
+        };
+      },
       stopPersistentSession: async () => {
         setCredential({version:1,url:'wss://livekit.test',roomName:'synthetic-room',
           participantIdentity:'browser_0123456789abcdef',workerIdentity:'worker_hermes_browser',
@@ -217,6 +229,47 @@ def test_active_cards_pin_only_after_crossing_top_stack_and_release_when_done(pa
     assert page.locator(".active-task-stack [data-task-id]").count() == 1
     page.evaluate("task('task_second','failed')")
     assert page.locator(".active-task-stack [data-task-id]").count() == 0
+
+
+@pytest.mark.parametrize("already_pinned", [False, True])
+def test_cards_join_at_visible_stack_boundary_and_growth_pins_next_card_in_same_refresh(
+    page, already_pinned: bool
+) -> None:
+    page.set_viewport_size({"width": 1280, "height": 1800})
+    page.evaluate(
+        """alreadyPinned => {
+      if(alreadyPinned) task('task_boundary_first');
+      for(let i=0;i<30;i++)
+        project('transcript_final',{role:'assistant',text:'Earlier synthetic history ' + i});
+      const scroll=document.querySelector('.conversation-scroll');
+      scroll.scrollTop=0; scroll.dispatchEvent(new Event('scroll'));
+      if(!alreadyPinned) task('task_boundary_first');
+      task('task_boundary_second'); task('task_boundary_third');
+      for(let i=0;i<20;i++)
+        project('transcript_final',{role:'assistant',text:'Later synthetic history ' + i});
+    }""",
+        already_pinned,
+    )
+    assert page.locator(".active-task-stack [data-task-id]").count() == int(already_pinned)
+    pinned = page.evaluate(
+        """alreadyPinned => {
+      const scroll=document.querySelector('.conversation-scroll');
+      const stack=document.querySelector('.active-task-stack');
+      const next=document.querySelector('[data-task-id="task_boundary_' +
+        (alreadyPinned?'second':'first') + '"]');
+      const boundary=alreadyPinned?stack.getBoundingClientRect().bottom:
+        scroll.getBoundingClientRect().top;
+      const gap=parseFloat(getComputedStyle(stack).rowGap);
+      scroll.scrollTop += next.getBoundingClientRect().top-boundary+(alreadyPinned?1:gap+1);
+      scroll.dispatchEvent(new Event('scroll'));
+      return [...stack.children].map(card => card.dataset.taskId);
+    }""",
+        already_pinned,
+    )
+    assert pinned == ["task_boundary_first", "task_boundary_second", "task_boundary_third"]
+    assert page.locator(".active-task-stack").bounding_box()["height"] <= (
+        page.locator(".conversation-scroll").bounding_box()["height"] * 0.4 + 1
+    )
 
 
 def test_many_active_cards_have_bounded_focusable_overflow_and_survive_retention(page) -> None:
@@ -386,6 +439,39 @@ def test_voice_clear_preserves_live_cards_and_anchors_until_exact_terminal_resul
     assert page.evaluate("""clearCards.every(card => card.parentElement.id === 'transcript' &&
       card === document.querySelector('[data-task-id="' + card.dataset.taskId + '"]'))""")
     assert page.evaluate("historyFixture.historyAccounting().retainedRows") == 2
+
+
+def test_voice_clear_preserves_actionable_approval_controls_and_removes_settled_cards(page) -> None:
+    page.evaluate("""() => {
+      historyFixture.prepareApprovalControls();
+      for(const suffix of ['approve','reject','settled'])
+        project('approval_state',{approvalId:'approval_clear_'+suffix,taskId:'task_approval',
+          state:'pending',actionable:true,command:'synthetic command',description:suffix});
+      project('approval_state',{approvalId:'approval_clear_settled',state:'approve',actionable:false});
+      window.originalApprovals=[...document.querySelectorAll('[data-operation="approval"]')]
+        .slice(0,2);
+      project('transcript_final',{role:'assistant',text:'Voice history to delete'});
+      project('voice_conversation_cleared',{});
+    }""")
+    approvals = page.locator('[data-operation="approval"]')
+    assert approvals.count() == 2
+    assert page.locator('[data-role="assistant"]').count() == 0
+    assert page.evaluate("originalApprovals.every(card => card.isConnected)")
+    assert page.evaluate("historyFixture.historyAccounting().retainedRows") == 2
+    approvals.nth(0).locator(".approve").click()
+    approvals.nth(1).locator(".secondary").click()
+    page.wait_for_function("approvalRequests.length===2")
+    assert page.evaluate("approvalRequests") == [
+        {"approvalId": "approval_clear_approve", "decision": "approve", "sequence": 1},
+        {"approvalId": "approval_clear_reject", "decision": "reject", "sequence": 2},
+    ]
+    page.evaluate("""() => {
+      project('approval_state',{approvalId:'approval_clear_approve',state:'approve',actionable:false});
+      project('approval_state',{approvalId:'approval_clear_reject',state:'reject',actionable:false});
+      project('voice_conversation_cleared',{});
+    }""")
+    assert approvals.count() == 0
+    assert page.evaluate("historyFixture.historyAccounting().retainedRows") == 0
 
 
 def test_active_capacity_refuses_overflow_visibly_without_evicting_work(page) -> None:

@@ -866,7 +866,7 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
   request: requestVoiceDeleteWire,
   clear: () => {
     clearPartialTranscript();
-    for (const item of conversationHistory.clearTranscript(transcript)) {
+    for (const item of conversationHistory.clearTranscript(transcript, actionableApprovalCard)) {
       transcriptRetention.remove(item);
       forgetEvictedTaskCard(item);
     }
