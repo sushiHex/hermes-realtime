@@ -514,6 +514,7 @@ class ConversationWorkControlSurface:
                         reason=_AMBIGUOUS_ACTIVE_REASON,
                     )
                 elif pending_starts:
+                    self._reserve()
                     pending = pending_starts[0]
                     pending.cancel_after_ack = True
                     operation = self._create_operation_locked(
@@ -691,6 +692,11 @@ class ConversationWorkControlSurface:
                             task_id=dispatch.task_id,
                         )
                     )
+                start_result = await self._project_accepted_start(dispatch.task_id)
+                # Establish the live card before attaching cancellation feedback.
+                # A later active projection would clear that feedback in the UI.
+                await self._project_cancel(cancel_result)
+                return start_result
             return await self._project_accepted_start(dispatch.task_id)
         except _ProjectionRolledBack as rolled_back:
             raise rolled_back.error from None

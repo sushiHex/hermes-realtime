@@ -341,6 +341,40 @@ def test_pending_replay_survives_repeated_reset_and_partial_publication_failure(
     ]
 
 
+@pytest.mark.parametrize("status", ("active", "cancelling"))
+def test_cancel_refusal_does_not_settle_retained_task_state(status: str) -> None:
+    projection = BrowserEventProjection(capacity=4)
+    state = {"taskId": "task_live", "status": status}
+    refusal = {"taskId": "task_live", "status": "rejected", "reason": "Cancellation refused"}
+    projection.publish("task_state", dict(state))
+    projection.publish("task_state", dict(refusal))
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", state), ("task_state", refusal),
+    ]
+    assert projection.open_state_count == 1
+    projection.acknowledge_through(2)
+    projection.reset()
+    projection.republish_open_state()
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", state),
+    ]
+
+
+@pytest.mark.parametrize("status", ("completed", "failed", "interrupted"))
+def test_authoritative_terminal_after_cancel_refusal_closes_retained_task(status: str) -> None:
+    projection = BrowserEventProjection(capacity=4)
+    projection.publish("task_state", {"taskId": "task_live", "status": "active"})
+    projection.publish("task_state", {"taskId": "task_live", "status": "rejected"})
+    terminal = {"taskId": "task_live", "status": status}
+    projection.publish("task_state", dict(terminal))
+    assert projection.open_state_count == 0
+    projection.reset()
+    projection.republish_open_state()
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", terminal),
+    ]
+
+
 def test_replay_uses_latest_settlement_identity_and_excludes_cancel_refusal() -> None:
     projection = BrowserEventProjection(capacity=8)
     projection.publish("task_state", {"taskId": "task_done", "status": "completed"})
