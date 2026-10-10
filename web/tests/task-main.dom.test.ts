@@ -45,11 +45,19 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   let emit: ((events: unknown[]) => void) | null = null;
   let sequence = 0;
   const requests: Array<{ sequence: number; text: string }> = [];
+  const approvals: Array<{ sequence: number; approvalId: string; decision: string }> = [];
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
     if (path === "/api/v1/stable-bootstrap" || path === "/api/v1/bootstrap") return Response.json(credential);
-    if (path === "/api/v1/stable-rebind") return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });
+    if (path === "/api/v1/stable-rebind") {
+      if (JSON.parse(options.body as string).freshView === true) sequence = 0;
+      return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });
+    }
     if (path === "/api/v1/refresh") return Response.json({ ...credential, token: "synthetic.rotated.token" });
     if (path === "/api/v1/media" || path === "/api/v1/stop") return Response.json({ version: 1 });
+    if (path === "/api/v1/approval") {
+      approvals.push(JSON.parse(options.body as string));
+      return Response.json({ version: 1 });
+    }
     if (path === "/api/v1/voices") return Response.json({ version: 1, voices: [], selectedVoice: null });
     if (path === "/api/v1/events") return new Promise<Response>((resolve) => {
       emit = (events) => resolve(Response.json({ version: 1, events }));
@@ -65,21 +73,28 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   const toggle = dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")!;
   toggle.click();
   await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
-  async function task(taskId: string | null, status: string, reason?: string) {
+  async function event(kind: string, data: object) {
     await vi.waitFor(() => expect(emit).not.toBeNull());
     const dispatch = emit!;
     emit = null;
     sequence += 1;
-    dispatch([{ sequence, kind: "task_state", monotonicMs: sequence * 1000, data: { taskId, status, ...(reason === undefined ? {} : { reason }) } }]);
+    dispatch([{ sequence, kind, monotonicMs: sequence * 1000, data }]);
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  const task = (taskId: string | null, status: string, reason?: string) => event("task_state", { taskId, status, ...(reason === undefined ? {} : { reason }) });
+  const approval = async (approvalId: string) => {
+    await event("approval_state", { approvalId, state: "pending", actionable: true, taskId: "task_fixture", command: "synthetic command", description: "Synthetic approval" });
+    dom.window.document.querySelector<HTMLButtonElement>('[data-operation="approval"]:last-child .approve')!.click();
+    await vi.waitFor(() => expect(approvals.at(-1)?.approvalId).toBe(approvalId));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
   const card = (taskId = "task_fixture") => dom.window.document.querySelector<HTMLLIElement>(`#transcript li[data-task-id="${taskId}"]`)!;
   const cancel = (taskId = "task_fixture") => card(taskId)?.querySelector<HTMLButtonElement>("button")!;
   const submit = (text: string) => {
     dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.value = text;
     dom.window.document.querySelector<HTMLFormElement>("#typed-form")!.dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
   };
-  return { requests, task, card, cancel, submit, toggle, refresh: () => refreshCredential!() };
+  return { requests, approvals, approval, task, card, cancel, submit, toggle, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -89,6 +104,49 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it("preserves admitted typed sequence across ordinary browser rebind", async () => {
+    const { requests, submit, toggle } = await mount();
+    submit("Synthetic input before rebind");
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("typed_input_admitted"));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    submit("Synthetic input after rebind");
+    await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 2]));
+    const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
+    expect(JSON.parse(rebind[1]!.body as string)).not.toHaveProperty("freshView");
+  });
+
+  it("preserves admitted approval sequence across ordinary browser rebind", async () => {
+    const { approvals, approval, toggle } = await mount();
+    await approval("approval_fixture_first");
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    await approval("approval_fixture_second");
+    expect(approvals.map((item) => item.sequence)).toEqual([1, 2]);
+  });
+
+  it("resets admitted input and approval counters on fresh-view recovery", async () => {
+    const { requests, approvals, approval, submit, toggle } = await mount(async (body) => {
+      if (body.text === "Synthetic uncertain input") throw new Error("synthetic lost acknowledgment");
+      return Response.json({ version: 1 });
+    });
+    await approval("approval_fixture_first");
+    submit("Synthetic admitted input");
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("typed_input_admitted"));
+    submit("Synthetic uncertain input");
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    submit("Synthetic input after reset");
+    await approval("approval_fixture_second");
+    await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 2, 1]));
+    expect(approvals.map((item) => item.sequence)).toEqual([1, 1]);
+  });
+
   it("requires a fresh-view reconnect after a server-admitted input loses its acknowledgment", async () => {
     let reject!: (reason: Error) => void;
     let spent = false;

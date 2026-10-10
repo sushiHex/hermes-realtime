@@ -2397,8 +2397,12 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
 
 function resetSessionInputAuthority(): void {
   inputSequence = 0;
-  microphoneProcessingEvidence = null;
   approvalController.reset();
+  resetBindingInputAuthority();
+}
+
+function resetBindingInputAuthority(): void {
+  microphoneProcessingEvidence = null;
   evidenceControls.reset();
   searchEgressControls.reset();
 }
@@ -2958,7 +2962,9 @@ async function connect(projectionResync = false): Promise<void> {
             addMarker("session_replaced", started);
           }
         }
-        if (!sessionReplaced) resetSessionInputAuthority();
+        // Ordinary rebind retains the server's input and approval counters.
+        // Only media/evidence/search authority belongs to the new binding.
+        if (!sessionReplaced) resetBindingInputAuthority();
         pendingRebindRequestId = null;
       }
     } else {

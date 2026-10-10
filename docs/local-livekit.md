@@ -438,6 +438,8 @@ command may already have been admitted. It never retries that command automatica
 **Connect** on a stable launch to restore a fresh authoritative view and input counters;
 a one-use launch requires a fresh launch from the host. Cancellation feedback keeps the
 last authoritative task state until a real task update arrives.
+An ordinary media reconnect keeps the admitted typed-input and approval counters;
+only a fresh view or a new session starts those counters again.
 
 With Codex and `--natural-work-tools`, ordinary language may invoke the
 same authoritative start/cancel surface; without that flag, ordinary speech and typed text remain
