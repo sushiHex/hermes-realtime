@@ -821,7 +821,7 @@ class BrowserSessionDirector:
                 raise RuntimeError("browser session recovery is finalizing")
             if self._active_generation is not None:
                 raise RuntimeError("a browser session is already active")
-            self._projection.reset()
+            self._projection.reset(initial_slots=self._fresh_view_initial_slots())
             status_reservation = (
                 self._projection.reserve_capture_status()
                 if self._evidence_status is not None
@@ -851,50 +851,57 @@ class BrowserSessionDirector:
                 raise TypeError("provision must return an exact integer generation")
             if generation <= 0:
                 raise ValueError("provision generation must be positive")
-            if self._on_session_started is not None:
-                try:
+            try:
+                if self._on_session_started is not None:
                     self._on_session_started(credential.participant_identity, generation)
-                except BaseException as callback_error:
-                    cancellations, rollback_error = await self._settle_start_rollback(
-                        credential.participant_identity,
-                        generation,
-                    )
-                    self._clear_active_session()
-                    failures: list[BaseException] = [callback_error, *cancellations]
-                    if rollback_error is not None:
-                        failures.append(rollback_error)
-                    if len(failures) > 1:
-                        raise BaseExceptionGroup(
-                            "browser session start callback and rollback failed",
-                            failures,
-                        ) from None
-                    raise
-            self._projection.publish(
-                "session_ready",
-                {
-                    "conversationProfile": self._conversation_profile,
-                    "mode": "microphone_or_typed",
-                    **self._speech_runtime.public_data(),
-                },
-            )
-            if self._model_configuration is not None:
+                self._projection.ensure_capacity(
+                    1
+                    + (1 if self._model_configuration is not None else 0)
+                    + (1 if self._search_egress_authority is not None else 0)
+                    + self._projection.open_state_count
+                )
                 self._projection.publish(
-                    "session_model",
-                    self._model_configuration.public_data(),
+                    "session_ready",
+                    {
+                        "conversationProfile": self._conversation_profile,
+                        "mode": "microphone_or_typed",
+                        **self._speech_runtime.public_data(),
+                    },
                 )
-            if status_reservation is not None:
-                status_provider = self._evidence_status
-                assert status_provider is not None
-                evidence_status = status_provider()
-                if type(evidence_status) is not CaptureStatusV1:
-                    raise TypeError("evidence_status must return an exact CaptureStatusV1")
-                self._projection.publish_capture_status(
-                    status_reservation,
-                    cast(
-                        dict[str, PublicValue],
-                        capture_status_to_primitive(evidence_status),
-                    ),
+                if self._model_configuration is not None:
+                    self._projection.publish(
+                        "session_model",
+                        self._model_configuration.public_data(),
+                    )
+                if status_reservation is not None:
+                    status_provider = self._evidence_status
+                    assert status_provider is not None
+                    evidence_status = status_provider()
+                    if type(evidence_status) is not CaptureStatusV1:
+                        raise TypeError("evidence_status must return an exact CaptureStatusV1")
+                    self._projection.publish_capture_status(
+                        status_reservation,
+                        cast(
+                            dict[str, PublicValue],
+                            capture_status_to_primitive(evidence_status),
+                        ),
+                    )
+                self._projection.republish_open_state()
+            except BaseException as callback_error:
+                cancellations, rollback_error = await self._settle_start_rollback(
+                    credential.participant_identity,
+                    generation,
                 )
+                self._clear_active_session()
+                failures: list[BaseException] = [callback_error, *cancellations]
+                if rollback_error is not None:
+                    failures.append(rollback_error)
+                if len(failures) > 1:
+                    raise BaseExceptionGroup(
+                        "browser session start callback and rollback failed",
+                        failures,
+                    ) from None
+                raise
             self._active_identity = credential.participant_identity
             self._active_generation = generation
             with self._evidence_gate_lock:
@@ -1034,6 +1041,9 @@ class BrowserSessionDirector:
                 reprovision = self._reprovision
                 if reprovision is None:
                     raise RuntimeError("browser session rebind is unavailable")
+                self._projection.ensure_replay_capacity(
+                    initial_slots=self._fresh_view_initial_slots(),
+                )
                 self._projection_resync_consumed = True
                 if self._search_egress_authority is not None:
                     self._projection.ensure_capacity()
@@ -1048,10 +1058,13 @@ class BrowserSessionDirector:
                         raise TypeError("reprovision must return an exact integer generation")
                     if replacement_generation <= 0 or replacement_generation == generation:
                         raise ValueError("reprovision generation must be a new positive generation")
+                    self._fresh_view()
                 except BaseException as replacement_error:
-                    cancellations, rollback_generation, rollback_error = (
-                        await self._settle_rebind_rollback(reprovision, identity)
-                    )
+                    (
+                        cancellations,
+                        rollback_generation,
+                        rollback_error,
+                    ) = await self._settle_rebind_rollback(reprovision, identity)
                     if rollback_generation is not None:
                         self._active_generation = rollback_generation
                         if self._search_egress_authority is not None:
@@ -1067,7 +1080,6 @@ class BrowserSessionDirector:
                             failures,
                         ) from None
                     raise
-                self._fresh_view()
                 self._previous_rebind_request = None
                 self._previous_rebind_credential = None
                 self._active_identity = credential.participant_identity
@@ -1090,6 +1102,14 @@ class BrowserSessionDirector:
                 self._touch_activity()
                 return credential
 
+    def _fresh_view_initial_slots(self) -> int:
+        return (
+            1
+            + (1 if self._model_configuration is not None else 0)
+            + (1 if self._search_egress_authority is not None else 0)
+            + (1 if self._evidence_status is not None else 0)
+        )
+
     def _fresh_view(self) -> None:
         """Reset everything a page holds, for a page that kept nothing but its identity.
 
@@ -1099,7 +1119,7 @@ class BrowserSessionDirector:
         replacement identity.
         """
 
-        self._projection.reset()
+        self._projection.reset(initial_slots=self._fresh_view_initial_slots())
         self._projection.ensure_capacity(
             1
             + (1 if self._model_configuration is not None else 0)
@@ -1178,6 +1198,10 @@ class BrowserSessionDirector:
             reprovision = self._reprovision
             if reprovision is None:
                 raise RuntimeError("browser session rebind is unavailable")
+            if fresh_view:
+                self._projection.ensure_replay_capacity(
+                    initial_slots=self._fresh_view_initial_slots(),
+                )
             if self._search_egress_authority is not None:
                 self._projection.ensure_capacity()
                 self._invalidate_search_egress(identity, generation)
@@ -1191,6 +1215,8 @@ class BrowserSessionDirector:
                     raise TypeError("reprovision must return an exact integer generation")
                 if replacement_generation <= 0 or replacement_generation == generation:
                     raise ValueError("reprovision generation must be a new positive generation")
+                if fresh_view:
+                    self._fresh_view()
                 self._touch_activity()
             except BaseException as replacement_error:
                 cancellations, rollback_generation, rollback_error = (
@@ -1211,8 +1237,6 @@ class BrowserSessionDirector:
                         failures,
                     ) from None
                 raise
-            if fresh_view:
-                self._fresh_view()
             self._previous_rebind_request = (
                 (identity, request_id) if request_id is not None else None
             )

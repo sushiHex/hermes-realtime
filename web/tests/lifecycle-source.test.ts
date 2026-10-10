@@ -95,7 +95,7 @@ describe("browser lifecycle wiring", () => {
     expect(mainSource).toContain("actionableApprovalCard(obsolete) && !repinned.has(obsolete)");
     expect(mainSource).not.toContain("activeApprovalCard");
     expect(mainSource).not.toContain("Superseded by a newer approval request.");
-    expect(mainSource).toContain("forgetEvictedTaskCard(obsolete)");
+    expect(mainSource).toContain("forgetEvictedOperationCard(obsolete)");
   });
 
   it("automatically rebinds after an authoritative terminal media disconnect", () => {
@@ -220,7 +220,10 @@ describe("browser lifecycle wiring", () => {
     const reconnectStart = mainSource.indexOf("const rebindRequestId =");
     const reconnectEnd = mainSource.indexOf("pendingRebindRequestId = null;", reconnectStart);
     const reconnect = mainSource.slice(reconnectStart, reconnectEnd);
-    expect(reconnect).toContain("if (!sessionReplaced) resetSessionInputAuthority();");
+    expect(reconnect).toContain("if (!sessionReplaced) {\n          resetBindingInputAuthority();");
+    const bindingReset = mainSource.split("function resetBindingInputAuthority(): void {")[1]!
+      .split("async function submitAudioDiagnostic")[0]!;
+    expect(bindingReset).toContain("searchEgressControls.reset()");
     expect(mainSource).toContain("async function submitSearchEgressControl(");
     const submitStart = mainSource.indexOf("async function submitSearchEgressControl(");
     const submitEnd = mainSource.indexOf("\n}\n", submitStart);
