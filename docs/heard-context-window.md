@@ -88,7 +88,8 @@ server's default applies, and that depends on the machine.
   same prompt can be truncated on a smaller GPU.
 
 **The derivation.** These are the steady-state prompt parts, in characters. The Ollama
-adapter adds no system instructions of its own.
+adapter now prepends one shared communication-policy message with labelled reference JSON,
+followed by the unchanged ordered conversational rows. Reference text adds no work authority.
 
 | Part | Characters |
 | --- | --- |
@@ -96,20 +97,23 @@ adapter adds no system instructions of its own.
 | Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
-| **Total** | **about 31,550** |
+| Foreground communication/style policy and work-state framing | about 2,200 |
+| **Total** | **about 33,750** |
 
-- **Tokens.** At a conservative 3 characters per token, that is about 10,510 tokens. The chat
-  template adds about 6 tokens for each of 35 messages (about 210), for about 10,720 in all.
+- **Tokens.** At a conservative 3 characters per token, that is about 11,250 tokens. The chat
+  template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Headroom.** `num_ctx` 16,384 leaves about 5,650 tokens for active-task and update system
-  messages and for the reply.
+- **Headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+  sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
   token, which may need a larger `num_ctx`.
 - **The marker.** Every completed request prints `[ollama-prompt]` with the prompt's message
   count, characters and UTF-8 bytes, the `num_ctx` requested, and Ollama's
-  `prompt_eval_count`. It carries no text. The desktop rehearsal records the marker for each
-  context check.
+  `prompt_eval_count`, plus the captured output-style enum and actual rendered reference-section
+  kinds (`memory`, `active_work`, `updates`). It carries no text. The desktop rehearsal records
+  those kinds for each context check; one combined system message is no longer a count of notes.
+  Conversation-context equality evidence remains separate and does not bind the selected style.
 - **It is a request, not a guarantee.** The server may cap it, for example at a model's
   trained context length, and the marker shows only what was requested. So the evidence is
   `prompt_eval_count`: a count near the context the model actually ran with means the prompt

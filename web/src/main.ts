@@ -1,3 +1,4 @@
+import { OutputStyleControls } from "./output-style";
 import {
   ConnectionState,
   RemoteAudioTrack,
@@ -136,6 +137,11 @@ const voiceDeleteStatus = element<HTMLOutputElement>("voice-delete-status");
 const speechRendererState = element<HTMLOutputElement>("speech-renderer-state");
 const muteButton = microphoneActivity;
 const microphoneSelect = element<HTMLSelectElement>("microphone");
+const outputStyleControls = new OutputStyleControls(
+  element<HTMLSelectElement>("output-style"),
+  element<HTMLOutputElement>("output-style-status"),
+  () => window.localStorage,
+);
 const voiceSelect = element<HTMLSelectElement>("voice");
 const modelSelect = element<HTMLSelectElement>("model-select");
 const effortSelect = element<HTMLSelectElement>("effort-select");
@@ -1911,6 +1917,29 @@ async function changeModelConfiguration(model: string, effort: string): Promise<
   }
 }
 
+async function applyOutputStyle(
+  activeCredential: BootstrapCredential,
+  current: () => boolean,
+): Promise<void> {
+  await outputStyleControls.sync(async style => {
+    const styleCredential = credential;
+    if (styleCredential === null || styleCredential.participantIdentity !== activeCredential.participantIdentity) {
+      throw new Error("style session is stale");
+    }
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), 5_000);
+    try {
+      const response = await fetch("/api/v1/output-style", {
+        method: "POST",
+        headers: {...authorization(styleCredential.token), "Content-Type": "application/json"},
+        body: JSON.stringify({style}), cache: "no-store", credentials: "omit",
+        referrerPolicy: "no-referrer", signal: abort.signal,
+      });
+      return response.ok ? await response.json() : null;
+    } finally { window.clearTimeout(timer); }
+  }, () => current() && credential?.participantIdentity === activeCredential.participantIdentity);
+}
+
 async function loadVoiceConfiguration(
   activeCredential: BootstrapCredential,
   connectGeneration: object,
@@ -2910,6 +2939,8 @@ async function connect(projectionResync = false): Promise<void> {
     }
     const activeCredential = credential;
     if (activeCredential === null) throw new Error("active credential is unavailable");
+    await applyOutputStyle(activeCredential, () => lifecycleAuthority.owns(connectGeneration));
+    if (!lifecycleAuthority.owns(connectGeneration)) { superseded = true; return; }
     // No SDK disconnect on page leave: it would read as a dropped connection, and the
     // leaving page would rebind, rotating the identity a reloaded tab is about to present.
     const activeRoom = new Room({
@@ -3117,6 +3148,7 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
+  outputStyleControls.reset();
   eventPolling?.abort();
   eventPolling = null;
   microphoneVerificationGeneration += 1;

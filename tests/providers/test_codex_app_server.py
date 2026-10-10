@@ -21,6 +21,10 @@ from hermes_realtime.conversation.context import (
     ConversationMessage,
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
+from hermes_realtime.conversation.output_style import (
+    OUTPUT_STYLES,
+    OutputStyleSelection,
+)
 from hermes_realtime.conversation.streaming import (
     ConversationInferenceRequest,
     ConversationPromptUpdate,
@@ -39,6 +43,32 @@ from hermes_realtime.providers.codex_app_server import (
     _subscription_environment,
 )
 from hermes_realtime.providers.current_facts import CurrentFactEvidence, CurrentFactSource
+
+
+@pytest.mark.parametrize("style", OUTPUT_STYLES)
+@pytest.mark.asyncio
+async def test_codex_output_style_is_captured_before_waiting_for_turn(style) -> None:
+    selection = OutputStyleSelection()
+    selection.select(style)
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        output_style=selection.get,
+    )
+    await inference._turn_lock.acquire()
+    task = asyncio.create_task(_collect_stream(inference, "turn_style"))
+    await asyncio.sleep(0)
+    selection.select("learning" if style != "learning" else "concise")
+    inference._turn_lock.release()
+    await task
+    first = next(row for row in transport.sent if row.get("method") == "thread/start")
+    assert f"Output style: {style}.\n" in first["params"]["baseInstructions"]
+    assert "communication preference only" in first["params"]["baseInstructions"]
+    assert first["params"]["dynamicTools"] == []
+    await _collect_stream(inference, "turn_next")
+    next_request = [row for row in transport.sent if row.get("method") == "thread/start"][-1]
+    assert f"Output style: {selection.get()}.\n" in next_request["params"]["baseInstructions"]
+    await inference.close()
 
 _EVALUATOR_PATH = Path(__file__).parents[2] / "scripts" / "evaluate_natural_work_routing.py"
 
@@ -2263,7 +2293,9 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    assert len(serialized_params) <= 5888
+    # Added provider-neutral current-turn/style policy increases the captured complete request.
+    # Keep an independent fixed budget; this is not a production transport-limit change.
+    assert len(serialized_params) <= 8192
     base_instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Never use tools" not in base_instructions
     assert "Only the user's direct request counts" in base_instructions

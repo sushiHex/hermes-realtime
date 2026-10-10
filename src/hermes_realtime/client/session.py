@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from threading import Lock
 from typing import cast
 
+from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.evidence.models import (
     BindingCloseReason,
     CaptureState,
@@ -321,6 +322,7 @@ class BrowserSessionDirector:
         on_session_started: Callable[[str, int], None] | None = None,
         voice_configuration: Callable[[], tuple[tuple[str, ...], str | None]] | None = None,
         select_voice: Callable[[str], Awaitable[None]] | None = None,
+        select_output_style: Callable[[str], None] | None = None,
         delete_voice_conversation: Callable[[str, int], Awaitable[str]] | None = None,
         voice_delete_status: Callable[[], str] | None = None,
         evidence_consent: Callable[
@@ -385,6 +387,8 @@ class BrowserSessionDirector:
             raise TypeError("on_session_started must be callable")
         if voice_configuration is not None and not callable(voice_configuration):
             raise TypeError("voice_configuration must be callable")
+        if select_output_style is not None and not callable(select_output_style):
+            raise TypeError("select_output_style must be callable")
         if select_voice is not None and not callable(select_voice):
             raise TypeError("select_voice must be callable")
         if evidence_consent is not None and not callable(evidence_consent):
@@ -445,6 +449,7 @@ class BrowserSessionDirector:
         self._on_session_started = on_session_started
         self._voice_configuration = voice_configuration
         self._select_voice = select_voice
+        self._select_output_style = select_output_style
         self._evidence_consent = evidence_consent
         self._evidence_status = evidence_status
         self._evidence_revoke = evidence_revoke
@@ -1599,6 +1604,22 @@ class BrowserSessionDirector:
                 )
                 self._touch_activity()
                 return result
+
+    async def change_output_style(self, *, participant_identity: str, style: str) -> str:
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact string")
+        selected = require_output_style(style)
+        async with self._start_lock:
+            if self._active_identity is None or self._active_generation is None:
+                raise NoBrowserSession("no browser session is active")
+            if participant_identity != self._active_identity:
+                raise PermissionError("style participant does not own the active session")
+            selector = self._select_output_style
+            if selector is None:
+                raise RuntimeError("output style selection is unavailable")
+            selector(selected)
+            self._touch_activity()
+            return selected
 
     async def change_voice(self, *, participant_identity: str, voice: str) -> None:
         if type(voice) is not str:

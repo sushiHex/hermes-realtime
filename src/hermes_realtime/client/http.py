@@ -147,6 +147,7 @@ class BrowserBootstrapApplication:
             "/api/v1/media",
             "/api/v1/model",
             "/api/v1/models",
+            "/api/v1/output-style",
             "/api/v1/projection-resync",
             "/api/v1/rebind",
             "/api/v1/refresh",
@@ -619,6 +620,32 @@ class BrowserBootstrapApplication:
             )
             payload = catalog.public_data()
             status = 200
+        elif path == "/api/v1/output-style":
+            accepted = False
+            try:
+                if not 1 <= len(body) <= 256:
+                    raise ValueError("style body must contain 1 to 256 bytes")
+                if headers.get("content-type") != "application/json":
+                    raise ValueError("style content-type must be application/json")
+                identity = self._verifier.verify(bearer)
+                try:
+                    decoded = json.loads(
+                        body.decode("utf-8"), object_pairs_hook=_strict_json_object,
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise ValueError("style body must be strict UTF-8 JSON") from None
+                if type(decoded) is not dict or set(decoded) != {"style"}:
+                    raise ValueError("style request must contain the exact style field")
+                selected = await self._sessions.change_output_style(
+                    participant_identity=identity, style=decoded["style"],
+                )
+                payload = {"selectedStyle": selected, "version": 1}
+                status = 200
+                accepted = True
+            finally:
+                print("[output-style] " + json.dumps(
+                    {"accepted": accepted, "version": 1}, separators=(",", ":"),
+                ), flush=True)
         elif path == "/api/v1/voice":
             if not 1 <= len(body) <= 256:
                 raise ValueError("voice body must contain 1 to 256 bytes")

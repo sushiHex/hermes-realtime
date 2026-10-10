@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from hermes_realtime import __version__
 from hermes_realtime.conversation.context import ConversationContextSnapshot
+from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
@@ -65,17 +66,6 @@ _TRANSCRIPT_INTERPRETATION_POLICY = (
     "remain and the choice "
     "changes the requested action. Never add a topic, domain, category, constraint, source, or "
     "entity the user did not request. "
-)
-_CONVERSATIONAL_STYLE_POLICY = (
-    "Lead with the answer or natural reaction, not a generic acknowledgment. Use one or two "
-    "short sentences for simple turns; expand only when the user asks or the answer needs it. "
-    "Continue from the immediate context. Do not restate the user's message. Questions are "
-    "welcome when genuine curiosity would make the exchange feel alive. Do not force a follow-up "
-    "question; ask at most one only when it genuinely advances the conversation or resolves "
-    "material ambiguity. Do not end every turn with an offer to help. Avoid headings, bullets, "
-    "numbered lists, and Markdown unless the user asks for a list or exact formatting. Use warm, "
-    "specific empathy when emotional context calls for it; avoid generic validation, scripted "
-    "empathy, and therapy language. "
 )
 _HERMES_REPRESENTATIVE_POLICY = (
     "You are the realtime voice of the configured Hermes Agent. Speak as that Hermes agent, not "
@@ -676,7 +666,11 @@ class CodexAppServerStreamingInference:
         max_events: int = 256,
         local_now: Callable[[], datetime] | None = None,
         hermes_context: HermesRepresentativeContext | None = None,
+        output_style: Callable[[], str] | None = None,
     ) -> None:
+        if output_style is not None and not callable(output_style):
+            raise TypeError("output_style must be callable")
+        self._output_style = output_style or (lambda: "default")
         if type(model) is not str:
             raise TypeError("model must be an exact built-in string")
         if not model.strip() or len(model) > _MAX_MODEL_CHARS:
@@ -991,6 +985,7 @@ class CodexAppServerStreamingInference:
         *,
         turn_id: str,
     ) -> AsyncIterator[str]:
+        style = require_output_style(self._output_style())
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         async with self._turn_lock:
@@ -1131,7 +1126,7 @@ class CodexAppServerStreamingInference:
                 base_instructions = (
                     "You are a concise realtime conversational assistant. Never use tools. "
                     + representative_policy
-                    + _CONVERSATIONAL_STYLE_POLICY
+                    + communication_policy(style)
                     + knowledge_policy
                     + _TRANSCRIPT_INTERPRETATION_POLICY
                     + "Respond only to the supplied conversation snapshot."
@@ -1198,7 +1193,7 @@ class CodexAppServerStreamingInference:
                 base_instructions = (
                     "Be a curious informal voice assistant. Match energy; mark hunches. "
                     + representative_policy
-                    + _CONVERSATIONAL_STYLE_POLICY
+                    + communication_policy(style)
                     + _NATIVE_AGENT_TOOL_POLICY
                     + knowledge_policy
                     + tool_policy

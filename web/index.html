@@ -115,6 +115,13 @@
         </article>
 
         <aside class="inspector" aria-label="Session details">
+          <section class="panel inspector-card" aria-labelledby="output-style-title">
+            <h2 id="output-style-title">Output style</h2>
+            <label for="output-style">Response preference</label>
+            <select id="output-style" aria-describedby="output-style-status"></select>
+            <output id="output-style-status" aria-live="polite"></output>
+            <p>Saved in this browser. Applies to the next response; model, effort and voice are separate.</p>
+          </section>
           <section class="panel inspector-card model-card" aria-labelledby="model-card-title">
             <div class="card-heading">
               <span class="card-icon model-icon" aria-hidden="true">

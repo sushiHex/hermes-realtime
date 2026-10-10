@@ -91,6 +91,7 @@ _KNOWN_MARKERS = frozenset(
         "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
         "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall", "binding-speech",
+        "output-style",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
@@ -981,11 +982,14 @@ def context_verdict(in_kept_context: bool, in_prompt: bool | None) -> list[Findi
     return [] if in_prompt else [("differ", "context_not_in_prompt")]
 
 
-def prompt_observation(messages: list[dict[str, str]], phrase: str) -> dict[str, int]:
+def prompt_observation(messages: list[dict[str, str]], phrase: str) -> dict[str, object]:
     """Counts only, at the adapter boundary: how many user rows of the prompt state the fact."""
+
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
 
     folded = phrase.casefold()
     return {
+        **OllamaStreamingInference.prompt_metadata(messages),
         "chars": sum(len(message["content"]) for message in messages),
         "fact_rows": sum(
             message["role"] == "user" and folded in message["content"].casefold()
@@ -2899,10 +2903,10 @@ def _observe_prompts() -> None:
         with opener.open(request, timeout=120) as response:
             return str(json.loads(response.read())["message"]["content"])
 
-    def observed(snapshot: Any) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = render(snapshot)
+    def observed(snapshot: Any, *, output_style: str = "default") -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = render(snapshot, output_style=output_style)
         marker("rehearsal-prompt", prompt_observation(messages, phrase))
-        # System notes (background work, updates) may follow the question.
+        # The leading policy/reference message leaves conversational rows in order.
         users = [message["content"] for message in messages if message["role"] == "user"]
         question[:] = [messages] if trials and users[-1:] == [_BIRD_QUESTION] else []
         return messages
