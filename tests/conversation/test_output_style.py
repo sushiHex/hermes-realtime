@@ -43,8 +43,17 @@ def test_style_rejects_string_subclasses() -> None:
 
 
 @pytest.mark.parametrize("provider", ["ollama", "codex"])
-def test_host_passes_the_same_live_selection_getter_to_each_provider(provider) -> None:
+def test_host_passes_the_same_live_selection_getter_to_each_provider(
+    provider, monkeypatch,
+) -> None:
     from hermes_realtime.host_launcher import _build_streaming_inference
+    from hermes_realtime.providers import codex_app_server
+
+    monkeypatch.setattr(codex_app_server.shutil, "which", lambda _name: None)
+    # Keep the real host/provider constructors; this wiring test never opens a transport.
+    monkeypatch.setattr(
+        codex_app_server, "_resolve_codex_executable", lambda _value: "synthetic-codex-unlaunched",
+    )
 
     selection = OutputStyleSelection()
     inference = _build_streaming_inference(
