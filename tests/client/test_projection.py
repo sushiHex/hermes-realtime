@@ -246,6 +246,162 @@ def test_projection_reset_starts_a_fresh_session_sequence() -> None:
     assert projection.events_after(0) == (replacement,)
 
 
+@pytest.mark.parametrize("slots", (True, 1.0, "1"))
+def test_replay_reset_rejects_inexact_initial_slot_count(slots) -> None:
+    projection = BrowserEventProjection(capacity=2)
+    with pytest.raises(TypeError, match="exact integer"):
+        projection.reset(initial_slots=slots)
+
+
+@pytest.mark.parametrize("slots", (-1, 3))
+def test_replay_reset_bounds_initial_slot_count(slots: int) -> None:
+    projection = BrowserEventProjection(capacity=2)
+    with pytest.raises(ValueError, match="capacity bound"):
+        projection.reset(initial_slots=slots)
+
+
+def test_replay_preflight_refusal_preserves_evidence_and_open_controls(capsys) -> None:
+    projection = BrowserEventProjection(capacity=3)
+    projection.publish("task_state", {"taskId": "task_running", "status": "active"})
+    projection.publish("task_state", {"taskId": "task_done", "status": "completed"})
+    projection.publish(
+        "task_result",
+        {
+            "taskId": "task_done",
+            "status": "completed",
+            "text": "Synthetic result",
+        },
+    )
+    before = projection.events_after(0)
+    with pytest.raises(RuntimeError, match="replay capacity"):
+        projection.reset(initial_slots=1)
+    assert projection.events_after(0) == before
+    assert projection.open_state_count == 1
+    assert capsys.readouterr().out == (
+        '[projection-replay-refusal] {"kind": "durable-state", "category": "capacity", '
+        '"settled_count": 2, "open_count": 1, "initial_slots": 1}\n'
+    )
+
+
+@pytest.mark.parametrize("operation", ("publish", "capture", "voice", "advisory"))
+def test_pending_replay_occupies_existing_projection_capacity(operation: str) -> None:
+    projection = BrowserEventProjection(capacity=2)
+    for task_id in ("task_first", "task_second"):
+        projection.publish("task_state", {"taskId": task_id, "status": "completed"})
+    projection.reset()
+    if operation == "advisory":
+        assert projection.publish_advisory("notification_queued", {}) is None
+        projection.republish_open_state()
+        assert [event.data["taskId"] for event in projection.events_after(0)] == [
+            "task_first",
+            "task_second",
+        ]
+    else:
+        with pytest.raises(RuntimeError, match="capacity"):
+            if operation == "publish":
+                projection.publish("notification_queued", {})
+            elif operation == "capture":
+                projection.reserve_capture_status()
+            else:
+                projection.reserve_voice_clear()
+
+
+def test_pending_replay_survives_repeated_reset_and_partial_publication_failure() -> None:
+    fail_clock = False
+    clock_calls = 0
+
+    def clock() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if fail_clock and clock_calls == 4:
+            raise RuntimeError("synthetic clock failure")
+        return 1.0
+
+    projection = BrowserEventProjection(capacity=4, clock=clock)
+    projection.publish("task_state", {"taskId": "task_done", "status": "completed"})
+    projection.publish(
+        "task_result",
+        {
+            "taskId": "task_done",
+            "status": "completed",
+            "text": "Synthetic result",
+        },
+    )
+    projection.reset()
+    projection.reset()
+    fail_clock = True
+    with pytest.raises(RuntimeError, match="clock failure"):
+        projection.republish_open_state()
+    fail_clock = False
+    projection.reset()
+    projection.republish_open_state()
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", {"taskId": "task_done", "status": "completed"}),
+        ("task_result", {"taskId": "task_done", "status": "completed", "text": "Synthetic result"}),
+    ]
+
+
+def test_replay_uses_latest_settlement_identity_and_excludes_cancel_refusal() -> None:
+    projection = BrowserEventProjection(capacity=8)
+    projection.publish("task_state", {"taskId": "task_done", "status": "completed"})
+    projection.publish(
+        "task_result",
+        {
+            "taskId": "task_done",
+            "status": "completed",
+            "text": "Synthetic first result",
+        },
+    )
+    projection.publish(
+        "task_result",
+        {
+            "taskId": "task_done",
+            "status": "completed",
+            "text": "Synthetic latest result",
+        },
+    )
+    projection.publish("task_state", {"taskId": "task_refused", "status": "rejected"})
+    projection.reset()
+    projection.republish_open_state()
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", {"taskId": "task_done", "status": "completed"}),
+        (
+            "task_result",
+            {"taskId": "task_done", "status": "completed", "text": "Synthetic latest result"},
+        ),
+    ]
+
+
+@pytest.mark.parametrize("kind,data", (
+    ("task_state", {"taskId": None, "status": "completed"}),
+    ("approval_state", {"approvalId": None, "actionable": False}),
+    ("approval_state", {"approvalId": "approval_0123456789abcdef"}),
+    ("notification_queued", {"taskId": "task_fake", "status": "completed"}),
+    ("notification_queued", {"approvalId": "approval_0123456789abcdef", "actionable": False}),
+    ("approval_state", {"approvalId": "approval_0123456789abcdef", "actionable": 0}),
+))
+def test_replay_excludes_idless_or_non_control_settlements(kind: str, data: dict) -> None:
+    projection = BrowserEventProjection()
+    projection.publish(kind, data)
+    projection.reset()
+    projection.republish_open_state()
+    assert projection.events_after(0) == ()
+
+
+@pytest.mark.parametrize("status", ("completed", "failed", "interrupted"))
+def test_replay_keeps_each_authoritative_terminal_outcome(status: str) -> None:
+    projection = BrowserEventProjection()
+    state = {"taskId": "task_done", "status": status}
+    result = dict(state, text="Synthetic result")
+    projection.publish("task_state", dict(state))
+    projection.publish("task_result", dict(result))
+    projection.reset()
+    projection.republish_open_state()
+    assert [(event.kind, dict(event.data)) for event in projection.events_after(0)] == [
+        ("task_state", state), ("task_result", result),
+    ]
+
+
 def test_projection_reserves_multiple_slots_before_partial_publication() -> None:
     projection = BrowserEventProjection(capacity=2)
     projection.publish("notification_queued", {})
@@ -439,6 +595,7 @@ def test_projection_validates_content_free_knowledge_timing() -> None:
         projection.publish_advisory("knowledge_timing", {**data, "query": "private"})
     with pytest.raises(ValueError, match="knowledge timing milliseconds"):
         projection.publish_advisory("knowledge_timing", {**data, "p95Ms": -1})
+
 
 def test_advisory_partial_drops_without_latching_projection_overflow() -> None:
     projection = BrowserEventProjection(capacity=1)

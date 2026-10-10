@@ -69,6 +69,26 @@ post-stop Connect cause, or physical recovery. Those limits remain tracked in
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159). This addition does
 not advance the page-wide reviewed baseline.
 
+The browser history presentation keeps worker results in one expandable task
+card per task identity, alongside the independently delivered assistant transcript.
+Active cards move into a stack only after reaching the history viewport top;
+they remain there until a terminal state, including while the reader scrolls
+backward. Disconnecting media preserves task status and exact-card identity
+until authoritative task state or result replay settles the durable work.
+The stack uses at most 40% of the history viewport and has named,
+keyboard-accessible overflow. Active and cancelling cards pulse their borders;
+reduced-motion preferences disable the animation. Live card retention is bounded
+by the runtime's hard limit of 256 active tasks, with visible refresh guidance
+on overflow. Terminal cards rejoin bounded history retention.
+One history scroll owner suspends automatic following when the reader leaves
+the live end and resumes it on return. Karaoke highlighting advances independently.
+The [headless layout regressions](../tests/integration/test_browser_history_presentation.py)
+exercise production projection, scrolling, replay, interruption, overflow and
+reduced-motion paths with synthetic inputs. They establish Chromium layout behavior,
+not physical speech acceptance or WebKit qualification. See
+[#229](https://github.com/sushiHex/hermes-realtime/issues/229) and
+[#230](https://github.com/sushiHex/hermes-realtime/issues/230).
+
 The [input-binding implementation](qualification-input-files.md) adds retained
 file and tool owners, source-locked dependency verification, six independent
 build recipes, purpose-specific Windows runtime installation, publisher and

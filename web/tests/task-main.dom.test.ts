@@ -105,7 +105,11 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     await vi.waitFor(() => expect(approvals.at(-1)?.approvalId).toBe(approvalId));
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
-  const card = (taskId = "task_fixture") => dom.window.document.querySelector<HTMLLIElement>(`#transcript li[data-task-id="${taskId}"]`)!;
+  const card = (taskId = "task_fixture") => {
+    const cards = dom.window.document.querySelectorAll<HTMLLIElement>(`#conversation-panel li[data-task-id="${taskId}"]`);
+    expect(cards).toHaveLength(1);
+    return cards[0]!;
+  };
   const cancel = (taskId = "task_fixture") => card(taskId)?.querySelector<HTMLButtonElement>("button")!;
   const submit = (text: string) => {
     dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.value = text;

@@ -95,7 +95,7 @@ describe("browser lifecycle wiring", () => {
     expect(mainSource).toContain("actionableApprovalCard(obsolete) && !repinned.has(obsolete)");
     expect(mainSource).not.toContain("activeApprovalCard");
     expect(mainSource).not.toContain("Superseded by a newer approval request.");
-    expect(mainSource).toContain("forgetEvictedTaskCard(obsolete)");
+    expect(mainSource).toContain("forgetEvictedOperationCard(obsolete)");
   });
 
   it("automatically rebinds after an authoritative terminal media disconnect", () => {
