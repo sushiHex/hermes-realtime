@@ -221,7 +221,7 @@ describe("browser lifecycle wiring", () => {
     const reconnectEnd = mainSource.indexOf("pendingRebindRequestId = null;", reconnectStart);
     const reconnect = mainSource.slice(reconnectStart, reconnectEnd);
     // Ordinary rebind renews search/media authority while retaining session counters.
-    expect(reconnect).toContain("if (!sessionReplaced) resetBindingInputAuthority();");
+    expect(reconnect).toContain("if (!sessionReplaced) {\n          resetBindingInputAuthority();");
     const bindingResetStart = mainSource.indexOf("function resetBindingInputAuthority(");
     const bindingReset = mainSource.slice(
       bindingResetStart, mainSource.indexOf("\n}\n", bindingResetStart),

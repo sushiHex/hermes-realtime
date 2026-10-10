@@ -58,7 +58,11 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     if (path === "/api/v1/stable-rebind") {
       if (!sessionActive) return new Response(null, { status: 409 });
       if (JSON.parse(options.body as string).freshView === true) sequence = 0;
-      return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });
+      const previousIdentity = JSON.parse(options.body as string).participantIdentity;
+      return Response.json({ ...credential,
+        participantIdentity: previousIdentity === credential.participantIdentity
+          ? "browser_fedcba9876543210" : "browser_0011223344556677",
+        token: "synthetic.rebound.token" });
     }
     if (path === "/api/v1/refresh") return Response.json({ ...credential, token: "synthetic.rotated.token" });
     if (path === "/api/v1/projection-resync") {
@@ -185,6 +189,46 @@ describe("mounted task controls", () => {
     await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 2]));
     const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
     expect(JSON.parse(rebind[1]!.body as string)).not.toHaveProperty("freshView");
+  });
+
+  it("ordinary rebind restores the retained task Cancel without task replay", async () => {
+    const { requests, task, cancel, card, submit, toggle } = await mount();
+    await task("task_fixture", "active");
+    const original = card();
+    submit("Synthetic admitted input before task rebind");
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("typed_input_admitted"));
+    media.rooms.at(-1)!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLInputElement>("#typed-input")!.disabled).toBe(false));
+    expect(card()).toBe(original);
+    expect(cancel().disabled).toBe(false);
+    cancel().click();
+    await vi.waitFor(() => expect(requests).toEqual([
+      { sequence: 1, text: "Synthetic admitted input before task rebind" },
+      { sequence: 2, text: "cancel task: task_fixture" },
+    ]));
+    const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
+    expect(JSON.parse(rebind[1]!.body as string)).not.toHaveProperty("freshView");
+  });
+
+  it("keeps a retained old-identity card disabled across fresh-view reset until authoritative task replay", async () => {
+    const { requests, task, cancel, card, toggle, poisonProjection } = await mount();
+    await task("task_fixture", "active");
+    const original = card();
+    await poisonProjection();
+    await vi.waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/api/v1/media")).toHaveLength(2));
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLInputElement>("#typed-input")!.disabled).toBe(false));
+    media.rooms.at(-1)!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLInputElement>("#typed-input")!.disabled).toBe(false));
+    expect(card()).toBe(original);
+    expect(cancel().disabled).toBe(true);
+    cancel().click();
+    expect(requests).toEqual([]);
+    await task("task_fixture", "active");
+    expect(cancel().disabled).toBe(false);
   });
 
   it("preserves admitted approval sequence across ordinary browser rebind", async () => {
@@ -466,20 +510,6 @@ describe("mounted task controls", () => {
     expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("synthetic diagnostic content");
   });
 
-  it("keeps a retained old-identity card disabled until current authoritative task state", async () => {
-    const { task, cancel, toggle, requests } = await mount();
-    await task("task_fixture", "active");
-    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
-    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
-    toggle.click();
-    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
-    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
-    expect(cancel().disabled).toBe(true);
-    cancel().click();
-    expect(requests).toEqual([]);
-    await task("task_fixture", "active");
-    expect(cancel().disabled).toBe(false);
-  });
 
   it.each([
     "No active task to cancel.",

@@ -2986,7 +2986,14 @@ async function connect(projectionResync = false): Promise<void> {
         }
         // Ordinary rebind retains the server's input and approval counters.
         // Only media/evidence/search authority belongs to the new binding.
-        if (!sessionReplaced) resetBindingInputAuthority();
+        if (!sessionReplaced) {
+          resetBindingInputAuthority();
+          for (const view of taskCardViews.values()) {
+            if (view.participantIdentity === previousCredential.participantIdentity) {
+              view.participantIdentity = credential!.participantIdentity;
+            }
+          }
+        }
         pendingRebindRequestId = null;
       }
     } else {
