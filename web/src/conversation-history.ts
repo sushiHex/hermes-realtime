@@ -31,6 +31,20 @@ export class ConversationHistory {
     return this.active.has(item);
   }
 
+  /** Voice deletion preserves durable work and its exact positions in history. */
+  clearTranscript(transcript: HTMLOListElement): readonly HTMLLIElement[] {
+    const preserved = new Set<HTMLLIElement>();
+    for (const [item, anchor] of this.active) {
+      preserved.add(item);
+      if (anchor !== null) preserved.add(anchor);
+    }
+    const removed = (Array.from(transcript.children) as HTMLLIElement[])
+      .filter((item) => !preserved.has(item));
+    for (const item of removed) item.remove();
+    this.refresh();
+    return removed;
+  }
+
   setActive(item: HTMLLIElement, active: boolean): void {
     if (active) {
       if (!this.active.has(item)) {

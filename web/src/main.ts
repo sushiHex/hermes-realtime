@@ -866,7 +866,10 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
   request: requestVoiceDeleteWire,
   clear: () => {
     clearPartialTranscript();
-    transcript.replaceChildren();
+    for (const item of conversationHistory.clearTranscript(transcript)) {
+      transcriptRetention.remove(item);
+      forgetEvictedTaskCard(item);
+    }
     assistantTurns.clear();
     syncTranscriptEmptyState();
   },

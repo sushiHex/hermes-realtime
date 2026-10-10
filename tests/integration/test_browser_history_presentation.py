@@ -50,6 +50,8 @@ def browser_script(tmp_path_factory: pytest.TempPathFactory) -> str:
         applySpeechTiming(timing);
       },
       advanceKaraoke: (time) => { remoteAudio.currentTime = time; },
+      historyAccounting: () => ({retainedRows:transcriptRetention.size,
+        retainedCost:transcriptRetention.cost,taskViews:taskCardViews.size}),
       stopPersistentSession: async () => {
         setCredential({version:1,url:'wss://livekit.test',roomName:'synthetic-room',
           participantIdentity:'browser_0123456789abcdef',workerIdentity:'worker_hermes_browser',
@@ -340,6 +342,50 @@ def test_persistent_session_stop_preserves_tasks_until_authoritative_completion(
       text:'Authoritative durable task completion'})""")
     assert page.locator(".active-task-stack [data-task-id]").count() == 0
     assert page.locator('#transcript > [data-task-id="task_session_stop"] details').count() == 1
+
+
+def test_voice_clear_preserves_live_cards_and_anchors_until_exact_terminal_results(page) -> None:
+    page.evaluate("""() => {
+      task('task_deleted_terminal','completed');
+      task('task_clear_pinned');
+      for(let i=0;i<30;i++)
+        project('transcript_final',{role:'assistant',text:'Voice history to delete ' + i});
+      const scroll=document.querySelector('.conversation-scroll');
+      scroll.scrollTop=0; scroll.dispatchEvent(new Event('scroll'));
+      task('task_clear_future','cancelling');
+      window.clearCards=['task_clear_pinned','task_clear_future'].map(id =>
+        document.querySelector('[data-task-id="' + id + '"]'));
+    }""")
+    assert page.locator('.active-task-stack [data-task-id="task_clear_pinned"]').count() == 1
+    assert page.locator('#transcript > [data-task-id="task_clear_future"]').count() == 1
+    page.evaluate("project('voice_conversation_cleared',{})")
+    assert page.locator("#transcript .task-history-slot").count() == 1
+    assert page.locator('#transcript > [data-task-id="task_clear_future"]').count() == 1
+    assert page.locator('[data-task-id="task_deleted_terminal"]').count() == 0
+    assert page.locator('[data-role="assistant"]').count() == 0
+    assert page.evaluate("historyFixture.historyAccounting()") == {
+        "retainedRows": 0,
+        "retainedCost": 0,
+        "taskViews": 2,
+    }
+    page.evaluate("""() => {
+      task('task_clear_pinned'); task('task_clear_future','cancelling');
+    }""")
+    assert page.evaluate("""clearCards.every(card => card.isConnected &&
+      card === document.querySelector('[data-task-id="' + card.dataset.taskId + '"]'))""")
+    assert page.locator('[data-operation="task"]').count() == 2
+    page.evaluate("""() => {
+      project('task_result',{taskId:'task_clear_pinned',status:'completed',
+        text:'Pinned task result'});
+      project('task_result',{taskId:'task_clear_future',status:'failed',
+        text:'Future task result'});
+    }""")
+    assert page.locator(".active-task-stack [data-task-id]").count() == 0
+    assert page.locator("#transcript > [data-task-id] details.task-result").count() == 2
+    assert page.locator(".task-history-slot").count() == 0
+    assert page.evaluate("""clearCards.every(card => card.parentElement.id === 'transcript' &&
+      card === document.querySelector('[data-task-id="' + card.dataset.taskId + '"]'))""")
+    assert page.evaluate("historyFixture.historyAccounting().retainedRows") == 2
 
 
 def test_active_capacity_refuses_overflow_visibly_without_evicting_work(page) -> None:
