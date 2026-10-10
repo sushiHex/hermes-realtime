@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -62,6 +64,183 @@ def _probe(context: ConversationContextStore | None = None) -> TaskControllerPro
         ),
         context=context,
     )
+
+
+def _spoken_router(context: ConversationContextStore, *, record=None):
+    controller = _probe(context)
+    events = []
+    surface = ConversationWorkControlSurface(
+        controller=controller,
+        context=context,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+    )
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda kind, data: events.append((kind, data)),
+        reserve_observer_capacity=lambda: None,
+        validate_user_input=context.validate_user_text if record is not None else None,
+        record_user_input=record,
+    )
+    return router, controller, events
+
+
+@pytest.mark.asyncio
+async def test_spoken_start_uses_existing_acknowledged_work_surface() -> None:
+    router, controller, events = _spoken_router(ConversationContextStore())
+    assert await router.route("Start task Inspect release evidence.") is True
+    assert controller.dispatches[0][0] == "Inspect release evidence."
+    assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
+
+
+@pytest.mark.asyncio
+async def test_spoken_start_emits_no_active_state_before_accepted_ack() -> None:
+    router, controller, events = _spoken_router(ConversationContextStore())
+    controller.dispatch_outcome = TaskDispatchOutcome(
+        task_id="task_release_check", accepted=False, reason="dispatch refused"
+    )
+    assert await router.route("start task Inspect release evidence") is True
+    assert events == [
+        (
+            "task_state",
+            {
+                "status": "rejected",
+                "taskId": "task_release_check",
+                "reason": "dispatch refused",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ("start task", "Start task.", "start task!", "start task?"))
+async def test_spoken_start_without_objective_returns_fixed_guidance(text: str) -> None:
+    router, controller, events = _spoken_router(ConversationContextStore())
+    assert await router.route(text) is True
+    assert controller.dispatches == []
+    assert events == [
+        (
+            "task_state",
+            {
+                "status": "rejected",
+                "taskId": None,
+                "reason": "Provide an objective after Start task.",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ("cancel task", "Cancel task.", "cancel task!", "cancel task?"))
+async def test_spoken_cancel_freezes_the_sole_public_task(text: str) -> None:
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_release_check", run_id="deleg_fixture", objective="Inspect release evidence"
+    )
+    router, controller, events = _spoken_router(context)
+    assert await router.route(text) is True
+    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
+    assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", (0, 2))
+async def test_spoken_cancel_refuses_missing_or_ambiguous_identity(count: int, capsys) -> None:
+    context = ConversationContextStore()
+    for index in range(count):
+        context.record_task_accepted(
+            task_id=f"task_fixture_{index}",
+            run_id=f"deleg_fixture_{index}",
+            objective=f"Work {index}",
+        )
+    router, controller, events = _spoken_router(context)
+    assert await router.route("cancel task") is True
+    assert controller.cancellations == []
+    assert events == [
+        (
+            "task_state",
+            {
+                "status": "rejected",
+                "taskId": None,
+                "reason": "No active task to cancel."
+                if count == 0
+                else "Several tasks are active. Use Cancel on the task you want to stop.",
+            },
+        )
+    ]
+    marker = capsys.readouterr().out
+    assert marker.startswith("[task-command-refusal] ")
+    assert json.loads(marker.removeprefix("[task-command-refusal] ")) == {
+        "kind": "explicit-command",
+        "category": "no-active-task" if count == 0 else "ambiguous-task",
+        "candidate_count": count,
+    }
+
+
+@pytest.mark.asyncio
+async def test_spoken_cancel_never_retargets_after_recording_await() -> None:
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_release_check", run_id="deleg_fixture", objective="Original work"
+    )
+
+    async def record(_text: str) -> None:
+        await asyncio.sleep(0)
+        context.record_task_completed(task_id="task_release_check", run_id="deleg_fixture")
+        context.record_task_accepted(
+            task_id="task_replacement", run_id="deleg_replacement", objective="Replacement work"
+        )
+
+    router, controller, events = _spoken_router(context, record=record)
+    assert await router.route("cancel task") is True
+    assert controller.cancellations == []
+    assert events == [
+        (
+            "task_state",
+            {
+                "status": "rejected",
+                "taskId": "task_release_check",
+                "reason": "task is not active",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_spoken_exact_identity_cancels_only_named_task_among_several() -> None:
+    context = ConversationContextStore()
+    for task_id in ("task_release_check", "task_other"):
+        context.record_task_accepted(
+            task_id=task_id, run_id=f"deleg_{task_id}", objective=f"Work for {task_id}"
+        )
+    router, controller, _events = _spoken_router(context)
+    assert await router.route("cancel task task_release_check") is True
+    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
+    assert tuple(task.task_id for task in context.snapshot().active_tasks) == (
+        "task_release_check",
+        "task_other",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    (
+        "stop",
+        "do not cancel task",
+        '"cancel task"',
+        '"start task Inspect release evidence"',
+        "please start task Inspect release evidence",
+        "start tasks Inspect release evidence",
+        "cancel tasks",
+        "start tasking Inspect release evidence",
+    ),
+)
+async def test_spoken_command_grammar_does_not_infer_authority(text: str) -> None:
+    router, controller, _events = _spoken_router(ConversationContextStore())
+    assert await router.route(text) is False
+    assert controller.dispatches == []
+    assert controller.cancellations == []
 
 
 def _lifecycle_owner() -> tuple[EvidenceLifecycleOwner, object]:
@@ -142,8 +321,7 @@ async def test_invalid_command_retires_final_input_without_evidence_hook() -> No
         observer=lambda _kind, _data: None,
         reserve_observer_capacity=lambda: None,
         lifecycle_owner=owner.conversation_authority,
-        on_command_accepted=lambda command: accepted.append(command)
-        or CommandDisposition.ADMITTED,
+        on_command_accepted=lambda command: accepted.append(command) or CommandDisposition.ADMITTED,
     )
 
     result = await router.route("task:", authority)
@@ -186,8 +364,9 @@ async def test_cancel_command_returns_exact_evidence_result_and_consumes_final_i
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "cancel_evidence_1",
         lifecycle_owner=owner.conversation_authority,
-        on_command_accepted=lambda command: accepted_authorities.append(command)
-        or CommandDisposition.ADMITTED,
+        on_command_accepted=lambda command: (
+            accepted_authorities.append(command) or CommandDisposition.ADMITTED
+        ),
     )
 
     result = await router.route(text, authority)
@@ -195,9 +374,7 @@ async def test_cancel_command_returns_exact_evidence_result_and_consumes_final_i
     assert result.outcome is expected_outcome
     assert result.user_turn_authority is None
     assert result.command_disposition is (
-        CommandDisposition.ADMITTED
-        if expected_outcome is CommandRoutingOutcome.ACCEPTED
-        else None
+        CommandDisposition.ADMITTED if expected_outcome is CommandRoutingOutcome.ACCEPTED else None
     )
     assert len(accepted_authorities) == (
         1 if expected_outcome is CommandRoutingOutcome.ACCEPTED else 0
@@ -227,8 +404,7 @@ async def test_rejected_command_ack_retires_final_input_without_evidence_hook() 
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "rejected_1",
         lifecycle_owner=owner.conversation_authority,
-        on_command_accepted=lambda command: accepted.append(command)
-        or CommandDisposition.ADMITTED,
+        on_command_accepted=lambda command: accepted.append(command) or CommandDisposition.ADMITTED,
     )
 
     result = await router.route("task: Inspect release evidence", authority)
@@ -291,8 +467,7 @@ async def test_surface_accepted_command_with_authority_returns_typed_evidence_re
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "route_typed",
         lifecycle_owner=owner.conversation_authority,
-        on_command_accepted=lambda command: accepted.append(command)
-        or CommandDisposition.ADMITTED,
+        on_command_accepted=lambda command: accepted.append(command) or CommandDisposition.ADMITTED,
     )
 
     result = await router.route("task: Inspect release evidence", authority)
@@ -328,12 +503,8 @@ async def test_explicit_cancel_routes_through_shared_work_control_surface() -> N
     )
 
     assert await router.route("cancel task: task_release_check") is True
-    assert controller.cancellations == [
-        ("task_release_check", "user requested task cancellation")
-    ]
-    assert events == [
-        ("task_state", {"status": "cancelling", "taskId": "task_release_check"})
-    ]
+    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
+    assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
 
 
 @pytest.mark.asyncio
@@ -364,8 +535,7 @@ async def test_shared_work_surface_cancel_preserves_evidence_outcome(
         reserve_observer_capacity=lambda: None,
         utterance_id_factory=lambda: "surface_route",
         lifecycle_owner=owner.conversation_authority,
-        on_command_accepted=lambda command: accepted.append(command)
-        or CommandDisposition.ADMITTED,
+        on_command_accepted=lambda command: accepted.append(command) or CommandDisposition.ADMITTED,
     )
 
     result = await router.route("cancel task: task_release_check", authority)
@@ -373,9 +543,7 @@ async def test_shared_work_surface_cancel_preserves_evidence_outcome(
     assert result.outcome is (
         CommandRoutingOutcome.ACCEPTED if task_active else CommandRoutingOutcome.REJECTED
     )
-    assert result.command_disposition is (
-        CommandDisposition.ADMITTED if task_active else None
-    )
+    assert result.command_disposition is (CommandDisposition.ADMITTED if task_active else None)
     assert result.user_turn_authority is None
     assert len(accepted) == (1 if task_active else 0)
     with pytest.raises(ReservationError, match="consumed"):
@@ -404,9 +572,7 @@ async def test_task_command_routes_only_explicit_prefix_and_projects_after_ack()
     assert await router.route("task: Inspect the release evidence") is True
 
     assert capacity_checks == 1
-    assert controller.dispatches == [
-        ("Inspect the release evidence", "utterance_command_1")
-    ]
+    assert controller.dispatches == [("Inspect the release evidence", "utterance_command_1")]
     assert events == [
         (
             "task_state",
@@ -427,9 +593,7 @@ async def test_cancel_command_targets_only_public_task_identifier() -> None:
     )
 
     assert await router.route("cancel task: task_release_check") is True
-    assert controller.cancellations == [
-        ("task_release_check", "user requested task cancellation")
-    ]
+    assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
     assert events == [
         (
             "task_state",
@@ -507,9 +671,7 @@ async def test_post_ack_projection_failure_rolls_back_new_task() -> None:
 
     with pytest.raises(RuntimeError, match="projection failed"):
         await router.route("task: dispatch then roll back")
-    assert controller.cancellations == [
-        ("task_release_check", "task state projection failed")
-    ]
+    assert controller.cancellations == [("task_release_check", "task state projection failed")]
 
 
 class _OrderedControllerProbe(TaskControllerProbe):
@@ -543,6 +705,8 @@ def _ordered_probe(order: list[str]) -> _OrderedControllerProbe:
     ("text", "action"),
     [
         pytest.param("task: Inspect the release evidence", "dispatch", id="task"),
+        pytest.param("start task Inspect the release evidence", "dispatch", id="spoken-start"),
+        pytest.param("cancel task", None, id="spoken-no-context"),
         pytest.param("  Task: padded utterance  ", "dispatch", id="exact-utterance"),
         pytest.param("cancel task: task_release_check", "cancel", id="cancel"),
         pytest.param("task:", None, id="invalid-task"),
@@ -626,6 +790,7 @@ async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> N
     "text",
     [
         pytest.param("task: " + "x" * 12, id="over-the-context-item-bound"),
+        pytest.param("start task " + "x" * 12, id="spoken-context-item-bound"),
         pytest.param("cancel task: task_deleg_private", id="private-run-token"),
         pytest.param("task: lone \ud800", id="not-utf8-encodable"),
     ],

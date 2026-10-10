@@ -224,6 +224,12 @@ class ConversationWorkControlSurface:
         return self._context.max_item_chars
 
     @property
+    def active_task_ids(self) -> tuple[str, ...]:
+        """Public identities frozen synchronously for an explicit current command."""
+
+        return tuple(task.task_id for task in self._context.snapshot().active_tasks)
+
+    @property
     def can_cancel_work(self) -> bool:
         return bool(self._pending_starts) or bool(self._context.snapshot().active_tasks)
 

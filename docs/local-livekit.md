@@ -419,8 +419,21 @@ record only pass/fail status and non-secret latency values.
 
 `hermes-realtime-host` is the Milestone 6.1b launcher. It keeps the browser, LiveKit,
 Hermes API, inference, STT, and TTS surfaces on loopback. Explicit
-`task: <objective>` and `cancel task: <public-task-id>` transcripts are always the deterministic
-background-work fallback. With Codex and `--natural-work-tools`, ordinary language may invoke the
+`start task <objective>` starts background work through the deterministic command router.
+The whole final utterance must begin with those exact words (case does not matter); no colon
+or other STT punctuation is required. The objective is bounded by the existing work surface.
+`cancel task` (optionally ending in `.`, `!` or `?`) cancels only when exactly one acknowledged
+task exists at command intake. Its public identity is frozen before any await; if that task
+ends meanwhile, cancellation is refused instead of selecting newer work. With no task the
+browser says there is no active task; with several it asks the operator to use the intended
+task card's **Cancel** control. Pending dispatches are not selected by this spoken command.
+`cancel task <public-task-id>` names an exact task. The legacy `task: <objective>` and
+`cancel task: <public-task-id>` forms remain supported. Negated, quoted or prefaced commands
+are not direct commands, and bare `stop` grants no task cancellation. A dispatch remains
+pending until Hermes accepts it; cancellation acknowledgment means stopping was requested,
+while a terminal event establishes that the task ended.
+
+With Codex and `--natural-work-tools`, ordinary language may invoke the
 same authoritative start/cancel surface; without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,

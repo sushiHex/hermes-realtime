@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable
@@ -24,6 +25,8 @@ _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _MAX_OBJECTIVE_CHARS = 1024
+_SPOKEN_START = re.compile(r"start task(?:\s+(.*)|[.!?])?\Z", re.IGNORECASE | re.DOTALL)
+_SPOKEN_CANCEL = re.compile(r"cancel task[.!?]?\Z", re.IGNORECASE)
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _CommandAcceptedHook = Callable[[CommandAdmissionAuthorityV1], CommandDisposition]
@@ -43,6 +46,9 @@ class _TaskController(Protocol):
 class _WorkControlSurface(Protocol):
     @property
     def max_objective_chars(self) -> int: ...
+
+    @property
+    def active_task_ids(self) -> tuple[str, ...]: ...
 
     async def start_work(
         self,
@@ -158,13 +164,44 @@ class ConversationTaskCommandRouter:
             raise TypeError("command text must be an exact built-in string")
         stripped = text.strip()
         folded = stripped.casefold()
-        if folded.startswith(("task:", "cancel task:")) and not await self._recorded(text):
+        spoken_start = _SPOKEN_START.fullmatch(stripped)
+        spoken_cancel = _SPOKEN_CANCEL.fullmatch(stripped) is not None
+        start_command = folded.startswith("task:") or spoken_start is not None
+        cancel_command = folded.startswith(("cancel task:", "cancel task ")) or spoken_cancel
+        # Freeze before even the history recording await. Never resolve a later
+        # active task after the original work has finished or been replaced.
+        candidates = (
+            self._surface.active_task_ids if spoken_cancel and self._surface is not None else ()
+        )
+        task_id = candidates[0] if len(candidates) == 1 else None
+        if (start_command or cancel_command) and not await self._recorded(text):
             self._publish_invalid()
             return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
-        if folded.startswith("task:"):
-            objective = stripped[len("task:") :].strip()
+        if spoken_cancel and task_id is None:
+            self._publish_invalid(
+                reason=(
+                    "No active task to cancel."
+                    if not candidates
+                    else "Several tasks are active. Use Cancel on the task you want to stop."
+                ),
+                category="no-active-task" if not candidates else "ambiguous-task",
+                candidate_count=len(candidates),
+            )
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.REJECTED)
+        if start_command:
+            objective = (
+                (spoken_start.group(1) or "").strip()
+                if spoken_start is not None
+                else stripped[len("task:") :].strip()
+            )
             if not self._valid_objective(objective):
-                self._publish_invalid()
+                self._publish_invalid(
+                    reason=(
+                        "Provide an objective after Start task."
+                        if spoken_start is not None and not objective
+                        else "invalid explicit task command"
+                    )
+                )
                 return self._closed_nonaccepted_result(
                     authority,
                     CommandRoutingOutcome.INVALID,
@@ -229,8 +266,12 @@ class ConversationTaskCommandRouter:
                     CommandRoutingOutcome.REJECTED,
                 )
             return True
-        if folded.startswith("cancel task:"):
-            task_id = stripped[len("cancel task:") :].strip()
+        if cancel_command:
+            if not spoken_cancel:
+                prefix = "cancel task:" if folded.startswith("cancel task:") else "cancel task "
+                task_id = stripped[len(prefix) :].strip()
+            if task_id is None:
+                raise RuntimeError("explicit cancellation has no frozen task identity")
             if _TASK_ID.fullmatch(task_id) is None or _PRIVATE_AUTHORITY.search(task_id):
                 self._publish_invalid()
                 return self._closed_nonaccepted_result(
@@ -351,16 +392,30 @@ class ConversationTaskCommandRouter:
             objective and len(objective) <= maximum and _PRIVATE_AUTHORITY.search(objective) is None
         )
 
-    def _publish_invalid(self) -> None:
-        self._reserve()
-        self._observer(
-            "task_state",
-            {
-                "reason": "invalid explicit task command",
-                "status": "rejected",
-                "taskId": None,
-            },
-        )
+    def _publish_invalid(
+        self,
+        *,
+        reason: str = "invalid explicit task command",
+        category: str = "invalid-command",
+        candidate_count: int = 0,
+    ) -> None:
+        try:
+            self._reserve()
+            self._observer(
+                "task_state",
+                {"reason": reason, "status": "rejected", "taskId": None},
+            )
+        finally:
+            print(
+                "[task-command-refusal] "
+                + json.dumps(
+                    {
+                        "kind": "explicit-command",
+                        "category": category,
+                        "candidate_count": candidate_count,
+                    }
+                )
+            )
 
 
 __all__ = ["ConversationTaskCommandRouter"]
