@@ -19,7 +19,7 @@ from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
 
 from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
-from .work_tools import WorkCancelResult, WorkStartResult
+from .work_tools import WorkCommandAdmission
 
 _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 _COMMAND_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,110}\Z")
@@ -50,20 +50,20 @@ class _WorkControlSurface(Protocol):
     @property
     def active_task_ids(self) -> tuple[str, ...]: ...
 
-    async def start_work(
+    async def submit_start_command(
         self,
         *,
         objective: str,
         invocation_id: str,
-    ) -> WorkStartResult: ...
+    ) -> WorkCommandAdmission: ...
 
-    async def cancel_work(
+    async def submit_cancel_command(
         self,
         *,
         task_id: str,
         invocation_id: str,
         reason: str = "user requested task cancellation",
-    ) -> WorkCancelResult: ...
+    ) -> WorkCommandAdmission: ...
 
 
 class ConversationTaskCommandRouter:
@@ -73,7 +73,9 @@ class ConversationTaskCommandRouter:
     the user row before the command acts; every other final input becomes a
     user row through the turn it starts. ``validate_user_input`` is the store's
     pure check: only its refusal makes a command invalid. A recording failure
-    propagates exactly as it would for an ordinary turn.
+    propagates exactly as it would for an ordinary turn. Surface commands await
+    bounded admission only; accepted routing consumes input authority but does
+    not claim a task acknowledgment. The owned surface settles and projects it.
     """
 
     def __init__(
@@ -100,10 +102,10 @@ class ConversationTaskCommandRouter:
         if surface is None and not callable(getattr(controller, "request_cancel", None)):
             raise TypeError("controller must provide request_cancel()")
         if surface is not None:
-            if not callable(getattr(surface, "start_work", None)):
-                raise TypeError("surface must provide start_work()")
-            if not callable(getattr(surface, "cancel_work", None)):
-                raise TypeError("surface must provide cancel_work()")
+            if not callable(getattr(surface, "submit_start_command", None)):
+                raise TypeError("surface must provide submit_start_command()")
+            if not callable(getattr(surface, "submit_cancel_command", None)):
+                raise TypeError("surface must provide submit_cancel_command()")
         if not callable(observer):
             raise TypeError("observer must be callable")
         if not callable(reserve_observer_capacity):
@@ -210,14 +212,11 @@ class ConversationTaskCommandRouter:
             if type(token) is not str or _COMMAND_TOKEN.fullmatch(token) is None:
                 raise RuntimeError("command utterance identifier factory returned an invalid value")
             if self._surface is not None:
-                start_result = await self._surface.start_work(
+                admission = await self._surface.submit_start_command(
                     objective=objective,
                     invocation_id=f"command_{token}",
                 )
-                if type(start_result) is not WorkStartResult:
-                    raise TypeError("work surface returned the wrong start result")
-                accepted_result = self._accepted_result(authority)
-                return True if accepted_result is None else accepted_result
+                return self._surface_admission_result(admission, authority)
             self._reserve()
             controller = self._controller
             if controller is None:
@@ -284,20 +283,12 @@ class ConversationTaskCommandRouter:
                     raise RuntimeError(
                         "command invocation identifier factory returned an invalid value"
                     )
-                cancel_result = await self._surface.cancel_work(
+                admission = await self._surface.submit_cancel_command(
                     task_id=task_id,
                     invocation_id=f"command_{token}",
                     reason="user requested task cancellation",
                 )
-                if type(cancel_result) is not WorkCancelResult:
-                    raise TypeError("work surface returned the wrong cancel result")
-                if not cancel_result.accepted:
-                    return self._closed_nonaccepted_result(
-                        authority,
-                        CommandRoutingOutcome.REJECTED,
-                    )
-                accepted_result = self._accepted_result(authority)
-                return True if accepted_result is None else accepted_result
+                return self._surface_admission_result(admission, authority)
             self._reserve()
             controller = self._controller
             if controller is None:
@@ -347,6 +338,23 @@ class ConversationTaskCommandRouter:
             command_disposition=None,
             user_turn_authority=owner.decline_to_user(authority),
         )
+
+    def _surface_admission_result(
+        self,
+        admission: WorkCommandAdmission,
+        authority: FinalInputAuthorityV1 | None,
+    ) -> bool | CommandRoutingResultV1:
+        if type(admission) is not WorkCommandAdmission:
+            raise TypeError("work surface returned the wrong command admission")
+        if admission is WorkCommandAdmission.UNAVAILABLE:
+            self._publish_invalid(
+                reason="Task control is unavailable. Restart the session before trying again.",
+                category="work-control-unavailable",
+            )
+        if admission is not WorkCommandAdmission.ADMITTED:
+            return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.REJECTED)
+        accepted_result = self._accepted_result(authority)
+        return True if accepted_result is None else accepted_result
 
     def _accepted_result(
         self,

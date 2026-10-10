@@ -560,6 +560,8 @@ function projectTaskStateCard(event: PublicEvent): void {
       "No active task to cancel.",
       "Several tasks are active. Use Cancel on the task you want to stop.",
       "Provide an objective after Start task.",
+      "Task command acknowledgment is uncertain. Check task status before trying again.",
+      "Task control is unavailable. Restart the session before trying again.",
       "invalid explicit task command",
     ]);
     const notice = document.createElement("li");

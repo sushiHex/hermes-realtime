@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Coroutine
@@ -38,6 +39,14 @@ class WorkControlHealth(StrEnum):
     OPEN = "open"
     UNCERTAIN = "uncertain"
     CLOSED = "closed"
+
+
+class WorkCommandAdmission(StrEnum):
+    """Command intake only; no member claims a task acknowledgment."""
+
+    ADMITTED = "admitted"
+    REFUSED = "refused"
+    UNAVAILABLE = "unavailable"
 
 
 def _validate_exact_text(value: str, field: str, *, maximum: int) -> None:
@@ -149,10 +158,12 @@ class _PendingStart:
     task_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _InvocationBinding:
     semantics: tuple[str, ...]
     operation: asyncio.Task[Any]
+    command_admitted: bool = True
+    deferred_observed: bool = False
 
 
 _ResultT = TypeVar("_ResultT", WorkStartResult, WorkCancelResult)
@@ -250,6 +261,20 @@ class ConversationWorkControlSurface:
         objective: str,
         invocation_id: str,
     ) -> WorkStartResult:
+        admission = await self._admit_start_work(objective=objective, invocation_id=invocation_id)
+        if isinstance(admission, _InvocationBinding):
+            return self._copy_start(await asyncio.shield(admission.operation))
+        return self._copy_start(admission)
+
+    async def submit_start_command(
+        self, *, objective: str, invocation_id: str
+    ) -> WorkCommandAdmission:
+        admission = await self._admit_start_work(objective=objective, invocation_id=invocation_id)
+        return self._submit_command_admission(admission, kind="start")
+
+    async def _admit_start_work(
+        self, *, objective: str, invocation_id: str
+    ) -> _InvocationBinding | WorkStartResult:
         self._validate_objective(objective)
         _validate_identifier(invocation_id, "invocation_id")
         semantics = ("start", objective)
@@ -262,7 +287,7 @@ class ConversationWorkControlSurface:
                 if existing.semantics != semantics:
                     self._mark_uncertain_locked()
                     return self._unavailable_start()
-                operation = cast(asyncio.Task[WorkStartResult], existing.operation)
+                binding = existing
             else:
                 if not self._admit_binding_locked():
                     return self._unavailable_start()
@@ -275,7 +300,9 @@ class ConversationWorkControlSurface:
                     pending.objective_identity == objective_identity
                     for pending in self._pending_starts.values()
                 )
+                command_admitted = True
                 if matching_work:
+                    command_admitted = False
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -294,6 +321,7 @@ class ConversationWorkControlSurface:
                     )
                     >= self._context.max_active_tasks
                 ):
+                    command_admitted = False
                     self._reserve()
                     operation = self._create_operation_locked(
                         self._project_start(
@@ -323,11 +351,13 @@ class ConversationWorkControlSurface:
                         ),
                         name=f"conversation-work-start:{invocation_id}",
                     )
-                self._bindings[invocation_id] = _InvocationBinding(
+                binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
+                    command_admitted=command_admitted,
                 )
-        return self._copy_start(await asyncio.shield(operation))
+                self._bindings[invocation_id] = binding
+        return binding
 
     async def cancel_active_work(self, *, invocation_id: str) -> WorkCancelResult:
         _validate_identifier(invocation_id, "invocation_id")
@@ -356,6 +386,24 @@ class ConversationWorkControlSurface:
             reason=reason,
             semantic_kind="cancel_exact",
         )
+
+    async def submit_cancel_command(
+        self,
+        *,
+        task_id: str,
+        invocation_id: str,
+        reason: str = "user requested task cancellation",
+    ) -> WorkCommandAdmission:
+        _validate_task_id(task_id)
+        _validate_identifier(invocation_id, "invocation_id")
+        _validate_reason(reason)
+        admission = await self._admit_cancel_work(
+            invocation_id=invocation_id,
+            expected_task_id=task_id,
+            reason=reason,
+            semantic_kind="cancel_exact",
+        )
+        return self._submit_command_admission(admission, kind="cancel")
 
     async def close(self) -> None:
         operation = self._close_operation
@@ -388,6 +436,24 @@ class ConversationWorkControlSurface:
         reason: str,
         semantic_kind: str,
     ) -> WorkCancelResult:
+        admission = await self._admit_cancel_work(
+            invocation_id=invocation_id,
+            expected_task_id=expected_task_id,
+            reason=reason,
+            semantic_kind=semantic_kind,
+        )
+        if isinstance(admission, _InvocationBinding):
+            return self._copy_cancel(await asyncio.shield(admission.operation))
+        return self._copy_cancel(admission)
+
+    async def _admit_cancel_work(
+        self,
+        *,
+        invocation_id: str,
+        expected_task_id: str | None,
+        reason: str,
+        semantic_kind: str,
+    ) -> _InvocationBinding | WorkCancelResult:
         semantics = (
             semantic_kind,
             "" if expected_task_id is None else expected_task_id,
@@ -402,17 +468,19 @@ class ConversationWorkControlSurface:
                 if existing.semantics != semantics:
                     self._mark_uncertain_locked()
                     return self._unavailable_cancel()
-                operation = cast(asyncio.Task[WorkCancelResult], existing.operation)
+                binding = existing
             else:
                 if not self._admit_binding_locked():
                     return self._unavailable_cancel()
                 active_tasks = self._context.snapshot().active_tasks
                 pending_starts = tuple(self._pending_starts.values())
+                command_admitted = True
                 if expected_task_id is not None:
                     matching = tuple(
                         task for task in active_tasks if task.task_id == expected_task_id
                     )
                     if not matching:
+                        command_admitted = False
                         operation = self._new_cancel_rejection_locked(
                             invocation_id,
                             task_id=expected_task_id,
@@ -425,12 +493,14 @@ class ConversationWorkControlSurface:
                             name=f"conversation-work-cancel:{invocation_id}",
                         )
                 elif self._logical_work_count(active_tasks, pending_starts) == 0:
+                    command_admitted = False
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
                         reason=_NO_ACTIVE_REASON,
                     )
                 elif self._logical_work_count(active_tasks, pending_starts) > 1:
+                    command_admitted = False
                     operation = self._new_cancel_rejection_locked(
                         invocation_id,
                         task_id=None,
@@ -450,11 +520,66 @@ class ConversationWorkControlSurface:
                         self._settle_cancel(task_id=task_id, reason=reason),
                         name=f"conversation-work-cancel:{invocation_id}",
                     )
-                self._bindings[invocation_id] = _InvocationBinding(
+                binding = _InvocationBinding(
                     semantics=semantics,
                     operation=operation,
+                    command_admitted=command_admitted,
                 )
-        return self._copy_cancel(await asyncio.shield(operation))
+                self._bindings[invocation_id] = binding
+        return binding
+
+    def _submit_command_admission(
+        self,
+        admission: _InvocationBinding | WorkStartResult | WorkCancelResult,
+        *,
+        kind: str,
+    ) -> WorkCommandAdmission:
+        if not isinstance(admission, _InvocationBinding):
+            return WorkCommandAdmission.UNAVAILABLE
+        if not admission.deferred_observed:
+            admission.deferred_observed = True
+            admission.operation.add_done_callback(
+                lambda operation: self._report_deferred_failure(operation, kind=kind)
+            )
+        return (
+            WorkCommandAdmission.ADMITTED
+            if admission.command_admitted
+            else WorkCommandAdmission.REFUSED
+        )
+
+    def _report_deferred_failure(self, operation: asyncio.Task[Any], *, kind: str) -> None:
+        if not operation.cancelled() and operation.exception() is None:
+            return
+        # A done callback has no await: this health update and the synchronous
+        # projection cannot interleave with admission or create another owner.
+        self._mark_uncertain_locked()
+        category = "acknowledgment-uncertain"
+        try:
+            self._reserve()
+            self._observer(
+                "task_state",
+                {
+                    "status": "rejected",
+                    "taskId": None,
+                    "reason": (
+                        "Task command acknowledgment is uncertain. "
+                        "Check task status before trying again."
+                    ),
+                },
+            )
+        except BaseException:
+            category = "uncertainty-projection-failed"
+        finally:
+            print(
+                "[task-command-settlement] "
+                + json.dumps(
+                    {
+                        "kind": kind,
+                        "category": category,
+                    },
+                    separators=(",", ":"),
+                )
+            )
 
     async def _settle_start(
         self,

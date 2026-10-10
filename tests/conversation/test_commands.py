@@ -85,10 +85,17 @@ def _spoken_router(context: ConversationContextStore, *, record=None):
     return router, controller, events
 
 
+async def _settle_surface(router: ConversationTaskCommandRouter) -> None:
+    surface = router._surface
+    assert isinstance(surface, ConversationWorkControlSurface)
+    await asyncio.gather(*(binding.operation for binding in surface._bindings.values()))
+
+
 @pytest.mark.asyncio
 async def test_spoken_start_uses_existing_acknowledged_work_surface() -> None:
     router, controller, events = _spoken_router(ConversationContextStore())
     assert await router.route("Start task Inspect release evidence.") is True
+    await _settle_surface(router)
     assert controller.dispatches[0][0] == "Inspect release evidence."
     assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
 
@@ -100,6 +107,7 @@ async def test_spoken_start_emits_no_active_state_before_accepted_ack() -> None:
         task_id="task_release_check", accepted=False, reason="dispatch refused"
     )
     assert await router.route("start task Inspect release evidence") is True
+    await _settle_surface(router)
     assert events == [
         (
             "task_state",
@@ -139,6 +147,7 @@ async def test_spoken_cancel_freezes_the_sole_public_task(text: str) -> None:
     )
     router, controller, events = _spoken_router(context)
     assert await router.route(text) is True
+    await _settle_surface(router)
     assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
     assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
 
@@ -193,6 +202,7 @@ async def test_spoken_cancel_never_retargets_after_recording_await() -> None:
 
     router, controller, events = _spoken_router(context, record=record)
     assert await router.route("cancel task") is True
+    await _settle_surface(router)
     assert controller.cancellations == []
     assert events == [
         (
@@ -215,6 +225,7 @@ async def test_spoken_exact_identity_cancels_only_named_task_among_several() -> 
         )
     router, controller, _events = _spoken_router(context)
     assert await router.route("cancel task task_release_check") is True
+    await _settle_surface(router)
     assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
     assert tuple(task.task_id for task in context.snapshot().active_tasks) == (
         "task_release_check",
@@ -443,6 +454,7 @@ async def test_explicit_start_routes_through_shared_work_control_surface() -> No
     )
 
     assert await router.route("task: Inspect the release evidence") is True
+    await surface.close()
     assert capacity_checks == 1
     assert controller.dispatches == [("Inspect the release evidence", "utterance_surface_1")]
     assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
@@ -476,6 +488,7 @@ async def test_surface_accepted_command_with_authority_returns_typed_evidence_re
     assert result.command_disposition is CommandDisposition.ADMITTED
     assert result.user_turn_authority is None
     assert len(accepted) == 1
+    await surface.close()
 
 
 @pytest.mark.asyncio
@@ -503,6 +516,7 @@ async def test_explicit_cancel_routes_through_shared_work_control_surface() -> N
     )
 
     assert await router.route("cancel task: task_release_check") is True
+    await surface.close()
     assert controller.cancellations == [("task_release_check", "user requested task cancellation")]
     assert events == [("task_state", {"status": "cancelling", "taskId": "task_release_check"})]
 
@@ -548,6 +562,51 @@ async def test_shared_work_surface_cancel_preserves_evidence_outcome(
     assert len(accepted) == (1 if task_active else 0)
     with pytest.raises(ReservationError, match="consumed"):
         owner.decline_to_user(authority)
+
+
+@pytest.mark.asyncio
+async def test_closed_surface_command_is_rejected_with_fixed_guidance_and_no_turn() -> None:
+    owner, authority = _lifecycle_owner()
+    context = ConversationContextStore()
+    router, controller, events = _spoken_router(context)
+    surface = router._surface
+    assert isinstance(surface, ConversationWorkControlSurface)
+    await surface.close()
+    router._lifecycle_owner = owner.conversation_authority
+    router._on_command_accepted = lambda _command: CommandDisposition.ADMITTED
+    result = await router.route("start task Synthetic work", authority)
+    assert result.outcome is CommandRoutingOutcome.REJECTED
+    assert result.user_turn_authority is None
+    assert controller.dispatches == []
+    assert events == [("task_state", {
+        "status": "rejected", "taskId": None,
+        "reason": "Task control is unavailable. Restart the session before trying again.",
+    })]
+    with pytest.raises(ReservationError, match="consumed"):
+        owner.decline_to_user(authority)
+
+
+@pytest.mark.asyncio
+async def test_surface_command_admission_rejects_wrong_runtime_type() -> None:
+    router, _, _ = _spoken_router(ConversationContextStore())
+    async def wrong(**_kwargs):
+        return "admitted"
+    router._surface.submit_start_command = wrong
+    with pytest.raises(TypeError, match="wrong command admission"):
+        await router.route("start task Synthetic work")
+
+
+@pytest.mark.parametrize("missing", ("submit_start_command", "submit_cancel_command"))
+def test_surface_requires_both_bounded_admission_methods(missing: str) -> None:
+    from types import SimpleNamespace
+    methods = {"submit_start_command": lambda **_kwargs: None,
+               "submit_cancel_command": lambda **_kwargs: None}
+    methods[missing] = None
+    with pytest.raises(TypeError, match=missing):
+        ConversationTaskCommandRouter(
+            surface=SimpleNamespace(**methods), observer=lambda *_args: None,
+            reserve_observer_capacity=lambda: None,
+        )
 
 
 @pytest.mark.asyncio
@@ -749,18 +808,18 @@ async def test_surface_commands_are_recorded_before_the_work_surface_acts() -> N
     class SurfaceProbe:
         max_objective_chars = 1024
 
-        async def start_work(self, *, objective: str, invocation_id: str) -> object:
+        async def submit_start_command(self, *, objective: str, invocation_id: str) -> object:
             del objective, invocation_id
             order.append("start")
-            from hermes_realtime.conversation.work_tools import WorkStartResult
+            from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 
-            return WorkStartResult(accepted=False, state="rejected", reason="probe")
+            return WorkCommandAdmission.REFUSED
 
-        async def cancel_work(self, **_kwargs: object) -> object:
+        async def submit_cancel_command(self, **_kwargs: object) -> object:
             order.append("cancel")
-            from hermes_realtime.conversation.work_tools import WorkCancelResult
+            from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 
-            return WorkCancelResult(accepted=False, state="rejected", reason="probe")
+            return WorkCommandAdmission.REFUSED
 
     async def record_user_input(recorded: str) -> None:
         order.append(f"record:{recorded}")

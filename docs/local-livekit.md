@@ -433,6 +433,12 @@ are not direct commands, and bare `stop` grants no task cancellation. A dispatch
 pending until Hermes accepts it; cancellation acknowledgment means stopping was requested,
 while a terminal event establishes that the task ended.
 
+Explicit command intake admits a bounded operation owned by the existing work surface;
+it does not wait for Hermes's acknowledgment while holding PCM intake. Task status still
+changes only after the authoritative acknowledgment. Deferred settlement failure emits
+bounded, content-free evidence and fixed uncertainty guidance; the surface then refuses
+further commands rather than retrying uncertain work.
+
 If a typed or card command loses its acknowledgment, the browser pauses input because the
 command may already have been admitted. It never retries that command automatically. Select
 **Connect** on a stable launch to restore a fresh authoritative view and input counters;

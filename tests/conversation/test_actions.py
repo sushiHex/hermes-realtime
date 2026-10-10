@@ -422,6 +422,47 @@ def _active_replay_evidence(
 
 
 @pytest.mark.asyncio
+async def test_cancel_without_speech_preserves_active_work_and_authoritative_prompt_notes() -> None:
+    from hermes_realtime.providers import OllamaStreamingInference
+
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_active_fixture", run_id="deleg_fixture", objective="Synthetic active work"
+    )
+    director = director_for_test(context, CompletionSource(TaskTerminalOutcome(
+        task_id="task_completed_fixture", status="completed", summary="Synthetic completed work",
+    )))
+    inference = RecordingInference()
+    speech = StreamingSpeechLoop(
+        context=context, foreground=ForegroundTurnCoordinator(), inference=inference,
+        synthesizer=Synthesizer(), playback=Playback(), ledger=DeliveredSpeechLedger(),
+    )
+    director.start()
+    await director.next_decision()
+    executor = ConversationUpdateExecutor(director=director, speech=speech)
+    executor.start()
+    before = context.snapshot().active_tasks
+    assert not executor.foreground_active
+    await executor.cancel_foreground()
+    assert context.snapshot().active_tasks == before
+    assert [update.sequence for update in director.pending_mentions()] == [1]
+    assert inference.requests == []
+    await executor.respond(
+        "turn_after_idle_cancel", Transcript(text="Synthetic follow-up", final=True)
+    )
+    assert [message for message in OllamaStreamingInference._messages(inference.requests[0])
+            if message["role"] == "system"] == [
+        {"role": "system", "content": (
+            "Active background work:\n- task_active_fixture: Synthetic active work"
+        )},
+        {"role": "system", "content": (
+            "Authoritative background updates:\n- completed: The requested report is ready."
+        )},
+    ]
+    await executor.close()
+
+
+@pytest.mark.asyncio
 async def test_executor_claims_mentions_once_for_next_real_user_turn() -> None:
     context = ConversationContextStore()
     director = director_for_test(
