@@ -433,6 +433,12 @@ are not direct commands, and bare `stop` grants no task cancellation. A dispatch
 pending until Hermes accepts it; cancellation acknowledgment means stopping was requested,
 while a terminal event establishes that the task ended.
 
+If a typed or card command loses its acknowledgment, the browser pauses input because the
+command may already have been admitted. It never retries that command automatically. Select
+**Connect** on a stable launch to restore a fresh authoritative view and input counters;
+a one-use launch requires a fresh launch from the host. Cancellation feedback keeps the
+last authoritative task state until a real task update arrives.
+
 With Codex and `--natural-work-tools`, ordinary language may invoke the
 same authoritative start/cancel surface; without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side

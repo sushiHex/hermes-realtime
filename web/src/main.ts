@@ -601,7 +601,7 @@ function projectTaskStateCard(event: PublicEvent): void {
         view.participantIdentity === credential?.participantIdentity,
       submit: submitTyped,
       onFailure: () => {
-        feedback.textContent = "Cancellation could not be submitted. Try again when connected.";
+        feedback.textContent = "Cancellation was not confirmed. Check task status.";
         refreshOperationCard(item);
       },
     });
@@ -3370,6 +3370,27 @@ async function submitTyped(text: string): Promise<void> {
         inputSequence = sequence;
         projectUserTranscript("typed-admission", text);
         addMarker("typed_input_admitted");
+      } catch (error) {
+        // HTTP error statuses classify exceptions across dispatch and projection;
+        // none proves that the command had no effect. A rotated participant owns
+        // a replacement binding, so a late old response cannot retire it.
+        if (credential?.participantIdentity === activeCredential.participantIdentity) {
+          refusal = "acknowledgment-uncertain";
+          const cleanup = disconnectLocal();
+          clearCredentialRefresh();
+          setCredential(null);
+          renderSessionToggle();
+          const notice = document.createElement("li");
+          notice.dataset.role = "operation";
+          notice.dataset.operation = "input-control";
+          notice.setAttribute("role", "status");
+          notice.textContent = stableLaunch
+            ? "Input acknowledgment was lost. Reconnect before sending more input. The previous command may have been admitted."
+            : "Input acknowledgment was lost. Open a fresh launch before sending more input. The previous command may have been admitted.";
+          admitOperationCard(notice);
+          await cleanup;
+        }
+        throw error;
       } finally {
         window.clearTimeout(timeout);
         typedSubmissionAbort = null;

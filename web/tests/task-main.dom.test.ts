@@ -23,11 +23,11 @@ const credential = {
 };
 let dom: JSDOM;
 
-async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 })) {
+async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 }), oneShot = false) {
   vi.resetModules();
   media.rooms.length = 0;
   dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
-    url: "http://localhost/", pretendToBeVisual: true,
+    url: oneShot ? `http://localhost/#bootstrap=${"a".repeat(43)}` : "http://localhost/", pretendToBeVisual: true,
   });
   for (const key of ["window", "document", "HTMLElement", "HTMLMediaElement", "Option"] as const) {
     vi.stubGlobal(key, key === "window" ? dom.window : dom.window[key]);
@@ -46,7 +46,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   let sequence = 0;
   const requests: Array<{ sequence: number; text: string }> = [];
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
-    if (path === "/api/v1/stable-bootstrap") return Response.json(credential);
+    if (path === "/api/v1/stable-bootstrap" || path === "/api/v1/bootstrap") return Response.json(credential);
     if (path === "/api/v1/stable-rebind") return Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rebound.token" });
     if (path === "/api/v1/refresh") return Response.json({ ...credential, token: "synthetic.rotated.token" });
     if (path === "/api/v1/media" || path === "/api/v1/stop") return Response.json({ version: 1 });
@@ -89,6 +89,71 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it("requires a fresh-view reconnect after a server-admitted input loses its acknowledgment", async () => {
+    let reject!: (reason: Error) => void;
+    let spent = false;
+    const { requests, task, cancel, submit, toggle } = await mount(() => {
+      if (spent) return Promise.resolve(Response.json({ version: 1 }));
+      spent = true;
+      return new Promise((_resolve, refuse) => { reject = refuse; });
+    });
+    await task("task_fixture", "active");
+    cancel().click();
+    submit("Synthetic queued input");
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    // The request spent sequence 1 on the server before its response was lost.
+    reject(new Error("synthetic lost acknowledgment"));
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    expect(dom.window.document.querySelector("#transcript")!.textContent).toContain("The previous command may have been admitted.");
+    expect(cancel().disabled).toBe(true);
+    submit("Synthetic later input");
+    cancel().click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(requests).toHaveLength(1);
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    const rebind = vi.mocked(fetch).mock.calls.find(([path]) => path === "/api/v1/stable-rebind")!;
+    expect(JSON.parse(rebind[1]!.body as string)).toMatchObject({ freshView: true });
+    expect(toggle.textContent).toBe("Disconnect");
+    submit("Synthetic input after fresh view");
+    await vi.waitFor(() => expect(requests).toEqual([
+      { sequence: 1, text: "cancel task: task_fixture" },
+      { sequence: 1, text: "Synthetic input after fresh view" },
+    ]));
+  });
+
+  it.each(["success", "failure"])("does not disconnect a replacement binding on late old input %s", async (outcome) => {
+    let release!: (response: Response) => void;
+    let reject!: (error: Error) => void;
+    const { requests, task, cancel, toggle } = await mount(() => new Promise((resolve, refuse) => {
+      release = resolve; reject = refuse;
+    }));
+    await task("task_fixture", "active");
+    cancel().click();
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    if (outcome === "success") release(Response.json({ version: 1 }));
+    else reject(new Error("synthetic old acknowledgment failure"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(toggle.textContent).toBe("Disconnect");
+    expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("Input acknowledgment was lost.");
+    expect(dom.window.document.querySelector("#markers")!.textContent).not.toContain("typed_input_admitted");
+  });
+
+  it("requires a fresh launch after uncertain input in a one-shot session", async () => {
+    const { requests, submit, toggle } = await mount(async () => { throw new Error("synthetic lost response"); }, true);
+    submit("Synthetic one-shot input");
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Fresh launch required"));
+    expect(toggle.disabled).toBe(true);
+    expect(dom.window.document.querySelector("#transcript")!.textContent).toContain("Open a fresh launch before sending more input.");
+    submit("Synthetic attempted repeat");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(requests).toHaveLength(1);
+  });
+
   it("routes the real card click once to its exact task through admitted typed input", async () => {
     let release!: (response: Response) => void;
     const { requests, task, cancel, card } = await mount(() => new Promise((resolve) => { release = resolve; }));
@@ -127,7 +192,7 @@ describe("mounted task controls", () => {
 
   it("refuses queued and late-return input after local disconnection", async () => {
     let release!: (response: Response) => void;
-    const { requests, task, cancel, submit } = await mount(() => new Promise((resolve) => { release = resolve; }));
+    const { requests, task, cancel, submit, toggle } = await mount(() => new Promise((resolve) => { release = resolve; }));
     await task("task_fixture", "active");
     cancel().click();
     submit("Synthetic queued input");
@@ -140,6 +205,7 @@ describe("mounted task controls", () => {
     expect(dom.window.document.querySelector("#markers")!.textContent).not.toContain("typed_input_admitted");
     expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("cancel task:");
     expect(dom.window.document.querySelector<HTMLTextAreaElement>("#typed-input")!.value).toBe("Synthetic queued input");
+    expect(toggle.textContent).toBe("Connect");
   });
 
   it("bounds the shared input queue while a prior admission is pending", async () => {
@@ -173,7 +239,7 @@ describe("mounted task controls", () => {
 
   it("rejects old queued and late input after native reconnect to the same room", async () => {
     let release!: (response: Response) => void;
-    const { requests, task, cancel, submit } = await mount(() => new Promise((resolve) => { release = resolve; }));
+    const { requests, task, cancel, submit, toggle } = await mount(() => new Promise((resolve) => { release = resolve; }));
     await task("task_fixture", "active");
     cancel().click();
     submit("Synthetic input before native reconnect");
@@ -186,19 +252,21 @@ describe("mounted task controls", () => {
     expect(requests).toHaveLength(1);
     expect(dom.window.document.querySelector("#markers")!.textContent).not.toContain("typed_input_admitted");
     expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("cancel task:");
+    expect(toggle.textContent).toBe("Connect");
   });
 
-  it("reports an admission refusal without claiming task cancellation", async () => {
+  it("treats an HTTP error after submission as uncertain without claiming task cancellation", async () => {
     const { task, cancel, card } = await mount(async () => new Response(null, { status: 503 }));
     await task("task_fixture", "active");
     cancel().click();
-    await vi.waitFor(() => expect(card().textContent).toContain("Cancellation could not be submitted."));
+    await vi.waitFor(() => expect(card().textContent).toContain("Cancellation was not confirmed."));
     expect(card().dataset.status).toBe("active");
     expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("cancel task:");
-    expect(cancel().disabled).toBe(false);
+    expect(cancel().disabled).toBe(true);
+    expect(dom.window.document.querySelector("#transcript")!.textContent).toContain("The previous command may have been admitted.");
   });
 
-  it("bounds a stalled input request and releases its pending Cancel control", async () => {
+  it("bounds a stalled input request and requires reconnect before another cancellation", async () => {
     const { task, cancel, card } = await mount((_body, signal) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(new Error("synthetic timeout")), { once: true });
     }));
@@ -212,14 +280,14 @@ describe("mounted task controls", () => {
     cancel().click();
     await vi.waitFor(() => expect(timeout).not.toBeNull());
     timeout!();
-    await vi.waitFor(() => expect(cancel().disabled).toBe(false));
-    expect(card().textContent).toContain("Cancellation could not be submitted.");
+    await vi.waitFor(() => expect(card().textContent).toContain("Cancellation was not confirmed."));
+    expect(cancel().disabled).toBe(true);
     expect(card().dataset.status).toBe("active");
   });
 
   it("refuses queued and late input after captured credentials rotate", async () => {
     let release!: (response: Response) => void;
-    const { requests, task, cancel, submit, refresh } = await mount(() => new Promise((resolve) => { release = resolve; }));
+    const { requests, task, cancel, submit, refresh, toggle } = await mount(() => new Promise((resolve) => { release = resolve; }));
     await task("task_fixture", "active");
     cancel().click();
     submit("Synthetic input before credential rotation");
@@ -231,6 +299,7 @@ describe("mounted task controls", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(requests).toHaveLength(1);
     expect(dom.window.document.querySelector("#transcript")!.textContent).not.toContain("cancel task:");
+    expect(toggle.textContent).toBe("Connect");
   });
 
   it("does not echo unrecognized command refusal text", async () => {
