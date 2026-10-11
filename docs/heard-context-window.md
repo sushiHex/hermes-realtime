@@ -141,7 +141,15 @@ prevents residual token-overflow truncation. At the pinned 0.34.4 GGUF source, t
 sets the runner's context-shift configuration, and the residual token-overflow path above
 returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
 propagates an opening refusal without a reply or automatic retry. This is source-based
-qualification; the paired options still require real-backend qualification.
+qualification. An isolated paired-options check at realtime commit `43b28a7` on Ollama
+0.34.4 completed a 372-token synthetic prompt and refused a 6,138-token prompt at a
+4,096-token allocation with HTTP 400 before any content or spoken segment. The oversized
+case used 13 intact rows within the host's row and text-window limits. This verifies that
+case's refusal, not every backend or model. The cold positive took 64.716 seconds under a
+120-second diagnostic bound, exceeding the host's unchanged 60-second budget; it is not
+host-readiness or voice-latency qualification.
+The [source-bound result and limits](https://github.com/sushiHex/hermes-realtime/issues/249#issuecomment-6115056437)
+remain in the owning issue.
 Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
 can also end generation at the context limit; it does not reserve reply tokens or prove
 model obedience. A change to this flag can
