@@ -1538,6 +1538,16 @@ describe("partial transcript lifecycle", () => {
 });
 
 describe("session model presentation", () => {
+  it("separates requested, advertised and observed context without inferring allocation", () => {
+    expect(formatSessionModelConfiguration({authentication: "local", provider: "ollama",
+      transport: "local-http", model: "synthetic:latest", effort: null,
+      contextWindowTokens: null, reportsTokenUsage: false, version: 2,
+      requestedContextTokens: 4096, advertisedContextTokens: 131072,
+      effectiveContextTokens: null, modelDigest: "a".repeat(64)}).slice(7)).toEqual([
+        ["Requested context", "4,096 tokens"], ["Advertised maximum", "131,072 tokens"],
+        ["Observed allocation", "Not observed"],
+      ]);
+  });
   it("labels configured identity and unavailable telemetry without guessing", () => {
     expect(
       formatSessionModelConfiguration({

@@ -127,6 +127,24 @@ describe("session model protocol", () => {
     ).toThrow(/shape/i);
   });
 
+  it("accepts versioned local context observations and refuses inconsistent metadata", () => {
+    const configuration = {authentication: "local", provider: "ollama", transport: "local-http",
+      model: "synthetic:latest", effort: null, contextWindowTokens: null, reportsTokenUsage: false,
+      version: 2, requestedContextTokens: 4096, advertisedContextTokens: 131072,
+      effectiveContextTokens: null, modelDigest: "a".repeat(64)};
+    expect(parseSessionModelConfiguration(configuration)).toEqual(configuration);
+    for (const change of [
+      {version: 1}, {requestedContextTokens: true}, {requestedContextTokens: 4096.5},
+      {requestedContextTokens: 2047},
+      {requestedContextTokens: 262145, advertisedContextTokens: 1048576},
+      {advertisedContextTokens: 2048},
+      {effectiveContextTokens: 0}, {modelDigest: "invalid"}, {provider: "different"},
+      {authentication: "subscription"}, {transport: "subscription-app-server"},
+      {effort: "low"}, {reportsTokenUsage: true}, {contextWindowTokens: 4096},
+      {privateEndpoint: "hidden"},
+    ]) expect(() => parseSessionModelConfiguration({...configuration, ...change})).toThrow();
+  });
+
   it("accepts exact cumulative usage and rejects unsafe counters", () => {
     const usage = {
       cachedInputTokens: 50,

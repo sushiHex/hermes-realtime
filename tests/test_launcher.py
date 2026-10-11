@@ -2023,6 +2023,68 @@ class _FullHostHarness:
 
 
 @pytest.mark.asyncio
+async def test_full_host_context_setting_precedes_warmup_and_browser_publication(monkeypatch):
+    import io
+
+    import hermes_realtime.providers.ollama as ollama_module
+    from hermes_realtime.conversation import ConversationContextSnapshot, ConversationMessage
+    from hermes_realtime.providers.ollama_models import OllamaModelClient
+
+    harness = _FullHostHarness(monkeypatch)
+    bodies = []
+    metadata_calls = []
+    digest = "a" * 64
+
+    async def metadata(endpoint, body):
+        metadata_calls.append(endpoint)
+        if endpoint == "version":
+            payload = {"version": "0.34.4"}
+        elif endpoint == "show":
+            payload = {"capabilities": ["completion"], "model_info": {
+                "general.architecture": "synthetic", "synthetic.context_length": 4096}}
+        else:
+            payload = {"models": [{"name": "synthetic:latest", "model": "synthetic:latest",
+                "digest": digest, "context_length": 4096}]}
+        return json.dumps(payload).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=metadata)
+    monkeypatch.setattr(ollama_module, "OllamaModelClient", lambda **kwargs: client)
+
+    def generate(request, timeout):
+        bodies.append(json.loads(request.data))
+        return io.BytesIO(b'{"message":{"content":"Ready."},"done":true}\n')
+
+    inference = ollama_module.OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="synthetic:latest", open_request=generate)
+    monkeypatch.setattr(
+        host_launcher_module, "_build_streaming_inference", lambda **kwargs: inference)
+
+    async def warmup(**kwargs):
+        snapshot = ConversationContextSnapshot(revision=0,
+            messages=(ConversationMessage("user", "Synthetic readiness."),), active_tasks=())
+        assert [part async for part in inference.stream(snapshot, turn_id="turn_preflight")]
+
+    monkeypatch.setattr(host_launcher_module, "_run_full_host_preflight", warmup)
+    launcher = harness.build(ollama_model="synthetic:latest", ollama_num_ctx=4096)
+    configuration = harness.browser["model_configuration"]
+    with pytest.raises(RuntimeError, match="not been configured"):
+        configuration.public_data()
+    try:
+        await launcher.start()
+        assert bodies[0]["options"] == {"num_ctx": 4096}
+        assert metadata_calls == ["version", "tags", "show", "tags", "tags", "ps"]
+        assert configuration.public_data() == {
+            "authentication": "local", "contextWindowTokens": None, "effort": None,
+            "model": "synthetic:latest", "provider": "ollama", "reportsTokenUsage": False,
+            "transport": "local-http", "version": 2, "modelDigest": digest,
+            "requestedContextTokens": 4096, "advertisedContextTokens": 4096,
+            "effectiveContextTokens": 4096,
+        }
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
 async def test_full_host_restores_the_voice_tail_before_preflight_and_closes_it_after_actions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

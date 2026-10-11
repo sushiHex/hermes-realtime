@@ -256,7 +256,7 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
 
     assert [body["options"] for body in bodies] == [{"num_ctx": 16_384}, {"num_ctx": 32_768}]
     assert all(body.get("shift") is False for body in bodies)
-    assert all("truncate" not in body for body in bodies)
+    assert all(body.get("truncate") is False for body in bodies)
     sent = cast(list[dict[str, str]], bodies[0]["messages"])
     content = "".join(message["content"] for message in sent)
     reports = [
@@ -308,7 +308,9 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     assert caught.value is refusal
     assert emitted == []
     assert len(requests) == 1
-    assert capsys.readouterr().out == ""
+    report = json.loads(capsys.readouterr().out.removeprefix("[ollama-refusal] "))
+    assert report == {"version": 1, "category": "backend_refusal", "status": 400,
+                      "messages": 3, "requested_context_tokens": 16384}
 
     # Let the failed iterator's scheduled cleanup take its next loop turn.
     await asyncio.sleep(0)

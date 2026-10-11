@@ -176,6 +176,9 @@ const modelFields = [
   element<HTMLElement>("model-transport"),
   element<HTMLElement>("model-context"),
   element<HTMLElement>("model-usage-reporting"),
+  element<HTMLElement>("model-requested-context"),
+  element<HTMLElement>("model-advertised-context"),
+  element<HTMLElement>("model-effective-context"),
 ] as const;
 const speechFields = [
   element<HTMLElement>("stt-provider"),
@@ -1736,6 +1739,7 @@ function projectPublicEvent(event: PublicEvent): void {
     }
   } else if (event.kind === "session_model") {
     const configuration = parseSessionModelConfiguration(event.data);
+    element<HTMLElement>("local-model-context").hidden = !("version" in configuration);
     formatSessionModelConfiguration(configuration).forEach((row, index) => {
       modelFields[index]!.textContent = row[1];
     });

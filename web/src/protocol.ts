@@ -28,7 +28,7 @@ export interface SpeechAuthority {
   readonly streamId: string;
 }
 
-export interface SessionModelConfiguration {
+interface SessionModelConfigurationV1 {
   readonly authentication: "subscription" | "api-token" | "local";
   readonly provider: string;
   readonly transport: string;
@@ -37,6 +37,16 @@ export interface SessionModelConfiguration {
   readonly contextWindowTokens: number | null;
   readonly reportsTokenUsage: boolean;
 }
+
+interface SessionModelConfigurationV2 extends SessionModelConfigurationV1 {
+  readonly version: 2;
+  readonly requestedContextTokens: number;
+  readonly advertisedContextTokens: number | null;
+  readonly effectiveContextTokens: number | null;
+  readonly modelDigest: string;
+}
+
+export type SessionModelConfiguration = SessionModelConfigurationV1 | SessionModelConfigurationV2;
 
 export interface SelectableModel {
   readonly model: string;
@@ -249,8 +259,29 @@ export function parseSessionModelConfiguration(value: unknown): SessionModelConf
     "reportsTokenUsage",
     "transport",
   ];
-  if (!isPlainRecord(value) || !hasExactKeys(value, keys)) {
+  if (!isPlainRecord(value)) {
     throw new TypeError("Session model configuration shape is invalid");
+  }
+  const versioned = value.version === 2;
+  if (!hasExactKeys(value, versioned ? [...keys, "version", "requestedContextTokens",
+    "advertisedContextTokens", "effectiveContextTokens", "modelDigest"] : keys)) {
+    throw new TypeError("Session model configuration shape is invalid");
+  }
+  if (versioned) {
+    const capacity = (item: unknown): boolean => Number.isSafeInteger(item)
+      && (item as number) >= 1 && (item as number) <= 100_000_000;
+    if (value.authentication !== "local" || value.provider !== "ollama"
+      || value.transport !== "local-http" || value.effort !== null
+      || value.reportsTokenUsage !== false || value.contextWindowTokens !== null
+      || !capacity(value.requestedContextTokens)
+      || (value.requestedContextTokens as number) < 2048
+      || (value.requestedContextTokens as number) > 262144
+      || (value.advertisedContextTokens !== null && (!capacity(value.advertisedContextTokens)
+        || (value.requestedContextTokens as number) > (value.advertisedContextTokens as number)))
+      || (value.effectiveContextTokens !== null && !capacity(value.effectiveContextTokens))
+      || typeof value.modelDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.modelDigest)) {
+      throw new TypeError("Local context observation fields are invalid");
+    }
   }
   const boundedString = (item: unknown, maximum: number): item is string =>
     typeof item === "string" && item.trim().length > 0 && item.length <= maximum;
