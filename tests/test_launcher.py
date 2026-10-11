@@ -2023,6 +2023,33 @@ class _FullHostHarness:
 
 
 @pytest.mark.asyncio
+async def test_configured_context_refuses_a_provider_without_ollama_identity(monkeypatch):
+    harness = _FullHostHarness(monkeypatch)
+    configured = False
+
+    class OtherInference:
+        async def configure_context(self, requested):
+            nonlocal configured
+            configured = True
+
+        async def cancel(self, turn_id):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(host_launcher_module, "_build_streaming_inference",
+                        lambda **kwargs: OtherInference())
+    launcher = harness.build(ollama_num_ctx=4096)
+    try:
+        with pytest.raises(TypeError, match="exact Ollama"):
+            await launcher.start()
+        assert not configured
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
 async def test_full_host_context_setting_precedes_warmup_and_browser_publication(monkeypatch):
     import io
 

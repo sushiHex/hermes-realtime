@@ -34,7 +34,7 @@ def _capacity(value: object) -> int | None:
 
 def _require_local(row: dict[str, object]) -> None:
     for field in ("remote_host", "remote_model"):
-        if field in row and (type(row[field]) is not str or row[field] != ""):
+        if field in row and row[field] != "":
             raise ValueError("context configuration requires local model weights")
 
 
@@ -131,7 +131,6 @@ class OllamaModelClient:
             or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
             or parsed.port is None
             or parsed.username is not None
-            or parsed.password is not None
             or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment

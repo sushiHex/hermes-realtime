@@ -167,7 +167,7 @@ class OllamaStreamingInference:
         async with self._state_lock:
             if self._inference_started:
                 raise RuntimeError("context must be configured before the first inference")
-            if self._closed or self._openings or self._responses:
+            if self._closed:
                 raise RuntimeError("context configuration requires an idle open adapter")
             if self._context_configuration is not None:
                 raise RuntimeError("session context configuration is already frozen")
