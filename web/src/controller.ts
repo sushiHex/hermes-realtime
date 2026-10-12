@@ -253,7 +253,7 @@ export function modelSelectionFor(
 export function formatSessionModelConfiguration(
   configuration: SessionModelConfiguration,
 ): readonly SessionModelPresentationRow[] {
-  return [
+  const rows: SessionModelPresentationRow[] = [
     ["Provider", configuration.provider],
     ["Model", configuration.model],
     [
@@ -277,6 +277,16 @@ export function formatSessionModelConfiguration(
       configuration.reportsTokenUsage ? "Reported live" : "Not reported by transport",
     ],
   ];
+  if ("version" in configuration) {
+    const tokens = (value: number | null, unknown: string): string => value === null
+      ? unknown : `${value.toLocaleString("en-US")} tokens`;
+    rows.push(
+      ["Requested context", tokens(configuration.requestedContextTokens, "Not reported")],
+      ["Advertised maximum", tokens(configuration.advertisedContextTokens, "Unknown")],
+      ["Observed allocation", tokens(configuration.effectiveContextTokens, "Not observed")],
+    );
+  }
+  return rows;
 }
 
 export function formatSessionTokenUsage(

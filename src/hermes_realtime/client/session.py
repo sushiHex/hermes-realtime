@@ -23,6 +23,7 @@ from hermes_realtime.evidence.models import (
     EvidenceRevokeRequestV1,
     capture_status_to_primitive,
 )
+from hermes_realtime.providers.ollama_models import OllamaContextObservation
 from hermes_realtime.search_egress import (
     SearchEgressAuthority,
     SearchEgressBindingV1,
@@ -228,6 +229,7 @@ class BrowserModelConfiguration:
     effort: str | None
     context_window_tokens: int | None
     reports_token_usage: bool
+    local_context: Callable[[], OllamaContextObservation] | None = None
 
     def __post_init__(self) -> None:
         if self.authentication not in {"subscription", "api-token", "local"}:
@@ -253,9 +255,11 @@ class BrowserModelConfiguration:
             raise ValueError("context window tokens must be a bounded exact integer or None")
         if type(self.reports_token_usage) is not bool:
             raise TypeError("reports_token_usage must be an exact boolean")
+        if self.local_context is not None and not callable(self.local_context):
+            raise TypeError("local_context must be callable")
 
     def public_data(self) -> dict[str, str | int | bool | None]:
-        return {
+        data: dict[str, str | int | bool | None] = {
             "authentication": self.authentication,
             "contextWindowTokens": self.context_window_tokens,
             "effort": self.effort,
@@ -264,6 +268,27 @@ class BrowserModelConfiguration:
             "reportsTokenUsage": self.reports_token_usage,
             "transport": self.transport,
         }
+        if self.local_context is not None:
+            category = "observation_read_refused"
+            try:
+                observation = self.local_context()
+                category = "observation_type_refused"
+                if type(observation) is not OllamaContextObservation:
+                    raise TypeError("local_context must return an exact context observation")
+                category = "binding_refused"
+                if (observation.configuration.model.model != self.model or self.provider != "ollama"
+                        or self.authentication != "local" or self.transport != "local-http"
+                        or self.effort is not None or self.reports_token_usage
+                        or self.context_window_tokens is not None):
+                    raise ValueError("local context identity does not match the session model")
+                category = "observation_read_refused"
+                data.update(observation.public_data())
+                category = "projected"
+            finally:
+                print("[browser-model] " + json.dumps(
+                    {"version": 1, "kind": "local_context", "category": category},
+                    separators=(",", ":")), flush=True)
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +336,7 @@ class BrowserSessionDirector:
         projection: BrowserEventProjection,
         speech_runtime: BrowserSpeechRuntime | None = None,
         model_configuration: BrowserModelConfiguration | None = None,
+        local_model_configuration: Callable[[], BrowserModelConfiguration] | None = None,
         model_catalog: Callable[[], Awaitable[BrowserModelCatalog]] | None = None,
         select_model: Callable[[str, str], Awaitable[BrowserModelCatalog]] | None = None,
         activate_media: Callable[[str, int, int], Awaitable[None]] | None = None,
@@ -441,6 +467,7 @@ class BrowserSessionDirector:
             tts_model="unavailable",
         )
         self._model_configuration = model_configuration
+        self._local_model_configuration = local_model_configuration
         self._model_catalog = model_catalog
         self._select_model = select_model
         self._activate_media = activate_media
@@ -811,10 +838,25 @@ class BrowserSessionDirector:
             cast(dict[str, PublicValue], search_egress_status_to_primitive(authority.status())),
         )
 
+    def require_model_prepared(self) -> None:
+        if self._local_model_configuration is not None:
+            category = "read_refused"
+            try:
+                configuration = self._local_model_configuration()
+                category = "type_refused"
+                if type(configuration) is not BrowserModelConfiguration:
+                    raise TypeError("local model admission requires an exact model configuration")
+                self._model_configuration = configuration
+                category = "prepared"
+            finally:
+                print("[browser-model-admission] " + json.dumps(
+                    {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
     async def start(self) -> BrowserJoinCredential:
         """Create one credential and provision its exact server-side identity first."""
 
         async with self._start_lock:
+            self.require_model_prepared()
             if self._rebind_finalization_failed:
                 raise RuntimeError("browser session recovery failed closed")
             if self._rebind_finalizer is not None:

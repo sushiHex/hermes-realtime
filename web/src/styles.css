@@ -274,6 +274,20 @@ textarea::placeholder { color: var(--faint); }
 .model-card { padding-bottom: 12px; }
 .model-icon { border-color: rgba(115,120,255,.24); background: var(--accent-soft); color: #a9acff; }
 .model-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .72fr); gap: 8px; margin: -2px 0 11px; padding-bottom: 11px; border-bottom: 1px solid rgba(255,255,255,.055); }
+.local-model-picker { display: grid; gap: 7px; margin: -2px 0 11px; padding-bottom: 11px; border-bottom: 1px solid rgba(255,255,255,.055); }
+.local-model-picker fieldset { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .72fr); gap: 8px; margin: 0; padding: 8px; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; }
+.local-model-picker[hidden] { display: none; }
+.local-model-picker fieldset[hidden] { display: none; }
+.local-model-picker legend { padding: 0 4px; color: var(--faint); font-size: 8px; }
+.local-model-picker fieldset label { display: grid; gap: 5px; min-width: 0; color: var(--muted); font-size: 9px; }
+.local-model-picker select, .local-model-picker input[type="number"] { width: 100%; min-height: 34px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 10px; }
+.local-model-budget-note, .local-model-selection-state { grid-column: 1 / -1; min-height: 13px; margin: 0; color: var(--faint); font-size: 9px; line-height: 1.4; }
+.local-model-selection-state[data-state="error"] { color: var(--danger); }
+.local-model-selection-state[data-state="ready"] { color: var(--success); }
+.local-model-observations { grid-column: 1 / -1; display: grid; gap: 2px; margin: 0; }
+.local-model-observations > div { display: flex; justify-content: space-between; gap: 8px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,.04); font-size: 9px; }
+.local-model-observations dt { color: var(--muted); }
+.local-model-observations dd { margin: 0; color: var(--text-secondary); font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
 .model-controls label { display: grid; gap: 5px; min-width: 0; color: var(--muted); font-size: 9px; }
 .model-controls select { min-height: 34px; padding-right: 26px; font-size: 10px; }
 .model-selection-state { grid-column: 1 / -1; min-height: 13px; margin: 0; color: var(--faint); font-size: 9px; line-height: 1.4; }

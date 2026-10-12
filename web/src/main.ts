@@ -118,6 +118,17 @@ import {
   type PublicEvent,
   type SpeechAuthority,
 } from "./protocol";
+import {
+  fetchLocalModelRequest,
+  LOCAL_MODEL_METADATA_TIMEOUT_MS,
+  LOCAL_MODEL_PREPARATION_TIMEOUT_MS,
+  localModelPreparationFor,
+  LocalModelProtocolError,
+  parseLocalModelCatalog,
+  parseLocalModelPreparation,
+  type LocalModelCatalog,
+  type PreparedLocalModelSelection,
+} from "./local-model-selection";
 
 function element<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -149,6 +160,17 @@ const voiceSelect = element<HTMLSelectElement>("voice");
 const modelSelect = element<HTMLSelectElement>("model-select");
 const effortSelect = element<HTMLSelectElement>("effort-select");
 const modelSelectionState = element<HTMLParagraphElement>("model-selection-state");
+const localModelPicker = element<HTMLDivElement>("local-model-picker");
+const existingModelControls = document.querySelector<HTMLElement>(".model-controls");
+const localModelOptions = element<HTMLFieldSetElement>("local-model-options");
+const localModelSelect = element<HTMLSelectElement>("local-model-select");
+const localModelContextInput = element<HTMLInputElement>("local-model-context-input");
+const localModelBudgetNote = element<HTMLParagraphElement>("local-model-budget-note");
+const localModelAdvertised = element<HTMLElement>("local-model-advertised");
+const localModelRequested = element<HTMLElement>("local-model-requested");
+const localModelEffective = element<HTMLElement>("local-model-effective");
+const localModelSelectionState = element<HTMLOutputElement>("local-model-selection-state");
+const localModelRetry = element<HTMLButtonElement>("local-model-retry");
 const typedForm = element<HTMLFormElement>("typed-form");
 const typedInput = element<HTMLTextAreaElement>("typed-input");
 const sendButton = element<HTMLButtonElement>("send");
@@ -176,6 +198,9 @@ const modelFields = [
   element<HTMLElement>("model-transport"),
   element<HTMLElement>("model-context"),
   element<HTMLElement>("model-usage-reporting"),
+  element<HTMLElement>("model-requested-context"),
+  element<HTMLElement>("model-advertised-context"),
+  element<HTMLElement>("model-effective-context"),
 ] as const;
 const speechFields = [
   element<HTMLElement>("stt-provider"),
@@ -370,6 +395,14 @@ let credentialRefreshTimer: number | null = null;
 let selectedVoice: string | null = null;
 let selectableModels: ModelCatalog | null = null;
 let modelSelectionPending = false;
+let localModelCatalog: LocalModelCatalog | null = null;
+let localModelDiscoveryState: "loading" | "ready" | "disabled" | "error" = "loading";
+let localModelDiscoveryPending = false;
+let localModelPreparationPending = false;
+let localModelPreparationError: string | null = null;
+let localModelDiscoveryError: string | null = null;
+let localModelDiscoveryGeneration = 0;
+let localModelDiscoveryAbort: AbortController | null = null;
 let microphoneReady: boolean | null = null;
 let voicePathState: VoicePathState = "waiting";
 let voicePathReadinessTimer: number | null = null;
@@ -1736,6 +1769,7 @@ function projectPublicEvent(event: PublicEvent): void {
     }
   } else if (event.kind === "session_model") {
     const configuration = parseSessionModelConfiguration(event.data);
+    element<HTMLElement>("local-model-context").hidden = !("version" in configuration);
     formatSessionModelConfiguration(configuration).forEach((row, index) => {
       modelFields[index]!.textContent = row[1];
     });
@@ -1937,6 +1971,7 @@ function setInteractive(connected: boolean): void {
   const modelInteractive = connected && selectableModels !== null && !modelSelectionPending;
   modelSelect.disabled = !modelInteractive;
   effortSelect.disabled = !modelInteractive;
+  renderLocalModelPicker();
 }
 
 function renderMicrophoneMute(): void {
@@ -2225,8 +2260,18 @@ function renderSessionToggle(state = controller.state): void {
     canStartSession(),
     remoteStopRequired,
   );
-  sessionToggleButton.textContent = toggle.label;
-  sessionToggleButton.disabled = toggle.disabled;
+  const localSelectionReady = localModelAllowsConnection();
+  const actionBlockedByLocalSelection = toggle.action === "connect" && !localSelectionReady;
+  sessionToggleButton.textContent = actionBlockedByLocalSelection
+    ? localModelDiscoveryState === "loading" || localModelDiscoveryState === "error"
+      ? "Check local model"
+      : localModelCatalog?.state === "preparing"
+        ? "Refresh host status"
+        : localModelSelect.value === ""
+          ? "Choose model"
+          : "Choose context"
+    : toggle.label;
+  sessionToggleButton.disabled = toggle.disabled || actionBlockedByLocalSelection;
   sessionToggleButton.classList.toggle("primary", toggle.action === "connect");
   sessionToggleButton.classList.toggle("danger", toggle.action === "stop");
 }
@@ -2268,6 +2313,231 @@ function authorization(token: string): HeadersInit {
   return {
     Authorization: `Bearer ${token}`,
   };
+}
+
+function localModelCapacity(value: number | null): string {
+  return value === null ? "Unknown" : `${value.toLocaleString("en-US")} tokens`;
+}
+
+function localModelLifecycleIsLocked(): boolean {
+  return ["connecting", "preparing", "connected", "reconnecting"].includes(controller.state);
+}
+
+function localModelChoiceIsValid(): boolean {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") return false;
+  const model = catalog.models.find((item) => item.model === localModelSelect.value);
+  const requested = localModelContextInput.value === "" ? NaN : localModelContextInput.valueAsNumber;
+  return model !== undefined && Number.isSafeInteger(requested) &&
+    requested >= catalog.minimumContextTokens && requested <= catalog.maximumContextTokens &&
+    (model.advertisedContextTokens === null || requested <= model.advertisedContextTokens);
+}
+
+function localModelAllowsConnection(): boolean {
+  if (localModelDiscoveryState === "disabled") return true;
+  if (localModelDiscoveryState !== "ready" || localModelCatalog === null) return false;
+  if (localModelCatalog.state === "prepared") return localModelCatalog.selection !== null;
+  if (localModelCatalog.state !== "configuring") return false;
+  return localModelChoiceIsValid();
+}
+
+function renderLocalModelPicker(): void {
+  const catalog = localModelCatalog;
+  const frozen = catalog?.state === "prepared" && catalog.selection !== null;
+  const unavailable = localModelDiscoveryState === "disabled";
+  if (existingModelControls !== null) {
+    existingModelControls.hidden = localModelDiscoveryState === "ready" && catalog !== null;
+  }
+  const lifecycleLocked = localModelLifecycleIsLocked();
+  const controlsDisabled = catalog === null || catalog.state !== "configuring" ||
+    localModelDiscoveryPending || localModelPreparationPending || frozen || lifecycleLocked;
+  localModelPicker.hidden = unavailable;
+  localModelOptions.hidden = catalog === null;
+  localModelOptions.disabled = controlsDisabled;
+  localModelSelect.disabled = controlsDisabled;
+  localModelContextInput.disabled = controlsDisabled;
+  localModelRetry.hidden = localModelDiscoveryState !== "error" && catalog?.state !== "preparing";
+  localModelRetry.disabled = localModelDiscoveryPending || localModelLifecycleIsLocked();
+  localModelPicker.dataset.ready = localModelDiscoveryState === "loading" || localModelDiscoveryPending
+    ? "false" : "true";
+
+  const selected = catalog?.models.find((item) => item.model === localModelSelect.value) ?? null;
+  const selection = catalog?.selection ?? null;
+  localModelAdvertised.textContent = localModelCapacity(
+    selection?.advertisedContextTokens ?? selected?.advertisedContextTokens ?? null,
+  );
+  localModelRequested.textContent = selection === null
+    ? localModelCapacity(localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber)
+    : localModelCapacity(selection.requestedContextTokens);
+  localModelEffective.textContent = selection === null
+    ? "Not observed"
+    : localModelCapacity(selection.effectiveContextTokens);
+
+  if (localModelDiscoveryState === "loading") {
+    localModelSelectionState.textContent = "Checking local model availability on this host…";
+    localModelBudgetNote.textContent = "Choose a model and context before connecting.";
+  } else if (localModelDiscoveryState === "error") {
+    localModelSelectionState.textContent = localModelDiscoveryError === null
+      ? "Local model discovery failed. Retry before connecting."
+      : `Local model discovery failed. ${localModelDiscoveryError} Retry before connecting.`;
+    localModelBudgetNote.textContent = "The host did not confirm whether local model selection is available.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (catalog?.state === "preparing") {
+    localModelSelectionState.textContent = "Local model preparation is already in progress. Refresh host status before connecting.";
+    localModelBudgetNote.textContent = "The host has not confirmed a frozen selection yet.";
+    delete localModelSelectionState.dataset.state;
+  } else if (frozen && selection !== null) {
+    localModelSelectionState.textContent = "Model fixed for this host. Restart the host to change it.";
+    localModelBudgetNote.textContent = "The prepared model and requested context are fixed for this host lifetime.";
+    localModelSelectionState.dataset.state = "ready";
+  } else if (catalog?.models.length === 0) {
+    localModelSelectionState.textContent = "No installed local models were found.";
+    localModelBudgetNote.textContent = "Restart the host after installing a local model.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (localModelPreparationPending) {
+    localModelSelectionState.textContent = "Checking readiness and preparing the local model before connecting…";
+    localModelBudgetNote.textContent = "This preparation has a separate bounded wait; no session starts until it succeeds.";
+    delete localModelSelectionState.dataset.state;
+  } else if (localModelPreparationError !== null) {
+    localModelSelectionState.textContent = `Local model preparation failed (${localModelPreparationError}). Retry readiness, or restart the host if installed models changed.`;
+    localModelBudgetNote.textContent = "No session was started; the host selection remains unchanged unless preparation succeeded.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (catalog !== null) {
+    localModelSelectionState.textContent = "Choose a model and context before connecting.";
+    const model = catalog.models.find((item) => item.model === localModelSelect.value);
+    if (model === undefined) {
+      localModelBudgetNote.textContent = catalog.defaultModel === null
+        ? "Choose an installed local model and enter the requested context."
+        : "Choose an installed local model before connecting.";
+    } else if (model.advertisedContextTokens === null) {
+      localModelBudgetNote.textContent = "Advertised capacity is unknown; enter an explicit requested context between 2,048 and 262,144 tokens.";
+    } else if (catalog.defaultRequestedContextTokens > model.advertisedContextTokens) {
+      localModelBudgetNote.textContent = `The 16,384-token host default exceeds this model's advertised maximum; enter a valid smaller value.`;
+    } else {
+      localModelBudgetNote.textContent = `Host default: ${catalog.defaultRequestedContextTokens.toLocaleString("en-US")} tokens. Change it if needed.`;
+    }
+    delete localModelSelectionState.dataset.state;
+  }
+  renderSessionToggle();
+}
+
+function populateLocalModelPicker(catalog: LocalModelCatalog): void {
+  const placeholder = new Option(catalog.models.length === 0 ? "No installed models" : "Select a model", "");
+  localModelSelect.replaceChildren(placeholder, ...catalog.models.map((model) => {
+    const option = new Option(model.model, model.model);
+    return option;
+  }));
+  const initialModel = catalog.selection?.model ?? catalog.defaultModel;
+  localModelSelect.value = initialModel ?? "";
+  if (catalog.selection !== null) {
+    localModelContextInput.value = String(catalog.selection.requestedContextTokens);
+  } else {
+    const selected = catalog.models.find((item) => item.model === localModelSelect.value);
+    localModelContextInput.value = selected?.advertisedContextTokens !== null &&
+      selected !== undefined && catalog.defaultRequestedContextTokens <= selected.advertisedContextTokens
+      ? String(catalog.defaultRequestedContextTokens) : "";
+  }
+  renderLocalModelPicker();
+}
+
+function localModelAuthorization(): HeadersInit | undefined {
+  return capability === null ? undefined : authorization(capability);
+}
+
+async function discoverLocalModelSelection(): Promise<void> {
+  localModelDiscoveryAbort?.abort();
+  const abort = new AbortController();
+  localModelDiscoveryAbort = abort;
+  const generation = ++localModelDiscoveryGeneration;
+  localModelDiscoveryPending = true;
+  localModelDiscoveryState = "loading";
+  localModelPreparationError = null;
+  localModelDiscoveryError = null;
+  renderLocalModelPicker();
+  let accepted = false;
+  try {
+    const response = await fetchLocalModelRequest("/api/v1/local-models", {
+      method: "POST",
+      headers: localModelAuthorization(),
+      body: null,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    }, LOCAL_MODEL_METADATA_TIMEOUT_MS, abort.signal);
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
+    const availability = parseLocalModelCatalog(await response.json());
+    if (generation !== localModelDiscoveryGeneration || abort.signal.aborted) return;
+    accepted = true;
+    if (!availability.available) {
+      localModelCatalog = null;
+      localModelDiscoveryState = "disabled";
+    } else {
+      localModelCatalog = availability;
+      localModelDiscoveryState = "ready";
+      populateLocalModelPicker(availability);
+    }
+  } catch (error) {
+    if (generation !== localModelDiscoveryGeneration || abort.signal.aborted) return;
+    localModelCatalog = null;
+    localModelDiscoveryState = "error";
+    const failure = connectionFailureCategory(error);
+    localModelDiscoveryError = failure === "authorization-refused"
+      ? "Host refused the request (403)."
+      : failure === "service-unavailable"
+        ? "Host refused the request (503)."
+        : failure === "request-timed-out"
+          ? "Host request timed out (408)."
+          : failure === "request-refused"
+            ? "Host refused the request."
+            : "Host request failed.";
+    if (!(error instanceof LocalModelProtocolError)) {
+      console.info(`[local-model-selection-refusal] ${JSON.stringify({ category: failure })}`);
+    }
+  } finally {
+    if (generation === localModelDiscoveryGeneration) {
+      localModelDiscoveryPending = false;
+      localModelDiscoveryAbort = null;
+      if (!accepted && localModelDiscoveryState === "loading") localModelDiscoveryState = "error";
+      renderLocalModelPicker();
+    }
+  }
+}
+
+async function prepareLocalModelSelection(
+  signal: AbortSignal,
+  connectGeneration: object,
+): Promise<void> {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") {
+    throw new Error("Local model catalog is not ready for preparation");
+  }
+  const request = localModelPreparationFor(
+    catalog,
+    localModelSelect.value,
+    localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber,
+  );
+  localModelPreparationPending = true;
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+  try {
+    const response = await fetchLocalModelRequest("/api/v1/local-model-prepare", {
+      method: "POST",
+      headers: { ...localModelAuthorization(), "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    }, LOCAL_MODEL_PREPARATION_TIMEOUT_MS, signal);
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
+    const prepared = parseLocalModelPreparation(await response.json(), request, catalog);
+    if (signal.aborted || !lifecycleAuthority.owns(connectGeneration)) {
+      throw new Error("Local model preparation was superseded");
+    }
+    localModelCatalog = { ...catalog, state: "prepared", selection: prepared };
+  } finally {
+    localModelPreparationPending = false;
+    renderLocalModelPicker();
+  }
 }
 
 class SessionRebindRejected extends ConnectionRequestRejected {}
@@ -2966,6 +3236,10 @@ async function reverifyMicrophoneAfterNativeReconnect(
 }
 
 async function connect(projectionResync = false): Promise<void> {
+  if (!localModelAllowsConnection()) {
+    addMarker("local_model_selection_required");
+    return;
+  }
   const connectGeneration = lifecycleAuthority.issue();
   connectionFailure = null;
   clearPartialTranscript();
@@ -3044,6 +3318,11 @@ async function connect(projectionResync = false): Promise<void> {
     return true;
   };
   try {
+    if (!resuming && localModelCatalog?.state === "configuring") {
+      failureStage = "configuration";
+      await prepareLocalModelSelection(localOperation.signal, connectGeneration);
+      failureStage = "bootstrap";
+    }
     if (resuming) {
       const previousCredential = credential;
       if (previousCredential === null) throw new Error("resume credential is unavailable");
@@ -3245,6 +3524,12 @@ async function connect(projectionResync = false): Promise<void> {
     if (sessionStopVersion !== observedStopVersion) return;
     refused = { stage: failureStage, category: connectionFailureCategory(error) };
     connectionFailure = refused;
+    const localPreparationFailed = failureStage === "configuration" &&
+      credential === null && localModelCatalog?.state === "configuring";
+    if (localPreparationFailed) {
+      localModelPreparationError = connectionFailureCategory(error);
+      renderLocalModelPicker();
+    }
     if (resuming && failureStage !== "bootstrap") {
       controller.disconnected();
       renderConnectionPresentation();
@@ -3255,7 +3540,7 @@ async function connect(projectionResync = false): Promise<void> {
     eventPolling?.abort();
     eventPolling = null;
     setCredential(null);
-    capability = null;
+    if (!localPreparationFailed) capability = null;
     controller.failed();
     addMarker("connection_failed", started);
   } finally {
@@ -3708,7 +3993,7 @@ async function submitApproval(
 sessionToggleButton.addEventListener("click", () => {
   const action = sessionTogglePresentation(
     controller.state,
-    canStartSession(),
+    canStartSession() && localModelAllowsConnection(),
     remoteStopRequired,
   ).action;
   if (action === "connect") {
@@ -3740,6 +4025,25 @@ remoteAudio.addEventListener("stalled", rendererInterrupted);
 remoteAudio.addEventListener("error", rendererInterrupted);
 muteButton.addEventListener("click", () => void toggleMicrophoneMute());
 voiceSelect.addEventListener("change", () => void changeVoice(voiceSelect.value));
+localModelSelect.addEventListener("change", () => {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") return;
+  const model = catalog.models.find((item) => item.model === localModelSelect.value);
+  const requested = localModelContextInput.value === "" ? NaN : localModelContextInput.valueAsNumber;
+  if (
+    model === undefined || model.advertisedContextTokens === null ||
+    !Number.isSafeInteger(requested) || requested > model.advertisedContextTokens
+  ) {
+    localModelContextInput.value = "";
+  }
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+});
+localModelContextInput.addEventListener("input", () => {
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+});
+localModelRetry.addEventListener("click", () => void discoverLocalModelSelection());
 modelSelect.addEventListener("change", () => {
   const catalog = selectableModels;
   if (catalog === null) return;
@@ -3774,3 +4078,4 @@ try {
   controller.failed();
   addMarker("fresh_launch_required");
 }
+void discoverLocalModelSelection();

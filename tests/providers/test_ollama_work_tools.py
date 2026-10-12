@@ -15,6 +15,10 @@ import hermes_realtime.providers.ollama as ollama
 from hermes_realtime.conversation.context import ConversationContextSnapshot, ConversationMessage
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
+from hermes_realtime.providers.ollama_models import OllamaModelClient
+from tests.support.ollama_metadata import supported_ollama_metadata
+
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
 
 class Response:
@@ -65,6 +69,7 @@ def adapter(lines: list[dict[str, object]], **options: object
         sent.append(json.loads(cast(bytes, req.data)))
         return response
 
+    options.setdefault("metadata_client", supported_ollama_metadata())
     inference = ollama.OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test",
                                               open_request=open_request, **options)
     handler = Handler()
@@ -94,12 +99,31 @@ async def test_native_start_advertises_only_exact_start_and_waits_for_acceptance
                              hashlib.sha256(b"turn_test").hexdigest())]
     assert response.closed
     body = sent[0]
+    assert body["shift"] is False
+    assert body["truncate"] is False
     assert body["options"] == {"num_ctx": 16384, "num_predict": 1024}
     assert body["tools"] == [{"type": "function", "function": {
         "name": "start_work", "description": ollama._WORK_TOOL_DESCRIPTION,
         "parameters": {"type": "object", "additionalProperties": False,
             "required": ["objective"], "properties": {"objective": {
                 "type": "string", "minLength": 1, "maxLength": 64}}}}}]
+
+
+@pytest.mark.asyncio
+async def test_native_work_still_refuses_unverified_runtime_before_any_opening() -> None:
+    async def read(endpoint, body):
+        assert (endpoint, body) == ("version", None)
+        return b'{"version":"unsupported"}'
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    inference, handler, sent, response = adapter([
+        {"message": {"tool_calls": [call()]}, "done": True},
+    ], metadata_client=client)
+    with pytest.raises(ValueError, match="source-reviewed"):
+        await collect(inference)
+    assert handler.calls == sent == []
+    assert response.closed is False
+    await inference.close()
 
 
 @pytest.mark.asyncio
@@ -156,6 +180,7 @@ async def test_unbound_conversation_retains_existing_prose_behavior() -> None:
     inference = ollama.OllamaStreamingInference(
         base_url="http://127.0.0.1:11434", model="test",
         open_request=lambda request, timeout: response,
+        metadata_client=supported_ollama_metadata(),
     )
     assert await collect(inference) == ["I've started that background task"]
 
@@ -295,10 +320,13 @@ async def test_preflight_is_tool_less_until_handler_is_bound() -> None:
         return response
 
     inference = ollama.OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test",
-                                              open_request=open_request)
+                                              open_request=open_request,
+                                              metadata_client=supported_ollama_metadata())
     assert await collect(inference) == ["Ready."]
     assert "tools" not in sent[0]
     inference.bind_work_tools(Handler())
+    with pytest.raises(RuntimeError, match="before the first inference"):
+        await inference.configure_context(4096)
 
 
 @pytest.mark.parametrize("handler", [object(), type("Bad", (), {
