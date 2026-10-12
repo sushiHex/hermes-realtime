@@ -68,8 +68,26 @@ diagnostic and leave acceptance pending.
 Use the diagnostic guide's initial profile: Windows Chrome, literal loopback,
 built-in memory, evidence capture and public search off, and explicit task
 commands with natural work tools disabled. Acceptance of
-[ADR 0004](adr/0004-model-action-authority.md) is not evidence that its proposed
-confirmation control has been implemented.
+[ADR 0004](adr/0004-model-action-authority.md) records automatic natural task starts
+and explicit user task cancellation. It requires no confirmation click for a
+model-proposed start and grants the model no cancellation or downstream approval
+authority. Design acceptance does not establish implemented routing, actual-model
+qualification, live activation or physical voice acceptance. The separately
+scoped implementation and its candidate-bound evidence belong to
+[#226](https://github.com/sushiHex/hermes-realtime/issues/226) and
+[#248](https://github.com/sushiHex/hermes-realtime/pull/248).
+
+A later automatic-routing acceptance session must first freeze a separately
+reviewed and qualified candidate, its natural-work setting, model artifact and
+provider/runtime configuration. Its observations extend this procedure: appropriate
+natural requests start work once with the intended objective; conversation,
+explanation, quotation, negation and instruction-shaped reference data are measured
+separately for unintended starts. Record denominators, failures and latency.
+Require an accepted acknowledgment with a run ID before active status, and test
+exact explicit-user cancellation with unrelated work active. Model cancellation
+and approval must have zero effect. Speech interruption must leave admitted
+background work independent. A finite corpus or stand-in pass does not prove
+arbitrary intent recognition, injection resistance or operator acceptance.
 
 Before starting, declare the observations: final transcript to first token,
 first token to audio, task acknowledgment/completion/cancellation, and reconnect
