@@ -77,6 +77,44 @@ not on how a provider split it.
 The adapter sends `options.num_ctx` (default 16,384) with every request. Without it, the
 server's default applies, and that depends on the machine.
 
+### Model capacity and session budget
+
+A model's advertised maximum, the requested session budget, and its observed runtime
+allocation are different values. Model metadata supplies the first; configuration chooses
+the second; the running backend may report the third. None establishes recall quality or
+tool-use reliability. A missing observation stays unknown.
+
+The full host accepts `--ollama-num-ctx <tokens>` for an explicit session choice. It reads
+the selected installed model's metadata before warmup, checks the requested value against
+the advertised maximum when known, and observes the loaded allocation after warmup. The
+choice is frozen before inference; recreate the session to change it. The supported request
+range is 2,048–262,144 tokens. This application bound does not redefine a model's advertised
+maximum. Without the option, the existing 16,384-token configuration remains in place.
+
+Every Ollama adapter requires the source-qualified Ollama 0.34.4 API contract before its
+first prompt, including default and legacy launcher paths. Successful validation is cached
+for that adapter; later turns do not repeat the metadata read. Recreate the session after
+replacing or upgrading the backend. Unknown runtimes are refused rather than assumed to
+honor no-truncation flags. Explicit context configuration supplies
+a versioned browser report showing the advertised, requested and observed values separately;
+an unavailable allocation remains unknown. Older browser clients do not support this new
+report. Metadata identity is checked during discovery and allocation observation. Ollama
+resolves mutable model names at inference, so concurrent external replacement of that name
+is unsupported; these checks do not provide an atomic model lease.
+
+Smaller models and smaller context budgets are valid choices for constrained applications.
+They do not require model-name exceptions or allocation of the advertised maximum. A model's
+original positional-scaling threshold is also not its advertised maximum. Qualification
+belongs to the particular model artifact, runtime and configuration, separately for ordinary
+conversation, task delegation and latency.
+
+The foreground text window and durable storage have separate responsibilities. Choosing a
+smaller inference budget does not delete the Hermes archive or memory. Conversely, stored
+history is not necessarily present in every model request. The text-window limits above are
+not exact token counts: templates, tools, memory, policy text and the generated reply also
+consume context. An explicit capacity refusal is preferable to silently dropping those
+sections. No character-to-token ratio proves that a request fits.
+
 **Measured on Ollama 0.34.4 here.** These tests used `phi4-mini`, a 24 GiB GPU and no
 `OLLAMA_CONTEXT_LENGTH`.
 
@@ -87,7 +125,7 @@ server's default applies, and that depends on the machine.
 - **Smaller GPUs get a smaller default.** Ollama picks the default by available VRAM, so the
   same prompt can be truncated on a smaller GPU.
 
-**What Ollama preserves.** At the measured version's immutable source commit,
+**What Ollama preserves by default.** At the measured version's immutable source commit,
 [`chatPrompt`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/prompt.go#L20-L86)
 keeps all system messages and the latest message while trimming older conversational rows.
 The leading policy/reference message therefore survives that message-level trimming.
@@ -99,13 +137,22 @@ and a suffix; it can cut policy or reference text inside the rendered prompt. Th
 overflow limit also applied to the previous separate system messages. Request assembly
 does not establish which complete sections the model evaluated.
 
-**Explicit overflow refusal.** The adapter now sends top-level `shift: false`, retaining
-`num_ctx` and normal conversational-row trimming. At the pinned 0.34.4 GGUF source, the
+**Explicit overflow refusal.** The adapter sends top-level `truncate: false` and
+`shift: false`. The first disables the message-trimming loop in `chatPrompt`; the second
+prevents residual token-overflow truncation. At the pinned 0.34.4 GGUF source, the
 [`Shift` request field](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/api/types.go#L160-L166)
 sets the runner's context-shift configuration, and the residual token-overflow path above
 returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
 propagates an opening refusal without a reply or automatic retry. This is source-based
-qualification; the changed option has not yet been qualified against the running backend.
+qualification. An isolated paired-options check at realtime commit `43b28a7` on Ollama
+0.34.4 completed a 372-token synthetic prompt and refused a 6,138-token prompt at a
+4,096-token allocation with HTTP 400 before any content or spoken segment. The oversized
+case used 13 intact rows within the host's row and text-window limits. This verifies that
+case's refusal, not every backend or model. The cold positive took 64.716 seconds under a
+120-second diagnostic bound, exceeding the host's unchanged 60-second budget; it is not
+host-readiness or voice-latency qualification.
+The [source-bound result and limits](https://github.com/sushiHex/hermes-realtime/issues/249#issuecomment-6115056437)
+remain in the owning issue.
 Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
 can also end generation at the context limit; it does not reserve reply tokens or prove
 model obedience. A change to this flag can

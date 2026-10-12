@@ -160,6 +160,7 @@ from hermes_realtime.providers.current_facts import (
     CurrentFactLookup,
     PublicRssCurrentFactLookup,
 )
+from hermes_realtime.providers.ollama_models import OllamaContextObservation, require_num_ctx
 from hermes_realtime.search_egress import SearchEgressAuthority
 from hermes_realtime.speech import (
     DeliveredSpeechLedger,
@@ -1419,6 +1420,7 @@ def _build_browser_model_configuration(
     ollama_model: str,
     codex_model: str,
     codex_effort: str,
+    local_context: Callable[[], OllamaContextObservation] | None = None,
 ) -> BrowserModelConfiguration:
     if inference_provider == "codex":
         return BrowserModelConfiguration(
@@ -1439,6 +1441,7 @@ def _build_browser_model_configuration(
             effort=None,
             context_window_tokens=None,
             reports_token_usage=False,
+            local_context=local_context,
         )
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
@@ -1879,6 +1882,7 @@ def build_local_host_launcher(
     inference_provider: str = "ollama",
     ollama_base_url: str = "http://127.0.0.1:11434",
     ollama_model: str = "hermes-4.3-36b-iq4xs-16k:latest",
+    ollama_num_ctx: int | None = None,
     codex_model: str = "gpt-5.6-terra",
     codex_effort: str = "low",
     codex_executable: str | None = None,
@@ -1963,6 +1967,10 @@ def build_local_host_launcher(
         )
     if type(natural_work_tools) is not bool:
         raise TypeError("natural_work_tools must be an exact boolean")
+    if ollama_num_ctx is not None:
+        require_num_ctx(ollama_num_ctx)
+        if inference_provider != "ollama":
+            raise ValueError("--ollama-num-ctx requires --inference-provider ollama")
     if natural_work_tools and inference_provider != "codex":
         raise ValueError("--natural-work-tools requires --inference-provider codex")
     if type(public_search) is not bool:
@@ -2746,6 +2754,9 @@ def build_local_host_launcher(
             ollama_model=ollama_model,
             codex_model=codex_model,
             codex_effort=codex_effort,
+            local_context=(inference.context_observation
+                if type(inference) is OllamaStreamingInference and ollama_num_ctx is not None
+                else None),
         ),
         model_catalog=model_catalog,
         select_model=select_model,
@@ -2809,6 +2820,15 @@ def build_local_host_launcher(
 
     async def preflight() -> None:
         nonlocal readiness_cue_template, restart_announcement
+        if ollama_num_ctx is not None:
+            if type(inference) is not OllamaStreamingInference:
+                try:
+                    raise TypeError("configured Ollama context requires exact Ollama inference")
+                finally:
+                    print("[ollama-context] " + json.dumps(
+                        {"version": 1, "category": "configuration_refused"},
+                        separators=(",", ":")), flush=True)
+            await inference.configure_context(ollama_num_ctx)
         if voice_tail_writer is not None:
             # Before preflight and so before any turn: the conversation resumes heard-first.
             await voice_tail_writer.open(context)
@@ -2845,6 +2865,8 @@ def build_local_host_launcher(
             if len(probes) != 1 or type(probes[0]) is not SpeechChunk:
                 raise RuntimeError("TTS preflight did not produce one playable chunk")
             readiness_cue_template = probes[0]
+            if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
+                await inference.observe_context()
             return
         readiness_cue_template = await _run_full_host_preflight(
             task_session=cast(_TaskSessionStarter, task_session),
@@ -2859,6 +2881,8 @@ def build_local_host_launcher(
             else None
         )
         announcement = _restart_announcement(settlement)
+        if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
+            await inference.observe_context()
         if announcement is not None:
             # Stopped work is history, never active: the prompt must not imply it runs.
             context.mark_prior_work_ended()
@@ -3025,6 +3049,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             bootstrap_ttl_seconds=args.bootstrap_ttl_seconds,
             inference_provider=args.inference_provider,
             ollama_model=args.ollama_model,
+            ollama_num_ctx=args.ollama_num_ctx,
             codex_model=args.codex_model,
             codex_effort=args.codex_effort,
             codex_executable=args.codex_executable,
@@ -3416,6 +3441,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--ollama-model",
         default="hermes-4.3-36b-iq4xs-16k:latest",
     )
+    parser.add_argument("--ollama-num-ctx", type=int,
+        help="explicit per-session Ollama context (2048–262144); metadata/runtime validated")
     parser.add_argument("--codex-model", default="gpt-5.6-terra")
     parser.add_argument(
         "--codex-effort",

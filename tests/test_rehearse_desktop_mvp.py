@@ -12,6 +12,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.ollama_metadata import supported_ollama_metadata
+
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "rehearse_desktop_mvp.py"
 sys.path.insert(0, str(_PATH.parent))
 _SPEC = importlib.util.spec_from_file_location("rehearse_desktop_mvp", _PATH)
@@ -278,7 +282,7 @@ def test_the_host_child_observes_exactly_the_prompt_the_adapter_sends(
         responses.append(Response())
         return responses[-1]
 
-    adapter = OllamaStreamingInference(
+    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="m", open_request=open_request
     )
     snapshot = ConversationContextSnapshot(
@@ -355,7 +359,7 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
         bodies.append(json.loads(request.data))  # type: ignore[arg-type]
         return Response()
 
-    adapter = OllamaStreamingInference(
+    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="stand-in", open_request=open_request
     )
 

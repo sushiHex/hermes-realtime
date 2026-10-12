@@ -33,6 +33,9 @@ from hermes_realtime.integration.voice_tail import (
 )
 from hermes_realtime.providers import OllamaStreamingInference
 from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk, Transcript
+from tests.support.ollama_metadata import supported_ollama_metadata
+
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
 _FACT = "My favorite bird is the kestrel."
 
@@ -97,7 +100,7 @@ def _loop(store: ConversationContextStore, ollama: _FakeOllama) -> StreamingSpee
     return StreamingSpeechLoop(
         context=store,
         foreground=ForegroundTurnCoordinator(),
-        inference=OllamaStreamingInference(
+        inference=OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
             base_url="http://127.0.0.1:11434", model="stand-in", open_request=ollama
         ),
         synthesizer=_Synthesizer(),

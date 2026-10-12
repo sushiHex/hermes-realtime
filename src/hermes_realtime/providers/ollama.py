@@ -8,13 +8,22 @@ import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from typing import Protocol, cast
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+import aiohttp
 
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
+from hermes_realtime.providers.ollama_models import (
+    DEFAULT_OLLAMA_NUM_CTX,
+    OllamaContextConfiguration,
+    OllamaContextObservation,
+    OllamaModelClient,
+)
 
 _MAX_MODEL_CHARS = 256
 _MAX_SEGMENT_CHARS = 4096
@@ -24,8 +33,7 @@ _MAX_RESPONSE_LINE_BYTES = 1_048_576
 _INTERRUPTED_SPEECH_SUFFIX = " [speech interrupted]"
 # Requested with every request in place of a server default that depends on the GPU
 # (docs/heard-context-window.md derives it). The server may cap it at the model's trained
-# context; prompt_eval_count in the [ollama-prompt] marker shows whether the prompt fit.
-DEFAULT_OLLAMA_NUM_CTX = 16_384
+# context; prompt_eval_count is an evaluated count, not proof of prompt retention.
 _MIN_NUM_CTX = 2048
 _MAX_NUM_CTX = 262_144
 _PROMPT_MARKER_PREFIX = "[ollama-prompt] "
@@ -68,6 +76,7 @@ class OllamaStreamingInference:
         max_active_streams: int = 4,
         num_ctx: int = DEFAULT_OLLAMA_NUM_CTX,
         output_style: Callable[[], str] | None = None,
+        metadata_client: OllamaModelClient | None = None,
     ) -> None:
         if type(base_url) is not str:
             raise TypeError("base_url must be an exact built-in string")
@@ -123,6 +132,10 @@ class OllamaStreamingInference:
         self._max_segment_chars = max_segment_chars
         self._max_active_streams = max_active_streams
         self._num_ctx = num_ctx
+        self._context_configuration: OllamaContextConfiguration | None = None
+        self._model_client = metadata_client
+        self._context_contract_verified = False
+        self._context_observation: OllamaContextObservation | None = None
         self._openings: dict[str, asyncio.Task[_LineResponse]] = {}
         self._opening_cleanups: dict[str, asyncio.Task[None]] = {}
         self._responses: dict[str, _LineResponse] = {}
@@ -132,6 +145,134 @@ class OllamaStreamingInference:
         self._state_lock = asyncio.Lock()
         self._close_operation: asyncio.Task[None] | None = None
         self._closed = False
+        self._inference_started = False
+
+    async def _ensure_context_contract_locked(
+        self, client: OllamaModelClient | None = None,
+    ) -> OllamaModelClient:
+        category = "contract_refused"
+        try:
+            metadata_client = client if client is not None else self._model_client
+            if metadata_client is None:
+                metadata_client = OllamaModelClient(
+                    base_url=self._endpoint.removesuffix("/api/chat"))
+            if type(metadata_client) is not OllamaModelClient:
+                raise TypeError("metadata client must be exact OllamaModelClient")
+            source = urlsplit(metadata_client._origin)
+            destination = urlsplit(self._endpoint)
+            if (source.hostname, source.port) != (
+                destination.hostname, destination.port,
+            ):
+                raise ValueError("metadata client must use the inference origin")
+            if self._context_contract_verified:
+                if metadata_client is not self._model_client:
+                    raise ValueError("verified session metadata client is already bound")
+                category = "cached"
+                return metadata_client
+            await metadata_client.require_context_contract()
+            self._model_client = metadata_client
+            self._context_contract_verified = True
+            category = "verified"
+            return metadata_client
+        finally:
+            print("[ollama-runtime-contract] " + json.dumps(
+                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
+    async def configure_context(
+        self, requested_context_tokens: int, *, client: OllamaModelClient | None = None,
+    ) -> None:
+        """Freeze a metadata-bound session choice before the first inference request.
+
+        This detects tag replacement at configuration boundaries. Ollama's chat API
+        resolves mutable names; concurrent external model replacement is unsupported.
+        """
+        category = "configuration_refused"
+        try:
+            await self._configure_context(requested_context_tokens, client=client)
+            category = "configured"
+        finally:
+            print("[ollama-context] " + json.dumps(
+                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
+    async def _configure_context(
+        self, requested_context_tokens: int, *, client: OllamaModelClient | None,
+    ) -> None:
+        async with self._state_lock:
+            if self._inference_started:
+                raise RuntimeError("context must be configured before the first inference")
+            if self._closed:
+                raise RuntimeError("context configuration requires an idle open adapter")
+            if self._context_configuration is not None:
+                raise RuntimeError("session context configuration is already frozen")
+            metadata_client = await self._ensure_context_contract_locked(client)
+            model = await metadata_client.discover(self._model)
+            configuration = OllamaContextConfiguration(
+                model=model, requested_context_tokens=requested_context_tokens)
+            self._num_ctx = cast(int, configuration.requested_context_tokens)
+            self._context_configuration = configuration
+            self._context_observation = OllamaContextObservation(configuration)
+            self._model_client = metadata_client
+
+    async def observe_context(self) -> None:
+        category = "not_configured"
+        try:
+            configuration = self._context_configuration
+            client = self._model_client
+            if configuration is None or client is None:
+                return
+            self._context_observation = OllamaContextObservation(configuration)
+            category = "identity_refused"
+            try:
+                digest = await client.identity(self._model)
+            except (aiohttp.ClientError, TimeoutError):
+                category = "identity_unavailable"
+                raise
+            if digest != configuration.model.digest:
+                raise ValueError("model identity changed; recreate the session configuration")
+            try:
+                effective = await client.effective_context(configuration.model)
+            except (aiohttp.ClientError, TimeoutError):
+                category = "unavailable"
+                effective = None
+            except (TypeError, ValueError):
+                category = "metadata_refused"
+                effective = None
+            else:
+                category = "unknown" if effective is None else "observed"
+            self._context_observation = OllamaContextObservation(configuration, effective)
+        except asyncio.CancelledError:
+            category = "cancelled"
+            raise
+        finally:
+            print("[ollama-context-observation] " + json.dumps(
+                {"version": 1, "kind": "allocation", "category": category},
+                separators=(",", ":")), flush=True)
+
+    def _open_response(self, request: Request, messages_count: int) -> _LineResponse:
+        """Own an HTTP refusal even when its awaiting turn has already cancelled."""
+        try:
+            return self._open_request(request, self._request_timeout)
+        except HTTPError as error:
+            category = "backend_refusal"
+            try:
+                error.close()
+            except BaseException as close_error:
+                category = "response_close_failed"
+                raise error from close_error
+            finally:
+                print("[ollama-refusal] " + json.dumps({
+                    "version": 1, "category": category, "status": error.code,
+                    "messages": messages_count, "requested_context_tokens": self._num_ctx,
+                }, separators=(",", ":")), flush=True)
+            raise
+
+    def context_observation(self) -> OllamaContextObservation:
+        if self._context_observation is None:
+            raise RuntimeError("session context has not been configured")
+        return self._context_observation
+
+    def context_public_data(self) -> dict[str, str | int | bool | None]:
+        return self.context_observation().public_data()
 
     async def stream(
         self,
@@ -143,22 +284,6 @@ class OllamaStreamingInference:
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         messages = self._messages(snapshot, output_style=style)
-        request = Request(
-            self._endpoint,
-            data=json.dumps(
-                {
-                    "model": self._model,
-                    "messages": messages,
-                    "options": {"num_ctx": self._num_ctx},
-                    "shift": False,
-                    "stream": True,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         opening: asyncio.Task[_LineResponse] | None = None
         response: _LineResponse | None = None
         read_operation: asyncio.Task[bytes] | None = None
@@ -169,11 +294,30 @@ class OllamaStreamingInference:
                 raise RuntimeError("turn already owns an Ollama stream")
             if len(self._openings) + len(self._responses) >= self._max_active_streams:
                 raise RuntimeError("Ollama stream capacity exhausted")
+            await self._ensure_context_contract_locked()
+            request = Request(
+                self._endpoint,
+                data=json.dumps(
+                    {
+                        "model": self._model,
+                        "messages": messages,
+                        "options": {"num_ctx": self._num_ctx},
+                        "shift": False,
+                        "truncate": False,
+                        "stream": True,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            self._inference_started = True
             opening = asyncio.create_task(
                 asyncio.to_thread(
-                    self._open_request,
+                    self._open_response,
                     request,
-                    self._request_timeout,
+                    len(messages),
                 ),
                 name=f"ollama-open:{turn_id}",
             )

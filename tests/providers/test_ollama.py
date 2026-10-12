@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import threading
 from collections import deque
@@ -20,6 +21,9 @@ from hermes_realtime.conversation.output_style import OUTPUT_STYLES, OutputStyle
 from hermes_realtime.conversation.streaming import ConversationPromptUpdate
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import OllamaStreamingInference
+from tests.support.ollama_metadata import supported_ollama_metadata
+
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
@@ -43,8 +47,10 @@ async def test_output_style_and_reference_kinds_bind_to_the_sent_prompt(style, c
         updates=(ConversationPromptUpdate(sequence=1, task_id="task_2", status="completed",
                                           text="Synthetic finding."),),
     )
-    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test",
-                                        open_request=open_request, output_style=selection.get)
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test",
+        open_request=open_request, output_style=selection.get)
     assert [part async for part in inference.stream(snapshot, turn_id="turn_style")]
     sent = requests[0]["messages"]
     assert [row["role"] for row in sent] == ["system", "user", "assistant", "user"]
@@ -136,7 +142,7 @@ async def test_ollama_streams_bounded_speakable_segments_without_tool_schema() -
         requests.append((request, timeout))
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="hermes-4.3-36b-iq4xs-16k:latest",
         open_request=open_request,
@@ -240,13 +246,13 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
             )
         )
 
-    default = OllamaStreamingInference(
+    default = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request
     )
     assert [segment async for segment in default.stream(_snapshot(), turn_id="turn_1")] == [
         "Short reply."
     ]
-    explicit = OllamaStreamingInference(
+    explicit = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
         num_ctx=32_768,
     )
@@ -256,7 +262,7 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
 
     assert [body["options"] for body in bodies] == [{"num_ctx": 16_384}, {"num_ctx": 32_768}]
     assert all(body.get("shift") is False for body in bodies)
-    assert all("truncate" not in body for body in bodies)
+    assert all(body.get("truncate") is False for body in bodies)
     sent = cast(list[dict[str, str]], bodies[0]["messages"])
     content = "".join(message["content"] for message in sent)
     reports = [
@@ -282,9 +288,10 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     requests: list[Request] = []
+    refusal_body = io.BytesIO(b"Synthetic refusal body.")
     refusal = HTTPError(
         "http://127.0.0.1:11434/api/chat", 400,
-        "the prompt is longer than the context window", {}, None,
+        "the prompt is longer than the context window", {}, refusal_body,
     )
     response = LineResponse((
         {"message": {"content": "Next turn reply."}, "done": True},
@@ -297,7 +304,7 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
             raise refusal
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
         max_active_streams=1,
     )
@@ -306,9 +313,14 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
         async for segment in inference.stream(_snapshot(), turn_id="turn_refused"):
             emitted.append(segment)
     assert caught.value is refusal
+    assert refusal_body.closed
     assert emitted == []
     assert len(requests) == 1
-    assert capsys.readouterr().out == ""
+    reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+               for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[ollama-refusal] ")]
+    assert reports == [{"version": 1, "category": "backend_refusal", "status": 400,
+                       "messages": 3, "requested_context_tokens": 16384}]
 
     # Let the failed iterator's scheduled cleanup take its next loop turn.
     await asyncio.sleep(0)
@@ -322,6 +334,86 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     assert len(requests) == 2
     assert response.closed
     await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_opening_closes_its_late_http_refusal_once(capsys):
+    entered = threading.Event()
+    release = threading.Event()
+    body = io.BytesIO(b"Synthetic refusal body.")
+
+    class Refusal(HTTPError):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            super().close()
+
+    refusal = Refusal("http://127.0.0.1:11434/api/chat", 400, "overflow", {}, body)
+
+    def open_request(request, timeout):
+        entered.set()
+        assert release.wait(3)
+        raise refusal
+
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+
+    async def consume():
+        return [part async for part in inference.stream(_snapshot(), turn_id="turn_cancelled_open")]
+
+    operation = asyncio.create_task(consume())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        release.set()
+        await inference.close()
+        assert body.closed and refusal.close_calls == 1
+        reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-refusal] ")]
+        assert reports == [{"version": 1, "category": "backend_refusal", "status": 400,
+                            "messages": 3, "requested_context_tokens": 16384}]
+    finally:
+        release.set()
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_http_refusal_survives_a_failing_response_close(capsys):
+    close_error = OSError("Synthetic private detail.")
+    body = io.BytesIO(b"Synthetic refusal body.")
+
+    class Refusal(HTTPError):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise close_error
+
+    refusal = Refusal("http://127.0.0.1:11434/api/chat", 400, "overflow", {}, body)
+
+    def open_request(request, timeout):
+        raise refusal
+
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+    try:
+        with pytest.raises(HTTPError) as caught:
+            async for _part in inference.stream(_snapshot(), turn_id="turn_close_failed"):
+                pytest.fail("a refusal emitted content")
+        assert caught.value is refusal and caught.value.code == 400
+        assert caught.value.__cause__ is close_error and refusal.close_calls == 1
+        reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-refusal] ")]
+        assert reports == [{"version": 1, "category": "response_close_failed", "status": 400,
+                           "messages": 3, "requested_context_tokens": 16384}]
+    finally:
+        body.close()
+        await inference.close()
 
 
 @pytest.mark.parametrize(
@@ -389,7 +481,7 @@ async def test_ollama_retains_and_closes_response_when_cancelled_during_open() -
         assert release_open.wait(timeout=5)
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=open_request,
@@ -436,7 +528,7 @@ async def test_ollama_cancel_waits_for_owned_blocked_reader_thread() -> None:
             close_called.set()
 
     response = BlockingReadResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,
@@ -489,7 +581,7 @@ async def test_ollama_cancel_ignores_reader_failure_caused_by_response_close() -
             ),
         )
     )
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: responses.popleft(),
@@ -544,7 +636,7 @@ async def test_ollama_cleanup_survives_caller_cancellation(
             release_read.set()
 
     response = BlockingCleanupResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,
@@ -601,7 +693,7 @@ async def test_ollama_failed_response_close_remains_owned_across_retries() -> No
             raise OSError("response close failed")
 
     response = FailingCloseResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,
