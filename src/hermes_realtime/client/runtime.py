@@ -8,6 +8,7 @@ import re
 import ssl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from hermes_realtime.evidence.models import (
@@ -46,6 +47,9 @@ from .session import (
 )
 from .tailnet import TailnetPeerAuthorizer
 
+if TYPE_CHECKING:
+    from hermes_realtime.providers.ollama_session import OllamaSessionSelection
+
 
 class BrowserClientRuntime:
     """Compose one browser HTTP surface around one conversation worker."""
@@ -71,6 +75,7 @@ class BrowserClientRuntime:
         bootstrap_ttl_seconds: int = 120,
         speech_runtime: BrowserSpeechRuntime | None = None,
         model_configuration: BrowserModelConfiguration | None = None,
+        local_model_selection: OllamaSessionSelection | None = None,
         model_catalog: Callable[[], Awaitable[BrowserModelCatalog]] | None = None,
         select_model: Callable[[str, str], Awaitable[BrowserModelCatalog]] | None = None,
         activate_media: Callable[[str, int, int], Awaitable[None]] | None = None,
@@ -214,6 +219,10 @@ class BrowserClientRuntime:
             projection=projection,
             speech_runtime=speech_runtime,
             model_configuration=model_configuration,
+            local_model_configuration=(
+                local_model_selection.require_prepared
+                if local_model_selection is not None else None
+            ),
             model_catalog=model_catalog,
             select_model=select_model,
             activate_media=activate_media,
@@ -248,6 +257,7 @@ class BrowserClientRuntime:
             worker_identity=worker_identity,
             tailnet_authorizer=tailnet_authorizer,
             loopback_authorizer=loopback_authorizer,
+            local_model_selection=local_model_selection,
         )
         self._server = BrowserHttpServer(
             application=application,

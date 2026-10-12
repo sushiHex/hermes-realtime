@@ -22,6 +22,7 @@ _MAX_MODELS = 256
 _MAX_CAPACITY = 100_000_000
 _REQUEST_TIMEOUT_SECONDS = 5.0
 _DISCOVERY_TIMEOUT_SECONDS = 10.0
+_CATALOG_TIMEOUT_SECONDS = 8.0
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -67,6 +68,17 @@ def _require_local(row: dict[str, object]) -> None:
     for field in ("remote_host", "remote_model"):
         if field in row and row[field] != "":
             raise ValueError("context configuration requires local model weights")
+
+
+def _completion_capability(payload: dict[str, object]) -> bool:
+    capabilities = payload.get("capabilities")
+    if (
+        type(capabilities) is not list
+        or len(capabilities) > 32
+        or any(type(item) is not str or len(item) > 64 for item in capabilities)
+    ):
+        raise ValueError("model completion capabilities must be a bounded exact string list")
+    return "completion" in capabilities
 
 
 def require_num_ctx(value: object) -> int:
@@ -142,6 +154,8 @@ class OllamaContextObservation:
 def _require_model(value: object) -> str:
     if type(value) is not str or not value.strip() or len(value) > 256:
         raise ValueError("model must be an exact nonblank bounded string")
+    if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+        raise ValueError("model identity cannot contain control characters")
     return value
 
 
@@ -263,6 +277,78 @@ class OllamaModelClient:
             raise ValueError("model identity requires an exact SHA256 digest")
         return digest
 
+    @classmethod
+    def _catalog_rows(cls, payload: dict[str, object]) -> dict[str, dict[str, object]]:
+        rows = cls._models(payload)
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            name = _require_model(row.get("name"))
+            # Use the same name/model ambiguity rule as individual discovery.
+            selected = cast(dict[str, object], cls._selected_row(payload, name))
+            OllamaModelMetadata(name, cast(str, selected.get("digest")), None)
+            for field in ("remote_host", "remote_model"):
+                if field in selected and type(selected[field]) is not str:
+                    raise ValueError("remote model declarations must be exact strings")
+            result[name] = selected
+        return result
+
+    async def installed_models(self) -> tuple[OllamaModelMetadata, ...]:
+        """Discover the whole installed catalog without loading any model."""
+        category = "metadata_refused"
+        count = excluded = refused_capacity = 0
+        try:
+            async with asyncio.timeout(_CATALOG_TIMEOUT_SECONDS):
+                before = self._catalog_rows(await self._request("tags"))
+                count = len(before)
+                semaphore = asyncio.Semaphore(4)
+
+                async def discover(name: str, row: dict[str, object]) -> OllamaModelMetadata | None:
+                    nonlocal excluded, refused_capacity
+                    if any(row.get(field, "") != "" for field in ("remote_host", "remote_model")):
+                        excluded += 1
+                        return None
+                    async with semaphore:
+                        payload = await self._request("show", {"model": name})
+                    _require_local(payload)
+                    if not _completion_capability(payload):
+                        excluded += 1
+                        return None
+                    try:
+                        maximum = _advertised_capacity(payload.get("model_info"))
+                    except ValueError:
+                        maximum = None
+                        refused_capacity += 1
+                    return OllamaModelMetadata(name, cast(str, row["digest"]), maximum)
+
+                tasks: list[asyncio.Task[OllamaModelMetadata | None]] = []
+                async with asyncio.TaskGroup() as group:
+                    for name, row in before.items():
+                        tasks.append(group.create_task(discover(name, row)))
+                after = self._catalog_rows(await self._request("tags"))
+                if after != before:
+                    raise ValueError("installed model identity changed during catalog discovery")
+                models = tuple(task.result() for task in tasks if task.result() is not None)
+                category = "capacity_refused" if refused_capacity else "discovered"
+                return cast(tuple[OllamaModelMetadata, ...], models)
+        except TimeoutError:
+            category = "deadline"
+            raise
+        finally:
+            print(
+                "[ollama-catalog] "
+                + json.dumps(
+                    {
+                        "version": 1,
+                        "category": category,
+                        "models": count,
+                        "excluded": excluded,
+                        "capacityRefused": refused_capacity,
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+
     async def discover(self, model: str) -> OllamaModelMetadata:
         category = "metadata_refused"
         try:
@@ -283,13 +369,7 @@ class OllamaModelClient:
         digest = await self.identity(model)
         payload = await self._request("show", {"model": model})
         _require_local(payload)
-        capabilities = payload.get("capabilities")
-        if (
-            type(capabilities) is not list
-            or len(capabilities) > 32
-            or any(type(item) is not str or len(item) > 64 for item in capabilities)
-            or "completion" not in capabilities
-        ):
+        if not _completion_capability(payload):
             raise ValueError("selected model must advertise completion capability")
         try:
             maximum = _advertised_capacity(payload.get("model_info"))
