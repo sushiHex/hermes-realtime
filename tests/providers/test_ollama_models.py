@@ -529,6 +529,58 @@ async def test_remote_backed_or_malformed_model_metadata_refuses(endpoint, field
         await client.discover("test:latest")
 
 
+@pytest.mark.parametrize("field", ["remote_host", "remote_model"])
+@pytest.mark.parametrize(
+    "value",
+    ["remote", True, None, False, 0, [], {}],
+    ids=["nonempty", "true", "null", "false", "number", "array", "object"],
+)
+async def test_remote_or_malformed_allocation_is_refused_and_observed_as_unknown(
+    field, value, capsys
+):
+    backend = Backend()
+
+    async def read(endpoint, body):
+        payload = json.loads(await backend(endpoint, body))
+        if endpoint == "ps":
+            payload["models"][0][field] = value
+        return json.dumps(payload).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    model = await client.discover("test:latest")
+    with pytest.raises(ValueError, match="local"):
+        await client.effective_context(model)
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="test:latest", metadata_client=client
+    )
+    try:
+        await inference.configure_context(4096)
+        capsys.readouterr()
+        await inference.observe_context()
+        assert inference.context_public_data()["effectiveContextTokens"] is None
+        reports = [
+            json.loads(line.removeprefix("[ollama-context-observation] "))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[ollama-context-observation] ")
+        ]
+        assert reports == [{"version": 1, "kind": "allocation", "category": "metadata_refused"}]
+    finally:
+        await inference.close()
+
+
+async def test_empty_remote_fields_preserve_local_allocation():
+    backend = Backend()
+
+    async def read(endpoint, body):
+        payload = json.loads(await backend(endpoint, body))
+        if endpoint == "ps":
+            payload["models"][0].update(remote_host="", remote_model="")
+        return json.dumps(payload).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    assert await client.effective_context(await client.discover("test:latest")) == 4096
+
+
 async def test_metadata_transport_reads_only_to_the_byte_cap_and_disables_redirects(monkeypatch):
     remaining = 2_000_000
     requested = []

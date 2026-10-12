@@ -286,6 +286,7 @@ class OllamaModelClient:
         row = self._selected_row(await self._request("ps"), model.model)
         if row is None or row.get("digest") != model.digest:
             return None
+        _require_local(row)
         return _capacity(row.get("context_length"))
 
     async def require_context_contract(self) -> None:
