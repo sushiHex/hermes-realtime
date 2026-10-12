@@ -202,17 +202,26 @@ class OllamaModelClient:
             raise TypeError("metadata model rows must be exact objects")
         return cast(list[dict[str, object]], models)
 
-    async def identity(self, model: str) -> str:
-        _require_model(model)
+    @classmethod
+    def _selected_row(cls, payload: dict[str, object], model: str) -> dict[str, object] | None:
         rows = [
-            row for row in self._models(await self._request("tags")) if row.get("name") == model
+            row
+            for row in cls._models(payload)
+            if row.get("name") == model or row.get("model") == model
         ]
         if len(rows) != 1:
-            raise ValueError("selected model must have one installed identity")
+            return None
         row = rows[0]
+        if row.get("name") != model or row.get("model", model) != model:
+            return None
+        return row
+
+    async def identity(self, model: str) -> str:
+        _require_model(model)
+        row = self._selected_row(await self._request("tags"), model)
+        if row is None:
+            raise ValueError("selected model must have one consistent installed identity")
         _require_local(row)
-        if row.get("model", model) != model:
-            raise ValueError("model identity fields disagree")
         digest = row.get("digest")
         if type(digest) is not str or _DIGEST.fullmatch(digest) is None:
             raise ValueError("model identity requires an exact SHA256 digest")
@@ -262,20 +271,8 @@ class OllamaModelClient:
         return OllamaModelMetadata(model, digest, maximum)
 
     async def effective_context(self, model: OllamaModelMetadata) -> int | None:
-        rows = [
-            row
-            for row in self._models(await self._request("ps"))
-            if row.get("name") == model.model
-            or row.get("model") == model.model
-        ]
-        if len(rows) != 1:
-            return None
-        row = rows[0]
-        if (
-            row.get("name") != model.model
-            or row.get("model", model.model) != model.model
-            or row.get("digest") != model.digest
-        ):
+        row = self._selected_row(await self._request("ps"), model.model)
+        if row is None or row.get("digest") != model.digest:
             return None
         return _capacity(row.get("context_length"))
 

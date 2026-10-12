@@ -246,6 +246,7 @@ async def test_multiple_effective_allocations_stay_unknown():
     assert await client.effective_context(await client.discover("test:latest")) is None
 
 
+@pytest.mark.parametrize("boundary", ["tags", "ps"])
 @pytest.mark.parametrize(
     ("extra", "reverse", "expected"),
     [
@@ -257,25 +258,31 @@ async def test_multiple_effective_allocations_stay_unknown():
     ],
     ids=["stale-after", "stale-before", "conflicting-name", "conflicting-model", "unrelated"],
 )
-async def test_effective_context_counts_all_rows_referring_to_selected_model(
-    extra, reverse, expected
-):
+async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, expected, boundary):
     selected = {"name": "test:latest", "digest": DIGEST, "context_length": 4096}
     rows = [selected, {**extra, "context_length": 16384}]
     if reverse:
         rows.reverse()
 
     async def read(endpoint, body):
-        assert (endpoint, body) == ("ps", None)
+        assert (endpoint, body) == (boundary, None)
         return json.dumps({"models": rows}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
-    assert (
-        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
-        == expected
-    )
+    if boundary == "tags":
+        if expected is None:
+            with pytest.raises(ValueError, match="identity"):
+                await client.identity("test:latest")
+        else:
+            assert await client.identity("test:latest") == DIGEST
+    else:
+        assert (
+            await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+            == expected
+        )
 
 
+@pytest.mark.parametrize("boundary", ["tags", "ps"])
 @pytest.mark.parametrize(
     ("row", "expected"),
     [
@@ -284,7 +291,6 @@ async def test_effective_context_counts_all_rows_referring_to_selected_model(
         ({"name": "other", "model": "test:latest"}, None),
         ({"model": "test:latest"}, None),
         ({"name": "test:latest", "model": "other"}, None),
-        ({"name": "test:latest", "context_length": True}, None),
     ],
     ids=[
         "optional-model",
@@ -292,18 +298,36 @@ async def test_effective_context_counts_all_rows_referring_to_selected_model(
         "conflicting-name",
         "missing-name",
         "conflicting-model",
-        "invalid-capacity",
     ],
 )
-async def test_effective_context_requires_one_consistent_selected_row(row, expected):
+async def test_selected_model_requires_one_consistent_row(row, expected, boundary):
     async def read(endpoint, body):
-        assert (endpoint, body) == ("ps", None)
+        assert (endpoint, body) == (boundary, None)
         return json.dumps({"models": [{"digest": DIGEST, "context_length": 4096, **row}]}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    if boundary == "tags":
+        if expected is None:
+            with pytest.raises(ValueError, match="identity"):
+                await client.identity("test:latest")
+        else:
+            assert await client.identity("test:latest") == DIGEST
+    else:
+        assert (
+            await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+            == expected
+        )
+
+
+async def test_effective_context_refuses_invalid_capacity():
+    async def read(endpoint, body):
+        return json.dumps(
+            {"models": [{"name": "test:latest", "digest": DIGEST, "context_length": True}]}
+        ).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     assert (
-        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
-        == expected
+        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072)) is None
     )
 
 
