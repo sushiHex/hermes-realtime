@@ -162,14 +162,19 @@ async def test_concurrent_catalog_uses_one_owned_discovery(monkeypatch):
     assert len([path for path, _ in harness.backend.requests if path == "tags"]) == 2
 
 
-@pytest.mark.parametrize("field,value", [("model", "alias"), ("requested", 2048)])
+@pytest.mark.parametrize("field,value", [
+    ("model", "alias"), ("requested", 2048), ("advertised", 8192), ("advertised", None),
+])
 async def test_configured_choice_must_equal_request(monkeypatch, field, value):
     harness = Harness(monkeypatch)
 
     async def configure(adapter, requested, *, client):
         adapter._context_observation = OllamaContextObservation(
             OllamaContextConfiguration(
-                OllamaModelMetadata(value if field == "model" else "small", "a" * 64, 4096),
+                OllamaModelMetadata(
+                    value if field == "model" else "small", "a" * 64,
+                    value if field == "advertised" else 4096,
+                ),
                 value if field == "requested" else requested,
             )
         )

@@ -175,15 +175,7 @@ class OllamaSessionSelection:
             )
             observation = candidate.context_observation()
             configured = observation.configuration
-            if (
-                configured.model.model,
-                configured.model.digest,
-                configured.requested_context_tokens,
-            ) != (
-                choice.model.model,
-                choice.model.digest,
-                choice.requested_context_tokens,
-            ):
+            if configured != choice:
                 raise ValueError("selected model identity changed before preparation")
             await self._readiness(candidate)
             await candidate.observe_context()

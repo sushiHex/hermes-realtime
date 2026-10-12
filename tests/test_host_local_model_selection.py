@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from hermes_realtime import host_launcher as host
@@ -57,21 +59,28 @@ def test_local_selection_cannot_replace_qualification_provider_overrides(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_state", ["active", "preparing"])
 async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    shutdown_state: str,
 ) -> None:
     from hermes_realtime.providers.ollama_models import (
         OllamaContextConfiguration,
         OllamaContextObservation,
         OllamaModelMetadata,
     )
-    from hermes_realtime.speech import AudioFrame, SpeechChunk
+    from hermes_realtime.speech import AudioFrame, SpeechChunk, Transcript
 
     events: list[str] = []
     captured: dict[str, object] = {}
     metadata = OllamaModelMetadata("selected:latest", "a" * 64, 32768)
+    turn_started = asyncio.Event()
+    transport_closed = asyncio.Event()
 
     class Provider:
+        async def cancel(self, turn_id: str) -> None:
+            events.append("provider_cancelled")
+
         async def close(self) -> None:
             events.append("provider_closed")
 
@@ -117,10 +126,19 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     async def stream(self, request: object, *, turn_id: str):  # type: ignore[no-untyped-def]
         assert self._model == metadata.model
         events.append("inference:" + turn_id)
+        if shutdown_state == "preparing" or turn_id != "turn_preflight":
+            turn_started.set()
+            await transport_closed.wait()
+            raise RuntimeError("selected transport closed before foreground cancellation")
         yield "Ready."
+
+    async def adapter_cancel(self: object, turn_id: str) -> None:
+        assert "adapter_closed" not in events
+        events.append("adapter_cancelled")
 
     async def adapter_close(self: object) -> None:
         events.append("adapter_closed")
+        transport_closed.set()
 
     original_speech = host.StreamingSpeechLoop
     original_actions_close = host.ConversationUpdateExecutor.close
@@ -131,7 +149,9 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
 
     def speech(**kwargs: object):  # type: ignore[no-untyped-def]
         captured["speech_inference"] = kwargs["inference"]
-        return original_speech(**kwargs)
+        instance = original_speech(**kwargs)
+        captured["speech"] = instance
+        return instance
 
     def no_default(**kwargs: object) -> None:
         raise AssertionError("selection must not construct a default adapter")
@@ -150,6 +170,7 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     monkeypatch.setattr(host.OllamaStreamingInference, "configure_context", configure)
     monkeypatch.setattr(host.OllamaStreamingInference, "observe_context", observe)
     monkeypatch.setattr(host.OllamaStreamingInference, "stream", stream)
+    monkeypatch.setattr(host.OllamaStreamingInference, "cancel", adapter_cancel)
     monkeypatch.setattr(host.OllamaStreamingInference, "close", adapter_close)
     launcher = host.build_local_host_launcher(
         hermes_api_bearer="x" * 32, allow_unsandboxed_tasks=True,
@@ -162,15 +183,26 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     assert events == []
     await launcher._preflight()
     assert events == ["tasks_started"]
-    await owner.prepare(metadata.model, metadata.digest, 4096)
-    assert events == ["tasks_started", "metadata", "configured",
-                      "inference:turn_preflight", "tts_ready", "observed"]
-    assert owner.require_prepared().model == metadata.model
-    await owner.prepare(metadata.model, metadata.digest, 4096)
-    assert events.count("tasks_started") == events.count("configured") == 1
+    if shutdown_state == "active":
+        await owner.prepare(metadata.model, metadata.digest, 4096)
+        assert events == ["tasks_started", "metadata", "configured",
+                          "inference:turn_preflight", "tts_ready", "observed"]
+        assert owner.require_prepared().model == metadata.model
+        await owner.prepare(metadata.model, metadata.digest, 4096)
+        assert events.count("tasks_started") == events.count("configured") == 1
+        operation = asyncio.create_task(captured["speech"].respond(
+            "turn_selected", Transcript(text="Synthetic selected turn", final=True),
+        ))
+    else:
+        operation = asyncio.create_task(owner.prepare(metadata.model, metadata.digest, 4096))
+    await asyncio.wait_for(turn_started.wait(), timeout=1)
     launcher._start_attempted = True
     await launcher.close()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(operation, timeout=0.2)
     assert events.index("ingress_closed") < events.index("adapter_closed")
-    assert events.index("adapter_closed") < events.index("actions_closed")
+    assert events.index("actions_closed") < events.index("adapter_closed")
+    if shutdown_state == "active":
+        assert events.index("adapter_cancelled") < events.index("adapter_closed")
     assert events.index("adapter_closed") < events.index("tasks_closed")
     assert events.index("adapter_closed") < events.index("provider_closed")

@@ -3002,18 +3002,13 @@ def build_local_host_launcher(
                 await runtime.close_ingress()
             except BaseException as error:
                 errors.append(error)
-            if local_selection_owner is not None:
-                try:
-                    # Accepted HTTP handlers outlive the listening socket. Settle
-                    # their candidate before tearing down speech or shared TTS.
-                    await local_selection_owner.close()
-                except BaseException as error:
-                    errors.append(error)
             try:
                 await actions.close()
             except BaseException as error:
                 errors.append(error)
             try:
+                # The inference owner also settles accepted model preparation.
+                # Foreground cancellation precedes it; shared TTS closes later.
                 await work_close_owner.close()
             except BaseException as error:
                 errors.append(error)
