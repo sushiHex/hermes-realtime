@@ -21,6 +21,7 @@ from hermes_realtime.conversation.output_style import OUTPUT_STYLES, OutputStyle
 from hermes_realtime.conversation.streaming import ConversationPromptUpdate
 from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import OllamaStreamingInference
+from tests.support.ollama_metadata import supported_ollama_metadata
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
@@ -44,8 +45,10 @@ async def test_output_style_and_reference_kinds_bind_to_the_sent_prompt(style, c
         updates=(ConversationPromptUpdate(sequence=1, task_id="task_2", status="completed",
                                           text="Synthetic finding."),),
     )
-    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test",
-                                        open_request=open_request, output_style=selection.get)
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test",
+        open_request=open_request, output_style=selection.get)
     assert [part async for part in inference.stream(snapshot, turn_id="turn_style")]
     sent = requests[0]["messages"]
     assert [row["role"] for row in sent] == ["system", "user", "assistant", "user"]
@@ -137,7 +140,7 @@ async def test_ollama_streams_bounded_speakable_segments_without_tool_schema() -
         requests.append((request, timeout))
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="hermes-4.3-36b-iq4xs-16k:latest",
         open_request=open_request,
@@ -241,13 +244,13 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
             )
         )
 
-    default = OllamaStreamingInference(
+    default = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request
     )
     assert [segment async for segment in default.stream(_snapshot(), turn_id="turn_1")] == [
         "Short reply."
     ]
-    explicit = OllamaStreamingInference(
+    explicit = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
         num_ctx=32_768,
     )
@@ -299,7 +302,7 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
             raise refusal
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request,
         max_active_streams=1,
     )
@@ -311,9 +314,11 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     assert refusal_body.closed
     assert emitted == []
     assert len(requests) == 1
-    report = json.loads(capsys.readouterr().out.removeprefix("[ollama-refusal] "))
-    assert report == {"version": 1, "category": "backend_refusal", "status": 400,
-                      "messages": 3, "requested_context_tokens": 16384}
+    reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+               for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[ollama-refusal] ")]
+    assert reports == [{"version": 1, "category": "backend_refusal", "status": 400,
+                       "messages": 3, "requested_context_tokens": 16384}]
 
     # Let the failed iterator's scheduled cleanup take its next loop turn.
     await asyncio.sleep(0)
@@ -349,7 +354,7 @@ async def test_cancelled_opening_closes_its_late_http_refusal_once(capsys):
         assert release.wait(3)
         raise refusal
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
 
     async def consume():
@@ -391,7 +396,7 @@ async def test_http_refusal_survives_a_failing_response_close(capsys):
     def open_request(request, timeout):
         raise refusal
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
     try:
         with pytest.raises(HTTPError) as caught:
@@ -399,9 +404,11 @@ async def test_http_refusal_survives_a_failing_response_close(capsys):
                 pytest.fail("a refusal emitted content")
         assert caught.value is refusal and caught.value.code == 400
         assert caught.value.__cause__ is close_error and refusal.close_calls == 1
-        report = json.loads(capsys.readouterr().out.removeprefix("[ollama-refusal] "))
-        assert report == {"version": 1, "category": "response_close_failed", "status": 400,
-                          "messages": 3, "requested_context_tokens": 16384}
+        reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-refusal] ")]
+        assert reports == [{"version": 1, "category": "response_close_failed", "status": 400,
+                           "messages": 3, "requested_context_tokens": 16384}]
     finally:
         body.close()
         await inference.close()
@@ -472,7 +479,7 @@ async def test_ollama_retains_and_closes_response_when_cancelled_during_open() -
         assert release_open.wait(timeout=5)
         return response
 
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=open_request,
@@ -519,7 +526,7 @@ async def test_ollama_cancel_waits_for_owned_blocked_reader_thread() -> None:
             close_called.set()
 
     response = BlockingReadResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,
@@ -572,7 +579,7 @@ async def test_ollama_cancel_ignores_reader_failure_caused_by_response_close() -
             ),
         )
     )
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: responses.popleft(),
@@ -627,7 +634,7 @@ async def test_ollama_cleanup_survives_caller_cancellation(
             release_read.set()
 
     response = BlockingCleanupResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,
@@ -684,7 +691,7 @@ async def test_ollama_failed_response_close_remains_owned_across_retries() -> No
             raise OSError("response close failed")
 
     response = FailingCloseResponse(())
-    inference = OllamaStreamingInference(
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
         base_url="http://127.0.0.1:11434",
         model="model",
         open_request=lambda _request, _timeout: response,

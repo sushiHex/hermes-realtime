@@ -76,6 +76,7 @@ class OllamaStreamingInference:
         max_active_streams: int = 4,
         num_ctx: int = DEFAULT_OLLAMA_NUM_CTX,
         output_style: Callable[[], str] | None = None,
+        metadata_client: OllamaModelClient | None = None,
     ) -> None:
         if type(base_url) is not str:
             raise TypeError("base_url must be an exact built-in string")
@@ -132,7 +133,8 @@ class OllamaStreamingInference:
         self._max_active_streams = max_active_streams
         self._num_ctx = num_ctx
         self._context_configuration: OllamaContextConfiguration | None = None
-        self._model_client: OllamaModelClient | None = None
+        self._model_client = metadata_client
+        self._context_contract_verified = False
         self._context_observation: OllamaContextObservation | None = None
         self._openings: dict[str, asyncio.Task[_LineResponse]] = {}
         self._opening_cleanups: dict[str, asyncio.Task[None]] = {}
@@ -144,6 +146,37 @@ class OllamaStreamingInference:
         self._close_operation: asyncio.Task[None] | None = None
         self._closed = False
         self._inference_started = False
+
+    async def _ensure_context_contract_locked(
+        self, client: OllamaModelClient | None = None,
+    ) -> OllamaModelClient:
+        category = "contract_refused"
+        try:
+            metadata_client = client if client is not None else self._model_client
+            if metadata_client is None:
+                metadata_client = OllamaModelClient(
+                    base_url=self._endpoint.removesuffix("/api/chat"))
+            if type(metadata_client) is not OllamaModelClient:
+                raise TypeError("metadata client must be exact OllamaModelClient")
+            source = urlsplit(metadata_client._origin)
+            destination = urlsplit(self._endpoint)
+            if (source.hostname, source.port) != (
+                destination.hostname, destination.port,
+            ):
+                raise ValueError("metadata client must use the inference origin")
+            if self._context_contract_verified:
+                if metadata_client is not self._model_client:
+                    raise ValueError("verified session metadata client is already bound")
+                category = "cached"
+                return metadata_client
+            await metadata_client.require_context_contract()
+            self._model_client = metadata_client
+            self._context_contract_verified = True
+            category = "verified"
+            return metadata_client
+        finally:
+            print("[ollama-runtime-contract] " + json.dumps(
+                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
 
     async def configure_context(
         self, requested_context_tokens: int, *, client: OllamaModelClient | None = None,
@@ -171,9 +204,7 @@ class OllamaStreamingInference:
                 raise RuntimeError("context configuration requires an idle open adapter")
             if self._context_configuration is not None:
                 raise RuntimeError("session context configuration is already frozen")
-            metadata_client = client or OllamaModelClient(
-                base_url=self._endpoint.removesuffix("/api/chat"))
-            await metadata_client.require_context_contract()
+            metadata_client = await self._ensure_context_contract_locked(client)
             model = await metadata_client.discover(self._model)
             configuration = OllamaContextConfiguration(
                 model=model, requested_context_tokens=requested_context_tokens)
@@ -263,6 +294,7 @@ class OllamaStreamingInference:
                 raise RuntimeError("turn already owns an Ollama stream")
             if len(self._openings) + len(self._responses) >= self._max_active_streams:
                 raise RuntimeError("Ollama stream capacity exhausted")
+            await self._ensure_context_contract_locked()
             request = Request(
                 self._endpoint,
                 data=json.dumps(

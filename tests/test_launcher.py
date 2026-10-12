@@ -2075,14 +2075,14 @@ async def test_full_host_context_setting_precedes_warmup_and_browser_publication
         return json.dumps(payload).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=metadata)
-    monkeypatch.setattr(ollama_module, "OllamaModelClient", lambda **kwargs: client)
 
     def generate(request, timeout):
         bodies.append(json.loads(request.data))
         return io.BytesIO(b'{"message":{"content":"Ready."},"done":true}\n')
 
     inference = ollama_module.OllamaStreamingInference(
-        base_url="http://127.0.0.1:11434", model="synthetic:latest", open_request=generate)
+        base_url="http://127.0.0.1:11434", model="synthetic:latest", open_request=generate,
+        metadata_client=client)
     monkeypatch.setattr(
         host_launcher_module, "_build_streaming_inference", lambda **kwargs: inference)
 
