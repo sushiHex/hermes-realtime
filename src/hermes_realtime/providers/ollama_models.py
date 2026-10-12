@@ -266,10 +266,18 @@ class OllamaModelClient:
             row
             for row in self._models(await self._request("ps"))
             if row.get("name") == model.model
-            and row.get("model", model.model) == model.model
-            and row.get("digest") == model.digest
+            or row.get("model") == model.model
         ]
-        return _capacity(rows[0].get("context_length")) if len(rows) == 1 else None
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if (
+            row.get("name") != model.model
+            or row.get("model", model.model) != model.model
+            or row.get("digest") != model.digest
+        ):
+            return None
+        return _capacity(row.get("context_length"))
 
     async def require_context_contract(self) -> None:
         # Exact source-reviewed runtime contract, independent of model identity.

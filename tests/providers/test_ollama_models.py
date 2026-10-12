@@ -14,7 +14,11 @@ from hermes_realtime.conversation import ConversationContextSnapshot, Conversati
 from hermes_realtime.host_launcher import _build_argument_parser, _build_browser_model_configuration
 from hermes_realtime.livekit import LiveKitConnection
 from hermes_realtime.providers.ollama import OllamaStreamingInference
-from hermes_realtime.providers.ollama_models import OllamaContextConfiguration, OllamaModelClient
+from hermes_realtime.providers.ollama_models import (
+    OllamaContextConfiguration,
+    OllamaModelClient,
+    OllamaModelMetadata,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -240,6 +244,67 @@ async def test_multiple_effective_allocations_stay_unknown():
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     assert await client.effective_context(await client.discover("test:latest")) is None
+
+
+@pytest.mark.parametrize(
+    ("extra", "reverse", "expected"),
+    [
+        ({"name": "test:latest", "digest": "b" * 64}, False, None),
+        ({"name": "test:latest", "digest": "b" * 64}, True, None),
+        ({"name": "other", "model": "test:latest", "digest": DIGEST}, False, None),
+        ({"name": "test:latest", "model": "other", "digest": DIGEST}, False, None),
+        ({"name": "other", "model": "other", "digest": DIGEST}, False, 4096),
+    ],
+    ids=["stale-after", "stale-before", "conflicting-name", "conflicting-model", "unrelated"],
+)
+async def test_effective_context_counts_all_rows_referring_to_selected_model(
+    extra, reverse, expected
+):
+    selected = {"name": "test:latest", "digest": DIGEST, "context_length": 4096}
+    rows = [selected, {**extra, "context_length": 16384}]
+    if reverse:
+        rows.reverse()
+
+    async def read(endpoint, body):
+        assert (endpoint, body) == ("ps", None)
+        return json.dumps({"models": rows}).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    assert (
+        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"name": "test:latest"}, 4096),
+        ({"name": "test:latest", "model": "test:latest"}, 4096),
+        ({"name": "other", "model": "test:latest"}, None),
+        ({"model": "test:latest"}, None),
+        ({"name": "test:latest", "model": "other"}, None),
+        ({"name": "test:latest", "context_length": True}, None),
+    ],
+    ids=[
+        "optional-model",
+        "consistent",
+        "conflicting-name",
+        "missing-name",
+        "conflicting-model",
+        "invalid-capacity",
+    ],
+)
+async def test_effective_context_requires_one_consistent_selected_row(row, expected):
+    async def read(endpoint, body):
+        assert (endpoint, body) == ("ps", None)
+        return json.dumps({"models": [{"digest": DIGEST, "context_length": 4096, **row}]}).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    assert (
+        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+        == expected
+    )
 
 
 async def test_session_setting_reaches_inference_and_freezes_identity():
