@@ -109,6 +109,36 @@ describe("pre-connect local model contract", () => {
     expect(parseLocalModelCatalog(catalog)).toEqual(catalog);
   });
 
+  it("refuses wrong catalog version, provider, schema, and selection lifecycle", () => {
+    const frozen = {
+      model: "installed:latest",
+      digest,
+      requestedContextTokens: 8192,
+      advertisedContextTokens: 32768,
+      effectiveContextTokens: 65536,
+    };
+    const malformed: unknown[] = [
+      { ...catalog, version: 2 },
+      { ...catalog, provider: "another-provider" },
+      { ...catalog, unsupported: true },
+      { ...catalog, state: "configuring", selection: frozen },
+      { ...catalog, state: "preparing", selection: frozen },
+      { ...catalog, state: "prepared", selection: null },
+    ];
+    const refusal = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      for (const value of malformed) {
+        refusal.mockClear();
+        expect(() => parseLocalModelCatalog(value)).toThrow(TypeError);
+        expect(refusal.mock.calls).toEqual([
+          ['[local-model-selection-refusal] {"category":"invalid_catalog"}'],
+        ]);
+      }
+    } finally {
+      refusal.mockRestore();
+    }
+  });
+
   it("accepts only the exact explicit feature-disabled response", () => {
     expect(parseLocalModelCatalog({ version: 1, available: false })).toEqual({ version: 1, available: false });
     const refusal = vi.spyOn(console, "info").mockImplementation(() => {});
