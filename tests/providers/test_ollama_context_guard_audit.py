@@ -239,6 +239,10 @@ async def test_metadata_http_failure_never_becomes_an_installed_identity(monkeyp
     import hermes_realtime.providers.ollama_models as module
 
     class Response:
+        status = 500
+        request_info = None
+        history = ()
+
         def __init__(self):
             self.content = self
             self.sent = False
@@ -248,9 +252,6 @@ async def test_metadata_http_failure_never_becomes_an_installed_identity(monkeyp
 
         async def __aexit__(self, *args):
             return None
-
-        def raise_for_status(self):
-            raise aiohttp.ClientResponseError(request_info=None, history=(), status=500)
 
         async def read(self, size):
             if self.sent:

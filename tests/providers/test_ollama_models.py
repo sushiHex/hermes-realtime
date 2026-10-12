@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import socket
 
+import aiohttp
 import pytest
+from aiohttp import web
 
 import hermes_realtime.providers.ollama_models as models_module
 from hermes_realtime.client import BrowserEventProjection
@@ -119,6 +122,87 @@ async def test_metadata_read_bound_is_applied_before_parsing():
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=oversized)
     with pytest.raises(ValueError, match="size"):
         await client.discover("test:latest")
+
+
+@pytest.mark.parametrize("status", [200, 204, 302])
+async def test_metadata_transport_requires_http_200_before_reading(status, capsys):
+    requests = []
+    payload = b'{"version":"0.34.4"}'
+
+    async def response(request):
+        requests.append(request.path)
+        return web.Response(status=status, body=payload, headers={"Location": "/redirect"})
+
+    app = web.Application()
+    app.router.add_get("/api/version", response)
+    app.router.add_get("/redirect", response)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    try:
+        await web.SockSite(runner, listener).start()
+        client = OllamaModelClient(base_url=f"http://127.0.0.1:{port}")
+        if status == 200:
+            await client.require_context_contract()
+        else:
+            with pytest.raises(aiohttp.ClientResponseError) as refusal:
+                await client.require_context_contract()
+            assert refusal.value.status == status
+        assert requests == ["/api/version"]
+        reports = [
+            json.loads(line.removeprefix("[ollama-metadata] "))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[ollama-metadata] ")
+        ]
+        assert reports == [
+            {
+                "version": 1,
+                "kind": "version",
+                "category": "accepted" if status == 200 else "unavailable",
+                "bytes": len(payload) if status == 200 else 0,
+            }
+        ]
+    finally:
+        await runner.cleanup()
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "raw"),
+    [
+        ("version", b'{"version":"wrong","version":"0.34.4"}'),
+        ("version", b'{"version":"0.34.4","version":"0.34.4"}'),
+        ("tags", b'{"models":[false],"models":[]}'),
+        ("tags", b'{"models":[{"name":"other","name":"test:latest"}]}'),
+        ("ps", b'{"models":[{"digest":"same","digest":"same"}]}'),
+        ("show", b'{"model_info":{"context_length":4096,"context_length":16384}}'),
+    ],
+    ids=[
+        "root-conflict",
+        "root-same",
+        "root-models",
+        "nested-name",
+        "nested-same",
+        "nested-capacity",
+    ],
+)
+async def test_metadata_rejects_duplicate_json_keys_at_every_object(endpoint, raw, capsys):
+    async def read(path, body):
+        assert path == endpoint
+        return raw
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    with pytest.raises(ValueError, match="unique"):
+        await client._request(endpoint)
+    assert capsys.readouterr().out.splitlines() == [
+        "[ollama-metadata] "
+        + json.dumps(
+            {"version": 1, "kind": endpoint, "category": "malformed", "bytes": len(raw)},
+            separators=(",", ":"),
+        )
+    ]
 
 
 async def test_effective_context_requires_exact_digest():
@@ -452,6 +536,7 @@ async def test_metadata_transport_reads_only_to_the_byte_cap_and_disables_redire
 
     class Response:
         content = None
+        status = 200
 
         def __init__(self):
             self.content = self
@@ -461,9 +546,6 @@ async def test_metadata_transport_reads_only_to_the_byte_cap_and_disables_redire
 
         async def __aexit__(self, *args):
             options["response_closed"] = True
-
-        def raise_for_status(self):
-            pass
 
         async def read(self, size):
             nonlocal remaining

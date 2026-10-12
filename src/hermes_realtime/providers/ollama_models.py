@@ -28,6 +28,15 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _ReadRequest = Callable[[str, dict[str, object] | None], Awaitable[bytes]]
 
 
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("metadata JSON object keys must be unique")
+        value[key] = item
+    return value
+
+
 def _capacity(value: object) -> int | None:
     return value if type(value) is int and 1 <= value <= _MAX_CAPACITY else None
 
@@ -152,7 +161,10 @@ class OllamaModelClient:
                 allow_redirects=False,
             ) as response,
         ):
-            response.raise_for_status()
+            if response.status != 200:
+                raise aiohttp.ClientResponseError(
+                    response.request_info, response.history, status=response.status
+                )
             chunks = bytearray()
             while len(chunks) <= _MAX_BYTES:
                 chunk = await response.content.read(min(65536, _MAX_BYTES + 1 - len(chunks)))
@@ -178,7 +190,7 @@ class OllamaModelClient:
             if len(raw) > _MAX_BYTES:
                 category = "oversized"
                 raise ValueError("metadata response exceeds supported size")
-            value = json.loads(raw)
+            value = json.loads(raw, object_pairs_hook=_unique_object)
             if type(value) is not dict:
                 raise TypeError("metadata response must be an exact object")
             category = "accepted"
