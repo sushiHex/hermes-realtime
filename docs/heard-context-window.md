@@ -87,9 +87,25 @@ tool-use reliability. A missing observation stays unknown.
 The full host accepts `--ollama-num-ctx <tokens>` for an explicit session choice. It reads
 the selected installed model's metadata before warmup, checks the requested value against
 the advertised maximum when known, and observes the loaded allocation after warmup. The
-choice is frozen before inference; recreate the session to change it. The supported request
+choice is frozen before inference; restart the host to change it. The supported request
 range is 2,048–262,144 tokens. This application bound does not redefine a model's advertised
 maximum. Without the option, the existing 16,384-token configuration remains in place.
+
+For browser selection, launch the Ollama host with `--local-model-selection` instead of
+`--ollama-num-ctx`. Before connecting, choose an installed model and enter a bounded context
+budget. Discovery reads metadata without loading a model. Preparing the choice checks its
+digest again and runs the host's inference and speech readiness checks before Connect can
+establish a voice session. Serving the configuration page does not mean voice is ready.
+
+A successfully prepared choice is fixed for that host's lifetime, including disconnect and
+reconnect. Start a fresh host to choose another model or budget. Preparation does not issue
+browser session credentials; the existing bootstrap authority still governs connection.
+An expired one-use launch requires a fresh launch, even if preparation completed. The browser
+reports advertised capacity, requested context and observed allocation separately; unknown
+values remain unknown. Choosing a model does not qualify it for automatic task delegation.
+
+This control does not fit prompts automatically or change the retained foreground window.
+An oversized request still fails explicitly under the no-truncation contract below.
 
 Every Ollama adapter requires the source-qualified Ollama 0.34.4 API contract before its
 first prompt, including default and legacy launcher paths. Successful validation is cached
