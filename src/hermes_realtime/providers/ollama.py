@@ -183,18 +183,57 @@ class OllamaStreamingInference:
             self._model_client = metadata_client
 
     async def observe_context(self) -> None:
-        configuration = self._context_configuration
-        client = self._model_client
-        if configuration is None or client is None:
-            return
-        self._context_observation = OllamaContextObservation(configuration)
-        if await client.identity(self._model) != configuration.model.digest:
-            raise ValueError("model identity changed; recreate the session configuration")
+        category = "not_configured"
         try:
-            effective = await client.effective_context(configuration.model)
-        except (aiohttp.ClientError, TimeoutError, TypeError, ValueError):
-            effective = None
-        self._context_observation = OllamaContextObservation(configuration, effective)
+            configuration = self._context_configuration
+            client = self._model_client
+            if configuration is None or client is None:
+                return
+            self._context_observation = OllamaContextObservation(configuration)
+            category = "identity_refused"
+            try:
+                digest = await client.identity(self._model)
+            except (aiohttp.ClientError, TimeoutError):
+                category = "identity_unavailable"
+                raise
+            if digest != configuration.model.digest:
+                raise ValueError("model identity changed; recreate the session configuration")
+            try:
+                effective = await client.effective_context(configuration.model)
+            except (aiohttp.ClientError, TimeoutError):
+                category = "unavailable"
+                effective = None
+            except (TypeError, ValueError):
+                category = "metadata_refused"
+                effective = None
+            else:
+                category = "unknown" if effective is None else "observed"
+            self._context_observation = OllamaContextObservation(configuration, effective)
+        except asyncio.CancelledError:
+            category = "cancelled"
+            raise
+        finally:
+            print("[ollama-context-observation] " + json.dumps(
+                {"version": 1, "kind": "allocation", "category": category},
+                separators=(",", ":")), flush=True)
+
+    def _open_response(self, request: Request, messages_count: int) -> _LineResponse:
+        """Own an HTTP refusal even when its awaiting turn has already cancelled."""
+        try:
+            return self._open_request(request, self._request_timeout)
+        except HTTPError as error:
+            category = "backend_refusal"
+            try:
+                error.close()
+            except BaseException as close_error:
+                category = "response_close_failed"
+                raise error from close_error
+            finally:
+                print("[ollama-refusal] " + json.dumps({
+                    "version": 1, "category": category, "status": error.code,
+                    "messages": messages_count, "requested_context_tokens": self._num_ctx,
+                }, separators=(",", ":")), flush=True)
+            raise
 
     def context_observation(self) -> OllamaContextObservation:
         if self._context_observation is None:
@@ -217,7 +256,6 @@ class OllamaStreamingInference:
         opening: asyncio.Task[_LineResponse] | None = None
         response: _LineResponse | None = None
         read_operation: asyncio.Task[bytes] | None = None
-        refusal_status: int | None = None
         async with self._state_lock:
             if self._closed:
                 raise RuntimeError("Ollama inference adapter is closed")
@@ -245,9 +283,9 @@ class OllamaStreamingInference:
             self._inference_started = True
             opening = asyncio.create_task(
                 asyncio.to_thread(
-                    self._open_request,
+                    self._open_response,
                     request,
-                    self._request_timeout,
+                    len(messages),
                 ),
                 name=f"ollama-open:{turn_id}",
             )
@@ -310,15 +348,7 @@ class OllamaStreamingInference:
                 yield segment
             if buffer:
                 raise AssertionError("final segmentation retained text")
-        except HTTPError as error:
-            refusal_status = error.code
-            raise
         finally:
-            if refusal_status is not None:
-                print("[ollama-refusal] " + json.dumps({
-                    "version": 1, "category": "backend_refusal", "status": refusal_status,
-                    "messages": len(messages), "requested_context_tokens": self._num_ctx,
-                }, separators=(",", ":")), flush=True)
             response_cleanup: asyncio.Task[None] | None = None
             async with self._state_lock:
                 current = asyncio.current_task()

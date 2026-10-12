@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import threading
 from collections import deque
@@ -282,9 +283,10 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     requests: list[Request] = []
+    refusal_body = io.BytesIO(b"Synthetic refusal body.")
     refusal = HTTPError(
         "http://127.0.0.1:11434/api/chat", 400,
-        "the prompt is longer than the context window", {}, None,
+        "the prompt is longer than the context window", {}, refusal_body,
     )
     response = LineResponse((
         {"message": {"content": "Next turn reply."}, "done": True},
@@ -306,6 +308,7 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
         async for segment in inference.stream(_snapshot(), turn_id="turn_refused"):
             emitted.append(segment)
     assert caught.value is refusal
+    assert refusal_body.closed
     assert emitted == []
     assert len(requests) == 1
     report = json.loads(capsys.readouterr().out.removeprefix("[ollama-refusal] "))
@@ -324,6 +327,84 @@ async def test_ollama_overflow_refusal_does_not_retry_or_emit_and_releases_turn(
     assert len(requests) == 2
     assert response.closed
     await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_opening_closes_its_late_http_refusal_once(capsys):
+    entered = threading.Event()
+    release = threading.Event()
+    body = io.BytesIO(b"Synthetic refusal body.")
+
+    class Refusal(HTTPError):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            super().close()
+
+    refusal = Refusal("http://127.0.0.1:11434/api/chat", 400, "overflow", {}, body)
+
+    def open_request(request, timeout):
+        entered.set()
+        assert release.wait(3)
+        raise refusal
+
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+
+    async def consume():
+        return [part async for part in inference.stream(_snapshot(), turn_id="turn_cancelled_open")]
+
+    operation = asyncio.create_task(consume())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        release.set()
+        await inference.close()
+        assert body.closed and refusal.close_calls == 1
+        reports = [json.loads(line.removeprefix("[ollama-refusal] "))
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-refusal] ")]
+        assert reports == [{"version": 1, "category": "backend_refusal", "status": 400,
+                            "messages": 3, "requested_context_tokens": 16384}]
+    finally:
+        release.set()
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_http_refusal_survives_a_failing_response_close(capsys):
+    close_error = OSError("Synthetic private detail.")
+    body = io.BytesIO(b"Synthetic refusal body.")
+
+    class Refusal(HTTPError):
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise close_error
+
+    refusal = Refusal("http://127.0.0.1:11434/api/chat", 400, "overflow", {}, body)
+
+    def open_request(request, timeout):
+        raise refusal
+
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+    try:
+        with pytest.raises(HTTPError) as caught:
+            async for _part in inference.stream(_snapshot(), turn_id="turn_close_failed"):
+                pytest.fail("a refusal emitted content")
+        assert caught.value is refusal and caught.value.code == 400
+        assert caught.value.__cause__ is close_error and refusal.close_calls == 1
+        report = json.loads(capsys.readouterr().out.removeprefix("[ollama-refusal] "))
+        assert report == {"version": 1, "category": "response_close_failed", "status": 400,
+                          "messages": 3, "requested_context_tokens": 16384}
+    finally:
+        body.close()
+        await inference.close()
 
 
 @pytest.mark.parametrize(

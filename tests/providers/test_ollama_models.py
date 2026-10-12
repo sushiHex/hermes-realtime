@@ -462,6 +462,101 @@ async def test_allocation_observability_failure_stays_unknown():
     await inference.close()
 
 
+@pytest.mark.parametrize("outcome", ["observed", "unknown", "unavailable", "metadata_refused"])
+async def test_allocation_observation_records_one_content_free_outcome(outcome, capsys):
+    backend = Backend()
+
+    async def read(endpoint, body):
+        if endpoint == "ps":
+            if outcome == "unavailable":
+                raise TimeoutError
+            if outcome == "metadata_refused":
+                return b'{"models":[false]}'
+            if outcome == "unknown":
+                return b'{"models":[]}'
+        return await backend(endpoint, body)
+
+    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test:latest")
+    await inference.configure_context(
+        4096, client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    )
+    capsys.readouterr()
+    await inference.observe_context()
+    reports = [
+        json.loads(line.removeprefix("[ollama-context-observation] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-context-observation] ")
+    ]
+    assert reports == [{"version": 1, "kind": "allocation", "category": outcome}]
+    assert inference.context_public_data()["effectiveContextTokens"] == (
+        4096 if outcome == "observed" else None
+    )
+    await inference.close()
+
+
+@pytest.mark.parametrize("outcome", ["not_configured", "identity_refused", "identity_unavailable"])
+async def test_observation_records_missing_configuration_and_identity_refusal(outcome, capsys):
+    backend = Backend()
+    unavailable = False
+
+    async def read(endpoint, body):
+        if unavailable:
+            raise TimeoutError
+        return await backend(endpoint, body)
+
+    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test:latest")
+    if outcome != "not_configured":
+        await inference.configure_context(
+            4096, client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+        )
+    backend.changed = outcome == "identity_refused"
+    unavailable = outcome == "identity_unavailable"
+    capsys.readouterr()
+    if outcome == "not_configured":
+        await inference.observe_context()
+    else:
+        with pytest.raises(ValueError if outcome == "identity_refused" else TimeoutError):
+            await inference.observe_context()
+        assert inference.context_public_data()["effectiveContextTokens"] is None
+    reports = [
+        json.loads(line.removeprefix("[ollama-context-observation] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-context-observation] ")
+    ]
+    assert reports == [{"version": 1, "kind": "allocation", "category": outcome}]
+    await inference.close()
+
+
+async def test_cancelled_allocation_observation_records_its_outcome(capsys):
+    entered = asyncio.Event()
+    backend = Backend()
+
+    async def read(endpoint, body):
+        if endpoint == "ps":
+            entered.set()
+            await asyncio.Event().wait()
+        return await backend(endpoint, body)
+
+    inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test:latest")
+    await inference.configure_context(
+        4096, client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    )
+    capsys.readouterr()
+    operation = asyncio.create_task(inference.observe_context())
+    await entered.wait()
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    reports = [
+        json.loads(line.removeprefix("[ollama-context-observation] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-context-observation] ")
+    ]
+    assert reports == [{"version": 1, "kind": "allocation", "category": "cancelled"}]
+    assert inference.context_public_data()["effectiveContextTokens"] is None
+    await inference.close()
+
+
 async def test_configuring_after_first_inference_is_refused():
     inference = OllamaStreamingInference(
         base_url="http://127.0.0.1:11434",
