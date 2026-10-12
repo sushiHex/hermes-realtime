@@ -91,9 +91,12 @@ choice is frozen before inference; recreate the session to change it. The suppor
 range is 2,048–262,144 tokens. This application bound does not redefine a model's advertised
 maximum. Without the option, the existing 16,384-token configuration remains in place.
 
-Explicit configuration requires the source-qualified Ollama 0.34.4 API contract. Unknown
-runtimes are refused rather than assumed to honor no-truncation flags. The browser receives
-a versioned context report showing the advertised, requested and observed values separately;
+Every Ollama adapter requires the source-qualified Ollama 0.34.4 API contract before its
+first prompt, including default and legacy launcher paths. Successful validation is cached
+for that adapter; later turns do not repeat the metadata read. Recreate the session after
+replacing or upgrading the backend. Unknown runtimes are refused rather than assumed to
+honor no-truncation flags. Explicit context configuration supplies
+a versioned browser report showing the advertised, requested and observed values separately;
 an unavailable allocation remains unknown. Older browser clients do not support this new
 report. Metadata identity is checked during discovery and allocation observation. Ollama
 resolves mutable model names at inference, so concurrent external replacement of that name
