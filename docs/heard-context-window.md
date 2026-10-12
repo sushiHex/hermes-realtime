@@ -96,6 +96,7 @@ For browser selection, launch the Ollama host with `--local-model-selection` ins
 budget. Discovery reads metadata without loading a model. Preparing the choice checks its
 digest again and runs the host's inference and speech readiness checks before Connect can
 establish a voice session. Serving the configuration page does not mean voice is ready.
+The installed-model list is a host snapshot; restart after installing or replacing models.
 
 A successfully prepared choice is fixed for that host's lifetime, including disconnect and
 reconnect. Start a fresh host to choose another model or budget. Preparation does not issue
@@ -103,6 +104,10 @@ browser session credentials; the existing bootstrap authority still governs conn
 An expired one-use launch requires a fresh launch, even if preparation completed. The browser
 reports advertised capacity, requested context and observed allocation separately; unknown
 values remain unknown. Choosing a model does not qualify it for automatic task delegation.
+Preparation has a 120-second budget and a separate three-second cleanup allowance. If a
+candidate cannot be cleaned up, the host refuses further choices and retains that candidate
+for cleanup retry; restart the host after resolving the failure. It never accumulates new
+candidate adapters behind a failed cleanup.
 
 This control does not fit prompts automatically or change the retained foreground window.
 An oversized request still fails explicitly under the no-truncation contract below.

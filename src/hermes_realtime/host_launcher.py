@@ -2813,16 +2813,19 @@ def build_local_host_launcher(
             tts_provider=tts_provider,
             edge_voice=edge_voice,
         ),
-        model_configuration=(None if local_selection_owner is not None
-                             else _build_browser_model_configuration(
-            inference_provider=inference_provider,
-            ollama_model=ollama_model,
-            codex_model=codex_model,
-            codex_effort=codex_effort,
-            local_context=(inference.context_observation
-                if type(inference) is OllamaStreamingInference and ollama_num_ctx is not None
-                else None),
-        )),
+        model_configuration=(
+            None if local_selection_owner is not None else _build_browser_model_configuration(
+                inference_provider=inference_provider,
+                ollama_model=ollama_model,
+                codex_model=codex_model,
+                codex_effort=codex_effort,
+                local_context=(
+                    inference.context_observation
+                    if type(inference) is OllamaStreamingInference and ollama_num_ctx is not None
+                    else None
+                ),
+            )
+        ),
         model_catalog=model_catalog,
         select_model=select_model,
         local_model_selection=local_selection_owner,
