@@ -77,18 +77,111 @@ not on how a provider split it.
 The adapter sends `options.num_ctx` (default 16,384) with every request. Without it, the
 server's default applies, and that depends on the machine.
 
+### Model capacity and session budget
+
+A model's advertised maximum, the requested session budget, and its observed runtime
+allocation are different values. Model metadata supplies the first; configuration chooses
+the second; the running backend may report the third. None establishes recall quality or
+tool-use reliability. A missing observation stays unknown.
+
+The full host accepts `--ollama-num-ctx <tokens>` for an explicit session choice. It reads
+the selected installed model's metadata before warmup, checks the requested value against
+the advertised maximum when known, and observes the loaded allocation after warmup. The
+choice is frozen before inference; restart the host to change it. The supported request
+range is 2,048–262,144 tokens. This application bound does not redefine a model's advertised
+maximum. Without the option, the existing 16,384-token configuration remains in place.
+
+For browser selection, launch the Ollama host with `--local-model-selection` instead of
+`--ollama-num-ctx`. Before connecting, choose an installed model and enter a bounded context
+budget. Discovery reads metadata without loading a model. Preparing the choice checks its
+digest again and runs the host's inference and speech readiness checks before Connect can
+establish a voice session. Serving the configuration page does not mean voice is ready.
+The installed-model list is a host snapshot; restart after installing or replacing models.
+
+A successfully prepared choice is fixed for that host's lifetime, including disconnect and
+reconnect. Start a fresh host to choose another model or budget. Preparation does not issue
+browser session credentials; the existing bootstrap authority still governs connection.
+An expired one-use launch requires a fresh launch, even if preparation completed. The browser
+reports advertised capacity, requested context and observed allocation separately; unknown
+values remain unknown. Choosing a model does not qualify it for automatic task delegation.
+Preparation has a 120-second budget and a separate three-second cleanup allowance. If a
+candidate cannot be cleaned up, the host refuses further choices and retains that candidate
+for cleanup retry; restart the host after resolving the failure. It never accumulates new
+candidate adapters behind a failed cleanup.
+
+This control does not fit prompts automatically or change the retained foreground window.
+An oversized request still fails explicitly under the no-truncation contract below.
+
+Every Ollama adapter requires the source-qualified Ollama 0.34.4 API contract before its
+first prompt, including default and legacy launcher paths. Successful validation is cached
+for that adapter; later turns do not repeat the metadata read. Recreate the session after
+replacing or upgrading the backend. Unknown runtimes are refused rather than assumed to
+honor no-truncation flags. Explicit context configuration supplies
+a versioned browser report showing the advertised, requested and observed values separately;
+an unavailable allocation remains unknown. Older browser clients do not support this new
+report. Metadata identity is checked during discovery and allocation observation. Ollama
+resolves mutable model names at inference, so concurrent external replacement of that name
+is unsupported; these checks do not provide an atomic model lease.
+
+Smaller models and smaller context budgets are valid choices for constrained applications.
+They do not require model-name exceptions or allocation of the advertised maximum. A model's
+original positional-scaling threshold is also not its advertised maximum. Qualification
+belongs to the particular model artifact, runtime and configuration, separately for ordinary
+conversation, task delegation and latency.
+
+The foreground text window and durable storage have separate responsibilities. Choosing a
+smaller inference budget does not delete the Hermes archive or memory. Conversely, stored
+history is not necessarily present in every model request. The text-window limits above are
+not exact token counts: templates, tools, memory, policy text and the generated reply also
+consume context. An explicit capacity refusal is preferable to silently dropping those
+sections. No character-to-token ratio proves that a request fits.
+
 **Measured on Ollama 0.34.4 here.** These tests used `phi4-mini`, a 24 GiB GPU and no
 `OLLAMA_CONTEXT_LENGTH`.
 
 - **The default context loaded at 32,768.**
 - **A 10,052-token prompt was silently truncated.** With `num_ctx` 4,096 or 8,192, Ollama
-  evaluated 4,026 or 8,034 tokens. It dropped the oldest messages and returned no error, and
+  evaluated 4,026 or 8,034 tokens. It dropped older conversational rows and returned no error, and
   the early fact went unanswered.
 - **Smaller GPUs get a smaller default.** Ollama picks the default by available VRAM, so the
   same prompt can be truncated on a smaller GPU.
 
+**What Ollama preserves by default.** At the measured version's immutable source commit,
+[`chatPrompt`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/prompt.go#L20-L86)
+keeps all system messages and the latest message while trimming older conversational rows.
+The leading policy/reference message therefore survives that message-level trimming.
+If the system messages plus the latest message still exceed the effective context, they
+reach a separate
+[token-level truncation path](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/llm/llama_server.go#L282-L321).
+With context shifting enabled, that path preserves only the configured prefix token count
+and a suffix; it can cut policy or reference text inside the rendered prompt. This extreme
+overflow limit also applied to the previous separate system messages. Request assembly
+does not establish which complete sections the model evaluated.
+
+**Explicit overflow refusal.** The adapter sends top-level `truncate: false` and
+`shift: false`. The first disables the message-trimming loop in `chatPrompt`; the second
+prevents residual token-overflow truncation. At the pinned 0.34.4 GGUF source, the
+[`Shift` request field](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/api/types.go#L160-L166)
+sets the runner's context-shift configuration, and the residual token-overflow path above
+returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
+propagates an opening refusal without a reply or automatic retry. This is source-based
+qualification. An isolated paired-options check at realtime commit `43b28a7` on Ollama
+0.34.4 completed a 372-token synthetic prompt and refused a 6,138-token prompt at a
+4,096-token allocation with HTTP 400 before any content or spoken segment. The oversized
+case used 13 intact rows within the host's row and text-window limits. This verifies that
+case's refusal, not every backend or model. The cold positive took 64.716 seconds under a
+120-second diagnostic bound, exceeding the host's unchanged 60-second budget; it is not
+host-readiness or voice-latency qualification.
+The [source-bound result and limits](https://github.com/sushiHex/hermes-realtime/issues/249#issuecomment-6115056437)
+remain in the owning issue.
+Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
+can also end generation at the context limit; it does not reserve reply tokens or prove
+model obedience. A change to this flag can
+[`reload an already loaded runner`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/sched.go#L1422-L1427).
+
 **The derivation.** These are the steady-state prompt parts, in characters. The Ollama
-adapter adds no system instructions of its own.
+adapter now prepends one shared communication-policy message with labelled reference JSON,
+followed by the unchanged ordered conversational rows. Reference text adds no work authority.
 
 | Part | Characters |
 | --- | --- |
@@ -96,27 +189,32 @@ adapter adds no system instructions of its own.
 | Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
-| **Total** | **about 31,550** |
+| Foreground communication/style policy and work-state framing | about 2,200 |
+| **Total** | **about 33,750** |
 
-- **Tokens.** At a conservative 3 characters per token, that is about 10,510 tokens. The chat
-  template adds about 6 tokens for each of 35 messages (about 210), for about 10,720 in all.
+- **Tokens.** At an estimated 3 characters per token, that is about 11,250 tokens. The chat
+  template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Headroom.** `num_ctx` 16,384 leaves about 5,650 tokens for active-task and update system
-  messages and for the reply.
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+  sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
   token, which may need a larger `num_ctx`.
 - **The marker.** Every completed request prints `[ollama-prompt]` with the prompt's message
   count, characters and UTF-8 bytes, the `num_ctx` requested, and Ollama's
-  `prompt_eval_count`. It carries no text. The desktop rehearsal records the marker for each
-  context check.
+  `prompt_eval_count`, plus the captured output-style enum and actual rendered reference-section
+  kinds (`memory`, `active_work`, `updates`). It carries no text. The desktop rehearsal records
+  those kinds for each context check; one combined system message is no longer a count of notes.
+  Conversation-context equality evidence remains separate and does not bind the selected style.
 - **It is a request, not a guarantee.** The server may cap it, for example at a model's
   trained context length, and the marker shows only what was requested. So the evidence is
   `prompt_eval_count`: a count near the context the model actually ran with means the prompt
-  was truncated. This removes the hardware-dependent default; it can't stretch a model's
+  may have been truncated. The count does not prove retention of any particular row or
+  reference section. This removes the hardware-dependent default; it can't stretch a model's
   context.
 - **The value overrides the model's own.** An explicit `num_ctx` also overrides a Modelfile's
-  value, such as a `-32k` model variant's. The window was derived to fit 16,384.
+  value, such as a `-32k` model variant's. The window estimate targets 16,384; it is not an
+  exact token bound or a guarantee for every supported model and input.
 
 ## Codex
 

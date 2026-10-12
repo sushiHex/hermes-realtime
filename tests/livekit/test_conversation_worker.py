@@ -4,6 +4,7 @@ from types import MethodType
 
 import pytest
 
+from hermes_realtime.conversation.ingress import IngressOverloadError
 from hermes_realtime.conversation.worker import ReconnectSafeConversationWorker
 from hermes_realtime.livekit.adapter import LiveKitRoomPeer
 from hermes_realtime.livekit.playback import ReconnectSafeLiveKitAudioPublisher
@@ -14,6 +15,7 @@ from hermes_realtime.livekit.worker import LiveKitConversationWorker
 async def test_receiver_failure_settles_binding_and_disconnects_peer_for_rebind() -> None:
     runtime, runtime_events, source_started = runtime_probe()
     peer, peer_events = peer_probe("failed-receiver")
+    replacement, replacement_events = peer_probe("replacement")
     release_failure = asyncio.Event()
     peer_disconnected = asyncio.Event()
 
@@ -27,8 +29,10 @@ async def test_receiver_failure_settles_binding_and_disconnects_peer_for_rebind(
         del self, source, receive_timeout_seconds
         runtime_events.append(f"source:{session_generation}")
         source_started.put_nowait(session_generation)
+        if session_generation != 1:
+            await asyncio.Event().wait()
         await release_failure.wait()
-        raise RuntimeError("synthetic connected receiver failure")
+        raise IngressOverloadError("PCM ingress queue age exhausted")
 
     async def observe_disconnect(
         self: LiveKitRoomPeer,
@@ -52,7 +56,7 @@ async def test_receiver_failure_settles_binding_and_disconnects_peer_for_rebind(
     release_failure.set()
     await asyncio.wait_for(peer_disconnected.wait(), timeout=0.5)
 
-    assert isinstance(worker.receiver_error, RuntimeError)
+    assert isinstance(worker.receiver_error, IngressOverloadError)
     assert runtime_events == [
         "bind:browser_user:1",
         "source:1",
@@ -64,6 +68,18 @@ async def test_receiver_failure_settles_binding_and_disconnects_peer_for_rebind(
         "disconnect:failed-receiver",
     ]
     assert worker.active_generation is None
+
+    await worker.disconnect()
+    assert await worker.connect(
+        replacement,
+        room_name="room",
+        participant_identity="browser_user",
+    ) == 2
+    assert await source_started.get() == 2
+    assert replacement_events == [
+        "bind:replacement:browser_user",
+        "connect:replacement:room",
+    ]
 
     await worker.close()
 

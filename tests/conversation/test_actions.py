@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from types import MethodType
 from typing import Any
@@ -419,6 +420,53 @@ def _active_replay_evidence(
         logical_session_id=logical_session_id,
     )
     return lifecycle, admission, writer, command
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_speech_preserves_active_work_and_authoritative_prompt_notes() -> None:
+    from hermes_realtime.providers import OllamaStreamingInference
+
+    context = ConversationContextStore()
+    context.record_task_accepted(
+        task_id="task_active_fixture", run_id="deleg_fixture", objective="Synthetic active work"
+    )
+    director = director_for_test(context, CompletionSource(TaskTerminalOutcome(
+        task_id="task_completed_fixture", status="completed", summary="Synthetic completed work",
+    )))
+    inference = RecordingInference()
+    speech = StreamingSpeechLoop(
+        context=context, foreground=ForegroundTurnCoordinator(), inference=inference,
+        synthesizer=Synthesizer(), playback=Playback(), ledger=DeliveredSpeechLedger(),
+    )
+    director.start()
+    await director.next_decision()
+    executor = ConversationUpdateExecutor(director=director, speech=speech)
+    executor.start()
+    before = context.snapshot().active_tasks
+    assert not executor.foreground_active
+    await executor.cancel_foreground()
+    assert context.snapshot().active_tasks == before
+    assert [update.sequence for update in director.pending_mentions()] == [1]
+    assert inference.requests == []
+    await executor.respond(
+        "turn_after_idle_cancel", Transcript(text="Synthetic follow-up", final=True)
+    )
+    rendered = OllamaStreamingInference._messages(inference.requests[0])
+    systems = [message for message in rendered if message["role"] == "system"]
+    assert len(systems) == 1
+    _, separator, references = systems[0]["content"].partition("\n\nReference data:\n")
+    assert separator == "\n\nReference data:\n"
+    assert json.loads(references) == {
+        "work_state": "active",
+        "active_work": [{
+            "task_id": "task_active_fixture", "objective": "Synthetic active work",
+        }],
+        "updates": [{
+            "sequence": 1, "task_id": "task_completed_fixture", "status": "completed",
+            "text": "The requested report is ready.",
+        }],
+    }
+    await executor.close()
 
 
 @pytest.mark.asyncio

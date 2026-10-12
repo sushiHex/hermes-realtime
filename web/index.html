@@ -49,7 +49,7 @@
 
       <section class="toolbar" aria-label="Connection controls">
         <div class="connection-actions">
-          <button id="session-toggle" class="button primary" type="button">Connect</button>
+          <button id="session-toggle" class="button primary" type="button" aria-describedby="connection-recovery">Connect</button>
           <button id="stop-speaking" class="button secondary" type="button" disabled hidden>Stop speaking</button>
           <output id="speech-renderer-state" class="status" aria-live="polite" hidden>Speech idle</output>
         </div>
@@ -63,6 +63,7 @@
             <select id="voice" disabled><option value="">Unavailable</option></select>
           </label>
         </div>
+        <output id="connection-recovery" class="connection-recovery" role="status" aria-live="polite" hidden></output>
       </section>
 
       <section class="workspace">
@@ -109,11 +110,18 @@
                 </svg>
               </button>
             </div>
-            <p class="composer-hint">Voice remains the primary input. Typed messages use the same conversation context.</p>
+            <p class="composer-hint">Voice remains the primary input. Typed messages use the same conversation context. Say “start task …” to delegate. Say “cancel task” when one task is active, or use its Cancel button.</p>
           </form>
         </article>
 
         <aside class="inspector" aria-label="Session details">
+          <section class="panel inspector-card" aria-labelledby="output-style-title">
+            <h2 id="output-style-title">Output style</h2>
+            <label for="output-style">Response preference</label>
+            <select id="output-style" aria-describedby="output-style-status"></select>
+            <output id="output-style-status" aria-live="polite"></output>
+            <p>Saved in this browser. Applies to the next response; model, effort and voice are separate.</p>
+          </section>
           <section class="panel inspector-card model-card" aria-labelledby="model-card-title">
             <div class="card-heading">
               <span class="card-icon model-icon" aria-hidden="true">
@@ -123,6 +131,27 @@
                 <p class="section-kicker">Inference</p>
                 <h2 id="model-card-title">Session model</h2>
               </div>
+            </div>
+            <div class="local-model-picker" id="local-model-picker" hidden>
+              <fieldset id="local-model-options" hidden disabled>
+                <legend>Prepare before connecting</legend>
+                <label for="local-model-select">
+                  <span>Installed model</span>
+                  <select id="local-model-select"><option value="">Select a model</option></select>
+                </label>
+                <label for="local-model-context-input">
+                  <span>Requested context tokens</span>
+                  <input id="local-model-context-input" type="number" min="2048" max="262144" step="1" inputmode="numeric" />
+                </label>
+                <p id="local-model-budget-note" class="local-model-budget-note">Enter the context capacity to request.</p>
+                <dl class="local-model-observations">
+                  <div><dt>Advertised maximum</dt><dd id="local-model-advertised">Unknown</dd></div>
+                  <div><dt>Requested context</dt><dd id="local-model-requested">Not selected</dd></div>
+                  <div><dt>Observed allocation</dt><dd id="local-model-effective">Not observed</dd></div>
+                </dl>
+              </fieldset>
+              <output id="local-model-selection-state" class="local-model-selection-state" role="status" aria-live="polite">Choose a model and context before connecting.</output>
+              <button id="local-model-retry" class="button secondary" type="button" hidden>Retry local model discovery</button>
             </div>
             <div class="model-controls" aria-label="Next turn model configuration">
               <label for="model-select">
@@ -144,6 +173,12 @@
               <div class="model-stat"><dt>Effort</dt><dd id="model-effort">—</dd></div>
               <div class="model-stat"><dt>Transport</dt><dd id="model-transport">—</dd></div>
               <div class="model-stat"><dt>Context</dt><dd id="model-context">Not reported</dd></div>
+              <div id="local-model-context" hidden>
+                <div class="model-stat"><dt>Requested context</dt><dd id="model-requested-context">—</dd></div>
+                <div class="model-stat"><dt>Advertised maximum</dt><dd id="model-advertised-context">Unknown</dd></div>
+                <div class="model-stat"><dt>Observed allocation</dt><dd id="model-effective-context">Not observed</dd></div>
+                <p>Stored history may not be included in every response. Advertised capacity is not a guarantee of quality or available memory.</p>
+              </div>
               <div class="model-stat"><dt>Usage feed</dt><dd id="model-usage-reporting">Awaiting session</dd></div>
               <div class="model-stat model-stat-section"><dt>Speech runtime</dt><dd></dd></div>
               <div class="model-stat"><dt>STT provider</dt><dd id="stt-provider">Awaiting session</dd></div>

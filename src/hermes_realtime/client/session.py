@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import re
@@ -13,6 +14,7 @@ from dataclasses import dataclass, replace
 from threading import Lock
 from typing import cast
 
+from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.evidence.models import (
     BindingCloseReason,
     CaptureState,
@@ -21,6 +23,7 @@ from hermes_realtime.evidence.models import (
     EvidenceRevokeRequestV1,
     capture_status_to_primitive,
 )
+from hermes_realtime.providers.ollama_models import OllamaContextObservation
 from hermes_realtime.search_egress import (
     SearchEgressAuthority,
     SearchEgressBindingV1,
@@ -226,6 +229,7 @@ class BrowserModelConfiguration:
     effort: str | None
     context_window_tokens: int | None
     reports_token_usage: bool
+    local_context: Callable[[], OllamaContextObservation] | None = None
 
     def __post_init__(self) -> None:
         if self.authentication not in {"subscription", "api-token", "local"}:
@@ -251,9 +255,11 @@ class BrowserModelConfiguration:
             raise ValueError("context window tokens must be a bounded exact integer or None")
         if type(self.reports_token_usage) is not bool:
             raise TypeError("reports_token_usage must be an exact boolean")
+        if self.local_context is not None and not callable(self.local_context):
+            raise TypeError("local_context must be callable")
 
     def public_data(self) -> dict[str, str | int | bool | None]:
-        return {
+        data: dict[str, str | int | bool | None] = {
             "authentication": self.authentication,
             "contextWindowTokens": self.context_window_tokens,
             "effort": self.effort,
@@ -262,6 +268,27 @@ class BrowserModelConfiguration:
             "reportsTokenUsage": self.reports_token_usage,
             "transport": self.transport,
         }
+        if self.local_context is not None:
+            category = "observation_read_refused"
+            try:
+                observation = self.local_context()
+                category = "observation_type_refused"
+                if type(observation) is not OllamaContextObservation:
+                    raise TypeError("local_context must return an exact context observation")
+                category = "binding_refused"
+                if (observation.configuration.model.model != self.model or self.provider != "ollama"
+                        or self.authentication != "local" or self.transport != "local-http"
+                        or self.effort is not None or self.reports_token_usage
+                        or self.context_window_tokens is not None):
+                    raise ValueError("local context identity does not match the session model")
+                category = "observation_read_refused"
+                data.update(observation.public_data())
+                category = "projected"
+            finally:
+                print("[browser-model] " + json.dumps(
+                    {"version": 1, "kind": "local_context", "category": category},
+                    separators=(",", ":")), flush=True)
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +336,7 @@ class BrowserSessionDirector:
         projection: BrowserEventProjection,
         speech_runtime: BrowserSpeechRuntime | None = None,
         model_configuration: BrowserModelConfiguration | None = None,
+        local_model_configuration: Callable[[], BrowserModelConfiguration] | None = None,
         model_catalog: Callable[[], Awaitable[BrowserModelCatalog]] | None = None,
         select_model: Callable[[str, str], Awaitable[BrowserModelCatalog]] | None = None,
         activate_media: Callable[[str, int, int], Awaitable[None]] | None = None,
@@ -321,6 +349,7 @@ class BrowserSessionDirector:
         on_session_started: Callable[[str, int], None] | None = None,
         voice_configuration: Callable[[], tuple[tuple[str, ...], str | None]] | None = None,
         select_voice: Callable[[str], Awaitable[None]] | None = None,
+        select_output_style: Callable[[str], None] | None = None,
         delete_voice_conversation: Callable[[str, int], Awaitable[str]] | None = None,
         voice_delete_status: Callable[[], str] | None = None,
         evidence_consent: Callable[
@@ -385,6 +414,8 @@ class BrowserSessionDirector:
             raise TypeError("on_session_started must be callable")
         if voice_configuration is not None and not callable(voice_configuration):
             raise TypeError("voice_configuration must be callable")
+        if select_output_style is not None and not callable(select_output_style):
+            raise TypeError("select_output_style must be callable")
         if select_voice is not None and not callable(select_voice):
             raise TypeError("select_voice must be callable")
         if evidence_consent is not None and not callable(evidence_consent):
@@ -436,6 +467,7 @@ class BrowserSessionDirector:
             tts_model="unavailable",
         )
         self._model_configuration = model_configuration
+        self._local_model_configuration = local_model_configuration
         self._model_catalog = model_catalog
         self._select_model = select_model
         self._activate_media = activate_media
@@ -445,6 +477,7 @@ class BrowserSessionDirector:
         self._on_session_started = on_session_started
         self._voice_configuration = voice_configuration
         self._select_voice = select_voice
+        self._select_output_style = select_output_style
         self._evidence_consent = evidence_consent
         self._evidence_status = evidence_status
         self._evidence_revoke = evidence_revoke
@@ -805,17 +838,32 @@ class BrowserSessionDirector:
             cast(dict[str, PublicValue], search_egress_status_to_primitive(authority.status())),
         )
 
+    def require_model_prepared(self) -> None:
+        if self._local_model_configuration is not None:
+            category = "read_refused"
+            try:
+                configuration = self._local_model_configuration()
+                category = "type_refused"
+                if type(configuration) is not BrowserModelConfiguration:
+                    raise TypeError("local model admission requires an exact model configuration")
+                self._model_configuration = configuration
+                category = "prepared"
+            finally:
+                print("[browser-model-admission] " + json.dumps(
+                    {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
     async def start(self) -> BrowserJoinCredential:
         """Create one credential and provision its exact server-side identity first."""
 
         async with self._start_lock:
+            self.require_model_prepared()
             if self._rebind_finalization_failed:
                 raise RuntimeError("browser session recovery failed closed")
             if self._rebind_finalizer is not None:
                 raise RuntimeError("browser session recovery is finalizing")
             if self._active_generation is not None:
                 raise RuntimeError("a browser session is already active")
-            self._projection.reset()
+            self._projection.reset(initial_slots=self._fresh_view_initial_slots())
             status_reservation = (
                 self._projection.reserve_capture_status()
                 if self._evidence_status is not None
@@ -828,55 +876,74 @@ class BrowserSessionDirector:
             )
             self._touch_activity()
             credential = self._issuer.issue()
+            selector = self._select_output_style
+            if selector is not None:
+                style_reset = False
+                try:
+                    selector("default")
+                    style_reset = True
+                finally:
+                    if not style_reset:
+                        print("[output-style] " + json.dumps(
+                            {"accepted": False, "category": "unavailable_or_selection_failure",
+                             "version": 1}, separators=(",", ":"),
+                        ), flush=True)
             generation = await self._provision(credential.participant_identity)
             if type(generation) is not int:
                 raise TypeError("provision must return an exact integer generation")
             if generation <= 0:
                 raise ValueError("provision generation must be positive")
-            if self._on_session_started is not None:
-                try:
+            try:
+                if self._on_session_started is not None:
                     self._on_session_started(credential.participant_identity, generation)
-                except BaseException as callback_error:
-                    cancellations, rollback_error = await self._settle_start_rollback(
-                        credential.participant_identity,
-                        generation,
-                    )
-                    self._clear_active_session()
-                    failures: list[BaseException] = [callback_error, *cancellations]
-                    if rollback_error is not None:
-                        failures.append(rollback_error)
-                    if len(failures) > 1:
-                        raise BaseExceptionGroup(
-                            "browser session start callback and rollback failed",
-                            failures,
-                        ) from None
-                    raise
-            self._projection.publish(
-                "session_ready",
-                {
-                    "conversationProfile": self._conversation_profile,
-                    "mode": "microphone_or_typed",
-                    **self._speech_runtime.public_data(),
-                },
-            )
-            if self._model_configuration is not None:
+                self._projection.ensure_capacity(
+                    1
+                    + (1 if self._model_configuration is not None else 0)
+                    + (1 if self._search_egress_authority is not None else 0)
+                    + self._projection.open_state_count
+                )
                 self._projection.publish(
-                    "session_model",
-                    self._model_configuration.public_data(),
+                    "session_ready",
+                    {
+                        "conversationProfile": self._conversation_profile,
+                        "mode": "microphone_or_typed",
+                        **self._speech_runtime.public_data(),
+                    },
                 )
-            if status_reservation is not None:
-                status_provider = self._evidence_status
-                assert status_provider is not None
-                evidence_status = status_provider()
-                if type(evidence_status) is not CaptureStatusV1:
-                    raise TypeError("evidence_status must return an exact CaptureStatusV1")
-                self._projection.publish_capture_status(
-                    status_reservation,
-                    cast(
-                        dict[str, PublicValue],
-                        capture_status_to_primitive(evidence_status),
-                    ),
+                if self._model_configuration is not None:
+                    self._projection.publish(
+                        "session_model",
+                        self._model_configuration.public_data(),
+                    )
+                if status_reservation is not None:
+                    status_provider = self._evidence_status
+                    assert status_provider is not None
+                    evidence_status = status_provider()
+                    if type(evidence_status) is not CaptureStatusV1:
+                        raise TypeError("evidence_status must return an exact CaptureStatusV1")
+                    self._projection.publish_capture_status(
+                        status_reservation,
+                        cast(
+                            dict[str, PublicValue],
+                            capture_status_to_primitive(evidence_status),
+                        ),
+                    )
+                self._projection.republish_open_state()
+            except BaseException as callback_error:
+                cancellations, rollback_error = await self._settle_start_rollback(
+                    credential.participant_identity,
+                    generation,
                 )
+                self._clear_active_session()
+                failures: list[BaseException] = [callback_error, *cancellations]
+                if rollback_error is not None:
+                    failures.append(rollback_error)
+                if len(failures) > 1:
+                    raise BaseExceptionGroup(
+                        "browser session start callback and rollback failed",
+                        failures,
+                    ) from None
+                raise
             self._active_identity = credential.participant_identity
             self._active_generation = generation
             with self._evidence_gate_lock:
@@ -1016,6 +1083,9 @@ class BrowserSessionDirector:
                 reprovision = self._reprovision
                 if reprovision is None:
                     raise RuntimeError("browser session rebind is unavailable")
+                self._projection.ensure_replay_capacity(
+                    initial_slots=self._fresh_view_initial_slots(),
+                )
                 self._projection_resync_consumed = True
                 if self._search_egress_authority is not None:
                     self._projection.ensure_capacity()
@@ -1030,10 +1100,13 @@ class BrowserSessionDirector:
                         raise TypeError("reprovision must return an exact integer generation")
                     if replacement_generation <= 0 or replacement_generation == generation:
                         raise ValueError("reprovision generation must be a new positive generation")
+                    self._fresh_view()
                 except BaseException as replacement_error:
-                    cancellations, rollback_generation, rollback_error = (
-                        await self._settle_rebind_rollback(reprovision, identity)
-                    )
+                    (
+                        cancellations,
+                        rollback_generation,
+                        rollback_error,
+                    ) = await self._settle_rebind_rollback(reprovision, identity)
                     if rollback_generation is not None:
                         self._active_generation = rollback_generation
                         if self._search_egress_authority is not None:
@@ -1049,7 +1122,6 @@ class BrowserSessionDirector:
                             failures,
                         ) from None
                     raise
-                self._fresh_view()
                 self._previous_rebind_request = None
                 self._previous_rebind_credential = None
                 self._active_identity = credential.participant_identity
@@ -1072,6 +1144,14 @@ class BrowserSessionDirector:
                 self._touch_activity()
                 return credential
 
+    def _fresh_view_initial_slots(self) -> int:
+        return (
+            1
+            + (1 if self._model_configuration is not None else 0)
+            + (1 if self._search_egress_authority is not None else 0)
+            + (1 if self._evidence_status is not None else 0)
+        )
+
     def _fresh_view(self) -> None:
         """Reset everything a page holds, for a page that kept nothing but its identity.
 
@@ -1081,7 +1161,7 @@ class BrowserSessionDirector:
         replacement identity.
         """
 
-        self._projection.reset()
+        self._projection.reset(initial_slots=self._fresh_view_initial_slots())
         self._projection.ensure_capacity(
             1
             + (1 if self._model_configuration is not None else 0)
@@ -1160,6 +1240,10 @@ class BrowserSessionDirector:
             reprovision = self._reprovision
             if reprovision is None:
                 raise RuntimeError("browser session rebind is unavailable")
+            if fresh_view:
+                self._projection.ensure_replay_capacity(
+                    initial_slots=self._fresh_view_initial_slots(),
+                )
             if self._search_egress_authority is not None:
                 self._projection.ensure_capacity()
                 self._invalidate_search_egress(identity, generation)
@@ -1173,6 +1257,8 @@ class BrowserSessionDirector:
                     raise TypeError("reprovision must return an exact integer generation")
                 if replacement_generation <= 0 or replacement_generation == generation:
                     raise ValueError("reprovision generation must be a new positive generation")
+                if fresh_view:
+                    self._fresh_view()
                 self._touch_activity()
             except BaseException as replacement_error:
                 cancellations, rollback_generation, rollback_error = (
@@ -1193,8 +1279,6 @@ class BrowserSessionDirector:
                         failures,
                     ) from None
                 raise
-            if fresh_view:
-                self._fresh_view()
             self._previous_rebind_request = (
                 (identity, request_id) if request_id is not None else None
             )
@@ -1599,6 +1683,22 @@ class BrowserSessionDirector:
                 )
                 self._touch_activity()
                 return result
+
+    async def change_output_style(self, *, participant_identity: str, style: str) -> str:
+        if type(participant_identity) is not str:
+            raise TypeError("participant_identity must be an exact string")
+        selected = require_output_style(style)
+        async with self._start_lock:
+            if self._active_identity is None or self._active_generation is None:
+                raise NoBrowserSession("no browser session is active")
+            if participant_identity != self._active_identity:
+                raise PermissionError("style participant does not own the active session")
+            selector = self._select_output_style
+            if selector is None:
+                raise RuntimeError("output style selection is unavailable")
+            selector(selected)
+            self._touch_activity()
+            return selected
 
     async def change_voice(self, *, participant_identity: str, voice: str) -> None:
         if type(voice) is not str:

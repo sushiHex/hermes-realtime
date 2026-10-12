@@ -333,3 +333,30 @@ async def test_memory_in_ollama_user_role_fails_data_only_witness(
         refresh_notifications=0, samples=1,
     )
     assert observed["authority"]["ollama_data_only"] == 0
+    assert observed["authority"] == _good()["authority"] | {"ollama_data_only": 0}
+
+
+@pytest.mark.asyncio
+async def test_removed_ollama_memory_fails_only_data_only_witness(monkeypatch) -> None:
+    import json
+
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    render = OllamaStreamingInference._messages
+
+    def dropped_memory(snapshot):
+        messages = render(snapshot)
+        if snapshot.memory is not None:
+            prefix, raw = messages[0]["content"].split("\n\nReference data:\n", 1)
+            sections = json.loads(raw)
+            del sections["memory"]
+            messages[0]["content"] = prefix + "\n\nReference data:\n" + json.dumps(sections)
+        return messages
+
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", staticmethod(dropped_memory))
+    observed = await _SCRIPT._turn_witness(
+        BuiltinMemorySnapshot("Synthetic untrusted data.", "", False),
+        attack_seen=True, refresh_turns=0, refresh_tool_calls=0,
+        refresh_notifications=0, samples=1,
+    )
+    assert observed["authority"] == _good()["authority"] | {"ollama_data_only": 0}

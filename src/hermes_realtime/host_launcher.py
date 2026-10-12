@@ -75,6 +75,7 @@ from hermes_realtime.conversation import (
     UpdatePolicyInput,
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
+from hermes_realtime.conversation.output_style import OutputStyleSelection
 from hermes_realtime.evidence import (
     CaptureState,
     ConsentDisposition,
@@ -159,6 +160,12 @@ from hermes_realtime.providers.current_facts import (
     CurrentFactLookup,
     PublicRssCurrentFactLookup,
 )
+from hermes_realtime.providers.ollama_models import (
+    OllamaContextObservation,
+    OllamaModelClient,
+    require_num_ctx,
+)
+from hermes_realtime.providers.ollama_session import OllamaSessionSelection
 from hermes_realtime.search_egress import SearchEgressAuthority
 from hermes_realtime.speech import (
     DeliveredSpeechLedger,
@@ -1282,6 +1289,7 @@ def _build_streaming_inference(
     knowledge_timing_observer: Callable[[dict[str, _PublicValue]], None] | None = None,
     knowledge_coordinator: KnowledgePrefetchCoordinator | None = None,
     hermes_context: HermesRepresentativeContext | None = None,
+    output_style: Callable[[], str] | None = None,
 ) -> OllamaStreamingInference | CodexAppServerStreamingInference:
     if type(inference_provider) is not str:
         raise TypeError("inference_provider must be an exact built-in string")
@@ -1292,6 +1300,7 @@ def _build_streaming_inference(
             base_url=ollama_base_url,
             model=ollama_model,
             request_timeout_seconds=60.0,
+            output_style=output_style,
         )
     if inference_provider == "codex":
         knowledge_lookup: CurrentFactLookup | None
@@ -1301,6 +1310,7 @@ def _build_streaming_inference(
             knowledge_lookup = current_fact_lookup
         codex_options: dict[str, object] = {
             "model": codex_model,
+            "output_style": output_style,
             "effort": codex_effort,
             "codex_executable": codex_executable,
             "token_usage_observer": token_usage_observer,
@@ -1370,12 +1380,31 @@ async def _run_full_host_preflight(
 ) -> SpeechChunk:
     """Warm tool-less dependencies, then grant the exact Codex instance work authority."""
 
+    await _start_host_task_session(task_session)
+    cue = await _run_inference_speech_readiness(inference, synthesizer)
+    _bind_natural_work_tools(
+        inference=inference,
+        surface=surface,
+        enabled=natural_work_tools,
+    )
+    return cue
+
+
+async def _start_host_task_session(task_session: _TaskSessionStarter) -> None:
     await task_session.start()
     if type(task_session) is HermesApiTaskSession:
         # Start has already emptied the run record, so this is the only chance to tell.
         notice = _hermes_restart_notice(task_session.restart_settlement)
         if notice is not None:
             print(notice, flush=True)
+
+
+async def _run_inference_speech_readiness(
+    inference: OllamaStreamingInference | CodexAppServerStreamingInference,
+    synthesizer: _PreflightSynthesizer,
+) -> SpeechChunk:
+    """Check a candidate without reopening durable host services or granting tools."""
+
     snapshot = ConversationInferenceRequest(
         revision=0,
         messages=(
@@ -1401,11 +1430,6 @@ async def _run_full_host_preflight(
     ]
     if len(tts_probe) != 1 or type(tts_probe[0]) is not SpeechChunk:
         raise RuntimeError("TTS preflight did not produce one playable chunk")
-    _bind_natural_work_tools(
-        inference=inference,
-        surface=surface,
-        enabled=natural_work_tools,
-    )
     return tts_probe[0]
 
 
@@ -1415,6 +1439,7 @@ def _build_browser_model_configuration(
     ollama_model: str,
     codex_model: str,
     codex_effort: str,
+    local_context: Callable[[], OllamaContextObservation] | None = None,
 ) -> BrowserModelConfiguration:
     if inference_provider == "codex":
         return BrowserModelConfiguration(
@@ -1435,6 +1460,7 @@ def _build_browser_model_configuration(
             effort=None,
             context_window_tokens=None,
             reports_token_usage=False,
+            local_context=local_context,
         )
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
@@ -1875,6 +1901,8 @@ def build_local_host_launcher(
     inference_provider: str = "ollama",
     ollama_base_url: str = "http://127.0.0.1:11434",
     ollama_model: str = "hermes-4.3-36b-iq4xs-16k:latest",
+    ollama_num_ctx: int | None = None,
+    local_model_selection: bool = False,
     codex_model: str = "gpt-5.6-terra",
     codex_effort: str = "low",
     codex_executable: str | None = None,
@@ -1959,6 +1987,28 @@ def build_local_host_launcher(
         )
     if type(natural_work_tools) is not bool:
         raise TypeError("natural_work_tools must be an exact boolean")
+    selection_configuration_valid = False
+    try:
+        if type(local_model_selection) is not bool:
+            raise TypeError("local_model_selection must be an exact boolean")
+        if local_model_selection:
+            if inference_provider != "ollama":
+                raise ValueError("--local-model-selection requires --inference-provider ollama")
+            if ollama_num_ctx is not None:
+                raise ValueError("--local-model-selection conflicts with --ollama-num-ctx")
+            if hermes_context is not None:
+                raise ValueError("local selection does not accept Hermes representative context")
+            if qualification_dependencies is not None:
+                raise ValueError("local selection does not accept qualification provider overrides")
+        selection_configuration_valid = True
+    finally:
+        if not selection_configuration_valid:
+            print('[local-model-selection] {"version":1,"category":"configuration_refused"}',
+                  flush=True)
+    if ollama_num_ctx is not None:
+        require_num_ctx(ollama_num_ctx)
+        if inference_provider != "ollama":
+            raise ValueError("--ollama-num-ctx requires --inference-provider ollama")
     if natural_work_tools and inference_provider != "codex":
         raise ValueError("--natural-work-tools requires --inference-provider codex")
     if type(public_search) is not bool:
@@ -2250,26 +2300,55 @@ def build_local_host_launcher(
         )
     )
 
-    inference = (
-        cast(
-            OllamaStreamingInference | CodexAppServerStreamingInference,
-            qualification_dependencies.inference_factory(),
+    output_style_selection = OutputStyleSelection()
+    readiness_cue_template: SpeechChunk | None = None
+    local_selection_owner: OllamaSessionSelection | None = None
+    inference: OllamaStreamingInference | CodexAppServerStreamingInference | OllamaSessionSelection
+    if local_model_selection:
+        metadata_client = OllamaModelClient(base_url=ollama_base_url)
+
+        def selected_adapter(model: str) -> OllamaStreamingInference:
+            return OllamaStreamingInference(
+                base_url=ollama_base_url,
+                model=model,
+                request_timeout_seconds=60.0,
+                metadata_client=metadata_client,
+                output_style=output_style_selection.get,
+            )
+
+        async def selected_readiness(candidate: OllamaStreamingInference) -> None:
+            nonlocal readiness_cue_template
+            readiness_cue_template = await _run_inference_speech_readiness(candidate, synthesizer)
+
+        local_selection_owner = OllamaSessionSelection(
+            client=metadata_client,
+            default_model=ollama_model,
+            adapter_factory=selected_adapter,
+            readiness=selected_readiness,
         )
-        if qualification_dependencies is not None
-        else _build_streaming_inference(
-            inference_provider=inference_provider,
-            ollama_base_url=ollama_base_url,
-            ollama_model=ollama_model,
-            codex_model=codex_model,
-            codex_effort=codex_effort,
-            codex_executable=codex_executable,
-            current_fact_lookup=current_fact_lookup,
-            token_usage_observer=observe_token_usage,
-            knowledge_timing_observer=lambda data: observe("knowledge_timing", data),
-            knowledge_coordinator=knowledge_coordinator,
-            hermes_context=hermes_context,
+        inference = local_selection_owner
+    else:
+        inference = (
+            cast(
+                OllamaStreamingInference | CodexAppServerStreamingInference,
+                qualification_dependencies.inference_factory(),
+            )
+            if qualification_dependencies is not None
+            else _build_streaming_inference(
+                inference_provider=inference_provider,
+                ollama_base_url=ollama_base_url,
+                ollama_model=ollama_model,
+                codex_model=codex_model,
+                codex_effort=codex_effort,
+                codex_executable=codex_executable,
+                current_fact_lookup=current_fact_lookup,
+                token_usage_observer=observe_token_usage,
+                knowledge_timing_observer=lambda data: observe("knowledge_timing", data),
+                knowledge_coordinator=knowledge_coordinator,
+                hermes_context=hermes_context,
+                output_style=output_style_selection.get,
+            )
         )
-    )
     synthesizer = (
         cast(
             EdgeTtsSynthesizer | KokoroSynthesizer,
@@ -2302,7 +2381,6 @@ def build_local_host_launcher(
     )
     media_incarnations: dict[int, int] = {}
     readiness_cue_authority = _ReadinessCueAuthority()
-    readiness_cue_template: SpeechChunk | None = None
     readiness_cue_tasks = _ReadinessCueTasks()
     publisher = ReconnectSafeLiveKitAudioPublisher()
     verifier_identity = (
@@ -2735,14 +2813,22 @@ def build_local_host_launcher(
             tts_provider=tts_provider,
             edge_voice=edge_voice,
         ),
-        model_configuration=_build_browser_model_configuration(
-            inference_provider=inference_provider,
-            ollama_model=ollama_model,
-            codex_model=codex_model,
-            codex_effort=codex_effort,
+        model_configuration=(
+            None if local_selection_owner is not None else _build_browser_model_configuration(
+                inference_provider=inference_provider,
+                ollama_model=ollama_model,
+                codex_model=codex_model,
+                codex_effort=codex_effort,
+                local_context=(
+                    inference.context_observation
+                    if type(inference) is OllamaStreamingInference and ollama_num_ctx is not None
+                    else None
+                ),
+            )
         ),
         model_catalog=model_catalog,
         select_model=select_model,
+        local_model_selection=local_selection_owner,
         activate_media=activate_media,
         yield_speech=yield_active_speech if conversation_profile == "natural_v1" else None,
         delete_voice_conversation=(
@@ -2754,6 +2840,7 @@ def build_local_host_launcher(
         projection=projection,
         voice_configuration=voice_configuration,
         select_voice=select_voice,
+        select_output_style=output_style_selection.select,
         evidence_consent=(
             (
                 lambda binding, request: _reserve_host_evidence_consent(
@@ -2802,6 +2889,15 @@ def build_local_host_launcher(
 
     async def preflight() -> None:
         nonlocal readiness_cue_template, restart_announcement
+        if ollama_num_ctx is not None:
+            if type(inference) is not OllamaStreamingInference:
+                try:
+                    raise TypeError("configured Ollama context requires exact Ollama inference")
+                finally:
+                    print("[ollama-context] " + json.dumps(
+                        {"version": 1, "category": "configuration_refused"},
+                        separators=(",", ":")), flush=True)
+            await inference.configure_context(ollama_num_ctx)
         if voice_tail_writer is not None:
             # Before preflight and so before any turn: the conversation resumes heard-first.
             await voice_tail_writer.open(context)
@@ -2813,6 +2909,19 @@ def build_local_host_launcher(
             voice_memory_receiver.start()
         if voice_forget_sender is not None:
             voice_forget_sender.start()
+        if local_selection_owner is not None:
+            # Launcher preflight owns durable initialization exactly once. Browser
+            # preparation owns only a fresh adapter and the tool-less readiness probe.
+            if not qualification_no_hermes_tasks:
+                await _start_host_task_session(cast(_TaskSessionStarter, task_session))
+                settlement = (
+                    task_session.restart_settlement
+                    if type(task_session) is HermesApiTaskSession else None
+                )
+                restart_announcement = _restart_announcement(settlement)
+                if restart_announcement is not None:
+                    context.mark_prior_work_ended()
+            return
         if qualification_no_hermes_tasks:
             snapshot = ConversationInferenceRequest(
                 revision=0,
@@ -2838,10 +2947,12 @@ def build_local_host_launcher(
             if len(probes) != 1 or type(probes[0]) is not SpeechChunk:
                 raise RuntimeError("TTS preflight did not produce one playable chunk")
             readiness_cue_template = probes[0]
+            if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
+                await inference.observe_context()
             return
         readiness_cue_template = await _run_full_host_preflight(
             task_session=cast(_TaskSessionStarter, task_session),
-            inference=inference,
+            inference=cast(OllamaStreamingInference | CodexAppServerStreamingInference, inference),
             synthesizer=synthesizer,
             surface=work_surface,
             natural_work_tools=natural_work_tools,
@@ -2852,6 +2963,8 @@ def build_local_host_launcher(
             else None
         )
         announcement = _restart_announcement(settlement)
+        if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
+            await inference.observe_context()
         if announcement is not None:
             # Stopped work is history, never active: the prompt must not imply it runs.
             context.mark_prior_work_ended()
@@ -2894,6 +3007,8 @@ def build_local_host_launcher(
             except BaseException as error:
                 errors.append(error)
             try:
+                # The inference owner also settles accepted model preparation.
+                # Foreground cancellation precedes it; shared TTS closes later.
                 await work_close_owner.close()
             except BaseException as error:
                 errors.append(error)
@@ -3018,6 +3133,8 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             bootstrap_ttl_seconds=args.bootstrap_ttl_seconds,
             inference_provider=args.inference_provider,
             ollama_model=args.ollama_model,
+            ollama_num_ctx=args.ollama_num_ctx,
+            local_model_selection=args.local_model_selection,
             codex_model=args.codex_model,
             codex_effort=args.codex_effort,
             codex_executable=args.codex_executable,
@@ -3409,6 +3526,10 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--ollama-model",
         default="hermes-4.3-36b-iq4xs-16k:latest",
     )
+    parser.add_argument("--ollama-num-ctx", type=int,
+        help="explicit per-session Ollama context (2048–262144); metadata/runtime validated")
+    parser.add_argument("--local-model-selection", action="store_true",
+        help="choose an installed Ollama model and context in the browser before connecting")
     parser.add_argument("--codex-model", default="gpt-5.6-terra")
     parser.add_argument(
         "--codex-effort",

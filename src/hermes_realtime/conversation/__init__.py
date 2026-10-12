@@ -52,6 +52,7 @@ from .updates import (
 from .work_tools import (
     ConversationWorkControlSurface,
     WorkCancelResult,
+    WorkCommandAdmission,
     WorkControlHealth,
     WorkStartResult,
 )
@@ -103,6 +104,7 @@ __all__ = [
     "TurnState",
     "TurnStateMachine",
     "WorkCancelResult",
+    "WorkCommandAdmission",
     "WorkControlHealth",
     "WorkStartResult",
 ]

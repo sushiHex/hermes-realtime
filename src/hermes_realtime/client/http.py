@@ -6,8 +6,11 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MethodType
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
+from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.evidence.models import (
     parse_evidence_consent_request,
     parse_evidence_revoke_request,
@@ -20,11 +23,14 @@ from hermes_realtime.search_egress import (
 
 from .bootstrap import BrowserJoinCredential, BrowserTokenVerifier, OneTimeBootstrapCapability
 from .loopback import LoopbackPeerAddress, LoopbackPeerAuthorizer
-from .session import BrowserAudioDiagnostic, BrowserSessionDirector
+from .session import BrowserAudioDiagnostic, BrowserSessionDirector, NoBrowserSession
 from .tailnet import TailnetPeerAddress, TailnetPeerAuthorizer
 
 StablePeerAddress = LoopbackPeerAddress | TailnetPeerAddress
 StablePeerAuthorizer = LoopbackPeerAuthorizer | TailnetPeerAuthorizer
+
+if TYPE_CHECKING:
+    from hermes_realtime.providers.ollama_session import OllamaSessionSelection
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -68,9 +74,24 @@ class BrowserBootstrapApplication:
         worker_identity: str,
         tailnet_authorizer: TailnetPeerAuthorizer | None = None,
         loopback_authorizer: LoopbackPeerAuthorizer | None = None,
+        local_model_selection: OllamaSessionSelection | None = None,
     ) -> None:
+        from hermes_realtime.providers.ollama_session import OllamaSessionSelection
+
+        if (
+            local_model_selection is not None
+            and type(local_model_selection) is not OllamaSessionSelection
+        ):
+            raise TypeError("local_model_selection must be an exact Ollama session owner or None")
         if type(sessions) is not BrowserSessionDirector:
             raise TypeError("sessions must be an exact BrowserSessionDirector")
+        if local_model_selection is not None:
+            admission = sessions._local_model_configuration
+            if (
+                type(admission) is not MethodType
+                or admission != local_model_selection.require_prepared
+            ):
+                raise ValueError("local model selection admission binding must match its owner")
         if type(verifier) is not BrowserTokenVerifier:
             raise TypeError("verifier must be an exact BrowserTokenVerifier")
         if capability is not None and type(capability) is not OneTimeBootstrapCapability:
@@ -100,6 +121,7 @@ class BrowserBootstrapApplication:
         self._capability = capability
         self._allowed_origin = allowed_origin
         self._worker_identity = worker_identity
+        self._local_model_selection = local_model_selection
         if tailnet_authorizer is not None and type(tailnet_authorizer) is not TailnetPeerAuthorizer:
             raise TypeError("tailnet_authorizer must be an exact TailnetPeerAuthorizer")
         if (
@@ -130,6 +152,68 @@ class BrowserBootstrapApplication:
     ) -> BrowserBootstrapResponse:
         """Validate, claim, provision, then expose one browser credential."""
 
+        if type(path) is str and path in {"/api/v1/local-models", "/api/v1/local-model-prepare"}:
+            category = "refused"
+            try:
+                response = await self._handle(
+                    method=method,
+                    path=path,
+                    headers=headers,
+                    body=body,
+                    peer=peer,
+                )
+                category = "accepted"
+                return response
+            finally:
+                print(
+                    "[local-model-http] "
+                    + json.dumps(
+                        {
+                            "version": 1,
+                            "kind": "catalog" if path == "/api/v1/local-models" else "prepare",
+                            "category": category,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+
+        if type(path) is not str or path != "/api/v1/output-style":
+            return await self._handle(
+                method=method, path=path, headers=headers, body=body, peer=peer,
+            )
+        stage = ["malformed_input"]
+        accepted = False
+        try:
+            response = await self._handle(
+                method=method, path=path, headers=headers, body=body, peer=peer,
+                output_style_stage=stage,
+            )
+            accepted = True
+            return response
+        except PermissionError:
+            stage[0] = "authentication_or_binding"
+            raise
+        except NoBrowserSession:
+            stage[0] = "absent_session"
+            raise
+        finally:
+            evidence: dict[str, object] = {"accepted": accepted}
+            if not accepted:
+                evidence["category"] = stage[0]
+            evidence["version"] = 1
+            print("[output-style] " + json.dumps(evidence, separators=(",", ":")), flush=True)
+
+    async def _handle(
+        self,
+        *,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        peer: StablePeerAddress | None = None,
+        output_style_stage: list[str] | None = None,
+    ) -> BrowserBootstrapResponse:
         if type(method) is not str or type(path) is not str:
             raise TypeError("method and path must be exact built-in strings")
         if type(headers) is not dict:
@@ -147,6 +231,9 @@ class BrowserBootstrapApplication:
             "/api/v1/media",
             "/api/v1/model",
             "/api/v1/models",
+            "/api/v1/local-models",
+            "/api/v1/local-model-prepare",
+            "/api/v1/output-style",
             "/api/v1/projection-resync",
             "/api/v1/rebind",
             "/api/v1/refresh",
@@ -183,7 +270,10 @@ class BrowserBootstrapApplication:
         bearer = ""
         stable_bootstrap_paths = {"/api/v1/stable-bootstrap", "/api/v1/tailnet-bootstrap"}
         stable_rebind_paths = {"/api/v1/stable-rebind", "/api/v1/tailnet-rebind"}
-        if path in stable_bootstrap_paths | stable_rebind_paths:
+        local_paths = {"/api/v1/local-models", "/api/v1/local-model-prepare"}
+        if path in stable_bootstrap_paths | stable_rebind_paths or (
+            path in local_paths and self._stable_authorizer is not None
+        ):
             if "authorization" in headers or headers.get("sec-fetch-site") != "same-origin":
                 raise PermissionError("stable session request is invalid")
             authorizer = self._stable_authorizer
@@ -196,9 +286,12 @@ class BrowserBootstrapApplication:
                 await authorizer.authorize(peer)
             else:
                 raise PermissionError("stable session request is invalid")
+            if path in local_paths:
+                return await self._handle_local_model(path, headers, body)
             if path in stable_bootstrap_paths:
                 if body:
                     raise ValueError("stable bootstrap request body must be empty")
+                self._sessions.require_model_prepared()
                 credential = await self._sessions.start()
             else:
                 if not 1 <= len(body) <= 384:
@@ -241,10 +334,15 @@ class BrowserBootstrapApplication:
                 raise PermissionError("client authorization is invalid")
             bearer = authorization[7:]
 
+        if path in local_paths:
+            cast(OneTimeBootstrapCapability, self._capability).validate(bearer)
+            return await self._handle_local_model(path, headers, body)
+
         if path == "/api/v1/bootstrap":
             if body:
                 raise ValueError("bootstrap request body must be empty")
             assert self._capability is not None
+            self._sessions.require_model_prepared()
             self._capability.consume(bearer)
             credential = await self._sessions.start()
             payload = self._credential_payload(credential)
@@ -285,8 +383,7 @@ class BrowserBootstrapApplication:
                 raise ValueError("rebind content-type must be application/json")
             try:
                 decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
+                    body.decode("utf-8"), object_pairs_hook=_strict_json_object,
                 )
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise ValueError("rebind body must be strict UTF-8 JSON") from None
@@ -619,6 +716,29 @@ class BrowserBootstrapApplication:
             )
             payload = catalog.public_data()
             status = 200
+        elif path == "/api/v1/output-style":
+            if not 1 <= len(body) <= 256:
+                raise ValueError("style body must contain 1 to 256 bytes")
+            if headers.get("content-type") != "application/json":
+                raise ValueError("style content-type must be application/json")
+            identity = self._verifier.verify(bearer)
+            try:
+                decoded = json.loads(
+                    body.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("style body must be strict UTF-8 JSON") from None
+            if type(decoded) is not dict or set(decoded) != {"style"}:
+                raise ValueError("style request must contain the exact style field")
+            style = require_output_style(decoded["style"])
+            if output_style_stage is not None:
+                output_style_stage[0] = "unavailable_or_selection_failure"
+            selected = await self._sessions.change_output_style(
+                participant_identity=identity, style=style,
+            )
+            payload = {"selectedStyle": selected, "version": 1}
+            status = 200
         elif path == "/api/v1/voice":
             if not 1 <= len(body) <= 256:
                 raise ValueError("voice body must contain 1 to 256 bytes")
@@ -696,6 +816,48 @@ class BrowserBootstrapApplication:
             status=status,
             headers=self._RESPONSE_HEADERS,
             body=encoded,
+        )
+
+    async def _handle_local_model(
+        self,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+    ) -> BrowserBootstrapResponse:
+        owner = self._local_model_selection
+        if path == "/api/v1/local-models":
+            if body or "content-type" in headers:
+                raise ValueError("local model catalog body must be empty")
+            payload = {"version": 1, "available": False} if owner is None else await owner.catalog()
+        else:
+            if owner is None:
+                raise PermissionError("local model selection is unavailable")
+            if headers.get("content-type") != "application/json" or not 1 <= len(body) <= 1024:
+                raise ValueError("local preparation requires bounded JSON")
+            decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
+            if (
+                type(decoded) is not dict
+                or set(decoded)
+                != {
+                    "version",
+                    "model",
+                    "digest",
+                    "requestedContextTokens",
+                }
+                or type(decoded["version"]) is not int
+                or decoded["version"] != 1
+            ):
+                raise ValueError("local preparation requires exact versioned fields")
+            selection = await owner.prepare(
+                decoded["model"],
+                decoded["digest"],
+                decoded["requestedContextTokens"],
+            )
+            payload = {"version": 1, "selection": selection}
+        return BrowserBootstrapResponse(
+            status=200,
+            headers=self._RESPONSE_HEADERS,
+            body=json.dumps(payload, separators=(",", ":")).encode(),
         )
 
     def _credential_payload(self, credential: object) -> dict[str, object]:

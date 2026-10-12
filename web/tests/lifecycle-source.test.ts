@@ -9,7 +9,7 @@ const mainSource = readFileSync(
 );
 
 describe("reloaded tab rebind wiring", () => {
-  it("remembers every new credential and forgets the session only after a stop succeeds", () => {
+  it("remembers every credential and forgets only on a stop or definitive rebind verdict", () => {
     const setter = mainSource.indexOf("function setCredential(");
     const setterEnd = mainSource.indexOf("\n}\n", setter);
     expect(setter).toBeGreaterThan(-1);
@@ -19,17 +19,17 @@ describe("reloaded tab rebind wiring", () => {
     const body = mainSource.slice(setter, setterEnd);
     expect(body).toContain("if (stableLaunch && value !== null) {");
     expect(body).toContain(
-      "rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });",
+      "rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });",
     );
-    // A failed connect clears the credential in memory but never the remembered session.
-    const forget = "if (stableLaunch) rememberSession(tabStorage(), null);";
-    expect(mainSource.split(forget)).toHaveLength(2);
-    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(2);
+    // Transient failures retain the remembered identity; definitive rebind and stop clear it.
+    const forget = "if (stableLaunch) rememberSession(sessionRecoveryStorage, null);";
+    expect(mainSource.split(forget)).toHaveLength(3);
+    expect(mainSource.match(/rememberSession\(/g)).toHaveLength(3);
     const stop = mainSource.indexOf("async function stop(");
     const stopBody = mainSource.slice(stop, mainSource.indexOf("\n}\n", stop));
     expect(stopBody.indexOf(forget)).toBeGreaterThan(stopBody.indexOf("} finally {"));
     expect(stopBody.indexOf("} finally {")).toBeGreaterThan(
-      stopBody.indexOf('if (!response.ok) throw new Error("session stop was rejected");'),
+      stopBody.indexOf("if (!response.ok) throw new ConnectionRequestRejected(response.status);"),
     );
   });
 
@@ -40,8 +40,8 @@ describe("reloaded tab rebind wiring", () => {
       mainSource.indexOf("    if (resuming) {", connectStart),
     );
     expect(freshPath).toBeGreaterThan(connectStart);
-    expect(mainSource.slice(freshPath, freshPath + 120)).toContain(
-      "setCredential(await bootstrapOrReload(localOperation.signal));",
+    expect(mainSource.slice(freshPath, freshPath + 200)).toContain(
+      "commitCredential(await bootstrapOrReload(localOperation.signal, (stage) => {",
     );
     const reload = mainSource.indexOf("async function bootstrapOrReload(");
     const reloadEnd = mainSource.indexOf("\n}\n", reload);
@@ -49,7 +49,7 @@ describe("reloaded tab rebind wiring", () => {
     // The verdict rules live in reloadOrBootstrap, tested behaviorally in controller.test.ts.
     expect(body).toContain("if (!stableLaunch) return bootstrap(signal);");
     expect(body).toContain("const result = await reloadOrBootstrap({");
-    expect(body).toContain("storage: tabStorage(),");
+    expect(body).toContain("storage: sessionRecoveryStorage,");
   });
 
   it("never lets a leaving page reconnect the session it is leaving", () => {
@@ -95,7 +95,7 @@ describe("browser lifecycle wiring", () => {
     expect(mainSource).toContain("actionableApprovalCard(obsolete) && !repinned.has(obsolete)");
     expect(mainSource).not.toContain("activeApprovalCard");
     expect(mainSource).not.toContain("Superseded by a newer approval request.");
-    expect(mainSource).toContain("forgetEvictedTaskCard(obsolete)");
+    expect(mainSource).toContain("forgetEvictedOperationCard(obsolete)");
   });
 
   it("automatically rebinds after an authoritative terminal media disconnect", () => {
@@ -220,7 +220,13 @@ describe("browser lifecycle wiring", () => {
     const reconnectStart = mainSource.indexOf("const rebindRequestId =");
     const reconnectEnd = mainSource.indexOf("pendingRebindRequestId = null;", reconnectStart);
     const reconnect = mainSource.slice(reconnectStart, reconnectEnd);
-    expect(reconnect).toContain("if (!sessionReplaced) resetSessionInputAuthority();");
+    // Ordinary rebind renews search/media authority while retaining session counters.
+    expect(reconnect).toContain("if (!sessionReplaced) {\n          resetBindingInputAuthority();");
+    const bindingResetStart = mainSource.indexOf("function resetBindingInputAuthority(");
+    const bindingReset = mainSource.slice(
+      bindingResetStart, mainSource.indexOf("\n}\n", bindingResetStart),
+    );
+    expect(bindingReset).toContain("searchEgressControls.reset()");
     expect(mainSource).toContain("async function submitSearchEgressControl(");
     const submitStart = mainSource.indexOf("async function submitSearchEgressControl(");
     const submitEnd = mainSource.indexOf("\n}\n", submitStart);

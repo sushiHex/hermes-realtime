@@ -419,8 +419,37 @@ record only pass/fail status and non-secret latency values.
 
 `hermes-realtime-host` is the Milestone 6.1b launcher. It keeps the browser, LiveKit,
 Hermes API, inference, STT, and TTS surfaces on loopback. Explicit
-`task: <objective>` and `cancel task: <public-task-id>` transcripts are always the deterministic
-background-work fallback. With Codex and `--natural-work-tools`, ordinary language may invoke the
+`start task <objective>` starts background work through the deterministic command router.
+The whole final utterance must begin with those exact words (case does not matter); no colon
+or other STT punctuation is required. The objective is bounded by the existing work surface.
+`cancel task` (optionally ending in `.`, `!` or `?`) cancels only when exactly one acknowledged
+task exists at command intake. Its public identity is frozen before any await; if that task
+ends meanwhile, cancellation is refused instead of selecting newer work. With no task the
+browser says there is no active task; with several it asks the operator to use the intended
+task card's **Cancel** control. Pending dispatches are not selected by this spoken command.
+`cancel task <public-task-id>` names an exact task. The legacy `task: <objective>` and
+`cancel task: <public-task-id>` forms remain supported. Negated, quoted or prefaced commands
+are not direct commands, and bare `stop` grants no task cancellation. A dispatch remains
+pending until Hermes accepts it; cancellation acknowledgment means stopping was requested,
+while a terminal event establishes that the task ended.
+
+Explicit command intake admits a bounded operation owned by the existing work surface;
+it does not wait for Hermes's acknowledgment while holding PCM intake. Task status still
+changes only after the authoritative acknowledgment. Deferred settlement failure emits
+bounded, content-free evidence and fixed uncertainty guidance; the surface then refuses
+further commands rather than retrying uncertain work.
+
+If a typed or card command loses its acknowledgment, the browser pauses input because the
+command may already have been admitted. It never retries that command automatically. Select
+**Connect** on a stable launch to restore a fresh authoritative view and input counters;
+a one-use launch requires a fresh launch from the host. Cancellation feedback keeps the
+last authoritative task state until a real task update arrives.
+Stable recovery retains its bounded public identity and request record in memory even
+when browser storage is unavailable. An unresolved input can retire only its own binding.
+An ordinary media reconnect keeps the admitted typed-input and approval counters;
+only a fresh view or a new session starts those counters again.
+
+With Codex and `--natural-work-tools`, ordinary language may invoke the
 same authoritative start/cancel surface; without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,
@@ -765,12 +794,12 @@ Perform these checks in order. Stop on the first contradiction.
    does not exist; the purpose is approval routing, not a filesystem change. Never approve
    a command targeting an existing path during this gate.
 9. Force a transient transport interruption while leaving the connected page open and without
-   pressing **Stop session**. Restore the same endpoint and credentials, wait for automatic
+   pressing **Disconnect**. Restore the same endpoint and credentials, wait for automatic
    reconnect, and require the same browser lease and still-live microphone track to resume without
    stale audio, duplicate transcripts, cross-participant media, replayed approval actions, or a
    second `getUserMedia` call. Reapply the user's mute choice before accepting recovered media.
 10. Stay connected beyond the original bearer lifetime, exercise typed fallback once more,
-   then press **Stop session**. Require terminal stopped state and complete worker/provider cleanup.
+   then press **Disconnect**. Require terminal stopped state and complete worker/provider cleanup.
    Finally press `Ctrl-C` in terminal B and then terminal A.
 
 Retain raw monotonic first-token, first-audio, microphone-onset-to-attenuation, and

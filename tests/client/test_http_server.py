@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -407,3 +409,69 @@ def test_only_an_absent_session_is_a_conflict() -> None:
     assert status(ValueError("malformed")) == 400
     assert status(TimeoutError()) == 408
     assert status(OSError("other")) == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_request_refusal_records_only_status_even_when_delivery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    write_fails: bool,
+) -> None:
+    server = object.__new__(BrowserHttpServer)
+    monkeypatch.setattr(
+        server, "_read_and_dispatch", AsyncMock(side_effect=RuntimeError("synthetic-private-value"))
+    )
+    writer = Mock()
+    writer.get_extra_info.return_value = ("127.0.0.1", 1234)
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    if write_fails:
+        writer.write.side_effect = OSError("synthetic-delivery-failure")
+        with pytest.raises(OSError):
+            await server._handle_connection(asyncio.StreamReader(), writer)
+    else:
+        await server._handle_connection(asyncio.StreamReader(), writer)
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("[browser-request] ")
+    assert json.loads(lines[0].removeprefix("[browser-request] ")) == {
+        "version": 1, "category": "request_refused", "status": 503,
+    }
+    writer.close.assert_called_once()
+    writer.wait_closed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_request_has_no_refusal_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = object.__new__(BrowserHttpServer)
+    response = server_module.BrowserBootstrapResponse(200, {}, b"ok")
+    monkeypatch.setattr(server, "_read_and_dispatch", AsyncMock(return_value=response))
+    writer = Mock()
+    writer.get_extra_info.return_value = ("127.0.0.1", 1234)
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    await server._handle_connection(asyncio.StreamReader(), writer)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+async def test_refusal_marker_failure_does_not_prevent_connection_cleanup(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+) -> None:
+    server = object.__new__(BrowserHttpServer)
+    monkeypatch.setattr(server, "_read_and_dispatch", AsyncMock(side_effect=RuntimeError()))
+    writer = Mock()
+    writer.get_extra_info.return_value = ("127.0.0.1", 1234)
+    writer.drain = AsyncMock()
+    writer.wait_closed = AsyncMock()
+    broken_stderr = Mock()
+    broken_stderr.write.side_effect = error_type("synthetic-sink-failure")
+    with monkeypatch.context() as patch:
+        patch.setattr(server_module.sys, "stderr", broken_stderr)
+        await server._handle_connection(asyncio.StreamReader(), writer)
+    writer.close.assert_called_once()
+    writer.wait_closed.assert_awaited_once()

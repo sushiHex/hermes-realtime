@@ -13,6 +13,7 @@ import os
 import sqlite3
 import sys
 import threading
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -866,6 +867,42 @@ def _wait_for_shared_start(start_event_name: str) -> None:
             raise RuntimeError("shared start event handle did not close")
 
 
+CONTENDER_FAILURE_STAGES = frozenset(
+    {
+        "setup",
+        "armed",
+        "shared_start",
+        "create_epoch",
+        "diagnostics",
+        "terminal",
+        "close_protocol",
+        "close",
+    }
+)
+CONTENDER_FAILURE_CATEGORIES = frozenset({"os_error", "runtime_error", "unexpected"})
+
+
+def _emit_contender_failure(contender_id: int, stage: str, error: Exception) -> None:
+    category = (
+        "os_error"
+        if isinstance(error, OSError)
+        else "runtime_error"
+        if isinstance(error, RuntimeError)
+        else "unexpected"
+    )
+    # A broken output pipe must not replace the exception being diagnosed.
+    with suppress(OSError, ValueError):
+        _emit_contender_frame(
+            {
+                "contenderId": contender_id,
+                "protocolVersion": 1,
+                "state": "FAILED",
+                "stage": stage,
+                "category": category,
+            }
+        )
+
+
 def _run_marker_only_contender(
     case_root: Path,
     contender_id: int,
@@ -875,8 +912,12 @@ def _run_marker_only_contender(
 
     from hermes_realtime.evidence.models import StoreDisposition, WriterFault
 
-    owned = _make_spool(case_root, clock=_Clock(START + timedelta(hours=2)))
+    stage = "setup"
+    owned = None
+    primary_failure = False
     try:
+        owned = _make_spool(case_root, clock=_Clock(START + timedelta(hours=2)))
+        stage = "armed"
         _emit_contender_frame(
             {
                 "contenderId": contender_id,
@@ -884,7 +925,9 @@ def _run_marker_only_contender(
                 "state": "ARMED",
             }
         )
+        stage = "shared_start"
         _wait_for_shared_start(start_event_name)
+        stage = "create_epoch"
         result = owned.create_epoch(
             _make_create_epoch(
                 epoch_id=CURRENT_EPOCH_ID,
@@ -892,11 +935,13 @@ def _run_marker_only_contender(
                 binding_id=CURRENT_BINDING_ID,
             )
         )
+        stage = "diagnostics"
         diagnostics = owned.diagnostics()
         ownership_refusal = (
             result is StoreDisposition.FAULTED
             and diagnostics.sticky_fault is WriterFault.OWNERSHIP_UNAVAILABLE
         )
+        stage = "terminal"
         _emit_contender_frame(
             {
                 "contenderId": contender_id,
@@ -906,10 +951,21 @@ def _run_marker_only_contender(
                 "state": "TERMINAL",
             }
         )
+        stage = "close_protocol"
         if sys.stdin.readline() != "CLOSE\n":
             raise RuntimeError("contender close protocol failed")
+    except Exception as error:
+        primary_failure = True
+        _emit_contender_failure(contender_id, stage, error)
+        raise
     finally:
-        owned.close()
+        if owned is not None:
+            try:
+                owned.close()
+            except Exception as error:
+                _emit_contender_failure(contender_id, "close", error)
+                if not primary_failure:
+                    raise
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

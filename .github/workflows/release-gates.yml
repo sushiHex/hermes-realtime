@@ -440,10 +440,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:HERMES_REALTIME_BROWSER_SELF_ACCEPTANCE = '1'
+          npm ci --ignore-scripts --prefix web
+          if ($LASTEXITCODE -ne 0) { throw "Browser layout dependency install failed" }
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER = $env:LIVEKIT_SERVER
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_SERVER_SHA256 = $env:LIVEKIT_SERVER_SHA256
           $env:HERMES_REALTIME_BROWSER_LIVEKIT_LOG_DIR = $env:TEMP
-          uv run --frozen --group dev --extra browser-acceptance pytest -q -s tests/integration/test_browser_self_acceptance.py
+          uv run --frozen --group dev --extra browser-acceptance pytest -q -s tests/integration/test_browser_self_acceptance.py tests/integration/test_browser_history_presentation.py
           if ($LASTEXITCODE -ne 0) { throw "Browser self-acceptance failed with exit code $LASTEXITCODE" }
       - name: Print sanitized LiveKit failure diagnostics
         if: failure()

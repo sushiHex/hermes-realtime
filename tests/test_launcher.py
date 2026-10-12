@@ -692,6 +692,7 @@ def test_host_inference_selection_is_explicit_without_fallback(
             "codex",
             {
                 "model": "gpt-5.6-terra",
+                "output_style": None,
                 "effort": "low",
                 "codex_executable": "C:/tools/codex.exe",
                 "hermes_context": HermesRepresentativeContext(
@@ -2019,6 +2020,98 @@ class _FullHostHarness:
             allow_unsandboxed_tasks=True,
             **kwargs,
         )
+
+
+@pytest.mark.asyncio
+async def test_configured_context_refuses_a_provider_without_ollama_identity(monkeypatch, capsys):
+    harness = _FullHostHarness(monkeypatch)
+    configured = False
+
+    class OtherInference:
+        async def configure_context(self, requested):
+            nonlocal configured
+            configured = True
+
+        async def cancel(self, turn_id):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(host_launcher_module, "_build_streaming_inference",
+                        lambda **kwargs: OtherInference())
+    launcher = harness.build(ollama_num_ctx=4096)
+    try:
+        with pytest.raises(TypeError, match="exact Ollama"):
+            await launcher.start()
+        assert not configured
+        assert capsys.readouterr().out.splitlines() == [
+            '[ollama-context] {"version":1,"category":"configuration_refused"}'
+        ]
+    finally:
+        await launcher.close()
+
+
+@pytest.mark.asyncio
+async def test_full_host_context_setting_precedes_warmup_and_browser_publication(monkeypatch):
+    import io
+
+    import hermes_realtime.providers.ollama as ollama_module
+    from hermes_realtime.conversation import ConversationContextSnapshot, ConversationMessage
+    from hermes_realtime.providers.ollama_models import OllamaModelClient
+
+    harness = _FullHostHarness(monkeypatch)
+    bodies = []
+    metadata_calls = []
+    digest = "a" * 64
+
+    async def metadata(endpoint, body):
+        metadata_calls.append(endpoint)
+        if endpoint == "version":
+            payload = {"version": "0.34.4"}
+        elif endpoint == "show":
+            payload = {"capabilities": ["completion"], "model_info": {
+                "general.architecture": "synthetic", "synthetic.context_length": 4096}}
+        else:
+            payload = {"models": [{"name": "synthetic:latest", "model": "synthetic:latest",
+                "digest": digest, "context_length": 4096}]}
+        return json.dumps(payload).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=metadata)
+
+    def generate(request, timeout):
+        bodies.append(json.loads(request.data))
+        return io.BytesIO(b'{"message":{"content":"Ready."},"done":true}\n')
+
+    inference = ollama_module.OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="synthetic:latest", open_request=generate,
+        metadata_client=client)
+    monkeypatch.setattr(
+        host_launcher_module, "_build_streaming_inference", lambda **kwargs: inference)
+
+    async def warmup(**kwargs):
+        snapshot = ConversationContextSnapshot(revision=0,
+            messages=(ConversationMessage("user", "Synthetic readiness."),), active_tasks=())
+        assert [part async for part in inference.stream(snapshot, turn_id="turn_preflight")]
+
+    monkeypatch.setattr(host_launcher_module, "_run_full_host_preflight", warmup)
+    launcher = harness.build(ollama_model="synthetic:latest", ollama_num_ctx=4096)
+    configuration = harness.browser["model_configuration"]
+    with pytest.raises(RuntimeError, match="not been configured"):
+        configuration.public_data()
+    try:
+        await launcher.start()
+        assert bodies[0]["options"] == {"num_ctx": 4096}
+        assert metadata_calls == ["version", "tags", "show", "tags", "tags", "ps"]
+        assert configuration.public_data() == {
+            "authentication": "local", "contextWindowTokens": None, "effort": None,
+            "model": "synthetic:latest", "provider": "ollama", "reportsTokenUsage": False,
+            "transport": "local-http", "version": 2, "modelDigest": digest,
+            "requestedContextTokens": 4096, "advertisedContextTokens": 4096,
+            "effectiveContextTokens": 4096,
+        }
+    finally:
+        await launcher.close()
 
 
 @pytest.mark.asyncio

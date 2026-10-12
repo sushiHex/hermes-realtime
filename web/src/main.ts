@@ -1,3 +1,4 @@
+import { OutputStyleControls } from "./output-style";
 import {
   ConnectionState,
   RemoteAudioTrack,
@@ -9,6 +10,7 @@ import {
   type RemoteTrack,
   type RemoteTrackPublication,
 } from "livekit-client";
+import { ConversationHistory } from "./conversation-history";
 
 import {
   ApprovalDecisionController,
@@ -45,7 +47,9 @@ import {
   rebindFailureAllowsFreshBootstrap,
   rebindRequestParameters,
   reloadOrBootstrap,
+  reloadRebindIsSettled,
   rememberSession,
+  rememberedSession,
   ResponseLatencyStatistics,
   RenderTimingTelemetry,
   formatLatencyDuration,
@@ -88,7 +92,15 @@ import {
   mountEvidenceControls,
 } from "./evidence-controls";
 import { mountSearchEgressControls } from "./search-egress-controls";
+import {
+  connectionFailureCategory,
+  ConnectionRequestRejected,
+  renderConnectionRecovery,
+  type ConnectionFailure,
+  type ConnectionFailureStage,
+} from "./connection-recovery";
 import { mountTypedComposerEnterSubmission } from "./typed-composer";
+import { mountTaskCancelControl } from "./task-controls";
 import { VoiceDeleteControls } from "./voice-delete-controls";
 import {
   parseBootstrapCredential,
@@ -106,6 +118,17 @@ import {
   type PublicEvent,
   type SpeechAuthority,
 } from "./protocol";
+import {
+  fetchLocalModelRequest,
+  LOCAL_MODEL_METADATA_TIMEOUT_MS,
+  LOCAL_MODEL_PREPARATION_TIMEOUT_MS,
+  localModelPreparationFor,
+  LocalModelProtocolError,
+  parseLocalModelCatalog,
+  parseLocalModelPreparation,
+  type LocalModelCatalog,
+  type PreparedLocalModelSelection,
+} from "./local-model-selection";
 
 function element<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -121,20 +144,38 @@ const microphoneActivity = element<HTMLButtonElement>("microphone-activity");
 const microphoneActivityLabel = element<HTMLSpanElement>("microphone-activity-label");
 const microphoneLevel = element<HTMLElement>("microphone-level");
 const sessionToggleButton = element<HTMLButtonElement>("session-toggle");
+const connectionRecovery = element<HTMLOutputElement>("connection-recovery");
 const stopSpeakingButton = element<HTMLButtonElement>("stop-speaking");
 const deleteVoiceButton = element<HTMLButtonElement>("delete-voice-conversation");
 const voiceDeleteStatus = element<HTMLOutputElement>("voice-delete-status");
 const speechRendererState = element<HTMLOutputElement>("speech-renderer-state");
 const muteButton = microphoneActivity;
 const microphoneSelect = element<HTMLSelectElement>("microphone");
+const outputStyleControls = new OutputStyleControls(
+  element<HTMLSelectElement>("output-style"),
+  element<HTMLOutputElement>("output-style-status"),
+  () => window.localStorage,
+);
 const voiceSelect = element<HTMLSelectElement>("voice");
 const modelSelect = element<HTMLSelectElement>("model-select");
 const effortSelect = element<HTMLSelectElement>("effort-select");
 const modelSelectionState = element<HTMLParagraphElement>("model-selection-state");
+const localModelPicker = element<HTMLDivElement>("local-model-picker");
+const existingModelControls = document.querySelector<HTMLElement>(".model-controls");
+const localModelOptions = element<HTMLFieldSetElement>("local-model-options");
+const localModelSelect = element<HTMLSelectElement>("local-model-select");
+const localModelContextInput = element<HTMLInputElement>("local-model-context-input");
+const localModelBudgetNote = element<HTMLParagraphElement>("local-model-budget-note");
+const localModelAdvertised = element<HTMLElement>("local-model-advertised");
+const localModelRequested = element<HTMLElement>("local-model-requested");
+const localModelEffective = element<HTMLElement>("local-model-effective");
+const localModelSelectionState = element<HTMLOutputElement>("local-model-selection-state");
+const localModelRetry = element<HTMLButtonElement>("local-model-retry");
 const typedForm = element<HTMLFormElement>("typed-form");
 const typedInput = element<HTMLTextAreaElement>("typed-input");
 const sendButton = element<HTMLButtonElement>("send");
 const transcript = element<HTMLOListElement>("transcript");
+const conversationHistory = new ConversationHistory(transcript.parentElement!);
 const transcriptEmpty = element<HTMLDivElement>("transcript-empty");
 const readinessHeadline = element<HTMLHeadingElement>("readiness-headline");
 const readinessDetail = element<HTMLParagraphElement>("readiness-detail");
@@ -157,6 +198,9 @@ const modelFields = [
   element<HTMLElement>("model-transport"),
   element<HTMLElement>("model-context"),
   element<HTMLElement>("model-usage-reporting"),
+  element<HTMLElement>("model-requested-context"),
+  element<HTMLElement>("model-advertised-context"),
+  element<HTMLElement>("model-effective-context"),
 ] as const;
 const speechFields = [
   element<HTMLElement>("stt-provider"),
@@ -315,9 +359,26 @@ const responseLatency = new ResponseLatencyStatistics();
 let capability: string | null = null;
 let stableLaunch = false;
 let credential: BootstrapCredential | null = null;
+// One bounded public identity/request record owns recovery in this page.
+// Browser persistence is optional; the existing parser validates its initial value.
+const initiallyRememberedSession = rememberedSession(tabStorage());
+let sessionRecord = initiallyRememberedSession === null
+  ? null : JSON.stringify(initiallyRememberedSession);
+const sessionRecoveryStorage = {
+  getItem: () => sessionRecord,
+  setItem: (key: string, value: string): void => {
+    sessionRecord = value;
+    tabStorage()?.setItem(key, value);
+  },
+  removeItem: (key: string): void => {
+    sessionRecord = null;
+    tabStorage()?.removeItem(key);
+  },
+};
 let pendingRebindRequestId: string | null = null;
 let projectionResyncAttempted = false;
 let remoteStopRequired = false;
+let connectionFailure: ConnectionFailure | null = null;
 let sessionStopVersion = 0;
 let room: Room | null = null;
 const admittedRooms = new WeakSet<Room>();
@@ -334,6 +395,14 @@ let credentialRefreshTimer: number | null = null;
 let selectedVoice: string | null = null;
 let selectableModels: ModelCatalog | null = null;
 let modelSelectionPending = false;
+let localModelCatalog: LocalModelCatalog | null = null;
+let localModelDiscoveryState: "loading" | "ready" | "disabled" | "error" = "loading";
+let localModelDiscoveryPending = false;
+let localModelPreparationPending = false;
+let localModelPreparationError: string | null = null;
+let localModelDiscoveryError: string | null = null;
+let localModelDiscoveryGeneration = 0;
+let localModelDiscoveryAbort: AbortController | null = null;
 let microphoneReady: boolean | null = null;
 let voicePathState: VoicePathState = "waiting";
 let voicePathReadinessTimer: number | null = null;
@@ -345,7 +414,16 @@ let microphoneMutePending = false;
 const microphoneReadinessAuthority = new MicrophoneReadinessAuthority<Room, LocalTrack>();
 const reconnectMicrophoneQueue = new SerializedAsyncQueue();
 const audioDiagnosticQueue = new SerializedAsyncQueue();
+const typedSubmissionQueue = new SerializedAsyncQueue();
+const maxTypedSubmissions = 8;
+let typedSubmissionCount = 0;
+let typedSubmissionGeneration: object = Object.freeze({});
+let activeTypedSubmission: {
+  readonly abort: AbortController;
+  readonly participantIdentity: string;
+} | null = null;
 const microphoneEnumerationAuthority = new GenerationAuthority();
+const lifecycleAuthority = new GenerationAuthority();
 const eventPollFailurePolicy = new ForegroundPollFailurePolicy(5);
 const localMediaReleaseTimeoutMs = 1_000;
 const stopRequestTimeoutMs = 5_000;
@@ -353,11 +431,19 @@ const connectionRequestTimeoutMs = 10_000;
 const approvalController = new ApprovalDecisionController(
   async (sequence, approvalId, decision) => {
     const activeCredential = credential;
-    if (activeCredential === null) throw new Error("browser session is not connected");
+    const view = approvalCardViews.get(approvalId);
+    if (view === undefined || !approvalCardHasAuthority(view) ||
+      view.pendingDecision?.participantIdentity !== activeCredential?.participantIdentity) {
+      try {
+        throw new Error("approval connection authority is unavailable");
+      } finally {
+        console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "connection_changed" })}`);
+      }
+    }
     const response = await fetch("/api/v1/approval", {
       method: "POST",
       headers: {
-        ...authorization(activeCredential.token),
+        ...authorization(activeCredential!.token),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ approvalId, decision, sequence }),
@@ -414,29 +500,43 @@ function addTranscript(
   item.append(label, document.createTextNode(text));
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
-function addBackgroundResult(text: string): void {
-  closeActiveUserTurn();
-  const item = document.createElement("li");
-  item.dataset.role = "task-result";
-  const label = document.createElement("strong");
-  label.textContent = "Background result: ";
-  item.append(label, document.createTextNode(text));
-  appendTranscriptBounded(item);
-  syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+function projectTaskResult(event: PublicEvent): void {
+  const { taskId, text } = event.data;
+  if (typeof taskId !== "string" || typeof text !== "string" || !text.trim()) return;
+  projectTaskStateCard(event);
+  const view = taskCardViews.get(taskId);
+  if (view === undefined) return;
+  if (view.result === null) {
+    const disclosure = document.createElement("details");
+    disclosure.className = "task-result";
+    const summary = document.createElement("summary");
+    summary.textContent = "Task result";
+    const content = document.createElement("p");
+    content.className = "operation-detail";
+    disclosure.append(summary, content);
+    view.item.append(disclosure);
+    view.result = content;
+    disclosure.addEventListener("toggle", () => conversationHistory.refresh());
+  }
+  view.result.textContent = text;
+  refreshOperationCard(view.item);
 }
 
 interface TaskCardView {
   readonly item: HTMLLIElement;
   readonly status: HTMLParagraphElement;
   readonly meta: HTMLSpanElement;
+  readonly feedback: HTMLParagraphElement;
+  readonly cancellation: ReturnType<typeof mountTaskCancelControl>;
+  participantIdentity: string | null;
   readonly startedBrowserMs: number;
   readonly startedServerMs: number;
   currentStatus: string;
   timer: number | null;
+  result: HTMLParagraphElement | null;
 }
 
 interface ApprovalCardView {
@@ -445,6 +545,9 @@ interface ApprovalCardView {
   readonly status: HTMLParagraphElement;
   readonly approve: HTMLButtonElement;
   readonly reject: HTMLButtonElement;
+  actionable: boolean;
+  participantIdentity: string | null;
+  pendingDecision: { readonly participantIdentity: string } | null;
 }
 
 const taskCardViews = new Map<string, TaskCardView>();
@@ -456,17 +559,23 @@ const approvalCardViews = new Map<string, ApprovalCardView>();
 
 function actionableApprovalCard(item: HTMLLIElement): boolean {
   for (const view of approvalCardViews.values()) {
-    if (view.item === item) return true;
+    if (view.item === item && view.actionable) return true;
   }
   return false;
 }
 
-function forgetEvictedTaskCard(item: HTMLLIElement): void {
+function forgetEvictedOperationCard(item: HTMLLIElement): void {
+  const approvalId = item.dataset.approvalId;
+  if (approvalId !== undefined && approvalCardViews.get(approvalId)?.item === item) {
+    approvalCardViews.delete(approvalId);
+  }
   const taskId = item.dataset.taskId;
   if (taskId === undefined) return;
   const view = taskCardViews.get(taskId);
   if (view?.item === item) {
     if (view.timer !== null) window.clearInterval(view.timer);
+    view.cancellation.dispose();
+    conversationHistory.forget(item);
     taskCardViews.delete(taskId);
   }
 }
@@ -483,18 +592,20 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
       pending.push(...transcriptRetention.admit(obsolete, retainedDomCost(obsolete)));
       continue;
     }
-    forgetEvictedTaskCard(obsolete);
+    forgetEvictedOperationCard(obsolete);
     obsolete.remove();
   }
 }
 
 function appendTranscriptBounded(item: HTMLLIElement): void {
   transcript.append(item);
+  if (conversationHistory.isActive(item)) return;
   disposeTranscriptEvictions(transcriptRetention.admit(item, retainedDomCost(item)));
 }
 
 function updateTranscriptBounded(item: HTMLLIElement): boolean {
   if (!item.isConnected) return false;
+  if (conversationHistory.isActive(item)) return true;
   disposeTranscriptEvictions(transcriptRetention.update(item, retainedDomCost(item)));
   return item.isConnected;
 }
@@ -503,17 +614,35 @@ function admitOperationCard(item: HTMLLIElement): void {
   closeActiveUserTurn();
   appendTranscriptBounded(item);
   syncTranscriptEmptyState();
-  item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function refreshOperationCard(item: HTMLLIElement): void {
-  if (updateTranscriptBounded(item)) item.scrollIntoView({ block: "nearest" });
+  if (updateTranscriptBounded(item)) conversationHistory.follow();
 }
 
 function projectTaskStateCard(event: PublicEvent): void {
   const data = event.data;
   const taskId = data.taskId;
   const status = data.status;
+  if (status === "rejected" && taskId === null) {
+    const knownReasons = new Set([
+      "No active task to cancel.",
+      "Several tasks are active. Use Cancel on the task you want to stop.",
+      "Provide an objective after Start task.",
+      "Task command acknowledgment is uncertain. Check task status before trying again.",
+      "Task control is unavailable. Restart the session before trying again.",
+      "invalid explicit task command",
+    ]);
+    const notice = document.createElement("li");
+    notice.dataset.role = "operation";
+    notice.dataset.operation = "task-command";
+    notice.setAttribute("role", "status");
+    notice.textContent = typeof data.reason === "string" && knownReasons.has(data.reason)
+      ? data.reason : "Task command was refused.";
+    admitOperationCard(notice);
+    return;
+  }
   if (
     typeof taskId !== "string" ||
     !/^task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}$/.test(taskId) ||
@@ -525,6 +654,34 @@ function projectTaskStateCard(event: PublicEvent): void {
     return;
   }
   let view = taskCardViews.get(taskId);
+  // A cancellation refusal is command feedback, not a new task lifecycle.
+  if (status === "rejected" && view !== undefined) {
+    view.feedback.textContent = "Cancellation was refused. The task status has not changed.";
+    refreshOperationCard(view.item);
+    return;
+  }
+  const live = status === "active" || status === "cancelling";
+  if (live && (view === undefined || !conversationHistory.isActive(view.item))) {
+    const activeCount = [...taskCardViews.values()].filter((card) =>
+      conversationHistory.isActive(card.item),
+    ).length;
+    if (activeCount >= 256) {
+      try {
+        let notice = document.querySelector<HTMLElement>(".history-capacity-notice");
+        if (notice === null) {
+          notice = document.createElement("span");
+          notice.className = "history-capacity-notice";
+          notice.setAttribute("role", "status");
+          transcript.closest(".conversation-panel")?.querySelector(".panel-header")?.append(notice);
+        }
+        notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
+        return;
+      } finally {
+        console.info(`[history-capacity] ${JSON.stringify({ activeCount, limit: 256, category: "active_task_capacity" })}`);
+      }
+    }
+  }
+
   if (view === undefined || !view.item.isConnected) {
     const item = document.createElement("li");
     item.dataset.role = "operation";
@@ -541,21 +698,56 @@ function projectTaskStateCard(event: PublicEvent): void {
     const meta = document.createElement("span");
     meta.className = "operation-meta";
     meta.textContent = "You can keep talking while this runs.";
-    item.append(label, title, state, meta);
+    const controls = document.createElement("div");
+    controls.className = "operation-controls";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "button danger";
+    cancel.textContent = "Cancel";
+    const feedback = document.createElement("p");
+    feedback.className = "operation-detail";
+    feedback.setAttribute("role", "status");
+    controls.append(cancel);
+    item.append(label, title, state, meta, controls, feedback);
+    const cancellation = mountTaskCancelControl(cancel, {
+      taskId,
+      canCancel: () => controller.state === "connected" &&
+        view?.currentStatus === "active" &&
+        view.participantIdentity === credential?.participantIdentity,
+      submit: submitTyped,
+      onFailure: () => {
+        feedback.textContent = "Cancellation was not confirmed. Check task status.";
+        refreshOperationCard(item);
+      },
+    });
     view = {
       item,
       status: state,
       meta,
+      feedback,
+      cancellation,
+      participantIdentity: credential?.participantIdentity ?? null,
       startedBrowserMs: performance.now(),
       startedServerMs: event.monotonicMs,
       currentStatus: status,
       timer: null,
+      result: null,
     };
     taskCardViews.set(taskId, view);
+    conversationHistory.setActive(item, live);
     admitOperationCard(item);
+  }
+  const wasLive = conversationHistory.isActive(view.item);
+  conversationHistory.setActive(view.item, live);
+  if (live) transcriptRetention.remove(view.item);
+  else if (wasLive) {
+    disposeTranscriptEvictions(transcriptRetention.admit(view.item, retainedDomCost(view.item)));
   }
   view.item.dataset.status = status;
   view.currentStatus = status;
+  view.participantIdentity = credential?.participantIdentity ?? null;
+  view.feedback.textContent = "";
+  view.cancellation.refresh();
   const render = (): void => {
     const elapsedMs =
       view!.currentStatus === "active" || view!.currentStatus === "cancelling"
@@ -583,7 +775,8 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   if (!actionable) {
     const view = approvalCardViews.get(approvalId);
     if (view === undefined) return;
-    approvalCardViews.delete(approvalId);
+    view.actionable = false;
+    view.pendingDecision = null;
     view.approve.disabled = true;
     view.reject.disabled = true;
     view.item.dataset.status = state;
@@ -606,11 +799,19 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   }
 
   const existing = approvalCardViews.get(approvalId);
-  if (existing !== undefined && existing.item.isConnected) return;
+  if (existing !== undefined && existing.item.isConnected) {
+    if (!approvalController.isSubmittingApproval(approvalId)) existing.pendingDecision = null;
+    existing.actionable = true;
+    existing.participantIdentity = credential?.participantIdentity ?? null;
+    existing.item.dataset.status = state;
+    renderApprovalCardAuthority(existing);
+    return;
+  }
 
   const item = document.createElement("li");
   item.dataset.role = "operation";
   item.dataset.operation = "approval";
+  item.dataset.approvalId = approvalId;
   item.dataset.status = state;
   const label = document.createElement("strong");
   label.textContent = "Approval required";
@@ -638,7 +839,10 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   reject.textContent = "Reject";
   controls.append(approve, reject);
   item.append(label, title, status, commandView, meta, controls);
-  const view = { approvalId, item, status, approve, reject };
+  const view: ApprovalCardView = {
+    approvalId, item, status, approve, reject, actionable: true,
+    participantIdentity: credential?.participantIdentity ?? null, pendingDecision: null,
+  };
   approvalCardViews.set(approvalId, view);
   // Disable this card's controls for the whole round trip. Without this a
   // double-click, or Approve immediately followed by Reject, issues two
@@ -649,17 +853,29 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
     reject.disabled = true;
     void submitApproval(approvalId, decision).catch(() => {
       addMarker("approval_failed");
-      // A failed decision consumes no sequence, so it may be retried. Restore
-      // the controls only while this request is still awaiting a decision.
-      if (approvalCardViews.get(approvalId) === view) {
-        approve.disabled = false;
-        reject.disabled = false;
-      }
     });
   };
   approve.addEventListener("click", () => submitDecision("approve"));
   reject.addEventListener("click", () => submitDecision("reject"));
+  renderApprovalCardAuthority(view);
   admitOperationCard(item);
+}
+
+function approvalCardHasAuthority(view: ApprovalCardView): boolean {
+  return view.actionable && controller.state === "connected" &&
+    view.participantIdentity === credential?.participantIdentity;
+}
+
+function renderApprovalCardAuthority(view: ApprovalCardView): void {
+  const enabled = approvalCardHasAuthority(view) && view.pendingDecision === null;
+  view.approve.disabled = !enabled;
+  view.reject.disabled = !enabled;
+  if (view.actionable) {
+    view.status.textContent = !approvalCardHasAuthority(view)
+      ? "Reconnect to review this approval."
+      : view.pendingDecision !== null ? "Submitting decision…"
+      : "Review the requested command before continuing.";
+  }
 }
 
 let partialTranscriptItem: HTMLLIElement | null = null;
@@ -698,7 +914,7 @@ function addUserTranscript(text: string): void {
   updateTranscriptBounded(view.item);
   if (!view.item.isConnected) activeUserTurn = null;
   syncTranscriptEmptyState();
-  view.item.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 function projectUserTranscript(source: UserTranscriptProjectionSource, text: string): void {
@@ -744,7 +960,7 @@ function updatePartialTranscript(role: "user" | "assistant", text: string): void
   const value = document.createElement("em");
   value.textContent = text;
   partialTranscriptItem.replaceChildren(label, value);
-  partialTranscriptItem.scrollIntoView({ block: "nearest" });
+  conversationHistory.follow();
 }
 
 interface AssistantSegmentView {
@@ -806,7 +1022,10 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
   request: requestVoiceDeleteWire,
   clear: () => {
     clearPartialTranscript();
-    transcript.replaceChildren();
+    for (const item of conversationHistory.clearTranscript(transcript, actionableApprovalCard)) {
+      transcriptRetention.remove(item);
+      forgetEvictedOperationCard(item);
+    }
     assistantTurns.clear();
     syncTranscriptEmptyState();
   },
@@ -941,7 +1160,7 @@ function renderAssistantTurnState(view: AssistantTurnView): void {
       snapshot.state === "interrupted" && unspoken.has(chunkId),
     );
   }
-  if (refreshAssistantRetention(view)) view.item.scrollIntoView({ block: "nearest" });
+  if (refreshAssistantRetention(view)) conversationHistory.follow();
 }
 
 function admitAssistantSegment(event: PublicEvent, text: string): boolean {
@@ -1484,7 +1703,6 @@ function maybeStartKaraoke(streamId: string): void {
       current?.classList.remove("karaoke-pending");
       current?.classList.add("karaoke-active");
       projectKaraokeGaps(segment, index);
-      current?.scrollIntoView({ block: "nearest", inline: "nearest" });
       activeKaraokeIndex = index;
     }
     activeKaraokeFrame = window.requestAnimationFrame(tick);
@@ -1551,6 +1769,7 @@ function projectPublicEvent(event: PublicEvent): void {
     }
   } else if (event.kind === "session_model") {
     const configuration = parseSessionModelConfiguration(event.data);
+    element<HTMLElement>("local-model-context").hidden = !("version" in configuration);
     formatSessionModelConfiguration(configuration).forEach((row, index) => {
       modelFields[index]!.textContent = row[1];
     });
@@ -1652,10 +1871,7 @@ function projectPublicEvent(event: PublicEvent): void {
   } else if (event.kind === "task_state") {
     projectTaskStateCard(event);
   } else if (event.kind === "task_result") {
-    const text = event.data.text;
-    if (typeof text === "string" && text.trim().length > 0) {
-      addBackgroundResult(text);
-    }
+    projectTaskResult(event);
   } else if (event.kind === "approval_state") {
     projectApprovalCard(event.data);
   }
@@ -1683,6 +1899,7 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
       });
       if (!response.ok) throw new Error("public event projection rejected");
       const batch = parseEventBatch(await response.json());
+      if (signal.aborted) return;
       for (const event of batch.events) {
         if (event.sequence !== eventSequence + 1) {
           throw new Error("public event sequence gap");
@@ -1707,15 +1924,29 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
           if (signal.aborted) return;
           error = resyncError;
         }
+        const failureGeneration = lifecycleAuthority.issue();
         const observedStopVersion = sessionStopVersion;
-        if (eventPolling?.signal === signal) {
-          eventPolling.abort();
-          eventPolling = null;
+        let superseded = false;
+        let refused: ConnectionFailure | null = null;
+        try {
+          if (eventPolling?.signal === signal) {
+            eventPolling.abort();
+            eventPolling = null;
+          }
+          await disconnectLocal();
+          if (!lifecycleAuthority.owns(failureGeneration)) {
+            superseded = true;
+            return;
+          }
+          if (observedStopVersion !== sessionStopVersion) return;
+          refused = { stage: "projection", category: connectionFailureCategory(error) };
+          connectionFailure = refused;
+          controller.failed();
+          throw error;
+        } finally {
+          if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
+          if (superseded) recordSupersededRecovery("projection");
         }
-        await disconnectLocal();
-        if (observedStopVersion !== sessionStopVersion) return;
-        controller.failed();
-        throw error;
       }
       addMarker("event_projection_retry");
       await new Promise<void>((resolve) =>
@@ -1730,6 +1961,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function setInteractive(connected: boolean): void {
+  for (const view of approvalCardViews.values()) renderApprovalCardAuthority(view);
   muteButton.disabled = !connected || activeMicrophoneTrack === null || microphoneMutePending;
   typedInput.disabled = !connected;
   sendButton.disabled = !connected;
@@ -1739,6 +1971,7 @@ function setInteractive(connected: boolean): void {
   const modelInteractive = connected && selectableModels !== null && !modelSelectionPending;
   modelSelect.disabled = !modelInteractive;
   effortSelect.disabled = !modelInteractive;
+  renderLocalModelPicker();
 }
 
 function renderMicrophoneMute(): void {
@@ -1813,9 +2046,10 @@ function renderModelSelection(
   effortSelect.value = selectedEffort;
 }
 
-async function loadModelConfiguration(): Promise<void> {
-  const activeCredential = credential;
-  if (activeCredential === null) return;
+async function loadModelConfiguration(
+  activeCredential: BootstrapCredential,
+  connectGeneration: object,
+): Promise<boolean> {
   const response = await fetch("/api/v1/models", {
     method: "POST",
     headers: authorization(activeCredential.token),
@@ -1824,21 +2058,24 @@ async function loadModelConfiguration(): Promise<void> {
     credentials: "omit",
     referrerPolicy: "no-referrer",
   });
-  if (!response.ok) {
+  const configuration = response.ok ? parseModelCatalog(await response.json()) : null;
+  if (!lifecycleAuthority.owns(connectGeneration)) return false;
+  if (configuration === null) {
     selectableModels = null;
     modelSelectionState.textContent = "Live selection is unavailable for this provider.";
     modelSelectionState.dataset.state = "error";
     setInteractive(controller.state === "connected");
     addMarker("model_catalog_unavailable");
-    return;
+    return true;
   }
-  selectableModels = parseModelCatalog(await response.json());
+  selectableModels = configuration;
   renderModelSelection(selectableModels);
   modelSelectionState.textContent =
     "Selected-model Codex options. Ultra is the highest provider effort.";
   modelSelectionState.dataset.state = "ready";
   setInteractive(controller.state === "connected");
   addMarker(`model_catalog_loaded_${selectableModels.models.length}`);
+  return true;
 }
 
 async function changeModelConfiguration(model: string, effort: string): Promise<void> {
@@ -1881,9 +2118,33 @@ async function changeModelConfiguration(model: string, effort: string): Promise<
   }
 }
 
-async function loadVoiceConfiguration(): Promise<void> {
-  const activeCredential = credential;
-  if (activeCredential === null) return;
+async function applyOutputStyle(
+  activeCredential: BootstrapCredential,
+  current: () => boolean,
+): Promise<void> {
+  await outputStyleControls.sync(async style => {
+    const styleCredential = credential;
+    if (styleCredential === null || styleCredential.participantIdentity !== activeCredential.participantIdentity) {
+      throw new Error("style session is stale");
+    }
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), 5_000);
+    try {
+      const response = await fetch("/api/v1/output-style", {
+        method: "POST",
+        headers: {...authorization(styleCredential.token), "Content-Type": "application/json"},
+        body: JSON.stringify({style}), cache: "no-store", credentials: "omit",
+        referrerPolicy: "no-referrer", signal: abort.signal,
+      });
+      return response.ok ? await response.json() : null;
+    } finally { window.clearTimeout(timer); }
+  }, () => current() && credential?.participantIdentity === activeCredential.participantIdentity);
+}
+
+async function loadVoiceConfiguration(
+  activeCredential: BootstrapCredential,
+  connectGeneration: object,
+): Promise<boolean> {
   const response = await fetch("/api/v1/voices", {
     method: "POST",
     headers: authorization(activeCredential.token),
@@ -1894,6 +2155,7 @@ async function loadVoiceConfiguration(): Promise<void> {
   });
   if (!response.ok) throw new Error("voice configuration rejected");
   const configuration = parseVoiceConfiguration(await response.json());
+  if (!lifecycleAuthority.owns(connectGeneration)) return false;
   voiceSelect.replaceChildren();
   for (const voice of configuration.voices) {
     const option = document.createElement("option");
@@ -1905,6 +2167,7 @@ async function loadVoiceConfiguration(): Promise<void> {
   if (selectedVoice !== null) voiceSelect.value = selectedVoice;
   voiceSelect.disabled = selectedVoice === null || controller.state !== "connected";
   addMarker(`voice_catalog_loaded_${configuration.voices.length}`);
+  return true;
 }
 
 async function changeVoice(voice: string): Promise<void> {
@@ -1941,6 +2204,7 @@ function renderConnectionPresentation(state = controller.state): void {
   connectionStatus.dataset.state = presentation.presentationState;
   readinessHeadline.textContent = presentation.headline;
   readinessDetail.textContent = presentation.detail;
+  renderConnectionRecovery(connectionRecovery, connectionFailure, canStartSession(), remoteStopRequired);
   voiceDeleteControls.render();
 }
 
@@ -1996,8 +2260,18 @@ function renderSessionToggle(state = controller.state): void {
     canStartSession(),
     remoteStopRequired,
   );
-  sessionToggleButton.textContent = toggle.label;
-  sessionToggleButton.disabled = toggle.disabled;
+  const localSelectionReady = localModelAllowsConnection();
+  const actionBlockedByLocalSelection = toggle.action === "connect" && !localSelectionReady;
+  sessionToggleButton.textContent = actionBlockedByLocalSelection
+    ? localModelDiscoveryState === "loading" || localModelDiscoveryState === "error"
+      ? "Check local model"
+      : localModelCatalog?.state === "preparing"
+        ? "Refresh host status"
+        : localModelSelect.value === ""
+          ? "Choose model"
+          : "Choose context"
+    : toggle.label;
+  sessionToggleButton.disabled = toggle.disabled || actionBlockedByLocalSelection;
   sessionToggleButton.classList.toggle("primary", toggle.action === "connect");
   sessionToggleButton.classList.toggle("danger", toggle.action === "stop");
 }
@@ -2006,6 +2280,7 @@ controller.subscribe((state) => {
   renderConnectionPresentation(state);
   renderSessionToggle(state);
   setInteractive(state === "connected");
+  for (const view of taskCardViews.values()) view.cancellation.refresh();
 });
 
 async function loadMicrophones(): Promise<void> {
@@ -2040,11 +2315,232 @@ function authorization(token: string): HeadersInit {
   };
 }
 
-class SessionRebindRejected extends Error {
-  constructor(readonly status: number) {
-    super("session rebind rejected");
+function localModelCapacity(value: number | null): string {
+  return value === null ? "Unknown" : `${value.toLocaleString("en-US")} tokens`;
+}
+
+function localModelLifecycleIsLocked(): boolean {
+  return ["connecting", "preparing", "connected", "reconnecting"].includes(controller.state);
+}
+
+function localModelChoiceIsValid(): boolean {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") return false;
+  const model = catalog.models.find((item) => item.model === localModelSelect.value);
+  const requested = localModelContextInput.value === "" ? NaN : localModelContextInput.valueAsNumber;
+  return model !== undefined && Number.isSafeInteger(requested) &&
+    requested >= catalog.minimumContextTokens && requested <= catalog.maximumContextTokens &&
+    (model.advertisedContextTokens === null || requested <= model.advertisedContextTokens);
+}
+
+function localModelAllowsConnection(): boolean {
+  if (localModelDiscoveryState === "disabled") return true;
+  if (localModelDiscoveryState !== "ready" || localModelCatalog === null) return false;
+  if (localModelCatalog.state === "prepared") return localModelCatalog.selection !== null;
+  if (localModelCatalog.state !== "configuring") return false;
+  return localModelChoiceIsValid();
+}
+
+function renderLocalModelPicker(): void {
+  const catalog = localModelCatalog;
+  const frozen = catalog?.state === "prepared" && catalog.selection !== null;
+  const unavailable = localModelDiscoveryState === "disabled";
+  if (existingModelControls !== null) {
+    existingModelControls.hidden = localModelDiscoveryState === "ready" && catalog !== null;
+  }
+  const lifecycleLocked = localModelLifecycleIsLocked();
+  const controlsDisabled = catalog === null || catalog.state !== "configuring" ||
+    localModelDiscoveryPending || localModelPreparationPending || frozen || lifecycleLocked;
+  localModelPicker.hidden = unavailable;
+  localModelOptions.hidden = catalog === null;
+  localModelOptions.disabled = controlsDisabled;
+  localModelSelect.disabled = controlsDisabled;
+  localModelContextInput.disabled = controlsDisabled;
+  localModelRetry.hidden = localModelDiscoveryState !== "error" && catalog?.state !== "preparing";
+  localModelRetry.disabled = localModelDiscoveryPending || localModelLifecycleIsLocked();
+  localModelPicker.dataset.ready = localModelDiscoveryState === "loading" || localModelDiscoveryPending
+    ? "false" : "true";
+
+  const selected = catalog?.models.find((item) => item.model === localModelSelect.value) ?? null;
+  const selection = catalog?.selection ?? null;
+  localModelAdvertised.textContent = localModelCapacity(
+    selection?.advertisedContextTokens ?? selected?.advertisedContextTokens ?? null,
+  );
+  localModelRequested.textContent = selection === null
+    ? localModelCapacity(localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber)
+    : localModelCapacity(selection.requestedContextTokens);
+  localModelEffective.textContent = selection === null
+    ? "Not observed"
+    : localModelCapacity(selection.effectiveContextTokens);
+
+  if (localModelDiscoveryState === "loading") {
+    localModelSelectionState.textContent = "Checking local model availability on this host…";
+    localModelBudgetNote.textContent = "Choose a model and context before connecting.";
+  } else if (localModelDiscoveryState === "error") {
+    localModelSelectionState.textContent = localModelDiscoveryError === null
+      ? "Local model discovery failed. Retry before connecting."
+      : `Local model discovery failed. ${localModelDiscoveryError} Retry before connecting.`;
+    localModelBudgetNote.textContent = "The host did not confirm whether local model selection is available.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (catalog?.state === "preparing") {
+    localModelSelectionState.textContent = "Local model preparation is already in progress. Refresh host status before connecting.";
+    localModelBudgetNote.textContent = "The host has not confirmed a frozen selection yet.";
+    delete localModelSelectionState.dataset.state;
+  } else if (frozen && selection !== null) {
+    localModelSelectionState.textContent = "Model fixed for this host. Restart the host to change it.";
+    localModelBudgetNote.textContent = "The prepared model and requested context are fixed for this host lifetime.";
+    localModelSelectionState.dataset.state = "ready";
+  } else if (catalog?.models.length === 0) {
+    localModelSelectionState.textContent = "No installed local models were found.";
+    localModelBudgetNote.textContent = "Restart the host after installing a local model.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (localModelPreparationPending) {
+    localModelSelectionState.textContent = "Checking readiness and preparing the local model before connecting…";
+    localModelBudgetNote.textContent = "This preparation has a separate bounded wait; no session starts until it succeeds.";
+    delete localModelSelectionState.dataset.state;
+  } else if (localModelPreparationError !== null) {
+    localModelSelectionState.textContent = `Local model preparation failed (${localModelPreparationError}). Retry readiness, or restart the host if installed models changed.`;
+    localModelBudgetNote.textContent = "No session was started; the host selection remains unchanged unless preparation succeeded.";
+    localModelSelectionState.dataset.state = "error";
+  } else if (catalog !== null) {
+    localModelSelectionState.textContent = "Choose a model and context before connecting.";
+    const model = catalog.models.find((item) => item.model === localModelSelect.value);
+    if (model === undefined) {
+      localModelBudgetNote.textContent = catalog.defaultModel === null
+        ? "Choose an installed local model and enter the requested context."
+        : "Choose an installed local model before connecting.";
+    } else if (model.advertisedContextTokens === null) {
+      localModelBudgetNote.textContent = "Advertised capacity is unknown; enter an explicit requested context between 2,048 and 262,144 tokens.";
+    } else if (catalog.defaultRequestedContextTokens > model.advertisedContextTokens) {
+      localModelBudgetNote.textContent = `The 16,384-token host default exceeds this model's advertised maximum; enter a valid smaller value.`;
+    } else {
+      localModelBudgetNote.textContent = `Host default: ${catalog.defaultRequestedContextTokens.toLocaleString("en-US")} tokens. Change it if needed.`;
+    }
+    delete localModelSelectionState.dataset.state;
+  }
+  renderSessionToggle();
+}
+
+function populateLocalModelPicker(catalog: LocalModelCatalog): void {
+  const placeholder = new Option(catalog.models.length === 0 ? "No installed models" : "Select a model", "");
+  localModelSelect.replaceChildren(placeholder, ...catalog.models.map((model) => {
+    const option = new Option(model.model, model.model);
+    return option;
+  }));
+  const initialModel = catalog.selection?.model ?? catalog.defaultModel;
+  localModelSelect.value = initialModel ?? "";
+  if (catalog.selection !== null) {
+    localModelContextInput.value = String(catalog.selection.requestedContextTokens);
+  } else {
+    const selected = catalog.models.find((item) => item.model === localModelSelect.value);
+    localModelContextInput.value = selected?.advertisedContextTokens !== null &&
+      selected !== undefined && catalog.defaultRequestedContextTokens <= selected.advertisedContextTokens
+      ? String(catalog.defaultRequestedContextTokens) : "";
+  }
+  renderLocalModelPicker();
+}
+
+function localModelAuthorization(): HeadersInit | undefined {
+  return capability === null ? undefined : authorization(capability);
+}
+
+async function discoverLocalModelSelection(): Promise<void> {
+  localModelDiscoveryAbort?.abort();
+  const abort = new AbortController();
+  localModelDiscoveryAbort = abort;
+  const generation = ++localModelDiscoveryGeneration;
+  localModelDiscoveryPending = true;
+  localModelDiscoveryState = "loading";
+  localModelPreparationError = null;
+  localModelDiscoveryError = null;
+  renderLocalModelPicker();
+  let accepted = false;
+  try {
+    const response = await fetchLocalModelRequest("/api/v1/local-models", {
+      method: "POST",
+      headers: localModelAuthorization(),
+      body: null,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    }, LOCAL_MODEL_METADATA_TIMEOUT_MS, abort.signal);
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
+    const availability = parseLocalModelCatalog(await response.json());
+    if (generation !== localModelDiscoveryGeneration || abort.signal.aborted) return;
+    accepted = true;
+    if (!availability.available) {
+      localModelCatalog = null;
+      localModelDiscoveryState = "disabled";
+    } else {
+      localModelCatalog = availability;
+      localModelDiscoveryState = "ready";
+      populateLocalModelPicker(availability);
+    }
+  } catch (error) {
+    if (generation !== localModelDiscoveryGeneration || abort.signal.aborted) return;
+    localModelCatalog = null;
+    localModelDiscoveryState = "error";
+    const failure = connectionFailureCategory(error);
+    localModelDiscoveryError = failure === "authorization-refused"
+      ? "Host refused the request (403)."
+      : failure === "service-unavailable"
+        ? "Host refused the request (503)."
+        : failure === "request-timed-out"
+          ? "Host request timed out (408)."
+          : failure === "request-refused"
+            ? "Host refused the request."
+            : "Host request failed.";
+    if (!(error instanceof LocalModelProtocolError)) {
+      console.info(`[local-model-selection-refusal] ${JSON.stringify({ category: failure })}`);
+    }
+  } finally {
+    if (generation === localModelDiscoveryGeneration) {
+      localModelDiscoveryPending = false;
+      localModelDiscoveryAbort = null;
+      if (!accepted && localModelDiscoveryState === "loading") localModelDiscoveryState = "error";
+      renderLocalModelPicker();
+    }
   }
 }
+
+async function prepareLocalModelSelection(
+  signal: AbortSignal,
+  connectGeneration: object,
+): Promise<void> {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") {
+    throw new Error("Local model catalog is not ready for preparation");
+  }
+  const request = localModelPreparationFor(
+    catalog,
+    localModelSelect.value,
+    localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber,
+  );
+  localModelPreparationPending = true;
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+  try {
+    const response = await fetchLocalModelRequest("/api/v1/local-model-prepare", {
+      method: "POST",
+      headers: { ...localModelAuthorization(), "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    }, LOCAL_MODEL_PREPARATION_TIMEOUT_MS, signal);
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
+    const prepared = parseLocalModelPreparation(await response.json(), request, catalog);
+    if (signal.aborted || !lifecycleAuthority.owns(connectGeneration)) {
+      throw new Error("Local model preparation was superseded");
+    }
+    localModelCatalog = { ...catalog, state: "prepared", selection: prepared };
+  } finally {
+    localModelPreparationPending = false;
+    renderLocalModelPicker();
+  }
+}
+
+class SessionRebindRejected extends ConnectionRequestRejected {}
 
 async function connectionFetch(
   input: RequestInfo | URL,
@@ -2074,21 +2570,27 @@ function tabStorage(): Storage | null {
 
 // Every new credential passes here, so the tab remembers the session's current identity.
 // Clearing the in-memory credential never forgets it: only a definitive verdict does (the
-// stop that succeeded, or a reload rebind answered 403 or 409).
+// stop that succeeded, or a rebind answered 403 or 409).
 function setCredential(value: BootstrapCredential | null): void {
+  invalidateTypedSubmissions();
   credential = value;
+  for (const view of taskCardViews.values()) view.cancellation.refresh();
   if (stableLaunch && value !== null) {
-    rememberSession(tabStorage(), { identity: value.participantIdentity, requestId: null });
+    rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });
   }
 }
 
-async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredential> {
+async function bootstrapOrReload(
+  signal: AbortSignal,
+  onStage: (stage: ConnectionFailureStage) => void,
+): Promise<BootstrapCredential> {
   if (!stableLaunch) return bootstrap(signal);
   let reloaded = false;
   const result = await reloadOrBootstrap({
-    storage: tabStorage(),
+    storage: sessionRecoveryStorage,
     newRequestId: () => `rebind_${crypto.randomUUID()}`,
     rebind: async (path, body) => {
+      onStage("rebind");
       const response = await connectionFetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2100,7 +2602,10 @@ async function bootstrapOrReload(signal: AbortSignal): Promise<BootstrapCredenti
       reloaded = response.ok;
       return response;
     },
-    bootstrap: () => bootstrap(signal),
+    bootstrap: () => {
+      onStage("bootstrap");
+      return bootstrap(signal);
+    },
     parse: parseBootstrapCredential,
   });
   if (reloaded) addMarker("session_reloaded");
@@ -2119,7 +2624,7 @@ async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
   }, signal);
   capability = null;
   if (!response.ok) {
-    throw new Error("bootstrap denied");
+    throw new ConnectionRequestRejected(response.status);
   }
   return parseBootstrapCredential(await response.json());
 }
@@ -2174,7 +2679,7 @@ async function announceMediaActivation(
       referrerPolicy: "no-referrer",
       signal: request.signal,
     });
-    if (!response.ok) throw new Error("media activation rejected");
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
   } finally {
     window.clearTimeout(timeout);
     signal?.removeEventListener("abort", abort);
@@ -2252,7 +2757,7 @@ async function projectionResyncBrowserCredential(
     credentials: "omit",
     referrerPolicy: "no-referrer",
   }, signal);
-  if (!response.ok) throw new Error("public event projection resync rejected");
+  if (!response.ok) throw new ConnectionRequestRejected(response.status);
   const replacement = parseBootstrapCredential(await response.json());
   if (replacement.participantIdentity === activeCredential.participantIdentity) {
     throw new Error("public event projection resync did not rotate credential authority");
@@ -2263,31 +2768,48 @@ async function projectionResyncBrowserCredential(
 async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
   const activeCredential = credential;
   if (activeCredential === null) throw new Error("active credential is unavailable");
+  const recoveryGeneration = lifecycleAuthority.issue();
   const observedStopVersion = sessionStopVersion;
-  const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
-  if (signal.aborted || sessionStopVersion !== observedStopVersion) return;
-  setCredential(replacement);
-  pendingRebindRequestId = null;
-  clearCredentialRefresh();
-  eventSequence = 0;
-  resetSessionInputAuthority();
-  if (eventPolling?.signal === signal) eventPolling = null;
-  addMarker("event_projection_resynced");
-  await disconnectLocal();
-  if (
-    signal.aborted ||
-    sessionStopVersion !== observedStopVersion ||
-    controller.state !== "disconnected"
-  ) {
-    return;
+  let superseded = false;
+  try {
+    const replacement = await projectionResyncBrowserCredential(activeCredential, signal);
+    if (signal.aborted || sessionStopVersion !== observedStopVersion) {
+      superseded = true;
+      return;
+    }
+    setCredential(replacement);
+    pendingRebindRequestId = null;
+    clearCredentialRefresh();
+    eventSequence = 0;
+    resetSessionInputAuthority();
+    if (eventPolling?.signal === signal) eventPolling = null;
+    addMarker("event_projection_resynced");
+    await disconnectLocal();
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (
+      signal.aborted ||
+      sessionStopVersion !== observedStopVersion ||
+      controller.state !== "disconnected"
+    ) {
+      return;
+    }
+    await connect(true);
+  } finally {
+    if (superseded) recordSupersededRecovery("projection");
   }
-  await connect(true);
 }
 
 function resetSessionInputAuthority(): void {
   inputSequence = 0;
-  microphoneProcessingEvidence = null;
   approvalController.reset();
+  resetBindingInputAuthority();
+}
+
+function resetBindingInputAuthority(): void {
+  microphoneProcessingEvidence = null;
   evidenceControls.reset();
   searchEgressControls.reset();
 }
@@ -2343,7 +2865,45 @@ async function submitAudioDiagnostic(
   });
 }
 
+function recordSupersededRecovery(stage: ConnectionFailureStage): void {
+  console.info(`[connection-recovery] ${JSON.stringify({ stage, category: "superseded" })}`);
+}
+
+async function handleWorkerDeparture(activeRoom: Room, participant: RemoteParticipant): Promise<void> {
+  let refused: ConnectionFailure | null = null;
+  let superseded = false;
+  let ignored = false;
+  try {
+    if (
+      room !== activeRoom ||
+      participant.identity !== credential?.workerIdentity ||
+      !admittedRooms.has(activeRoom)
+    ) {
+      ignored = true;
+      return;
+    }
+    const departureGeneration = lifecycleAuthority.issue();
+    await disconnectLocal();
+    // A user stop or a newer connection owns its own outcome.
+    if (!lifecycleAuthority.owns(departureGeneration)) {
+      superseded = true;
+      return;
+    }
+    refused = { stage: "worker", category: "request-failed" };
+    connectionFailure = refused;
+    renderConnectionPresentation();
+    addMarker("speech_worker_disconnected");
+  } finally {
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
+    if (superseded) recordSupersededRecovery("worker");
+    if (ignored) console.info(`[connection-recovery] ${JSON.stringify({ stage: "worker", category: "irrelevant-departure" })}`);
+  }
+}
+
 function bindRoomEvents(activeRoom: Room): void {
+  activeRoom.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+    void handleWorkerDeparture(activeRoom, participant);
+  });
   activeRoom.on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
     if (room !== activeRoom) return;
     if (terminalDisconnectIsAuthoritative(state, admittedRooms.has(activeRoom))) {
@@ -2361,6 +2921,7 @@ function bindRoomEvents(activeRoom: Room): void {
       microphoneReadinessAuthority.invalidate();
       microphoneEnumerationAuthority.invalidate();
       microphoneReady = null;
+      invalidateTypedSubmissions();
       controller.reconnecting();
       addMarker("media_reconnecting");
     } else if (
@@ -2675,10 +3236,16 @@ async function reverifyMicrophoneAfterNativeReconnect(
 }
 
 async function connect(projectionResync = false): Promise<void> {
+  if (!localModelAllowsConnection()) {
+    addMarker("local_model_selection_required");
+    return;
+  }
+  const connectGeneration = lifecycleAuthority.issue();
+  connectionFailure = null;
   clearPartialTranscript();
   prepareMicrophoneSignalMonitor();
   const startingState = controller.state;
-  const disconnectedResume = startingState === "disconnected";
+  const disconnectedResume = startingState === "disconnected" && credential !== null;
   const errorResume = startingState === "error" && credential !== null;
   const resuming = disconnectedResume || errorResume;
   if (!resuming && credential === null && !stableLaunch && capability === null) {
@@ -2732,7 +3299,30 @@ async function connect(projectionResync = false): Promise<void> {
   let attemptedRoom: Room | null = null;
   let attempt: ConnectionAttempt<Room> | null = null;
   let sessionReplaced = false;
+  let failureStage: ConnectionFailureStage = resuming ? "rebind" : "bootstrap";
+  let refused: ConnectionFailure | null = null;
+  let superseded = false;
+  const commitCredential = (candidate: BootstrapCredential): void => {
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) {
+      throw new Error("connection superseded");
+    }
+    setCredential(candidate);
+  };
+  const retireRejectedCredential = (error: unknown): boolean => {
+    if (!(error instanceof SessionRebindRejected) || !reloadRebindIsSettled(error.status)) return false;
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) throw error;
+    clearCredentialRefresh();
+    setCredential(null);
+    pendingRebindRequestId = null;
+    if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
+    return true;
+  };
   try {
+    if (!resuming && localModelCatalog?.state === "configuring") {
+      failureStage = "configuration";
+      await prepareLocalModelSelection(localOperation.signal, connectGeneration);
+      failureStage = "bootstrap";
+    }
     if (resuming) {
       const previousCredential = credential;
       if (previousCredential === null) throw new Error("resume credential is unavailable");
@@ -2748,7 +3338,7 @@ async function connect(projectionResync = false): Promise<void> {
         eventPolling?.abort();
         eventPolling = null;
         try {
-          setCredential(
+          commitCredential(
             await rebindBrowserCredential(
               previousCredential,
               localOperation.signal,
@@ -2757,9 +3347,10 @@ async function connect(projectionResync = false): Promise<void> {
           );
           addMarker("session_rebound", started);
         } catch (error) {
-          if (localOperation.signal.aborted) throw error;
           try {
-            setCredential(
+            if (retireRejectedCredential(error)) throw error;
+            if (localOperation.signal.aborted) throw error;
+            commitCredential(
               await rebindBrowserCredential(
                 previousCredential,
                 localOperation.signal,
@@ -2768,6 +3359,7 @@ async function connect(projectionResync = false): Promise<void> {
             );
             addMarker("session_rebound_after_retry", started);
           } catch (retryError) {
+            retireRejectedCredential(retryError);
             if (localOperation.signal.aborted) throw retryError;
             if (!stableLaunch) throw retryError;
             if (
@@ -2776,17 +3368,32 @@ async function connect(projectionResync = false): Promise<void> {
             ) {
               throw retryError;
             }
-            setCredential(await bootstrap(localOperation.signal));
+            failureStage = "bootstrap";
+            controller.disconnected();
+            controller.beginConnect();
+            commitCredential(await bootstrap(localOperation.signal));
+            controller.bootstrapReady();
             sessionReplaced = true;
             resetSessionInputAuthority();
             addMarker("session_replaced", started);
           }
         }
-        if (!sessionReplaced) resetSessionInputAuthority();
+        // Ordinary rebind retains the server's input and approval counters.
+        // Transfer retained card bindings without changing captured submission owners.
+        if (!sessionReplaced) {
+          resetBindingInputAuthority();
+          for (const view of [...taskCardViews.values(), ...approvalCardViews.values()]) {
+            if (view.participantIdentity === previousCredential.participantIdentity) {
+              view.participantIdentity = credential!.participantIdentity;
+            }
+          }
+        }
         pendingRebindRequestId = null;
       }
     } else {
-      setCredential(await bootstrapOrReload(localOperation.signal));
+      commitCredential(await bootstrapOrReload(localOperation.signal, (stage) => {
+        failureStage = stage;
+      }));
       pendingRebindRequestId = null;
       resetSessionInputAuthority();
       addMarker("bootstrap_complete", started);
@@ -2794,6 +3401,8 @@ async function connect(projectionResync = false): Promise<void> {
     }
     const activeCredential = credential;
     if (activeCredential === null) throw new Error("active credential is unavailable");
+    await applyOutputStyle(activeCredential, () => lifecycleAuthority.owns(connectGeneration));
+    if (!lifecycleAuthority.owns(connectGeneration)) { superseded = true; return; }
     // No SDK disconnect on page leave: it would read as a dropped connection, and the
     // leaving page would rebind, rotating the identity a reloaded tab is about to present.
     const activeRoom = new Room({
@@ -2808,6 +3417,7 @@ async function connect(projectionResync = false): Promise<void> {
     room = activeRoom;
     microphoneEnumerationAuthority.invalidate();
     bindRoomEvents(activeRoom);
+    failureStage = "media";
     await activeRoom.connect(activeCredential.url, activeCredential.token, {
       autoSubscribe: true,
     });
@@ -2827,6 +3437,7 @@ async function connect(projectionResync = false): Promise<void> {
     );
     scheduleCredentialRefresh(activeCredential);
     const incarnation = nextMediaIncarnation();
+    failureStage = "microphone";
     const activation = await enableSelectedMicrophone(activeRoom, incarnation);
     const settled = await settleMicrophoneVerification(
       attempt.owns(connectionAttempt) &&
@@ -2856,6 +3467,7 @@ async function connect(projectionResync = false): Promise<void> {
       microphoneSignalMonitor.stop();
       clearVoicePathReadinessTimer();
     }
+    failureStage = "activation";
     const mediaCommitted = await settleMediaActivation(
       announceMediaActivation(activeCredential, incarnation, localOperation.signal),
       () =>
@@ -2885,11 +3497,19 @@ async function connect(projectionResync = false): Promise<void> {
         if (!eventPolling?.signal.aborted) addMarker("event_projection_failed");
       });
     }
-    await loadVoiceConfiguration();
-    await loadModelConfiguration();
-  } catch {
+    failureStage = "configuration";
+    if (!await loadVoiceConfiguration(activeCredential, connectGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (!await loadModelConfiguration(activeCredential, connectGeneration)) superseded = true;
+  } catch (error) {
     if (attempt !== null && !attempt.owns(connectionAttempt)) {
       await closeLocalRoom(attemptedRoom);
+      return;
+    }
+    if (!lifecycleAuthority.owns(connectGeneration) || localOperation.signal.aborted) {
+      superseded = true;
       return;
     }
     if (controller.state === "stopping") return;
@@ -2897,9 +3517,22 @@ async function connect(projectionResync = false): Promise<void> {
     const detachedAttemptedRoom = room === attemptedRoom ? null : attemptedRoom;
     await disconnectLocal();
     if (detachedAttemptedRoom !== null) await closeLocalRoom(detachedAttemptedRoom);
+    if (!lifecycleAuthority.owns(connectGeneration)) {
+      superseded = true;
+      return;
+    }
     if (sessionStopVersion !== observedStopVersion) return;
-    if (resuming) {
+    refused = { stage: failureStage, category: connectionFailureCategory(error) };
+    connectionFailure = refused;
+    const localPreparationFailed = failureStage === "configuration" &&
+      credential === null && localModelCatalog?.state === "configuring";
+    if (localPreparationFailed) {
+      localModelPreparationError = connectionFailureCategory(error);
+      renderLocalModelPicker();
+    }
+    if (resuming && failureStage !== "bootstrap") {
       controller.disconnected();
+      renderConnectionPresentation();
       addMarker("media_reconnect_failed", started);
       return;
     }
@@ -2907,10 +3540,12 @@ async function connect(projectionResync = false): Promise<void> {
     eventPolling?.abort();
     eventPolling = null;
     setCredential(null);
-    capability = null;
+    if (!localPreparationFailed) capability = null;
     controller.failed();
     addMarker("connection_failed", started);
   } finally {
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
+    if (superseded) recordSupersededRecovery(failureStage);
     if (attempt !== null && attempt.owns(connectionAttempt)) connectionAttempt = null;
     if (operation === localOperation) operation = null;
   }
@@ -2981,6 +3616,14 @@ async function closeLocalRoom(
 }
 
 async function disconnectLocal(): Promise<void> {
+  outputStyleControls.reset();
+  const uncertainInputCredential = activeTypedSubmission !== null && !remoteStopRequired &&
+    activeTypedSubmission.participantIdentity === credential?.participantIdentity
+    ? credential : null;
+  invalidateTypedSubmissions();
+  if (uncertainInputCredential !== null) retireUncertainInputCredential();
+  eventPolling?.abort();
+  eventPolling = null;
   microphoneVerificationGeneration += 1;
   voicePathState = "waiting";
   clearVoicePathReadinessTimer();
@@ -3006,30 +3649,45 @@ async function disconnectLocal(): Promise<void> {
   locallySilencedSpeech = null;
   speechYieldPending = false;
   renderSpeechControl("idle");
-  await closeLocalRoom(activeRoom, authoritativeTrack);
+  const cleanup = closeLocalRoom(activeRoom, authoritativeTrack);
+  microphoneReady = null;
   if (["connecting", "preparing", "connected", "reconnecting"].includes(controller.state)) {
     controller.disconnected();
   }
-  microphoneReady = null;
   addMarker("media_disconnected");
+  // Room and microphone authority have already been released. Await only the captured
+  // room's cleanup; a newer connection must not be changed after this await.
+  await cleanup;
 }
 
 async function recoverTerminalMediaDisconnect(): Promise<void> {
+  const recoveryGeneration = lifecycleAuthority.issue();
   const observedStopVersion = sessionStopVersion;
-  await disconnectLocal();
-  if (
-    sessionStopVersion !== observedStopVersion ||
-    credential === null ||
-    controller.state !== "disconnected"
-  ) return;
-  addMarker("media_terminal_rebind_started");
-  await connect();
+  let superseded = false;
+  try {
+    await disconnectLocal();
+    if (!lifecycleAuthority.owns(recoveryGeneration)) {
+      superseded = true;
+      return;
+    }
+    if (
+      sessionStopVersion !== observedStopVersion ||
+      credential === null ||
+      controller.state !== "disconnected"
+    ) return;
+    addMarker("media_terminal_rebind_started");
+    await connect();
+  } finally {
+    if (superseded) recordSupersededRecovery("media");
+  }
 }
 
 async function stop(): Promise<void> {
   const activeCredential = credential;
   if (activeCredential === null) return;
   const rebindRequestId = pendingRebindRequestId;
+  lifecycleAuthority.invalidate();
+  connectionFailure = null;
   controller.beginStop();
   sessionStopVersion += 1;
   remoteStopRequired = true;
@@ -3038,6 +3696,7 @@ async function stop(): Promise<void> {
   await disconnectLocal();
   const stopRequest = new AbortController();
   const stopTimeout = window.setTimeout(() => stopRequest.abort(), stopRequestTimeoutMs);
+  let refused: ConnectionFailure | null = null;
   try {
     const response = await fetch("/api/v1/stop", {
       method: "POST",
@@ -3054,13 +3713,16 @@ async function stop(): Promise<void> {
       referrerPolicy: "no-referrer",
       signal: stopRequest.signal,
     });
-    if (!response.ok) throw new Error("session stop was rejected");
+    if (!response.ok) throw new ConnectionRequestRejected(response.status);
   } catch (error) {
+    refused = { stage: "stop", category: connectionFailureCategory(error) };
+    connectionFailure = refused;
     controller.stopFailed(false);
     addMarker("session_stop_failed");
     throw error;
   } finally {
     window.clearTimeout(stopTimeout);
+    if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);
   }
   remoteStopRequired = false;
   pendingRebindRequestId = null;
@@ -3069,20 +3731,15 @@ async function stop(): Promise<void> {
   microphoneSignalMonitor.stop();
   setCredential(null);
   // The remote stop succeeded: the session is gone, so the tab forgets it.
-  if (stableLaunch) rememberSession(tabStorage(), null);
+  if (stableLaunch) rememberSession(sessionRecoveryStorage, null);
   capability = null;
   microphoneReady = null;
   userMicrophoneMuted = false;
   microphoneMutePending = false;
   renderMicrophoneMute();
   typedInput.value = "";
-  for (const view of approvalCardViews.values()) {
-    view.approve.disabled = true;
-    view.reject.disabled = true;
-    view.status.textContent = "Session stopped before a decision.";
-  }
-  approvalCardViews.clear();
-  taskCardViews.clear();
+  // Media disconnect leaves durable work alive. Preserve exact-card identity
+  // for the task state/result replay when the browser next connects.
   speechFields.forEach((field, index) => {
     field.textContent = index % 2 === 0 ? "Awaiting session" : "—";
   });
@@ -3102,23 +3759,96 @@ async function stop(): Promise<void> {
 
 async function submitTyped(text: string): Promise<void> {
   const activeCredential = credential;
-  if (activeCredential === null) throw new Error("no active credential");
-  const sequence = inputSequence + 1;
-  const response = await fetch("/api/v1/input", {
-    method: "POST",
-    headers: {
-      ...authorization(activeCredential.token),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ sequence, text }),
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-  });
-  if (!response.ok) throw new Error("typed input rejected");
-  inputSequence = sequence;
-  projectUserTranscript("typed-admission", text);
-  addMarker("typed_input_admitted");
+  const activeRoom = room;
+  const generation = typedSubmissionGeneration;
+  let refusal: string | null = null;
+  let admitted = false;
+  try {
+    if (activeCredential === null || activeRoom === null || controller.state !== "connected") {
+      refusal = "disconnected";
+      throw new Error("input requires a connected session");
+    }
+    if (typedSubmissionCount >= maxTypedSubmissions) {
+      refusal = "capacity";
+      throw new Error("input submission capacity exhausted");
+    }
+    typedSubmissionCount += 1;
+    admitted = true;
+    const requireCurrent = (): void => {
+      if (generation !== typedSubmissionGeneration) {
+        refusal = "stale";
+        throw new Error("input belongs to a stale connection");
+      }
+    };
+    await typedSubmissionQueue.run(async () => {
+      requireCurrent();
+      const sequence = inputSequence + 1;
+      const abort = new AbortController();
+      activeTypedSubmission = { abort, participantIdentity: activeCredential.participantIdentity };
+      const timeout = window.setTimeout(() => abort.abort(), stopRequestTimeoutMs);
+      try {
+        const response = await fetch("/api/v1/input", {
+          method: "POST",
+          headers: {
+            ...authorization(activeCredential.token),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ sequence, text }),
+          cache: "no-store",
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          signal: abort.signal,
+        });
+        requireCurrent();
+        if (!response.ok) {
+          refusal = "admission-refused";
+          throw new Error("typed input rejected");
+        }
+        inputSequence = sequence;
+        projectUserTranscript("typed-admission", text);
+        addMarker("typed_input_admitted");
+      } catch (error) {
+        // HTTP error statuses classify exceptions across dispatch and projection;
+        // none proves that the command had no effect. A rotated participant owns
+        // a replacement binding, so a late old response cannot retire it.
+        if (credential?.participantIdentity === activeCredential.participantIdentity) {
+          refusal = "acknowledgment-uncertain";
+          await disconnectLocal();
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeout);
+        activeTypedSubmission = null;
+      }
+    });
+  } catch (error) {
+    refusal ??= "request-failed";
+    throw error;
+  } finally {
+    if (admitted) typedSubmissionCount -= 1;
+    if (refusal !== null) console.info(`[input-control-refusal] ${JSON.stringify({
+      kind: "typed-input", category: refusal, pending_count: typedSubmissionCount,
+    })}`);
+  }
+}
+
+function invalidateTypedSubmissions(): void {
+  typedSubmissionGeneration = Object.freeze({});
+  activeTypedSubmission?.abort.abort();
+}
+
+function retireUncertainInputCredential(): void {
+  clearCredentialRefresh();
+  setCredential(null);
+  renderSessionToggle();
+  const notice = document.createElement("li");
+  notice.dataset.role = "operation";
+  notice.dataset.operation = "input-control";
+  notice.setAttribute("role", "status");
+  notice.textContent = stableLaunch
+    ? "Input acknowledgment was lost. Reconnect before sending more input. The previous command may have been admitted."
+    : "Input acknowledgment was lost. Open a fresh launch before sending more input. The previous command may have been admitted.";
+  admitOperationCard(notice);
 }
 
 async function requestVoiceDeleteWire(
@@ -3241,19 +3971,20 @@ async function submitApproval(
   if (view === undefined) {
     throw new Error("no approval is actionable");
   }
-  view.approve.disabled = true;
-  view.reject.disabled = true;
-  view.status.textContent = "Submitting decision…";
+  const pending = { participantIdentity: credential!.participantIdentity };
+  view.pendingDecision = pending;
+  renderApprovalCardAuthority(view);
   try {
     await approvalController.submit(approvalId, decision);
     addMarker(`approval_${decision}`);
+    if (view.pendingDecision === pending && approvalCardHasAuthority(view)) {
+      view.status.textContent = "Decision submitted. Waiting for task update.";
+    }
   } catch (error) {
-    // Leave the card actionable so the operator can retry this exact request;
-    // the authoritative resolution event is what removes it from the map.
-    if (approvalCardViews.get(approvalId) === view) {
-      view.approve.disabled = false;
-      view.reject.disabled = false;
-      view.status.textContent = "Decision failed. Try again.";
+    if (view.pendingDecision === pending) {
+      view.pendingDecision = null;
+      renderApprovalCardAuthority(view);
+      if (approvalCardHasAuthority(view)) view.status.textContent = "Decision failed. Try again.";
     }
     throw error;
   }
@@ -3262,7 +3993,7 @@ async function submitApproval(
 sessionToggleButton.addEventListener("click", () => {
   const action = sessionTogglePresentation(
     controller.state,
-    canStartSession(),
+    canStartSession() && localModelAllowsConnection(),
     remoteStopRequired,
   ).action;
   if (action === "connect") {
@@ -3294,6 +4025,25 @@ remoteAudio.addEventListener("stalled", rendererInterrupted);
 remoteAudio.addEventListener("error", rendererInterrupted);
 muteButton.addEventListener("click", () => void toggleMicrophoneMute());
 voiceSelect.addEventListener("change", () => void changeVoice(voiceSelect.value));
+localModelSelect.addEventListener("change", () => {
+  const catalog = localModelCatalog;
+  if (catalog === null || catalog.state !== "configuring") return;
+  const model = catalog.models.find((item) => item.model === localModelSelect.value);
+  const requested = localModelContextInput.value === "" ? NaN : localModelContextInput.valueAsNumber;
+  if (
+    model === undefined || model.advertisedContextTokens === null ||
+    !Number.isSafeInteger(requested) || requested > model.advertisedContextTokens
+  ) {
+    localModelContextInput.value = "";
+  }
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+});
+localModelContextInput.addEventListener("input", () => {
+  localModelPreparationError = null;
+  renderLocalModelPicker();
+});
+localModelRetry.addEventListener("click", () => void discoverLocalModelSelection());
 modelSelect.addEventListener("change", () => {
   const catalog = selectableModels;
   if (catalog === null) return;
@@ -3328,3 +4078,4 @@ try {
   controller.failed();
   addMarker("fresh_launch_required");
 }
+void discoverLocalModelSelection();

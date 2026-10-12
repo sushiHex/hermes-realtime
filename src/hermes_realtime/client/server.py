@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import json
 import re
 import ssl
+import sys
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import urlsplit
@@ -199,14 +201,28 @@ class BrowserHttpServer:
                 peer = LoopbackPeerAddress.from_peername(peername)
             except Exception:
                 peer = None
+        refusal_status: int | None = None
         try:
             response = await self._read_and_dispatch(reader, peer=peer)
         except Exception as error:
-            response = self._error_response(error_status(error))
+            refusal_status = error_status(error)
+            response = self._error_response(refusal_status)
         try:
             writer.write(self._encode_response(response))
             await writer.drain()
         finally:
+            if refusal_status is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        "[browser-request] "
+                        + json.dumps(
+                            {"version": 1, "category": "request_refused", "status": refusal_status},
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
             writer.close()
             with contextlib.suppress(Exception):
                 async with asyncio.timeout(1.0):
