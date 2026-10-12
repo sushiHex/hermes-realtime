@@ -85,7 +85,7 @@ async def test_identity_change_during_discovery_refuses():
 
 
 @pytest.mark.parametrize("maximum", [None, True, 0, -1, 100_000_001, "4096", 4096.0])
-async def test_invalid_capacity_stays_unknown_requires_explicit_setting(maximum):
+async def test_invalid_capacity_stays_unknown_requires_explicit_setting(maximum, capsys):
     client = OllamaModelClient(
         base_url="http://127.0.0.1:11434", read_request=Backend(maximum=maximum)
     )
@@ -99,6 +99,84 @@ async def test_invalid_capacity_stays_unknown_requires_explicit_setting(maximum)
         ).requested_context_tokens
         == 4096
     )
+    reports = [
+        json.loads(line.removeprefix("[ollama-discovery] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-discovery] ")
+    ]
+    assert reports == [
+        {"version": 1, "category": "capacity_unknown" if maximum is None else "capacity_refused"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "info",
+    ["missing", None, {}, {"general.architecture": None}, {"general.architecture": "synthetic"}],
+    ids=[
+        "missing-info",
+        "null-info",
+        "missing-architecture",
+        "null-architecture",
+        "missing-capacity",
+    ],
+)
+async def test_absent_advertised_capacity_remains_unknown_without_refusal(info, capsys):
+    backend = Backend()
+
+    async def read(endpoint, body):
+        payload = json.loads(await backend(endpoint, body))
+        if endpoint == "show":
+            if info == "missing":
+                payload.pop("model_info")
+            else:
+                payload["model_info"] = info
+        return json.dumps(payload).encode()
+
+    model = await OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read).discover(
+        "test:latest"
+    )
+    assert model.advertised_context_tokens is None
+    reports = [
+        json.loads(line.removeprefix("[ollama-discovery] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-discovery] ")
+    ]
+    assert reports == [{"version": 1, "category": "capacity_unknown"}]
+
+
+@pytest.mark.parametrize("malformed", ["capacity", "info", "architecture"])
+@pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+async def test_refused_advertised_capacity_still_allows_explicit_session_choice(malformed, capsys):
+    backend = Backend()
+
+    async def read(endpoint, body):
+        payload = json.loads(await backend(endpoint, body))
+        if endpoint == "show":
+            if malformed == "capacity":
+                payload["model_info"]["synthetic.context_length"] = True
+            elif malformed == "info":
+                payload["model_info"] = False
+            else:
+                payload["model_info"]["general.architecture"] = False
+        return json.dumps(payload).encode()
+
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434",
+        model="test:latest",
+        metadata_client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read),
+    )
+    try:
+        await inference.configure_context(4096)
+        assert inference.context_public_data()["advertisedContextTokens"] is None
+        assert inference.context_public_data()["requestedContextTokens"] == 4096
+        reports = [
+            json.loads(line.removeprefix("[ollama-discovery] "))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[ollama-discovery] ")
+        ]
+        assert reports == [{"version": 1, "category": "capacity_refused"}]
+    finally:
+        await inference.close()
 
 
 async def test_requested_context_does_not_allocate_advertised_maximum():
@@ -413,16 +491,20 @@ async def test_selected_model_requires_one_consistent_row(row, expected, boundar
             )
 
 
-async def test_effective_context_refuses_invalid_capacity():
+@pytest.mark.parametrize(
+    "capacity",
+    [True, False, 0, -1, 100_000_001, "4096", 4096.0, [], {}],
+    ids=["true", "false", "zero", "negative", "oversized", "string", "float", "array", "object"],
+)
+async def test_effective_context_refuses_invalid_capacity(capacity):
     async def read(endpoint, body):
         return json.dumps(
-            {"models": [{"name": "test:latest", "digest": DIGEST, "context_length": True}]}
+            {"models": [{"name": "test:latest", "digest": DIGEST, "context_length": capacity}]}
         ).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
-    assert (
-        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072)) is None
-    )
+    with pytest.raises(ValueError, match="capacity"):
+        await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
 
 
 @pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
@@ -710,6 +792,7 @@ async def test_allocation_observability_failure_stays_unknown():
         ("absent", "unknown"),
         ("capacity_missing", "unknown"),
         ("capacity_null", "unknown"),
+        ("capacity_invalid", "metadata_refused"),
     ],
 )
 async def test_allocation_source_refusals_are_distinct_from_unavailable_capacity(
@@ -739,6 +822,8 @@ async def test_allocation_source_refusals_are_distinct_from_unavailable_capacity
                 row.pop("context_length")
             elif case == "capacity_null":
                 row["context_length"] = None
+            elif case == "capacity_invalid":
+                row["context_length"] = True
         return json.dumps(payload).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)

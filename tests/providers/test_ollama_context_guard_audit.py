@@ -102,7 +102,7 @@ async def test_malformed_model_rows_make_optional_allocation_unknown():
         {"general.architecture": "x" * 129, f"{'x' * 129}.context_length": 4096},
     ],
 )
-async def test_capacity_stays_unknown_without_bounded_architecture_metadata(info):
+async def test_capacity_stays_unknown_without_bounded_architecture_metadata(info, capsys):
     async def read(endpoint, body):
         if endpoint == "show":
             payload = {"capabilities": ["completion"], "model_info": info}
@@ -117,6 +117,12 @@ async def test_capacity_stays_unknown_without_bounded_architecture_metadata(info
     ).discover(MODEL.model)
     assert metadata.advertised_context_tokens is None
     assert OllamaContextConfiguration(metadata, 4096).requested_context_tokens == 4096
+    reports = [
+        json.loads(line.removeprefix("[ollama-discovery] "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[ollama-discovery] ")
+    ]
+    assert reports == [{"version": 1, "category": "capacity_refused"}]
 
 
 async def test_closed_adapter_refuses_context_configuration_before_metadata_io():

@@ -41,6 +41,28 @@ def _capacity(value: object) -> int | None:
     return value if type(value) is int and 1 <= value <= _MAX_CAPACITY else None
 
 
+def _optional_capacity(value: object) -> int | None:
+    if value is None:
+        return None
+    capacity = _capacity(value)
+    if capacity is None:
+        raise ValueError("metadata capacity must be a bounded exact integer or unavailable")
+    return capacity
+
+
+def _advertised_capacity(info: object) -> int | None:
+    if info is None:
+        return None
+    if type(info) is not dict:
+        raise ValueError("model_info must be an exact object or unavailable")
+    architecture = info.get("general.architecture")
+    if architecture is None:
+        return None
+    if type(architecture) is not str or not 1 <= len(architecture) <= 128:
+        raise ValueError("advertised architecture must be a bounded exact string")
+    return _optional_capacity(info.get(f"{architecture}.context_length"))
+
+
 def _require_local(row: dict[str, object]) -> None:
     for field in ("remote_host", "remote_model"):
         if field in row and row[field] != "":
@@ -245,12 +267,7 @@ class OllamaModelClient:
         category = "metadata_refused"
         try:
             async with asyncio.timeout(_DISCOVERY_TIMEOUT_SECONDS):
-                metadata = await self._discover(model)
-            category = (
-                "discovered"
-                if metadata.advertised_context_tokens is not None
-                else "capacity_unknown"
-            )
+                metadata, category = await self._discover(model)
             return metadata
         except TimeoutError:
             category = "deadline"
@@ -262,7 +279,7 @@ class OllamaModelClient:
                 flush=True,
             )
 
-    async def _discover(self, model: str) -> OllamaModelMetadata:
+    async def _discover(self, model: str) -> tuple[OllamaModelMetadata, str]:
         digest = await self.identity(model)
         payload = await self._request("show", {"model": model})
         _require_local(payload)
@@ -274,15 +291,15 @@ class OllamaModelClient:
             or "completion" not in capabilities
         ):
             raise ValueError("selected model must advertise completion capability")
-        maximum = None
-        info = payload.get("model_info")
-        if type(info) is dict:
-            architecture = info.get("general.architecture")
-            if type(architecture) is str and 1 <= len(architecture) <= 128:
-                maximum = _capacity(info.get(f"{architecture}.context_length"))
+        try:
+            maximum = _advertised_capacity(payload.get("model_info"))
+            category = "discovered" if maximum is not None else "capacity_unknown"
+        except ValueError:
+            maximum = None
+            category = "capacity_refused"
         if await self.identity(model) != digest:
             raise ValueError("model identity changed during discovery")
-        return OllamaModelMetadata(model, digest, maximum)
+        return OllamaModelMetadata(model, digest, maximum), category
 
     async def effective_context(self, model: OllamaModelMetadata) -> int | None:
         row = self._selected_row(await self._request("ps"), model.model)
@@ -291,7 +308,7 @@ class OllamaModelClient:
         if row.get("digest") != model.digest:
             raise ValueError("allocation model identity differs from session configuration")
         _require_local(row)
-        return _capacity(row.get("context_length"))
+        return _optional_capacity(row.get("context_length"))
 
     async def require_context_contract(self) -> None:
         # Exact source-reviewed runtime contract, independent of model identity.
