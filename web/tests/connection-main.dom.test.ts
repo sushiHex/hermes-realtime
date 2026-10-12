@@ -34,7 +34,13 @@ const credential = {
 };
 let dom: JSDOM;
 
-async function mount(request: (path: string) => Response | Promise<Response>, remembered = false, oneShot = false) {
+async function mount(
+  request: (path: string, init?: RequestInit) => Response | Promise<Response>,
+  remembered = false,
+  oneShot = false,
+  localModelResponse: Response | ((init?: RequestInit) => Response | Promise<Response>) =
+    Response.json({ version: 1, available: false }),
+) {
   vi.resetModules();
   media.connect.mockReset().mockResolvedValue();
   media.disconnect.mockReset().mockResolvedValue();
@@ -48,7 +54,16 @@ async function mount(request: (path: string) => Response | Promise<Response>, re
   }
   vi.stubGlobal("navigator", { mediaDevices: { enumerateDevices: async () => [] } });
   vi.spyOn(dom.window.HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
-  vi.stubGlobal("fetch", vi.fn((path: string) => request(path)));
+  const localModelRequests: Array<RequestInit | undefined> = [];
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path === "/api/v1/local-models") {
+      localModelRequests.push(init);
+      return typeof localModelResponse === "function" ? localModelResponse(init) : localModelResponse;
+    }
+    return request(path, init);
+  });
+  vi.stubGlobal("fetch", fetchMock);
   vi.spyOn(console, "info").mockImplementation(() => {});
   if (remembered) {
     dom.window.sessionStorage.setItem("hermes-realtime.stable-session.v1", JSON.stringify({
@@ -56,9 +71,13 @@ async function mount(request: (path: string) => Response | Promise<Response>, re
     }));
   }
   await import("../src/main");
+  await vi.waitFor(() => expect(
+    dom.window.document.querySelector<HTMLElement>("#local-model-picker")?.dataset.ready,
+  ).toBe("true"));
+  fetchMock.mockClear();
   const toggle = dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")!;
   const recovery = dom.window.document.querySelector<HTMLOutputElement>("#connection-recovery")!;
-  return { toggle, recovery, fetch: vi.mocked(fetch) };
+  return { toggle, recovery, fetch: fetchMock, localModelRequests };
 }
 
 it.each([false, true])("applies stored output style before media admission (remembered: %s)", async (remembered) => {
@@ -93,6 +112,22 @@ function normalRequest(path: string): Response | Promise<Response> {
   return new Response(null, { status: 503 });
 }
 
+function localModelOptions(advertisedContextTokens: number | null = 32768) {
+  return {
+    version: 1,
+    available: true,
+    provider: "ollama",
+    state: "configuring",
+    models: [{ model: "synthetic:installed", digest: "a".repeat(64), advertisedContextTokens }],
+    defaultModel: "synthetic:installed",
+    defaultRequestedContextTokens: 16384,
+    minimumContextTokens: 2048,
+    maximumContextTokens: 262144,
+    preparationTimeoutMs: 120000,
+    selection: null,
+  };
+}
+
 afterEach(() => {
   dom?.window.close();
   vi.restoreAllMocks();
@@ -100,6 +135,139 @@ afterEach(() => {
 });
 
 describe("mounted connection recovery", () => {
+  it("prepares the host-selected installed model before the unchanged bootstrap and freezes the observed selection", async () => {
+    const order: string[] = [];
+    let preparationBody = "";
+    const { toggle, fetch } = await mount((path, init) => {
+      if (path === "/api/v1/local-model-prepare") {
+        order.push("prepare");
+        preparationBody = init?.body as string;
+        return Response.json({ version: 1, selection: {
+          model: "synthetic:installed", digest: "a".repeat(64),
+          requestedContextTokens: 8192, advertisedContextTokens: 32768,
+          effectiveContextTokens: 4096,
+        } });
+      }
+      if (path === "/api/v1/stable-bootstrap") order.push("bootstrap");
+      return normalRequest(path);
+    }, false, false, () => { order.push("catalog"); return Response.json(localModelOptions()); });
+    const model = dom.window.document.querySelector<HTMLSelectElement>("#local-model-select")!;
+    expect(dom.window.document.querySelector<HTMLElement>(".model-controls")?.hidden).toBe(true);
+    expect(model.value).toBe("synthetic:installed");
+    expect(Array.from(model.options).map((option) => option.value)).toEqual(["", "synthetic:installed"]);
+    const requested = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    expect(requested.value).toBe("16384");
+    requested.value = "8192";
+    requested.dispatchEvent(new dom.window.Event("input"));
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(order.slice(0, 3)).toEqual(["catalog", "prepare", "bootstrap"]);
+    expect(JSON.parse(preparationBody)).toEqual({
+      version: 1,
+      model: "synthetic:installed",
+      digest: "a".repeat(64),
+      requestedContextTokens: 8192,
+    });
+    expect(fetch.mock.calls.find(([path]) => path === "/api/v1/local-model-prepare")?.[1]?.headers)
+      .not.toHaveProperty("Authorization");
+    expect(dom.window.document.querySelector("#local-model-advertised")?.textContent).toBe("32,768 tokens");
+    expect(dom.window.document.querySelector("#local-model-requested")?.textContent).toBe("8,192 tokens");
+    expect(dom.window.document.querySelector("#local-model-effective")?.textContent).toBe("4,096 tokens");
+    expect(model.disabled).toBe(true);
+    expect(requested.disabled).toBe(true);
+    expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
+      .toContain("Model fixed for this host");
+  });
+
+  it("does not clamp a host default above advertised capacity and requires explicit correction", async () => {
+    const { toggle } = await mount(normalRequest, false, false, Response.json(localModelOptions(8192)));
+    const requested = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    expect(requested.disabled).toBe(false);
+    expect(requested.value).toBe("");
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.textContent).toBe("Choose context");
+    expect(dom.window.document.querySelector("#local-model-budget-note")?.textContent)
+      .toContain("enter a valid smaller value");
+    requested.value = "4096";
+    requested.dispatchEvent(new dom.window.Event("input"));
+    await vi.waitFor(() => expect(toggle.disabled).toBe(false));
+  });
+
+  it("requires explicit feature-disabled metadata and does not treat authorization errors as unavailable", async () => {
+    const { toggle, fetch } = await mount(normalRequest, false, false, new Response(null, { status: 403 }));
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
+      .toContain("Host refused the request (403)"));
+    expect(toggle.disabled).toBe(true);
+    expect(fetch.mock.calls.some(([path]) => path === "/api/v1/stable-bootstrap")).toBe(false);
+  });
+
+  it("preserves existing next-turn model controls when local selection is explicitly disabled", async () => {
+    await mount(normalRequest);
+    expect(dom.window.document.querySelector<HTMLElement>(".model-controls")?.hidden).toBe(false);
+  });
+
+  it("ignores an older discovery response after a newer host-status result", async () => {
+    let discoveryCalls = 0;
+    let resolveOlder!: (response: Response) => void;
+    const { toggle } = await mount(normalRequest, false, false, () => {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) return new Response(null, { status: 403 });
+      if (discoveryCalls === 2) return new Promise<Response>((resolve) => { resolveOlder = resolve; });
+      return Response.json({ version: 1, available: false });
+    });
+    const retry = dom.window.document.querySelector<HTMLButtonElement>("#local-model-retry")!;
+    retry.click();
+    await vi.waitFor(() => expect(discoveryCalls).toBe(2));
+    retry.disabled = false;
+    retry.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() => expect(discoveryCalls).toBe(3));
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")!.dataset.ready).toBe("true"));
+    expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")?.hidden).toBe(true);
+    resolveOlder(Response.json(localModelOptions()));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")?.hidden).toBe(true);
+    expect(toggle.disabled).toBe(false);
+  });
+
+  it("does not label an invalid local context as requiring a fresh host launch", async () => {
+    const { toggle } = await mount(normalRequest, false, false, Response.json(localModelOptions(8192)));
+    expect(toggle.textContent).toBe("Choose context");
+    expect(toggle.textContent).not.toBe("Fresh launch required");
+  });
+
+  it("recovers an already-prepared host selection without preparing it again", async () => {
+    const frozen = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 8192,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const catalog = {
+      ...localModelOptions(), state: "prepared", selection: frozen,
+    };
+    const { toggle, fetch } = await mount(normalRequest, false, false, Response.json(catalog));
+    expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
+      .toContain("Model fixed for this host");
+    expect(dom.window.document.querySelector("#local-model-effective")?.textContent)
+      .toBe("4,096 tokens");
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(fetch.mock.calls.map(([path]) => path)).not.toContain("/api/v1/local-model-prepare");
+  });
+
+  it("does not start bootstrap after local model preparation is refused", async () => {
+    let bootstrapCalls = 0;
+    const { toggle, recovery, fetch } = await mount((path) => {
+      if (path === "/api/v1/stable-bootstrap") bootstrapCalls += 1;
+      if (path === "/api/v1/local-model-prepare") return new Response(null, { status: 503 });
+      return normalRequest(path);
+    }, false, false, Response.json(localModelOptions()));
+    toggle.click();
+    await vi.waitFor(() => expect(recovery.dataset.stage).toBe("configuration"));
+    expect(bootstrapCalls).toBe(0);
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual(["/api/v1/local-model-prepare"]);
+    expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
+      .toContain("Local model preparation failed");
+  });
+
   it("shows safe bootstrap refusal and retry beside retained history", async () => {
     const { toggle, recovery } = await mount(() => new Response(null, { status: 503 }));
     const history = dom.window.document.querySelector("#transcript")!;

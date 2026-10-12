@@ -132,6 +132,27 @@
                 <h2 id="model-card-title">Session model</h2>
               </div>
             </div>
+            <div class="local-model-picker" id="local-model-picker" hidden>
+              <fieldset id="local-model-options" hidden disabled>
+                <legend>Prepare before connecting</legend>
+                <label for="local-model-select">
+                  <span>Installed model</span>
+                  <select id="local-model-select"><option value="">Select a model</option></select>
+                </label>
+                <label for="local-model-context-input">
+                  <span>Requested context tokens</span>
+                  <input id="local-model-context-input" type="number" min="2048" max="262144" step="1" inputmode="numeric" />
+                </label>
+                <p id="local-model-budget-note" class="local-model-budget-note">Enter the context capacity to request.</p>
+                <dl class="local-model-observations">
+                  <div><dt>Advertised maximum</dt><dd id="local-model-advertised">Unknown</dd></div>
+                  <div><dt>Requested context</dt><dd id="local-model-requested">Not selected</dd></div>
+                  <div><dt>Observed allocation</dt><dd id="local-model-effective">Not observed</dd></div>
+                </dl>
+              </fieldset>
+              <output id="local-model-selection-state" class="local-model-selection-state" role="status" aria-live="polite">Choose a model and context before connecting.</output>
+              <button id="local-model-retry" class="button secondary" type="button" hidden>Retry local model discovery</button>
+            </div>
             <div class="model-controls" aria-label="Next turn model configuration">
               <label for="model-select">
                 <span>Model</span>
