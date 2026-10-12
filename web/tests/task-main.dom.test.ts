@@ -50,6 +50,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   const approvals: Array<{ sequence: number; approvalId: string; decision: string }> = [];
   let sessionActive = false;
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
+    if (path === "/api/v1/local-models") return Response.json({ version: 1, available: false });
     if (path === "/api/v1/stable-bootstrap" || path === "/api/v1/bootstrap") {
       if (sessionActive) return new Response(null, { status: 503 });
       sessionActive = true;
@@ -87,6 +88,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     return new Response(null, { status: 503 });
   }));
   await import("../src/main");
+  await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")!.dataset.ready).toBe("true"));
   const toggle = dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")!;
   toggle.click();
   await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));

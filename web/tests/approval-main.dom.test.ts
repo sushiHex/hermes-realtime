@@ -50,6 +50,7 @@ async function mount(
   };
   const decisions: Array<{ approvalId: string; decision: string; sequence: number }> = [];
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
+    if (path === "/api/v1/local-models") return Response.json({ version: 1, available: false });
     if (path === "/api/v1/stable-bootstrap") {
       return Response.json(mintCredential());
     }
@@ -76,6 +77,7 @@ async function mount(
     return new Response(null, { status: 503 });
   }));
   await import("../src/main");
+  await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")!.dataset.ready).toBe("true"));
   const toggle = dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")!;
   async function connect() {
     toggle.click();

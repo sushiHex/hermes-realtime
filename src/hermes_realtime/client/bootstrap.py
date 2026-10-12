@@ -80,6 +80,15 @@ class OneTimeBootstrapCapability:
     def consume(self, presented: str) -> None:
         """Consume an exact, unexpired capability once."""
 
+        self._claim(presented, consume=True)
+
+    def validate(self, presented: str) -> None:
+        """Authorize pre-connect metadata without consuming or renewing authority."""
+
+        self._claim(presented, consume=False)
+
+    def _claim(self, presented: str, *, consume: bool) -> None:
+
         if type(presented) is not str:
             raise TypeError("presented capability must be an exact built-in string")
         now = self._clock()
@@ -94,7 +103,8 @@ class OneTimeBootstrapCapability:
                 raise RuntimeError("bootstrap capability has expired")
             if len(presented) > 128 or not hmac.compare_digest(self._token, presented):
                 raise PermissionError("bootstrap capability is invalid")
-            self._consumed = True
+            if consume:
+                self._consumed = True
 
 
 class BrowserTokenIssuer:
