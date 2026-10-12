@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   parseBootstrapCredential,
@@ -83,6 +83,28 @@ describe("renderer yield authority protocol", () => {
 });
 
 describe("session model protocol", () => {
+  it("records one content-free session model refusal and keeps accepted parsing quiet", () => {
+    const marker = vi.spyOn(console, "info").mockImplementation(() => {});
+    const configuration = {authentication: "local", provider: "ollama", transport: "local-http",
+      model: "synthetic:latest", effort: null, contextWindowTokens: null, reportsTokenUsage: false,
+      version: 2, requestedContextTokens: 4096, advertisedContextTokens: 131072,
+      effectiveContextTokens: null, modelDigest: "a".repeat(64)};
+    try {
+      expect(parseSessionModelConfiguration(configuration)).toEqual(configuration);
+      expect(marker).not.toHaveBeenCalled();
+      for (const rejected of [null, {...configuration, privateEndpoint: "synthetic private detail"},
+        {...configuration, requestedContextTokens: true}, {...configuration, model: ""}]) {
+        marker.mockClear();
+        expect(() => parseSessionModelConfiguration(rejected)).toThrow(TypeError);
+        expect(marker.mock.calls).toEqual([
+          ['[session-model-refusal] {"category":"invalid_configuration"}'],
+        ]);
+      }
+    } finally {
+      marker.mockRestore();
+    }
+  });
+
   it("accepts an exact model catalog and rejects unsupported selected effort", () => {
     const catalog = {
       models: [

@@ -250,6 +250,19 @@ export function parseSpeechRuntime(value: unknown): SpeechRuntime {
 }
 
 export function parseSessionModelConfiguration(value: unknown): SessionModelConfiguration {
+  let accepted = false;
+  try {
+    const configuration = parseSessionModelConfigurationFields(value);
+    accepted = true;
+    return configuration;
+  } finally {
+    if (!accepted) {
+      console.info(`[session-model-refusal] ${JSON.stringify({ category: "invalid_configuration" })}`);
+    }
+  }
+}
+
+function parseSessionModelConfigurationFields(value: unknown): SessionModelConfiguration {
   const keys = [
     "authentication",
     "contextWindowTokens",
