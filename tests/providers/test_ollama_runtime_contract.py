@@ -12,7 +12,7 @@ from hermes_realtime.host_launcher import _build_streaming_inference
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("deny_uninjected_ollama_metadata")]
 ORIGIN = "http://127.0.0.1:11434"
 SNAPSHOT = ConversationContextSnapshot(
     revision=0, messages=(ConversationMessage("user", "Synthetic question."),), active_tasks=()

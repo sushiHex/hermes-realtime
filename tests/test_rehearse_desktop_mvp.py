@@ -14,6 +14,8 @@ import pytest
 
 from tests.support.ollama_metadata import supported_ollama_metadata
 
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "rehearse_desktop_mvp.py"
 sys.path.insert(0, str(_PATH.parent))
 _SPEC = importlib.util.spec_from_file_location("rehearse_desktop_mvp", _PATH)

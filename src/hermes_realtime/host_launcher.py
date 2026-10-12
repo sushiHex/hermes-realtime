@@ -2822,7 +2822,12 @@ def build_local_host_launcher(
         nonlocal readiness_cue_template, restart_announcement
         if ollama_num_ctx is not None:
             if type(inference) is not OllamaStreamingInference:
-                raise TypeError("configured Ollama context requires exact Ollama inference")
+                try:
+                    raise TypeError("configured Ollama context requires exact Ollama inference")
+                finally:
+                    print("[ollama-context] " + json.dumps(
+                        {"version": 1, "category": "configuration_refused"},
+                        separators=(",", ":")), flush=True)
             await inference.configure_context(ollama_num_ctx)
         if voice_tail_writer is not None:
             # Before preflight and so before any turn: the conversation resumes heard-first.

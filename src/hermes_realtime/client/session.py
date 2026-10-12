@@ -269,15 +269,25 @@ class BrowserModelConfiguration:
             "transport": self.transport,
         }
         if self.local_context is not None:
-            observation = self.local_context()
-            if type(observation) is not OllamaContextObservation:
-                raise TypeError("local_context must return an exact context observation")
-            if (observation.configuration.model.model != self.model or self.provider != "ollama"
-                    or self.authentication != "local" or self.transport != "local-http"
-                    or self.effort is not None or self.reports_token_usage
-                    or self.context_window_tokens is not None):
-                raise ValueError("local context identity does not match the session model")
-            data.update(observation.public_data())
+            category = "observation_read_refused"
+            try:
+                observation = self.local_context()
+                category = "observation_type_refused"
+                if type(observation) is not OllamaContextObservation:
+                    raise TypeError("local_context must return an exact context observation")
+                category = "binding_refused"
+                if (observation.configuration.model.model != self.model or self.provider != "ollama"
+                        or self.authentication != "local" or self.transport != "local-http"
+                        or self.effort is not None or self.reports_token_usage
+                        or self.context_window_tokens is not None):
+                    raise ValueError("local context identity does not match the session model")
+                category = "observation_read_refused"
+                data.update(observation.public_data())
+                category = "projected"
+            finally:
+                print("[browser-model] " + json.dumps(
+                    {"version": 1, "kind": "local_context", "category": category},
+                    separators=(",", ":")), flush=True)
         return data
 
 

@@ -221,11 +221,13 @@ class OllamaModelClient:
             for row in cls._models(payload)
             if row.get("name") == model or row.get("model") == model
         ]
-        if len(rows) != 1:
+        if not rows:
             return None
+        if len(rows) != 1:
+            raise ValueError("selected model identity is ambiguous")
         row = rows[0]
         if row.get("name") != model or row.get("model", model) != model:
-            return None
+            raise ValueError("selected model identity fields disagree")
         return row
 
     async def identity(self, model: str) -> str:
@@ -284,8 +286,10 @@ class OllamaModelClient:
 
     async def effective_context(self, model: OllamaModelMetadata) -> int | None:
         row = self._selected_row(await self._request("ps"), model.model)
-        if row is None or row.get("digest") != model.digest:
+        if row is None:
             return None
+        if row.get("digest") != model.digest:
+            raise ValueError("allocation model identity differs from session configuration")
         _require_local(row)
         return _capacity(row.get("context_length"))
 

@@ -23,6 +23,8 @@ from hermes_realtime.memory import BuiltinMemorySnapshot
 from hermes_realtime.providers import OllamaStreamingInference
 from tests.support.ollama_metadata import supported_ollama_metadata
 
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
 @pytest.mark.asyncio

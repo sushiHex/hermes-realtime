@@ -210,7 +210,8 @@ async def test_effective_context_requires_exact_digest():
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=backend)
     model = await client.discover("test:latest")
     backend.changed = True
-    assert await client.effective_context(model) is None
+    with pytest.raises(ValueError, match="identity"):
+        await client.effective_context(model)
 
 
 async def test_runtime_contract_rejects_unknown_versions():
@@ -317,7 +318,7 @@ async def test_non_completion_metadata_refuses(capabilities):
         await client.discover("test:latest")
 
 
-async def test_multiple_effective_allocations_stay_unknown():
+async def test_multiple_effective_allocations_are_refused():
     backend = Backend()
 
     async def read(endpoint, body):
@@ -327,7 +328,8 @@ async def test_multiple_effective_allocations_stay_unknown():
         return json.dumps(payload).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
-    assert await client.effective_context(await client.discover("test:latest")) is None
+    with pytest.raises(ValueError, match="identity"):
+        await client.effective_context(await client.discover("test:latest"))
 
 
 @pytest.mark.parametrize("boundary", ["tags", "ps"])
@@ -360,10 +362,14 @@ async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, ex
         else:
             assert await client.identity("test:latest") == DIGEST
     else:
-        assert (
-            await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
-            == expected
-        )
+        if expected is None:
+            with pytest.raises(ValueError, match="identity"):
+                await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+        else:
+            assert (
+                await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+                == expected
+            )
 
 
 @pytest.mark.parametrize("boundary", ["tags", "ps"])
@@ -397,10 +403,14 @@ async def test_selected_model_requires_one_consistent_row(row, expected, boundar
         else:
             assert await client.identity("test:latest") == DIGEST
     else:
-        assert (
-            await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
-            == expected
-        )
+        if expected is None:
+            with pytest.raises(ValueError, match="identity"):
+                await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+        else:
+            assert (
+                await client.effective_context(OllamaModelMetadata("test:latest", DIGEST, 131072))
+                == expected
+            )
 
 
 async def test_effective_context_refuses_invalid_capacity():
@@ -415,6 +425,7 @@ async def test_effective_context_refuses_invalid_capacity():
     )
 
 
+@pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 async def test_session_setting_reaches_inference_and_freezes_identity():
     backend = Backend()
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=backend)
@@ -454,6 +465,7 @@ async def test_session_setting_reaches_inference_and_freezes_identity():
     await inference.close()
 
 
+@pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 async def test_inflight_configuration_and_request_share_the_admission_lock():
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -498,7 +510,7 @@ async def test_inflight_configuration_and_request_share_the_admission_lock():
     await inference.close()
 
 
-async def test_conflicting_effective_model_fields_stay_unknown():
+async def test_conflicting_effective_model_fields_are_refused():
     backend = Backend()
 
     async def read(endpoint, body):
@@ -508,7 +520,8 @@ async def test_conflicting_effective_model_fields_stay_unknown():
         return json.dumps(payload).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
-    assert await client.effective_context(await client.discover("test:latest")) is None
+    with pytest.raises(ValueError, match="identity"):
+        await client.effective_context(await client.discover("test:latest"))
 
 
 @pytest.mark.parametrize("endpoint", ["tags", "show"])
@@ -685,6 +698,68 @@ async def test_allocation_observability_failure_stays_unknown():
     await inference.close()
 
 
+@pytest.mark.parametrize(
+    "case,category",
+    [
+        ("stale", "metadata_refused"),
+        ("missing_digest", "metadata_refused"),
+        ("ambiguous", "metadata_refused"),
+        ("inconsistent_name", "metadata_refused"),
+        ("inconsistent_model", "metadata_refused"),
+        ("missing_name", "metadata_refused"),
+        ("absent", "unknown"),
+        ("capacity_missing", "unknown"),
+        ("capacity_null", "unknown"),
+    ],
+)
+async def test_allocation_source_refusals_are_distinct_from_unavailable_capacity(
+    case, category, capsys
+):
+    backend = Backend()
+
+    async def read(endpoint, body):
+        payload = json.loads(await backend(endpoint, body))
+        if endpoint == "ps":
+            row = payload["models"][0]
+            if case == "stale":
+                row["digest"] = "b" * 64
+            elif case == "missing_digest":
+                row.pop("digest")
+            elif case == "ambiguous":
+                payload["models"].append(row.copy())
+            elif case == "inconsistent_name":
+                row["name"] = "other"
+            elif case == "inconsistent_model":
+                row["model"] = "other"
+            elif case == "missing_name":
+                row.pop("name")
+            elif case == "absent":
+                payload["models"] = []
+            elif case == "capacity_missing":
+                row.pop("context_length")
+            elif case == "capacity_null":
+                row["context_length"] = None
+        return json.dumps(payload).encode()
+
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
+    inference = OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="test:latest", metadata_client=client
+    )
+    try:
+        await inference.configure_context(4096)
+        capsys.readouterr()
+        await inference.observe_context()
+        assert inference.context_public_data()["effectiveContextTokens"] is None
+        reports = [
+            json.loads(line.removeprefix("[ollama-context-observation] "))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[ollama-context-observation] ")
+        ]
+        assert reports == [{"version": 1, "kind": "allocation", "category": category}]
+    finally:
+        await inference.close()
+
+
 @pytest.mark.parametrize("outcome", ["observed", "unknown", "unavailable", "metadata_refused"])
 async def test_allocation_observation_records_one_content_free_outcome(outcome, capsys):
     backend = Backend()
@@ -780,8 +855,12 @@ async def test_cancelled_allocation_observation_records_its_outcome(capsys):
     await inference.close()
 
 
+@pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 async def test_configuring_after_first_inference_is_refused():
     inference = OllamaStreamingInference(
+        metadata_client=OllamaModelClient(
+            base_url="http://127.0.0.1:11434", read_request=Backend()
+        ),
         base_url="http://127.0.0.1:11434",
         model="test:latest",
         open_request=lambda request, timeout: io.BytesIO(

@@ -35,6 +35,8 @@ from hermes_realtime.providers import OllamaStreamingInference
 from hermes_realtime.speech import AudioFrame, DeliveredSpeechLedger, SpeechChunk, Transcript
 from tests.support.ollama_metadata import supported_ollama_metadata
 
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
 _FACT = "My favorite bird is the kestrel."
 
 

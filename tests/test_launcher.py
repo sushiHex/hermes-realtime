@@ -2023,7 +2023,7 @@ class _FullHostHarness:
 
 
 @pytest.mark.asyncio
-async def test_configured_context_refuses_a_provider_without_ollama_identity(monkeypatch):
+async def test_configured_context_refuses_a_provider_without_ollama_identity(monkeypatch, capsys):
     harness = _FullHostHarness(monkeypatch)
     configured = False
 
@@ -2045,6 +2045,9 @@ async def test_configured_context_refuses_a_provider_without_ollama_identity(mon
         with pytest.raises(TypeError, match="exact Ollama"):
             await launcher.start()
         assert not configured
+        assert capsys.readouterr().out.splitlines() == [
+            '[ollama-context] {"version":1,"category":"configuration_refused"}'
+        ]
     finally:
         await launcher.close()
 

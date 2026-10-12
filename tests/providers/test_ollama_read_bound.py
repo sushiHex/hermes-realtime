@@ -16,6 +16,8 @@ from hermes_realtime.providers.ollama import (
 )
 from tests.support.ollama_metadata import supported_ollama_metadata
 
+pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
 
 def _snapshot() -> ConversationInferenceRequest:
     return ConversationInferenceRequest(

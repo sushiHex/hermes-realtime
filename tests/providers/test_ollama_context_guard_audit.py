@@ -170,7 +170,7 @@ async def test_browser_callback_requires_callable():
         browser_configuration(local_context=123)
 
 
-async def test_browser_callback_requires_validated_observation():
+async def test_browser_callback_requires_validated_observation(capsys):
     class UnverifiedObservation:
         configuration = CONFIGURATION
 
@@ -179,6 +179,23 @@ async def test_browser_callback_requires_validated_observation():
 
     with pytest.raises(TypeError):
         browser_configuration(local_context=UnverifiedObservation).public_data()
+    assert capsys.readouterr().out.splitlines() == [
+        '[browser-model] {"version":1,"kind":"local_context","category":"observation_type_refused"}'
+    ]
+
+
+async def test_browser_callback_read_refusal_records_no_exception_content(capsys):
+    refusal = RuntimeError("synthetic private detail")
+
+    def unavailable():
+        raise refusal
+
+    with pytest.raises(RuntimeError) as caught:
+        browser_configuration(local_context=unavailable).public_data()
+    assert caught.value is refusal
+    assert capsys.readouterr().out.splitlines() == [
+        '[browser-model] {"version":1,"kind":"local_context","category":"observation_read_refused"}'
+    ]
 
 
 async def test_malformed_empty_models_cannot_be_reported_as_no_allocation():
@@ -194,6 +211,7 @@ async def test_malformed_empty_models_cannot_be_reported_as_no_allocation():
 @pytest.mark.parametrize(
     "field,value",
     [
+        ("model", "different"),
         ("provider", "other"),
         ("authentication", "subscription"),
         ("transport", "other"),
@@ -202,10 +220,29 @@ async def test_malformed_empty_models_cannot_be_reported_as_no_allocation():
         ("context_window_tokens", 4096),
     ],
 )
-async def test_browser_refuses_local_budget_bound_to_an_incompatible_session(field, value):
+async def test_browser_refuses_local_budget_bound_to_an_incompatible_session(field, value, capsys):
     configuration = browser_configuration(local_context=lambda: OBSERVATION)
     with pytest.raises(ValueError, match="identity"):
         replace(configuration, **{field: value}).public_data()
+    assert capsys.readouterr().out.splitlines() == [
+        '[browser-model] {"version":1,"kind":"local_context","category":"binding_refused"}'
+    ]
+
+
+async def test_browser_projection_records_success_only_after_observation_projection(capsys):
+    assert browser_configuration(local_context=lambda: OBSERVATION).public_data() == {
+        "authentication": "local",
+        "provider": "ollama",
+        "transport": "local-http",
+        "model": MODEL.model,
+        "effort": None,
+        "contextWindowTokens": None,
+        "reportsTokenUsage": False,
+        **OBSERVATION.public_data(),
+    }
+    assert capsys.readouterr().out.splitlines() == [
+        '[browser-model] {"version":1,"kind":"local_context","category":"projected"}'
+    ]
 
 
 async def test_host_refuses_ollama_context_configuration_for_another_provider(monkeypatch):
