@@ -183,6 +183,14 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     assert events == []
     await launcher._preflight()
     assert events == ["tasks_started"]
+    shared_actions = captured["worker"]._runtime._actions
+    from hermes_realtime.evidence import ConversationOperationKind
+
+    reservation = shared_actions.operation_scheduler.try_reserve(ConversationOperationKind.REPLAY)
+    with pytest.raises(RuntimeError, match="quiescent"):
+        await asyncio.wait_for(owner.prepare(metadata.model, metadata.digest, 4096), 0.1)
+    assert "configured" not in events
+    shared_actions.operation_scheduler.release(reservation)
     if shutdown_state == "active":
         await owner.prepare(metadata.model, metadata.digest, 4096)
         assert events == ["tasks_started", "metadata", "configured",

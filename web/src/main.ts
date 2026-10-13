@@ -171,6 +171,7 @@ const localModelRequested = element<HTMLElement>("local-model-requested");
 const localModelEffective = element<HTMLElement>("local-model-effective");
 const localModelSelectionState = element<HTMLOutputElement>("local-model-selection-state");
 const localModelRetry = element<HTMLButtonElement>("local-model-retry");
+const localModelChange = element<HTMLButtonElement>("local-model-change");
 const typedForm = element<HTMLFormElement>("typed-form");
 const typedInput = element<HTMLTextAreaElement>("typed-input");
 const sendButton = element<HTMLButtonElement>("send");
@@ -396,6 +397,8 @@ let selectedVoice: string | null = null;
 let selectableModels: ModelCatalog | null = null;
 let modelSelectionPending = false;
 let localModelCatalog: LocalModelCatalog | null = null;
+let localModelPrevious: LocalModelCatalog | null = null;
+let localModelReplacementUnconfirmed = false;
 let localModelDiscoveryState: "loading" | "ready" | "disabled" | "error" = "loading";
 let localModelDiscoveryPending = false;
 let localModelPreparationPending = false;
@@ -2320,7 +2323,8 @@ function localModelCapacity(value: number | null): string {
 }
 
 function localModelLifecycleIsLocked(): boolean {
-  return ["connecting", "preparing", "connected", "reconnecting"].includes(controller.state);
+  return credential !== null ||
+    ["connecting", "preparing", "connected", "reconnecting"].includes(controller.state);
 }
 
 function localModelChoiceIsValid(): boolean {
@@ -2334,6 +2338,7 @@ function localModelChoiceIsValid(): boolean {
 }
 
 function localModelAllowsConnection(): boolean {
+  if (localModelReplacementUnconfirmed) return false;
   if (localModelDiscoveryState === "disabled") return true;
   if (localModelDiscoveryState !== "ready" || localModelCatalog === null) return false;
   if (localModelCatalog.state === "prepared") return localModelCatalog.selection !== null;
@@ -2356,8 +2361,13 @@ function renderLocalModelPicker(): void {
   localModelOptions.disabled = controlsDisabled;
   localModelSelect.disabled = controlsDisabled;
   localModelContextInput.disabled = controlsDisabled;
-  localModelRetry.hidden = localModelDiscoveryState !== "error" && catalog?.state !== "preparing";
+  localModelRetry.hidden = !localModelReplacementUnconfirmed &&
+    localModelDiscoveryState !== "error" && catalog?.state !== "preparing";
   localModelRetry.disabled = localModelDiscoveryPending || localModelLifecycleIsLocked();
+  localModelChange.hidden = localModelPrevious === null && catalog?.state !== "prepared";
+  localModelChange.disabled = lifecycleLocked || localModelDiscoveryPending || localModelPreparationPending ||
+    (!stableLaunch && capability === null);
+  localModelChange.textContent = localModelPrevious === null ? "Change model or context" : "Cancel change";
   localModelPicker.dataset.ready = localModelDiscoveryState === "loading" || localModelDiscoveryPending
     ? "false" : "true";
 
@@ -2377,7 +2387,9 @@ function renderLocalModelPicker(): void {
     localModelSelectionState.textContent = "Checking local model availability on this host…";
     localModelBudgetNote.textContent = "Choose a model and context before connecting.";
   } else if (localModelDiscoveryState === "error") {
-    localModelSelectionState.textContent = localModelDiscoveryError === null
+    localModelSelectionState.textContent = localModelReplacementUnconfirmed
+      ? "The replacement could not be confirmed. Restart the host before reconnecting."
+      : localModelDiscoveryError === null
       ? "Local model discovery failed. Retry before connecting."
       : `Local model discovery failed. ${localModelDiscoveryError} Retry before connecting.`;
     localModelBudgetNote.textContent = "The host did not confirm whether local model selection is available.";
@@ -2386,9 +2398,13 @@ function renderLocalModelPicker(): void {
     localModelSelectionState.textContent = "Local model preparation is already in progress. Refresh host status before connecting.";
     localModelBudgetNote.textContent = "The host has not confirmed a frozen selection yet.";
     delete localModelSelectionState.dataset.state;
+  } else if (localModelReplacementUnconfirmed && !localModelPreparationPending) {
+    localModelSelectionState.textContent = "Refresh host status to confirm the replacement before connecting.";
+    localModelBudgetNote.textContent = "The previous selection is not a readiness guarantee after replacement was requested.";
+    delete localModelSelectionState.dataset.state;
   } else if (frozen && selection !== null) {
-    localModelSelectionState.textContent = "Model fixed for this host. Restart the host to change it.";
-    localModelBudgetNote.textContent = "The prepared model and requested context are fixed for this host lifetime.";
+    localModelSelectionState.textContent = "Model prepared. Disconnect the session before changing model or context.";
+    localModelBudgetNote.textContent = "A changed choice must pass preparation before connecting again.";
     localModelSelectionState.dataset.state = "ready";
   } else if (catalog?.models.length === 0) {
     localModelSelectionState.textContent = "No installed local models were found.";
@@ -2468,6 +2484,7 @@ async function discoverLocalModelSelection(): Promise<void> {
     const availability = parseLocalModelCatalog(await response.json());
     if (generation !== localModelDiscoveryGeneration || abort.signal.aborted) return;
     accepted = true;
+    localModelReplacementUnconfirmed = false;
     if (!availability.available) {
       localModelCatalog = null;
       localModelDiscoveryState = "disabled";
@@ -2517,6 +2534,11 @@ async function prepareLocalModelSelection(
     localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber,
   );
   localModelPreparationPending = true;
+  if (localModelPrevious !== null) {
+    // Once replacement is requested, Cancel cannot restore a cached readiness claim.
+    localModelPrevious = null;
+    localModelReplacementUnconfirmed = true;
+  }
   localModelPreparationError = null;
   renderLocalModelPicker();
   try {
@@ -2534,6 +2556,8 @@ async function prepareLocalModelSelection(
       throw new Error("Local model preparation was superseded");
     }
     localModelCatalog = { ...catalog, state: "prepared", selection: prepared };
+    localModelPrevious = null;
+    localModelReplacementUnconfirmed = false;
   } finally {
     localModelPreparationPending = false;
     renderLocalModelPicker();
@@ -2614,10 +2638,12 @@ async function bootstrapOrReload(
 
 async function bootstrap(signal: AbortSignal): Promise<BootstrapCredential> {
   const request = bootstrapRequestParameters(stableLaunch, capability);
+  const selection = localModelCatalog?.selection ?? null;
+  const headers = request.bearer === null ? {} : authorization(request.bearer);
   const response = await connectionFetch(request.path, {
     method: "POST",
-    headers: request.bearer === null ? undefined : authorization(request.bearer),
-    body: null,
+    headers: selection === null ? headers : { ...headers, "Content-Type": "application/json" },
+    body: selection === null ? null : JSON.stringify({ version: 1, localModelSelection: selection }),
     cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
@@ -3528,6 +3554,11 @@ async function connect(projectionResync = false): Promise<void> {
       credential === null && localModelCatalog?.state === "configuring";
     if (localPreparationFailed) {
       localModelPreparationError = connectionFailureCategory(error);
+      if (localModelReplacementUnconfirmed) {
+        // An unanswered replacement may have changed the resident allocation.
+        // Only the server's current catalog may establish a prepared selection.
+        await discoverLocalModelSelection();
+      }
       renderLocalModelPicker();
     }
     if (resuming && failureStage !== "bootstrap") {
@@ -4044,6 +4075,28 @@ localModelContextInput.addEventListener("input", () => {
   renderLocalModelPicker();
 });
 localModelRetry.addEventListener("click", () => void discoverLocalModelSelection());
+localModelChange.addEventListener("click", () => {
+  let accepted = false;
+  try {
+    const catalog = localModelCatalog;
+    if (catalog === null || localModelLifecycleIsLocked() || localModelDiscoveryPending ||
+      localModelPreparationPending || (!stableLaunch && capability === null) ||
+      (localModelPrevious === null && (catalog.state !== "prepared" || catalog.selection === null))) return;
+    if (localModelPrevious === null) {
+      localModelPrevious = catalog;
+      localModelCatalog = { ...catalog, state: "configuring", selection: null };
+    } else {
+      localModelCatalog = localModelPrevious;
+      localModelPrevious = null;
+      populateLocalModelPicker(localModelCatalog);
+    }
+    localModelPreparationError = null;
+    accepted = true;
+    renderLocalModelPicker();
+  } finally {
+    if (!accepted) console.info(`[local-model-edit-refusal] ${JSON.stringify({ category: "lifecycle" })}`);
+  }
+});
 modelSelect.addEventListener("change", () => {
   const catalog = selectableModels;
   if (catalog === null) return;

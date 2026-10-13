@@ -10,7 +10,8 @@ import hashlib
 import json
 import secrets
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
 from queue import Empty, Full
@@ -268,6 +269,7 @@ class ConversationOperationScheduler:
             tuple[_OperationState, int, ConversationOperationKind],
         ] = {}
         self._closed = False
+        self._paused = False
 
     @property
     def owner_generation(self) -> int:
@@ -293,7 +295,7 @@ class ConversationOperationScheduler:
     ) -> ConversationOperationReservation | None:
         exact_kind = _exact_operation_kind(kind)
         with self._lock:
-            if self._closed or len(self._states) >= self._max_operations:
+            if self._closed or self._paused or len(self._states) >= self._max_operations:
                 return None
             reservation = self._mint_locked(exact_kind)
             self._states[reservation] = (
@@ -302,6 +304,25 @@ class ConversationOperationScheduler:
                 exact_kind,
             )
             return reservation
+
+    @contextmanager
+    def quiescent(self) -> Iterator[None]:
+        """Fence new shared operations only while the existing owner is idle."""
+        acquired = False
+        try:
+            with self._lock:
+                if self._closed or self._paused or self._states:
+                    raise RuntimeError("conversation operations are not quiescent")
+                self._paused = True
+                acquired = True
+            yield
+        finally:
+            if acquired:
+                with self._lock:
+                    self._paused = False
+            print("[conversation-quiescence] " + json.dumps(
+                {"version": 1, "category": "released" if acquired else "refused"},
+                separators=(",", ":")), flush=True)
 
     def validate(
         self,

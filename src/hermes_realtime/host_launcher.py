@@ -2325,6 +2325,7 @@ def build_local_host_launcher(
             default_model=ollama_model,
             adapter_factory=selected_adapter,
             readiness=selected_readiness,
+            quiescent=lambda: actions.quiescent(),
         )
         inference = local_selection_owner
     else:
