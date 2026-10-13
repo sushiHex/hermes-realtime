@@ -568,11 +568,97 @@ async def test_preflight_is_tool_less_until_handler_is_bound() -> None:
     inference = ollama.OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test",
                                               open_request=open_request,
                                               metadata_client=supported_ollama_metadata())
-    assert await collect(inference) == ["Ready."]
+    assert [part async for part in inference.stream(request(), turn_id="turn_preflight")] == [
+        "Ready.",
+    ]
     assert "tools" not in sent[0]
     inference.bind_work_tools(Handler())
     with pytest.raises(RuntimeError, match="before the first inference"):
         await inference.configure_context(4096)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_id", ["turn_user", "turn_preflight_extra"])
+async def test_completed_user_turn_prevents_late_work_binding(turn_id, capsys) -> None:
+    inference, _, _, _ = adapter([{"message": {"content": "Ready."}, "done": True}])
+    inference._work_tool_handler = None
+    try:
+        assert [part async for part in inference.stream(request(), turn_id=turn_id)] == ["Ready."]
+        with pytest.raises(RuntimeError, match="before user-turn admission"):
+            inference.bind_work_tools(Handler())
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [
+            '[ollama-work] {"category":"binding_after_admission","kind":"start","attempts":0}',
+        ]
+        assert inference._work_tool_handler is None
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap", ["state_lock", "context_contract"])
+async def test_user_turn_prevents_binding_before_first_request(gap, capsys) -> None:
+    inference, _, sent, _ = adapter([{"message": {"content": "Ready."}, "done": True}])
+    inference._work_tool_handler = None
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = inference._ensure_context_contract_locked
+
+    async def waiting_contract():
+        entered.set()
+        await release.wait()
+        return await original()
+
+    inference._ensure_context_contract_locked = waiting_contract
+    await inference._state_lock.acquire()
+    task = asyncio.create_task(collect(inference))
+    try:
+        await asyncio.sleep(0)
+        if gap == "context_contract":
+            inference._state_lock.release()
+            await asyncio.wait_for(entered.wait(), 1)
+        assert sent == []
+        with pytest.raises(RuntimeError, match="before user-turn admission"):
+            inference.bind_work_tools(Handler())
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [
+            '[ollama-work] {"category":"binding_after_admission","kind":"start","attempts":0}',
+        ]
+        assert inference._work_tool_handler is None
+    finally:
+        if gap == "state_lock":
+            inference._state_lock.release()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+        await inference.close()
+    assert task.result() == ["Ready."]
+    assert "format" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_preflight_after_user_turn_does_not_reopen_work_binding(capsys) -> None:
+    response = Response([{"message": {"content": "Ready."}, "done": True}])
+    inference = ollama.OllamaStreamingInference(
+        base_url="http://127.0.0.1:11434", model="test",
+        metadata_client=supported_ollama_metadata(),
+        open_request=lambda req, timeout: response,
+    )
+    try:
+        assert await collect(inference) == ["Ready."]
+        inference._open_request = lambda req, timeout: Response([
+            {"message": {"content": "Ready."}, "done": True},
+        ])
+        assert [part async for part in inference.stream(request(), turn_id="turn_preflight")]
+        with pytest.raises(RuntimeError, match="before user-turn admission"):
+            inference.bind_work_tools(Handler())
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [
+            '[ollama-work] {"category":"binding_after_admission","kind":"start","attempts":0}',
+        ]
+    finally:
+        await inference.close()
 
 
 @pytest.mark.parametrize("handler", [object(), type("Bad", (), {
