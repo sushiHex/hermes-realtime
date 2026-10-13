@@ -6,7 +6,6 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MethodType
 from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
@@ -85,13 +84,11 @@ class BrowserBootstrapApplication:
             raise TypeError("local_model_selection must be an exact Ollama session owner or None")
         if type(sessions) is not BrowserSessionDirector:
             raise TypeError("sessions must be an exact BrowserSessionDirector")
-        if local_model_selection is not None:
-            admission = sessions._local_model_configuration
-            if (
-                type(admission) is not MethodType
-                or admission != local_model_selection.require_prepared
-            ):
-                raise ValueError("local model selection admission binding must match its owner")
+        if (
+            local_model_selection is not None
+            and sessions._local_model_owner() is not local_model_selection
+        ):
+            raise ValueError("local model selection admission binding must match its owner")
         if type(verifier) is not BrowserTokenVerifier:
             raise TypeError("verifier must be an exact BrowserTokenVerifier")
         if capability is not None and type(capability) is not OneTimeBootstrapCapability:
@@ -289,10 +286,8 @@ class BrowserBootstrapApplication:
             if path in local_paths:
                 return await self._handle_local_model(path, headers, body)
             if path in stable_bootstrap_paths:
-                if body:
-                    raise ValueError("stable bootstrap request body must be empty")
-                self._sessions.require_model_prepared()
-                credential = await self._sessions.start()
+                expected = self._bootstrap_selection(headers, body)
+                credential = await self._sessions.start(expected_local_selection=expected)
             else:
                 if not 1 <= len(body) <= 384:
                     raise ValueError("stable rebind body must contain 1 to 384 bytes")
@@ -339,12 +334,14 @@ class BrowserBootstrapApplication:
             return await self._handle_local_model(path, headers, body)
 
         if path == "/api/v1/bootstrap":
-            if body:
-                raise ValueError("bootstrap request body must be empty")
             assert self._capability is not None
-            self._sessions.require_model_prepared()
-            self._capability.consume(bearer)
-            credential = await self._sessions.start()
+            self._capability.validate(bearer)
+            expected = self._bootstrap_selection(headers, body)
+            credential = await self._sessions.start(
+                expected_local_selection=expected,
+                bootstrap_capability=self._capability,
+                bootstrap_bearer=bearer,
+            )
             payload = self._credential_payload(credential)
             status = 200
         elif path in stable_bootstrap_paths | stable_rebind_paths:
@@ -818,6 +815,28 @@ class BrowserBootstrapApplication:
             body=encoded,
         )
 
+    def _bootstrap_selection(self, headers: Mapping[str, str], body: bytes) -> object:
+        category = "refused"
+        try:
+            if self._local_model_selection is None:
+                if body:
+                    raise ValueError("bootstrap request body must be empty")
+                category = "disabled"
+                return None
+            if headers.get("content-type") != "application/json" or len(body) > 1024:
+                raise ValueError("local bootstrap requires bounded selection JSON")
+            decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
+            if (
+                type(decoded) is not dict or set(decoded) != {"version", "localModelSelection"}
+                or type(decoded["version"]) is not int or decoded["version"] != 1
+            ):
+                raise ValueError("local bootstrap requires exact versioned selection fields")
+            category = "parsed"
+            return decoded["localModelSelection"]
+        finally:
+            print("[local-model-bootstrap] " + json.dumps(
+                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
     async def _handle_local_model(
         self,
         path: str,
@@ -848,7 +867,7 @@ class BrowserBootstrapApplication:
                 or decoded["version"] != 1
             ):
                 raise ValueError("local preparation requires exact versioned fields")
-            selection = await owner.prepare(
+            selection = await self._sessions.prepare_local_model(
                 decoded["model"],
                 decoded["digest"],
                 decoded["requestedContextTokens"],

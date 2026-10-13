@@ -135,6 +135,164 @@ afterEach(() => {
 });
 
 describe("mounted connection recovery", () => {
+  it("changes a prepared choice before joining, retains 4096, and prepares before bootstrap", async () => {
+    const selection = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const order: string[] = [];
+    const { toggle, fetch } = await mount((path, init) => {
+      if (path === "/api/v1/local-model-prepare") {
+        order.push("prepare");
+        expect(JSON.parse(init?.body as string).requestedContextTokens).toBe(2048);
+        return Response.json({ version: 1, selection: { ...selection, requestedContextTokens: 2048, effectiveContextTokens: 2048 } });
+      }
+      if (path === "/api/v1/stable-bootstrap") {
+        order.push("bootstrap");
+        expect(JSON.parse(init?.body as string)).toEqual({ version: 1, localModelSelection: {
+          ...selection, requestedContextTokens: 2048, effectiveContextTokens: 2048,
+        } });
+        expect(init?.headers).toHaveProperty("Content-Type", "application/json");
+      }
+      return normalRequest(path);
+    }, false, false, Response.json({ ...localModelOptions(), state: "prepared", selection }));
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    expect(change).not.toBeNull();
+    change.click();
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    expect(input.disabled).toBe(false);
+    expect(input.value).toBe("4096");
+    expect(fetch).not.toHaveBeenCalled();
+    input.value = "2048";
+    input.dispatchEvent(new dom.window.Event("input"));
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(order).toEqual(["prepare", "bootstrap"]);
+    expect(change.disabled).toBe(true);
+  });
+
+  it("cancels local editing without resetting or re-preparing the server selection", async () => {
+    const selection = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const { toggle, fetch } = await mount(normalRequest, false, false,
+      Response.json({ ...localModelOptions(), state: "prepared", selection }));
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    expect(change).not.toBeNull();
+    change.click();
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    input.value = "2048";
+    change.click();
+    expect(input.value).toBe("4096");
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(fetch.mock.calls.map(([path]) => path)).not.toContain("/api/v1/local-model-prepare");
+  });
+
+  it("never claims the old selection ready after a refused replacement", async () => {
+    const selection = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    let catalogRequests = 0;
+    const { toggle, fetch } = await mount(path => path === "/api/v1/local-model-prepare"
+      ? new Response(null, { status: 503 }) : normalRequest(path), false, false,
+      () => ++catalogRequests === 1
+        ? Response.json({ ...localModelOptions(), state: "prepared", selection })
+        : new Response(null, { status: 503 }));
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    expect(change).not.toBeNull();
+    change.click();
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    input.value = "2048";
+    input.dispatchEvent(new dom.window.Event("input"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
+      .toContain("Restart the host"));
+    expect(toggle.disabled).toBe(true);
+    expect(fetch.mock.calls.map(([path]) => path)).not.toContain("/api/v1/stable-bootstrap");
+  });
+
+  it("uses fresh server evidence to retain an untouched choice after replacement admission refuses", async () => {
+    const selection = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const { toggle, fetch } = await mount(path => path === "/api/v1/local-model-prepare"
+      ? new Response(null, { status: 503 }) : normalRequest(path), false, false,
+      () => Response.json({ ...localModelOptions(), state: "prepared", selection }));
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    change.click();
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    input.value = "2048";
+    input.dispatchEvent(new dom.window.Event("input"));
+    toggle.click();
+    await vi.waitFor(() => expect(fetch.mock.calls.map(([path]) => path)).toContain("/api/v1/local-models"));
+    await vi.waitFor(() => expect(input.value).toBe("4096"));
+    expect(input.disabled).toBe(true);
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/local-model-prepare")).toHaveLength(1);
+  });
+
+  it.each(["stopped", "worker-left", "stop-refused"] as const)("allows Change only after a successful explicit stop (%s)", async (state) => {
+    const selection = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const { toggle, fetch } = await mount(path => path === "/api/v1/stop" && state === "stop-refused"
+      ? new Response(null, { status: 503 }) : normalRequest(path), false, false,
+      () => Response.json({ ...localModelOptions(), state: "prepared", selection }));
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    if (state === "worker-left") {
+      media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
+      await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    } else {
+      toggle.click();
+      await vi.waitFor(() => expect(fetch.mock.calls.map(([path]) => path)).toContain("/api/v1/stop"));
+      await vi.waitFor(() => expect(toggle.textContent).toBe(state === "stopped" ? "Connect" : "Disconnect"));
+    }
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    change.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    expect(input.value).toBe("4096");
+    expect(input.disabled).toBe(state !== "stopped");
+    expect(fetch.mock.calls.map(([path]) => path)).not.toContain("/api/v1/local-model-prepare");
+  });
+
+  it("confirms an unanswered committed replacement without letting Cancel restore stale readiness", async () => {
+    const old = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 4096,
+      advertisedContextTokens: 32768, effectiveContextTokens: 4096,
+    };
+    const committed = { ...old, requestedContextTokens: 2048, effectiveContextTokens: 2048 };
+    let catalogs = 0;
+    const { toggle, fetch } = await mount((path, init) => {
+      if (path === "/api/v1/local-model-prepare") return new Response(null, { status: 503 });
+      if (path === "/api/v1/stable-bootstrap") {
+        expect(JSON.parse(init?.body as string).localModelSelection).toEqual(committed);
+      }
+      return normalRequest(path);
+    }, false, false, () => Response.json({ ...localModelOptions(), state: "prepared",
+      selection: ++catalogs === 1 ? old : committed }));
+    const change = dom.window.document.querySelector<HTMLButtonElement>("#local-model-change")!;
+    change.click();
+    const input = dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!;
+    input.value = "2048";
+    input.dispatchEvent(new dom.window.Event("input"));
+    toggle.click();
+    await vi.waitFor(() => expect(catalogs).toBe(2));
+    await vi.waitFor(() => expect(input.value).toBe("2048"));
+    expect(change.textContent).toBe("Change model or context");
+    change.click();
+    change.click();
+    expect(input.value).toBe("2048");
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(fetch.mock.calls.filter(([path]) => path === "/api/v1/local-model-prepare")).toHaveLength(1);
+  });
   it("prepares the host-selected installed model before the unchanged bootstrap and freezes the observed selection", async () => {
     const order: string[] = [];
     let preparationBody = "";
@@ -176,7 +334,7 @@ describe("mounted connection recovery", () => {
     expect(model.disabled).toBe(true);
     expect(requested.disabled).toBe(true);
     expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
-      .toContain("Model fixed for this host");
+      .toContain("Model prepared");
   });
 
   it("does not clamp a host default above advertised capacity and requires explicit correction", async () => {
@@ -245,7 +403,7 @@ describe("mounted connection recovery", () => {
     };
     const { toggle, fetch } = await mount(normalRequest, false, false, Response.json(catalog));
     expect(dom.window.document.querySelector("#local-model-selection-state")?.textContent)
-      .toContain("Model fixed for this host");
+      .toContain("Model prepared");
     expect(dom.window.document.querySelector("#local-model-effective")?.textContent)
       .toBe("4,096 tokens");
     toggle.click();

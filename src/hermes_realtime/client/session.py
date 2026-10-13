@@ -9,10 +9,11 @@ import logging
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from threading import Lock
-from typing import cast
+from types import MethodType
+from typing import TYPE_CHECKING, cast
 
 from hermes_realtime.conversation.output_style import require_output_style
 from hermes_realtime.evidence.models import (
@@ -33,10 +34,13 @@ from hermes_realtime.search_egress import (
     search_egress_status_to_primitive,
 )
 
-from .bootstrap import BrowserJoinCredential, BrowserTokenIssuer
+from .bootstrap import BrowserJoinCredential, BrowserTokenIssuer, OneTimeBootstrapCapability
 from .projection import BrowserEventProjection, BrowserPublicEvent, PublicValue
 
 _LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from hermes_realtime.providers.ollama_session import OllamaSessionSelection
 
 
 class NoBrowserSession(RuntimeError):
@@ -852,17 +856,101 @@ class BrowserSessionDirector:
                 print("[browser-model-admission] " + json.dumps(
                     {"version": 1, "category": category}, separators=(",", ":")), flush=True)
 
-    async def start(self) -> BrowserJoinCredential:
+    def _local_model_owner(self) -> OllamaSessionSelection:
+        from hermes_realtime.providers.ollama_session import OllamaSessionSelection
+
+        admission = self._local_model_configuration
+        owner = getattr(admission, "__self__", None)
+        if (
+            type(admission) is not MethodType
+            or type(owner) is not OllamaSessionSelection
+            or admission != owner.require_prepared
+        ):
+            raise ValueError("local model selection admission binding must match its owner")
+        return owner
+
+    async def prepare_local_model(
+        self,
+        model: str,
+        digest: str,
+        requested_context_tokens: int,
+    ) -> dict[str, object]:
+        """Configure a local adapter only between successfully settled sessions."""
+        category = "session_refused"
+        try:
+            from hermes_realtime.providers.ollama_session import PREPARATION_TIMEOUT_SECONDS
+
+            async with asyncio.timeout(PREPARATION_TIMEOUT_SECONDS), self._start_lock:
+                if self._active_generation is not None:
+                    raise RuntimeError("an active browser session cannot change local model")
+                if self._rebind_finalizer is not None or self._rebind_finalization_failed:
+                    raise RuntimeError("browser session recovery has not settled")
+                category = "preparation_refused"
+                result = await self._local_model_owner().prepare(
+                    model,
+                    digest,
+                    requested_context_tokens,
+                )
+                category = "prepared"
+                return result
+        except TimeoutError:
+            category = "deadline"
+            raise
+        finally:
+            print(
+                "[local-model-configuration] "
+                + json.dumps({"version": 1, "category": category}, separators=(",", ":")),
+                flush=True,
+            )
+
+    @contextlib.asynccontextmanager
+    async def _start_admission_lock(self) -> AsyncIterator[None]:
+        category = "refused"
+        acquired = False
+        try:
+            # The existing session transition budget also bounds queued bootstrap.
+            async with asyncio.timeout(self._rollback_timeout):
+                await self._start_lock.acquire()
+            acquired = True
+            category = "acquired"
+            yield
+        except TimeoutError:
+            category = "deadline"
+            raise
+        finally:
+            if acquired:
+                self._start_lock.release()
+            else:
+                print("[browser-start-lock] " + json.dumps(
+                    {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+
+    async def start(
+        self, *, expected_local_selection: object = None,
+        bootstrap_capability: OneTimeBootstrapCapability | None = None,
+        bootstrap_bearer: str | None = None,
+    ) -> BrowserJoinCredential:
         """Create one credential and provision its exact server-side identity first."""
 
-        async with self._start_lock:
+        async with self._start_admission_lock():
             self.require_model_prepared()
+            if self._local_model_configuration is not None:
+                self._local_model_owner().require_choice(expected_local_selection)
             if self._rebind_finalization_failed:
                 raise RuntimeError("browser session recovery failed closed")
             if self._rebind_finalizer is not None:
                 raise RuntimeError("browser session recovery is finalizing")
             if self._active_generation is not None:
                 raise RuntimeError("a browser session is already active")
+            if bootstrap_capability is not None:
+                category = "refused"
+                try:
+                    if type(bootstrap_capability) is not OneTimeBootstrapCapability:
+                        raise TypeError("bootstrap capability must be exact")
+                    bootstrap_capability.consume(cast(str, bootstrap_bearer))
+                    category = "claimed"
+                finally:
+                    print("[bootstrap-capability] " + json.dumps(
+                        {"version": 1, "category": category}, separators=(",", ":")), flush=True)
             self._projection.reset(initial_slots=self._fresh_view_initial_slots())
             status_reservation = (
                 self._projection.reserve_capture_status()

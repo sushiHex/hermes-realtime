@@ -31,7 +31,9 @@ class Harness:
             assert client is harness.client
             digest = "d" * 64 if harness.backend.changed else "a" * 64
             adapter._context_observation = OllamaContextObservation(
-                OllamaContextConfiguration(OllamaModelMetadata("small", digest, 4096), requested)
+                OllamaContextConfiguration(
+                    OllamaModelMetadata(adapter._model, digest, 4096), requested
+                )
             )
 
         async def observe(adapter):
@@ -89,8 +91,6 @@ async def test_prepare_freezes_exact_adapter_and_context(monkeypatch):
     request_count = len(harness.backend.requests)
     assert (await harness.owner.catalog())["selection"] == selection
     assert len(harness.backend.requests) == request_count
-    with pytest.raises(RuntimeError, match="frozen"):
-        await harness.owner.prepare("small", "a" * 64, 2048)
     await harness.owner.close()
     assert harness.closed == harness.adapters
     with pytest.raises(RuntimeError):
@@ -106,6 +106,154 @@ async def test_stale_selection_never_runs_readiness(monkeypatch):
     assert harness.ready == []
     assert harness.closed == harness.adapters
     assert (await harness.owner.catalog())["state"] == "configuring"
+
+
+async def test_replacement_closes_exact_old_adapter_and_commits_fresh_binding(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    old = harness.adapters[0]
+    await harness.owner.prepare("small", "a" * 64, 2048)
+    assert harness.closed == [old]
+    assert harness.owner.context_observation().configuration.requested_context_tokens == 2048
+    assert harness.owner.require_prepared().local_context.__self__ is harness.adapters[1]
+    await harness.owner.close()
+
+
+async def test_replacement_cleanup_failure_fences_owner_and_retains_old_adapter(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    original_close = OllamaStreamingInference.close
+    failed = True
+
+    async def close(adapter):
+        if failed:
+            raise RuntimeError("synthetic cleanup refusal")
+        await original_close(adapter)
+
+    monkeypatch.setattr(OllamaStreamingInference, "close", close)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        await harness.owner.prepare("small", "a" * 64, 2048)
+    with pytest.raises(RuntimeError, match="closed"):
+        await harness.prepare()
+    failed = False
+    await harness.owner.close()
+    assert len(harness.closed) == len(harness.adapters) and set(harness.closed) == set(
+        harness.adapters
+    )
+
+
+async def test_replacement_reports_preparing_and_refuses_old_choice_admission(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    harness.block = asyncio.Event()
+    preparing = asyncio.create_task(harness.owner.prepare("small", "a" * 64, 2048))
+    for _ in range(100):
+        if len(harness.ready) == 2:
+            break
+        if preparing.done():
+            preparing.result()
+        await asyncio.sleep(0)
+    assert len(harness.ready) == 2
+    with pytest.raises(RuntimeError, match="preparing"):
+        harness.owner.require_prepared()
+    catalog = await harness.owner.catalog()
+    assert catalog["state"] == "preparing" and catalog["selection"] is None
+    with pytest.raises(RuntimeError, match="preparing"):
+        await harness.prepare()
+    assert harness.closed == []
+    harness.block.set()
+    await preparing
+    await harness.owner.close()
+
+
+async def test_failed_replacement_never_republishes_stale_old_allocation(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    harness.fail = True
+    with pytest.raises(RuntimeError, match="readiness"):
+        await harness.owner.prepare("small", "a" * 64, 2048)
+    with pytest.raises(RuntimeError, match="closed"):
+        harness.owner.require_prepared()
+    with pytest.raises(RuntimeError, match="closed"):
+        await harness.owner.catalog()
+    assert harness.closed == [harness.adapters[1]]
+    await harness.owner.close()
+    assert set(harness.closed) == set(harness.adapters)
+
+
+async def test_invalid_replacement_before_factory_preserves_prepared_owner(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    configuration = harness.owner.require_prepared()
+    with pytest.raises(ValueError):
+        await harness.owner.prepare("small", "a" * 64, 8192)
+    assert harness.owner.require_prepared() is configuration
+    assert len(harness.adapters) == 1 and harness.closed == []
+    await harness.owner.close()
+
+
+async def test_replacement_refuses_active_stream_without_closing_it(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+
+    async def stream(adapter, snapshot, *, turn_id):
+        yield "Synthetic segment"
+
+    monkeypatch.setattr(OllamaStreamingInference, "stream", stream)
+    iterator = harness.owner.stream(object(), turn_id="turn_synthetic")
+    await anext(iterator)
+    with pytest.raises(RuntimeError, match="streaming"):
+        await harness.owner.prepare("small", "a" * 64, 2048)
+    assert harness.closed == [] and len(harness.adapters) == 1
+    await iterator.aclose()
+    await harness.owner.prepare("small", "a" * 64, 2048)
+    await harness.owner.close()
+
+
+async def test_close_during_old_cleanup_never_returns_a_new_prepared_choice(monkeypatch):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    old = harness.adapters[0]
+
+    async def close(adapter):
+        harness.closed.append(adapter)
+        if adapter is old:
+            harness.owner._closed = True
+
+    monkeypatch.setattr(OllamaStreamingInference, "close", close)
+    with pytest.raises(RuntimeError, match="closed"):
+        await harness.owner.prepare("small", "a" * 64, 2048)
+    assert harness.owner._selection["requestedContextTokens"] == 4096
+    assert set(harness.closed) == set(harness.adapters)
+
+
+async def test_quiescence_restoration_sees_the_committed_choice_and_clear_preparation(monkeypatch):
+    harness = Harness(monkeypatch)
+
+    @contextlib.contextmanager
+    def quiescent():
+        yield
+        observation = harness.owner.context_observation()
+        assert observation.configuration.requested_context_tokens == 4096
+
+    harness.owner._quiescent = quiescent
+    await harness.prepare()
+    await harness.owner.close()
+
+
+@pytest.mark.parametrize("field", ["model", "digest"])
+async def test_new_model_or_digest_never_reuses_the_previous_adapter(monkeypatch, field):
+    harness = Harness(monkeypatch)
+    await harness.prepare()
+    model = "another" if field == "model" else "small"
+    digest = "d" * 64 if field == "digest" else "a" * 64
+    harness.backend.changed = field == "digest"
+    harness.owner._models = (OllamaModelMetadata(model, digest, 4096),)
+    result = await harness.owner.prepare(model, digest, 4096)
+    assert result["model"] == model and result["digest"] == digest
+    assert len(harness.adapters) == 2
+    assert harness.closed == [harness.adapters[0]]
+    await harness.owner.close()
 
 
 async def test_failed_readiness_closes_candidate_and_can_retry(monkeypatch):
@@ -162,9 +310,15 @@ async def test_concurrent_catalog_uses_one_owned_discovery(monkeypatch):
     assert len([path for path, _ in harness.backend.requests if path == "tags"]) == 2
 
 
-@pytest.mark.parametrize("field,value", [
-    ("model", "alias"), ("requested", 2048), ("advertised", 8192), ("advertised", None),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model", "alias"),
+        ("requested", 2048),
+        ("advertised", 8192),
+        ("advertised", None),
+    ],
+)
 async def test_configured_choice_must_equal_request(monkeypatch, field, value):
     harness = Harness(monkeypatch)
 
@@ -172,7 +326,8 @@ async def test_configured_choice_must_equal_request(monkeypatch, field, value):
         adapter._context_observation = OllamaContextObservation(
             OllamaContextConfiguration(
                 OllamaModelMetadata(
-                    value if field == "model" else "small", "a" * 64,
+                    value if field == "model" else "small",
+                    "a" * 64,
                     value if field == "advertised" else 4096,
                 ),
                 value if field == "requested" else requested,
@@ -322,6 +477,7 @@ async def test_concurrent_close_does_not_repeat_adapter_cleanup(monkeypatch):
         ("default_model", "bad\nmodel"),
         ("adapter_factory", None),
         ("readiness", None),
+        ("quiescent", None),
     ],
 )
 async def test_constructor_requires_exact_source_and_valid_callbacks(monkeypatch, field, value):
