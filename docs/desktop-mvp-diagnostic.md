@@ -379,6 +379,12 @@ From the host:
 - `[speech-cleanup-refusal]`: `category: pending`, the shared cleanup guard refused admission
   or close while provider or consumer cleanup remained pending. Each line records one guard
   refusal, including close refusals, rather than one refused user turn. `pending: 1` is presence.
+- `[moonshine-finalization-refusal]`: `category: native_finalization_failed`, Moonshine reported
+  an error or returned no final result. The adapter refuses to promote its partial snapshot
+  into a final transcript. Each line records one refused finalization (`count: 1`), even if
+  closing the stream also fails. Record this marker when investigating missing ending words;
+  its absence does not establish a VAD or recognition cause. It contains no transcript or
+  native error details.
 - `[hermes-bridge-welcome]`: the host refused the companion's side of the bridge hello. The
   category is one of these:
   - `shape`: the welcome was a refusal, or was malformed or cut off;

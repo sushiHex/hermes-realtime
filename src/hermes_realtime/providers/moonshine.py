@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
+import json
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -57,6 +59,7 @@ class _NativeMoonshineBackend:
         self._stream: Any | None = None
         self._lines: dict[int, tuple[float, str]] = {}
         self._dirty = False
+        self._stream_error = False
 
     def _ensure_stream(self) -> Any:
         stream = self._stream
@@ -73,6 +76,11 @@ class _NativeMoonshineBackend:
         return stream
 
     def _on_event(self, event: object) -> None:
+        # The SDK reports final-pass exceptions as events rather than raising
+        # from stop(). Retain that fact until the stream is successfully closed.
+        if getattr(event, "error", None) is not None:
+            self._stream_error = True
+            return
         line = getattr(event, "line", None)
         if line is None:
             return
@@ -119,10 +127,12 @@ class _NativeMoonshineBackend:
         stream = self._stream
         if stream is None:
             return ""
+        refused = False
         try:
             result = stream.stop()
-            if result is None:
-                return self._snapshot()
+            if self._stream_error or result is None:
+                refused = True
+                raise RuntimeError("Moonshine finalization failed")
             lines = getattr(result, "lines", None)
             if not isinstance(lines, list):
                 raise TypeError("Moonshine final transcript lines are invalid")
@@ -137,10 +147,29 @@ class _NativeMoonshineBackend:
             final_text = " ".join(texts)
             return final_text or self._snapshot()
         finally:
-            stream.close()
-            self._stream = None
-            self._lines.clear()
-            self._dirty = False
+            try:
+                stream.close()
+                self._stream = None
+                self._lines.clear()
+                self._dirty = False
+                self._stream_error = False
+            finally:
+                if refused:
+                    # Diagnostic output must not replace the provider refusal
+                    # or interrupt the custody of a stream whose close failed.
+                    with contextlib.suppress(Exception):
+                        print(
+                            "[moonshine-finalization-refusal] "
+                            + json.dumps(
+                                {
+                                    "version": 1,
+                                    "category": "native_finalization_failed",
+                                    "count": 1,
+                                },
+                                separators=(",", ":"),
+                            ),
+                            flush=True,
+                        )
 
     def cancel(self) -> None:
         stream = self._stream
@@ -149,6 +178,7 @@ class _NativeMoonshineBackend:
         self._stream = None
         self._lines.clear()
         self._dirty = False
+        self._stream_error = False
 
 
     def close(self) -> None:

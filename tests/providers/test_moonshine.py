@@ -1,14 +1,166 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_realtime.providers import MoonshineStreamingTranscriber
+from hermes_realtime.providers.moonshine import _NativeMoonshineBackend
 from hermes_realtime.speech import AudioFrame, Transcript
+
+
+class SyntheticNativeAudio:
+    def astype(self, dtype: object) -> SyntheticNativeAudio:
+        return self
+
+    def __itruediv__(self, divisor: float) -> SyntheticNativeAudio:
+        return self
+
+
+class SyntheticNativeStream:
+    def __init__(self) -> None:
+        self.listener: Callable[[object], None] = lambda event: None
+        self.result: object = SimpleNamespace(lines=[SimpleNamespace(text="Synthetic complete")])
+        self.emit_error = False
+        self.close_fails = False
+        self.close_calls = 0
+
+    def add_listener(self, listener: Callable[[object], None]) -> None:
+        self.listener = listener
+
+    def start(self) -> None:
+        pass
+
+    def add_audio(self, audio: object, sample_rate: int) -> None:
+        self.listener(
+            SimpleNamespace(
+                line=SimpleNamespace(line_id=1, start_time=0.0, text="Synthetic prefix")
+            )
+        )
+
+    def stop(self) -> object:
+        # The pinned SDK catches final-pass errors, emits Error(line=None),
+        # and returns None instead of propagating the exception.
+        if self.emit_error:
+            self.listener(
+                SimpleNamespace(line=None, error=RuntimeError("synthetic sensitive detail"))
+            )
+        return self.result
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_fails:
+            raise RuntimeError("synthetic close failure")
+
+
+def _native_backend(
+    monkeypatch: pytest.MonkeyPatch, stream: SyntheticNativeStream
+) -> _NativeMoonshineBackend:
+    monkeypatch.setitem(sys.modules, "numpy", SimpleNamespace(
+        frombuffer=lambda pcm, dtype: SyntheticNativeAudio(), int16=object(), float32=object()
+    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "moonshine_voice",
+        SimpleNamespace(
+            ModelArch=SimpleNamespace(TINY_STREAMING="tiny"),
+            get_model_for_language=lambda **kwargs: ("synthetic-model", "tiny"),
+            Transcriber=lambda **kwargs: SimpleNamespace(
+                create_stream=lambda **kwargs: stream, close=lambda: None
+            ),
+        ),
+    )
+    return _NativeMoonshineBackend(language="en", model_tier="tiny", update_interval_seconds=0.2)
+
+
+@pytest.mark.parametrize(
+    "failure", ("missing_final", "error_with_final", "sdk_error", "prior_error")
+)
+@pytest.mark.asyncio
+async def test_native_moonshine_refuses_failed_finalization_and_recovers(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    stream = SyntheticNativeStream()
+    stream.emit_error = failure in {"error_with_final", "sdk_error"}
+    if failure in {"missing_final", "sdk_error"}:
+        stream.result = None
+    backend = _native_backend(monkeypatch, stream)
+    transcriber = MoonshineStreamingTranscriber(backend=backend)
+    await transcriber.push(_frame())
+    if failure == "prior_error":
+        backend._on_event(SimpleNamespace(line=None, error=RuntimeError("synthetic prior error")))
+
+    with pytest.raises(RuntimeError, match="^Moonshine finalization failed$"):
+        await transcriber.finish_utterance()
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    lines = output.out.splitlines()
+    assert len(lines) == 1
+    prefix = "[moonshine-finalization-refusal] "
+    assert lines[0].startswith(prefix)
+    assert json.loads(lines[0][len(prefix) :]) == {
+        "version": 1,
+        "category": "native_finalization_failed",
+        "count": 1,
+    }
+    assert stream.close_calls == 1
+    assert backend._stream is None
+    assert backend._lines == {}
+    assert backend._stream_error is False
+
+    stream.emit_error = False
+    stream.result = SimpleNamespace(lines=[SimpleNamespace(text="Synthetic complete")])
+    await transcriber.push(_frame())
+    assert await transcriber.finish_utterance() == Transcript(text="Synthetic complete", final=True)
+    assert capsys.readouterr().out == ""
+    await transcriber.close()
+
+
+def test_native_moonshine_retains_error_until_stream_close_succeeds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = SyntheticNativeStream()
+    backend = _native_backend(monkeypatch, stream)
+    backend.add_pcm(_frame().pcm, 48_000, 1)
+    stream.emit_error = True
+    stream.result = None
+    stream.close_fails = True
+
+    with pytest.raises(RuntimeError, match="synthetic close failure"):
+        backend.finish()
+    assert backend._stream is stream
+    assert backend._stream_error is True
+    assert len(capsys.readouterr().out.splitlines()) == 1
+
+    stream.close_fails = False
+    backend.cancel()
+    assert backend._stream is None
+    assert backend._stream_error is False
+    assert backend._lines == {}
+
+
+def test_native_moonshine_diagnostic_failure_preserves_finalization_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = SyntheticNativeStream()
+    stream.result = None
+    backend = _native_backend(monkeypatch, stream)
+    backend.add_pcm(_frame().pcm, 48_000, 1)
+
+    def failed_output(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic sink failure")
+
+    monkeypatch.setattr("builtins.print", failed_output)
+    with pytest.raises(RuntimeError, match="^Moonshine finalization failed$"):
+        backend.finish()
+    assert backend._stream is None
+    assert backend._stream_error is False
 
 
 def _frame(samples: int = 480) -> AudioFrame:
