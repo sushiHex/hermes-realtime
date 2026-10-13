@@ -26,6 +26,50 @@ from tests.support.ollama_metadata import supported_ollama_metadata
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
 
+@pytest.mark.parametrize("instruction", [
+    "For an ordinary reply, use one or two short spoken sentences.",
+    "Give the direct answer first, then stop when the question is answered.",
+    "Expand only when the user explicitly requests detail or essential facts, uncertainty, "
+    "or the requested format require it.",
+], ids=["ordinary-budget", "answer-and-stop", "detail-and-accuracy"])
+@pytest.mark.asyncio
+async def test_concise_spoken_contract_reaches_actual_request_without_truncation(instruction):
+    requests = []
+    selection = OutputStyleSelection()
+    selection.select("concise")
+
+    def open_request(request, timeout):
+        requests.append(json.loads(request.data))
+        return LineResponse(({"message": {"content": "Synthetic answer."}, "done": True},))
+
+    snapshot = ConversationInferenceRequest(
+        revision=1,
+        messages=(ConversationMessage("user", "Explain the example in detail."),),
+        active_tasks=(),
+    )
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test", num_ctx=4096,
+        open_request=open_request, output_style=selection.get,
+    )
+    assert [part async for part in inference.stream(snapshot, turn_id="turn_concise")]
+    request = requests[0]
+    policy, references = request["messages"][0]["content"].split("\n\nReference data:\n", 1)
+    common, presentation = policy.split("\n\nResponse presentation:\n", 1)
+    assert common.startswith("Output style: concise.\n")
+    assert "communication preference only" in common
+    assert "accepted dispatch" in common
+    assert instruction in presentation
+    assert "one or two short sentences for simple turns" not in presentation
+    assert json.loads(references) == {"work_state": "none"}
+    assert request["messages"][1:] == [
+        {"role": "user", "content": "Explain the example in detail."},
+    ]
+    assert request["options"] == {"num_ctx": 4096}
+    assert request["shift"] is False and request["truncate"] is False
+    await inference.close()
+
+
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
 @pytest.mark.asyncio
 async def test_output_style_and_reference_kinds_bind_to_the_sent_prompt(style, capsys) -> None:
