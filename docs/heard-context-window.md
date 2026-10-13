@@ -206,16 +206,21 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
 | Part | Characters |
 | --- | --- |
 | Heard window | 22,528 |
-| Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
+| Interrupted delivery indices, JSON wrapper and index/authority framing | at most 500 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
 | Foreground communication/style policy and work-state framing | about 2,200 |
-| **Total** | **about 33,750** |
+| **Total** | **about 33,600** |
 
-- **Tokens.** At an estimated 3 characters per token, that is about 11,250 tokens. The chat
-  template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
+- **Delivery metadata.** At most 32 zero-based indices for the bounded heard window are
+  carried in labelled system reference JSON. The wrapper and all indices take 139 characters;
+  the index/authority explanation takes 295, so 500 is a conservative allowance. Dialogue text
+  stays unchanged, and the heard-window limits remain unchanged. A model may still verbalize
+  metadata; this representation is not a guarantee of model obedience.
+- **Tokens.** At an estimated 3 characters per token, that is about 11,200 tokens. The chat
+  template adds about 6 tokens for each of 33 messages (about 200), for about 11,400 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Estimated headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 5,000 tokens for active-task and update reference
   sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
