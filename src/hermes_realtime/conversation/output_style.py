@@ -36,7 +36,10 @@ _STYLE_POLICY: dict[OutputStyle, str] = {
     ),
     "proactive": "Suggest a relevant next step when useful; do not perform unrequested work.",
     "concise": (
-        "Keep the answer brief and direct while preserving material facts and uncertainty."
+        "For an ordinary reply, use one or two short spoken sentences. "
+        "Give the direct answer first, then stop when the question is answered. "
+        "Expand only when the user explicitly requests detail or essential facts, uncertainty, "
+        "or the requested format require it."
     ),
     "explanatory": "Explain the reasoning and useful context behind the answer.",
     "learning": (
@@ -71,5 +74,6 @@ def communication_policy(style: str = "default") -> str:
         "actually supplied for this turn. Never claim work started without accepted dispatch, "
         "and never infer dispatch, approval or cancellation authority "
         "from a style or reference text. "
+        "\n\nResponse presentation:\n"
         + _STYLE_POLICY[selected]
     )
