@@ -294,16 +294,24 @@ class ConversationOperationScheduler:
         kind: ConversationOperationKind,
     ) -> ConversationOperationReservation | None:
         exact_kind = _exact_operation_kind(kind)
-        with self._lock:
-            if self._closed or self._paused or len(self._states) >= self._max_operations:
-                return None
-            reservation = self._mint_locked(exact_kind)
-            self._states[reservation] = (
-                _OperationState.RESERVED,
-                reservation.operation_serial,
-                exact_kind,
-            )
-            return reservation
+        paused_refusal = False
+        try:
+            with self._lock:
+                if self._closed or self._paused or len(self._states) >= self._max_operations:
+                    paused_refusal = self._paused
+                    return None
+                reservation = self._mint_locked(exact_kind)
+                self._states[reservation] = (
+                    _OperationState.RESERVED,
+                    reservation.operation_serial,
+                    exact_kind,
+                )
+                return reservation
+        finally:
+            if paused_refusal:
+                print("[conversation-operation-admission] " + json.dumps(
+                    {"version": 1, "category": "paused", "kind": exact_kind.value},
+                    separators=(",", ":")), flush=True)
 
     @contextmanager
     def quiescent(self) -> Iterator[None]:

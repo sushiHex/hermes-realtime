@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from test_actions import (
@@ -20,6 +21,27 @@ from hermes_realtime.conversation import (
 )
 from hermes_realtime.evidence import ConversationOperationKind, ConversationOperationScheduler
 from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
+
+
+@pytest.mark.parametrize("kind", list(ConversationOperationKind))
+def test_paused_reservation_records_exact_kind_without_reserving(kind, capsys):
+    scheduler = ConversationOperationScheduler(owner_generation=1)
+    with scheduler.quiescent():
+        assert scheduler.try_reserve(kind) is None
+        assert scheduler.active_count == 0
+        marker, payload = capsys.readouterr().out.strip().split(" ", 1)
+        assert marker == "[conversation-operation-admission]"
+        assert json.loads(payload) == {"version": 1, "category": "paused", "kind": kind.value}
+
+
+def test_nonpaused_reservations_do_not_emit_pause_evidence(capsys):
+    scheduler = ConversationOperationScheduler(owner_generation=1, max_operations=1)
+    reservation = scheduler.try_reserve(ConversationOperationKind.RESPONSE)
+    assert reservation is not None
+    assert scheduler.try_reserve(ConversationOperationKind.REPLAY) is None
+    scheduler.close()
+    assert scheduler.try_reserve(ConversationOperationKind.PROACTIVE) is None
+    assert capsys.readouterr().out == ""
 
 
 def test_quiescent_scheduler_blocks_all_kinds_and_restores_after_failure():
