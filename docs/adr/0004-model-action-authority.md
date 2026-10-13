@@ -83,6 +83,24 @@ stand-in evidence or loosen thresholds after seeing the result.
 
 ## Required qualification
 
+Qualification cases must identify their target and material baseline, or supply
+an actual context or execution contract under which Hermes can discover them.
+A repository, workspace or deployment binding cannot be assumed from wording
+alone. When a material input is absent and not discoverable under that contract,
+a foreground clarification may be appropriate; asking for that input differs
+from denying available background capabilities. Freeze inputs, expected decisions
+and clarification criteria before inference, and distinguish operational or budget
+failures from semantic decisions. Preserve previous evidence and holdout labels
+and thresholds.
+
+The [development fixture](../../tests/fixtures/natural_work_development_cases.json)
+separates ten routing cases from one clarification control requiring manual
+semantic review. The unchanged 100-case holdout includes repository inspection
+and test-suite requests that assume an available workspace. Establish and freeze
+the actual workspace and discoverability contract before interpreting those cases
+as qualification evidence; do not compensate for a missing premise by relabeling
+cases or changing thresholds after observing results.
+
 - Real-model positive requests for research, current information and tool use
   delegate with the intended objective; ordinary conversation and explanations
   remain direct. Include negation, quotation, neutral turns and instruction-shaped
