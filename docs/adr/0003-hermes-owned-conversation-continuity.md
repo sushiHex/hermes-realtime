@@ -268,7 +268,12 @@ Interruption is data, not text: a turn that ends abnormally after some speech wa
 `interrupted` once on its last confirmed row, including after a rollover. Its text stays exactly
 the confirmed portion. A crash conservatively flags the open row in the durable voice tail.
 Providers render the flag deterministically, as an `"interrupted": true` field in the Codex
-snapshot and as a fixed suffix in Ollama's chat messages. Model text can never forge the flag.
+snapshot and as ordered zero-based conversation-row indices in Ollama's labelled system
+reference `speech_delivery.interrupted_message_indices`, excluding the system message.
+Ollama preserves each dialogue row's text and order exactly; literal text resembling an
+interruption marker does not establish a flag. Delivery metadata identifies heard prefixes,
+does not request automatic resumption, and grants no work authority. Model text cannot forge
+the stored flag, though a model may still verbalize reference metadata.
 A turn with nothing confirmed writes no assistant row. A replay is a new turn and adds only
 newly confirmed text in its own row; the undelivered remainder stays in the resumable-replay
 machinery. The Codex prompt's statement that earlier assistant messages "represent only speech
