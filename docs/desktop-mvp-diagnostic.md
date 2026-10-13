@@ -373,6 +373,12 @@ From the host:
 - `[binding-speech]`: `cause: resisted`, speech the page's binding started, such as the
   readiness cue, did not stop within 10 s of the binding closing. The reload or reconnect that
   closed it fails, and a retry tries again. It is a finding.
+- `[speech-consumer-cleanup]`: `category: retained`, cleanup returned while a speech consumer
+  remained live, so the runtime retains it until it settles. `pending: 1` means pending cleanup
+  is present; it is not a count of consumers or tasks.
+- `[speech-cleanup-refusal]`: `category: pending`, the shared cleanup guard refused admission
+  or close while provider or consumer cleanup remained pending. Each line records one guard
+  refusal, including close refusals, rather than one refused user turn. `pending: 1` is presence.
 - `[hermes-bridge-welcome]`: the host refused the companion's side of the bridge hello. The
   category is one of these:
   - `shape`: the welcome was a refusal, or was malformed or cut off;
