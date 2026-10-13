@@ -29,6 +29,15 @@ _MAX_MODEL_CHARS = 256
 _MAX_SEGMENT_CHARS = 4096
 _MAX_ACTIVE_STREAMS = 16
 _MAX_RESPONSE_LINE_BYTES = 1_048_576
+# Ollama durations describe one foreground request. Keep individual reported
+# values finite and bounded without imposing cross-field duration assumptions.
+_MAX_DURATION_NS = 86_400_000_000_000  # 24 hours
+_DURATION_FIELDS = (
+    ("load_duration", "load_duration_ns"),
+    ("prompt_eval_duration", "prompt_eval_duration_ns"),
+    ("eval_duration", "eval_duration_ns"),
+    ("total_duration", "total_duration_ns"),
+)
 # Render-time rendering of an interrupted row; stored context text never contains it.
 _INTERRUPTED_SPEECH_SUFFIX = " [speech interrupted]"
 # Requested with every request in place of a server default that depends on the GPU
@@ -373,7 +382,7 @@ class OllamaStreamingInference:
                     for segment in segments:
                         yield segment
                 if done:
-                    self._report_prompt(messages, payload.get("prompt_eval_count"))
+                    self._report_prompt(messages, payload.get("prompt_eval_count"), payload)
                     break
             segments, buffer = self._extract_segments(buffer, final=True)
             for segment in segments:
@@ -643,7 +652,12 @@ class OllamaStreamingInference:
             kind for kind in ("memory", "active_work", "updates") if kind in sections
         ]}
 
-    def _report_prompt(self, messages: list[dict[str, str]], prompt_eval_count: object) -> None:
+    def _report_prompt(
+        self,
+        messages: list[dict[str, str]],
+        prompt_eval_count: object,
+        completion: dict[str, object],
+    ) -> None:
         """One content-free line: the prompt this adapter sent beside what Ollama evaluated.
 
         ``num_ctx`` is what was requested; the server may cap it at the model's trained
@@ -652,6 +666,17 @@ class OllamaStreamingInference:
         """
 
         content = "".join(message["content"] for message in messages)
+        durations: dict[str, int | None] = {}
+        invalid_duration_fields: list[str] = []
+        for source_name, marker_name in _DURATION_FIELDS:
+            value = completion.get(source_name)
+            if source_name not in completion:
+                durations[marker_name] = None
+            elif type(value) is int and 0 <= value <= _MAX_DURATION_NS:
+                durations[marker_name] = value
+            else:
+                durations[marker_name] = None
+                invalid_duration_fields.append(source_name)
         print(
             _PROMPT_MARKER_PREFIX
             + json.dumps(
@@ -664,6 +689,9 @@ class OllamaStreamingInference:
                     "prompt_eval_count": (
                         prompt_eval_count if type(prompt_eval_count) is int else None
                     ),
+                    **durations,
+                    "timing_invalid_count": len(invalid_duration_fields),
+                    "timing_invalid_fields": invalid_duration_fields,
                     "version": 1,
                 },
                 separators=(",", ":"),

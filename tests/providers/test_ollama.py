@@ -277,6 +277,12 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
         "prompt_bytes": len(content.encode("utf-8")),
         "prompt_chars": len(content),
         "prompt_eval_count": 31,
+        "load_duration_ns": None,
+        "prompt_eval_duration_ns": None,
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+        "timing_invalid_count": 0,
+        "timing_invalid_fields": [],
         "version": 1,
     }
     assert reports[1]["num_ctx"] == 32_768

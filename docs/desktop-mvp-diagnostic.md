@@ -420,6 +420,16 @@ verbatim.
 The browser's **Session model** panel shows **Response last** and **Response average**: the time
 from your final transcript to the first foreground token. **Diagnostics → Latency markers** lists
 named timings in milliseconds, such as `transcript_to_first_token` and `first_token_to_audio`.
+The `[ollama-prompt]` marker's `load_duration_ns`, `prompt_eval_duration_ns`, `eval_duration_ns`,
+and `total_duration_ns` are provider-reported timings from Ollama's final completion record, in
+nanoseconds ([Ollama API usage](https://github.com/ollama/ollama/blob/main/docs/api/usage.mdx)).
+They are read only from a `done=true` final stream record, so failed or uncompleted requests may
+have no timing record. Each field accepts an exact integer from 0 through 86,400,000,000,000 ns
+(24 hours), independently. A `null` value means unavailable or invalid; `timing_invalid_count`
+and `timing_invalid_fields` identify invalid values without recording model text. The host's
+`first_playable_audio` marker is emitted before playback begins, so `first_token_to_audio` is not
+a browser-playback or physical-audibility measurement. Browser media-playback observations are
+separate, and no machine timing establishes speaker output or that a person heard it.
 For task steps, use wall-clock seconds from submitting the command to each task state.
 
 ### The record sheet
