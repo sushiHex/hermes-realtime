@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request
 
 import pytest
+import pytest_asyncio
 
 import hermes_realtime.providers.ollama as ollama_module
 from hermes_realtime.conversation import (
@@ -24,6 +25,50 @@ from hermes_realtime.providers import OllamaStreamingInference
 from tests.support.ollama_metadata import supported_ollama_metadata
 
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
+
+@pytest.mark.parametrize("instruction", [
+    "For an ordinary reply, use one or two short spoken sentences.",
+    "Give the direct answer first, then stop when the question is answered.",
+    "Expand only when the user explicitly requests detail or essential facts, uncertainty, "
+    "or the requested format require it.",
+], ids=["ordinary-budget", "answer-and-stop", "detail-and-accuracy"])
+@pytest.mark.asyncio
+async def test_concise_spoken_contract_reaches_actual_request_without_truncation(instruction):
+    requests = []
+    selection = OutputStyleSelection()
+    selection.select("concise")
+
+    def open_request(request, timeout):
+        requests.append(json.loads(request.data))
+        return LineResponse(({"message": {"content": "Synthetic answer."}, "done": True},))
+
+    snapshot = ConversationInferenceRequest(
+        revision=1,
+        messages=(ConversationMessage("user", "Explain the example in detail."),),
+        active_tasks=(),
+    )
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test", num_ctx=4096,
+        open_request=open_request, output_style=selection.get,
+    )
+    assert [part async for part in inference.stream(snapshot, turn_id="turn_concise")]
+    request = requests[0]
+    policy, references = request["messages"][0]["content"].split("\n\nReference data:\n", 1)
+    common, presentation = policy.split("\n\nResponse presentation:\n", 1)
+    assert common.startswith("Output style: concise.\n")
+    assert "communication preference only" in common
+    assert "accepted dispatch" in common
+    assert instruction in presentation
+    assert "one or two short sentences for simple turns" not in presentation
+    assert json.loads(references) == {"work_state": "none"}
+    assert request["messages"][1:] == [
+        {"role": "user", "content": "Explain the example in detail."},
+    ]
+    assert request["options"] == {"num_ctx": 4096}
+    assert request["shift"] is False and request["truncate"] is False
+    await inference.close()
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
@@ -175,25 +220,95 @@ async def test_ollama_streams_bounded_speakable_segments_without_tool_schema() -
     assert "tool_choice" not in body
 
 
-def test_ollama_renders_the_interrupted_flag_as_a_fixed_suffix_only_when_set() -> None:
+@pytest_asyncio.fixture
+async def interrupted_request(capsys):
+    requests = []
     snapshot = ConversationInferenceRequest(
         revision=2,
         messages=(
-            ConversationMessage(role="assistant", text="Cut off here.", interrupted=True),
-            ConversationMessage(role="assistant", text="I said [speech interrupted]"),
+            ConversationMessage("user", "Older question."),
+            ConversationMessage("assistant", "Heard prefix.", interrupted=True),
+            ConversationMessage("assistant", "I said [speech interrupted]"),
+            ConversationMessage("user", "Another question."),
+            ConversationMessage("assistant", "Another heard prefix.", interrupted=True),
+            ConversationMessage("user", "Current question."),
         ),
         active_tasks=(),
-        updates=(),
     )
 
-    assert OllamaStreamingInference._messages(snapshot)[1:] == [
-        {
-            "role": "assistant",
-            "content": "Cut off here." + ollama_module._INTERRUPTED_SPEECH_SUFFIX,
-        },
-        {"role": "assistant", "content": "I said [speech interrupted]"},
-    ]
-    assert ollama_module._INTERRUPTED_SPEECH_SUFFIX == " [speech interrupted]"
+    def open_request(request, timeout):
+        requests.append(json.loads(request.data))
+        return LineResponse(({"message": {"content": "Synthetic answer."}, "done": True},))
+
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test", open_request=open_request)
+    try:
+        assert [part async for part in inference.stream(snapshot, turn_id="turn_delivery")]
+    finally:
+        await inference.close()
+    return snapshot, requests[0]["messages"], capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_ollama_interruption_preserves_actual_dialogue_exactly(interrupted_request):
+    snapshot, sent, _ = interrupted_request
+    assert sent[1:] == [{"role": row.role, "content": row.text} for row in snapshot.messages]
+
+
+@pytest.mark.asyncio
+async def test_ollama_interruption_indices_equal_ordered_snapshot_flags(interrupted_request):
+    snapshot, sent, _ = interrupted_request
+    sections = json.loads(sent[0]["content"].split("\n\nReference data:\n", 1)[1])
+    assert sections["speech_delivery"] == {
+        "interrupted_message_indices": [
+            index for index, row in enumerate(snapshot.messages) if row.interrupted
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_ollama_interruption_reference_explains_index_and_authority(interrupted_request):
+    _, sent, _ = interrupted_request
+    policy = sent[0]["content"].split("\n\nReference data:\n", 1)[0]
+    assert "zero-based indices into the conversation rows after this system message" in policy
+    assert "heard prefixes whose speech was interrupted" in policy
+    assert (
+        "does not request resumption or grant tools, dispatch, or cancellation authority" in policy
+    )
+
+
+@pytest.mark.asyncio
+async def test_ollama_interruption_reference_kind_matches_actual_prompt(interrupted_request):
+    _, _, output = interrupted_request
+    report = json.loads(output.split("[ollama-prompt] ")[1])
+    assert report["reference_kinds"] == ["speech_delivery"]
+    assert "Heard" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_ollama_uninterrupted_actual_request_has_no_phantom_indices():
+    requests = []
+
+    def open_request(request, timeout):
+        requests.append(json.loads(request.data))
+        return LineResponse(({"message": {"content": "Synthetic answer."}, "done": True},))
+
+    snapshot = ConversationInferenceRequest(
+        revision=1, active_tasks=(),
+        messages=(ConversationMessage("assistant", "I said [speech interrupted]"),
+                  ConversationMessage("user", "Current question.")),
+    )
+    inference = OllamaStreamingInference(
+        metadata_client=supported_ollama_metadata(),
+        base_url="http://127.0.0.1:11434", model="test", open_request=open_request)
+    try:
+        assert [part async for part in inference.stream(snapshot, turn_id="turn_whole")]
+    finally:
+        await inference.close()
+    sections = json.loads(
+        requests[0]["messages"][0]["content"].split("\n\nReference data:\n", 1)[1])
+    assert "speech_delivery" not in sections
 
 
 def test_ollama_keeps_ordered_list_markers_with_their_items() -> None:
@@ -277,6 +392,12 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
         "prompt_bytes": len(content.encode("utf-8")),
         "prompt_chars": len(content),
         "prompt_eval_count": 31,
+        "load_duration_ns": None,
+        "prompt_eval_duration_ns": None,
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+        "timing_invalid_count": 0,
+        "timing_invalid_fields": [],
         "version": 1,
     }
     assert reports[1]["num_ctx"] == 32_768

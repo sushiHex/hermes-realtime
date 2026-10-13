@@ -373,6 +373,18 @@ From the host:
 - `[binding-speech]`: `cause: resisted`, speech the page's binding started, such as the
   readiness cue, did not stop within 10 s of the binding closing. The reload or reconnect that
   closed it fails, and a retry tries again. It is a finding.
+- `[speech-consumer-cleanup]`: `category: retained`, cleanup returned while a speech consumer
+  remained live, so the runtime retains it until it settles. `pending: 1` means pending cleanup
+  is present; it is not a count of consumers or tasks.
+- `[speech-cleanup-refusal]`: `category: pending`, the shared cleanup guard refused admission
+  or close while provider or consumer cleanup remained pending. Each line records one guard
+  refusal, including close refusals, rather than one refused user turn. `pending: 1` is presence.
+- `[moonshine-finalization-refusal]`: `category: native_finalization_failed`, Moonshine reported
+  an error or returned no final result. The adapter refuses to promote its partial snapshot
+  into a final transcript. Each line records one refused finalization (`count: 1`), even if
+  closing the stream also fails. Record this marker when investigating missing ending words;
+  its absence does not establish a VAD or recognition cause. It contains no transcript or
+  native error details.
 - `[hermes-bridge-welcome]`: the host refused the companion's side of the bridge hello. The
   category is one of these:
   - `shape`: the welcome was a refusal, or was malformed or cut off;
@@ -420,6 +432,16 @@ verbatim.
 The browser's **Session model** panel shows **Response last** and **Response average**: the time
 from your final transcript to the first foreground token. **Diagnostics → Latency markers** lists
 named timings in milliseconds, such as `transcript_to_first_token` and `first_token_to_audio`.
+The `[ollama-prompt]` marker's `load_duration_ns`, `prompt_eval_duration_ns`, `eval_duration_ns`,
+and `total_duration_ns` are provider-reported timings from Ollama's final completion record, in
+nanoseconds ([Ollama API usage](https://github.com/ollama/ollama/blob/main/docs/api/usage.mdx)).
+They are read only from a `done=true` final stream record, so failed or uncompleted requests may
+have no timing record. Each field accepts an exact integer from 0 through 86,400,000,000,000 ns
+(24 hours), independently. A `null` value means unavailable or invalid; `timing_invalid_count`
+and `timing_invalid_fields` identify invalid values without recording model text. The host's
+`first_playable_audio` marker is emitted before playback begins, so `first_token_to_audio` is not
+a browser-playback or physical-audibility measurement. Browser media-playback observations are
+separate, and no machine timing establishes speaker output or that a person heard it.
 For task steps, use wall-clock seconds from submitting the command to each task state.
 
 ### The record sheet

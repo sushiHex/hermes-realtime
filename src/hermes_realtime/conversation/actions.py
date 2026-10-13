@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import math
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock
 
@@ -191,6 +193,8 @@ class ConversationUpdateExecutor:
             raise ValueError("evidence admission must share operation scheduler")
         self._decision_consumer: asyncio.Task[None] | None = None
         self._owned_operations: set[asyncio.Task[None]] = set()
+        self._actions_ready = asyncio.Event()
+        self._actions_ready.set()
         self._operation_reservations: dict[
             asyncio.Task[None],
             ConversationOperationReservation,
@@ -260,6 +264,32 @@ class ConversationUpdateExecutor:
     @property
     def active_operation_count(self) -> int:
         return len(self._owned_operations)
+
+    @contextmanager
+    def quiescent(self) -> Iterator[None]:
+        """Defer action admission while a disconnected provider is being prepared."""
+        acquired = False
+        try:
+            if self._owned_operations or self._speech.foreground_active:
+                raise RuntimeError("conversation actions are not quiescent")
+            with self._operation_scheduler.quiescent():
+                self._actions_ready.clear()
+                acquired = True
+                try:
+                    yield
+                finally:
+                    self._actions_ready.set()
+        finally:
+            if acquired:
+                self._start_idle_mention_drain()
+            print(
+                "[conversation-reconfiguration] "
+                + json.dumps(
+                    {"version": 1, "category": "released" if acquired else "refused"},
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
 
     @property
     def reserved_operation_count(self) -> int:
@@ -720,6 +750,8 @@ class ConversationUpdateExecutor:
         try:
             while True:
                 decision, claim = await self._director._next_execution(self)
+                while not self._actions_ready.is_set():
+                    await self._actions_ready.wait()
                 if decision.kind == UpdateDecisionKind.MENTION_NEXT.value:
                     if claim is not None:
                         raise RuntimeError("mention decision unexpectedly received an action claim")

@@ -110,6 +110,62 @@ async def test_native_start_advertises_only_exact_start_and_waits_for_acceptance
 
 
 @pytest.mark.asyncio
+async def test_native_start_preserves_selected_context_delivery_and_completion_timing(
+    capsys,
+) -> None:
+    async def read_metadata(endpoint, body):
+        if endpoint == "version":
+            assert body is None
+            return b'{"version":"0.34.4"}'
+        if endpoint == "tags":
+            assert body is None
+            return json.dumps({"models": [{"name": "test", "model": "test",
+                                            "digest": "a" * 64}]}).encode()
+        assert (endpoint, body) == ("show", {"model": "test"})
+        return b'{"capabilities":["completion"],"model_info":{}}'
+
+    inference, handler, sent, _ = adapter([
+        {"message": {"tool_calls": [call()]}, "done": True, "prompt_eval_count": 321,
+         "load_duration": 11, "prompt_eval_duration": 22, "eval_duration": 33,
+         "total_duration": 66},
+    ], metadata_client=OllamaModelClient(
+        base_url="http://127.0.0.1:11434", read_request=read_metadata,
+    ))
+    await inference.configure_context(4096)
+    snapshot = ConversationInferenceRequest(
+        revision=2,
+        messages=(ConversationMessage("assistant", "Heard prefix.", interrupted=True),
+                  ConversationMessage("user", "Please inspect the release.")),
+        active_tasks=(),
+    )
+    assert await collect(inference, snapshot) == ["I've started that background task."]
+    assert len(handler.calls) == 1
+    body = sent[0]
+    assert body["options"] == {"num_ctx": 4096, "num_predict": 1024}
+    assert body["shift"] is False and body["truncate"] is False
+    assert [tool["function"]["name"] for tool in body["tools"]] == ["start_work"]
+    messages = body["messages"]
+    assert messages[1:] == [
+        {"role": message.role, "content": message.text} for message in snapshot.messages
+    ]
+    sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
+    assert sections["speech_delivery"] == {"interrupted_message_indices": [0]}
+    assert ollama._WORK_POLICY in messages[0]["content"]
+    reports = [json.loads(line.removeprefix("[ollama-prompt] "))
+               for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[ollama-prompt] ")]
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["num_ctx"] == 4096 and report["prompt_eval_count"] == 321
+    assert report["reference_kinds"] == ["speech_delivery"]
+    assert [report[field] for field in (
+        "load_duration_ns", "prompt_eval_duration_ns", "eval_duration_ns", "total_duration_ns",
+    )] == [11, 22, 33, 66]
+    assert report["timing_invalid_count"] == 0 and report["timing_invalid_fields"] == []
+    await inference.close()
+
+
+@pytest.mark.asyncio
 async def test_native_work_still_refuses_unverified_runtime_before_any_opening() -> None:
     async def read(endpoint, body):
         assert (endpoint, body) == ("version", None)
@@ -406,7 +462,7 @@ async def test_deadline_expired_before_admission_has_no_dispatch_effect() -> Non
     inference, handler, _, _ = adapter([
         {"message": {"tool_calls": [call()]}, "done": True}], request_timeout_seconds=0.05)
 
-    def delay_report(messages, count):
+    def delay_report(messages, count, completion):
         time.sleep(0.06)
 
     inference._report_prompt = delay_report
@@ -487,7 +543,7 @@ async def test_each_before_admission_ownership_guard_blocks_dispatch_independent
     inference, handler, _, _ = adapter([
         {"message": {"tool_calls": [call()]}, "done": True}])
 
-    def retire_after_read(messages, count):
+    def retire_after_read(messages, count, completion):
         if state == "closed":
             inference._closed = True
         elif state == "cancelled":

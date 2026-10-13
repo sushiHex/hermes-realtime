@@ -91,7 +91,8 @@ _KNOWN_MARKERS = frozenset(
         "voice-forget-send",
         "hermes-identity", "real-hermes-gate", "consent-activation", "qualification-checkpoint",
         "speech-stop", "ollama-prompt", "rehearsal-prompt", "rehearsal-recall", "binding-speech",
-        "output-style",
+        "output-style", "speech-consumer-cleanup", "speech-cleanup-refusal",
+        "moonshine-finalization-refusal",
     }
 )  # fmt: skip
 _MARKER_CATEGORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")

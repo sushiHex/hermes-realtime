@@ -1,10 +1,11 @@
-"""One pre-connect local choice, frozen for the lifetime of its host."""
+"""Own a local model choice between disconnected preparation boundaries."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import cast
 
 from hermes_realtime.client.session import BrowserModelConfiguration
@@ -34,19 +35,22 @@ class OllamaSessionSelection:
         default_model: str,
         adapter_factory: Callable[[str], OllamaStreamingInference],
         readiness: Callable[[OllamaStreamingInference], Awaitable[None]],
+        quiescent: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         if type(client) is not OllamaModelClient:
             raise TypeError("client must be an exact Ollama metadata client")
         _require_model(default_model)
-        if not callable(adapter_factory) or not callable(readiness):
-            raise TypeError("adapter factory and readiness must be callable")
+        if not callable(adapter_factory) or not callable(readiness) or not callable(quiescent):
+            raise TypeError("adapter factory, readiness and quiescence must be callable")
         self._client = client
         self._default_model = default_model
         self._factory = adapter_factory
         self._readiness = readiness
+        self._quiescent = quiescent
         self._models: tuple[OllamaModelMetadata, ...] | None = None
         self._catalog_task: asyncio.Task[tuple[OllamaModelMetadata, ...]] | None = None
         self._preparation: asyncio.Task[dict[str, object]] | None = None
+        self._active_streams = 0
         self._adapter: OllamaStreamingInference | None = None
         self._configuration: BrowserModelConfiguration | None = None
         self._selection: dict[str, object] | None = None
@@ -89,9 +93,9 @@ class OllamaSessionSelection:
             "version": 1,
             "available": True,
             "provider": "ollama",
-            "state": "prepared"
-            if self._selection is not None
-            else ("preparing" if self._preparation is not None else "configuring"),
+            "state": "preparing"
+            if self._preparation is not None
+            else ("prepared" if self._selection is not None else "configuring"),
             "models": [
                 {
                     "model": row.model,
@@ -107,7 +111,9 @@ class OllamaSessionSelection:
             "minimumContextTokens": 2048,
             "maximumContextTokens": 262144,
             "preparationTimeoutMs": int(PREPARATION_TIMEOUT_SECONDS * 1000),
-            "selection": None if self._selection is None else dict(self._selection),
+            "selection": None
+            if self._preparation is not None or self._selection is None
+            else dict(self._selection),
         }
 
     async def prepare(
@@ -127,28 +133,25 @@ class OllamaSessionSelection:
                     raise ValueError("selection identity does not match the installed catalog")
                 choice = OllamaContextConfiguration(row, requested_context_tokens)
                 self._require_open()
-                if self._selection is not None:
-                    if (model, digest, requested_context_tokens) != (
+                if self._preparation is not None or self._active_streams:
+                    raise RuntimeError("local selection is already preparing or streaming")
+                if self._selection is not None and (model, digest, requested_context_tokens) == (
                         self._selection["model"],
                         self._selection["digest"],
                         self._selection["requestedContextTokens"],
-                    ):
-                        raise RuntimeError(
-                            "local selection is frozen; restart the host to change it"
-                        )
+                ):
                     category = "prepared"
                     return dict(self._selection)
-                if self._preparation is not None:
-                    raise RuntimeError("local selection is already preparing")
-                operation = asyncio.create_task(self._prepare(choice))
-                self._preparation = operation
-                category = "readiness_refused"
-                try:
-                    result = await operation
-                    category = "prepared"
-                    return result
-                finally:
-                    self._preparation = None
+                with self._quiescent():
+                    operation = asyncio.create_task(self._prepare(choice))
+                    self._preparation = operation
+                    category = "readiness_refused"
+                    try:
+                        result = await operation
+                        category = "prepared"
+                        return result
+                    finally:
+                        self._preparation = None
         except TimeoutError:
             category = "deadline"
             raise
@@ -201,6 +204,9 @@ class OllamaSessionSelection:
                 reports_token_usage=False,
                 local_context=candidate.context_observation,
             )
+            if self._adapter is not None:
+                await self._close_adapter(self._adapter)
+            self._require_open()
             models = cast(tuple[OllamaModelMetadata, ...], self._models)
             self._models = tuple(metadata if row.model == metadata.model else row for row in models)
             self._adapter = candidate
@@ -210,6 +216,10 @@ class OllamaSessionSelection:
             return dict(selection)
         finally:
             if not committed:
+                if self._adapter is not None:
+                    # The candidate may have changed resident allocation. There is no
+                    # implicit rollback or readiness claim for the previous adapter.
+                    self._closed = True
                 await self._close_adapter(candidate)
 
     async def _close_adapter(self, adapter: OllamaStreamingInference) -> None:
@@ -234,6 +244,8 @@ class OllamaSessionSelection:
         category = "refused"
         try:
             self._require_open()
+            if self._preparation is not None:
+                raise RuntimeError("local selection is preparing")
             if self._configuration is None:
                 raise RuntimeError("local selection must be prepared before connecting")
             category = "prepared"
@@ -244,6 +256,27 @@ class OllamaSessionSelection:
                 + json.dumps({"version": 1, "category": category}, separators=(",", ":")),
                 flush=True,
             )
+
+    def require_choice(self, expected: object) -> None:
+        """Bind a browser's prepared snapshot to the currently committed choice."""
+        category = "refused"
+        try:
+            if type(expected) is not dict or set(expected) != {
+                "model", "digest", "requestedContextTokens", "advertisedContextTokens",
+                "effectiveContextTokens",
+            }:
+                raise ValueError("expected local selection requires exact fields")
+            metadata = OllamaModelMetadata(
+                expected["model"], expected["digest"], expected["advertisedContextTokens"],
+            )
+            configuration = OllamaContextConfiguration(metadata, expected["requestedContextTokens"])
+            OllamaContextObservation(configuration, expected["effectiveContextTokens"])
+            if expected != self._selection:
+                raise ValueError("expected local selection no longer matches the prepared choice")
+            category = "bound"
+        finally:
+            print("[local-model-choice] " + json.dumps(
+                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
 
     def context_observation(self) -> OllamaContextObservation:
         self.require_prepared()
@@ -257,8 +290,12 @@ class OllamaSessionSelection:
     ) -> AsyncIterator[str]:
         self.require_prepared()
         adapter = cast(OllamaStreamingInference, self._adapter)
-        async for segment in adapter.stream(snapshot, turn_id=turn_id):
-            yield segment
+        self._active_streams += 1
+        try:
+            async for segment in adapter.stream(snapshot, turn_id=turn_id):
+                yield segment
+        finally:
+            self._active_streams -= 1
 
     async def cancel(self, turn_id: str) -> None:
         if self._adapter is not None:

@@ -98,9 +98,23 @@ digest again and runs the host's inference and speech readiness checks before Co
 establish a voice session. Serving the configuration page does not mean voice is ready.
 The installed-model list is a host snapshot; restart after installing or replacing models.
 
-A successfully prepared choice is fixed for that host's lifetime, including disconnect and
-reconnect. Start a fresh host to choose another model or budget. Preparation does not issue
-browser session credentials; the existing bootstrap authority still governs connection.
+A successfully prepared choice stays fixed while its browser session is active, including
+a dropped network connection and reconnect. Before joining, or after a successful explicit
+session Disconnect on a persistent launch, choose **Change model or context** to edit it.
+The form retains the last requested budget; Cancel keeps the existing prepared choice.
+Connecting with an edited choice prepares a fresh adapter and checks readiness before
+replacing the old adapter. Merely editing the form does not release the old choice.
+Foreground and proactive action admission pauses only during that transaction; durable
+Hermes jobs and stored history remain independent. Busy actions refuse preparation.
+Preparation does not issue browser session credentials; the existing bootstrap authority
+still governs connection. A consumed one-use launch is never renewed by model selection;
+use the persistent loopback/Tailnet launch for successive sessions, or start a fresh host.
+Local-selection bootstrap sends the exact versioned prepared snapshot and checks it under
+the same session lock before issuing credentials or consuming a one-use capability. A stale
+tab cannot join a different tab's replacement choice. Older local-selection browser clients
+that send empty bootstrap requests fail closed; ordinary non-selection bootstrap is unchanged.
+Waiting for that lock uses the existing ten-second session transition bound; the existing
+provisioning budget is separate, so this is not a guarantee against every late response.
 An expired one-use launch requires a fresh launch, even if preparation completed. The browser
 reports advertised capacity, requested context and observed allocation separately; unknown
 values remain unknown. Choosing a model does not qualify it for automatic task delegation.
@@ -108,6 +122,12 @@ Preparation has a 120-second budget and a separate three-second cleanup allowanc
 candidate cannot be cleaned up, the host refuses further choices and retains that candidate
 for cleanup retry; restart the host after resolving the failure. It never accumulates new
 candidate adapters behind a failed cleanup.
+If a replacement candidate has been created and its preparation fails, the host also fails
+closed and requires restart. The candidate may have changed Ollama's resident allocation;
+retaining the old adapter object cannot establish rollback readiness. A refusal before
+candidate creation leaves the existing choice untouched. After an unanswered or refused
+replacement request, the browser refreshes bounded host status and accepts only the
+selection the host confirms; it never restores readiness from a cached form snapshot.
 
 This control does not fit prompts automatically or change the retained foreground window.
 An oversized request still fails explicitly under the no-truncation contract below.
@@ -186,16 +206,21 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
 | Part | Characters |
 | --- | --- |
 | Heard window | 22,528 |
-| Interrupted suffix, ` [speech interrupted]` on every row | 32 × 21 = 672 |
+| Interrupted delivery indices, JSON wrapper and index/authority framing | at most 500 |
 | M4 memory, two blocks of at most 4,096 UTF-8 bytes | 8,192 |
 | Memory label and JSON wrapper | about 150 |
 | Foreground communication/style policy and work-state framing | about 2,200 |
-| **Total** | **about 33,750** |
+| **Total** | **about 33,600** |
 
-- **Tokens.** At an estimated 3 characters per token, that is about 11,250 tokens. The chat
-  template adds about 6 tokens for each of 33 messages (about 200), for about 11,450 in all.
+- **Delivery metadata.** At most 32 zero-based indices for the bounded heard window are
+  carried in labelled system reference JSON. The wrapper and all indices take 139 characters;
+  the index/authority explanation takes 295, so 500 is a conservative allowance. Dialogue text
+  stays unchanged, and the heard-window limits remain unchanged. A model may still verbalize
+  metadata; this representation is not a guarantee of model obedience.
+- **Tokens.** At an estimated 3 characters per token, that is about 11,200 tokens. The chat
+  template adds about 6 tokens for each of 33 messages (about 200), for about 11,400 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Estimated headroom.** `num_ctx` 16,384 leaves about 4,900 tokens for active-task and update reference
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 5,000 tokens for active-task and update reference
   sections and for the reply.
 - **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
