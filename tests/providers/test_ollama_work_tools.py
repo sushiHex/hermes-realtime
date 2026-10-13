@@ -478,12 +478,121 @@ async def test_bound_completion_requires_explicit_normal_stop(reason, kind, caps
 @pytest.mark.asyncio
 async def test_reply_field_bound_is_independent_of_wire_byte_bound(monkeypatch) -> None:
     monkeypatch.setattr(ollama, "_MAX_WORK_RESPONSE_BYTES", 262144)
+    monkeypatch.setattr(ollama, "_MAX_WORK_DECISION_BYTES", 262144)
     inference, handler, _, _ = adapter([
         decision_frame({"kind": "reply", "text": "x" * 65537}),
     ])
     with pytest.raises(ValueError, match="reply_length"):
         await collect(inference)
     assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_envelope_only_prefix_does_not_consume_decision_budget() -> None:
+    prefix = {"model": "synthetic-model", "created_at": "2026-10-13T00:00:00Z",
+              "message": {"content": "", "thinking": "Synthetic reasoning."}, "done": False}
+    inference, handler, _, response = adapter([prefix] * 500 + [start_frame()])
+    assert sum(len(line) for line in response.lines) > 65536
+    assert await collect(inference) == ["I've started that background task."]
+    assert len(handler.calls) == 1
+    assert response.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_kind", ["ascii", "unicode"])
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact", "overflow"])
+async def test_decision_utf8_byte_boundary(text_kind, overflow, capsys) -> None:
+    overhead = len(json.dumps({"kind": "reply", "text": ""}, separators=(",", ":")).encode())
+    remaining = 65536 - overhead
+    text = "x" * remaining if text_kind == "ascii" else (
+        "é" * (remaining // 2) + "x" * (remaining % 2))
+    if overflow:
+        text += "x"
+    decision = json.dumps({"kind": "reply", "text": text}, ensure_ascii=False,
+                          separators=(",", ":"))
+    assert len(decision.encode()) == 65536 + int(overflow)
+    split = len(decision) // 2
+    inference, handler, _, response = adapter([
+        {"message": {"content": decision[:split]}, "done": False},
+        {"message": {"content": decision[split:]}, "done": True, "done_reason": "stop"},
+    ])
+    if overflow:
+        with pytest.raises(ValueError, match="decision_bytes"):
+            await collect(inference)
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [
+            '[ollama-work] {"category":"decision_bytes","kind":"start","attempts":0}',
+        ]
+    else:
+        assert "".join(await collect(inference)) == text
+    assert handler.calls == []
+    assert response.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact", "overflow"])
+async def test_total_wire_byte_boundary(overflow, capsys) -> None:
+    prefix = {"message": {"content": "", "thinking": ""}, "done": False,
+              "envelope_padding": ""}
+    frame = decision_frame({"kind": "reply", "text": "Synthetic answer."})
+    frame["envelope_padding"] = ""
+    wire_size = sum(len(json.dumps(row).encode()) + 1 for row in (prefix, frame))
+    remaining = 1048576 - wire_size
+    prefix["envelope_padding"] = "x" * (remaining // 2)
+    frame["envelope_padding"] = "x" * (remaining - remaining // 2 + int(overflow))
+    inference, handler, _, response = adapter([prefix, frame])
+    assert sum(len(line) for line in response.lines) == 1048576 + int(overflow)
+    if overflow:
+        with pytest.raises(ValueError, match="response_bytes"):
+            await collect(inference)
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [
+            '[ollama-work] {"category":"response_bytes","kind":"start","attempts":0}',
+        ]
+    else:
+        assert await collect(inference) == ["Synthetic answer."]
+    assert handler.calls == []
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_oversized_decision_refuses_before_buffer_append(monkeypatch) -> None:
+    class ObserveAppend(str):
+        def __radd__(self, other):
+            raise AssertionError("oversized decision was appended")
+
+    inference, handler, _, response = adapter([
+        {"message": {"content": "x" * 65537}, "done": True, "done_reason": "stop"},
+    ])
+    original = inference._content
+
+    def observe_validated_content(payload):
+        content, done = original(payload)
+        return ObserveAppend(content), done
+
+    monkeypatch.setattr(inference, "_content", observe_validated_content)
+    with pytest.raises(ValueError, match="decision_bytes"):
+        await collect(inference)
+    assert handler.calls == []
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_decision_content_requires_strict_utf8_before_buffering(capsys) -> None:
+    inference, handler, _, response = adapter([
+        {"message": {"content": "\ud800"}, "done": True, "done_reason": "stop"},
+    ])
+    with pytest.raises(ValueError, match="decision_unicode"):
+        await collect(inference)
+    markers = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[ollama-work] ")]
+    assert markers == [
+        '[ollama-work] {"category":"decision_unicode","kind":"start","attempts":0}',
+    ]
+    assert handler.calls == []
+    assert response.closed
 
 
 @pytest.mark.asyncio
@@ -518,8 +627,8 @@ async def test_decision_buffer_has_independent_byte_and_chunk_bounds(bound, monk
         lines = [{"message": {"content": "Long enough response."}, "done": True}]
     else:
         monkeypatch.setattr(ollama, "_MAX_WORK_RESPONSE_CHUNKS", 1)
-        lines = [{"message": {"content": "a"}, "done": False},
-                 {"message": {"content": "b"}, "done": True}]
+        lines = [{"message": {"content": "", "thinking": "Synthetic reasoning."}, "done": False},
+                 start_frame()]
     inference, handler, _, _ = adapter(lines)
     with pytest.raises(ValueError, match="response_" + bound):
         await collect(inference)

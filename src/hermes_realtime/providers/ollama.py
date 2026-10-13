@@ -48,7 +48,10 @@ _DURATION_FIELDS = (
 _MIN_NUM_CTX = 2048
 _MAX_NUM_CTX = 262_144
 _PROMPT_MARKER_PREFIX = "[ollama-prompt] "
-_MAX_WORK_RESPONSE_BYTES = 65_536
+_MAX_WORK_DECISION_BYTES = 65_536  # Retained decision JSON has a separate UTF-8 budget.
+# One existing line allowance bounds all wire bytes across the stream, including
+# envelopes and reasoning. This resource ceiling is not a token-size guarantee.
+_MAX_WORK_RESPONSE_BYTES = _MAX_RESPONSE_LINE_BYTES
 _MAX_WORK_RESPONSE_CHUNKS = 1024
 _MAX_WORK_REPLY_CHARS = 65_536
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
@@ -422,6 +425,7 @@ class OllamaStreamingInference:
             objective: str | None = None
             operation: asyncio.Task[WorkStartResult] | None = None
             response_bytes = 0
+            decision_bytes = 0
             response_chunks = 0
             done = False
             while True:
@@ -474,6 +478,13 @@ class OllamaStreamingInference:
                             "unexpected_native_calls" if handler is not None else "unadvertised",
                         )
                 if content:
+                    if handler is not None:
+                        try:
+                            decision_bytes += len(content.encode("utf-8", errors="strict"))
+                        except UnicodeEncodeError:
+                            self._refuse_work("decision_unicode")
+                        if decision_bytes > _MAX_WORK_DECISION_BYTES:
+                            self._refuse_work("decision_bytes")
                     buffer += content
                     if handler is None:
                         segments, buffer = self._extract_segments(buffer, final=False)
