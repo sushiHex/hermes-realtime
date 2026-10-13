@@ -563,7 +563,10 @@ async def test_inflight_configuration_and_request_share_the_admission_lock(natur
 
     def generate(request, timeout):
         bodies.append(json.loads(request.data))
-        return io.BytesIO(b'{"message":{"content":"Ready."},"done":true}\n')
+        text = json.dumps({"kind": "reply", "text": "Ready."}) if natural_tools else "Ready."
+        return io.BytesIO(json.dumps({
+            "message": {"content": text}, "done": True, "done_reason": "stop",
+        }).encode() + b"\n")
 
     inference = OllamaStreamingInference(
         base_url="http://127.0.0.1:11434", model="test:latest", open_request=generate

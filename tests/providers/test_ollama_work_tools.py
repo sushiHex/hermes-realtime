@@ -55,6 +55,27 @@ def call(**changes: object) -> dict[str, object]:
             **changes}
 
 
+def decision_frame(value: dict[str, object], **completion: object) -> dict[str, object]:
+    return {"message": {"content": json.dumps(value)}, "done": True,
+            "done_reason": "stop", **completion}
+
+
+def start_frame(**completion: object) -> dict[str, object]:
+    return decision_frame({"kind": "start_work", "objective": "Inspect release"}, **completion)
+
+
+def reply_schema() -> dict[str, object]:
+    return {"type": "object", "additionalProperties": False, "required": ["kind", "text"],
+            "properties": {"kind": {"const": "reply"}, "text": {
+                "type": "string", "minLength": 1, "maxLength": 65536}}}
+
+
+def start_schema() -> dict[str, object]:
+    return {"type": "object", "additionalProperties": False, "required": ["kind", "objective"],
+            "properties": {"kind": {"const": "start_work"}, "objective": {
+                "type": "string", "minLength": 1, "maxLength": 64}}}
+
+
 def request() -> ConversationInferenceRequest:
     return ConversationInferenceRequest(revision=1,
         messages=(ConversationMessage("user", "Please inspect the release."),), active_tasks=())
@@ -83,12 +104,12 @@ async def collect(inference: ollama.OllamaStreamingInference,
 
 
 @pytest.mark.asyncio
-async def test_native_start_advertises_only_exact_start_and_waits_for_acceptance() -> None:
+async def test_constrained_start_advertises_exact_union_and_waits_for_acceptance() -> None:
+    decision = json.dumps({"kind": "start_work", "objective": "Inspect release"})
     inference, handler, sent, response = adapter([
-        {"message": {"content": "I started already."}, "done": False},
-        {"message": {"tool_calls": [call(id="local_call", type="function", function={
-            "index": 0, "name": "start_work", "arguments": {"objective": "Inspect release"}})]},
-         "done": True}])
+        {"message": {"content": decision[:18]}, "done": False},
+        {"message": {"content": decision[18:]}, "done": True, "done_reason": "stop"},
+    ])
     handler.release.clear()
     result = asyncio.create_task(collect(inference))
     await asyncio.wait_for(handler.entered.wait(), 1)
@@ -102,15 +123,13 @@ async def test_native_start_advertises_only_exact_start_and_waits_for_acceptance
     assert body["shift"] is False
     assert body["truncate"] is False
     assert body["options"] == {"num_ctx": 16384, "num_predict": 1024}
-    assert body["tools"] == [{"type": "function", "function": {
-        "name": "start_work", "description": ollama._WORK_TOOL_DESCRIPTION,
-        "parameters": {"type": "object", "additionalProperties": False,
-            "required": ["objective"], "properties": {"objective": {
-                "type": "string", "minLength": 1, "maxLength": 64}}}}}]
+    assert "tools" not in body
+    assert body["format"] == {"oneOf": [reply_schema(), start_schema()]}
+
 
 
 @pytest.mark.asyncio
-async def test_native_start_preserves_selected_context_delivery_and_completion_timing(
+async def test_constrained_start_preserves_selected_context_delivery_and_completion_timing(
     capsys,
 ) -> None:
     async def read_metadata(endpoint, body):
@@ -125,7 +144,7 @@ async def test_native_start_preserves_selected_context_delivery_and_completion_t
         return b'{"capabilities":["completion"],"model_info":{}}'
 
     inference, handler, sent, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True, "prompt_eval_count": 321,
+        {**start_frame(), "prompt_eval_count": 321,
          "load_duration": 11, "prompt_eval_duration": 22, "eval_duration": 33,
          "total_duration": 66},
     ], metadata_client=OllamaModelClient(
@@ -143,7 +162,8 @@ async def test_native_start_preserves_selected_context_delivery_and_completion_t
     body = sent[0]
     assert body["options"] == {"num_ctx": 4096, "num_predict": 1024}
     assert body["shift"] is False and body["truncate"] is False
-    assert [tool["function"]["name"] for tool in body["tools"]] == ["start_work"]
+    assert "tools" not in body
+    assert body["format"] == {"oneOf": [reply_schema(), start_schema()]}
     messages = body["messages"]
     assert messages[1:] == [
         {"role": message.role, "content": message.text} for message in snapshot.messages
@@ -166,14 +186,14 @@ async def test_native_start_preserves_selected_context_delivery_and_completion_t
 
 
 @pytest.mark.asyncio
-async def test_native_work_still_refuses_unverified_runtime_before_any_opening() -> None:
+async def test_constrained_work_refuses_unverified_runtime_before_any_opening() -> None:
     async def read(endpoint, body):
         assert (endpoint, body) == ("version", None)
         return b'{"version":"unsupported"}'
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     inference, handler, sent, response = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True},
+        start_frame(),
     ], metadata_client=client)
     with pytest.raises(ValueError, match="source-reviewed"):
         await collect(inference)
@@ -190,16 +210,18 @@ async def test_native_work_still_refuses_unverified_runtime_before_any_opening()
      "That background task was accepted and is now being cancelled.")])
 async def test_rejected_and_pending_cancel_results_do_not_claim_active_work(result, spoken) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"content": "I am working now.", "tool_calls": [call()]}, "done": True}])
+        start_frame()])
     handler.result = result
     assert await collect(inference) == [spoken]
 
 
 @pytest.mark.asyncio
-async def test_normal_prose_retains_segmentation_without_dispatch() -> None:
+async def test_structured_reply_retains_segmentation_without_dispatch() -> None:
+    decision = json.dumps({"kind": "reply", "text": "One sentence. Another."})
     inference, handler, _, _ = adapter([
-        {"message": {"content": "One sentence. "}, "done": False},
-        {"message": {"content": "Another."}, "done": True}])
+        {"message": {"content": decision[:22]}, "done": False},
+        {"message": {"content": decision[22:]}, "done": True, "done_reason": "stop"},
+    ])
     assert await collect(inference) == ["One sentence.", "Another."]
     assert handler.calls == []
 
@@ -211,9 +233,11 @@ async def test_normal_prose_retains_segmentation_without_dispatch() -> None:
     ["I\u2019ve started that background task."],
 ], ids=["single_chunk", "split_claim", "curly_apostrophe"])
 async def test_no_call_background_claim_refuses_before_any_speech(chunks, capsys) -> None:
+    decision = json.dumps({"kind": "reply", "text": "".join(chunks)}, ensure_ascii=False)
+    boundary = decision.index("started") + 3
     inference, handler, _, response = adapter([
-        {"message": {"content": content}, "done": index == len(chunks) - 1}
-        for index, content in enumerate(chunks)
+        {"message": {"content": decision[:boundary]}, "done": False},
+        {"message": {"content": decision[boundary:]}, "done": True, "done_reason": "stop"},
     ])
     spoken = []
     with pytest.raises(ValueError, match="unverified_claim"):
@@ -250,71 +274,162 @@ async def test_unbound_conversation_retains_existing_prose_behavior() -> None:
                          ids=["snapshot_only", "no_user", "assistant_last"])
 async def test_without_current_user_request_no_work_schema_or_effect(snapshot) -> None:
     inference, handler, sent, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        start_frame()])
     with pytest.raises(ValueError, match="unadvertised"):
         await collect(inference, snapshot)
     assert "tools" not in sent[0]
+    assert sent[0]["format"] == reply_schema()
     assert handler.calls == []
 
 
-_INVALID_CALLS = [
-    (None, "calls_type"), ({}, "calls_type"), ([call(), call()], "call_count"),
-    ([True], "call_schema"), ([call(extra=True)], "call_schema"),
-    ([call(type="other")], "call_type"), ([call(id=1)], "call_id"),
-    ([call(id="x" * 129)], "call_id"),
-    ([call(function=True)], "function_schema"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "Inspect"},
-                     "extra": True})], "function_schema"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "Inspect"},
-                     "index": True})], "function_index"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "Inspect"},
-                     "index": 1})], "function_index"),
-    ([call(function={"name": "cancel_active_work", "arguments": {"objective": "Inspect"}})],
-     "tool_name"),
-    ([call(function={"name": "approve_work", "arguments": {"objective": "Inspect"}})],
-     "tool_name"),
-    ([call(function={"name": "start_work", "arguments": "{}"})], "arguments_schema"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "Inspect", "x": 1}})],
-     "arguments_schema"),
-    ([call(function={"name": "start_work", "arguments": {"objective": 1}})], "objective_type"),
-    ([call(function={"name": "start_work", "arguments": {"objective": " "}})], "objective_blank"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "x" * 65}})],
-     "objective_length"),
-    ([call(function={"name": "start_work", "arguments": {"objective": "deleg_private"}})],
-     "private_authority"),
+_INVALID_DECISIONS = [
+    ("not JSON", "decision_json"),
+    ('```json\n{"kind":"start_work","objective":"Inspect"}\n```', "decision_json"),
+    ('{"kind":"start_work","objective":"Inspect"} extra', "decision_json"),
+    ('{"kind":"start_work","objective":"Inspect"}{"kind":"reply","text":"No"}',
+     "decision_json"),
+    ('{"kind":"reply","kind":"start_work","objective":"Inspect"}', "duplicate_keys"),
+    ('{"kind":"start_work","objective":"Inspect","objective":"Changed"}', "duplicate_keys"),
+    ('[]', "decision_schema"), ('true', "decision_schema"), ('null', "decision_schema"),
+    ('{}', "decision_schema"), ('{"kind":true,"objective":"Inspect"}', "decision_schema"),
+    ('{"kind":"cancel_work","objective":"Inspect"}', "decision_schema"),
+    ('{"kind":"approve_work","objective":"Inspect"}', "decision_schema"),
+    ('{"kind":"start_work","objective":"Inspect","text":"Started"}', "decision_schema"),
+    ('{"kind":"start_work","objective":"Inspect","task_id":"task_other"}', "decision_schema"),
+    ('{"kind":"reply","text":"Answer","objective":"Inspect"}', "decision_schema"),
+    ('{"kind":"reply"}', "decision_schema"),
+    ('{"kind":"start_work"}', "decision_schema"),
+    ('{"kind":"reply","text":1}', "reply_type"),
+    ('{"kind":"reply","text":true}', "reply_type"),
+    ('{"kind":"reply","text":" "}', "reply_blank"),
+    ('{"kind":"reply","text":"\\ud800"}', "reply_unicode"),
+    ('{"kind":"start_work","objective":1}', "objective_type"),
+    ('{"kind":"start_work","objective":true}', "objective_type"),
+    ('{"kind":"start_work","objective":" "}', "objective_blank"),
+    (json.dumps({"kind": "start_work", "objective": "x" * 65}), "objective_length"),
+    ('{"kind":"start_work","objective":"\\udfff"}', "objective_unicode"),
+    ('{"kind":"start_work","objective":"deleg_private"}', "private_authority"),
+    ('NaN', "decision_json"),
+    ('{"kind":"reply","text":NaN}', "decision_json"),
+    ('["nested",' * 2000 + 'null' + ']' * 2000, "decision_json"),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("calls,category", _INVALID_CALLS, ids=[x[1] for x in _INVALID_CALLS])
-async def test_invalid_native_calls_refuse_before_effect_and_emit_content_free_evidence(
-    calls, category, capsys
+@pytest.mark.parametrize(
+    "content,category", _INVALID_DECISIONS,
+    ids=[f"{index}-{item[1]}" for index, item in enumerate(_INVALID_DECISIONS)],
+)
+async def test_invalid_decisions_refuse_before_effect_and_emit_content_free_evidence(
+    content, category, capsys,
 ) -> None:
     inference, handler, _, response = adapter([
-        {"message": {"content": "I already started.", "tool_calls": calls}, "done": True}])
+        {"message": {"content": content}, "done": True, "done_reason": "stop"},
+    ])
+    spoken = []
     with pytest.raises(ValueError, match=category):
-        await collect(inference)
-    assert handler.calls == []
+        async for segment in inference.stream(request(), turn_id="turn_test"):
+            spoken.append(segment)
+    assert handler.calls == spoken == []
     assert response.closed
-    line = next(line for line in capsys.readouterr().out.splitlines()
-                if line.startswith("[ollama-work] "))
-    assert json.loads(line.removeprefix("[ollama-work] "))["category"] == category
-    assert "Inspect" not in line and "deleg_private" not in line and "turn_test" not in line
+    lines = [json.loads(line.removeprefix("[ollama-work] "))
+             for line in capsys.readouterr().out.splitlines()
+             if line.startswith("[ollama-work] ")]
+    assert lines == [{"category": category, "kind": "start", "attempts": 0}]
 
 
 @pytest.mark.asyncio
-async def test_second_streamed_call_refuses_whole_completion_before_dispatch() -> None:
-    inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": False},
-        {"message": {"tool_calls": [call()]}, "done": True}])
-    with pytest.raises(ValueError, match="call_count"):
+@pytest.mark.parametrize("calls,category", [
+    (None, "calls_type"), ({}, "calls_type"), ([call()], "unexpected_native_calls"),
+    ([call(), call()], "unexpected_native_calls"), ([True], "unexpected_native_calls"),
+])
+async def test_native_calls_never_authorize_constrained_decision(calls, category) -> None:
+    frame = start_frame()
+    frame["message"]["tool_calls"] = calls
+    inference, handler, _, _ = adapter([frame])
+    with pytest.raises(ValueError, match=category):
         await collect(inference)
     assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multiple_streamed_decisions_refuse_before_dispatch() -> None:
+    first = start_frame()
+    first["done"] = False
+    inference, handler, _, _ = adapter([first, start_frame()])
+    with pytest.raises(ValueError, match="decision_json"):
+        await collect(inference)
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot", [
+    ConversationContextSnapshot(revision=1, messages=request().messages, active_tasks=()),
+    ConversationInferenceRequest(revision=1, messages=(), active_tasks=()),
+    ConversationInferenceRequest(revision=1,
+        messages=(ConversationMessage("assistant", "Update."),), active_tasks=()),
+], ids=["snapshot_only", "no_user", "assistant_last"])
+async def test_bound_reference_turns_use_reply_only_schema(snapshot) -> None:
+    inference, handler, sent, _ = adapter([
+        decision_frame({"kind": "reply", "text": "An ordinary answer."}),
+    ])
+    assert await collect(inference, snapshot) == ["An ordinary answer."]
+    assert handler.calls == []
+    assert sent[0]["format"] == reply_schema()
+    assert "tools" not in sent[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [None, "length", "future", 1, True])
+@pytest.mark.parametrize("kind", ["reply", "start_work"])
+async def test_bound_completion_requires_explicit_normal_stop(reason, kind, capsys) -> None:
+    value = {"kind": kind, "text" if kind == "reply" else "objective": "Synthetic answer."}
+    frame = decision_frame(value, done_reason=reason)
+    if reason is None:
+        frame.pop("done_reason")
+    inference, handler, _, response = adapter([frame])
+    spoken = []
+    with pytest.raises(ValueError, match="completion_reason"):
+        async for segment in inference.stream(request(), turn_id="turn_test"):
+            spoken.append(segment)
+    assert handler.calls == spoken == []
+    assert response.closed
+    lines = [json.loads(line.removeprefix("[ollama-work] "))
+             for line in capsys.readouterr().out.splitlines()
+             if line.startswith("[ollama-work] ")]
+    assert lines == [{"category": "completion_reason", "kind": "start", "attempts": 0}]
+
+
+@pytest.mark.asyncio
+async def test_reply_field_bound_is_independent_of_wire_byte_bound(monkeypatch) -> None:
+    monkeypatch.setattr(ollama, "_MAX_WORK_RESPONSE_BYTES", 262144)
+    inference, handler, _, _ = adapter([
+        decision_frame({"kind": "reply", "text": "x" * 65537}),
+    ])
+    with pytest.raises(ValueError, match="reply_length"):
+        await collect(inference)
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["reply", "start_work"])
+async def test_valid_unicode_decisions_preserve_exact_string(kind) -> None:
+    text = "Inspect café 漢字 U0001f600."
+    key = "text" if kind == "reply" else "objective"
+    frame = decision_frame({"kind": kind, key: text})
+    frame["message"]["tool_calls"] = []
+    inference, handler, _, _ = adapter([frame])
+    output = await collect(inference)
+    if kind == "reply":
+        assert output == [text] and handler.calls == []
+    else:
+        assert output == ["I've started that background task."]
+        assert handler.calls == [(text, "ollama_work_" + hashlib.sha256(b"turn_test").hexdigest())]
 
 
 @pytest.mark.asyncio
 async def test_missing_done_never_dispatches_partial_completion() -> None:
-    inference, handler, _, _ = adapter([{"message": {"tool_calls": [call()]}, "done": False}])
+    inference, handler, _, _ = adapter([{**start_frame(), "done": False}])
     with pytest.raises(ValueError, match="incomplete"):
         await collect(inference)
     assert handler.calls == []
@@ -339,7 +454,7 @@ async def test_decision_buffer_has_independent_byte_and_chunk_bounds(bound, monk
 @pytest.mark.asyncio
 async def test_ack_timeout_is_unknown_and_never_claims_started(capsys) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}], request_timeout_seconds=0.05)
+        start_frame()], request_timeout_seconds=0.05)
     handler.release.clear()
     started = time.monotonic()
     assert await collect(inference) == ["I couldn't confirm that background work started."]
@@ -353,7 +468,7 @@ async def test_ack_timeout_is_unknown_and_never_claims_started(capsys) -> None:
 @pytest.mark.asyncio
 async def test_foreground_cancel_during_ack_does_not_cancel_background_work(capsys) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        start_frame()])
     handler.release.clear()
     result = asyncio.create_task(collect(inference))
     await asyncio.wait_for(handler.entered.wait(), 1)
@@ -418,7 +533,7 @@ async def test_binding_requires_idle_open_and_unbound_adapter(state) -> None:
     accepted=True, state="active", task_id="task_test")], ids=["wrong_type", "forged_state"])
 async def test_untrusted_handler_result_is_reconstructively_validated(result) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"content": "I started.", "tool_calls": [call()]}, "done": True}])
+        start_frame()])
     if type(result) is WorkStartResult:
         object.__setattr__(result, "state", "rejected")
     handler.result = result
@@ -429,7 +544,7 @@ async def test_untrusted_handler_result_is_reconstructively_validated(result) ->
 @pytest.mark.asyncio
 async def test_handler_failure_is_unknown_and_never_speaks_model_start_claim(capsys) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"content": "I started.", "tool_calls": [call()]}, "done": True}])
+        start_frame()])
 
     async def fail(**kwargs):
         raise OSError("Synthetic unavailable transport")
@@ -458,9 +573,11 @@ async def test_whole_decision_deadline_bounds_many_fast_individual_reads() -> No
 
 
 @pytest.mark.asyncio
-async def test_deadline_expired_before_admission_has_no_dispatch_effect() -> None:
+@pytest.mark.parametrize("kind", ["start_work", "reply"])
+async def test_deadline_expired_before_admission_has_no_dispatch_effect(kind) -> None:
+    value = {"kind": kind, "text" if kind == "reply" else "objective": "Inspect release"}
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}], request_timeout_seconds=0.05)
+        decision_frame(value)], request_timeout_seconds=0.05)
 
     def delay_report(messages, count, completion):
         time.sleep(0.06)
@@ -472,9 +589,13 @@ async def test_deadline_expired_before_admission_has_no_dispatch_effect() -> Non
 
 
 @pytest.mark.asyncio
-async def test_cancel_before_completed_decision_never_dispatches(capsys) -> None:
+@pytest.mark.parametrize("kind", ["start_work", "reply"])
+async def test_cancel_before_completed_decision_never_dispatches(kind, capsys) -> None:
+    frame = decision_frame({
+        "kind": kind, "text" if kind == "reply" else "objective": "Inspect release",
+    })
     inference, handler, _, response = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        frame])
     entered = threading.Event()
     release = threading.Event()
     def waiting_read(limit=-1):
@@ -482,7 +603,7 @@ async def test_cancel_before_completed_decision_never_dispatches(capsys) -> None
         release.wait(1)
         # Return a valid completed call even after response closure. Authority,
         # rather than the HTTP object's cooperative behavior, must prevent dispatch.
-        return json.dumps({"message": {"tool_calls": [call()]}, "done": True}).encode()
+        return json.dumps(frame).encode()
 
     def close():
         response.closed = True
@@ -504,11 +625,50 @@ async def test_cancel_before_completed_decision_never_dispatches(capsys) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("tail", ["Second sentence.", "Trailing without punctuation"])
+async def test_cancel_between_reply_segments_suppresses_resumed_output(bound, tail, capsys) -> None:
+    text = "First sentence. " + tail
+    frame = decision_frame({"kind": "reply", "text": text})
+    if not bound:
+        frame["message"]["content"] = text
+    inference, handler, _, _ = adapter([frame])
+    if not bound:
+        inference._work_tool_handler = None
+    stream = inference.stream(request(), turn_id="turn_test")
+    assert await anext(stream) == "First sentence."
+    await inference.cancel("turn_test")
+    with pytest.raises(RuntimeError, match="ownership|cancelled"):
+        await anext(stream)
+    assert handler.calls == []
+    await stream.aclose()
+    prefix = "[ollama-work] " if bound else "[ollama-stream] "
+    evidence = [json.loads(line.removeprefix(prefix))
+                for line in capsys.readouterr().out.splitlines() if line.startswith(prefix)]
+    assert evidence == [{"category": "ownership_after_admission", "kind": "start", "attempts": 0}
+                        if bound else {"category": "ownership_before_yield"}]
+
+
+@pytest.mark.asyncio
+async def test_reply_playback_drain_does_not_reopen_decision_deadline() -> None:
+    inference, handler, _, _ = adapter([
+        decision_frame({"kind": "reply", "text": "First sentence. Second sentence."}),
+    ], request_timeout_seconds=0.05)
+    stream = inference.stream(request(), turn_id="turn_test")
+    assert await anext(stream) == "First sentence."
+    await asyncio.sleep(0.06)
+    assert await anext(stream) == "Second sentence."
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
 async def test_cancel_after_local_enqueue_before_shared_handler_entry_preserves_owned_start(
     monkeypatch
 ) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        start_frame()])
     release_entry = asyncio.Event()
     enqueued = asyncio.Event()
     start = handler.start_work
@@ -539,9 +699,15 @@ async def test_cancel_after_local_enqueue_before_shared_handler_entry_preserves_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["closed", "cancelled", "ownership"])
-async def test_each_before_admission_ownership_guard_blocks_dispatch_independently(state) -> None:
+@pytest.mark.parametrize("kind", ["start_work", "reply"])
+async def test_each_before_admission_ownership_guard_blocks_dispatch_independently(
+    state, kind,
+) -> None:
+    frame = decision_frame({
+        "kind": kind, "text" if kind == "reply" else "objective": "Inspect release",
+    })
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        frame])
 
     def retire_after_read(messages, count, completion):
         if state == "closed":
@@ -563,7 +729,7 @@ async def test_each_after_admission_cancellation_guard_suppresses_speech_indepen
     state
 ) -> None:
     inference, handler, _, _ = adapter([
-        {"message": {"tool_calls": [call()]}, "done": True}])
+        start_frame()])
     start = handler.start_work
 
     async def retire_after_start(**kwargs):
