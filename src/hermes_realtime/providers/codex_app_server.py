@@ -20,7 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 from hermes_realtime import __version__
 from hermes_realtime.conversation.context import ConversationContextSnapshot
@@ -2010,7 +2010,9 @@ class CodexAppServerStreamingInference:
         thread_id = self._bounded_identifier(params.get("threadId"), "tool thread id")
         turn_id = self._bounded_identifier(params.get("turnId"), "tool turn id")
         call_id = self._bounded_identifier(item.get("id"), "tool call id")
-        tool, namespace, arguments, canonical = self._dynamic_semantics(item)
+        tool, namespace, arguments, canonical = self._dynamic_semantics(
+            item, turn_identity=(thread_id, turn_id),
+        )
         advertised_tools = self._advertised_dynamic_tools.get(thread_id)
         if advertised_tools is None or tool not in advertised_tools:
             raise RuntimeError("Codex invoked an unadvertised dynamic tool")
@@ -2124,11 +2126,18 @@ class CodexAppServerStreamingInference:
             raise RuntimeError("Codex dynamic tool success is invalid")
 
     def _dynamic_semantics(
-        self, value: Mapping[str, object]
+        self, value: Mapping[str, object], *, turn_identity: _TurnIdentity | None = None,
     ) -> tuple[str, None, dict[str, object], str]:
         tool = self._exact_string(value.get("tool"), "dynamic tool name")
         if tool not in _DYNAMIC_TOOL_NAMES:
-            raise RuntimeError("Codex dynamic tool is not allowlisted")
+            routing = self._turn_routing.get(turn_identity) if turn_identity is not None else None
+            self._refuse_model_control(
+                "Codex dynamic tool is not allowlisted",
+                report=(routing is None or not routing.failure.is_set()) and (
+                    turn_identity is None
+                    or turn_identity[0] not in self._pending_thread_routing_errors
+                ),
+            )
         if "namespace" in value and value.get("namespace") is not None:
             raise RuntimeError("Codex dynamic tool namespace is prohibited")
         arguments = self._exact_mapping(value.get("arguments"), "dynamic tool arguments")
@@ -2203,7 +2212,9 @@ class CodexAppServerStreamingInference:
                 params.get("callId"),
                 "tool call id",
             )
-            tool, namespace, _arguments, canonical = self._dynamic_semantics(params)
+            tool, namespace, _arguments, canonical = self._dynamic_semantics(
+                params, turn_identity=identity,
+            )
             call = self._dynamic_calls.get((thread_id, turn_id, call_id))
             if call is None:
                 raise RuntimeError("Codex dynamic tool request is not registered")
@@ -2329,7 +2340,9 @@ class CodexAppServerStreamingInference:
                     dynamic=True,
                 )
                 return
-            tool, namespace, _arguments, canonical = self._dynamic_semantics(params)
+            tool, namespace, _arguments, canonical = self._dynamic_semantics(
+                params, turn_identity=turn_identity,
+            )
             call = self._dynamic_calls.get((thread_id, turn_id, call_id))
             if call is None:
                 self._mark_turn_failure(
@@ -2493,16 +2506,7 @@ class CodexAppServerStreamingInference:
             )
             return evidence
         if call.tool != "start_work":
-            try:
-                raise RuntimeError("Codex model work control is not available")
-            finally:
-                print(
-                    _TOOL_REFUSAL_PREFIX + json.dumps(
-                        {"refusal": "model_control_unavailable", "tool": "work", "version": 1},
-                        separators=(",", ":"),
-                    ),
-                    flush=True,
-                )
+            self._refuse_model_control("Codex model work control is not available")
         handler = self._work_tool_handler
         if handler is None:
             raise RuntimeError("work tool handler is unavailable")
@@ -2510,6 +2514,20 @@ class CodexAppServerStreamingInference:
             objective=cast(str, call.arguments["objective"]),
             invocation_id=self._invocation_id(call.identity),
         )
+
+    @staticmethod
+    def _refuse_model_control(message: str, *, report: bool = True) -> NoReturn:
+        try:
+            raise RuntimeError(message)
+        finally:
+            if report:
+                print(
+                    _TOOL_REFUSAL_PREFIX + json.dumps(
+                        {"refusal": "model_control_unavailable", "tool": "work", "version": 1},
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
 
     @classmethod
     def _search_result_response(cls, result: CurrentFactEvidence) -> dict[str, object]:

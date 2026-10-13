@@ -23,7 +23,7 @@ from hermes_realtime.providers import codex_app_server as provider
 
 
 @pytest.mark.parametrize("tool", ("cancel_active_work", "cancel_work", "approve_work"))
-def test_codex_removed_controls_are_not_valid_dynamic_semantics(tool) -> None:
+def test_codex_removed_controls_are_not_valid_dynamic_semantics(tool, capsys) -> None:
     inference = provider.CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
         effort="low",
@@ -32,6 +32,9 @@ def test_codex_removed_controls_are_not_valid_dynamic_semantics(tool) -> None:
     inference.bind_work_tools(FakeWorkToolHandler(can_cancel_work=True))
     with pytest.raises(RuntimeError, match="not allowlisted"):
         inference._dynamic_semantics({"tool": tool, "arguments": {}})
+    assert capsys.readouterr().out == (
+        '[codex-tool-refusal] {"refusal":"model_control_unavailable","tool":"work","version":1}\n'
+    )
 
 
 def test_codex_start_cannot_report_a_cancellation_result() -> None:
@@ -68,10 +71,11 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ("cancel_active_work", "cancel_work", "approve_work"))
 @pytest.mark.parametrize("arguments", ({}, {"task_id": "task_public"}))
-async def test_codex_model_cancellation_is_refused_before_effect(arguments) -> None:
+async def test_codex_model_cancellation_is_refused_before_effect(tool, arguments, capsys) -> None:
     transport = DynamicStartCodexTransport(
-        tool="cancel_active_work",
+        tool=tool,
         arguments=arguments,
         assistant_delta="Synthetic response.",
     )
@@ -90,6 +94,41 @@ async def test_codex_model_cancellation_is_refused_before_effect(arguments) -> N
         assert handler.starts == handler.cancels == handler.exact_cancels == []
     finally:
         await inference.close()
+    assert capsys.readouterr().out == (
+        '[codex-tool-refusal] {"refusal":"model_control_unavailable","tool":"work","version":1}\n'
+    )
+
+
+def test_codex_valid_start_semantics_emit_no_control_refusal(capsys) -> None:
+    inference = provider.CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport,
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    assert inference._dynamic_semantics({
+        "tool": "start_work", "arguments": {"objective": "Inspect the build"},
+    })[0] == "start_work"
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("phase", ["registered", "pending_thread"])
+def test_codex_repeated_control_validation_does_not_repeat_failure_evidence(phase, capsys) -> None:
+    inference = provider.CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport,
+    )
+    identity = ("thread_synthetic", "turn_synthetic")
+    arguments = {"tool": "cancel_work", "arguments": {"task_id": "task_public"}}
+    with pytest.raises(RuntimeError, match="not allowlisted") as refused:
+        inference._dynamic_semantics(arguments, turn_identity=identity)
+    if phase == "registered":
+        inference._turn_routing[identity] = provider._TurnRouting()
+        inference._mark_turn_failure(identity, refused.value)
+    else:
+        inference._pending_thread_routing_errors[identity[0]] = refused.value
+    with pytest.raises(RuntimeError, match="not allowlisted"):
+        inference._dynamic_semantics(arguments, turn_identity=identity)
+    assert capsys.readouterr().out == (
+        '[codex-tool-refusal] {"refusal":"model_control_unavailable","tool":"work","version":1}\n'
+    )
 
 
 @pytest.mark.asyncio
