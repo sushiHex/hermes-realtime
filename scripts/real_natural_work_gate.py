@@ -25,7 +25,6 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 if TYPE_CHECKING:
@@ -43,7 +42,6 @@ from hermes_realtime.conversation import (
     WorkCancelResult,
     WorkStartResult,
 )
-from hermes_realtime.conversation.tasks import TaskCancelOutcome
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
@@ -670,6 +668,29 @@ class RecordingWorkHandler:
             self._cancel_acknowledgement_ms.append((acknowledged_at - started_at) * 1000.0)
         return result
 
+    async def observe_cancel_operation(self, operation: asyncio.Task[Any]) -> Any:
+        """Measure an already admitted surface operation without initiating a command."""
+
+        self.cancel_attempts += 1
+        self._last_cancel_was_exactly_accepted = False
+        self._last_accepted_cancel_task_id = None
+        self._last_cancel_acknowledged_at = None
+        started_at = self._clock()
+        result = await asyncio.shield(operation)
+        if (
+            type(result) is WorkCancelResult
+            and result.accepted is True
+            and result.state == "cancelling"
+            and result.task_id is not None
+        ):
+            self.accepted_cancel_calls += 1
+            self._last_cancel_was_exactly_accepted = True
+            self._last_accepted_cancel_task_id = result.task_id
+            acknowledged_at = self._clock()
+            self._last_cancel_acknowledged_at = acknowledged_at
+            self._cancel_acknowledgement_ms.append((acknowledged_at - started_at) * 1000.0)
+        return result
+
 
 class _ObservedTaskSession:
     """Expose session-close failures that the controller intentionally consumes."""
@@ -1195,39 +1216,44 @@ async def _explicit_cancel_task(
     admitted_at = 0.0
     category = "ack_rejected"
     accepted = False
-    acknowledged = False
 
     async def record(text: str) -> None:
         nonlocal admitted_at
         admitted_at = clock()
         context.record_user_transcript(Transcript(text=text, final=True))
 
-    async def cancel(target: str, *, reason: str | None = None) -> TaskCancelOutcome:
-        nonlocal acknowledged
-        del reason
-        result = await handler.cancel_work(
-            task_id=target, invocation_id="command_natural_gate_cancel",
-        )
-        if (
-            type(result) is not WorkCancelResult
-            or result.accepted is not True
-            or result.task_id != task_id
-        ):
-            raise RuntimeError("explicit cancellation lacked an exact accepted acknowledgement")
-        acknowledged = True
-        return TaskCancelOutcome(task_id=result.task_id, accepted=True)
-
-    router = ConversationTaskCommandRouter(
-        # Only the fixed cancellation command is routed; dispatch is never invoked.
-        controller=SimpleNamespace(dispatch=handler.start_work, request_cancel=cancel),
-        observer=observer, reserve_observer_capacity=lambda: None,
-        validate_user_input=context.validate_user_text, record_user_input=record,
-    )
     try:
         async with asyncio.timeout(_TIMED_TURN_TIMEOUT_SECONDS):
+            surface = handler._delegate
+            if type(surface) is not ConversationWorkControlSurface:
+                raise RuntimeError("explicit cancellation requires the actual shared surface")
+            invocation_id = "command_natural_gate_cancel"
+            if invocation_id in surface._bindings:
+                raise RuntimeError("explicit cancellation binding already exists")
+            router = ConversationTaskCommandRouter(
+                surface=surface, utterance_id_factory=lambda: "natural_gate_cancel",
+                observer=observer, reserve_observer_capacity=lambda: None,
+                validate_user_input=context.validate_user_text, record_user_input=record,
+            )
             await router.route(f"cancel task: {task_id}")
-            if not acknowledged:
-                raise RuntimeError("explicit cancellation command was not acknowledged")
+            binding = surface._bindings.get(invocation_id)
+            semantics = ("cancel_exact", task_id, "user requested task cancellation")
+            if binding is None or binding.semantics != semantics:
+                raise RuntimeError("explicit cancellation binding was not acknowledged")
+            operation = binding.operation
+            result = await handler.observe_cancel_operation(operation)
+            if (
+                surface._bindings.get(invocation_id) is not binding
+                or binding.operation is not operation
+                or binding.semantics != semantics
+            ):
+                raise RuntimeError("explicit cancellation binding changed during settlement")
+            if (
+                type(result) is not WorkCancelResult
+                or result.accepted is not True
+                or result.task_id != task_id
+            ):
+                raise RuntimeError("explicit cancellation lacked an exact accepted acknowledgement")
         accepted = True
         return admitted_at
     except TimeoutError:
