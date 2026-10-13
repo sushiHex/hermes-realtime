@@ -3,6 +3,9 @@
 Status: Accepted by owner decision on 2026-10-10; implementation tracked in
 [#226](https://github.com/sushiHex/hermes-realtime/issues/226).
 [Decision record](https://github.com/sushiHex/hermes-realtime/issues/205#issuecomment-6096188370).
+The owner approved the provider framing correction on 2026-10-13; the
+[failed native-call probe](https://github.com/sushiHex/hermes-realtime/pull/248#issuecomment-6144062862)
+records why it is needed. Qualification remains separate from this decision.
 
 ## Context
 
@@ -43,8 +46,19 @@ Interruption after work admission must not cancel independently owned work.
 Provider tool handling is bounded and fail-closed. Unknown tools, malformed or
 multiple start calls, cancelled turns and invalid arguments produce no new
 effect. Preflight, memory refresh and announcements do not start work. Tool-call
-payloads are never spoken. Ollama uses native tools and acknowledgment-derived
-speech rather than speaking a buffered promise before dispatch is accepted.
+payloads are never spoken. Codex retains its native tool transport. When work
+authority is bound, Ollama instead requests one schema-constrained completion:
+either `{"kind":"reply","text":"..."}` or
+`{"kind":"start_work","objective":"..."}`. Both shapes have exact required
+keys and bounded strings; they cannot combine speech with a start request.
+Only an admitted user turn is offered the start branch. Other bound turns have
+the reply shape only; tool-less readiness retains its ordinary speech response.
+
+Ollama buffers and validates the entire response before any speech or dispatch.
+Duplicate keys, extra fields, invalid types, incomplete or truncated responses,
+and unexpected native calls are refused. No textual-call recovery, second model
+call, or fallback transport is attempted. The existing controller admits a
+validated objective; only its accepted acknowledgment produces started speech.
 Disabling natural work preserves explicit commands. This decision does not
 silently change an already running session.
 
@@ -59,7 +73,9 @@ never trusted cancellation or approval events.
 
 Buffering an Ollama tool decision adds latency before speech. Bound that
 completion and use one inference call rather than a classification round trip.
-Native tool capability is necessary but does not establish routing quality.
+The provider's framing must be qualified, but valid framing does not establish
+routing quality. A valid reply string can still contain misleading or tool-like
+prose; structural validation is not a semantic guarantee about that string.
 Failed real-model qualification remains a failure; do not replace it with
 stand-in evidence or loosen thresholds after seeing the result.
 
@@ -75,6 +91,10 @@ stand-in evidence or loosen thresholds after seeing the result.
   At most one admitted model start per turn; replay cannot duplicate its effect.
 - Schema, objective, capacity and identity refusals fail closed. Each changed
   guard must fail its targeted mutation independently, with source restored.
+- Ollama's pinned runtime enforces the selected schema and both response branches
+  pass real-model probes. Malformed, mixed, duplicate-key and truncated envelopes
+  cause neither speech nor dispatch, including syntactically complete JSON from
+  a token-limited completion. Reference data cannot advertise the start branch.
 - Only accepted acknowledgment permits active reporting. Rejection and unknown
   outcomes remain truthful. Interruption before admission prevents dispatch;
   interruption after admission leaves independently owned work intact.

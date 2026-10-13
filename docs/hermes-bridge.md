@@ -567,6 +567,14 @@ grant approvals. Explicit commands and task-specific Cancel controls retain canc
 The unsandboxed-task acknowledgment is required in either mode. See
 [ADR 0004](adr/0004-model-action-authority.md) for the model-trust limit and qualification.
 
+Codex uses native tool calls. Ollama uses one schema-constrained response that is
+either reply text or a start objective, validated completely before speech or
+dispatch. Non-user turns receive only the reply shape. This replaces native tool
+framing for Ollama; malformed responses are not retried through another parser.
+The model supplies no cancellation, approval or run identity. Only the host's
+accepted dispatch result permits started speech. Complete buffering adds latency;
+valid structure alone does not establish correct task intent or reply quality.
+
 Source-backed foreground knowledge is a separate authority plane. It is disabled unless the host
 operator passes `--enable-public-search`, and each active browser binding must separately consent.
 When both gates are open, Codex hosts route source-sensitive final transcripts through bounded
