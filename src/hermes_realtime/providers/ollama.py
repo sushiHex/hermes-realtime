@@ -544,7 +544,9 @@ class OllamaStreamingInference:
             if buffer:
                 raise AssertionError("final segmentation retained text")
         except TimeoutError:
-            self._refuse_work("deadline")
+            if handler is not None:
+                self._refuse_work("deadline")
+            raise
         finally:
             response_cleanup: asyncio.Task[None] | None = None
             async with self._state_lock:

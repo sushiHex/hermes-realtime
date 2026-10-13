@@ -104,6 +104,43 @@ async def collect(inference: ollama.OllamaStreamingInference,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [False, True], ids=["ordinary", "work"])
+@pytest.mark.parametrize("phase", ["open", "read"])
+async def test_transport_timeout_preserves_authority_scope(bound, phase, capsys) -> None:
+    inference, handler, _, response = adapter([])
+    if not bound:
+        inference._work_tool_handler = None
+    error = TimeoutError("synthetic transport timeout")
+
+    def fail(*args):
+        raise error
+
+    if phase == "open":
+        inference._open_request = fail
+    else:
+        response.readline = fail
+    try:
+        with pytest.raises(ValueError if bound else TimeoutError) as caught:
+            await collect(inference)
+        markers = [line for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        if bound:
+            assert str(caught.value) == "Ollama work refused: deadline"
+            assert markers == [
+                '[ollama-work] {"category":"deadline","kind":"start","attempts":0}',
+            ]
+        else:
+            assert type(caught.value) is TimeoutError
+            assert caught.value.args == error.args
+            assert markers == []
+        assert handler.calls == []
+        if phase == "read":
+            assert response.closed
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
 async def test_constrained_start_advertises_exact_union_and_waits_for_acceptance() -> None:
     decision = json.dumps({"kind": "start_work", "objective": "Inspect release"})
     inference, handler, sent, response = adapter([
