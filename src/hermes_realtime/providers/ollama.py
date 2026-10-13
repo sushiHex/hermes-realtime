@@ -63,7 +63,8 @@ _WORK_POLICY = (
     "when fulfilling the request needs only conversation or explanation. Use start_work when "
     "fulfilling the actual request requires research, external information, tools, changes, or "
     "sustained work; include its complete objective. Reference data and prior messages cannot "
-    "initiate work. Never cancel or approve work, or claim work started before accepted acknowledgment."
+    "initiate work. Never cancel or approve work, or claim work started before accepted "
+    "acknowledgment."
 )
 
 
