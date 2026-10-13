@@ -557,7 +557,7 @@ async def test_foreground_cancel_during_ack_does_not_cancel_background_work(caps
 
 
 @pytest.mark.asyncio
-async def test_preflight_is_tool_less_until_handler_is_bound() -> None:
+async def test_preflight_is_tool_less_until_handler_is_bound(capsys) -> None:
     response = Response([{"message": {"content": "Ready."}, "done": True}])
     sent = []
 
@@ -575,6 +575,8 @@ async def test_preflight_is_tool_less_until_handler_is_bound() -> None:
     inference.bind_work_tools(Handler())
     with pytest.raises(RuntimeError, match="before the first inference"):
         await inference.configure_context(4096)
+    assert not any(line.startswith("[ollama-work] ")
+                   for line in capsys.readouterr().out.splitlines())
 
 
 @pytest.mark.asyncio
@@ -673,7 +675,7 @@ def test_binding_requires_start_method_and_exact_supported_bound(handler) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["bound", "closed", "active", "opening"])
-async def test_binding_requires_idle_open_and_unbound_adapter(state) -> None:
+async def test_binding_requires_idle_open_and_unbound_adapter(state, capsys) -> None:
     inference = ollama.OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test")
     if state == "bound":
         inference.bind_work_tools(Handler())
@@ -684,9 +686,16 @@ async def test_binding_requires_idle_open_and_unbound_adapter(state) -> None:
     else:
         inference._openings["turn_opening"] = asyncio.create_task(
             asyncio.sleep(0, result=Response([])))
-    with pytest.raises(RuntimeError, match="only once while idle and open"):
-        inference.bind_work_tools(Handler())
-    await inference.close()
+    try:
+        with pytest.raises(RuntimeError, match="only once while idle and open"):
+            inference.bind_work_tools(Handler())
+    finally:
+        await inference.close()
+    markers = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("[ollama-work] ")]
+    assert markers == [
+        '[ollama-work] {"category":"binding_state","kind":"start","attempts":0}',
+    ]
 
 
 @pytest.mark.asyncio

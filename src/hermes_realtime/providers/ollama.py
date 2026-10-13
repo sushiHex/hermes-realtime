@@ -196,7 +196,10 @@ class OllamaStreamingInference:
             finally:
                 self._work_evidence("binding_after_admission", attempts=0)
         if self._closed or self._work_tool_handler is not None or self._openings or self._responses:
-            raise RuntimeError("Ollama work tools may be bound only once while idle and open")
+            try:
+                raise RuntimeError("Ollama work tools may be bound only once while idle and open")
+            finally:
+                self._work_evidence("binding_state", attempts=0)
         if not callable(getattr(handler, "start_work", None)):
             raise TypeError("work tool handler must provide start_work()")
         maximum = handler.max_objective_chars
