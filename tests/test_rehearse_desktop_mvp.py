@@ -9,9 +9,11 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from hermes_realtime.providers.moonshine import _NativeMoonshineBackend
 from tests.support.ollama_metadata import supported_ollama_metadata
 
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
@@ -1366,4 +1368,25 @@ def test_cleanup_markers_retain_bounded_refusal_evidence(name: str, category: st
     line = f"[{name}] " + json.dumps(payload, separators=(",", ":"))
     found, dropped = rehearsal.markers([line])
     assert found == [f"[{name}] " + json.dumps(payload, separators=(",", ":"), sort_keys=True)]
+    assert dropped == 0
+
+
+def test_moonshine_finalization_refusal_is_retained_from_native_adapter(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = _NativeMoonshineBackend.__new__(_NativeMoonshineBackend)
+    backend._stream = SimpleNamespace(stop=lambda: None, close=lambda: None)
+    backend._lines = {1: (0.0, "Synthetic prefix")}
+    backend._dirty = False
+    backend._stream_error = False
+
+    with pytest.raises(RuntimeError, match="^Moonshine finalization failed$"):
+        backend.finish()
+
+    found, dropped = rehearsal.markers(capsys.readouterr().out.splitlines())
+    payload = {"version": 1, "category": "native_finalization_failed", "count": 1}
+    expected = "[moonshine-finalization-refusal] " + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
+    assert found == [expected]
     assert dropped == 0
