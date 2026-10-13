@@ -186,9 +186,15 @@ class OllamaStreamingInference:
         self._closed = False
         self._work_tool_handler: _WorkToolHandler | None = None
         self._inference_started = False
+        self._user_turn_admitted = False
 
     def bind_work_tools(self, handler: _WorkToolHandler) -> None:
         """Bind start authority after tool-less preflight; cancellation stays explicit."""
+        if self._user_turn_admitted:
+            try:
+                raise RuntimeError("Ollama work tools must be bound before user-turn admission")
+            finally:
+                self._work_evidence("binding_after_admission", attempts=0)
         if self._closed or self._work_tool_handler is not None or self._openings or self._responses:
             raise RuntimeError("Ollama work tools may be bound only once while idle and open")
         if not callable(getattr(handler, "start_work", None)):
@@ -335,6 +341,8 @@ class OllamaStreamingInference:
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         messages = self._messages(snapshot, output_style=style)
+        if turn_id != "turn_preflight":
+            self._user_turn_admitted = True
         opening: asyncio.Task[_LineResponse] | None = None
         response: _LineResponse | None = None
         read_operation: asyncio.Task[bytes] | None = None
