@@ -1357,3 +1357,13 @@ def test_the_host_import_check_fails_setup_with_its_category(
         run._candidate()
     assert raised.value.category == "host_import"
     assert raised.value.notes["exit_code"] == 1
+@pytest.mark.parametrize(
+    ("name", "category"),
+    [("speech-consumer-cleanup", "retained"), ("speech-cleanup-refusal", "pending")],
+)
+def test_cleanup_markers_retain_bounded_refusal_evidence(name: str, category: str) -> None:
+    payload = {"version": 1, "category": category, "pending": 1}
+    line = f"[{name}] " + json.dumps(payload, separators=(",", ":"))
+    found, dropped = rehearsal.markers([line])
+    assert found == [f"[{name}] " + json.dumps(payload, separators=(",", ":"), sort_keys=True)]
+    assert dropped == 0
