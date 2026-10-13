@@ -972,15 +972,11 @@ class StreamingSpeechLoop:
                 return False
             self._authority_revision += 1
             revision = self._authority_revision
-            if expected_resumable is not None:
-                self._resumable_speech = None
-            else:
+            if expected_resumable is None:
                 self._revoke_active_locked(
                     preserve_resumable=preserve_resumable,
                     terminal_reason=TerminalReason.RESPONSE_REPLACED,
                 )
-            if not preserve_resumable:
-                self._resumable_speech = None
 
         await self._settle_owned_cleanups()
         self._raise_if_provider_cleanup_pending()
@@ -1057,6 +1053,8 @@ class StreamingSpeechLoop:
                             )
                         )
                 else:
+                    if expected_resumable is not None or not preserve_resumable:
+                        self._resumable_speech = None
                     self._active_turn_id = turn_id
                     self._active_lease = lease
                     self._active_consumer = consumer
@@ -2193,7 +2191,21 @@ class StreamingSpeechLoop:
             if cleanup.done():
                 self._provider_cleanup_done(cleanup)
         if self._provider_cleanup_tasks:
-            raise RuntimeError("provider cleanup is still pending")
+            refusal = RuntimeError("provider cleanup is still pending")
+            try:
+                raise refusal
+            finally:
+                try:
+                    print(
+                        "[speech-cleanup-refusal] "
+                        + json.dumps(
+                            {"version": 1, "category": "pending", "pending": 1},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                except BaseException as marker_error:
+                    raise refusal from marker_error
 
     def _provider_cleanup_done(self, cleanup: asyncio.Task[None]) -> None:
         self._provider_cleanup_tasks.discard(cleanup)

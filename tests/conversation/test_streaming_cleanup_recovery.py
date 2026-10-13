@@ -183,6 +183,7 @@ async def test_new_inference_remains_refused_until_held_prefetch_releases(
             assert any(isinstance(error, OSError) for error in captured.value.exceptions)
             assert any(isinstance(error, TimeoutError) for error in captured.value.exceptions)
             assert speech._resumable_cleanup_count == 0
+            monkeypatch.undo()
         elif cancel_caller:
             cancellation = asyncio.create_task(speech.cancel_for_binding_close())
             async with asyncio.timeout(1):
@@ -225,3 +226,142 @@ async def test_new_inference_remains_refused_until_held_prefetch_releases(
                 with suppress(BaseException):
                     await asyncio.wait_for(response, 1)
         await speech.close()
+
+
+async def _held_replay_fixture():
+    class RecoverySynthesizer(SegmentSynthesizer):
+        def __init__(self):
+            super().__init__()
+            self.held = BlockingSynthesisSynthesizer()
+            self.calls = 0
+
+        def synthesize(self, text, turn_id):
+            self.calls += 1
+            if self.calls == 1:
+                return self.held.synthesize(text, turn_id)
+            return super().synthesize(text, turn_id)
+
+    class CountInference(PerTurnInference):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _stream(self, snapshot, *, turn_id):
+            self.calls += 1
+            async for value in super()._stream(snapshot, turn_id=turn_id):
+                yield value
+
+    synth = RecoverySynthesizer()
+    inference = CountInference()
+    playback = RecordingPlayback()
+    speech = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=synth,
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+        cleanup_timeout_seconds=0.02,
+    )
+    response = asyncio.create_task(
+        speech.respond("turn_held", Transcript(text="Synthetic", final=True))
+    )
+    await asyncio.wait_for(synth.held.iterator.started.wait(), 1)
+    with pytest.raises(TimeoutError, match="speech consumer cleanup"):
+        await speech.cancel()
+    return speech, synth, inference, playback, response
+
+
+async def _release_replay_fixture(speech, synth, response):
+    synth.held.iterator.release.set()
+    with suppress(BaseException):
+        await asyncio.wait_for(response, 1)
+    await speech.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_cleanup_refuses_replay_without_consuming_saved_speech():
+    speech, synth, inference, playback, response = await _held_replay_fixture()
+    try:
+        saved = speech._resumable_speech
+        assert saved is not None
+        with pytest.raises(RuntimeError, match="provider cleanup is still pending"):
+            await speech.resume_interrupted()
+        assert speech._resumable_speech is saved
+        synth.held.iterator.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(response, 1)
+        assert await asyncio.wait_for(speech.resume_interrupted(), 1) is True
+        assert playback.chunks
+        assert inference.calls == 1
+        assert await speech.resume_interrupted() is False
+    finally:
+        await _release_replay_fixture(speech, synth, response)
+
+
+@pytest.mark.asyncio
+async def test_each_pending_cleanup_rejection_emits_one_bounded_marker(capsys):
+    speech, synth, _, _, response = await _held_replay_fixture()
+    capsys.readouterr()
+    saved = speech._resumable_speech
+    try:
+        with pytest.raises(RuntimeError, match="provider cleanup is still pending"):
+            await speech.resume_interrupted()
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="provider cleanup is still pending"):
+                await speech.respond("turn_rejected", Transcript(text="Synthetic", final=True))
+        assert speech._resumable_speech is saved
+        records = [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[speech-cleanup-refusal] ")
+        ]
+        assert (
+            records
+            == ['[speech-cleanup-refusal] {"version":1,"category":"pending","pending":1}'] * 3
+        )
+    finally:
+        await _release_replay_fixture(speech, synth, response)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_refusal_marker_failure_still_preserves_replay_and_blocks_inference(
+    monkeypatch,
+):
+    import hermes_realtime.conversation.streaming as module
+
+    speech, synth, inference, _, response = await _held_replay_fixture()
+    saved = speech._resumable_speech
+
+    def refuse(*args, **kwargs):
+        raise OSError("synthetic refusal-marker failure")
+
+    try:
+        monkeypatch.setattr(module, "print", refuse, raising=False)
+        with pytest.raises(RuntimeError, match="provider cleanup is still pending") as captured:
+            await speech.resume_interrupted()
+        assert isinstance(captured.value.__cause__, OSError)
+        assert speech._resumable_speech is saved
+        assert inference.calls == 1
+    finally:
+        monkeypatch.undo()
+        await _release_replay_fixture(speech, synth, response)
+
+
+@pytest.mark.asyncio
+async def test_committed_new_response_discards_prior_replay_after_cleanup_settles():
+    speech, synth, inference, _, response = await _held_replay_fixture()
+    try:
+        assert speech._resumable_speech is not None
+        synth.held.iterator.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(response, 1)
+        await asyncio.wait_for(
+            speech.respond("turn_new", Transcript(text="Synthetic replacement", final=True)),
+            1,
+        )
+        assert inference.calls == 2
+        assert speech._resumable_speech is None
+        assert await speech.resume_interrupted() is False
+    finally:
+        await _release_replay_fixture(speech, synth, response)
