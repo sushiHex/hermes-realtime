@@ -519,13 +519,17 @@ class OllamaStreamingInference:
                                                  task_id=result.task_id, reason=result.reason)
                     except (TypeError, ValueError):
                         self._refuse_work("result_schema", attempts=1)
-                    buffer = (
-                        "I've started that background task."
-                        if result.accepted and result.state == "active"
-                        else "That background task was accepted and is now being cancelled."
-                        if result.accepted
-                        else "The background task was not accepted."
-                    )
+                    try:
+                        buffer = (
+                            "I've started that background task."
+                            if result.accepted and result.state == "active"
+                            else "That background task was accepted and is now being cancelled."
+                            if result.accepted
+                            else "The background task was not accepted."
+                        )
+                    finally:
+                        if not result.accepted:
+                            self._work_evidence("ack_rejected", attempts=1)
             elif handler is not None and has_background_work_claim(buffer):
                 self._refuse_work("unverified_claim")
             segments, buffer = self._extract_segments(buffer, final=True)

@@ -216,6 +216,44 @@ async def test_rejected_and_pending_cancel_results_do_not_claim_active_work(resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "capacity exhausted", "matching work is already active",
+    "work control unavailable; restart required",
+])
+async def test_rejected_ack_reports_one_bounded_marker_before_refusal_speech(
+    reason, capsys,
+) -> None:
+    inference, handler, _, response = adapter([start_frame()])
+    handler.result = WorkStartResult(accepted=False, state="rejected", reason=reason)
+    stream = inference.stream(request(), turn_id="turn_test")
+    try:
+        assert await anext(stream) == "The background task was not accepted."
+        markers = [json.loads(line.removeprefix("[ollama-work] "))
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[ollama-work] ")]
+        assert markers == [{"category": "ack_rejected", "kind": "start", "attempts": 1}]
+        assert len(handler.calls) == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert response.closed
+        assert not any(line.startswith("[ollama-work] ")
+                       for line in capsys.readouterr().out.splitlines())
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["active", "cancelling"])
+async def test_accepted_ack_has_no_rejection_marker(state, capsys) -> None:
+    inference, handler, _, _ = adapter([start_frame()])
+    handler.result = WorkStartResult(accepted=True, state=state, task_id="task_test")
+    assert await collect(inference)
+    assert len(handler.calls) == 1
+    assert not any(line.startswith("[ollama-work] ")
+                   for line in capsys.readouterr().out.splitlines())
+
+
+@pytest.mark.asyncio
 async def test_structured_reply_retains_segmentation_without_dispatch() -> None:
     decision = json.dumps({"kind": "reply", "text": "One sentence. Another."})
     inference, handler, _, _ = adapter([
