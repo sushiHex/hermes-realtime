@@ -1919,6 +1919,21 @@ class StreamingSpeechLoop:
             await self._settle_consumer(owner.consumer)
         except BaseException as error:
             errors.append(error)
+        finally:
+            if not owner.consumer.done():
+                self._provider_cleanup_tasks.add(owner.consumer)
+                owner.consumer.add_done_callback(self._provider_cleanup_done)
+                try:
+                    print(
+                        "[speech-consumer-cleanup] "
+                        + json.dumps(
+                            {"version": 1, "category": "retained", "pending": 1},
+                            separators=(",", ":"),
+                        ),
+                        flush=True,
+                    )
+                except BaseException as error:
+                    errors.append(error)
         async with self._lifecycle_lock:
             if owner.preserve_resumable:
                 if self._resumable_cleanup_count <= 0:
