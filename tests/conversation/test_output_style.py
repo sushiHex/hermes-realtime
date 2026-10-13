@@ -9,6 +9,22 @@ from hermes_realtime.conversation.output_style import (
 )
 
 
+@pytest.mark.parametrize("style, expected", [
+    ("default", "Use one or two short sentences for simple turns; expand only when the user "
+     "asks or the answer needs it."),
+    ("proactive", "Suggest a relevant next step when useful; do not perform unrequested work."),
+    ("explanatory", "Explain the reasoning and useful context behind the answer."),
+    ("learning", "Help the user understand with useful examples and occasional understanding "
+     "checks."),
+], ids=["default", "proactive", "explanatory", "learning"])
+def test_selected_presentation_block_preserves_other_style_intent(style, expected):
+    common, presentation = communication_policy(style).split("\n\nResponse presentation:\n", 1)
+    assert presentation == expected
+    _, concise_common = communication_policy("concise").split("\n", 1)
+    _, selected_common = common.split("\n", 1)
+    assert concise_common.split("\n\nResponse presentation:\n", 1)[0] == selected_common
+
+
 def test_output_styles_are_exact_bounded_communication_preferences() -> None:
     assert OUTPUT_STYLES == ("default", "proactive", "concise", "explanatory", "learning")
     selection = OutputStyleSelection()
