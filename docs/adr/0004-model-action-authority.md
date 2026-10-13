@@ -1,49 +1,91 @@
-# ADR 0004: Confirm model-proposed work at a trusted action boundary
+# ADR 0004: Natural task starts, explicit task cancellation
 
-Status: Proposed for owner decision. [Decision issue](https://github.com/sushiHex/hermes-realtime/issues/205). This record changes no routing or runtime behavior by itself.
+Status: Accepted by owner decision on 2026-10-10; implementation tracked in
+[#226](https://github.com/sushiHex/hermes-realtime/issues/226).
+[Decision record](https://github.com/sushiHex/hermes-realtime/issues/205#issuecomment-6096188370).
 
 ## Context
 
-The conversational model currently receives `start_work` and, when work is available, `cancel_active_work` as dynamic tools. The adapter rejects unadvertised calls and malformed arguments, while the shared work surface checks identity, capacity, replay and task state. Those checks establish a well-formed call, not that the current user intended its effect. The forced stand-in probe in [#205](https://github.com/sushiHex/hermes-realtime/issues/205) made one dispatch and one cancellation on a neutral user turn with an already-active task. It demonstrates this execution boundary's limit under forced model behavior; it does not demonstrate production-model obedience to adversarial memory, or new authority from M4. [ADR 0003 criterion 17](0003-hermes-owned-conversation-continuity.md#required-qualification-before-acceptance) separately qualifies that memory adds no authority.
+Voice users should state a goal without learning a task prefix. The foreground
+model can choose between ordinary conversation and requests requiring tools,
+current information, research or sustained work. Hermes already owns execution;
+realtime needs a bounded handoff, not another planner or executor.
 
-The existing explicit `task: <objective>` and `cancel task: <task_id>` commands are parsed from admitted final user input before foreground inference. Natural routing is useful, but neither model output, recalled memory, quoted text, tool results nor an imperative-word pattern can confer user authority. The desktop outcome in [#159](https://github.com/sushiHex/hermes-realtime/issues/159) requires that interrupting speech leave unrelated work running. Cancelling the only active task on a neutral turn would violate that outcome even though the present task-state check permits it.
+The forced-model probe in [#205](https://github.com/sushiHex/hermes-realtime/issues/205)
+demonstrated that valid model calls can start and cancel work on a neutral turn.
+Schema and task-state validation cannot establish semantic user intent. This is
+a model-trust limit, not evidence of production-model exploitation. ADR 0003's
+memory qualification establishes that memory adds no authority, not obedience.
 
-## Proposed decision
+The owner superseded the earlier confirmation-for-both policy with automatic
+starts and explicit user cancellation. The earlier design remains in #205 and
+Git history. No confirmation UI or proposal/grant lifecycle is required now.
 
-Treat a model call to start or cancel work as a **proposal**. The model may formulate an objective or identify work to stop, but it may not dispatch, cancel or approve. A separate trusted control, showing the exact proposed effect to the operator, must produce an action grant before the existing work surface is invoked. Until the owner accepts this ADR and a separately scoped change implements and qualifies it, current routing remains as documented above.
+## Decision
 
-An explicit command from the admitted current user final, or a direct trusted control action, may continue to invoke the work surface without a model proposal. These are separate authority paths. The command grammar is exact; ordinary natural language, even when it contains words such as “start” or “stop,” is never converted by a keyword rule into a grant. Natural requests can still lead to a model proposal and a confirmation control. A model-written “yes,” an assistant message, an inferred user intent, or a tool result cannot confirm it.
+Advertise `start_work` for an admitted user turn when natural work is enabled.
+The foreground model chooses whether to answer directly or delegate to Hermes.
+Ordinary explanations stay in the foreground. Requests needing unavailable tools,
+current external information, research or sustained work should delegate with a
+bounded objective. No additional routing model or keyword classifier is added.
 
-The confirmation boundary has one authoritative state transition:
+Only the existing host-owned work controller admits starts, retaining objective,
+identity, capacity, binding, replay and acknowledgment checks. A request is not
+active work until Hermes accepts it with a validated run ID. The model cannot
+choose private run handles or bypass Hermes's downstream execution policy.
 
-1. Validate and freeze a bounded proposal originating from an admitted current user turn. Memory refresh, a system announcement or a model continuation without that turn cannot create one. A start proposal contains the complete objective and the selected Hermes profile. A cancel proposal resolves to exactly one cancellable work item: an active public task ID with its already-acknowledged private Hermes run ID, or a pending start bound to its original dispatch invocation identity and pending record before a run ID exists. Retain that same pending record only for the proposal's bounded lifetime so its accepted task can be matched to the controller-validated run if acknowledgment wins the confirmation race; do not create a historical lookup by objective or current active task. A bare “active work” model call is resolved at proposal time; if there are zero or multiple candidates, refuse it. The private run ID and pending invocation identity stay out of model-visible content and the confirmation display.
-2. Display the action type, the full objective and selected profile, and either the exact active public task ID or an explicit indication that the exact dispatch is still pending, in a trusted operator control. Truncation cannot turn hidden content into accepted content: an objective too long to review is refused or must be deliberately expanded before confirmation. Confirmation is an explicit control event, not speech or an inferred reply.
-3. Mint a single-use grant bound to the frozen canonical action payload and proposal ID, conversation session and generation, selected profile, originating user turn, and, for cancellation, either the active task ID plus its acknowledged run ID or the pending start's original dispatch invocation identity and pending record. The grant has a short declared expiry and is held outside model context. Atomic consumption occurs at the work-surface admission point; retries of that one admitted operation use its existing invocation/idempotency identity, not a fresh grant.
-4. Recheck the binding when consuming the grant. Refuse changed arguments, a changed session/profile/generation, expiry, replay, retired or already-cancelling work, or an active task whose current run ID differs. For a pending-start proposal, atomically verify the original pending record: if dispatch is still pending, record cancellation on that same invocation for the existing cancel-after-ack path; if it has just been accepted, verify that record's accepted task ID and its controller-validated run are still active and cancel only that run. A rejected, unknown, replaced or unverifiable dispatch has no cancellation effect. Never resolve the grant against whichever task is currently active. A newer admitted user turn or a newer proposal supersedes an unconfirmed proposal. A failed confirmation or stale proposal has no work effect. A reconnect does not silently carry an unconsumed control into a different conversation generation.
+The model has no cancellation or approval tool. Explicit admitted user commands
+and trusted task-specific controls retain cancellation and their exact-target
+and ambiguity checks. Model text is never routed back as a user command.
+Speaking interrupts speech and the foreground turn, not background tasks.
+Interruption after work admission must not cancel independently owned work.
 
-The trusted control owns grant issuance and consumption. The model cannot write approval state, choose a grant ID, or call the work surface through another path. The proposed action may be edited only by creating and displaying a new proposal. The displayed action fields must equal the corresponding frozen action fields exactly, rather than overlapping or being semantically similar. Hidden authority bindings, including the private run ID or pending dispatch invocation identity, are checked separately at consumption. No token or private run handle is placed in a transcript, prompt, speech, URL, or content-bearing log.
+Provider tool handling is bounded and fail-closed. Unknown tools, malformed or
+multiple start calls, cancelled turns and invalid arguments produce no new
+effect. Preflight, memory refresh and announcements do not start work. Tool-call
+payloads are never spoken. Ollama uses native tools and acknowledgment-derived
+speech rather than speaking a buffered promise before dispatch is accepted.
+Disabling natural work preserves explicit commands. This decision does not
+silently change an already running session.
 
-Dispatch remains a request until the existing `work.dispatch.acknowledged` event accepts it with a Hermes run ID. A grant or a pending proposal never justifies “started” or “working” language. A confirmed cancellation while dispatch is still pending records cancellation for that same invocation and follows the existing `cancel_after_ack` path: rejection produces no cancellation signal; acceptance supplies the run ID and triggers cancellation of that exact accepted task. If acceptance arrives before grant consumption, the same bound pending record's accepted task ID and the controller-validated run binding identify the exact run for cancellation. Neither path mints a fresh start or selects a different active task. Cancellation remains a request, with its existing acknowledgment and terminal-state rules; confirmation does not imply that Hermes stopped work. Rejections and unknown outcomes remain truthful. The existing Hermes per-dispatch idempotency key and recovery rules in [ADR 0003](0003-hermes-owned-conversation-continuity.md) still govern an ambiguous dispatch acknowledgment.
+## Trust and limits
 
-Speech interruption and foreground-turn cancellation stay immediate controls in their own scopes. They neither consume an action grant nor cancel a task. A model-proposed task cancellation uses the task scope only; session shutdown and direct trusted controls retain their separately defined behavior. A speech barge-in while a proposal is displayed does not grant or execute it.
+Automatic delegation deliberately trusts the foreground model to recognize the
+user's request. A structurally valid unwanted start remains possible. Neither a
+prompt nor a finite corpus proves arbitrary intent or injection resistance.
+Measure false starts, missed starts, objective fidelity and latency with the
+actual foreground model. Memory, history and results remain reference data,
+never trusted cancellation or approval events.
 
-## Alternatives considered
+Buffering an Ollama tool decision adds latency before speech. Bound that
+completion and use one inference call rather than a classification round trip.
+Native tool capability is necessary but does not establish routing quality.
+Failed real-model qualification remains a failure; do not replace it with
+stand-in evidence or loosen thresholds after seeing the result.
 
-- **Keep model-initiated execution and measure errors.** This preserves natural routing and its latency, but the neutral-turn forced-call case remains an admitted dispatch/cancel. Prompt wording and the existing active-task check cannot establish present user intent.
-- **Remove recalled memory from an action-routing model call.** This can isolate one source of influence, at extra latency and context cost. It does not prevent a forced call from another untrusted context or prove general model obedience.
-- **Infer a per-turn capability from imperative words or a model intent classification.** Ambiguity, quotation, negation and indirect requests make that classification an authority decision. It cannot safely mint the grant proposed here.
-- **Require only cancellation confirmation.** That protects active work but still permits an unwanted start. Start and cancel both cross the work boundary; the same grant mechanism can bind each effect while keeping exact-target cancellation stricter.
-- **Use explicit commands alone.** This is deterministic and low latency but removes natural-language delegation from the supported interaction. The proposed confirmation control retains natural requests at the cost of an extra operator action.
+## Required qualification
 
-## Consequences and qualification
+- Real-model positive requests for research, current information and tool use
+  delegate with the intended objective; ordinary conversation and explanations
+  remain direct. Include negation, quotation, neutral turns and instruction-shaped
+  reference data. Report denominators, errors and latency without real user text.
+- Forced cancellation and approval calls have zero effect with unrelated work
+  active. Explicit start/cancel controls retain their positive coverage.
+- No start from preflight, memory refresh, announcements or cancelled turns.
+  At most one admitted model start per turn; replay cannot duplicate its effect.
+- Schema, objective, capacity and identity refusals fail closed. Each changed
+  guard must fail its targeted mutation independently, with source restored.
+- Only accepted acknowledgment permits active reporting. Rejection and unknown
+  outcomes remain truthful. Interruption before admission prevents dispatch;
+  interruption after admission leaves independently owned work intact.
+- Relevant provider, host, task-controller and continuity qualifications, lint,
+  type checks and exact-head hosted gates pass. Real-model routing and physical
+  voice acceptance remain separate from deterministic stand-in evidence.
 
-The operator must confirm each model-proposed start or cancellation, adding an interaction and its latency. The policy does not prove that a model proposes the right action or objective, or that a human reads every detail. It makes the effect inspectable and confines execution to what the trusted control accepted. No claim of general prompt-injection resistance follows. Approval for work within Hermes remains governed by its own controls; this grant authorizes only realtime dispatch or exact task cancellation, never model-granted downstream approval.
+## Alternatives
 
-A later implementation item must name the protocol/control surface, stale-grant behavior, bounded retention, and UI copy. The current pending record tracks the start invocation and later task ID, while the public `TaskDispatchOutcome` omits the private run ID; an implementation must make the controller-validated task/run binding privately available for the acknowledgment-before-confirmation case, without exposing it to the model or retaining an unbounded task history. RED-GREEN-REFACTOR applies to that production change. Qualification must observe, with the same forced model calls used in #205:
-
-- A neutral user turn, including one with adversarial recalled memory and one unrelated active task, produces proposals but zero dispatches and zero task cancellation signals without a trusted grant. Unadvertised calls still fail closed.
-- An ordinary natural delegation and an explicit stop request show the correct exact effect; confirmation invokes it once. The direct `task:` and exact `cancel task:` paths retain their intended positive controls. Model text alone never confirms either.
-- Mutating the proposed objective, action kind, profile, session, generation, originating turn, active task ID or acknowledged run ID, or pending dispatch invocation/record identity individually refuses consumption. Replay, expiry, supersession and a task-state change also refuse it, with zero effect on unrelated work. Acceptance between proposal and confirmation permits cancellation only when the same pending record proves the exact acknowledged task/run pair is still active.
-- A dispatch is reported active only after a matching accepted acknowledgment with a run ID; rejected or ambiguous outcomes do not become “started.” A confirmed stop while dispatch is pending waits for that dispatch's outcome, cancels only its accepted task, and sends no cancellation on rejection. A confirmation just after acceptance cancels that same accepted run once; an unverifiable or terminal outcome does not target other active work. An active-task cancel names only the bound run, and a barge-in stops speech/foreground output without signalling that run.
-
-Each guard needs an independently failing mutation and a bounded, content-free refusal marker under `AGENTS.md`. The exact supported UI and acceptable added interaction latency require owner review. Owner acceptance would settle the policy; implementation still requires a separately scoped work item and authorization. It would not itself change #159 acceptance or #204's M4 qualification.
+Confirmation on every start avoids autonomous work effects but adds delegation
+friction. Explicit commands remain a fallback, not the requested interaction.
+Model cancellation recreates the demonstrated neutral-turn risk and is excluded.
+A second intent model or imperative-word allowlist adds machinery without proving
+intent. Hermes remains the sole background executor.
