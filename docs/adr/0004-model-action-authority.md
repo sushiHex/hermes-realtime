@@ -51,6 +51,8 @@ authority is bound, Ollama instead requests one schema-constrained completion:
 either `{"kind":"reply","text":"..."}` or
 `{"kind":"start_work","objective":"..."}`. Both shapes have exact required
 keys and bounded strings; they cannot combine speech with a start request.
+The schema is supplied through Ollama's documented
+[`format` parameter](https://docs.ollama.com/capabilities/structured-outputs).
 Only an admitted user turn is offered the start branch. Other bound turns have
 the reply shape only; tool-less readiness retains its ordinary speech response.
 
