@@ -920,8 +920,9 @@ class BrowserSessionDirector:
         finally:
             if acquired:
                 self._start_lock.release()
-            print("[browser-start-lock] " + json.dumps(
-                {"version": 1, "category": category}, separators=(",", ":")), flush=True)
+            else:
+                print("[browser-start-lock] " + json.dumps(
+                    {"version": 1, "category": category}, separators=(",", ":")), flush=True)
 
     async def start(
         self, *, expected_local_selection: object = None,

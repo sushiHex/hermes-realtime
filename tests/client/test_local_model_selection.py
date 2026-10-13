@@ -438,7 +438,7 @@ async def test_bootstrap_cannot_accept_an_impostor_capability(capsys):
 
 
 @pytest.mark.asyncio
-async def test_start_lock_is_released_even_when_its_marker_writer_fails(monkeypatch):
+async def test_successful_start_does_not_call_the_refusal_marker_writer(monkeypatch):
     import hermes_realtime.client.session as module
 
     _, director, _, _, _ = make_application()
@@ -447,8 +447,27 @@ async def test_start_lock_is_released_even_when_its_marker_writer_fails(monkeypa
         raise OSError("synthetic marker write refusal")
 
     monkeypatch.setattr(module, "print", fail, raising=False)
-    with pytest.raises(OSError, match="marker"):
-        await director.start()
+    await director.start()
+    assert not director._start_lock.locked()
+    assert director.active_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_start_lock_keeps_foreign_ownership_if_its_refusal_writer_fails(monkeypatch):
+    import hermes_realtime.client.session as module
+
+    _, director, _, issued, provisioned = make_application()
+    director._rollback_timeout = 0.01
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic marker write refusal")
+
+    monkeypatch.setattr(module, "print", fail, raising=False)
+    async with director._start_lock:
+        with pytest.raises(OSError, match="marker"):
+            await director.start()
+        assert director._start_lock.locked()
+    assert issued == provisioned == []
     assert not director._start_lock.locked()
 
 
