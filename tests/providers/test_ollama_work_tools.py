@@ -12,7 +12,11 @@ from urllib.request import Request
 import pytest
 
 import hermes_realtime.providers.ollama as ollama
-from hermes_realtime.conversation.context import ConversationContextSnapshot, ConversationMessage
+from hermes_realtime.conversation.context import (
+    ActiveTaskSummary,
+    ConversationContextSnapshot,
+    ConversationMessage,
+)
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
@@ -101,6 +105,37 @@ def adapter(lines: list[dict[str, object]], **options: object
 async def collect(inference: ollama.OllamaStreamingInference,
                   snapshot: ConversationContextSnapshot | None = None) -> list[str]:
     return [part async for part in inference.stream(snapshot or request(), turn_id="turn_test")]
+
+
+@pytest.mark.asyncio
+async def test_ollama_request_carries_lifecycle_framing_without_granting_authority() -> None:
+    """Witness policy propagation, not semantic obedience by a real model."""
+    inference, handler, sent, _response = adapter([
+        decision_frame({"kind": "reply", "text": "Use the task's Cancel control."}),
+    ])
+    snapshot = ConversationInferenceRequest(
+        revision=1,
+        messages=(ConversationMessage("user", "Please stop the background research task."),),
+        active_tasks=(ActiveTaskSummary("task_unrelated", "Unrelated background research"),),
+    )
+    try:
+        assert await collect(inference, snapshot) == ["Use the task's Cancel control."]
+    finally:
+        await inference.close()
+    instructions = sent[0]["messages"][0]["content"]
+    framing = instructions.split("from a style or reference text. ", 1)[1].split(
+        "\n\nResponse presentation:\n", 1,
+    )[0]
+    assert framing == (
+        "Task cancellation is controlled only by explicit user commands or trusted task controls. "
+        "Never cancel tasks or grant approvals yourself. For a request to stop background work, "
+        "direct the user to the task's Cancel control. Do not claim work stopped, was cancelled, "
+        "was approved, or completed merely because the user requested it; report lifecycle "
+        "changes only from trusted acknowledged task state."
+    )
+    assert handler.calls == []
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema()]}
+    assert "tools" not in sent[0]
 
 
 @pytest.mark.asyncio

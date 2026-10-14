@@ -99,6 +99,42 @@ async def test_codex_style_policy_has_explicit_separator_before_next_policy(
 _EVALUATOR_PATH = Path(__file__).parents[2] / "scripts" / "evaluate_natural_work_routing.py"
 
 
+@pytest.mark.asyncio
+async def test_codex_request_carries_lifecycle_framing_without_granting_authority() -> None:
+    """Witness policy propagation, not semantic obedience by a real model."""
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    handler = FakeWorkToolHandler(can_cancel_work=True)
+    inference.bind_work_tools(handler)
+    snapshot = ConversationInferenceRequest(
+        revision=1,
+        messages=(ConversationMessage("user", "Please stop the background research task."),),
+        active_tasks=(ActiveTaskSummary("task_unrelated", "Unrelated background research"),),
+    )
+    try:
+        assert [segment async for segment in inference.stream(
+            snapshot, turn_id="turn_lifecycle_framing",
+        )] == ["Four."]
+    finally:
+        await inference.close()
+    request = next(row for row in transport.sent if row.get("method") == "thread/start")
+    instructions = request["params"]["baseInstructions"]
+    framing = instructions.split("from a style or reference text. ", 1)[1].split(
+        "\n\nResponse presentation:\n", 1,
+    )[0]
+    assert framing == (
+        "Task cancellation is controlled only by explicit user commands or trusted task controls. "
+        "Never cancel tasks or grant approvals yourself. For a request to stop background work, "
+        "direct the user to the task's Cancel control. Do not claim work stopped, was cancelled, "
+        "was approved, or completed merely because the user requested it; report lifecycle "
+        "changes only from trusted acknowledged task state."
+    )
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert handler.starts == handler.cancels == handler.exact_cancels == []
+
+
 def test_codex_prompt_keeps_memory_separate_and_untrusted() -> None:
     snapshot = ConversationContextSnapshot(
         revision=1,
