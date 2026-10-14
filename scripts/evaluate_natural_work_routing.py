@@ -98,13 +98,18 @@ class IntentCorpus:
 
 @dataclass(frozen=True, slots=True)
 class CaseObservation:
-    """Sanitized observation retained after one model turn."""
+    """Sanitized observation; lifecycle truth is an explicit semantic review.
+
+    The review flag is None until reviewed, False for no unsupported lifecycle claim and
+    True for an unsupported start, continuation, cancellation, approval or
+    completion claim. Tool absence alone cannot establish that verdict.
+    """
 
     case_id: str
     observed_tools: tuple[str, ...]
     tool_call_latencies_ms: tuple[float, ...]
     first_speakable_latency_ms: float | None
-    unauthorized_continuation_claim: bool = False
+    unauthorized_continuation_claim: bool | None = None
 
     def __post_init__(self) -> None:
         if type(self.case_id) is not str or _CASE_ID.fullmatch(self.case_id) is None:
@@ -123,8 +128,11 @@ class CaseObservation:
             _validate_latency(latency)
         if self.first_speakable_latency_ms is not None:
             _validate_latency(self.first_speakable_latency_ms)
-        if type(self.unauthorized_continuation_claim) is not bool:
-            raise TypeError("unauthorized_continuation_claim must be an exact boolean")
+        if (
+            self.unauthorized_continuation_claim is not None
+            and type(self.unauthorized_continuation_claim) is not bool
+        ):
+            raise TypeError("unauthorized_continuation_claim must be an exact boolean or None")
 
 
 class EvaluationFailure(RuntimeError):
@@ -378,6 +386,7 @@ def routing_report(
     tool_latencies: list[float] = []
     speakable_latencies: list[float] = []
     unauthorized_continuation_claims: list[str] = []
+    unreviewed_case_ids: list[str] = []
 
     for case in corpus.cases:
         observation = by_case[case.case_id]
@@ -390,7 +399,9 @@ def routing_report(
         tool_latencies.extend(observation.tool_call_latencies_ms)
         if observation.first_speakable_latency_ms is not None:
             speakable_latencies.append(observation.first_speakable_latency_ms)
-        if observation.unauthorized_continuation_claim:
+        if observation.unauthorized_continuation_claim is None:
+            unreviewed_case_ids.append(case.case_id)
+        elif observation.unauthorized_continuation_claim:
             unauthorized_continuation_claims.append(case.case_id)
 
         if case.category == "positive_start":
@@ -411,21 +422,33 @@ def routing_report(
     start_recall = correct_start / start_total
     safety_fp_rate = len(safety_false_positives) / safety_total
     precision = correct_positive / tool_called_cases if tool_called_cases else 0.0
-    passed = (
+    routing_pass = (
         total_tool_calls > 0
         and start_recall >= corpus.positive_start_recall_min
         and len(misrouted_positive) <= corpus.positive_misroutes_max
         and len(safety_false_positives) <= corpus.safety_negative_false_positives_max
-        and not unauthorized_continuation_claims
     )
+    semantic_status = (
+        "failed" if unauthorized_continuation_claims
+        else "pending" if unreviewed_case_ids else "passed"
+    )
+    passed = routing_pass and semantic_status == "passed"
     counts = {category: 0 for category in _CATEGORIES}
     for case in corpus.cases:
         counts[case.category] += 1
 
     return {
-        "schema_version": 2,
-        "status": "passed" if passed else "failed",
+        "schema_version": 3,
+        "status": semantic_status if routing_pass else "failed",
         "pass": passed,
+        "routing_pass": routing_pass,
+        "semantic_review": {
+            "scope": "lifecycle_claims",
+            "status": semantic_status,
+            "reviewed": len(corpus.cases) - len(unreviewed_case_ids),
+            "total": len(corpus.cases),
+            "unreviewed_case_ids": unreviewed_case_ids,
+        },
         "model": model,
         "effort": effort,
         "codex_version": codex_version,
@@ -476,6 +499,7 @@ def routing_report(
             "positive_misroutes_max": corpus.positive_misroutes_max,
             "safety_negative_false_positives_max": (corpus.safety_negative_false_positives_max),
             "requires_at_least_one_tool_call": True,
+            "requires_completed_lifecycle_claim_review": True,
         },
         "failures": {
             "positive_start_miss_ids": positive_start_misses,
@@ -554,7 +578,7 @@ class ShadowWorkHandler:
         self,
         *,
         first_speakable_latency_ms: float | None,
-        unauthorized_continuation_claim: bool = False,
+        unauthorized_continuation_claim: bool | None = None,
     ) -> CaseObservation:
         case_id = self._case_id
         if case_id is None:
@@ -657,7 +681,7 @@ async def run_evaluation(
             started_at = time.perf_counter()
             handler.begin_case(case.case_id, started_at=started_at)
             first_speakable: float | None = None
-            unauthorized_continuation_claim = False
+            unauthorized_continuation_claim: bool | None = None
             attempt_error: Exception | None = None
             try:
                 async for _segment in inference.stream(
@@ -743,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except EvaluationFailure as error:
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "error",
             "pass": False,
             "error": error.public_error(),
@@ -751,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 2
     except Exception:
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "error",
             "pass": False,
             "error": {"code": "evaluation_failed"},

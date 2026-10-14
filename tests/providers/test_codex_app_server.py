@@ -511,6 +511,110 @@ def test_natural_work_evaluator_fails_unauthorized_continuation_claim() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("verdict", "status", "qualified", "reviewed", "unreviewed"),
+    [(None, "pending", False, 99, ["nw-021"]),
+     (True, "failed", False, 100, []), (False, "passed", True, 100, [])],
+)
+def test_natural_work_evaluator_separates_cancellation_truth_from_zero_effects(
+    verdict, status, qualified, reviewed, unreviewed,
+) -> None:
+    corpus = load_corpus(_NATURAL_WORK_CORPUS)
+    observations = [
+        CaseObservation(
+            case_id=case.case_id,
+            observed_tools=(case.expected_tool,) if case.expected_tool is not None else (),
+            tool_call_latencies_ms=(1.0,) if case.expected_tool is not None else (),
+            first_speakable_latency_ms=2.0,
+            unauthorized_continuation_claim=verdict if case.case_id == "nw-021" else False,
+        )
+        for case in corpus.cases
+    ]
+    assert observations[20].observed_tools == ()
+    report = routing_report(
+        corpus=corpus, observations=observations, model="model_test", effort="low",
+        codex_version="0.0.0-test",
+    )
+    assert report["schema_version"] == 3
+    assert report["routing_pass"] is True
+    assert report["pass"] is qualified
+    assert report["status"] == status
+    assert report["semantic_review"] == {
+        "scope": "lifecycle_claims", "status": status, "reviewed": reviewed, "total": 100,
+        "unreviewed_case_ids": unreviewed,
+    }
+    assert report["metrics"]["safety_negative"]["false_positives"] == 0
+    assert report["acceptance"]["requires_completed_lifecycle_claim_review"] is True
+    assert report["metrics"]["unauthorized_continuation_claims"] == {
+        "count": int(verdict is True), "case_ids": ["nw-021"] if verdict is True else [],
+    }
+
+
+def test_natural_work_observation_defaults_to_unreviewed_truth() -> None:
+    observation = CaseObservation(
+        case_id="nw-021", observed_tools=(), tool_call_latencies_ms=(),
+        first_speakable_latency_ms=1.0,
+    )
+    assert observation.unauthorized_continuation_claim is None
+
+
+@pytest.mark.parametrize("value", [0, 1, "false"])
+def test_natural_work_observation_requires_exact_review_verdict(value) -> None:
+    with pytest.raises(TypeError, match="exact boolean or None"):
+        CaseObservation(
+            case_id="nw-021", observed_tools=(), tool_call_latencies_ms=(),
+            first_speakable_latency_ms=1.0, unauthorized_continuation_claim=value,
+        )
+
+
+@pytest.mark.asyncio
+async def test_natural_work_runner_does_not_invent_semantic_review(monkeypatch) -> None:
+    corpus = load_corpus(_NATURAL_WORK_CORPUS)
+    instances = []
+
+    class FakeInference:
+        def __init__(self, **kwargs):
+            self.case = corpus.cases[len(instances)]
+            self.handler = None
+            instances.append(self)
+
+        def bind_work_tools(self, handler):
+            self.handler = handler
+
+        async def stream(self, snapshot, *, turn_id):
+            if self.case.expected_tool == "start_work":
+                await self.handler.start_work(
+                    objective="Synthetic work", invocation_id="tool_" + "a" * 32,
+                )
+            yield "Synthetic reply."
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(_EVALUATOR, "_resolve_codex_executable", lambda value: "synthetic")
+    monkeypatch.setattr(_EVALUATOR, "_codex_version", lambda value: "0.0.0-test")
+    monkeypatch.setattr(_EVALUATOR, "CodexAppServerStreamingInference", FakeInference)
+    report = await _EVALUATOR.run_evaluation(
+        corpus=corpus, model="model_test", effort="low", codex_executable=None,
+    )
+    assert len(instances) == 100
+    assert report["routing_pass"] is True
+    assert report["pass"] is False
+    assert report["status"] == "pending"
+    assert report["semantic_review"] == {
+        "scope": "lifecycle_claims", "status": "pending", "reviewed": 0, "total": 100,
+        "unreviewed_case_ids": [case.case_id for case in corpus.cases],
+    }
+    assert "Synthetic reply." not in json.dumps(report)
+
+
+def test_natural_work_shadow_handler_does_not_default_to_reviewed_truth() -> None:
+    handler = _EVALUATOR.ShadowWorkHandler(can_cancel_work=True)
+    handler.begin_case("nw-021", started_at=time.perf_counter())
+    observation = handler.finish_case(first_speakable_latency_ms=1.0)
+    assert observation.unauthorized_continuation_claim is None
+
+
 def test_natural_work_evaluator_never_calls_tools_fails() -> None:
     corpus = load_corpus(_NATURAL_WORK_CORPUS)
     observations = [

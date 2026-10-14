@@ -101,6 +101,21 @@ the actual workspace and discoverability contract before interpreting those case
 as qualification evidence; do not compensate for a missing premise by relabeling
 cases or changing thresholds after observing results.
 
+Routing and effect safety do not establish grounded lifecycle claims. The existing
+development cancellation case also requires manual review that the reply makes
+no unsupported start, cancellation, approval, continuation or completion claim;
+zero effects cannot make a false completion claim pass. Apply the same truthfulness
+requirement to qualification responses without a keyword classifier. An absent
+review remains pending. Evaluator report schema 3 separates `routing_pass` from
+combined `pass`, and records semantic review with scope `lifecycle_claims` as
+pending, failed or passed with counts and case IDs. Its existing claim flag is
+`None` until reviewed, `False` only for a reviewed absence of unsupported lifecycle
+claims, and `True` for an unsupported lifecycle claim. The automatic runner supplies
+no semantic verdict. This combined pass covers routing and lifecycle claims only;
+objective fidelity, clarification quality, real backend and voice acceptance still
+require their separate qualification evidence. Corpus schema 2, utterances, labels
+and routing thresholds remain unchanged.
+
 - Real-model positive requests for research, current information and tool use
   delegate with the intended objective; ordinary conversation and explanations
   remain direct. Include negation, quotation, neutral turns and instruction-shaped
