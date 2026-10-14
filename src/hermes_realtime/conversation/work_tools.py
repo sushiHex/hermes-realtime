@@ -18,6 +18,15 @@ from .context import (
 )
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 
+WORK_OBJECTIVE_CONTEXT_POLICY = (
+    "Background work receives the objective, not this conversation. Make the objective "
+    "self-contained: carry over the target, material baseline and constraints from available "
+    "context, or identify a concrete resource Hermes can access to discover them. Do not "
+    "assume a workspace, account or baseline merely because the user refers to one. If a "
+    "required detail is neither supplied nor discoverable from an identified resource, ask "
+    "one clarifying question instead of starting work."
+)
+
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")

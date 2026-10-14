@@ -27,7 +27,7 @@ from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
-from hermes_realtime.conversation.work_tools import WorkStartResult
+from hermes_realtime.conversation.work_tools import WORK_OBJECTIVE_CONTEXT_POLICY, WorkStartResult
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.current_facts import (
@@ -1157,6 +1157,8 @@ class CodexAppServerStreamingInference:
                     "or task controls. "
                     "Never cancel tasks or grant approvals yourself. "
                 )
+                if tool_handler is not None:
+                    work_policy += WORK_OBJECTIVE_CONTEXT_POLICY + " "
                 base_instructions = (
                     "Be a curious informal voice assistant. Match energy; mark hunches. "
                     + representative_policy

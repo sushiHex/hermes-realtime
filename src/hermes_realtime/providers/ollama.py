@@ -19,7 +19,7 @@ import aiohttp
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
-from hermes_realtime.conversation.work_tools import WorkStartResult
+from hermes_realtime.conversation.work_tools import WORK_OBJECTIVE_CONTEXT_POLICY, WorkStartResult
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.ollama_models import (
@@ -384,6 +384,7 @@ class OllamaStreamingInference:
                 messages[0]["content"] = messages[0]["content"].replace(
                     "\n\nReference data:\n",
                     _WORK_REPLY_POLICY + (_WORK_POLICY if can_start else "")
+                    + " " + WORK_OBJECTIVE_CONTEXT_POLICY
                     + " Response schema: " + json.dumps(body["format"], separators=(",", ":"))
                     + "\n\nReference data:\n", 1,
                 )

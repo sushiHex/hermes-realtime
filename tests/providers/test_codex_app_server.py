@@ -18,6 +18,7 @@ from hermes_realtime import __version__
 from hermes_realtime.conversation.context import (
     ActiveTaskSummary,
     ConversationContextSnapshot,
+    ConversationContextStore,
     ConversationMessage,
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
@@ -44,6 +45,20 @@ from hermes_realtime.providers.codex_app_server import (
     _subscription_environment,
 )
 from hermes_realtime.providers.current_facts import CurrentFactEvidence, CurrentFactSource
+from hermes_realtime.speech import Transcript
+
+_OBJECTIVE_CONTEXT_CONTRACT = (
+    "Background work receives the objective, not this conversation. Make the objective "
+    "self-contained: carry over the target, material baseline and constraints from available "
+    "context, or identify a concrete resource Hermes can access to discover them. Do not "
+    "assume a workspace, account or baseline merely because the user refers to one. If a "
+    "required detail is neither supplied nor discoverable from an identified resource, ask "
+    "one clarifying question instead of starting work."
+)
+_CONTEXT_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "natural_work_context_contract_cases.json")
+    .read_text(encoding="utf-8")
+)["cases"]
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
@@ -132,6 +147,59 @@ async def test_codex_request_carries_lifecycle_framing_without_granting_authorit
         "changes only from trusted acknowledged task state."
     )
     assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert handler.starts == handler.cancels == handler.exact_cancels == []
+
+
+@pytest.mark.asyncio
+async def test_codex_outbound_work_request_carries_objective_context_contract() -> None:
+    """Actual request witness; model obedience requires separate qualification."""
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    try:
+        assert await _collect_stream(inference, "turn_context_contract") == ["Four."]
+    finally:
+        await inference.close()
+    request = next(row for row in transport.sent if row.get("method") == "thread/start")
+    assert request["params"]["baseInstructions"].count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert handler.starts == handler.cancels == handler.exact_cancels == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _CONTEXT_CASES, ids=lambda case: case["id"])
+async def test_codex_outbound_work_request_retains_actual_user_context(case) -> None:
+    store = ConversationContextStore()
+    for text in [*case["prior_user_turns"], case["utterance"]]:
+        store.record_user_transcript(Transcript(text=text, final=True))
+    source = store.snapshot()
+    snapshot = ConversationInferenceRequest(
+        revision=source.revision,
+        messages=source.messages,
+        active_tasks=source.active_tasks,
+        memory=source.memory,
+    )
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    try:
+        assert [segment async for segment in inference.stream(
+            snapshot, turn_id="turn_retained_context",
+        )] == ["Four."]
+    finally:
+        await inference.close()
+    request = next(row for row in transport.sent if row.get("method") == "turn/start")
+    payload = json.loads(request["params"]["input"][0]["text"].splitlines()[-1])
+    assert payload["messages"] == [
+        {"role": "user", "text": text}
+        for text in [*case["prior_user_turns"], case["utterance"]]
+    ]
     assert handler.starts == handler.cancels == handler.exact_cancels == []
 
 
@@ -2973,6 +3041,7 @@ async def test_codex_dispatches_generalized_search_without_background_work_tools
     ] == ["search_knowledge"]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Call search_knowledge at most once per turn" in instructions
+    assert _OBJECTIVE_CONTEXT_CONTRACT not in instructions
     assert "Never infer an exact fact that the returned text does not establish" in instructions
     response = next(item for item in transport.sent if item.get("id") == 91)
     result = response["result"]
@@ -3403,6 +3472,9 @@ async def test_codex_preflight_and_rejected_local_call_keep_binding_open() -> No
     with pytest.raises(ValueError, match="turn_id"):
         await _collect_stream(inference, "")
     assert await _collect_stream(inference, "turn_preflight") == ["Four."]
+
+    request = next(row for row in transport.sent if row.get("method") == "thread/start")
+    assert _OBJECTIVE_CONTEXT_CONTRACT not in request["params"]["baseInstructions"]
 
     inference.bind_work_tools(FakeWorkToolHandler())
     await inference.close()

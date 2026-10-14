@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import cast
 from urllib.request import Request
 
@@ -15,14 +16,29 @@ import hermes_realtime.providers.ollama as ollama
 from hermes_realtime.conversation.context import (
     ActiveTaskSummary,
     ConversationContextSnapshot,
+    ConversationContextStore,
     ConversationMessage,
 )
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
+from hermes_realtime.speech import Transcript
 from tests.support.ollama_metadata import supported_ollama_metadata
 
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
+
+_OBJECTIVE_CONTEXT_CONTRACT = (
+    "Background work receives the objective, not this conversation. Make the objective "
+    "self-contained: carry over the target, material baseline and constraints from available "
+    "context, or identify a concrete resource Hermes can access to discover them. Do not "
+    "assume a workspace, account or baseline merely because the user refers to one. If a "
+    "required detail is neither supplied nor discoverable from an identified resource, ask "
+    "one clarifying question instead of starting work."
+)
+_CONTEXT_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "natural_work_context_contract_cases.json")
+    .read_text(encoding="utf-8")
+)["cases"]
 
 
 class Response:
@@ -136,6 +152,49 @@ async def test_ollama_request_carries_lifecycle_framing_without_granting_authori
     assert handler.calls == []
     assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema()]}
     assert "tools" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_ollama_outbound_work_request_carries_objective_context_contract() -> None:
+    """Actual request witness; model obedience requires separate qualification."""
+    inference, handler, sent, _ = adapter([
+        decision_frame({"kind": "reply", "text": "Which baseline should I use?"}),
+    ])
+    try:
+        assert await collect(inference) == ["Which baseline should I use?"]
+    finally:
+        await inference.close()
+    instructions = sent[0]["messages"][0]["content"]
+    assert instructions.count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
+    assert handler.calls == []
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema()]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", _CONTEXT_CASES, ids=lambda case: case["id"])
+async def test_ollama_outbound_work_request_retains_actual_user_context(case) -> None:
+    store = ConversationContextStore()
+    for text in [*case["prior_user_turns"], case["utterance"]]:
+        store.record_user_transcript(Transcript(text=text, final=True))
+    source = store.snapshot()
+    snapshot = ConversationInferenceRequest(
+        revision=source.revision,
+        messages=source.messages,
+        active_tasks=source.active_tasks,
+        memory=source.memory,
+    )
+    inference, handler, sent, _ = adapter([
+        decision_frame({"kind": "reply", "text": "Synthetic answer."}),
+    ])
+    try:
+        assert await collect(inference, snapshot) == ["Synthetic answer."]
+    finally:
+        await inference.close()
+    assert sent[0]["messages"][1:] == [
+        {"role": "user", "content": text}
+        for text in [*case["prior_user_turns"], case["utterance"]]
+    ]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -717,6 +776,7 @@ async def test_preflight_is_tool_less_until_handler_is_bound(capsys) -> None:
     ]
     assert "tools" not in sent[0]
     inference.bind_work_tools(Handler())
+    assert _OBJECTIVE_CONTEXT_CONTRACT not in sent[0]["messages"][0]["content"]
     with pytest.raises(RuntimeError, match="before the first inference"):
         await inference.configure_context(4096)
     assert not any(line.startswith("[ollama-work] ")

@@ -37,6 +37,17 @@ identity, capacity, binding, replay and acknowledgment checks. A request is not
 active work until Hermes accepts it with a validated run ID. The model cannot
 choose private run handles or bypass Hermes's downstream execution policy.
 
+The handoff carries the bounded objective, not the foreground conversation.
+Make that objective self-contained: preserve the target, material baseline and
+constraints already supplied in context, or identify a concrete resource Hermes
+can access to discover them. A reference to "our" workspace or version does not
+establish either a binding or access. When a required detail is neither supplied
+nor discoverable through an identified resource, ask one clarifying question
+instead of starting work. Both providers receive this same instruction when work
+is available; tool-less readiness does not. This documents the existing handoff,
+not a new semantic validator or a guarantee of model obedience. It does not
+forward history or change explicit-command admission.
+
 The model has no cancellation or approval tool. Explicit admitted user commands
 and trusted task-specific controls retain cancellation and their exact-target
 and ambiguity checks. Model text is never routed back as a user command.
@@ -100,6 +111,16 @@ and test-suite requests that assume an available workspace. Establish and freeze
 the actual workspace and discoverability contract before interpreting those cases
 as qualification evidence; do not compensate for a missing premise by relabeling
 cases or changing thresholds after observing results.
+
+Qualify supplied, discoverable and missing inputs separately. Use ordinary prior
+user turns to supply context, and verify the configured backend's actual access
+before admitting a discovery case. A locator must survive in the delegated
+objective because conversation history is not forwarded. Request/history and
+objective-equality tests establish transport behavior; real-model review must
+still establish faithful objectives and appropriate clarification. Keep these
+new cases separate from the original development fixture and holdout, preserving
+their earlier results. Repeated observations remain finite evidence, not proof
+that an ambiguous request can never be misrouted.
 
 Routing and effect safety do not establish grounded lifecycle claims. The existing
 development cancellation case also requires manual review that the reply makes
