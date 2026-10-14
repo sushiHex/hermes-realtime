@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import secrets
 import shutil
@@ -34,6 +35,79 @@ from scripts.windows_storage_oracle import (
     audit_purge_deletions,
     audit_storage_release,
 )
+
+_WORKER_STAGES = dict(zip(
+    b"BICOSFDRPUEZ",
+    (
+        "bootstrap", "imports_ready", "configuration_ready", "opening_storage",
+        "seeding", "exercising_fault", "inspecting_storage", "scanning",
+        "prepared", "purging", "finishing", "complete",
+    ), strict=True,
+))
+_PARENT_STAGES = {
+    "launch", "first_observation", "preparation_audit", "final_observation",
+    "release_audit", "process_exit", "validation",
+}
+
+
+def _read_worker_stages(fd: int) -> tuple[int, str]:
+    """Sample a fixed one-way diagnostic sequence without waiting for EOF."""
+    try:
+        import _winapi
+        import msvcrt
+
+        peek = _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd), 1)
+        available = peek[1]
+        raw = os.read(fd, min(available, 13)) if available else b""
+        if len(raw) > 12 or any(code not in _WORKER_STAGES for code in raw):
+            return len(raw), "invalid"
+        return len(raw), _WORKER_STAGES[raw[-1]] if raw else "unavailable"
+    except Exception:
+        return 0, "unavailable"
+
+
+@contextmanager
+def _storage_refusal_evidence(
+    fd: int | None, action: str, point: str,
+) -> Iterator[dict[str, str]]:
+    started = time.monotonic()
+    stage = {"parent_stage": "launch"}
+    failure: BaseException | None = None
+    try:
+        yield stage
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if failure is not None:
+            # This channel is diagnostic only. Missing evidence cannot replace
+            # the original refusal, and worker bytes never authorize a result.
+            try:
+                count, worker_stage = (
+                    _read_worker_stages(fd) if fd is not None else (0, "unavailable")
+                )
+                evidence = {
+                    "version": 1,
+                    "action": action if action in {
+                        "crash", "recover", "purge", "repeat_purge", "synthetic",
+                    } else "unknown",
+                    "case": point if point in CASES_V1 else "unknown",
+                    "failure": "timeout" if isinstance(failure, TimeoutError) else "value"
+                    if isinstance(failure, ValueError) else "os"
+                    if isinstance(failure, OSError) else "other",
+                    "parent_stage": stage["parent_stage"]
+                    if stage["parent_stage"] in _PARENT_STAGES else "unknown",
+                    "worker_stage": worker_stage,
+                    "stage_count": count,
+                    "elapsed_ms": int(min(60_000, max(0, (time.monotonic() - started) * 1000))),
+                }
+                print(
+                    "[storage-worker]"
+                    + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                    flush=True,
+                )
+            except Exception:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,19 +288,30 @@ def _run_storage_worker(
         with ExitStack() as pipes:
             request_read, request_write = os.pipe()
             response_read, response_write = os.pipe()
+            phase_pipe = os.pipe() if synthetic else None
+            descriptors: tuple[int, ...] = (
+                request_read, request_write, response_read, response_write,
+            )
+            readers = {request_read, response_read}
+            if phase_pipe is not None:
+                descriptors += phase_pipe
+                readers.add(phase_pipe[0])
             endpoints = {
                 fd: pipes.enter_context(
                     os.fdopen(
-                        fd, "rb" if fd in {request_read, response_read} else "wb", buffering=0
+                        fd, "rb" if fd in readers else "wb", buffering=0
                     )
                 )
-                for fd in (request_read, request_write, response_read, response_write)
+                for fd in descriptors
             }
             import msvcrt
 
-            for fd in (request_read, response_write):
+            inherited: tuple[int, ...] = (request_read, response_write)
+            if phase_pipe is not None:
+                inherited += (phase_pipe[1],)
+            for fd in inherited:
                 os.set_inheritable(fd, True)
-            handles = tuple(msvcrt.get_osfhandle(fd) for fd in (request_read, response_write))
+            handles = tuple(msvcrt.get_osfhandle(fd) for fd in inherited)
             module = (
                 "scripts.synthetic_fault_worker"
                 if synthetic
@@ -236,8 +321,21 @@ def _run_storage_worker(
             )
             bootstrap = (
                 "import sys,runpy;sys.path[:0]=[sys.argv.pop(1),sys.argv.pop(1)];"
-                f"runpy.run_module('{module}',run_name='__main__')"
             )
+            if synthetic:
+                # Twelve fixed diagnostic bytes cannot fill this pipe. There is
+                # no acknowledgment, wait, or diagnostic-to-result authority.
+                bootstrap += (
+                    "import os,msvcrt;phase_handle=sys.argv.pop();\n"
+                    "try:\n"
+                    " sys._storage_phase_fd=msvcrt.open_osfhandle("
+                    "int(phase_handle),os.O_WRONLY|os.O_BINARY)\n"
+                    " os.set_inheritable(sys._storage_phase_fd,False)\n"
+                    " os.write(sys._storage_phase_fd,b'B')\n"
+                    "except Exception:\n"
+                    " pass\n"
+                )
+            bootstrap += f"runpy.run_module('{module}',run_name='__main__')"
             command = (
                 str(python),
                 "-I",
@@ -277,9 +375,14 @@ def _run_storage_worker(
                 ),
             )
             job = core._WindowsScenarioJobV1(kernel, spec, runner, rules)
+            stage = pipes.enter_context(_storage_refusal_evidence(
+                phase_pipe[0] if phase_pipe is not None else None, action, point,
+            ))
             root = job.launch_root()
             endpoints[request_read].close()
             endpoints[response_write].close()
+            if phase_pipe is not None:
+                endpoints[phase_pipe[1]].close()
             nonce = secrets.token_hex(32)
 
             def execute() -> tuple[Any, int, bool]:
@@ -330,14 +433,17 @@ def _run_storage_worker(
                         )
                     return observation
 
+                stage["parent_stage"] = "first_observation"
                 observation = receive()
                 if normal:
                     _require(observation == {"phase": "prepared"}, "purge preparation differs")
+                    stage["parent_stage"] = "preparation_audit"
                     with audit_purge_deletions(
                         case_root / "evidence",
                         present=action != "repeat_purge",
                     ):
                         _write_frame(request_write, {"version": 1, "nonce": nonce, "sequence": 0})
+                        stage["parent_stage"] = "final_observation"
                         observation = receive()
                 drain_released = action == "crash" and point == "after_drain_ack_before_exit"
                 if drain_released:
@@ -346,6 +452,7 @@ def _run_storage_worker(
                         root.process_handle,
                     )
                 if normal:
+                    stage["parent_stage"] = "release_audit"
                     audit_storage_release(
                         case_root / "evidence",
                         root.process_handle,
@@ -368,6 +475,7 @@ def _run_storage_worker(
                         request_write,
                         {"version": 1, "nonce": nonce, "sequence": 1 if normal else 0},
                     )
+                stage["parent_stage"] = "process_exit"
                 kernel.wait(root.process_handle, 10_000)
                 code = _exit_code(kernel, root.process_handle)
                 _require(code == expected_exit, "storage worker did not reach its prescribed exit")
@@ -386,6 +494,7 @@ def _run_storage_worker(
                 expected_exit,
                 storage_released,
             )
+            stage["parent_stage"] = "validation"
             _validate_invocation(record)
             _require(
                 hashlib.sha256(python.read_bytes()).hexdigest() == python_hash,
