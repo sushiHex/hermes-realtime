@@ -356,24 +356,29 @@ def _qualify(hermes_python: Path) -> None:
         port, token = available_port(), secrets.token_urlsafe(32)
         python = Path(sys.executable)
         _install_plugin(hermes_home)
-        companion: _Companion | None = None
+        # Every companion this run starts is stopped on exit unless it already exited.
+        spawned: list[_Companion] = []
+
+        def spawn(mode: str = "own") -> _Companion:
+            spawned.append(_Companion(hermes_python, hermes_home, port, token, mode))
+            return spawned[-1]
+
         try:
             steps["fill"] = _run(python, realtime, port, token, "fill", str(port))
-            companion = _Companion(hermes_python, hermes_home, port, token)
+            companion = spawn()
             steps["companion_ready"] = companion.ready()
             # Hermes discovers plugins in every process: a second waits without DB access.
-            steps["second_process"] = _Companion(
-                hermes_python, hermes_home, port, token, "contend"
-            ).process.wait(timeout=_STEP_TIMEOUT_SECONDS)
+            steps["second_process"] = spawn("contend").process.wait(
+                timeout=_STEP_TIMEOUT_SECONDS
+            )
             steps["drain"] = _run(python, realtime, port, token, "drain", str(port))
             steps["companion_unloaded"] = companion.stop()
             steps["trailing"] = _run(python, realtime, port, token, "trailing", str(port))
-            companion = _Companion(hermes_python, hermes_home, port, token)
+            companion = spawn()
             steps["companion_ready_again"] = companion.ready()
             before = len(_archived(hermes_home))
             steps["settle"] = _run(python, realtime, port, token, "settle", str(port))
             steps["companion_unloaded_again"] = companion.stop()
-            companion = None
             steps["control"] = _run(python, realtime, port, token, "control", str(port))
             archived = _archived(hermes_home)
             truth = json.loads((realtime / "truth.json").read_text(encoding="utf-8"))
@@ -409,8 +414,18 @@ def _qualify(hermes_python: Path) -> None:
             evidence["passed"] = False
             raise
         finally:
-            if companion is not None:
-                companion.stop()
+            # One failed stop must neither strand later companions nor replace the
+            # qualification's own failure; its category becomes evidence instead.
+            cleanup_failures = []
+            for owned in spawned:
+                if owned.process.poll() is None:
+                    try:
+                        owned.stop()
+                    except Exception as error:
+                        cleanup_failures.append(type(error).__name__)
+            if cleanup_failures:
+                evidence["cleanup_failures"] = cleanup_failures
+                evidence["passed"] = False
             print(_PREFIX + json.dumps(evidence, separators=(",", ":"), sort_keys=True), flush=True)
     if evidence["passed"] is not True:
         raise SystemExit(1)
