@@ -454,3 +454,131 @@ async def test_status_receipt_send_uses_remaining_deadline_and_drains_terminal_t
             [part async for part in inference.stream(_snapshot(), turn_id="turn_after_failure")]
     finally:
         await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [True, False, "terminal"])
+async def test_expired_status_call_cannot_send_or_select_with_immediate_transport(ready):
+    import asyncio
+
+    from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
+
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    transport = ManualDynamicCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    registered = asyncio.Event()
+    original = inference._handle_dynamic_lifecycle
+
+    def expire(method, params, item):
+        original(method, params, item)
+        if method == "item/started":
+            call = inference._dynamic_calls[(params["threadId"], params["turnId"], item["id"])]
+            call.deadline = asyncio.get_running_loop().time() - 1
+            if ready is False:
+                inference._server_turn_ready[params["threadId"]].clear()
+            if ready == "terminal":
+                inference._turn_routing[(params["threadId"], params["turnId"])].terminal = True
+            registered.set()
+
+    inference._handle_dynamic_lifecycle = expire
+    rows = []
+
+    async def collect_turn():
+        async for part in inference.stream(_snapshot(), turn_id="turn_expired"):
+            rows.append(part)
+
+    response = asyncio.create_task(collect_turn())
+    try:
+        await asyncio.wait_for(transport.turn_started.get(), 1)
+        await transport.start_item(tool="task_status", arguments={})
+        await asyncio.wait_for(registered.wait(), 1)
+        await transport.request_tool(request_id=91, tool="task_status", arguments={})
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(response, 0.3)
+        assert rows == []
+        assert transport.tool_responses.empty()
+    finally:
+        await inference.close()
+        await asyncio.gather(response, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching", [True, False])
+async def test_terminal_during_status_interrupt_quiesce_is_rechecked(matching):
+    import asyncio
+
+    from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
+
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    class ObservedTransport(ManualDynamicCodexTransport):
+        def __init__(self):
+            super().__init__()
+            self.terminal_observed = asyncio.Event()
+
+        async def receive(self):
+            message = await super().receive()
+            if message.get("method") == "turn/completed":
+                self.terminal_observed.set()
+            return message
+
+        async def send(self, message):
+            if message.get("method") == "turn/interrupt":
+                routing = inference._turn_routing[(self.thread_id, self.turn_id)]
+                if routing.terminal:
+                    raise RuntimeError("synthetic peer turn already ended")
+            await super().send(message)
+
+    transport = ObservedTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    quiescing = asyncio.Event()
+    release = asyncio.Event()
+    original = inference._quiesce_dynamic_turn
+
+    async def hold_interrupt(active):
+        if active.cancelled:
+            quiescing.set()
+            await release.wait()
+        await original(active)
+
+    inference._quiesce_dynamic_turn = hold_interrupt
+
+    async def collect_turn():
+        return [part async for part in inference.stream(_snapshot(), turn_id="turn_terminal_race")]
+
+    response = asyncio.create_task(collect_turn())
+    try:
+        async with asyncio.timeout(1):
+            await transport.turn_started.get()
+            await transport.start_item(tool="task_status", arguments={})
+            await transport.request_tool(request_id=91, tool="task_status", arguments={})
+            await quiescing.wait()
+            await transport.incoming.put(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": transport.thread_id,
+                        "turn": {
+                            "id": transport.turn_id if matching else "turn_unrelated",
+                            "status": "completed",
+                        },
+                    },
+                }
+            )
+            await transport.terminal_observed.wait()
+            release.set()
+            assert await response == [HostSpeechRequest()]
+            assert (
+                any(row.get("method") == "turn/interrupt" for row in transport.sent) is not matching
+            )
+    finally:
+        release.set()
+        await inference.close()
+        await asyncio.gather(response, return_exceptions=True)

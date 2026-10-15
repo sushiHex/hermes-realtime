@@ -496,3 +496,53 @@ async def test_loop_rejects_projection_subclass_with_model_text():
     with pytest.raises(ValueError, match="projection_type"):
         await loop.respond("turn_forged", Transcript(text="Status?", final=True))
     await loop.close()
+
+
+@pytest.mark.parametrize("surface_count", [2, 1])
+def test_surface_pending_counts_require_exact_owner_agreement(surface_count):
+    from test_work_tools import _surface
+
+    surface, probe, _ = _surface()
+    probe.task_status = lambda: TaskStatusSnapshot(active=1, pending=1)
+    surface._pending_starts.update({str(number): object() for number in range(surface_count)})
+    assert surface.task_status() == (
+        TaskStatusSnapshot(active=1, pending=1)
+        if surface_count == 1
+        else TaskStatusSnapshot(available=False)
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_controller_pending_mismatch_clears_after_acknowledgment():
+    from test_tasks import PreAckTerminalSession
+
+    from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
+
+    context = ConversationContextStore()
+    session = PreAckTerminalSession()
+    owner = ConversationTaskController(
+        context=context,
+        session=session,
+        session_id="session_001",
+        id_factory=iter(("direct", "dispatch")).__next__,
+    )
+    surface = ConversationWorkControlSurface(
+        controller=owner,
+        context=context,
+        observer=lambda *_: None,
+        reserve_observer_capacity=lambda: None,
+    )
+    operation = asyncio.create_task(
+        owner.dispatch(objective="Synthetic work", utterance_id="user_1")
+    )
+    try:
+        await session.dispatch_started.wait()
+        assert surface.task_status() == TaskStatusSnapshot(available=False)
+        session.release_ack.set()
+        await operation
+        assert surface.task_status() == TaskStatusSnapshot(active=1)
+    finally:
+        session.release_ack.set()
+        await operation
+        await surface.close()
+        await owner.close()

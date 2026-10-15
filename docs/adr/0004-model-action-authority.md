@@ -100,10 +100,12 @@ A snapshot describes the instant it is rendered and may change during playback.
 
 Codex selects host speech before sending its bounded tool receipt, so a peer
 completion during that send cannot discard the selection. The receipt uses the
-existing call deadline; timeout or send failure drains ownership, reports a
-bounded category and closes the adapter to further turns without retry. Matching
-peer terminal state avoids a late interruption, while receipt ownership still
-drains before teardown. Codex then ends the foreground stream and uses its
+existing call deadline, checked synchronously before selection and every
+registered status receipt, including refusals. Timeout or send failure drains
+ownership, reports a bounded category and closes admission for the remainder of
+that adapter session without retry. Matching
+peer terminal state is rechecked under send ownership to avoid a late
+interruption, while receipt ownership still drains before teardown. Codex then ends the foreground stream and uses its
 existing owned-turn interruption/cleanup. It does not wait for or speak a
 model continuation. Speech emitted before a status selection cannot be undone.
 The speech loop accepts at most one terminal host item and refuses later items.

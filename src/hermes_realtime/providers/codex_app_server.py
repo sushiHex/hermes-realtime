@@ -1594,10 +1594,22 @@ class CodexAppServerStreamingInference:
                     }
                 )
             raise RuntimeError("Codex app-server reader failed") from routing.error
-        response = await self._request(
-            "turn/interrupt",
-            {"threadId": active.thread_id, "turnId": active.server_id},
-        )
+        if routing is not None and routing.host_status_ready:
+            async with self._send_lock:
+                # A matching terminal can arrive while the interrupt task is
+                # scheduled or quiescing. Recheck after acquiring send ownership.
+                if routing.terminal:
+                    active.terminal = True
+                    return
+                response = await self._request_locked(
+                    "turn/interrupt",
+                    {"threadId": active.thread_id, "turnId": active.server_id},
+                )
+        else:
+            response = await self._request(
+                "turn/interrupt",
+                {"threadId": active.thread_id, "turnId": active.server_id},
+            )
         self._result(response, "turn/interrupt")
 
     async def _quiesce_dynamic_turn(self, active: _ActiveTurn) -> None:
@@ -2366,6 +2378,17 @@ class CodexAppServerStreamingInference:
             return
 
         call: _DynamicCall | None = None
+        routing: _TurnRouting | None = None
+
+        async def reject() -> None:
+            if call is not None and call.tool == "task_status" and routing is not None:
+                await self._send_status_receipt(
+                    request_id, call, routing,
+                    self._tool_response(_REJECTED_TOOL_RESULT, success=False),
+                )
+            else:
+                await self._send_rejected_server_request(request_id, dynamic=True)
+
         try:
             params = self._exact_mapping(message.get("params"), "dynamic tool request")
             required = {
@@ -2386,25 +2409,19 @@ class CodexAppServerStreamingInference:
             call_id = self._bounded_identifier(params.get("callId"), "tool call id")
             turn_identity = (thread_id, turn_id)
             routing = self._turn_routing.get(turn_identity)
+            call = self._dynamic_calls.get((thread_id, turn_id, call_id))
             if routing is None or routing.terminal or routing.failure.is_set():
-                await self._send_rejected_server_request(
-                    request_id,
-                    dynamic=True,
-                )
+                await reject()
                 return
             tool, namespace, _arguments, canonical = self._dynamic_semantics(
                 params, turn_identity=turn_identity,
             )
-            call = self._dynamic_calls.get((thread_id, turn_id, call_id))
             if call is None:
                 self._mark_turn_failure(
                     turn_identity,
                     RuntimeError("Codex dynamic tool request is not registered"),
                 )
-                await self._send_rejected_server_request(
-                    request_id,
-                    dynamic=True,
-                )
+                await reject()
                 return
             if (
                 call.tool != tool
@@ -2415,18 +2432,12 @@ class CodexAppServerStreamingInference:
                     turn_identity,
                     RuntimeError("Codex dynamic tool request conflicts with lifecycle"),
                 )
-                await self._send_rejected_server_request(
-                    request_id,
-                    dynamic=True,
-                )
+                await reject()
                 return
             call.response_tasks.add(current)
             ready = self._server_turn_ready.get(thread_id)
             if ready is None:
-                await self._send_rejected_server_request(
-                    request_id,
-                    dynamic=True,
-                )
+                await reject()
                 return
             if not ready.is_set():
                 remaining = call.deadline - asyncio.get_running_loop().time()
@@ -2437,17 +2448,18 @@ class CodexAppServerStreamingInference:
                     )
                 except TimeoutError:
                     self._settle_noncommittal(call, "deadline")
-                    await self._send({"id": request_id, "result": call.response})
+                    if call.tool == "task_status":
+                        assert call.response is not None
+                        await self._send_status_receipt(request_id, call, routing, call.response)
+                    else:
+                        await self._send({"id": request_id, "result": call.response})
                     return
             if (
                 routing.failure.is_set()
                 or routing.terminal
                 or not self._is_live_server_turn(thread_id, turn_id)
             ):
-                await self._send_rejected_server_request(
-                    request_id,
-                    dynamic=True,
-                )
+                await reject()
                 return
             if call.response is None and call.tool == "task_status":
                 call.response = self._tool_response({"kind": "host_task_status"}, success=True)
@@ -2455,10 +2467,7 @@ class CodexAppServerStreamingInference:
             if call.response is None:
                 if call.operation is None:
                     if routing.failure.is_set() or routing.terminal:
-                        await self._send_rejected_server_request(
-                            request_id,
-                            dynamic=True,
-                        )
+                        await reject()
                         return
                     call.operation = asyncio.create_task(
                         self._invoke_dynamic_call(call),
@@ -2513,31 +2522,10 @@ class CodexAppServerStreamingInference:
                         with suppress(asyncio.CancelledError):
                             await response_ready
             assert call.response is not None
-            if (call.tool == "task_status" and routing.status_selected
-                    and call.response.get("success") is True):
-                # The validated choice is host-owned before sending its tool receipt.
-                # The peer can finish the model turn while send() is still suspended.
-                routing.host_status_ready = True
-                routing.dynamic_registered.set()
             if call.tool == "task_status":
-                try:
-                    async with asyncio.timeout_at(call.deadline):
-                        await self._send({"id": request_id, "result": call.response})
-                except Exception as error:
-                    failure = RuntimeError("Codex status receipt send failed")
-                    failure.__cause__ = error
-                    # Receipt ownership outlives the peer's terminal notification.
-                    # Generic routing failure admission ignores already-terminal turns.
-                    if routing.error is None:
-                        routing.error = failure
-                    routing.failure.set()
-                    self._closed = True
-                    try:
-                        return
-                    finally:
-                        self._status_refusal_evidence(
-                            "response_send_deadline" if isinstance(error, TimeoutError)
-                            else "response_send_failed")
+                await self._send_status_receipt(
+                    request_id, call, routing, call.response,
+                )
             else:
                 await self._send({"id": request_id, "result": call.response})
         except RuntimeError as error:
@@ -2550,13 +2538,45 @@ class CodexAppServerStreamingInference:
                         (failure_thread_id, failure_turn_id),
                         error,
                     )
-            await self._send_rejected_server_request(
-                request_id,
-                dynamic=True,
-            )
+            await reject()
         finally:
             if call is not None:
                 call.response_tasks.discard(current)
+
+    def _fail_status_receipt(
+        self, routing: _TurnRouting, category: str, error: Exception | None = None,
+    ) -> None:
+        failure = RuntimeError("Codex status receipt failed: " + category)
+        failure.__cause__ = error
+        if routing.error is None:
+            routing.error = failure
+        routing.failure.set()
+        self._closed = True
+        try:
+            return
+        finally:
+            self._status_refusal_evidence(category)
+
+    async def _send_status_receipt(
+        self, request_id: _RequestId, call: _DynamicCall, routing: _TurnRouting,
+        response: dict[str, object],
+    ) -> None:
+        # An expired timeout cancels on the next suspension; an immediate send may
+        # never suspend. Check the existing deadline before admitting host speech.
+        if asyncio.get_running_loop().time() >= call.deadline:
+            self._fail_status_receipt(routing, "deadline")
+            return
+        if routing.status_selected and response.get("success") is True:
+            routing.host_status_ready = True
+            routing.dynamic_registered.set()
+        try:
+            async with asyncio.timeout_at(call.deadline):
+                await self._send({"id": request_id, "result": response})
+        except Exception as error:
+            self._fail_status_receipt(
+                routing, "response_send_deadline" if isinstance(error, TimeoutError)
+                else "response_send_failed", error,
+            )
 
     async def _invoke_dynamic_call(
         self, call: _DynamicCall

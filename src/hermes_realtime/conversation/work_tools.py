@@ -253,8 +253,9 @@ class ConversationWorkControlSurface:
         status = read()
         if type(status) is not TaskStatusSnapshot:
             return TaskStatusSnapshot(available=False)
-        # A surface-owned start can be queued before dispatch reserves its identity.
-        if self._pending_starts and not status.pending:
+        # Surface intake and controller reservations can transiently disagree.
+        # Do not project a partial count while either owner has unsettled intake.
+        if status.pending != len(self._pending_starts):
             return TaskStatusSnapshot(available=False)
         try:
             return replace(status)
