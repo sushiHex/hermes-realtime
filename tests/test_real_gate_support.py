@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import socket
 import subprocess
 import sys
@@ -18,6 +19,26 @@ _SUPPORT_SPEC.loader.exec_module(_SUPPORT)
 available_port = _SUPPORT.available_port
 installed_hermes_identity = _SUPPORT.installed_hermes_identity
 load_api_key = _SUPPORT.load_api_key
+
+
+def test_setup_runner_uses_noninteractive_windowless_process_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "ready", "")
+
+    monkeypatch.setattr(_SUPPORT.subprocess, "run", run)
+    result = _SUPPORT._checked_run(
+        "hermes_cache", ["synthetic-setup"], cwd=tmp_path, timeout=5,
+    )
+    assert result.stdout == "ready"
+    assert observed["stdin"] == subprocess.DEVNULL
+    assert observed["creationflags"] == (
+        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    )
 
 
 def _git(checkout: Path, *arguments: str) -> str:

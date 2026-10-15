@@ -51,6 +51,8 @@ def _checked_run(
         env=None if env is None else dict(env),
         check=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         text=True,
         timeout=timeout,
     )
