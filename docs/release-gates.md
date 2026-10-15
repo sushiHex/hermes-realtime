@@ -142,13 +142,22 @@ questions make the exchange feel engaged rather than interrogative.
 
 ## Opted-in Windows evaluator ownership
 
-The existing routing evaluator can run under an independent base-Python guardian:
+The configured-provider routing evaluator requires the exact clean candidate commit and
+tree for every invocation. It selects the host's provider factory, makes one tool-less
+readiness call, binds the shared effect-free work handler, then makes one decision call
+per corpus case. This is a source-bound synthetic routing check, not a real-Hermes
+dispatch, voice, or semantic lifecycle review. A failed case is never retried.
+
+On Windows, opt into the independent base-Python guardian with the same binding:
 
 ```sh
 python -m scripts.evaluate_natural_work_routing \
+  --source-head "$(git rev-parse HEAD)" \
+  --source-tree "$(git rev-parse 'HEAD^{tree}')" \
   --launch-binding interpreter-binding.json \
   --launch-binding-sha256 APPROVED_SHA256 \
   --launch-receipt private-launch.jsonl \
+  --provider ollama --mode diagnostic_override \
   --model SELECTED_MODEL
 ```
 
@@ -161,11 +170,33 @@ Keep this file, receipt and retained output private; do not commit local paths.
 {"schema_version":1,"guardian":{"path":"ABSOLUTE_BASE_PYTHON","sha256":"SHA256"},"controller":{"path":"ABSOLUTE_CONTROLLER_PYTHON","sha256":"SHA256"}}
 ```
 
-All three launch options are required together. Without them the legacy CLI stays
-in-process and claims no guardian ownership. The selected model, effort, corpus,
-existing retry policy and scoring remain unchanged. The script entrypoint selects
-its own candidate source before product imports and refuses already loaded modules
-from another checkout before evaluation.
+All three launch options are required together. Without them the CLI runs in process
+and claims no guardian ownership. `--mode production_default` takes provider settings
+from the host factory and refuses explicit model/runtime overrides. It is the CLI
+default. Select `--mode diagnostic_override` for model or runtime overrides. `--provider codex`
+remains the default; `--provider ollama` selects the same host factory and optional
+`--ollama-base-url` and `--ollama-num-ctx` settings. The entrypoint refuses a missing or
+changed source commit/tree, a dirty worktree, or production imports from another
+checkout before model execution, and verifies source stability again afterward.
+
+The version-four report declares a 20-second readiness bound, a 60-second decision
+bound, a 10-second adapter-close bound and a 3500-second total evaluation bound. It
+uses a 3600-second outer guardian deadline, leaving room for bounded cleanup and
+receipt writing without silently doubling the evaluation budget. The total clock
+starts before Codex version discovery when Codex is selected. It
+records one attempt per case and distinguishes a fresh per-case adapter from unknown
+external runtime process/cache freshness. Reports contain model labels, aggregate
+routing counts and bounded failure categories; they do not contain prompts, replies,
+private paths, or raw provider errors. A provider decision can be a false or misleading
+lifecycle claim; the separate semantic review remains pending until reviewed.
+If the owned controller completes with a nonzero result and source remains bound,
+the caller preserves its reviewed report (including a pending semantic review) and
+the retained private result artifact. If post-run source binding fails, it emits only
+bounded `owned_result_failed` with a secondary source category, without echoing the
+controller output. A valid unsuccessful guardian
+receipt retains its recorded stage, category and cleanup fields in the public failure
+summary, distinct from a missing or malformed receipt. Source drift observed after
+either failure is reported as a secondary category without replacing the first one.
 
 The default launch requests explicit Job breakaway, hides the process and verifies
 the actual base guardian is outside inherited Jobs. Windows may refuse breakaway;
