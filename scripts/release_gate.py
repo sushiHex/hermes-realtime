@@ -817,7 +817,7 @@ def gate_materialized_candidate(
         "pytest",
         "-q",
         *PYTEST_DURATIONS,
-        *(("--native-git-executable", str(git_executable)) if git_executable is not None else ()),
+        *((f"--native-git-executable={git_executable}",) if git_executable is not None else ()),
         cwd=root,
         env=environment,
     )

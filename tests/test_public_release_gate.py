@@ -33,7 +33,7 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
     monkeypatch.setitem(gate.__globals__, "run", observe)
     with pytest.raises(FullPytestReached):
         gate(tmp_path, livekit=False, git_executable=selected)
-    expected = ("--native-git-executable", str(selected)) if explicit else ()
+    expected = (f"--native-git-executable={selected}",) if explicit else ()
     assert commands[-1] == (
         "uv",
         "run",
@@ -47,6 +47,12 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
         *expected,
     )
     assert all("--native-git-executable" not in command for command in commands[:-1])
+    parsed = pytest.Config.fromdictargs({}, list(commands[-1][6:]))
+    try:
+        assert parsed.getoption("native_git_executable") == selected
+        assert parsed.rootpath == ROOT
+    finally:
+        parsed._ensure_unconfigure()
 
 
 def _run(*command: str, cwd: Path) -> bytes:
