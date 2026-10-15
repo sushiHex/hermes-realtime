@@ -21,8 +21,9 @@ installed_hermes_identity = _SUPPORT.installed_hermes_identity
 load_api_key = _SUPPORT.load_api_key
 
 
+@pytest.mark.parametrize("entrypoint", ["setup", "identity"])
 def test_setup_runner_uses_noninteractive_windowless_process_contract(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entrypoint: str,
 ) -> None:
     observed: dict[str, object] = {}
 
@@ -31,14 +32,18 @@ def test_setup_runner_uses_noninteractive_windowless_process_contract(
         return subprocess.CompletedProcess(argv, 0, "ready", "")
 
     monkeypatch.setattr(_SUPPORT.subprocess, "run", run)
-    result = _SUPPORT._checked_run(
-        "hermes_cache", ["synthetic-setup"], cwd=tmp_path, timeout=5,
-    )
-    assert result.stdout == "ready"
+    if entrypoint == "setup":
+        result = _SUPPORT._checked_run(
+            "hermes_cache", ["synthetic-setup"], cwd=tmp_path, timeout=5,
+        ).stdout
+    else:
+        result = _SUPPORT._git(tmp_path, "rev-parse", "HEAD")
+    assert result == "ready"
     assert observed["stdin"] == subprocess.DEVNULL
     assert observed["creationflags"] == (
         subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     )
+    assert observed["timeout"] == (5 if entrypoint == "setup" else 60)
 
 
 def _git(checkout: Path, *arguments: str) -> str:

@@ -184,8 +184,8 @@ def _unrepresentable_paths(checkout: Path) -> set[str]:
 
 
 def _git(checkout: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ("git", *arguments), cwd=checkout, check=True, capture_output=True, text=True
+    return _checked_run(
+        "hermes_identity", ["git", *arguments], cwd=checkout, timeout=60,
     ).stdout
 
 
