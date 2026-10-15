@@ -571,6 +571,68 @@ def test_launch_bounds_fail_before_creation(tmp_path: Path, timeout: object, arg
     assert not (tmp_path / "receipt").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher watchdog contract")
+@pytest.mark.parametrize("fault", ["none", "kill", "wait", "both", "record"])
+def test_guardian_watchdog_persists_timeout_even_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fault: str
+) -> None:
+    binding, digest = _binding(tmp_path)
+    script = tmp_path / "controller.py"
+    script.write_text("print('never executed')\n")
+    receipt = tmp_path / "receipt.jsonl"
+    expired = subprocess.TimeoutExpired("synthetic", 65)
+    events = []
+
+    class Process:
+        def wait(self, *, timeout: int) -> int:
+            events.append(("wait", timeout))
+            if len(events) == 1:
+                raise expired
+            if fault in {"wait", "both"}:
+                raise OSError("synthetic wait failure")
+            return 0
+
+        def kill(self) -> None:
+            events.append(("kill", None))
+            if fault in {"kill", "both"}:
+                raise OSError("synthetic kill failure")
+
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda *a, **k: Process())
+    record = launch._record
+
+    def recorded(path: Path, value: dict[str, object], **kwargs: object) -> None:
+        if fault == "record" and value.get("stage") == "observer_timeout":
+            raise OSError("synthetic record failure")
+        record(path, value, **kwargs)
+
+    monkeypatch.setattr(launch, "_record", recorded)
+    with pytest.raises((TimeoutError, BaseExceptionGroup)) as caught:
+        launch.run_owned_controller(
+            script,
+            (),
+            binding_path=binding,
+            binding_sha256=digest,
+            receipt=receipt,
+            timeout_seconds=5,
+        )
+    assert events == [("wait", 65), ("kill", None), ("wait", 30)]
+    if fault == "none":
+        assert isinstance(caught.value, TimeoutError) and caught.value.__cause__ is expired
+    else:
+        assert isinstance(caught.value, BaseExceptionGroup)
+        assert caught.value.exceptions[0] is expired
+        assert len(caught.value.exceptions) == (3 if fault == "both" else 2)
+    marker = capsys.readouterr().err.split("[qualification-launch] ")[-1]
+    assert json.loads(marker)["category"] == "guardian_timeout"
+    rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
+    if fault == "record":
+        assert rows[-1]["stage"] == "reserved"
+    else:
+        assert rows[-1]["stage"] == "observer_timeout"
+        assert rows[-1]["category"] == "guardian_timeout"
+        assert rows[-1]["cleanup_verified"] is None and rows[-1]["controller_completed"] is False
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows caller-interruption proof")
 def test_caller_interruption_keeps_guardian_inputs_until_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

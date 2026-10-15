@@ -416,10 +416,31 @@ def run_owned_controller(
             raise RuntimeError(category) from error
         try:
             process.wait(timeout=timeout_seconds + 60)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=30)
-            raise TimeoutError("launch_guardian_deadline") from None
+        except subprocess.TimeoutExpired as primary:
+            category = "guardian_timeout"
+            failures: list[BaseException] = [primary]
+            try:
+                for operation in (process.kill, lambda: process.wait(timeout=30)):
+                    try:
+                        operation()
+                    except BaseException as error:
+                        failures.append(error)
+            finally:
+                try:
+                    _record(
+                        receipt,
+                        {
+                            "stage": "observer_timeout",
+                            "category": category,
+                            "controller_completed": False,
+                            "cleanup_verified": None,
+                        },
+                    )
+                except BaseException as error:
+                    failures.append(error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup("guardian timeout and cleanup failed", failures) from None
+            raise TimeoutError("launch_guardian_deadline") from primary
         except KeyboardInterrupt:
             category = "interrupted"
             _record(receipt, {"stage": "observer_interrupted", "category": category})
