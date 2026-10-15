@@ -25,11 +25,7 @@ def main() -> None:
     parser.add_argument("--wheel-sha256", required=True)
     parser.add_argument("--livekit-executable", type=Path, required=True)
     parser.add_argument("--livekit-sha256", required=True)
-    parser.add_argument(
-        "--git-executable",
-        type=Path,
-        default=Path("C:/Program Files/Git/mingw64/bin/git.exe"),
-    )
+    parser.add_argument("--git-executable", type=Path)
     arguments = parser.parse_args()
     candidate = arguments.candidate.resolve(strict=True)
     identity = verify_clean_tracked_candidate(candidate, arguments.baseline)
