@@ -6,6 +6,12 @@ from test_ollama_work_tools import adapter, collect, decision_frame
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 
 
+def _no_transport():
+    # Unit tests drive the adapter's internals directly. Injecting a transport also keeps
+    # the constructor from resolving a host-installed Codex CLI, which CI does not have.
+    raise AssertionError("unit test opened a Codex transport")
+
+
 @pytest.mark.asyncio
 async def test_ollama_status_is_a_marker_without_work_effects():
     inference, handler, sent, _ = adapter([decision_frame({"kind": "task_status"})])
@@ -590,6 +596,7 @@ async def test_status_admission_cleanup_uses_existing_bounded_budget(timeout, mo
 
     inference = module.CodexAppServerStreamingInference(
         model="synthetic", effort="low", request_timeout_seconds=timeout,
+        transport_factory=_no_transport,
     )
     loop = asyncio.get_running_loop()
     now = loop.time()
@@ -623,7 +630,9 @@ async def test_status_cleanup_acceptance_rechecks_shared_deadline(phase, monkeyp
 
     from hermes_realtime.providers import codex_app_server as module
 
-    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    inference = module.CodexAppServerStreamingInference(
+        model="synthetic", effort="low", transport_factory=_no_transport,
+    )
     loop = asyncio.get_running_loop()
     now = loop.time()
     clock = [now]
@@ -661,7 +670,9 @@ async def test_status_expiry_recovery_does_not_reopen_prior_uncertainty(prior):
 
     from hermes_realtime.providers import codex_app_server as module
 
-    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    inference = module.CodexAppServerStreamingInference(
+        model="synthetic", effort="low", transport_factory=_no_transport,
+    )
     original = RuntimeError("synthetic protocol failure") if prior == "protocol_failure" else None
     routing = module._TurnRouting(error=original, host_status_ready=prior == "host_ready")
     call = module._DynamicCall(
@@ -688,7 +699,9 @@ async def test_cancelled_status_cleanup_preserves_cancellation_and_closes(phase)
 
     from hermes_realtime.providers import codex_app_server as module
 
-    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    inference = module.CodexAppServerStreamingInference(
+        model="synthetic", effort="low", transport_factory=_no_transport,
+    )
     now = asyncio.get_running_loop().time()
     routing = module._TurnRouting(error=module._StatusAdmissionExpired(now + 1))
 
