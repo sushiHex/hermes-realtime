@@ -619,6 +619,7 @@ def test_oracle_fixture_uses_shared_native_discovery(
     from types import SimpleNamespace
 
     from scripts import candidate_e2e_fast_track as fast_track
+    from tests.support import native_git_selection
 
     executable = tmp_path / layout / "bin" / "git.exe"
     observed: list[object] = []
@@ -632,12 +633,17 @@ def test_oracle_fixture_uses_shared_native_discovery(
 
     monkeypatch.setattr(fast_track, "_measure_git_pin", measure)
     monkeypatch.setattr(fast_track.subprocess, "run", refuse_unshared_probe)
+    monkeypatch.setattr(native_git_selection, "_requested_executable", None)
     namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
-    pin = namespace["_initialize_git_fixture"](None)
 
     assert observed == [None]
-    assert pin.path == executable
-    assert (pin.sha256, pin.version, pin.link_count) == (digest, version, 4)
+    assert namespace["GIT"] == executable
+    assert namespace["native_git_selection"] is native_git_selection
+    assert (namespace["GIT_SHA256"], namespace["GIT_VERSION"], namespace["GIT_LINK_COUNT"]) == (
+        digest,
+        version,
+        4,
+    )
 
 
 @pytest.mark.parametrize("changed", ["sha256", "version", "link_count"])
@@ -661,9 +667,8 @@ def test_oracle_fixture_retains_exact_image_identity_guard(
         {"sha256": "0" * 64, "version": "git version 2.56.0.windows.3", "link_count": 5}[changed],
     )
     monkeypatch.setattr(fast_track, "_measure_git_pin", lambda path: pin)
-    namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
     with pytest.raises(RuntimeError, match="unapproved Git fixture identity"):
-        namespace["_initialize_git_fixture"](None)
+        run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
 
 
 def test_oracle_fixture_explicit_selection_survives_ambiguous_default(
@@ -673,6 +678,7 @@ def test_oracle_fixture_explicit_selection_survives_ambiguous_default(
     from types import SimpleNamespace
 
     from scripts import candidate_e2e_fast_track as fast_track
+    from tests.support import native_git_selection
 
     selected = tmp_path / "ucrt64" / "bin" / "git.exe"
     calls: list[object] = []
@@ -690,13 +696,33 @@ def test_oracle_fixture_explicit_selection_survives_ambiguous_default(
         )
 
     monkeypatch.setattr(fast_track, "_measure_git_pin", measure)
+    monkeypatch.setattr(native_git_selection, "_requested_executable", selected)
     namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
+    assert namespace["GIT"] == selected
+    assert namespace["native_git_selection"] is native_git_selection
+    assert calls == [selected]
 
-    def selected_option(name: str) -> Path:
+
+def test_pytest_native_git_selection_is_configured_and_cleared(tmp_path: Path) -> None:
+    from runpy import run_path
+    from types import SimpleNamespace
+
+    from tests.support import native_git_selection
+
+    hooks = run_path(str(Path(__file__).with_name("conftest.py")))
+    selected = tmp_path / "ucrt64" / "bin" / "git.exe"
+    previous = native_git_selection.requested_native_git()
+
+    def option(name: str) -> Path:
         assert name == "native_git_executable"
         return selected
 
-    fixture = namespace["_selected_git_fixture"].__wrapped__
-    fixture(SimpleNamespace(getoption=selected_option))
-    assert fixture.__globals__["GIT"] == selected
-    assert calls == [selected]
+    config = SimpleNamespace(getoption=option)
+    try:
+        hooks["pytest_configure"](config)
+        assert hooks["native_git_selection"] is native_git_selection
+        assert native_git_selection.requested_native_git() == selected
+        hooks["pytest_unconfigure"](config)
+        assert native_git_selection.requested_native_git() is None
+    finally:
+        native_git_selection.set_requested_native_git(previous)

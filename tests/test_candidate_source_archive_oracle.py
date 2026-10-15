@@ -16,6 +16,7 @@ from runpy import run_path
 import pytest
 
 from scripts.candidate_e2e_fast_track import GitExecutablePinV1, _measure_git_pin
+from tests.support import native_git_selection
 
 ROOT = Path(__file__).resolve().parents[1]
 _AUTHORIZED_GIT_IDENTITIES = frozenset(
@@ -56,16 +57,13 @@ def _initialize_git_fixture(executable: Path | None) -> GitExecutablePinV1:
     return pin
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _selected_git_fixture(pytestconfig: pytest.Config) -> None:
-    global GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT
-    pin = _initialize_git_fixture(pytestconfig.getoption("native_git_executable"))
-    GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = (
-        pin.path,
-        pin.sha256,
-        pin.version,
-        pin.link_count,
-    )
+_GIT_FIXTURE_PIN = _initialize_git_fixture(native_git_selection.requested_native_git())
+GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = (
+    _GIT_FIXTURE_PIN.path,
+    _GIT_FIXTURE_PIN.sha256,
+    _GIT_FIXTURE_PIN.version,
+    _GIT_FIXTURE_PIN.link_count,
+)
 
 
 def _git(*arguments: str, cwd: Path = ROOT) -> bytes:
