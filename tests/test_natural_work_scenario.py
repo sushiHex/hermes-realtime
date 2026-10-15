@@ -485,3 +485,340 @@ def test_private_row_budget_and_partial_write_refusals() -> None:
 
     with pytest.raises(OSError):
         scenario.write_private_row(ShortWrite(), row)
+
+
+DEVELOPMENT = ROOT / "tests/fixtures/natural_work_development_cases.json"
+DEVELOPMENT_IDS = (
+    "research", "greeting", "explanation", "quotation", "negation",
+    "cancel_model_authority", "approval_model_authority", "ambiguity", "host_status",
+)
+
+
+def test_development_diagnostic_keeps_frozen_cases_and_separate_status(tmp_path: Path) -> None:
+    before = DEVELOPMENT.read_bytes()
+    value = scenario.load_development(DEVELOPMENT)
+    assert tuple(case.case_id for case in value.cases) == DEVELOPMENT_IDS
+    original = json.loads(before)
+    by_id = {row["id"]: row for row in original["development_cases"]}
+    by_id["ambiguity"] = original["clarification_control"]
+    for case in value.cases[:-1]:
+        assert (case.utterance, case.expected_tool) == (
+            by_id[case.case_id]["utterance"], by_id[case.case_id]["expected_tool"],
+        )
+    assert value.cases[-1].utterance == "How is work?"
+    for case in value.cases:
+        context, request = scenario.make_context(case, 1, ())
+        assert bool(request.active_tasks) == (case.case_id in (
+            "cancel_model_authority", "approval_model_authority", "host_status",
+        ))
+        assert context.snapshot().messages == request.messages
+    altered = tmp_path / "development.json"
+    altered.write_bytes(before + b" ")
+    with pytest.raises(ValueError, match="input_binding"):
+        scenario.load_development(altered)
+    assert DEVELOPMENT.read_bytes() == before
+
+
+@pytest.fixture
+def development_factory(monkeypatch: pytest.MonkeyPatch):
+    """Actual factory/parser/surface; only metadata and completion transport are fake."""
+    from hermes_realtime.providers.ollama_models import OllamaModelClient
+
+    real = scenario.factory
+    instances, wires = [], []
+
+    def factory(**options):
+        inference = real(**options)
+        instances.append(inference)
+
+        async def metadata(endpoint, body):
+            return json.dumps(
+                {"version": "0.34.4"} if endpoint == "version" else (
+                    {"models": [{"name": "test:model", "digest": "a" * 64}]}
+                    if endpoint == "tags" else {
+                        "capabilities": ["completion"],
+                        "model_info": {"general.architecture": "phi3",
+                                       "phi3.context_length": 131072},
+                    }
+                )
+            ).encode()
+
+        inference._model_client = OllamaModelClient(
+            base_url="http://127.0.0.1:1", read_request=metadata,
+        )
+
+        def opened(request, timeout):
+            body = json.loads(request.data)
+            wires.append(body)
+            if "format" not in body:
+                content = "Ready."
+            else:
+                utterance = body["messages"][-1]["content"]
+                # Deliberate semantic miss on the first case must not stop the cohort.
+                content = json.dumps(
+                    {"kind": "task_status"} if utterance in (
+                        "How is work?", "Please stop the background research task.",
+                    ) else {"kind": "reply", "text": "Synthetic private response."}
+                )
+            return io.BytesIO(json.dumps({
+                "message": {"content": content}, "done": True, "done_reason": "stop",
+            }).encode() + b"\n")
+
+        inference._open_request = opened
+        return inference
+
+    monkeypatch.setattr(scenario, "factory", factory)
+    return instances, wires
+
+
+@pytest.mark.asyncio
+async def test_development_actual_adapter_continues_all_nine_and_keeps_selection_private(
+    development_factory,
+) -> None:
+    value = scenario.load_development(DEVELOPMENT)
+    sink = io.BytesIO()
+    rows = await scenario.run_cases(
+        value, model="test:model", base_url="http://127.0.0.1:1", private_sink=sink,
+    )
+    instances, wires = development_factory
+    assert len(instances) == 9 and len(wires) == 18
+    assert all(instance._closed for instance in instances)
+    assert [row["id"] for row in rows] == list(DEVELOPMENT_IDS)
+    assert all(row["usable_decision"] for row in rows)
+    assert len(sink.getvalue().splitlines()) == 9
+    for row in rows:
+        selected = row["id"] in ("cancel_model_authority", "host_status")
+        assert (row["host_status_request_ms"] is not None) is selected
+        if selected:
+            assert row["speech"] == [] and row["first_speakable_ms"] is None
+            assert row["objectives"] == []
+    assert all(wire["options"] == (
+        {"num_ctx": 4096, "num_predict": 1024} if "format" in wire
+        else {"num_ctx": 4096}
+    ) for wire in wires)
+    report = scenario.build_development_report(value, rows, model="test:model")
+    assert report["diagnostic_only"] is True and report["pass"] is False
+    assert report["structural_pass"] is False
+    assert report["host_status_requests"]["scope"] == "selection_only"
+    assert report["host_status_requests"]["count"] == 2
+    assert report["objective_fidelity"] == report["lifecycle_review"] == "pending"
+    assert "Synthetic private response." not in json.dumps(report)
+    with pytest.raises(ValueError, match="complete_order"):
+        scenario.build_development_report(value, rows[:-1], model="test:model")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["subclass", "later", "prior_speech"])
+async def test_development_marker_is_exact_terminal_selection(
+    monkeypatch: pytest.MonkeyPatch, development_factory, bad: str,
+) -> None:
+    import dataclasses
+
+    from hermes_realtime.conversation.task_status import HostSpeechRequest
+
+    value = scenario.load_development(DEVELOPMENT)
+    value = dataclasses.replace(value, cases=value.cases[-1:])
+    original_factory = scenario.factory
+
+    def factory(**options):
+        inference = original_factory(**options)
+        original_stream = inference.stream
+
+        async def stream(snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                async for part in original_stream(snapshot, turn_id=turn_id):
+                    yield part
+                return
+            if bad == "prior_speech":
+                yield "Untrusted model prose."
+            if bad == "subclass":
+                class Forged(HostSpeechRequest):
+                    pass
+                yield Forged()
+            else:
+                yield HostSpeechRequest()
+            if bad == "later":
+                yield "Late model prose."
+
+        inference.stream = stream
+        return inference
+
+    monkeypatch.setattr(scenario, "factory", factory)
+    rows = []
+    with pytest.raises(RuntimeError):
+        await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1",
+                                 observations=rows)
+    assert len(rows) == 1 and rows[0]["usable_decision"] is False
+
+
+def test_development_cli_reserves_receipt_before_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scenario, "source_binding", lambda: {"head": "a" * 40, "dirty": False})
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("unreserved diagnostic reached inference")
+
+    monkeypatch.setattr(scenario, "run_cases", forbidden)
+    args = ["--development-fixture", str(DEVELOPMENT), "--source-head", "a" * 40,
+            "--model", "test:model", "--base-url", "http://127.0.0.1:1", "--live"]
+    assert scenario.main(args) == 2
+    receipt = tmp_path / "existing.jsonl"
+    receipt.write_text("Retain prior evidence.")
+    assert scenario.main(args + ["--private-receipt", str(receipt)]) == 2
+    assert receipt.read_text() == "Retain prior evidence."
+
+
+@pytest.mark.asyncio
+async def test_development_primary_and_both_cleanup_failures_keep_partial_evidence(
+    monkeypatch: pytest.MonkeyPatch, development_factory,
+) -> None:
+    import dataclasses
+
+    value = scenario.load_development(DEVELOPMENT)
+    value = dataclasses.replace(value, cases=value.cases[:1])
+    real_factory, real_close = scenario.factory, scenario.ConversationWorkControlSurface.close
+    closed = []
+
+    def factory(**options):
+        inference = real_factory(**options)
+        original_stream, original_close = inference.stream, inference.close
+
+        async def stream(snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                async for part in original_stream(snapshot, turn_id=turn_id):
+                    yield part
+                return
+            raise RuntimeError("decision_primary")
+
+        async def close():
+            await original_close()
+            closed.append("adapter")
+            raise RuntimeError("adapter_cleanup")
+
+        inference.stream, inference.close = stream, close
+        return inference
+
+    async def close_surface(self):
+        await real_close(self)
+        closed.append("surface")
+        raise RuntimeError("surface_cleanup")
+
+    monkeypatch.setattr(scenario, "factory", factory)
+    monkeypatch.setattr(scenario.ConversationWorkControlSurface, "close", close_surface)
+    rows, sink = [], io.BytesIO()
+    with pytest.raises(ExceptionGroup) as failure:
+        await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1",
+                                 observations=rows, private_sink=sink)
+    assert [str(error) for error in failure.value.exceptions] == [
+        "decision_primary", "adapter_cleanup", "surface_cleanup",
+    ]
+    assert closed == ["adapter", "surface"]
+    assert len(rows) == 1 and rows[0]["error"] == "operational_failure"
+    assert rows[0]["cleanup_failed"] is True and rows[0]["usable_decision"] is False
+    assert json.loads(sink.getvalue()) == rows[0]
+
+
+def test_development_cli_prepare_is_not_a_holdout_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(scenario, "source_binding", lambda: {"head": "a" * 40, "dirty": False})
+    args = ["--development-fixture", str(DEVELOPMENT), "--source-head", "a" * 40,
+            "--model", "test:model", "--base-url", "http://127.0.0.1:1"]
+    assert scenario.main(args) == 0
+    report = json.loads(capsys.readouterr().out.split("[natural-work-scenario] ")[1])
+    assert report["status"] == "prepared_only" and report["pass"] is False
+    assert report["decision_attempts"] == 0
+    assert scenario.main(args + ["--access-proof", str(tmp_path)]) == 2
+
+
+def test_development_actual_cli_retains_nine_rows_and_manual_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, development_factory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    binding = {"head": "a" * 40, "dirty": False}
+    monkeypatch.setattr(scenario, "source_binding", lambda: binding)
+    receipt = tmp_path / "nine.jsonl"
+    assert scenario.main([
+        "--development-fixture", str(DEVELOPMENT), "--source-head", "a" * 40,
+        "--model", "test:model", "--base-url", "http://127.0.0.1:1",
+        "--live", "--private-receipt", str(receipt),
+    ]) == 1
+    report = json.loads(capsys.readouterr().out.split("[natural-work-scenario] ")[1])
+    assert report["diagnostic_only"] is True and report["pass"] is False
+    assert report["readiness_attempts"] == report["decision_attempts"] == 9
+    assert report["lifecycle_review"] == report["objective_fidelity"] == "pending"
+    assert len(development_factory[1]) == 18
+    assert [json.loads(line)["id"] for line in receipt.read_bytes().splitlines()] == list(
+        DEVELOPMENT_IDS)
+    assert "Synthetic private response." not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_development_blank_chunks_do_not_set_speech_latency_or_reply(
+    monkeypatch: pytest.MonkeyPatch, development_factory,
+) -> None:
+    import dataclasses
+    from types import SimpleNamespace
+
+    value = scenario.load_development(DEVELOPMENT)
+    value = dataclasses.replace(value, cases=value.cases[1:2])
+    original = scenario.factory
+    now = 0.0
+
+    def factory(**options):
+        inference = original(**options)
+        stream = inference.stream
+
+        async def chunks(snapshot, *, turn_id):
+            nonlocal now
+            if turn_id == "turn_preflight":
+                async for part in stream(snapshot, turn_id=turn_id):
+                    yield part
+                return
+            now = 1.0
+            yield "   "
+            now = 10.0
+            yield "A useful answer."
+
+        inference.stream = chunks
+        return inference
+
+    monkeypatch.setattr(scenario, "factory", factory)
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(monotonic=lambda: now))
+    rows = await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1")
+    assert rows[0]["speech"] == ["   ", "A useful answer."]
+    assert rows[0]["first_speakable_ms"] == 10000.0
+    rows[0]["speech"] = ["   "]
+    rows[0]["first_speakable_ms"] = None
+    report = scenario.build_development_report(value, rows, model="test:model")
+    assert report["cases"][0]["observed"] == "invalid"
+
+
+def test_development_failed_run_still_binds_source_and_input_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    binding = {"head": "a" * 40, "dirty": False}
+    monkeypatch.setattr(scenario, "source_binding", lambda: binding)
+    checked = []
+
+    async def failed(*args, **kwargs):
+        raise RuntimeError("private primary failure")
+
+    def drift(*args):
+        checked.append(True)
+        raise ValueError("private drift detail")
+
+    monkeypatch.setattr(scenario, "run_cases", failed)
+    monkeypatch.setattr(scenario, "verify_stability", drift)
+    assert scenario.main([
+        "--development-fixture", str(DEVELOPMENT), "--source-head", "a" * 40,
+        "--model", "test:model", "--base-url", "http://127.0.0.1:1", "--live",
+        "--private-receipt", str(tmp_path / "failed.jsonl"),
+    ]) == 2
+    report = json.loads(capsys.readouterr().out.split("[natural-work-scenario] ")[1])
+    assert checked == [True]
+    assert report["error"] == "scenario_evaluation_failed"
+    assert report["source_binding"] == binding
+    assert report["secondary_categories"] == ["execution_input_drift"]
+    assert "private primary failure" not in json.dumps(report)

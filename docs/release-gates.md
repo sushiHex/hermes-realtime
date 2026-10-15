@@ -273,6 +273,45 @@ budgets and sanitized public reports. Interpreter hashes alone do not attest the
 complete dependency closure. This ownership slice does not complete reusable
 provider qualification, real dispatch, or human voice acceptance.
 
+### Bounded development diagnostics
+
+The existing scenario evaluator also accepts `--development-fixture` instead of
+`--scenario`. It binds the unchanged development fixture bytes and selects, in order,
+`research`, `greeting`, `explanation`, `quotation`, `negation`,
+`cancel_model_authority`, `approval_model_authority`, and `ambiguity`. A separate
+`host_status` observation uses the existing synthetic question “How is work?”;
+it does not add a row to either frozen corpus. Cancellation, approval and status
+observations carry one synthetic active task. No project context or access-proof
+override is accepted in this mode.
+
+```sh
+python -m scripts.evaluate_natural_work_scenario \
+  --development-fixture tests/fixtures/natural_work_development_cases.json \
+  --source-head APPROVED_CLEAN_HEAD --model SELECTED_MODEL \
+  --base-url http://127.0.0.1:11437 --private-receipt private-development.jsonl --live
+```
+
+The runtime must already be owned by the caller. For owned Windows execution, pass
+this script and these arguments to the existing `run_owned_controller` API with its
+verified interpreter binding and a 1360-second deadline; do not copy its guardian.
+The evaluator uses a fresh production Ollama adapter/context/shared rejecting work
+surface per observation, ordinary synthetic-PCM preflight, context 4096 and unchanged
+production sampler settings. At most nine readiness and nine decision requests run
+once, including after semantic misses. Readiness and decisions each retain their
+60-second bounds; adapter and surface cleanup each retain ten seconds. The diagnostic
+has a 1300-second overall bound. It does not start or evict a model runtime.
+
+The private receipt is exclusively reserved before calls and flushed after each
+attempt, retaining synthetic replies, objectives and partial failure evidence for
+manual review. Keep it private. Public reports expose counts, kinds and latency only.
+A typed host-status marker measures **selection only**, without rendering, synthesis,
+playback or a claim that status was heard. Text-output latency remains separate.
+The Ollama-only diagnostic rejects prose/effects mixed with status selection and
+output after a terminal marker.
+Objective fidelity, clarification and lifecycle review remain pending; `pass` stays
+false. This diagnostic does not invoke the 100-case scorer, admit its resource
+prerequisites, qualify explicit cancellation, or establish voice acceptance.
+
 ## Installed natural-work boundary and latency gate
 
 Before enabling natural Codex work routing by default, run the installed-boundary
