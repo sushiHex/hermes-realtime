@@ -321,6 +321,8 @@ def _guardian(path: Path, digest: str) -> int:
             if isinstance(error, RuntimeError) and str(error) == "guardian_inherited_job"
             else "timed_out"
             if isinstance(error, TimeoutError)
+            or isinstance(error, BaseExceptionGroup)
+            and error.subgroup(TimeoutError) is not None
             else "invalid_input"
             if isinstance(error, ValueError)
             else "execution_failed"

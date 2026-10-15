@@ -457,6 +457,52 @@ def test_native_owner_retains_failure_and_requires_quiescence(
             "close": "synthetic",
         }
         assert str(primary) == expected[fault]
+        if fault in {"deadline", "active", "exit", "cleanup_wait"}:
+            # Feed the actual error group raised above by the real owner with
+            # a fake kernel into the guardian's durable classifier.
+            original_error = caught.value
+            if fault == "active":
+                # A cleanup deadline can be nested beside another failure;
+                # timeout classification must not inspect only the first leaf.
+                original_error = BaseExceptionGroup(
+                    "nested cleanup deadline", [RuntimeError("synthetic primary"), original_error]
+                )
+
+            def owned(plan: object, binding: object, final: dict[str, object]) -> object:
+                final.update(evidence)
+                raise original_error
+
+            monkeypatch.setattr(launch, "_outside_jobs", lambda: True)
+            monkeypatch.setattr(
+                launch,
+                "load_binding",
+                lambda *a, **k: launch.InterpreterBinding("b", "v", "x", "y"),
+            )
+            monkeypatch.setattr(launch, "_owned_controller", owned)
+            raw = json.dumps(
+                {
+                    "receipt": str(tmp_path / "guardian.jsonl"),
+                    "binding": "unused",
+                    "binding_sha256": "unused",
+                    "launcher_sha256": hashlib.sha256(
+                        Path(launch.__file__).read_bytes()
+                    ).hexdigest(),
+                }
+            ).encode()
+            guardian_plan = tmp_path / "guardian-plan.json"
+            guardian_plan.write_bytes(raw)
+            assert launch._guardian(guardian_plan, hashlib.sha256(raw).hexdigest()) == 2
+            final = json.loads((tmp_path / "guardian.jsonl").read_bytes().splitlines()[-1])
+            assert final["category"] == (
+                "timed_out" if fault in {"deadline", "active"} else "execution_failed"
+            )
+            assert final["stage"] == "incomplete" and final["controller_completed"] is False
+            assert final["cleanup_verified"] is evidence["cleanup_verified"]
+            if fault == "deadline":
+                original_error = primary
+                assert launch._guardian(guardian_plan, hashlib.sha256(raw).hexdigest()) == 2
+                final = json.loads((tmp_path / "guardian.jsonl").read_bytes().splitlines()[-1])
+                assert final["category"] == "timed_out" and final["cleanup_verified"] is True
         if fault in {"terminate", "cleanup_wait", "query_type", "active"}:
             assert "close" not in events
 
