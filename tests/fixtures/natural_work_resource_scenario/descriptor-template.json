@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "scenario_id": "hermes-resource-scenario-v1",
+  "main": {
+    "path": "main.json",
+    "sha256": "e6c04956cf2ed734ead5272c2c78f39017aa719681f1663dd1435651591104ac"
+  },
+  "context": {
+    "path": "context-template.json",
+    "sha256": "fe5a8f2c37173af244368e0cb31e61b80296a4334e2eeff4648c9abd479cafc9"
+  },
+  "controls": {
+    "path": "controls-template.json",
+    "sha256": "2c69d6a0d6f84d37ae23ac7cc75ebe065429f949eac32075440947cf23ac4d33"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "provenance": "Synthetic benchmark input specifications, not active runtime settings or recorded benchmark results. No default pair is selected.",
+  "model": "gemma4:e4b",
+  "model_digest": "c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb",
+  "profiles": [
+    {"name": "compact", "num_ctx": 4096, "num_predict": 1024},
+    {"name": "balanced", "num_ctx": 8192, "num_predict": 1024},
+    {"name": "wide", "num_ctx": 16384, "num_predict": 1024}
+  ],
+  "sampling": "Installed model defaults; no seed or sampler overrides specified here."
+}

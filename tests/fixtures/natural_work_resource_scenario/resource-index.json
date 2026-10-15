@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "project": {
+    "name": "Hermes Realtime",
+    "origin": "https://github.com/sushiHex/hermes-realtime",
+    "revision": "8be7063079ca6247ab853f6fcafdc5b73d470379",
+    "tree": "694bc7819f19da17b9aa2a123684152e4894366c",
+    "layout": "Complete, unmodified source archive with the separate inputs below placed in scenario/. An archive export has no git working-tree metadata."
+  },
+  "source_resources": {
+    "overview": "README.md",
+    "package": "pyproject.toml",
+    "dependency_lock": "uv.lock",
+    "media_server_pin": "docs/local-livekit.md",
+    "bridge_contract": "docs/hermes-bridge.md",
+    "microphone_controls": "src/hermes_realtime/host_launcher.py",
+    "wire_models": "src/hermes_realtime/protocol/events.py",
+    "wire_examples": "tests/protocol/test_events.py",
+    "test_suite": "tests/",
+    "timing_reference": "docs/source-backed-latency.md"
+  },
+  "scenario_inputs": {
+    "api_example": "scenario/api_example.py",
+    "diagnostic_record": "scenario/diagnostic.json",
+    "calendar": "scenario/calendar.json",
+    "inference_profiles": "scenario/inference_profiles.json"
+  },
+  "artifact": {
+    "name": "source-8be.zip",
+    "kind": "Complete source snapshot archive, not a released wheel or an official release receipt",
+    "configuration_path": "pyproject.toml"
+  },
+  "public_sources": [
+    "https://packaging.python.org/",
+    "https://github.com/livekit/livekit/releases",
+    "https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API",
+    "https://raw.githubusercontent.com/sushiHex/hermes-realtime/8be7063079ca6247ab853f6fcafdc5b73d470379/src/hermes_realtime/protocol/events.py",
+    "https://api.osv.dev/v1/query",
+    "https://api.weather.gov/points/34.05,-118.25"
+  ],
+  "host_observations": {
+    "scope": "Read-only inspection of the actual qualification host, if separately authorized and demonstrated",
+    "gpu": "Actual NVIDIA process and memory observations; no recorded values supplied here",
+    "tcp_port": 8765
+  },
+  "access": "A directory and listed URL do not establish access. The working directory is not a security sandbox. No personal-account credentials or remote-deployment inventory are supplied."
+}

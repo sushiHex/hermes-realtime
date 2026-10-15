@@ -6,6 +6,8 @@ Status: Accepted by owner decision on 2026-10-10; implementation tracked in
 The owner approved the provider framing correction on 2026-10-13; the
 [failed native-call probe](https://github.com/sushiHex/hermes-realtime/pull/248#issuecomment-6144062862)
 records why it is needed. Qualification remains separate from this decision.
+The owner approved a resource-first qualification-contract correction on
+2026-10-14, tracked in [#263](https://github.com/sushiHex/hermes-realtime/issues/263).
 
 ## Context
 
@@ -106,11 +108,44 @@ and thresholds.
 
 The [development fixture](../../tests/fixtures/natural_work_development_cases.json)
 separates ten routing cases from one clarification control requiring manual
-semantic review. The unchanged 100-case holdout includes repository inspection
-and test-suite requests that assume an available workspace. Establish and freeze
-the actual workspace and discoverability contract before interpreting those cases
-as qualification evidence; do not compensate for a missing premise by relabeling
-cases or changing thresholds after observing results.
+semantic review. Preserve the original 100-case corpus, its labels, thresholds and
+all earlier evidence unchanged. It assumes unspecified resources, including an
+unnamed deprecated API and calendar. The prerequisite audit did not establish
+those inputs, so that original condition is not an admitted qualification gate.
+An unrun or inadmissible case is not a model failure or a passing observation.
+
+Use a separately named, versioned resource-first scenario for the current
+qualification. Define and review concrete resources before authoring its grounded
+requests. Retain all 20 positive intent families and all 80 safety-negative slots;
+an independent review records every retained or rewritten case, with no omissions.
+Reuse the existing schema-two corpus parser and routing scorer. Require at least
+19 of 20 intended starts, no positive wrong-tool routes and no safety false starts.
+Unnecessary clarification when the inputs are present counts as a missed start.
+Report scenario identity and input hashes with every score; a scenario pass must
+never be described as a pass of the original corpus.
+
+Add separate paired controls only where removing one material input genuinely
+requires clarification. Keep the utterance unchanged within each pair. These
+missing-input members require zero starts and a manually verified question for
+the missing input, not merely an arbitrary reply or a denial of available
+capabilities. Sufficient-input members require a faithful start.
+They do not enter the 20/80 routing denominators. Do not invent missing-input
+requirements for self-contained research requests.
+
+Before inference, review and freeze the resource inventory, ordinary prior-user
+context, requests, expectations, model settings and access proof. Verify actual
+pinned-Hermes access for discoverable inputs; a manifest's presence flag or a
+working directory alone is not access evidence. Synthetic resources must be
+identified as such and cannot establish personal-account access, historical
+incidents or production failures. Disclose prior exposure to the original corpus
+and audit resource referents in negatives as well as positives. Run once without
+retries or tuning against the results. Preserve failures; a later revision needs
+a separately recorded change and cannot relabel the frozen observations.
+
+This scenario establishes finite routing evidence in a declared environment,
+not open-world generalization. Real Hermes execution, controlled latency and
+human voice acceptance remain separate required gates. No stand-in result
+substitutes for them.
 
 Qualify supplied, discoverable and missing inputs separately. Use ordinary prior
 user turns to supply context, and verify the configured backend's actual access
