@@ -257,6 +257,9 @@ def test_natural_work_evaluator_failure_diagnostics_are_bounded() -> None:
     assert error.public_error() == {
         "code": "codex_turn_failed",
         "case_id": "nw-001",
+        "completed_cases": 0,
+        "attempted_cases": 1,
+        "failed_attempts": 1,
     }
     assert "provider response containing private material" not in json.dumps(error.public_error())
 
@@ -416,7 +419,7 @@ async def test_legacy_work_handler_binds_without_advertising_model_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_natural_work_evaluator_isolates_cases_and_retries_a_failed_turn(
+async def test_natural_work_evaluator_refuses_first_failed_turn_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     corpus = load_corpus(_NATURAL_WORK_CORPUS)
@@ -432,7 +435,9 @@ async def test_natural_work_evaluator_isolates_cases_and_retries_a_failed_turn(
             return None
 
         async def stream(self, _snapshot: object, *, turn_id: str):
-            del turn_id
+            if turn_id == "turn_preflight":
+                yield "Ready."
+                return
             if self is instances[0]:
                 raise RuntimeError("synthetic transient turn failure")
             if False:
@@ -443,18 +448,19 @@ async def test_natural_work_evaluator_isolates_cases_and_retries_a_failed_turn(
 
     monkeypatch.setattr(_EVALUATOR, "_resolve_codex_executable", lambda _value: "codex")
     monkeypatch.setattr(_EVALUATOR, "_codex_version", lambda _value: "0.145.0")
-    monkeypatch.setattr(_EVALUATOR, "CodexAppServerStreamingInference", FakeInference)
+    monkeypatch.setattr(_EVALUATOR, "_build_streaming_inference", FakeInference)
 
-    report = await _EVALUATOR.run_evaluation(
-        corpus=two_cases,
-        model="gpt-5.6-terra",
-        effort="low",
-        codex_executable=None,
-    )
+    with pytest.raises(_EVALUATOR.EvaluationFailure, match="codex_turn_failed") as failure:
+        await _EVALUATOR.run_evaluation(
+            corpus=two_cases,
+            model="gpt-5.6-terra",
+            effort="low",
+            codex_executable=None,
+        )
 
-    assert len(instances) == 3
+    assert failure.value.public_error()["completed_cases"] == 0
+    assert len(instances) == 1
     assert all(instance.closed for instance in instances)
-    assert report["retries"] == {"count": 1, "case_ids": ["nw-001"]}
 
 
 @pytest.mark.asyncio
@@ -475,7 +481,9 @@ async def test_natural_work_evaluator_does_not_retry_after_a_recorded_tool_call(
             self.handler = handler
 
         async def stream(self, _snapshot: object, *, turn_id: str):
-            del turn_id
+            if turn_id == "turn_preflight":
+                yield "Ready."
+                return
             assert self.handler is not None
             await self.handler.start_work(
                 objective="Synthetic recorded objective",
@@ -490,7 +498,7 @@ async def test_natural_work_evaluator_does_not_retry_after_a_recorded_tool_call(
 
     monkeypatch.setattr(_EVALUATOR, "_resolve_codex_executable", lambda _value: "codex")
     monkeypatch.setattr(_EVALUATOR, "_codex_version", lambda _value: "0.145.0")
-    monkeypatch.setattr(_EVALUATOR, "CodexAppServerStreamingInference", FakeInference)
+    monkeypatch.setattr(_EVALUATOR, "_build_streaming_inference", FakeInference)
 
     with pytest.raises(_EVALUATOR.EvaluationFailure, match="codex_turn_failed"):
         await _EVALUATOR.run_evaluation(
@@ -692,6 +700,9 @@ async def test_natural_work_runner_does_not_invent_semantic_review(monkeypatch) 
             self.handler = handler
 
         async def stream(self, snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+                return
             if self.case.expected_tool == "start_work":
                 await self.handler.start_work(
                     objective="Synthetic work", invocation_id="tool_" + "a" * 32,
@@ -703,7 +714,7 @@ async def test_natural_work_runner_does_not_invent_semantic_review(monkeypatch) 
 
     monkeypatch.setattr(_EVALUATOR, "_resolve_codex_executable", lambda value: "synthetic")
     monkeypatch.setattr(_EVALUATOR, "_codex_version", lambda value: "0.0.0-test")
-    monkeypatch.setattr(_EVALUATOR, "CodexAppServerStreamingInference", FakeInference)
+    monkeypatch.setattr(_EVALUATOR, "_build_streaming_inference", FakeInference)
     report = await _EVALUATOR.run_evaluation(
         corpus=corpus, model="model_test", effort="low", codex_executable=None,
     )
