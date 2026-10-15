@@ -49,7 +49,7 @@ def _discover_native_git() -> Path:
     count = 0
     category: str | None = "authority_refused"
     try:
-        installation = candidate_source_archive_oracle._known_program_files() / "Git"
+        installation: Path = candidate_source_archive_oracle._known_program_files() / "Git"
         # Git for Windows 2.56 migrated from MINGW64 to UCRT64. Both are native
         # images; cmd/bin launchers would introduce another executable identity.
         candidates = tuple(
