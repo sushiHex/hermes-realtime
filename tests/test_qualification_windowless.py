@@ -154,13 +154,13 @@ def _observe_bound_chain(tmp_path: Path) -> None:
 
     if sys.prefix == sys.base_prefix:
         pytest.skip("Actual venv redirector observation requires a venv interpreter")
+    kernel = core._CtypesWindowsKernelV1()
+    api = kernel._api()
     user, station, name, desktop = _private_desktop()
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user.EnumDesktopWindows.argtypes = [wintypes.HANDLE, callback_type, wintypes.LPARAM]
     user.EnumDesktopWindows.restype = wintypes.BOOL
     user.IsWindowVisible.argtypes = [wintypes.HWND]
-    kernel = core._CtypesWindowsKernelV1()
-    api = kernel._api()
     job = root = None
     cleanup = False
     closed = False
@@ -235,9 +235,9 @@ def test_bound_venv_caller_chain_has_no_console_on_private_desktop(tmp_path: Pat
     from scripts import qualify_evidence_slice_zero as core
 
     # Give the real venv chain a console to inherit, wholly off the input desktop.
-    user, station, name, desktop = _private_desktop()
     kernel = core._CtypesWindowsKernelV1()
     api = kernel._api()
+    user, station, name, desktop = _private_desktop()
     job = root = None
     cleanup = closed = False
     program = (
