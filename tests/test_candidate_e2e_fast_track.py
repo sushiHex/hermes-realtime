@@ -338,13 +338,11 @@ def test_git_cli_consumers_deliver_the_measured_image_to_the_archive_oracle(
 def _archive() -> tuple[bytes, object]:
     from scripts import candidate_e2e_fast_track as fast_track
 
-    CandidateArchiveMemberV1 = (
-        fast_track.candidate_source_archive_oracle.CandidateArchiveMemberV1
-    )
+    CandidateArchiveMemberV1 = fast_track.candidate_source_archive_oracle.CandidateArchiveMemberV1
     CandidateSourceArchiveMetadataV1 = fast_track.CandidateSourceArchiveMetadataV1
 
     prefix = "hermes-realtime-0.0.3"
-    payload = b"[project]\nname = \"fixture\"\n"
+    payload = b'[project]\nname = "fixture"\n'
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:") as archive:
         root = tarfile.TarInfo(prefix)
@@ -589,3 +587,75 @@ def test_main_forwards_candidate_and_livekit_ownership_arguments(
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("layout", "digest", "version"),
+    [
+        (
+            "mingw64",
+            "d1b62b94aa15e5c3bbcdd6440d5f716f78daa2736a951b0f1fad11d38c5f16da",
+            "git version 2.55.0.windows.5",
+        ),
+        (
+            "ucrt64",
+            "b824434dfe3b5f9cf648af6c9cc8cb1f6a982cc6e13b6c6ebbe6533c7e51cc2e",
+            "git version 2.56.0.windows.2",
+        ),
+    ],
+    ids=["legacy", "current"],
+)
+def test_oracle_fixture_uses_shared_native_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    digest: str,
+    version: str,
+) -> None:
+    from runpy import run_path
+    from types import SimpleNamespace
+
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    executable = tmp_path / layout / "bin" / "git.exe"
+    observed: list[object] = []
+
+    def measure(path: object) -> object:
+        observed.append(path)
+        return SimpleNamespace(path=executable, sha256=digest, version=version, link_count=4)
+
+    def refuse_unshared_probe(*args: object, **kwargs: object) -> object:
+        raise AssertionError("fixture bypassed shared native discovery")
+
+    monkeypatch.setattr(fast_track, "_measure_git_pin", measure)
+    monkeypatch.setattr(fast_track.subprocess, "run", refuse_unshared_probe)
+    namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
+
+    assert observed == [None]
+    assert namespace["GIT"] == executable
+    assert namespace["_MEASURED_GIT_IDENTITY"] == (digest, version, 4)
+
+
+@pytest.mark.parametrize("changed", ["sha256", "version", "link_count"])
+def test_oracle_fixture_retains_exact_image_identity_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    from runpy import run_path
+    from types import SimpleNamespace
+
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    pin = SimpleNamespace(
+        path=tmp_path / "ucrt64" / "bin" / "git.exe",
+        sha256="b824434dfe3b5f9cf648af6c9cc8cb1f6a982cc6e13b6c6ebbe6533c7e51cc2e",
+        version="git version 2.56.0.windows.2",
+        link_count=4,
+    )
+    setattr(
+        pin,
+        changed,
+        {"sha256": "0" * 64, "version": "git version 2.56.0.windows.3", "link_count": 5}[changed],
+    )
+    monkeypatch.setattr(fast_track, "_measure_git_pin", lambda path: pin)
+    with pytest.raises(RuntimeError, match="unapproved Git fixture identity"):
+        run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
