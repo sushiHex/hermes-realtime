@@ -738,12 +738,18 @@ def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
         return launch.LaunchResult(1, b'{"pass":false}\n')
 
     monkeypatch.setattr(launch, "run_owned_controller", run)
-    monkeypatch.setattr(evaluator, "_verify_controller_source", lambda: None)
+    monkeypatch.setattr(evaluator, "_verify_source_binding", lambda _head, _tree: None)
     binding, digest = _binding(tmp_path)
     code = evaluator.main(
         [
             "--model",
             "synthetic",
+            "--mode",
+            "diagnostic_override",
+            "--source-head",
+            "a" * 40,
+            "--source-tree",
+            "b" * 40,
             "--launch-binding",
             str(binding),
             "--launch-binding-sha256",
@@ -754,17 +760,24 @@ def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
     )
     assert code == 1 and json.loads(capsys.readouterr().out) == {"pass": False}
     assert seen[0][0].resolve() == Path(evaluator.__file__).resolve()
+    assert seen[0][2]["timeout_seconds"] == 3600
     assert seen[0][1] == (
         "--corpus",
         str(evaluator._DEFAULT_CORPUS),
+        "--provider",
+        "codex",
+        "--mode",
+        "diagnostic_override",
+        "--source-head",
+        "a" * 40,
+        "--source-tree",
+        "b" * 40,
         "--model",
         "synthetic",
-        "--effort",
-        "low",
     )
 
 
-def test_legacy_cli_does_not_claim_owned_launch(
+def test_unbound_cli_refuses_before_claiming_owned_launch(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from scripts import evaluate_natural_work_routing as evaluator
@@ -777,7 +790,7 @@ def test_legacy_cli_does_not_claim_owned_launch(
     monkeypatch.setattr(
         launch, "run_owned_controller", lambda *a, **k: pytest.fail("legacy invoked owner")
     )
-    assert evaluator.main([]) == 0
+    assert evaluator.main([]) == 2
     assert "owned" not in capsys.readouterr().out
 
 
@@ -809,6 +822,18 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
             str(receipt),
             "--codex-executable",
             str(tmp_path / "absent.exe"),
+            "--mode",
+            "diagnostic_override",
+            "--source-head",
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+                text=True, capture_output=True,
+            ).stdout.strip(),
+            "--source-tree",
+            subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
+                text=True, capture_output=True,
+            ).stdout.strip(),
         ],
         cwd=root,
         env=environment,
