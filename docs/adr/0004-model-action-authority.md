@@ -77,6 +77,55 @@ validated objective; only its accepted acknowledgment produces started speech.
 Disabling natural work preserves explicit commands. This decision does not
 silently change an already running session.
 
+## Host-authored task status
+
+The owner approved the bounded status path in #270 on 2026-10-15. An admitted
+user turn may select `task_status` alongside reply/start: Ollama uses the exact
+object `{"kind":"task_status"}`; Codex uses the native tool with exact empty
+arguments. Neither surface accepts text, a target, cancellation or approval.
+Only one status selection is permitted. For native tools the first admitted
+choice owns the route; a later status/start choice is refused. A later call cannot
+undo an earlier accepted start, whose background ownership remains independent.
+Readiness, announcements and other non-user turns do not advertise status.
+The status choice shares the existing natural-work binding; when natural work is
+disabled, explicit controls remain available but this model choice is absent.
+
+Providers return an internal typed request, never model-authored status text.
+The current foreground lease renders status directly from the existing task
+controller's authoritative state. Pending acknowledgment, active work, pending
+cancellation, acknowledged cancellation and unavailable authority are distinct.
+An unavailable or unsupported view never means no work. The view is read-only;
+it creates no dispatch, cancellation, approval or second lifecycle registry.
+A snapshot describes the instant it is rendered and may change during playback.
+
+Codex selects host speech before sending its bounded tool receipt, so a peer
+completion during that send cannot discard the selection. The receipt uses the
+existing call deadline; timeout or send failure drains ownership, reports a
+bounded category and closes the adapter to further turns without retry. Matching
+peer terminal state avoids a late interruption, while receipt ownership still
+drains before teardown. Codex then ends the foreground stream and uses its
+existing owned-turn interruption/cleanup. It does not wait for or speak a
+model continuation. Speech emitted before a status selection cannot be undone.
+The speech loop accepts at most one terminal host item and refuses later items.
+Existing generation admission, playback confirmation and interruption rules
+apply to host speech exactly as they apply to ordinary speech.
+
+Host source survives publication, replay, heard context and provider prompt
+metadata. Only transport-confirmed heard text enters context; source changes
+start a separate heard row. Content-free committed-context evidence binds the
+indices of host rows. Provenance is bounded to this process: the existing strict
+voice-tail/archive wire remains unchanged, and persisted/reloaded rows have
+ordinary assistant provenance. No source is reconstructed from wording, and
+historical host speech grants no authority or proof of current state.
+Existing deterministic start acknowledgments retain their previous provenance;
+[#272](https://github.com/sushiHex/hermes-realtime/issues/272) owns any extension
+to them.
+
+This mechanism is truthful by construction when selected. Free replies can
+still make false lifecycle claims, and the model may never select status.
+Retain that counterexample and measure selection and unsupported claims
+separately. No phrase filter, routing model or semantic guarantee is added.
+
 ## Trust and limits
 
 Automatic delegation deliberately trusts the foreground model to recognize the
