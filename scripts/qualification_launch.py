@@ -24,6 +24,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SHA = re.compile(r"[0-9a-f]{64}")
 _MAX_JSON = 65536
 _MAX_OUTPUT = 8 * 1024**2
+# Shared by the guardian and outer qualification callers/proofs. DETACHED_PROCESS
+# must not be added: Windows then ignores CREATE_NO_WINDOW for that process.
+WINDOWLESS_BREAKAWAY_FLAGS = 0x1000000 | 0x200 | 0x8000000
 
 
 def _read(path: Path, maximum: int) -> bytes:
@@ -400,7 +403,7 @@ def run_owned_controller(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=0x1000000 | 0x200 | 0x8000000,
+                creationflags=WINDOWLESS_BREAKAWAY_FLAGS,
                 close_fds=True,
             )
         except OSError as error:

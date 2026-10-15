@@ -208,6 +208,23 @@ controller completion record, retained exit evidence, and an observed empty owne
 Job. Completion is containment/quiescence evidence, not a model/scoring pass or an
 authenticated inventory of all descendant images.
 
+An outer Windows caller that starts the bound virtual-environment interpreter
+must use `scripts.qualification_launch.WINDOWLESS_BREAKAWAY_FLAGS`, including in
+its model-free proof, with NUL stdin and private redirected output. Do not add
+`DETACHED_PROCESS`: [Windows ignores `CREATE_NO_WINDOW` when they are combined](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags).
+Console suppression and lifetime independence are different properties; the
+existing base guardian still checks breakaway and owns the controller Job. This
+constant grants no interpreter, source or execution authority and does not bound
+a caller's output or wait; those remain the caller's existing responsibilities.
+
+The Windows regression observes the actual virtual-environment redirector's
+interpreter child from a console-attached parent on private desktops that are
+never selected for input. Removing `CREATE_NO_WINDOW` or adding `DETACHED_PROCESS`
+leaves the child with a console; the corrected flags leave it without one. This is not attribution
+of the historical visible window's owner, which was not retained. A host that
+cannot run the private-desktop/redirector observation does not establish that
+native coverage. No model or provider runtime participates in this test.
+
 An explicit breakaway can succeed while leaving the guardian in a
 [restrictive ancestor Job](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs).
 That host receives `guardian_inherited_job` before controller
