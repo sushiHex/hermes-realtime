@@ -324,6 +324,14 @@ class _CodexTransportClosed(RuntimeError):
     """Signal the expected protocol EOF during owned transport shutdown."""
 
 
+class _StatusAdmissionExpired(RuntimeError):
+    """A refused admission whose peer cleanup shares one existing cleanup budget."""
+
+    def __init__(self, cleanup_deadline: float) -> None:
+        super().__init__("Codex status admission deadline expired")
+        self.cleanup_deadline = cleanup_deadline
+
+
 class ConversationWorkToolHandler(Protocol):
     @property
     def max_objective_chars(self) -> int: ...
@@ -1383,8 +1391,18 @@ class CodexAppServerStreamingInference:
                     if cleanup_active is not None:
                         cleanup_routing = self._turn_routing.get(
                             (cleanup_active.thread_id, cleanup_active.server_id))
-                        if cleanup_routing is not None and cleanup_routing.host_status_ready:
+                        if cleanup_routing is not None and (
+                            cleanup_routing.host_status_ready
+                            or cleanup_routing.status_selected
+                            or type(cleanup_routing.error) is _StatusAdmissionExpired
+                        ):
                             await self._quiesce_dynamic_turn(cleanup_active)
+                            if type(cleanup_routing.error) is _StatusAdmissionExpired:
+                                if not self._closed:
+                                    interrupt = await self._ensure_interrupt(cleanup_active)
+                                    await asyncio.shield(interrupt)
+                                raise RuntimeError("Codex status admission expired") from (
+                                    cleanup_routing.error)
                             if cleanup_routing.failure.is_set():
                                 raise RuntimeError("Codex status receipt send failed") from (
                                     cleanup_routing.error)
@@ -1579,6 +1597,29 @@ class CodexAppServerStreamingInference:
     async def _interrupt(self, active: _ActiveTurn) -> None:
         await self._quiesce_dynamic_turn(active)
         routing = self._turn_routing.get((active.thread_id, active.server_id))
+        if routing is not None and type(routing.error) is _StatusAdmissionExpired:
+            deadline = routing.error.cleanup_deadline
+            try:
+                async with asyncio.timeout_at(deadline):
+                    async with self._send_lock:
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise TimeoutError("status cleanup deadline expired")
+                        if routing.terminal:
+                            active.terminal = True
+                            return
+                        response = await self._request_locked(
+                            "turn/interrupt",
+                            {"threadId": active.thread_id, "turnId": active.server_id},
+                        )
+                        self._result(response, "turn/interrupt")
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise TimeoutError("status cleanup deadline expired")
+            except BaseException as error:
+                self._fail_status_receipt(routing, "admission_cleanup_interrupt_failed")
+                if not isinstance(error, Exception):
+                    raise
+                raise RuntimeError("Codex status admission cleanup failed") from routing.error
+            return
         if routing is not None and routing.failure.is_set():
             async with self._send_lock:
                 request_id = self._next_request_id
@@ -2382,6 +2423,7 @@ class CodexAppServerStreamingInference:
 
         async def reject() -> None:
             if call is not None and call.tool == "task_status" and routing is not None:
+                call.response_tasks.add(current)
                 await self._send_status_receipt(
                     request_id, call, routing,
                     self._tool_response(_REJECTED_TOOL_RESULT, success=False),
@@ -2564,7 +2606,7 @@ class CodexAppServerStreamingInference:
         # An expired timeout cancels on the next suspension; an immediate send may
         # never suspend. Check the existing deadline before admitting host speech.
         if asyncio.get_running_loop().time() >= call.deadline:
-            self._fail_status_receipt(routing, "deadline")
+            await self._reject_expired_status(request_id, call, routing)
             return
         if routing.status_selected and response.get("success") is True:
             routing.host_status_ready = True
@@ -2577,6 +2619,36 @@ class CodexAppServerStreamingInference:
                 routing, "response_send_deadline" if isinstance(error, TimeoutError)
                 else "response_send_failed", error,
             )
+
+    async def _reject_expired_status(
+        self, request_id: _RequestId, call: _DynamicCall, routing: _TurnRouting,
+    ) -> None:
+        if routing.host_status_ready or (
+            routing.error is not None and type(routing.error) is not _StatusAdmissionExpired
+        ):
+            self._fail_status_receipt(routing, "deadline")
+            return
+        if routing.error is None:
+            routing.error = _StatusAdmissionExpired(
+                asyncio.get_running_loop().time() + min(self._request_timeout, 1.0)
+            )
+            routing.failure.set()
+            self._status_refusal_evidence("admission_deadline")
+        assert type(routing.error) is _StatusAdmissionExpired
+        deadline = routing.error.cleanup_deadline
+        call.response = self._tool_response(_NONCOMMITTAL_TOOL_RESULT, success=False)
+        call.response_ready.set()
+        try:
+            async with asyncio.timeout_at(deadline):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("status cleanup deadline expired")
+                await self._send({"id": request_id, "result": call.response})
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("status cleanup deadline expired")
+        except BaseException as error:
+            self._fail_status_receipt(routing, "admission_cleanup_receipt_failed")
+            if not isinstance(error, Exception):
+                raise
 
     async def _invoke_dynamic_call(
         self, call: _DynamicCall
