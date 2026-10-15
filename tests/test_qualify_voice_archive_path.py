@@ -184,3 +184,49 @@ def test_an_unfrozen_first_send_fails_the_qualification() -> None:
     evidence = _evidence() | {"frozen_resent_unchanged": False}
 
     assert _SCRIPT._passed(evidence, _BASELINE) is False
+
+
+@pytest.mark.parametrize("primary_stop_fails", [False, True])
+def test_a_contender_that_never_exits_is_stopped_with_the_primary(
+    primary_stop_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spawned: list[Any] = []
+
+    class _Process:
+        def __init__(self, mode: str) -> None:
+            self.mode, self.returncode = mode, None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float) -> int:
+            raise _SCRIPT.subprocess.TimeoutExpired("contend", timeout)
+
+    class _Companion:
+        def __init__(self, *_: object) -> None:
+            self.process = _Process(_[4] if len(_) > 4 else "own")
+            spawned.append(self)
+
+        def ready(self) -> int:
+            return 1
+
+        def stop(self) -> int:
+            if primary_stop_fails and self.process.mode == "own":
+                raise OSError("stop file not writable")
+            self.process.returncode = 0
+            return 0
+
+    monkeypatch.setattr(_SCRIPT, "_Companion", _Companion)
+    monkeypatch.setattr(_SCRIPT, "_install_plugin", lambda _home: None)
+    monkeypatch.setattr(_SCRIPT, "_run", lambda *_args: 0)
+
+    with pytest.raises(_SCRIPT.subprocess.TimeoutExpired):
+        _SCRIPT._qualify(Path("hermes-python"))
+
+    assert [owned.process.mode for owned in spawned] == ["own", "contend"]
+    assert spawned[1].process.returncode == 0
+    marker = _SCRIPT.json.loads(capsys.readouterr().out.strip().removeprefix(_SCRIPT._PREFIX))
+    assert marker["failure"] == "TimeoutExpired"
+    assert marker.get("cleanup_failures", []) == (["OSError"] if primary_stop_fails else [])
