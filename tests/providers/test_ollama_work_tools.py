@@ -960,7 +960,9 @@ async def test_deadline_expired_before_admission_has_no_dispatch_effect(kind) ->
         decision_frame(value)], request_timeout_seconds=0.05)
 
     def delay_report(messages, count, completion):
-        time.sleep(0.06)
+        # Exceed the 50 ms deadline by more than the Windows monotonic tick (15.6 ms).
+        # A 60 ms sleep was measured under 50 ms in 27 of 200 trials.
+        time.sleep(0.1)
 
     inference._report_prompt = delay_report
     with pytest.raises(ValueError, match="deadline"):
