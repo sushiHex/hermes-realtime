@@ -839,3 +839,27 @@ async def test_ollama_failed_response_close_remains_owned_across_retries() -> No
     with pytest.raises(OSError, match="response close failed"):
         await inference.close()
     assert response.close_calls == 1
+
+
+def test_reference_kinds_equal_every_section_actually_sent() -> None:
+    request = ConversationInferenceRequest(
+        revision=1,
+        messages=(
+            ConversationMessage("user", "What is running?"),
+            ConversationMessage(
+                "assistant", "No confirmed active background tasks.", source="host_task_status"
+            ),
+            ConversationMessage("user", "And now?"),
+        ),
+        active_tasks=(),
+        terminal_task_count=0,
+        memory=None,
+        updates=(),
+    )
+    messages = OllamaStreamingInference._messages(request)
+    sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
+
+    assert "host_speech_message_indices" in sections
+    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == [
+        kind for kind in sections if kind != "work_state"
+    ]

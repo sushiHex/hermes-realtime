@@ -977,9 +977,10 @@ class OllamaStreamingInference:
         style = require_output_style(
             header.splitlines()[0].removeprefix("Output style: ").removesuffix(".")
         )
+        # Equal to the sections actually sent, so a new section cannot go unreported.
+        # work_state is always present and is state, not a reference kind.
         return {"output_style": style, "reference_kinds": [
-            kind for kind in ("memory", "active_work", "updates", "speech_delivery")
-            if kind in sections
+            kind for kind in sections if kind != "work_state"
         ]}
 
     def _report_prompt(
