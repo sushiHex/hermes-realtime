@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """Evaluate Codex natural-work routing without dispatching Hermes work."""
 
 from __future__ import annotations
@@ -16,6 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Never, cast
 
+_ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    sys.path[:0] = [str(_ROOT / "src"), str(_ROOT)]
+
 from hermes_realtime.conversation.context import (
     ActiveTaskSummary,
     ConversationContextSnapshot,
@@ -28,7 +33,6 @@ from hermes_realtime.providers.codex_app_server import (
     _subscription_environment,
 )
 
-_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CORPUS = _ROOT / "tests" / "fixtures" / "natural_work_intent_cases.json"
 _CATEGORIES = (
     "positive_start",
@@ -747,12 +751,63 @@ def _parser() -> argparse.ArgumentParser:
         default="low",
     )
     parser.add_argument("--codex-executable")
+    parser.add_argument("--launch-binding", type=Path)
+    parser.add_argument("--launch-binding-sha256")
+    parser.add_argument("--launch-receipt", type=Path)
     return parser
+
+
+def _verify_controller_source() -> None:
+    from hermes_realtime import __file__ as package_file
+    from hermes_realtime.conversation import context, work_tools
+    from hermes_realtime.providers import codex_app_server
+
+    observed = (
+        (package_file, "__init__.py"),
+        (context.__file__, "conversation/context.py"),
+        (work_tools.__file__, "conversation/work_tools.py"),
+        (codex_app_server.__file__, "providers/codex_app_server.py"),
+    )
+    if any(
+        Path(path).resolve() != _ROOT / "src/hermes_realtime" / relative
+        for path, relative in observed
+    ):
+        raise ValueError("evaluator_source_binding")
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        _verify_controller_source()
+        launch_options = (
+            arguments.launch_binding,
+            arguments.launch_binding_sha256,
+            arguments.launch_receipt,
+        )
+        if any(value is not None for value in launch_options):
+            if any(value is None for value in launch_options):
+                raise ValueError("owned launch requires binding, digest and receipt")
+            from scripts.qualification_launch import run_owned_controller
+
+            controller_arguments: tuple[str, ...] = (
+                "--corpus",
+                str(arguments.corpus),
+                "--model",
+                arguments.model,
+                "--effort",
+                arguments.effort,
+            )
+            if arguments.codex_executable is not None:
+                controller_arguments += ("--codex-executable", arguments.codex_executable)
+            result = run_owned_controller(
+                Path(__file__),
+                controller_arguments,
+                binding_path=arguments.launch_binding,
+                binding_sha256=arguments.launch_binding_sha256,
+                receipt=arguments.launch_receipt,
+            )
+            print(result.stdout.decode("utf-8"), end="")
+            return cast(int, result.exit_code)
         corpus = load_corpus(arguments.corpus)
         report = asyncio.run(
             run_evaluation(

@@ -140,6 +140,75 @@ Blind A/B review can compare prompt candidates, but desktop/iPhone listening rem
 for warmth, pacing, silence, echo, repetition, barge-in feel, and whether optional follow-up
 questions make the exchange feel engaged rather than interrogative.
 
+## Opted-in Windows evaluator ownership
+
+The existing routing evaluator can run under an independent base-Python guardian:
+
+```sh
+python -m scripts.evaluate_natural_work_routing \
+  --launch-binding interpreter-binding.json \
+  --launch-binding-sha256 APPROVED_SHA256 \
+  --launch-receipt private-launch.jsonl \
+  --model SELECTED_MODEL
+```
+
+The private binding has exactly this versioned shape; supply absolute local paths
+and SHA-256s of their exact executable bytes. The guardian must be the current
+interpreter's `sys._base_executable`; the controller must be `sys.executable`.
+Keep this file, receipt and retained output private; do not commit local paths.
+
+```json
+{"schema_version":1,"guardian":{"path":"ABSOLUTE_BASE_PYTHON","sha256":"SHA256"},"controller":{"path":"ABSOLUTE_CONTROLLER_PYTHON","sha256":"SHA256"}}
+```
+
+All three launch options are required together. Without them the legacy CLI stays
+in-process and claims no guardian ownership. The selected model, effort, corpus,
+existing retry policy and scoring remain unchanged. The script entrypoint selects
+its own candidate source before product imports and refuses already loaded modules
+from another checkout before evaluation.
+
+The default launch requests explicit Job breakaway, hides the process and verifies
+the actual base guardian is outside inherited Jobs. Windows may refuse breakaway;
+`breakaway_not_permitted` is a recorded refusal with no fallback. The generic
+Windows kernel associates the controller with its noninherited kill-on-close Job
+atomically while suspended. The controller retains its explicit interpreter and
+uses private output files plus NUL input. A completed launch needs a normal
+controller completion record, retained exit evidence, and an observed empty owned
+Job. Completion is containment/quiescence evidence, not a model/scoring pass or an
+authenticated inventory of all descendant images.
+
+An explicit breakaway can succeed while leaving the guardian in a
+[restrictive ancestor Job](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs).
+That host receives `guardian_inherited_job` before controller
+execution; it is not a supported fallback execution mode. Windows tests use an
+independent base-Python/Win32 capability probe and verify the actual API and CLI
+refuse without starting a controller on constrained hosts. Controller-dependent
+native fault tests are then explicitly reported as unexercised, rather than
+claimed as completion coverage. Supported hosts still run those paths; synthetic
+kernel, binding and watchdog checks remain independent of host capability.
+
+The fresh receipt and adjacent `.work` directory are retained, including after
+caller interruption. Missing final evidence remains incomplete; do not infer
+cleanup or automatically retry. The guardian has its own bounded deadline
+(four hours maximum, plus at most thirty seconds for cleanup). Retained stdout is
+limited to 8 MiB, stderr to 64 KiB; size polling rejects excess every 50 ms. This
+is an acceptance/polling bound, not a hard disk-write quota. The Job's explicit
+64 GiB per-process / 128 GiB aggregate limits do not replace a provider's GPU or
+memory admission contract.
+
+The observer checks its execution deadline after each bounded wait, before
+accepting a signaled exit, and its cleanup deadline before accepting a zero-active
+observation. After verified Job quiescence, final stdout, stderr
+and completion reads enforce their acceptance bounds again.
+
+`scripts.qualification_launch.run_owned_controller` is also a caller-bound script
+API: it hashes and executes the exact external controller bytes without importing
+the tooling package into that controller's namespace. The caller remains responsible
+for controller dependencies, runtime provenance, source/bootstrap checks, provider
+budgets and sanitized public reports. Interpreter hashes alone do not attest their
+complete dependency closure. This ownership slice does not complete reusable
+provider qualification, real dispatch, or human voice acceptance.
+
 ## Installed natural-work boundary and latency gate
 
 Before enabling natural Codex work routing by default, run the installed-boundary
