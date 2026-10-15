@@ -1,10 +1,11 @@
 # ruff: noqa: E402
-"""Evaluate Codex natural-work routing without dispatching Hermes work."""
+"""Evaluate configured-provider natural-work routing without dispatching Hermes work."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import math
 import os
@@ -12,10 +13,10 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Never, cast
+from typing import Any, Never, TypedDict, cast
 
 _ROOT = Path(__file__).resolve().parents[1]
 if __name__ == "__main__":
@@ -23,15 +24,27 @@ if __name__ == "__main__":
 
 from hermes_realtime.conversation.context import (
     ActiveTaskSummary,
-    ConversationContextSnapshot,
     ConversationMessage,
 )
+from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
+from hermes_realtime.host_launcher import (
+    _build_streaming_inference,
+    build_local_host_launcher,
+)
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
     _resolve_codex_executable,
     _subscription_environment,
 )
+from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+_READINESS_BUDGET_SECONDS = 20.0
+_DECISION_BUDGET_SECONDS = 60.0
+_CLOSE_BUDGET_SECONDS = 10.0
+_EVALUATION_BUDGET_SECONDS = 3500.0
+_OWNED_DEADLINE_SECONDS = 3600
+_DEFAULT_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 
 _DEFAULT_CORPUS = _ROOT / "tests" / "fixtures" / "natural_work_intent_cases.json"
 _CATEGORIES = (
@@ -65,15 +78,15 @@ _TERMINAL_HISTORY_CASE_IDS = frozenset({"nw-098"})
 
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
 _CASE_ID = re.compile(r"nw-[0-9]{3}\Z")
-_INVOCATION_ID = re.compile(r"tool_[0-9a-f]{32}\Z")
+_INVOCATION_ID = re.compile(r"(?:tool_[0-9a-f]{32}|ollama_work_[0-9a-f]{64})\Z")
 _PUBLIC_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}\Z")
+_GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
 
 _VERSION = re.compile(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)")
 _MAX_CORPUS_BYTES = 256 * 1024
 _MAX_DESCRIPTION_CHARS = 512
 _MAX_UTTERANCE_CHARS = 1024
 _MAX_CALLS_PER_CASE = 16
-_MAX_CASE_ATTEMPTS = 2
 _ACTIVE_TASK = ActiveTaskSummary(
     task_id="task_shadow_active",
     objective="Synthetic active background work for routing evaluation.",
@@ -142,25 +155,84 @@ class CaseObservation:
 class EvaluationFailure(RuntimeError):
     """A bounded public failure classification with no provider text."""
 
-    def __init__(self, code: str, *, case_id: str | None = None) -> None:
-        if code not in {"codex_setup_failed", "codex_turn_failed"}:
+    def __init__(
+        self, code: str, *, case_id: str | None = None, completed_cases: int = 0,
+        secondary_categories: tuple[str, ...] = (),
+        attempt_started: bool | None = None,
+    ) -> None:
+        if code not in {
+            "codex_setup_failed", "codex_turn_failed", "provider_readiness_failed",
+            "provider_turn_failed", "evaluation_timed_out", "provider_cleanup_failed",
+        }:
             raise ValueError("unsupported evaluation failure code")
         if case_id is not None and _CASE_ID.fullmatch(case_id) is None:
             raise ValueError("evaluation failure case_id is invalid")
+        if type(completed_cases) is not int or completed_cases < 0:
+            raise ValueError("completed_cases must be a non-negative integer")
+        if attempt_started is not None and type(attempt_started) is not bool:
+            raise ValueError("attempt_started must be an exact boolean or None")
+        if type(secondary_categories) is not tuple or any(
+            category not in ("provider_cleanup_failed", "source_binding_failed")
+            for category in secondary_categories
+        ) or len(set(secondary_categories)) != len(secondary_categories):
+            raise ValueError("unsupported secondary failure category")
         super().__init__(code)
         self.code = code
         self.case_id = case_id
+        self.completed_cases = completed_cases
+        self.secondary_categories = secondary_categories
+        self.attempt_started = (
+            attempt_started if attempt_started is not None
+            else case_id is not None and code != "evaluation_timed_out"
+        )
 
-    def public_error(self) -> dict[str, str]:
-        error = {"code": self.code}
+    def public_error(self) -> dict[str, object]:
+        attempted_cases = self.completed_cases + int(self.attempt_started)
+        error: dict[str, object] = {
+            "code": self.code, "completed_cases": self.completed_cases,
+            "attempted_cases": attempted_cases,
+            "failed_attempts": attempted_cases - self.completed_cases,
+        }
         if self.case_id is not None:
             error["case_id"] = self.case_id
+        if self.secondary_categories:
+            error["secondary_categories"] = list(self.secondary_categories)
         return error
+
+
+class SourceBindingFailure(ValueError):
+    """The invoked source does not match the declared candidate."""
+
+
+class OwnedLaunchFailure(RuntimeError):
+    """A failed owned launch with a bounded classification of its retained receipt."""
+
+    def __init__(self, summary: dict[str, object]) -> None:
+        super().__init__("owned_launch_failed")
+        self.summary = summary
+
+
+class OwnedResultFailure(RuntimeError):
+    """The owned controller completed but returned a nonpassing result."""
+
+
+class ProviderOptions(TypedDict):
+    provider: str
+    mode: str
+    model: str
+    effort: str
+    codex_executable: str | None
+    ollama_base_url: str
+    ollama_num_ctx: int | None
 
 
 def _validate_latency(value: float) -> None:
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
         raise ValueError("latency must be a finite non-negative number")
+
+
+def _is_speakable(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -522,10 +594,11 @@ class ShadowWorkHandler:
 
     max_objective_chars = _MAX_UTTERANCE_CHARS
 
-    def __init__(self, *, can_cancel_work: bool) -> None:
-        if type(can_cancel_work) is not bool:
-            raise TypeError("shadow cancellation availability must be an exact boolean")
+    def __init__(self, *, can_cancel_work: bool, accept_start: bool = True) -> None:
+        if type(can_cancel_work) is not bool or type(accept_start) is not bool:
+            raise TypeError("shadow acknowledgment options must be exact booleans")
         self.can_cancel_work = can_cancel_work
+        self.accept_start = accept_start
         self._case_id: str | None = None
         self._started_at: float | None = None
         self._tools: list[str] = []
@@ -556,6 +629,10 @@ class ShadowWorkHandler:
         ):
             raise ValueError("shadow start objective is invalid")
         self._record("start_work", invocation_id)
+        if not self.accept_start:
+            return WorkStartResult(
+                accepted=False, state="rejected", reason="synthetic capacity refusal",
+            )
         return WorkStartResult(
             accepted=True,
             state="active",
@@ -619,7 +696,7 @@ class ShadowWorkHandler:
         self._latencies_ms.append((time.perf_counter() - self._started_at) * 1000)
 
 
-def _snapshot(case: IntentCase, revision: int) -> ConversationContextSnapshot:
+def _snapshot(case: IntentCase, revision: int) -> ConversationInferenceRequest:
     active_tasks = (
         (_ACTIVE_TASK,)
         if case.category in _ACTIVE_CONTEXT_CATEGORIES
@@ -627,11 +704,12 @@ def _snapshot(case: IntentCase, revision: int) -> ConversationContextSnapshot:
         or case.case_id in _ACTIVE_CONTEXT_CASE_IDS
         else ()
     )
-    return ConversationContextSnapshot(
+    return ConversationInferenceRequest(
         revision=revision,
         messages=(ConversationMessage(role="user", text=case.utterance),),
         active_tasks=active_tasks,
         terminal_task_count=(1 if case.case_id in _TERMINAL_HISTORY_CASE_IDS else 0),
+        updates=(),
     )
 
 
@@ -641,6 +719,7 @@ def _codex_version(executable: str) -> str:
         [executable, "--version"],
         check=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -648,10 +727,68 @@ def _codex_version(executable: str) -> str:
         env=_subscription_environment(os.environ),
         creationflags=creationflags,
     )
+    if len(completed.stdout) > 4096 or len(completed.stderr) > 4096:
+        raise RuntimeError("Codex CLI version output exceeded the qualification bound")
     match = _VERSION.search(completed.stdout)
     if match is None:
         raise RuntimeError("Codex CLI returned an unrecognized version")
     return match.group(1)
+
+
+async def _open_qualified_inference(
+    *,
+    provider: str,
+    model: str,
+    effort: str,
+    codex_executable: str | None,
+    ollama_base_url: str,
+    ollama_num_ctx: int | None,
+    handler: ShadowWorkHandler,
+    deadline: float | None = None,
+) -> OllamaStreamingInference | CodexAppServerStreamingInference:
+    """Use the host factory, then admit tools only after tool-less readiness."""
+
+    inference = _build_streaming_inference(
+        inference_provider=provider,
+        ollama_base_url=ollama_base_url,
+        ollama_model=model,
+        codex_model=model,
+        codex_effort=effort,
+        codex_executable=codex_executable,
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        readiness_deadline = loop.time() + _READINESS_BUDGET_SECONDS
+        if deadline is not None:
+            readiness_deadline = min(readiness_deadline, deadline)
+        async with asyncio.timeout_at(readiness_deadline):
+            if provider == "ollama" and ollama_num_ctx is not None:
+                await cast(OllamaStreamingInference, inference).configure_context(ollama_num_ctx)
+            preflight = ConversationInferenceRequest(
+                revision=0,
+                messages=(ConversationMessage(
+                    role="user", text="Reply with one short sentence confirming readiness."
+                ),),
+                active_tasks=(),
+                updates=(),
+            )
+            spoke = False
+            async for part in inference.stream(preflight, turn_id="turn_preflight"):
+                if type(part) is not str:
+                    raise RuntimeError("qualification preflight emitted unsupported output")
+                spoke = spoke or _is_speakable(part)
+        if not spoke:
+            raise RuntimeError("qualification preflight produced no speakable output")
+        inference.bind_work_tools(handler)
+    except BaseException as primary:
+        try:
+            await asyncio.wait_for(inference.close(), timeout=_CLOSE_BUDGET_SECONDS)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "qualification preflight and adapter cleanup failed", [primary, cleanup]
+            ) from None
+        raise
+    return inference
 
 
 async def run_evaluation(
@@ -660,80 +797,157 @@ async def run_evaluation(
     model: str,
     effort: str,
     codex_executable: str | None,
+    provider: str = "codex",
+    mode: str = "diagnostic_override",
+    ollama_base_url: str = _DEFAULT_OLLAMA_ORIGIN,
+    ollama_num_ctx: int | None = None,
 ) -> dict[str, Any]:
-    """Run every case sequentially through the production Codex adapter."""
+    """Run every case sequentially through the selected production adapter."""
 
-    try:
-        executable = _resolve_codex_executable(codex_executable)
-        version = _codex_version(executable)
-    except Exception as error:
-        raise EvaluationFailure("codex_setup_failed") from error
+    if provider not in ("codex", "ollama") or mode not in (
+        "production_default", "diagnostic_override"
+    ):
+        raise ValueError("qualification provider or mode is invalid")
+    if provider == "codex" and ollama_num_ctx is not None:
+        raise ValueError("Ollama context is not a Codex option")
+    if provider == "ollama" and codex_executable is not None:
+        raise ValueError("Codex executable is not an Ollama option")
+    if mode == "production_default":
+        defaults = _host_provider_defaults()
+        if (
+            model != defaults[f"{provider}_model"]
+            or effort != defaults["codex_effort"]
+            or ollama_base_url != defaults["ollama_base_url"]
+            or ollama_num_ctx != defaults["ollama_num_ctx"]
+            or codex_executable != defaults["codex_executable"]
+        ):
+            raise ValueError("production_default settings differ from the host")
+    loop = asyncio.get_running_loop()
+    total_deadline = loop.time() + _EVALUATION_BUDGET_SECONDS
+    executable: str | None = None
+    version = "unknown"
+    if provider == "codex":
+        try:
+            executable = _resolve_codex_executable(codex_executable)
+            version = _codex_version(executable)
+        except Exception as error:
+            raise EvaluationFailure("codex_setup_failed") from error
     observations: list[CaseObservation] = []
-    retried_case_ids: list[str] = []
     for revision, case in enumerate(corpus.cases, start=1):
         snapshot = _snapshot(case, revision)
-        final_error: Exception | None = None
-        for attempt in range(_MAX_CASE_ATTEMPTS):
-            handler = ShadowWorkHandler(can_cancel_work=bool(snapshot.active_tasks))
-            inference = CodexAppServerStreamingInference(
-                model=model,
-                effort=effort,
-                codex_executable=executable,
-                request_timeout_seconds=60.0,
+        if loop.time() >= total_deadline:
+            raise EvaluationFailure(
+                "evaluation_timed_out", case_id=case.case_id,
+                completed_cases=len(observations),
             )
-            inference.bind_work_tools(handler)
-            started_at = time.perf_counter()
-            handler.begin_case(case.case_id, started_at=started_at)
-            first_speakable: float | None = None
-            unauthorized_continuation_claim: bool | None = None
-            attempt_error: Exception | None = None
-            try:
-                async for _segment in inference.stream(
-                    snapshot,
-                    turn_id=f"turn_eval_{case.case_id.replace('-', '_')}_{attempt + 1}",
+        handler = ShadowWorkHandler(can_cancel_work=bool(snapshot.active_tasks))
+        try:
+            inference = await _open_qualified_inference(
+                provider=provider, model=model, effort=effort,
+                codex_executable=executable, ollama_base_url=ollama_base_url,
+                ollama_num_ctx=ollama_num_ctx, handler=handler,
+                deadline=total_deadline,
+            )
+        except Exception as error:
+            raise EvaluationFailure(
+                "provider_readiness_failed", case_id=case.case_id,
+                completed_cases=len(observations),
+                secondary_categories=("provider_cleanup_failed",)
+                if isinstance(error, BaseExceptionGroup) else (),
+            ) from error
+        started_at = time.perf_counter()
+        handler.begin_case(case.case_id, started_at=started_at)
+        first_speakable: float | None = None
+        attempt_error: Exception | None = None
+        try:
+            async with asyncio.timeout_at(
+                min(loop.time() + _DECISION_BUDGET_SECONDS, total_deadline)
+            ):
+                async for segment in inference.stream(
+                    snapshot, turn_id=f"turn_eval_{case.case_id.replace('-', '_')}_1",
                 ):
-                    if first_speakable is None:
+                    if type(segment) is not str:
+                        raise RuntimeError("qualification decision emitted unsupported output")
+                    if first_speakable is None and _is_speakable(segment):
                         first_speakable = (time.perf_counter() - started_at) * 1000
-            except Exception as error:
-                attempt_error = error
-            except BaseException:
-                handler.abandon_case()
-                with suppress(Exception):
-                    await inference.close()
-                raise
-            try:
-                await inference.close()
-            except Exception as error:
-                if attempt_error is None:
-                    attempt_error = error
-
-            if attempt_error is None:
-                observations.append(
-                    handler.finish_case(
-                        first_speakable_latency_ms=first_speakable,
-                        unauthorized_continuation_claim=unauthorized_continuation_claim,
-                    )
-                )
-                break
-            if handler.has_recorded_tools:
-                raise EvaluationFailure(
-                    "codex_turn_failed", case_id=case.case_id
-                ) from attempt_error
+        except Exception as error:
+            attempt_error = error
+        except BaseException:
             handler.abandon_case()
-            final_error = attempt_error
-            if attempt + 1 < _MAX_CASE_ATTEMPTS:
-                retried_case_ids.append(case.case_id)
-        else:
-            assert final_error is not None
-            raise EvaluationFailure("codex_turn_failed", case_id=case.case_id) from final_error
-    return routing_report(
+            with suppress(Exception):
+                await asyncio.wait_for(inference.close(), timeout=_CLOSE_BUDGET_SECONDS)
+            raise
+        cleanup_error: Exception | None = None
+        try:
+            await asyncio.wait_for(inference.close(), timeout=_CLOSE_BUDGET_SECONDS)
+        except Exception as error:
+            cleanup_error = error
+
+        if cleanup_error is not None:
+            handler.abandon_case()
+            if attempt_error is not None:
+                raise EvaluationFailure(
+                    "codex_turn_failed" if provider == "codex" else "provider_turn_failed",
+                    case_id=case.case_id, completed_cases=len(observations),
+                    secondary_categories=("provider_cleanup_failed",),
+                ) from ExceptionGroup(
+                    "qualification decision and cleanup failed", [attempt_error, cleanup_error]
+                )
+            raise EvaluationFailure(
+                "provider_cleanup_failed", case_id=case.case_id,
+                completed_cases=len(observations),
+            ) from cleanup_error
+        if attempt_error is not None:
+            handler.abandon_case()
+            raise EvaluationFailure(
+                "codex_turn_failed" if provider == "codex" else "provider_turn_failed",
+                case_id=case.case_id, completed_cases=len(observations),
+            ) from attempt_error
+        if loop.time() >= total_deadline:
+            handler.abandon_case()
+            raise EvaluationFailure(
+                "evaluation_timed_out", case_id=case.case_id,
+                completed_cases=len(observations), attempt_started=True,
+            )
+        observations.append(
+            handler.finish_case(
+                first_speakable_latency_ms=first_speakable,
+                unauthorized_continuation_claim=None,
+            )
+        )
+    report = routing_report(
         corpus=corpus,
         observations=observations,
         model=model,
         effort=effort,
         codex_version=version,
-        retried_case_ids=tuple(retried_case_ids),
+        retried_case_ids=(),
     )
+    report.update({
+        "schema_version": 4,
+        "provider": provider,
+        "mode": mode,
+        "attempt_policy": "single_attempt_per_case",
+        "process_evidence": {
+            "adapter_lifetime": "fresh_per_case",
+            "external_runtime_cache": "unknown",
+            "provider_process_freshness": "unknown",
+        },
+        "budgets_seconds": {
+            "readiness_per_attempt": _READINESS_BUDGET_SECONDS,
+            "decision_per_attempt": _DECISION_BUDGET_SECONDS,
+            "close_per_attempt": _CLOSE_BUDGET_SECONDS,
+            "total_evaluation": _EVALUATION_BUDGET_SECONDS,
+        },
+    })
+    if provider == "ollama":
+        del report["codex_version"]
+        del report["effort"]
+        report["runtime_version"] = "unknown"
+        report["ollama_context_tokens"] = (
+            ollama_num_ctx if ollama_num_ctx is not None else "adapter_default"
+        )
+    return report
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -744,44 +958,217 @@ class _JsonArgumentParser(argparse.ArgumentParser):
 
 def _parser() -> argparse.ArgumentParser:
     parser = _JsonArgumentParser(
-        description="Run the side-effect-free Codex natural-work routing evaluation."
+        description="Run side-effect-free natural-work routing through a configured provider."
     )
     parser.add_argument("--corpus", type=Path, default=_DEFAULT_CORPUS)
-    parser.add_argument("--model", default="gpt-5.6-terra")
+    parser.add_argument("--provider", choices=("codex", "ollama"), default="codex")
+    parser.add_argument(
+        "--mode", choices=("production_default", "diagnostic_override"),
+        default="production_default",
+    )
+    parser.add_argument("--model")
     parser.add_argument(
         "--effort",
         choices=("none", "low", "medium", "high", "xhigh", "max", "ultra"),
-        default="low",
+        default=None,
     )
     parser.add_argument("--codex-executable")
+    parser.add_argument("--ollama-base-url")
+    parser.add_argument("--ollama-num-ctx", type=int)
     parser.add_argument("--launch-binding", type=Path)
     parser.add_argument("--launch-binding-sha256")
     parser.add_argument("--launch-receipt", type=Path)
+    parser.add_argument("--source-head", required=True)
+    parser.add_argument("--source-tree", required=True)
     return parser
 
 
+def _host_provider_defaults() -> dict[str, object]:
+    parameters = inspect.signature(build_local_host_launcher).parameters
+    return {
+        name: parameters[name].default
+        for name in (
+            "ollama_base_url", "ollama_model", "ollama_num_ctx", "codex_model",
+            "codex_effort", "codex_executable",
+        )
+    }
+
+
+def _resolved_provider_options(arguments: argparse.Namespace) -> ProviderOptions:
+    defaults = _host_provider_defaults()
+    explicit = {
+        name for name in (
+            "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx"
+        ) if getattr(arguments, name) is not None
+    }
+    if arguments.mode == "production_default" and explicit:
+        raise ValueError("production_default refuses diagnostic overrides")
+    if arguments.provider == "codex" and explicit & {"ollama_base_url", "ollama_num_ctx"}:
+        raise ValueError("Codex refuses Ollama options")
+    if arguments.provider == "ollama" and explicit & {"effort", "codex_executable"}:
+        raise ValueError("Ollama refuses Codex options")
+    provider = cast(str, arguments.provider)
+    model = cast(str, arguments.model or defaults[f"{provider}_model"])
+    effort = cast(str, arguments.effort or defaults["codex_effort"])
+    base_url = cast(str, arguments.ollama_base_url or defaults["ollama_base_url"])
+    num_ctx = cast(int | None, (
+        arguments.ollama_num_ctx
+        if arguments.ollama_num_ctx is not None else defaults["ollama_num_ctx"]
+    ))
+    executable = cast(str | None, (
+        arguments.codex_executable
+        if arguments.codex_executable is not None else defaults["codex_executable"]
+    ))
+    if (
+        type(model) is not str or _PUBLIC_LABEL.fullmatch(model) is None
+        or type(effort) is not str or _PUBLIC_LABEL.fullmatch(effort) is None
+        or type(base_url) is not str
+    ):
+        raise ValueError("resolved provider settings are invalid")
+    return {
+        "provider": provider, "mode": cast(str, arguments.mode),
+        "model": model, "effort": effort,
+        "codex_executable": executable,
+        "ollama_base_url": base_url, "ollama_num_ctx": num_ctx,
+    }
+
+
 def _verify_controller_source() -> None:
+    import scripts
     from hermes_realtime import __file__ as package_file
-    from hermes_realtime.conversation import context, work_tools
-    from hermes_realtime.providers import codex_app_server
+    from hermes_realtime import host_launcher
+    from hermes_realtime.conversation import context, streaming, work_tools
+    from hermes_realtime.providers import codex_app_server, ollama
+    from scripts import qualification_launch
 
     observed = (
         (package_file, "__init__.py"),
         (context.__file__, "conversation/context.py"),
         (work_tools.__file__, "conversation/work_tools.py"),
+        (streaming.__file__, "conversation/streaming.py"),
         (codex_app_server.__file__, "providers/codex_app_server.py"),
+        (ollama.__file__, "providers/ollama.py"),
+        (host_launcher.__file__, "host_launcher.py"),
     )
     if any(
         Path(path).resolve() != _ROOT / "src/hermes_realtime" / relative
         for path, relative in observed
     ):
         raise ValueError("evaluator_source_binding")
+    if (
+        Path(__file__).resolve() != _ROOT / "scripts/evaluate_natural_work_routing.py"
+        or Path(scripts.__file__).resolve() != _ROOT / "scripts/__init__.py"
+        or Path(qualification_launch.__file__).resolve()
+        != _ROOT / "scripts/qualification_launch.py"
+        or _build_streaming_inference is not host_launcher._build_streaming_inference
+        or build_local_host_launcher is not host_launcher.build_local_host_launcher
+        or CodexAppServerStreamingInference is not codex_app_server.CodexAppServerStreamingInference
+        or OllamaStreamingInference is not ollama.OllamaStreamingInference
+    ):
+        raise ValueError("evaluator_script_binding")
+
+
+def _git_value(*arguments: str) -> str:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    completed = subprocess.run(
+        ["git", "-C", str(_ROOT), *arguments], stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+        timeout=5, creationflags=creationflags,
+    )
+    if completed.returncode != 0 or len(completed.stdout) > 4096:
+        raise SourceBindingFailure("source_binding_failed")
+    try:
+        return completed.stdout.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise SourceBindingFailure("source_binding_failed") from error
+
+
+def _git_source() -> tuple[str, str, bool]:
+    root = _git_value("rev-parse", "--show-toplevel")
+    if Path(root).resolve() != _ROOT:
+        raise SourceBindingFailure("source_binding_failed")
+    head = _git_value("rev-parse", "HEAD")
+    tree = _git_value("rev-parse", "HEAD^{tree}")
+    clean = not _git_value("status", "--porcelain", "--untracked-files=all")
+    return head, tree, clean
+
+
+def _verify_source_binding(head: str, tree: str) -> None:
+    if (
+        type(head) is not str or _GIT_OBJECT.fullmatch(head) is None
+        or type(tree) is not str or _GIT_OBJECT.fullmatch(tree) is None
+    ):
+        raise SourceBindingFailure("source_binding_failed")
+    try:
+        _verify_controller_source()
+    except Exception as error:
+        raise SourceBindingFailure("source_binding_failed") from error
+    try:
+        current_head, current_tree, clean = _git_source()
+    except Exception as error:
+        raise SourceBindingFailure("source_binding_failed") from error
+    if (current_head, current_tree, clean) != (head, tree, True):
+        raise SourceBindingFailure("source_binding_failed")
+
+
+def _failed_launch_summary(receipt: Path) -> dict[str, object]:
+    missing: dict[str, object] = {"receipt_status": "missing_or_malformed"}
+    try:
+        with receipt.open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            return missing
+        lines = raw.splitlines()
+        if not lines:
+            return missing
+
+        def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            value: dict[str, object] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate receipt field")
+                value[key] = item
+            return value
+
+        row = json.loads(lines[-1], object_pairs_hook=exact_object)
+        if type(row) is not dict:
+            return missing
+        stage = row.get("stage")
+        if stage == "complete":
+            return {"receipt_status": "complete_but_unverified"}
+        if stage not in ("incomplete", "refused", "observer_timeout", "observer_interrupted"):
+            return missing
+        category = row.get("category")
+        if category is not None and category not in (
+            "guardian_inherited_job", "timed_out", "invalid_input", "execution_failed",
+            "breakaway_not_permitted", "guardian_spawn_failed", "guardian_timeout",
+            "interrupted",
+        ):
+            return missing
+        cleanup = row.get("cleanup_verified")
+        completed = row.get("controller_completed")
+        if cleanup is not None and type(cleanup) is not bool:
+            return missing
+        if completed is not None and type(completed) is not bool:
+            return missing
+        return {
+            "receipt_status": "valid_unsuccessful", "stage": stage,
+            "category": category, "cleanup_verified": cleanup,
+            "controller_completed": completed,
+        }
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return missing
 
 
 def main(argv: list[str] | None = None) -> int:
+    category = "refused"
+    completed_cases = 0
+    source_secondary = False
+    marker_secondary: list[str] = []
     try:
         arguments = _parser().parse_args(argv)
-        _verify_controller_source()
+        _verify_source_binding(arguments.source_head, arguments.source_tree)
+        selected = _resolved_provider_options(arguments)
         launch_options = (
             arguments.launch_binding,
             arguments.launch_binding_sha256,
@@ -795,49 +1182,159 @@ def main(argv: list[str] | None = None) -> int:
             controller_arguments: tuple[str, ...] = (
                 "--corpus",
                 str(arguments.corpus),
-                "--model",
-                arguments.model,
-                "--effort",
-                arguments.effort,
+                "--provider",
+                arguments.provider,
+                "--mode",
+                arguments.mode,
+                "--source-head",
+                arguments.source_head,
+                "--source-tree",
+                arguments.source_tree,
             )
+            if arguments.model is not None:
+                controller_arguments += ("--model", arguments.model)
+            if arguments.effort is not None:
+                controller_arguments += ("--effort", arguments.effort)
             if arguments.codex_executable is not None:
                 controller_arguments += ("--codex-executable", arguments.codex_executable)
-            result = run_owned_controller(
-                Path(__file__),
-                controller_arguments,
-                binding_path=arguments.launch_binding,
-                binding_sha256=arguments.launch_binding_sha256,
-                receipt=arguments.launch_receipt,
-            )
+            if arguments.ollama_base_url is not None:
+                controller_arguments += ("--ollama-base-url", arguments.ollama_base_url)
+            if arguments.ollama_num_ctx is not None:
+                controller_arguments += ("--ollama-num-ctx", str(arguments.ollama_num_ctx))
+            try:
+                result = run_owned_controller(
+                    Path(__file__),
+                    controller_arguments,
+                    binding_path=arguments.launch_binding,
+                    binding_sha256=arguments.launch_binding_sha256,
+                    receipt=arguments.launch_receipt,
+                    timeout_seconds=_OWNED_DEADLINE_SECONDS,
+                )
+            except BaseException as error:
+                try:
+                    _verify_source_binding(arguments.source_head, arguments.source_tree)
+                except SourceBindingFailure:
+                    source_secondary = True
+                if isinstance(error, Exception):
+                    raise OwnedLaunchFailure(
+                        _failed_launch_summary(arguments.launch_receipt)
+                    ) from error
+                raise
+            if result.exit_code != 0:
+                try:
+                    _verify_source_binding(arguments.source_head, arguments.source_tree)
+                except SourceBindingFailure:
+                    source_secondary = True
+                    raise OwnedResultFailure("owned_result_failed") from None
+            else:
+                _verify_source_binding(arguments.source_head, arguments.source_tree)
+            category = "owned_complete" if result.exit_code == 0 else "owned_result_failed"
             print(result.stdout.decode("utf-8"), end="")
-            return cast(int, result.exit_code)
+            return result.exit_code
         corpus = load_corpus(arguments.corpus)
-        report = asyncio.run(
-            run_evaluation(
-                corpus=corpus,
-                model=arguments.model,
-                effort=arguments.effort,
-                codex_executable=arguments.codex_executable,
-            )
+        try:
+            with redirect_stdout(sys.stderr):
+                report = asyncio.run(
+                    run_evaluation(
+                        corpus=corpus,
+                        **selected,
+                    )
+                )
+        except BaseException:
+            try:
+                _verify_source_binding(arguments.source_head, arguments.source_tree)
+            except SourceBindingFailure:
+                source_secondary = True
+            raise
+        else:
+            _verify_source_binding(arguments.source_head, arguments.source_tree)
+        report["source_binding"] = {
+            "head": arguments.source_head,
+            "tree": arguments.source_tree,
+            "imports": "verified",
+            "worktree": "clean",
+        }
+        report["configured_overrides"] = sorted(
+            name for name in (
+                "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx"
+            ) if getattr(arguments, name) is not None
         )
-    except EvaluationFailure as error:
+        completed_cases = len(corpus.cases)
+    except SourceBindingFailure:
+        category = "source_binding_failed"
         report = {
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "error",
             "pass": False,
-            "error": error.public_error(),
+            "error": {"code": "source_binding_failed"},
+        }
+        exit_code = 2
+    except OwnedLaunchFailure as error:
+        category = "owned_launch_failed"
+        public_error: dict[str, object] = {"code": "owned_launch_failed", **error.summary}
+        if source_secondary:
+            public_error["secondary_categories"] = ["source_binding_failed"]
+            marker_secondary = ["source_binding_failed"]
+        report = {
+            "schema_version": 4,
+            "status": "error",
+            "pass": False,
+            "error": public_error,
+        }
+        exit_code = 2
+    except OwnedResultFailure:
+        category = "owned_result_failed"
+        public_error = {"code": "owned_result_failed"}
+        if source_secondary:
+            public_error["secondary_categories"] = ["source_binding_failed"]
+            marker_secondary = ["source_binding_failed"]
+        report = {
+            "schema_version": 4,
+            "status": "error",
+            "pass": False,
+            "error": public_error,
+        }
+        exit_code = 2
+    except EvaluationFailure as error:
+        category = error.code
+        completed_cases = error.completed_cases
+        public_error = error.public_error()
+        marker_secondary = list(error.secondary_categories)
+        if source_secondary:
+            if "source_binding_failed" not in marker_secondary:
+                marker_secondary.append("source_binding_failed")
+            public_error["secondary_categories"] = marker_secondary
+        report = {
+            "schema_version": 4,
+            "status": "error",
+            "pass": False,
+            "error": public_error,
         }
         exit_code = 2
     except Exception:
+        category = "evaluation_failed"
+        public_error = {"code": "evaluation_failed"}
+        if source_secondary:
+            public_error["secondary_categories"] = ["source_binding_failed"]
+            marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "error",
             "pass": False,
-            "error": {"code": "evaluation_failed"},
+            "error": public_error,
         }
         exit_code = 2
     else:
+        category = "complete" if report["pass"] else "observed_failed"
         exit_code = 0 if report["pass"] else 1
+    finally:
+        print(
+            "[provider-qualification] " + json.dumps({
+                "version": 1, "category": category, "completed_cases": completed_cases,
+                "secondary_categories": marker_secondary,
+            }, separators=(",", ":")),
+            file=sys.stderr,
+        )
     print(
         json.dumps(
             report,
