@@ -1,0 +1,703 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from scripts import qualification_launch as launch
+
+
+def _binding(tmp_path: Path) -> tuple[Path, str]:
+    def image(path: str) -> dict[str, str]:
+        return {"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+
+    raw = json.dumps(
+        {
+            "schema_version": 1,
+            "guardian": image(sys._base_executable),
+            "controller": image(sys.executable),
+        }
+    ).encode()
+    path = tmp_path / "interpreters.json"
+    path.write_bytes(raw)
+    return path, hashlib.sha256(raw).hexdigest()
+
+
+def test_interpreter_roles_are_explicit_and_default_selection_is_shared(tmp_path: Path) -> None:
+    path, digest = _binding(tmp_path)
+    binding = launch.load_binding(path, digest)
+    assert launch.guardian_command(binding)[0] == sys._base_executable
+    assert binding.controller == sys.executable
+
+
+@pytest.mark.parametrize(
+    "change", ["digest", "image_digest", "null_sha", "unknown", "base", "controller", "version"]
+)
+def test_interpreter_binding_refuses_drift(tmp_path: Path, change: str) -> None:
+    path, digest = _binding(tmp_path)
+    if change != "digest":
+        value = json.loads(path.read_bytes())
+        if change == "null_sha":
+            value["guardian"]["sha256"] = None
+        elif change == "image_digest":
+            value["guardian"]["sha256"] = "0" * 64
+        elif change == "version":
+            value["schema_version"] = True
+        elif change == "unknown":
+            value["unknown"] = True
+        else:
+            copy = tmp_path / "another.exe"
+            copy.write_bytes(Path(sys._base_executable).read_bytes())
+            value["guardian" if change == "base" else "controller"] = {
+                "path": str(copy),
+                "sha256": hashlib.sha256(copy.read_bytes()).hexdigest(),
+            }
+        path.write_text(json.dumps(value))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    else:
+        digest = "0" * 64
+    with pytest.raises(ValueError):
+        launch.load_binding(path, digest)
+
+
+def test_missing_completion_is_not_success() -> None:
+    assert launch.completion_status(None, cleanup_verified=True) == "incomplete"
+    assert (
+        launch.completion_status({"normal_exit": True, "exit_code": 0}, cleanup_verified=False)
+        == "incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "output",
+        "stderr",
+        "exit",
+        "wait",
+        "deadline",
+        "query_type",
+        "active",
+        "terminate",
+        "cleanup_wait",
+        "close",
+        "kernel_binding",
+    ],
+)
+def test_native_owner_retains_failure_and_requires_quiescence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    from types import SimpleNamespace
+
+    from scripts import qualify_evidence_slice_zero as core
+
+    events = []
+
+    class Kernel:
+        def __init__(self) -> None:
+            def exit_code(handle: object, code: object) -> int:
+                code._obj.value = 1 if fault == "exit" else 0
+                return 1
+
+            self.api = SimpleNamespace(
+                WaitForSingleObject=lambda *a: 1 if fault == "wait" else 0,
+                GetExitCodeProcess=exit_code,
+            )
+
+        def _api(self) -> object:
+            return self.api
+
+        def create_job(self, limits: object) -> int:
+            events.append("job")
+            return 10
+
+        def create_process_suspended(
+            self,
+            command: object,
+            environment: object,
+            cwd: object,
+            handles: object,
+            flags: int,
+            *,
+            job: int,
+        ) -> object:
+            assert job == 10 and flags & 0x8000000 and flags & 0x4
+            events.append("atomic_create")
+            if fault == "stderr":
+                (tmp_path / "stderr").write_bytes(b"x" * 65537)
+            return SimpleNamespace(process_handle=20, thread_handle=21)
+
+        def resume_thread(self, thread: int) -> None:
+            events.append("resume")
+
+        def terminate_job(self, job: int) -> None:
+            events.append("terminate")
+            if fault == "terminate":
+                raise RuntimeError("synthetic")
+
+        def wait(self, process: int, timeout: int) -> None:
+            events.append("wait")
+            if fault == "cleanup_wait":
+                raise RuntimeError("synthetic")
+
+        def query_job_active_process_count(self, job: int) -> int:
+            events.append("query")
+            return False if fault == "query_type" else 1 if fault == "active" else 0
+
+        def close_handle(self, handle: int) -> None:
+            events.append("close")
+            if fault == "close":
+                raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(core, "_CtypesWindowsKernelV1", Kernel)
+    if os.name != "nt":
+        monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: fd))
+    kernel_path = Path(core.__file__).resolve()
+    plan = {
+        "timeout_seconds": -1 if fault == "deadline" else 10,
+        "work": str(tmp_path),
+        "plan_path": str(tmp_path / "plan"),
+        "cwd": str(tmp_path),
+        "completion": str(tmp_path / "completion"),
+        "kernel_path": str(kernel_path),
+        "kernel_sha256": "0" * 64
+        if fault == "kernel_binding"
+        else hashlib.sha256(kernel_path.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "completion").write_text('{"normal_exit":true,"exit_code":0}')
+    if fault == "output":
+        monkeypatch.setattr(launch, "_MAX_OUTPUT", -1)
+    evidence = {}
+    if fault == "active":
+        times = iter([0, 0, 0, 0, 100])
+        monkeypatch.setattr(
+            launch, "time", SimpleNamespace(monotonic=lambda: next(times), sleep=lambda _: None)
+        )
+    if fault == "none":
+        stdout, completion, clean = launch._owned_controller(
+            plan, launch.InterpreterBinding("base", "venv", "x", "y"), evidence
+        )
+        assert stdout == b"" and completion["normal_exit"] is True and clean is True
+        assert events == [
+            "job",
+            "atomic_create",
+            "resume",
+            "terminate",
+            "wait",
+            "query",
+            "close",
+            "close",
+            "close",
+        ]
+    else:
+        with pytest.raises((BaseExceptionGroup, ValueError)) as caught:
+            launch._owned_controller(
+                plan, launch.InterpreterBinding("base", "venv", "x", "y"), evidence
+            )
+        assert evidence.get("cleanup_verified", False) is (
+            fault in {"output", "stderr", "exit", "wait", "deadline"}
+        )
+        primary = (
+            caught.value.exceptions[0]
+            if isinstance(caught.value, BaseExceptionGroup)
+            else caught.value
+        )
+        expected = {
+            "output": "launch_output_bound",
+            "stderr": "launch_output_bound",
+            "exit": "launch_controller_exit",
+            "wait": "launch_controller_wait",
+            "deadline": "launch_controller_deadline",
+            "query_type": "launch_cleanup_count",
+            "active": "launch_cleanup_deadline",
+            "kernel_binding": "launch_kernel_binding",
+            "terminate": "synthetic",
+            "cleanup_wait": "synthetic",
+            "close": "synthetic",
+        }
+        assert str(primary) == expected[fault]
+        if fault in {"terminate", "cleanup_wait", "query_type", "active"}:
+            assert "close" not in events
+
+
+def test_completion_requires_normal_exact_exit_code() -> None:
+    assert (
+        launch.completion_status({"normal_exit": True, "exit_code": False}, cleanup_verified=True)
+        == "incomplete"
+    )
+    assert (
+        launch.completion_status({"normal_exit": True, "exit_code": 1}, cleanup_verified=True)
+        == "complete"
+    )
+    assert (
+        launch.completion_status({"normal_exit": False, "exit_code": 0}, cleanup_verified=True)
+        == "incomplete"
+    )
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "oversize"])
+def test_bounded_strict_binding_input(tmp_path: Path, kind: str) -> None:
+    valid, _ = _binding(tmp_path)
+    raw = valid.read_bytes()
+    if kind == "duplicate":
+        raw = raw.replace(b'"schema_version": 1', b'"schema_version": 1,"schema_version": 1')
+    else:
+        raw += b" " * (65537 - len(raw))
+    path = tmp_path / "bad.json"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError):
+        launch.load_binding(path, hashlib.sha256(raw).hexdigest())
+
+
+def test_guardian_refuses_inherited_job_before_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / "receipt"
+    plan = tmp_path / "plan"
+    raw = json.dumps({"receipt": str(receipt)}).encode()
+    plan.write_bytes(raw)
+    monkeypatch.setattr(launch, "_outside_jobs", lambda: False)
+    monkeypatch.setattr(
+        launch, "load_binding", lambda *a, **k: pytest.fail("controller admission reached")
+    )
+    assert launch._guardian(plan, hashlib.sha256(raw).hexdigest()) == 2
+    final = json.loads(receipt.read_bytes())
+    assert final["category"] == "guardian_inherited_job" and final["controller_completed"] is False
+
+
+@pytest.mark.parametrize("fault", ["none", "existing", "bound", "short"])
+def test_lifecycle_record_is_exclusive_bounded_and_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    calls = []
+    monkeypatch.setattr(launch.os, "fsync", lambda fd: calls.append(fd))
+    path = tmp_path / "receipt"
+    if fault == "short":
+
+        class Sink:
+            def __enter__(self) -> object:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                pass
+
+            def write(self, raw: bytes) -> int:
+                return 0
+
+            def fileno(self) -> int:
+                return 1
+
+        class Destination:
+            def open(self, *args: object, **kwargs: object) -> Sink:
+                return Sink()
+
+        with pytest.raises(OSError):
+            launch._record(Destination(), {"stage": "test"}, reserve=True)
+        assert calls == []
+    elif fault == "bound":
+        with pytest.raises(ValueError):
+            launch._record(path, {"data": "x" * 65537}, reserve=True)
+        assert not path.exists()
+    else:
+        launch._record(path, {"stage": "start"}, reserve=True)
+        if fault == "existing":
+            with pytest.raises(FileExistsError):
+                launch._record(path, {"stage": "again"}, reserve=True)
+        else:
+            launch._record(path, {"stage": "end"})
+        assert len(calls) == (1 if fault == "existing" else 2)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows Job ownership")
+def test_default_launch_uses_base_guardian_and_explicit_controller(tmp_path: Path) -> None:
+    binding, digest = _binding(tmp_path)
+    script = tmp_path / "controller.py"
+    script.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'pass':False,'venv':sys.prefix!=sys.base_prefix}))\n"
+        "raise SystemExit(1)\n"
+    )
+    receipt = tmp_path / "receipt.jsonl"
+    result = launch.run_owned_controller(
+        script, (), binding_path=binding, binding_sha256=digest, receipt=receipt, timeout_seconds=30
+    )
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["pass"] is False
+    rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
+    assert [row["stage"] for row in rows] == ["reserved", "started", "complete"]
+    assert rows[-1]["cleanup_verified"] is True
+    assert rows[-1]["controller_completed"] is True
+    assert (
+        rows[-1]["guardian_sha256"]
+        == hashlib.sha256(Path(sys._base_executable).read_bytes()).hexdigest()
+    )
+    with pytest.raises(FileExistsError):
+        launch.run_owned_controller(
+            script,
+            (),
+            binding_path=binding,
+            binding_sha256=digest,
+            receipt=receipt,
+            timeout_seconds=30,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows Job ownership")
+def test_controller_death_retains_incomplete_receipt(tmp_path: Path) -> None:
+    binding, digest = _binding(tmp_path)
+    script = tmp_path / "controller.py"
+    script.write_text("import os\nos._exit(0)\n")
+    receipt = tmp_path / "receipt.jsonl"
+    with pytest.raises(RuntimeError):
+        launch.run_owned_controller(
+            script,
+            (),
+            binding_path=binding,
+            binding_sha256=digest,
+            receipt=receipt,
+            timeout_seconds=30,
+        )
+    final = json.loads(receipt.read_bytes().splitlines()[-1])
+    assert final["stage"] == "incomplete"
+    assert final["controller_completed"] is False
+    assert final["cleanup_verified"] is True
+
+
+def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import evaluate_natural_work_routing as evaluator
+
+    seen = []
+
+    def run(script: Path, args: tuple[str, ...], **kwargs: object) -> launch.LaunchResult:
+        seen.append((script, args, kwargs))
+        return launch.LaunchResult(1, b'{"pass":false}\n')
+
+    monkeypatch.setattr(launch, "run_owned_controller", run)
+    monkeypatch.setattr(evaluator, "_verify_controller_source", lambda: None)
+    binding, digest = _binding(tmp_path)
+    code = evaluator.main(
+        [
+            "--model",
+            "synthetic",
+            "--launch-binding",
+            str(binding),
+            "--launch-binding-sha256",
+            digest,
+            "--launch-receipt",
+            str(tmp_path / "receipt.jsonl"),
+        ]
+    )
+    assert code == 1 and json.loads(capsys.readouterr().out) == {"pass": False}
+    assert seen[0][0].resolve() == Path(evaluator.__file__).resolve()
+    assert seen[0][1] == (
+        "--corpus",
+        str(evaluator._DEFAULT_CORPUS),
+        "--model",
+        "synthetic",
+        "--effort",
+        "low",
+    )
+
+
+def test_legacy_cli_does_not_claim_owned_launch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import evaluate_natural_work_routing as evaluator
+
+    async def evaluate(**kwargs: object) -> dict[str, object]:
+        return {"pass": True}
+
+    monkeypatch.setattr(evaluator, "run_evaluation", evaluate)
+    monkeypatch.setattr(evaluator, "_verify_controller_source", lambda: None)
+    monkeypatch.setattr(
+        launch, "run_owned_controller", lambda *a, **k: pytest.fail("legacy invoked owner")
+    )
+    assert evaluator.main([]) == 0
+    assert "owned" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
+def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(tmp_path: Path) -> None:
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "cli-receipt.jsonl"
+    root = Path(__file__).resolve().parents[1]
+    wrong = tmp_path / "wrong"
+    (wrong / "hermes_realtime").mkdir(parents=True)
+    (wrong / "hermes_realtime/__init__.py").write_text(
+        "raise RuntimeError('wrong source imported')"
+    )
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join((str(wrong), str(root))))
+    # A deliberately absent executable refuses before any provider subprocess.
+    # This checks the real opted-in CLI and dependency refusal.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.evaluate_natural_work_routing",
+            "--launch-binding",
+            str(binding),
+            "--launch-binding-sha256",
+            digest,
+            "--launch-receipt",
+            str(receipt),
+            "--codex-executable",
+            str(tmp_path / "absent.exe"),
+        ],
+        cwd=root,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=30,
+    )
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["pass"] is False
+    assert json.loads(completed.stdout)["error"]["code"] == "codex_setup_failed"
+    rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
+    assert rows[-1]["stage"] == "complete" and rows[-1]["exit_code"] == 2
+    assert rows[-1]["cleanup_verified"] is True
+
+
+def test_evaluator_refuses_already_loaded_wrong_source_before_evaluation(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    reached = tmp_path / "evaluation-reached"
+    program = (
+        f"import sys;sys.path[:0]=[{str(root / 'src')!r},{str(root)!r}]\n"
+        "from scripts import evaluate_natural_work_routing as e\n"
+        "from hermes_realtime.providers import codex_app_server as c\n"
+        "from pathlib import Path\nc.__file__='wrong-source.py'\n"
+        "async def reached(**kwargs):\n"
+        f" Path({str(reached)!r}).write_text('unexpected')\n raise AssertionError()\n"
+        "e.run_evaluation=reached\nraise SystemExit(e.main([]))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    assert result.returncode == 2 and not reached.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows boundary faults")
+@pytest.mark.parametrize(
+    "fault", ["plan", "launcher", "script", "result", "result_size", "breakaway"]
+)
+def test_launch_rejects_bound_artifact_or_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    binding, digest = _binding(tmp_path)
+    script = tmp_path / "controller.py"
+    script.write_text("print('harmless')\n")
+    receipt = tmp_path / "receipt.jsonl"
+    original = subprocess.Popen
+
+    def popen(command: tuple[str, ...], **kwargs: object) -> subprocess.Popen[bytes]:
+        if fault == "breakaway":
+            error = OSError("synthetic")
+            error.winerror = 5
+            raise error
+        args = list(command)
+        path = Path(args[-2])
+        raw = path.read_bytes()
+        plan = json.loads(raw)
+        if fault == "plan":
+            path.write_bytes(raw + b" ")
+        if fault == "launcher":
+            plan["launcher_sha256"] = "0" * 64
+            path.write_text(json.dumps(plan))
+            args[-1] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if fault == "script":
+            script.write_text("print('changed')\n")
+        process = original(args, **kwargs)
+        if fault in {"result", "result_size"}:
+            wait = process.wait
+
+            def changed(*args: object, **kwargs: object) -> int:
+                code = wait(*args, **kwargs)
+                if fault == "result":
+                    target = Path(plan["result"])
+                    before = target.read_bytes()
+                    target.write_bytes(bytes([before[0] ^ 1]) + before[1:])
+                else:
+                    rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
+                    rows[-1]["stdout_bytes"] = 0
+                    receipt.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                return code
+
+            process.wait = changed
+        return process
+
+    monkeypatch.setattr(launch.subprocess, "Popen", popen)
+    with pytest.raises((RuntimeError, ValueError)):
+        launch.run_owned_controller(
+            script,
+            (),
+            binding_path=binding,
+            binding_sha256=digest,
+            receipt=receipt,
+            timeout_seconds=20,
+        )
+    if fault == "breakaway":
+        final = json.loads(receipt.read_bytes().splitlines()[-1])
+        assert final["stage"] == "refused" and final["category"] == "breakaway_not_permitted"
+        assert "breakaway_not_permitted" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "timeout,args", [(False, ()), (0, ()), (14401, ()), (1, ["not_tuple"]), (1, ("\0",))]
+)
+def test_launch_bounds_fail_before_creation(tmp_path: Path, timeout: object, args: object) -> None:
+    with pytest.raises(ValueError):
+        launch.run_owned_controller(
+            tmp_path / "absent",
+            args,
+            binding_path=tmp_path / "absent",
+            binding_sha256="0" * 64,
+            receipt=tmp_path / "receipt",
+            timeout_seconds=timeout,
+        )
+    assert not (tmp_path / "receipt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows caller-interruption proof")
+def test_caller_interruption_keeps_guardian_inputs_until_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding, digest = _binding(tmp_path)
+    script = tmp_path / "short.py"
+    script.write_text("import time\ntime.sleep(.3)\nprint('harmless')\n")
+    receipt = tmp_path / "interrupted.jsonl"
+    observed = []
+    original = subprocess.Popen
+
+    def popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original(*args, **kwargs)
+        observed.append(process)
+        process.wait = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())
+        return process
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(launch.subprocess, "Popen", popen)
+            with pytest.raises(KeyboardInterrupt):
+                launch.run_owned_controller(
+                    script,
+                    (),
+                    binding_path=binding,
+                    binding_sha256=digest,
+                    receipt=receipt,
+                    timeout_seconds=20,
+                )
+        assert (receipt.with_name(receipt.name + ".work") / "plan.json").is_file()
+    finally:
+        for process in observed:
+            original.wait(process, timeout=25)
+    final = json.loads(receipt.read_bytes().splitlines()[-1])
+    assert final["stage"] == "complete" and final["cleanup_verified"] is True
+    assert (
+        receipt.with_name(receipt.name + ".work") / "result"
+    ).read_bytes().strip() == b"harmless"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ownership fault injection")
+def test_launcher_loss_preserves_guardian_then_guardian_loss_exits_descendants(
+    tmp_path: Path,
+) -> None:
+    import ctypes
+
+    from scripts import qualify_evidence_slice_zero as core
+
+    binding, digest = _binding(tmp_path)
+    root = Path(__file__).resolve().parents[1]
+    ready, guardian_ready = tmp_path / "children.json", tmp_path / "guardian.json"
+    script = tmp_path / "controller.py"
+    script.write_text(
+        "import json,os,subprocess,sys,time\nfrom pathlib import Path\n"
+        "child=subprocess.Popen([sys._base_executable,'-c','import time;time.sleep(60)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+        "creationflags=subprocess.CREATE_NO_WINDOW)\n"
+        f"p=Path({str(ready)!r}); t=p.with_suffix('.tmp')\n"
+        "t.write_text(json.dumps([os.getpid(),child.pid])); t.replace(p)\ntime.sleep(60)\n"
+    )
+    helper = tmp_path / "release.py"
+    helper.write_text(
+        "import json,subprocess,sys\nfrom pathlib import Path\n"
+        f"sys.path.insert(0,{str(root)!r})\nfrom scripts import qualification_launch as q\n"
+        "original=subprocess.Popen\ndef observed(*args,**kwargs):\n"
+        " p=original(*args,**kwargs)\n"
+        f" f=Path({str(guardian_ready)!r}); t=f.with_suffix('.tmp')\n"
+        " t.write_text(json.dumps(p.pid)); t.replace(f); return p\n"
+        "subprocess.Popen=observed\n"
+        f"q.run_owned_controller(Path({str(script)!r}),(),binding_path=Path({str(binding)!r}),"
+        f"binding_sha256={digest!r},"
+        f"receipt=Path({str(tmp_path / 'fault.jsonl')!r}),timeout_seconds=45)\n"
+    )
+    kernel = core._CtypesWindowsKernelV1()
+    job = kernel.create_job(core._WindowsJobLimitsV1(8, 1024**3, 2 * 1024**3))
+    api = kernel._api()
+    info = core._JOBOBJECT_EXTENDED_LIMIT_INFORMATION_V1()
+    assert api.QueryInformationJobObject(
+        ctypes.c_void_p(job), 9, ctypes.byref(info), ctypes.sizeof(info), None
+    )
+    info.BasicLimitInformation.LimitFlags |= 0x800  # explicit, not silent, breakaway
+    assert api.SetInformationJobObject(
+        ctypes.c_void_p(job), 9, ctypes.byref(info), ctypes.sizeof(info)
+    )
+    handles = []
+    release = None
+    try:
+        import msvcrt
+
+        with open(os.devnull, "r+b") as null:
+            os.set_inheritable(null.fileno(), True)
+            environment = tuple(
+                sorted(os.environ.items(), key=lambda item: (item[0].casefold(), item[0]))
+            )
+            release = kernel.create_process_suspended(
+                (sys.executable, "-B", str(helper)),
+                environment,
+                str(root),
+                (msvcrt.get_osfhandle(null.fileno()),),
+                0x4 | 0x400 | 0x80000 | 0x8000000,
+                job=job,
+            )
+            kernel.resume_thread(release.thread_handle)
+            until = time.monotonic() + 15
+            while not ready.exists() or not guardian_ready.exists():
+                assert time.monotonic() < until, "harmless controller did not start"
+                time.sleep(0.02)
+            pids = [json.loads(guardian_ready.read_bytes()), *json.loads(ready.read_bytes())]
+            handles = [kernel.open_process(pid, 0x101001) for pid in pids]
+            kernel.terminate_job(job)
+            kernel.wait(release.process_handle, 5000)
+            assert kernel.query_job_active_process_count(job) == 0
+            assert all(
+                api.WaitForSingleObject(ctypes.c_void_p(handle), 100) == 258 for handle in handles
+            )
+            kernel.terminate_process(handles[0])
+            for handle in handles:
+                kernel.wait(handle, 5000)
+            rows = [json.loads(row) for row in (tmp_path / "fault.jsonl").read_bytes().splitlines()]
+            assert rows[-1]["stage"] == "started"  # no invented completion/cleanup
+    finally:
+        if handles and api.WaitForSingleObject(ctypes.c_void_p(handles[0]), 0) == 258:
+            kernel.terminate_process(handles[0])
+        kernel.terminate_job(job)
+        for handle in handles:
+            kernel.close_handle(handle)
+        if release is not None:
+            kernel.close_handle(release.thread_handle)
+            kernel.close_handle(release.process_handle)
+        kernel.close_handle(job)
