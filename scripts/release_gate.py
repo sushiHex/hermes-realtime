@@ -720,6 +720,7 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "scripts/benchmark_evidence_admission.py",
         "scripts/qualify_evidence_slice_zero.py",
         "scripts/qualification_run_journal.py",
+        "scripts/qualification_launch.py",
         "scripts/deterministic_equivalence.py",
         "scripts/equivalence_process.py",
         "scripts/equivalence_worker.py",
@@ -775,6 +776,7 @@ def gate_materialized_candidate(
     root: Path,
     *,
     livekit: bool,
+    git_executable: Path | None = None,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
@@ -816,6 +818,7 @@ def gate_materialized_candidate(
         "pytest",
         "-q",
         *PYTEST_DURATIONS,
+        *((f"--native-git-executable={git_executable}",) if git_executable is not None else ()),
         cwd=root,
         env=environment,
     )

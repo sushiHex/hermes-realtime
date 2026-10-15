@@ -15,15 +15,10 @@ from runpy import run_path
 
 import pytest
 
+from scripts.candidate_e2e_fast_track import GitExecutablePinV1, _measure_git_pin
+from tests.support import native_git_selection
+
 ROOT = Path(__file__).resolve().parents[1]
-GIT = Path(r"C:\Program Files\Git\mingw64\bin\git.exe")
-_MEASURED_GIT_IDENTITY = (
-    hashlib.sha256(GIT.read_bytes()).hexdigest(),
-    subprocess.run((str(GIT), "--version"), check=True, capture_output=True)
-    .stdout.rstrip(b"\n")
-    .decode("ascii"),
-    GIT.stat().st_nlink,
-)
 _AUTHORIZED_GIT_IDENTITIES = frozenset(
     {
         (
@@ -41,11 +36,34 @@ _AUTHORIZED_GIT_IDENTITIES = frozenset(
             "git version 2.55.0.windows.4",
             4,
         ),
+        # Official https://github.com/git-for-windows/git/releases/tag/v2.56.0.windows.2
+        # Git-2.56.0.2-64-bit.tar.bz2 SHA256: 16ca394bdb94b372267d79e1e10b68763674f73e03e0648202a7971a8a730a84.
+        # ucrt64/bin/git.exe is independently hashed below; four installed links
+        # remains a fail-closed fixture expectation, not a property proved by that archive.
+        (
+            "b824434dfe3b5f9cf648af6c9cc8cb1f6a982cc6e13b6c6ebbe6533c7e51cc2e",
+            "git version 2.56.0.windows.2",
+            4,
+        ),
     }
 )
-if _MEASURED_GIT_IDENTITY not in _AUTHORIZED_GIT_IDENTITIES:
-    raise RuntimeError(f"unapproved Git fixture identity: {_MEASURED_GIT_IDENTITY!r}")
-GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = _MEASURED_GIT_IDENTITY
+
+
+def _initialize_git_fixture(executable: Path | None) -> GitExecutablePinV1:
+    pin = _measure_git_pin(executable)
+    measured = (pin.sha256, pin.version, pin.link_count)
+    if measured not in _AUTHORIZED_GIT_IDENTITIES:
+        raise RuntimeError(f"unapproved Git fixture identity: {measured!r}")
+    return pin
+
+
+_GIT_FIXTURE_PIN = _initialize_git_fixture(native_git_selection.requested_native_git())
+GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = (
+    _GIT_FIXTURE_PIN.path,
+    _GIT_FIXTURE_PIN.sha256,
+    _GIT_FIXTURE_PIN.version,
+    _GIT_FIXTURE_PIN.link_count,
+)
 
 
 def _git(*arguments: str, cwd: Path = ROOT) -> bytes:
