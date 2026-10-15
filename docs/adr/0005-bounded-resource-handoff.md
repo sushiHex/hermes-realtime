@@ -44,6 +44,34 @@ belong to a reviewed, versioned contract covering size, count, identity, generat
 lifetime, invalidation, privacy and acknowledgment behavior before implementation.
 The contract must distinguish resource data from instructions and permissions.
 
+## Existing Hermes carriers and profile boundary
+
+The pinned Hermes v0.21.0 Runs handler already accepts `input` as message content
+and explicit `conversation_history` as role/content messages; no new Hermes API is
+assumed here. These are model-visible content carriers, not typed resource bindings
+or evidence that a tool can read a referenced target. The reviewed realtime adapter
+currently sends the objective as `input` and does not send `conversation_history`
+([adapter](../../src/hermes_realtime/integration/api.py)). Passing `session_id` is
+not a resource binding: when explicit history is absent, Runs may load stored
+messages for that session; when omitted, Hermes gives the run its own session ID.
+([Runs request fields](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3024-L3084),
+[session behavior](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3131-L3240)).
+
+Hermes already selects multiplexed profiles through a `/p/<profile>/` URL prefix
+and carries that request profile into the background Runs agent
+([profile middleware](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2100-L2206),
+[Runs profile scope](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3397-L3467)).
+The current realtime API client accepts only a loopback origin, so it cannot
+currently select that prefix
+([client configuration](../../src/hermes_realtime/integration/api.py)). Hermes
+already has file-reading and terminal tools, but their availability, backend and
+working directory depend on the selected profile's tool configuration
+([file tools](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/file_tools.py),
+[terminal tool](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/terminal_tool.py)).
+Review must choose and bound the existing content carrier and settle how the host
+binds it to the correct local profile before deciding whether any new Hermes API
+surface is needed.
+
 ## Limits and unchanged authority
 
 Preserving references cannot guarantee correct model intent, a faithful objective,
@@ -68,6 +96,12 @@ A witness through the actual pinned Hermes Runs route and selected profile must
 then demonstrate that admitted references arrive unchanged and identify resources
 that the background executor can use. A direct terminal read alone is insufficient;
 neither successful transport nor a working-directory setting proves this handoff.
+The planned witness uses an isolated Runs fixture and a deterministic test model to
+request one read-only call to an existing, profile-enabled file or terminal tool
+against a canary resource. It must verify the exact reference at the tool boundary,
+the selected profile and backend, and the canary result. This is a real fixture Run
+through Hermes's handler and tool dispatch, without external inference or a user
+gateway. It has not yet been executed.
 
 Actual-adapter qualification must separately assess routing, objective fidelity,
 resource sufficiency and truthful lifecycle claims. Real execution and voice gates
