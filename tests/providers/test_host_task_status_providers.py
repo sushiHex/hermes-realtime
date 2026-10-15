@@ -458,7 +458,7 @@ async def test_status_receipt_send_uses_remaining_deadline_and_drains_terminal_t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ready", [True, False, "terminal"])
-async def test_expired_status_call_cannot_send_or_select_with_immediate_transport(ready):
+async def test_expired_status_call_rejects_without_speech_and_same_adapter_recovers(ready):
     import asyncio
 
     from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
@@ -475,7 +475,7 @@ async def test_expired_status_call_cannot_send_or_select_with_immediate_transpor
 
     def expire(method, params, item):
         original(method, params, item)
-        if method == "item/started":
+        if method == "item/started" and params["threadId"] == "thread_server_1":
             call = inference._dynamic_calls[(params["threadId"], params["turnId"], item["id"])]
             call.deadline = asyncio.get_running_loop().time() - 1
             if ready is False:
@@ -491,19 +491,380 @@ async def test_expired_status_call_cannot_send_or_select_with_immediate_transpor
         async for part in inference.stream(_snapshot(), turn_id="turn_expired"):
             rows.append(part)
 
+    async def collect_next():
+        return [part async for part in inference.stream(_snapshot(), turn_id="turn_recovered")]
+
     response = asyncio.create_task(collect_turn())
     try:
         await asyncio.wait_for(transport.turn_started.get(), 1)
         await transport.start_item(tool="task_status", arguments={})
         await asyncio.wait_for(registered.wait(), 1)
         await transport.request_tool(request_id=91, tool="task_status", arguments={})
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as failure:
             await asyncio.wait_for(response, 0.3)
         assert rows == []
-        assert transport.tool_responses.empty()
+        refusal = await asyncio.wait_for(transport.tool_responses.get(), 0.1)
+        assert refusal["result"]["success"] is False
+        assert "admission deadline" in str(failure.value.__cause__)
+        assert inference._closed is False
+        next_turn = asyncio.create_task(collect_next())
+        await asyncio.wait_for(transport.turn_started.get(), 0.3)
+        await transport.complete_turn(delta="Recovered.")
+        assert await asyncio.wait_for(next_turn, 0.3) == ["Recovered."]
     finally:
         await inference.close()
         await asyncio.gather(response, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stall", ["receipt", "interrupt", "terminal_receipt"])
+async def test_expired_status_cleanup_stall_closes_session_within_one_budget(stall):
+    import asyncio
+
+    from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
+
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    class Stalled(ManualDynamicCodexTransport):
+        async def send(self, message):
+            if (
+                (stall in ("receipt", "terminal_receipt") and message.get("id") == 91)
+                or (stall == "interrupt" and message.get("method") == "turn/interrupt")
+            ):
+                await asyncio.Future()
+            await super().send(message)
+
+    transport = Stalled()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        request_timeout_seconds=0.05,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    original = inference._handle_dynamic_lifecycle
+
+    def expire(method, params, item):
+        original(method, params, item)
+        if method == "item/started":
+            identity = (params["threadId"], params["turnId"], item["id"])
+            inference._dynamic_calls[identity].deadline = asyncio.get_running_loop().time() - 1
+            if stall == "terminal_receipt":
+                inference._turn_routing[identity[:2]].terminal = True
+
+    inference._handle_dynamic_lifecycle = expire
+
+    rows = []
+
+    async def collect_turn():
+        async for part in inference.stream(_snapshot(), turn_id="turn_cleanup_stall"):
+            rows.append(part)
+
+    response = asyncio.create_task(collect_turn())
+    try:
+        async with asyncio.timeout(0.4):
+            await transport.turn_started.get()
+            await transport.start_item(tool="task_status", arguments={})
+            await transport.request_tool(request_id=91, tool="task_status", arguments={})
+            with pytest.raises(RuntimeError):
+                await response
+        assert inference._closed is True
+        assert rows == []
+        assert not inference._server_request_tasks
+        assert all(
+            row["result"]["success"] is False for row in list(transport.tool_responses._queue)
+        )
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+        with pytest.raises(RuntimeError, match="closed"):
+            [part async for part in inference.stream(_snapshot(), turn_id="turn_refused")]
+    finally:
+        await inference.close()
+        await asyncio.gather(response, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0.25, 3.0])
+async def test_status_admission_cleanup_uses_existing_bounded_budget(timeout, monkeypatch):
+    import asyncio
+
+    from hermes_realtime.providers import codex_app_server as module
+
+    inference = module.CodexAppServerStreamingInference(
+        model="synthetic", effort="low", request_timeout_seconds=timeout,
+    )
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: now)
+    routing = module._TurnRouting(status_selected=True)
+    call = module._DynamicCall(("thread", "turn", "call"), "task_status", None, {}, "{}", now - 1)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    inference._send = send
+    await inference._send_status_receipt(91, call, routing, {"success": True})
+    assert type(routing.error) is module._StatusAdmissionExpired
+    assert routing.error.cleanup_deadline == now + min(timeout, 1.0)
+    assert sent[0]["result"]["success"] is False
+    assert routing.host_status_ready is False
+    assert inference._closed is False
+    deadline = routing.error.cleanup_deadline
+    monkeypatch.setattr(loop, "time", lambda: now + 0.1)
+    await inference._send_status_receipt(92, call, routing, {"success": True})
+    assert routing.error.cleanup_deadline == deadline
+    assert sent[1]["result"]["success"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before_receipt", "after_receipt", "before_interrupt",
+                                      "after_interrupt"])
+async def test_status_cleanup_acceptance_rechecks_shared_deadline(phase, monkeypatch):
+    import asyncio
+
+    from hermes_realtime.providers import codex_app_server as module
+
+    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    clock = [now]
+    monkeypatch.setattr(loop, "time", lambda: clock[0])
+    deadline = now - 1 if phase.startswith("before") else now + 1
+    routing = module._TurnRouting(error=module._StatusAdmissionExpired(deadline))
+    routing.failure.set()
+    sent = []
+
+    async def send(message, *_args):
+        sent.append(message)
+        clock[0] = now + 2
+        return {"result": {}}
+
+    inference._send = send
+    inference._request_locked = send
+    if phase.endswith("receipt"):
+        call = module._DynamicCall(
+            ("thread", "turn", "call"), "task_status", None, {}, "{}", now - 1,
+        )
+        await inference._reject_expired_status(91, call, routing)
+    else:
+        active = module._ActiveTurn("turn_public", "thread", "turn")
+        inference._turn_routing[("thread", "turn")] = routing
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await inference._interrupt(active)
+    assert inference._closed is True
+    assert len(sent) == (0 if phase.startswith("before") else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior", ["host_ready", "protocol_failure"])
+async def test_status_expiry_recovery_does_not_reopen_prior_uncertainty(prior):
+    import asyncio
+
+    from hermes_realtime.providers import codex_app_server as module
+
+    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    original = RuntimeError("synthetic protocol failure") if prior == "protocol_failure" else None
+    routing = module._TurnRouting(error=original, host_status_ready=prior == "host_ready")
+    call = module._DynamicCall(
+        ("thread", "turn", "call"), "task_status", None, {}, "{}",
+        asyncio.get_running_loop().time() - 1,
+    )
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    inference._send = send
+    await inference._reject_expired_status(91, call, routing)
+    assert inference._closed is True
+    assert sent == []
+    if original is not None:
+        assert routing.error is original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["receipt", "interrupt"])
+async def test_cancelled_status_cleanup_preserves_cancellation_and_closes(phase):
+    import asyncio
+
+    from hermes_realtime.providers import codex_app_server as module
+
+    inference = module.CodexAppServerStreamingInference(model="synthetic", effort="low")
+    now = asyncio.get_running_loop().time()
+    routing = module._TurnRouting(error=module._StatusAdmissionExpired(now + 1))
+
+    async def cancelled(*_args):
+        raise asyncio.CancelledError
+
+    inference._send = cancelled
+    inference._request_locked = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        if phase == "receipt":
+            call = module._DynamicCall(
+                ("thread", "turn", "call"), "task_status", None, {}, "{}", now - 1,
+            )
+            await inference._reject_expired_status(91, call, routing)
+        else:
+            inference._turn_routing[("thread", "turn")] = routing
+            await inference._interrupt(module._ActiveTurn("turn_public", "thread", "turn"))
+    assert inference._closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching_terminal", [True, False])
+async def test_expired_status_reuse_waits_for_matching_terminal_or_interrupt_ack(matching_terminal):
+    import asyncio
+
+    from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
+
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    class HeldInterrupt(ManualDynamicCodexTransport):
+        def __init__(self):
+            super().__init__()
+            self.interrupt_requested = asyncio.Event()
+            self.terminal_read = asyncio.Event()
+            self.interrupt_id = None
+
+        async def send(self, message):
+            if message.get("method") == "turn/interrupt":
+                self.sent.append(dict(message))
+                self.interrupt_id = message["id"]
+                self.interrupt_requested.set()
+                return
+            await super().send(message)
+            if message.get("id") == 91:
+                await self.incoming.put({
+                    "method": "turn/completed", "params": {
+                        "threadId": self.thread_id,
+                        "turn": {"id": self.turn_id if matching_terminal else "turn_other",
+                                 "status": "completed"},
+                    },
+                })
+                await self.terminal_read.wait()
+
+        async def receive(self):
+            message = await super().receive()
+            if message.get("method") == "turn/completed":
+                self.terminal_read.set()
+            return message
+
+    transport = HeldInterrupt()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    original = inference._handle_dynamic_lifecycle
+
+    def expire(method, params, item):
+        original(method, params, item)
+        if method == "item/started" and params["threadId"] == "thread_server_1":
+            identity = (params["threadId"], params["turnId"], item["id"])
+            inference._dynamic_calls[identity].deadline = asyncio.get_running_loop().time() - 1
+
+    inference._handle_dynamic_lifecycle = expire
+
+    async def collect(turn):
+        return [part async for part in inference.stream(_snapshot(), turn_id=turn)]
+
+    first = asyncio.create_task(collect("turn_expired_owned"))
+    next_turn = None
+    try:
+        async with asyncio.timeout(0.6):
+            await transport.turn_started.get()
+            await transport.start_item(tool="task_status", arguments={})
+            await transport.request_tool(request_id=91, tool="task_status", arguments={})
+            refusal = await transport.tool_responses.get()
+            assert refusal["result"]["success"] is False
+            await transport.terminal_read.wait()
+            if not matching_terminal:
+                await transport.interrupt_requested.wait()
+                next_turn = asyncio.create_task(collect("turn_wait_for_cleanup"))
+                await asyncio.sleep(0)
+                assert transport.turn_number == 1 and not next_turn.done()
+                await transport.incoming.put({"id": transport.interrupt_id, "result": {}})
+            with pytest.raises(RuntimeError) as failure:
+                await first
+            assert "admission deadline" in str(failure.value.__cause__)
+            assert transport.interrupt_requested.is_set() is not matching_terminal
+            assert inference._closed is False
+            if next_turn is None:
+                next_turn = asyncio.create_task(collect("turn_after_cleanup"))
+            await transport.turn_started.get()
+            await transport.complete_turn(delta="Recovered.")
+            assert await next_turn == ["Recovered."]
+    finally:
+        if transport.interrupt_id is not None:
+            await transport.incoming.put({"id": transport.interrupt_id, "result": {}})
+        await inference.close()
+        await asyncio.gather(first, *([next_turn] if next_turn is not None else []),
+                             return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_consumed_before_expired_receipt_still_drains_and_fails_turn():
+    import asyncio
+
+    from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
+
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    transport = ManualDynamicCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    original_lifecycle = inference._handle_dynamic_lifecycle
+
+    def expire(method, params, item):
+        original_lifecycle(method, params, item)
+        if method == "item/started":
+            identity = (params["threadId"], params["turnId"], item["id"])
+            inference._dynamic_calls[identity].deadline = asyncio.get_running_loop().time() - 1
+
+    inference._handle_dynamic_lifecycle = expire
+    entered, release, quiescing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_reject = inference._reject_expired_status
+    original_quiesce = inference._quiesce_dynamic_turn
+
+    async def held_reject(*args):
+        entered.set()
+        await release.wait()
+        await original_reject(*args)
+
+    async def observed_quiesce(active):
+        quiescing.set()
+        await original_quiesce(active)
+
+    inference._reject_expired_status = held_reject
+    inference._quiesce_dynamic_turn = observed_quiesce
+    rows = []
+
+    async def collect():
+        async for part in inference.stream(_snapshot(), turn_id="turn_expired_terminal"):
+            rows.append(part)
+
+    response = asyncio.create_task(collect())
+    witness = asyncio.create_task(quiescing.wait())
+    try:
+        async with asyncio.timeout(0.5):
+            await transport.turn_started.get()
+            await transport.start_item(tool="task_status", arguments={})
+            await transport.request_tool(request_id=91, tool="task_status", arguments={})
+            await entered.wait()
+            await transport.complete_turn()
+            await asyncio.wait((response, witness), return_when=asyncio.FIRST_COMPLETED)
+            assert quiescing.is_set() and not response.done()
+            release.set()
+            with pytest.raises(RuntimeError) as failure:
+                await response
+            assert "admission deadline" in str(failure.value.__cause__)
+            assert (await transport.tool_responses.get())["result"]["success"] is False
+            assert inference._closed is False and rows == []
+    finally:
+        release.set()
+        await inference.close()
+        witness.cancel()
+        await asyncio.gather(response, witness, return_exceptions=True)
 
 
 @pytest.mark.asyncio
