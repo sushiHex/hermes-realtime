@@ -196,6 +196,11 @@ is an acceptance/polling bound, not a hard disk-write quota. The Job's explicit
 64 GiB per-process / 128 GiB aggregate limits do not replace a provider's GPU or
 memory admission contract.
 
+The observer checks its execution deadline after each bounded wait, before
+accepting a signaled exit, and its cleanup deadline before accepting a zero-active
+observation. After verified Job quiescence, final stdout, stderr
+and completion reads enforce their acceptance bounds again.
+
 `scripts.qualification_launch.run_owned_controller` is also a caller-bound script
 API: it hashes and executes the exact external controller bytes without importing
 the tooling package into that controller's namespace. The caller remains responsible

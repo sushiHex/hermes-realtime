@@ -314,9 +314,15 @@ def test_missing_completion_is_not_success() -> None:
         "none",
         "output",
         "stderr",
+        "late_stderr",
+        "cleanup_stderr",
+        "late_stdout",
+        "cleanup_completion",
         "exit",
         "wait",
         "deadline",
+        "late_deadline",
+        "late_cleanup_zero",
         "query_type",
         "active",
         "terminate",
@@ -333,6 +339,7 @@ def test_native_owner_retains_failure_and_requires_quiescence(
     from scripts import qualify_evidence_slice_zero as core
 
     events = []
+    clock = [0]
 
     class Kernel:
         def __init__(self) -> None:
@@ -340,8 +347,17 @@ def test_native_owner_retains_failure_and_requires_quiescence(
                 code._obj.value = 1 if fault == "exit" else 0
                 return 1
 
+            def waited(*args: object) -> int:
+                if fault == "late_deadline":
+                    clock[0] = 20
+                if fault == "late_stderr":
+                    (tmp_path / "stderr").write_bytes(b"x" * 65537)
+                if fault == "late_stdout":
+                    (tmp_path / "stdout").write_bytes(b"xxxx")
+                return 1 if fault == "wait" else 0
+
             self.api = SimpleNamespace(
-                WaitForSingleObject=lambda *a: 1 if fault == "wait" else 0,
+                WaitForSingleObject=waited,
                 GetExitCodeProcess=exit_code,
             )
 
@@ -383,6 +399,13 @@ def test_native_owner_retains_failure_and_requires_quiescence(
 
         def query_job_active_process_count(self, job: int) -> int:
             events.append("query")
+            if fault == "late_cleanup_zero":
+                clock[0] = 40
+            if fault == "cleanup_stderr":
+                (tmp_path / "stderr").write_bytes(b"x" * 65537)
+            if fault == "cleanup_completion":
+                payload = b'{"normal_exit":true,"exit_code":0}'
+                (tmp_path / "completion").write_bytes(b" " * (65537 - len(payload)) + payload)
             return False if fault == "query_type" else 1 if fault == "active" else 0
 
         def close_handle(self, handle: int) -> None:
@@ -408,7 +431,13 @@ def test_native_owner_retains_failure_and_requires_quiescence(
     (tmp_path / "completion").write_text('{"normal_exit":true,"exit_code":0}')
     if fault == "output":
         monkeypatch.setattr(launch, "_MAX_OUTPUT", -1)
+    if fault == "late_stdout":
+        monkeypatch.setattr(launch, "_MAX_OUTPUT", 3)
     evidence = {}
+    if fault in {"late_deadline", "late_cleanup_zero"}:
+        monkeypatch.setattr(
+            launch, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None)
+        )
     if fault == "active":
         times = iter([0, 0, 0, 0, 100])
         monkeypatch.setattr(
@@ -436,7 +465,19 @@ def test_native_owner_retains_failure_and_requires_quiescence(
                 plan, launch.InterpreterBinding("base", "venv", "x", "y"), evidence
             )
         assert evidence.get("cleanup_verified", False) is (
-            fault in {"output", "stderr", "exit", "wait", "deadline"}
+            fault
+            in {
+                "output",
+                "stderr",
+                "late_stderr",
+                "cleanup_stderr",
+                "late_stdout",
+                "cleanup_completion",
+                "exit",
+                "wait",
+                "deadline",
+                "late_deadline",
+            }
         )
         primary = (
             caught.value.exceptions[0]
@@ -446,9 +487,15 @@ def test_native_owner_retains_failure_and_requires_quiescence(
         expected = {
             "output": "launch_output_bound",
             "stderr": "launch_output_bound",
+            "late_stderr": "launch_input_bound",
+            "cleanup_stderr": "launch_input_bound",
+            "late_stdout": "launch_input_bound",
+            "cleanup_completion": "launch_input_bound",
             "exit": "launch_controller_exit",
             "wait": "launch_controller_wait",
             "deadline": "launch_controller_deadline",
+            "late_deadline": "launch_controller_deadline",
+            "late_cleanup_zero": "launch_cleanup_deadline",
             "query_type": "launch_cleanup_count",
             "active": "launch_cleanup_deadline",
             "kernel_binding": "launch_kernel_binding",
@@ -457,7 +504,14 @@ def test_native_owner_retains_failure_and_requires_quiescence(
             "close": "synthetic",
         }
         assert str(primary) == expected[fault]
-        if fault in {"deadline", "active", "exit", "cleanup_wait"}:
+        if fault in {
+            "deadline",
+            "late_deadline",
+            "late_cleanup_zero",
+            "active",
+            "exit",
+            "cleanup_wait",
+        }:
             # Feed the actual error group raised above by the real owner with
             # a fake kernel into the guardian's durable classifier.
             original_error = caught.value
@@ -494,7 +548,9 @@ def test_native_owner_retains_failure_and_requires_quiescence(
             assert launch._guardian(guardian_plan, hashlib.sha256(raw).hexdigest()) == 2
             final = json.loads((tmp_path / "guardian.jsonl").read_bytes().splitlines()[-1])
             assert final["category"] == (
-                "timed_out" if fault in {"deadline", "active"} else "execution_failed"
+                "timed_out"
+                if fault in {"deadline", "late_deadline", "late_cleanup_zero", "active"}
+                else "execution_failed"
             )
             assert final["stage"] == "incomplete" and final["controller_completed"] is False
             assert final["cleanup_verified"] is evidence["cleanup_verified"]
@@ -503,7 +559,7 @@ def test_native_owner_retains_failure_and_requires_quiescence(
                 assert launch._guardian(guardian_plan, hashlib.sha256(raw).hexdigest()) == 2
                 final = json.loads((tmp_path / "guardian.jsonl").read_bytes().splitlines()[-1])
                 assert final["category"] == "timed_out" and final["cleanup_verified"] is True
-        if fault in {"terminate", "cleanup_wait", "query_type", "active"}:
+        if fault in {"terminate", "cleanup_wait", "query_type", "active", "late_cleanup_zero"}:
             assert "close" not in events
 
 

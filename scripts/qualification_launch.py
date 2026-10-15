@@ -215,10 +215,10 @@ def _owned_controller(
             while True:
                 if output.stat().st_size > _MAX_OUTPUT or errors.stat().st_size > _MAX_JSON:
                     raise ValueError("launch_output_bound")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("launch_controller_deadline")
                 api = kernel._api()
                 status = api.WaitForSingleObject(ctypes.c_void_p(root.process_handle), 50)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("launch_controller_deadline")
                 if status == 0:
                     api.GetExitCodeProcess.argtypes = [
                         ctypes.c_void_p,
@@ -256,11 +256,11 @@ def _owned_controller(
                     active = kernel.query_job_active_process_count(job)
                     if type(active) is not int:
                         raise ValueError("launch_cleanup_count")
+                    if time.monotonic() >= until:
+                        raise TimeoutError("launch_cleanup_deadline")
                     if active == 0:
                         cleanup = not failures
                         break
-                    if time.monotonic() >= until:
-                        raise TimeoutError("launch_cleanup_deadline")
                     time.sleep(0.01)
             except BaseException as error:
                 failures.append(error)
@@ -277,6 +277,9 @@ def _owned_controller(
             failures.insert(0, primary)
         if failures:
             raise BaseExceptionGroup("controller execution or cleanup failed", failures)
+    # Descendants may write until Job quiescence; the final acceptance bound
+    # must follow cleanup, not merely the root's signaled wait.
+    _read(errors, _MAX_JSON)
     completion = (
         _json(_read(Path(plan["completion"]), _MAX_JSON))
         if Path(plan["completion"]).exists()
