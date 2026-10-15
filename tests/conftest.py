@@ -1,8 +1,14 @@
 """Explicit transport denial for synthetic Ollama streaming tests."""
 
+from pathlib import Path
+
 import pytest
 
 from hermes_realtime.providers.ollama_models import OllamaModelClient
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption("--native-git-executable", type=Path, default=None)
 
 
 @pytest.fixture

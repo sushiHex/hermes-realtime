@@ -11,6 +11,44 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("explicit", [False, True], ids=["automatic", "explicit"])
+def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool
+) -> None:
+    gate = run_path(str(ROOT / "scripts" / "release_gate.py"))["gate_materialized_candidate"]
+    selected = tmp_path / "ucrt64" / "bin" / "git.exe" if explicit else None
+    commands: list[tuple[str, ...]] = []
+
+    class FullPytestReached(Exception):
+        pass
+
+    def observe(*command: str, **kwargs: object) -> None:
+        commands.append(command)
+        if "pytest" in command:
+            raise FullPytestReached
+
+    for name in ("reject_ambient_paths", "scan_for_secrets"):
+        monkeypatch.setitem(gate.__globals__, name, lambda root: None)
+    monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", lambda root, target: None)
+    monkeypatch.setitem(gate.__globals__, "run", observe)
+    with pytest.raises(FullPytestReached):
+        gate(tmp_path, livekit=False, git_executable=selected)
+    expected = ("--native-git-executable", str(selected)) if explicit else ()
+    assert commands[-1] == (
+        "uv",
+        "run",
+        "--frozen",
+        "--group",
+        "dev",
+        "pytest",
+        "-q",
+        "--durations=0",
+        "--durations-min=0.005",
+        *expected,
+    )
+    assert all("--native-git-executable" not in command for command in commands[:-1])
+
+
 def _run(*command: str, cwd: Path) -> bytes:
     return subprocess.run(command, cwd=cwd, check=True, capture_output=True).stdout
 

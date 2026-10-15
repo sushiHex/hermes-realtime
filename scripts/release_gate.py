@@ -775,6 +775,7 @@ def gate_materialized_candidate(
     root: Path,
     *,
     livekit: bool,
+    git_executable: Path | None = None,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
     livekit_pid: int | None = None,
@@ -816,6 +817,7 @@ def gate_materialized_candidate(
         "pytest",
         "-q",
         *PYTEST_DURATIONS,
+        *(("--native-git-executable", str(git_executable)) if git_executable is not None else ()),
         cwd=root,
         env=environment,
     )

@@ -458,7 +458,9 @@ def test_run_fast_track_consumes_verified_token_into_downstream_gate(
     executable = tmp_path / "git.exe"
     executable.write_bytes(b"git")
     identity = object()
-    pin = object()
+    from types import SimpleNamespace
+
+    pin = SimpleNamespace(path=executable)
     token = object()
     metadata = object()
     archive = b"verified archive"
@@ -530,6 +532,7 @@ def test_run_fast_track_consumes_verified_token_into_downstream_gate(
             "candidate",
             {
                 "livekit": True,
+                "git_executable": executable,
                 "livekit_executable": tmp_path / "livekit.exe",
                 "livekit_executable_sha256": "e" * 64,
                 "livekit_pid": 123,
@@ -630,10 +633,11 @@ def test_oracle_fixture_uses_shared_native_discovery(
     monkeypatch.setattr(fast_track, "_measure_git_pin", measure)
     monkeypatch.setattr(fast_track.subprocess, "run", refuse_unshared_probe)
     namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
+    pin = namespace["_initialize_git_fixture"](None)
 
     assert observed == [None]
-    assert namespace["GIT"] == executable
-    assert namespace["_MEASURED_GIT_IDENTITY"] == (digest, version, 4)
+    assert pin.path == executable
+    assert (pin.sha256, pin.version, pin.link_count) == (digest, version, 4)
 
 
 @pytest.mark.parametrize("changed", ["sha256", "version", "link_count"])
@@ -657,5 +661,42 @@ def test_oracle_fixture_retains_exact_image_identity_guard(
         {"sha256": "0" * 64, "version": "git version 2.56.0.windows.3", "link_count": 5}[changed],
     )
     monkeypatch.setattr(fast_track, "_measure_git_pin", lambda path: pin)
+    namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
     with pytest.raises(RuntimeError, match="unapproved Git fixture identity"):
-        run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
+        namespace["_initialize_git_fixture"](None)
+
+
+def test_oracle_fixture_explicit_selection_survives_ambiguous_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runpy import run_path
+    from types import SimpleNamespace
+
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    selected = tmp_path / "ucrt64" / "bin" / "git.exe"
+    calls: list[object] = []
+
+    def measure(path: object) -> object:
+        calls.append(path)
+        if path is None:
+            raise ValueError("ambiguous native images")
+        assert path == selected
+        return SimpleNamespace(
+            path=selected,
+            sha256="b824434dfe3b5f9cf648af6c9cc8cb1f6a982cc6e13b6c6ebbe6533c7e51cc2e",
+            version="git version 2.56.0.windows.2",
+            link_count=4,
+        )
+
+    monkeypatch.setattr(fast_track, "_measure_git_pin", measure)
+    namespace = run_path(str(Path(__file__).with_name("test_candidate_source_archive_oracle.py")))
+
+    def selected_option(name: str) -> Path:
+        assert name == "native_git_executable"
+        return selected
+
+    fixture = namespace["_selected_git_fixture"].__wrapped__
+    fixture(SimpleNamespace(getoption=selected_option))
+    assert fixture.__globals__["GIT"] == selected
+    assert calls == [selected]

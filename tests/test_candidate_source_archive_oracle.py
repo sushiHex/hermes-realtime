@@ -15,16 +15,9 @@ from runpy import run_path
 
 import pytest
 
-from scripts.candidate_e2e_fast_track import _measure_git_pin
+from scripts.candidate_e2e_fast_track import GitExecutablePinV1, _measure_git_pin
 
 ROOT = Path(__file__).resolve().parents[1]
-_GIT_FIXTURE_PIN = _measure_git_pin(None)
-GIT = _GIT_FIXTURE_PIN.path
-_MEASURED_GIT_IDENTITY = (
-    _GIT_FIXTURE_PIN.sha256,
-    _GIT_FIXTURE_PIN.version,
-    _GIT_FIXTURE_PIN.link_count,
-)
 _AUTHORIZED_GIT_IDENTITIES = frozenset(
     {
         (
@@ -53,9 +46,26 @@ _AUTHORIZED_GIT_IDENTITIES = frozenset(
         ),
     }
 )
-if _MEASURED_GIT_IDENTITY not in _AUTHORIZED_GIT_IDENTITIES:
-    raise RuntimeError(f"unapproved Git fixture identity: {_MEASURED_GIT_IDENTITY!r}")
-GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = _MEASURED_GIT_IDENTITY
+
+
+def _initialize_git_fixture(executable: Path | None) -> GitExecutablePinV1:
+    pin = _measure_git_pin(executable)
+    measured = (pin.sha256, pin.version, pin.link_count)
+    if measured not in _AUTHORIZED_GIT_IDENTITIES:
+        raise RuntimeError(f"unapproved Git fixture identity: {measured!r}")
+    return pin
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _selected_git_fixture(pytestconfig: pytest.Config) -> None:
+    global GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT
+    pin = _initialize_git_fixture(pytestconfig.getoption("native_git_executable"))
+    GIT, GIT_SHA256, GIT_VERSION, GIT_LINK_COUNT = (
+        pin.path,
+        pin.sha256,
+        pin.version,
+        pin.link_count,
+    )
 
 
 def _git(*arguments: str, cwd: Path = ROOT) -> bytes:

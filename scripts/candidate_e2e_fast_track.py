@@ -139,6 +139,7 @@ def run_fast_track(
         root = _materialize_archive(Path(temporary), archive, metadata)
         release_gate.gate_materialized_candidate(
             root,
+            git_executable=pin.path,
             livekit=require_livekit,
             livekit_executable=livekit_executable,
             livekit_executable_sha256=livekit_executable_sha256,
