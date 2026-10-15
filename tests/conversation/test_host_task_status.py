@@ -546,3 +546,47 @@ async def test_direct_controller_pending_mismatch_clears_after_acknowledgment():
         await operation
         await surface.close()
         await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_status_uses_actual_host_observer_without_new_public_event(capsys):
+    from test_streaming import RecordingPlayback, SegmentSynthesizer
+
+    from hermes_realtime.client import BrowserEventProjection
+    from hermes_realtime.conversation.context import ConversationContextStore
+    from hermes_realtime.conversation.foreground import ForegroundTurnCoordinator
+    from hermes_realtime.conversation.streaming import StreamingSpeechLoop
+    from hermes_realtime.host_launcher import _project_conversation_observation
+    from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
+
+    class Inference:
+        async def stream(self, snapshot, *, turn_id):
+            yield HostSpeechRequest()
+
+        async def cancel(self, turn_id):
+            pass
+
+    projection = BrowserEventProjection(capacity=64)
+    context = ConversationContextStore()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=Inference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        task_status=TaskStatusSnapshot,
+        observer=lambda kind, data: _project_conversation_observation(projection, kind, data),
+    )
+    try:
+        await loop.respond("turn_host_status", Transcript(text="Status?", final=True))
+        assert context.snapshot().messages[-1].source == "host_task_status"
+        assert not context.snapshot().messages[-1].interrupted
+        import json
+
+        lines = capsys.readouterr().out.splitlines()
+        assert [json.loads(line.removeprefix("[host-speech] ")) for line in lines] == [
+            {"category": "delivered", "source": "host_task_status", "chunks": 1}
+        ]
+    finally:
+        await loop.close()

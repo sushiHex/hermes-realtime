@@ -1506,10 +1506,6 @@ class StreamingSpeechLoop:
                     confirmation=confirmation,
                     source=publication.source,
                 )
-                if publication.source == "host_task_status" and self._observer is not None:
-                    self._observer(
-                        "host_speech_delivered", {"source": "host_task_status", "chunks": 1},
-                    )
                 if item.heard_text is not None:
                     last_heard_segment = item.segment
                 partially_delivered_sequences.add(publication.sequence)
@@ -1518,6 +1514,10 @@ class StreamingSpeechLoop:
                 )
                 last_delivered_chunk_ids[publication.sequence] = chunk.chunk_id
                 pending_admissions.remove(admission)
+                if publication.source == "host_task_status":
+                    print("[host-speech] " + json.dumps(
+                        {"category": "delivered", "source": "host_task_status", "chunks": 1},
+                        separators=(",", ":")), flush=True)
             await asyncio.shield(prefetch_task)
             await asyncio.shield(producer_result)
             turn_counts = self._ledger.snapshot_turn_counts(turn_id)

@@ -115,7 +115,8 @@ apply to host speech exactly as they apply to ordinary speech.
 Host source survives publication, replay, heard context and provider prompt
 metadata. Only transport-confirmed heard text enters context; source changes
 start a separate heard row. Content-free committed-context evidence binds the
-indices of host rows. Provenance is bounded to this process: the existing strict
+indices of host rows. Delivery diagnostics carry local source/category/counts;
+no new public browser event is added. Provenance is bounded to this process: the existing strict
 voice-tail/archive wire remains unchanged, and persisted/reloaded rows have
 ordinary assistant provenance. No source is reconstructed from wording, and
 historical host speech grants no authority or proof of current state.
