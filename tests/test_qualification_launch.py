@@ -795,18 +795,69 @@ def test_unbound_cli_refuses_before_claiming_owned_launch(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
-def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
-    tmp_path: Path, launch_capability: str
+def test_materialized_evaluator_refuses_owned_cli_without_git_source(
+    tmp_path: Path,
 ) -> None:
-    binding, digest = _binding(tmp_path)
-    receipt = tmp_path / "cli-receipt.jsonl"
     root = Path(__file__).resolve().parents[1]
+    if (root / ".git").exists():
+        pytest.skip("Git-less materialized candidate required; checkout witness runs separately")
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "archive-cli-receipt.jsonl"
     wrong = tmp_path / "wrong"
     (wrong / "hermes_realtime").mkdir(parents=True)
     (wrong / "hermes_realtime/__init__.py").write_text(
         "raise RuntimeError('wrong source imported')"
     )
     environment = dict(os.environ, PYTHONPATH=os.pathsep.join((str(wrong), str(root))))
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.evaluate_natural_work_routing",
+            "--launch-binding", str(binding),
+            "--launch-binding-sha256", digest,
+            "--launch-receipt", str(receipt),
+            "--codex-executable", str(tmp_path / "absent.exe"),
+            "--mode", "diagnostic_override",
+            "--source-head", "a" * 40,
+            "--source-tree", "b" * 40,
+        ],
+        cwd=root, env=environment, stdin=subprocess.DEVNULL,
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=30,
+    )
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["error"]["code"] == "source_binding_failed"
+    assert not receipt.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
+def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
+    tmp_path: Path, launch_capability: str
+) -> None:
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "cli-receipt.jsonl"
+    root = Path(__file__).resolve().parents[1]
+    if not (root / ".git").exists():
+        pytest.skip("Git checkout required; materialized archive refusal runs separately")
+    from tests.test_candidate_source_archive_oracle import GIT
+
+    source_head = subprocess.run(
+        [str(GIT), "rev-parse", "HEAD"], cwd=root, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    source_tree = subprocess.run(
+        [str(GIT), "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    wrong = tmp_path / "wrong"
+    (wrong / "hermes_realtime").mkdir(parents=True)
+    (wrong / "hermes_realtime/__init__.py").write_text(
+        "raise RuntimeError('wrong source imported')"
+    )
+    environment = dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join((str(wrong), str(root))),
+        PATH=os.pathsep.join((str(GIT.parent), os.environ.get("PATH", ""))),
+    )
     # A deliberately absent executable refuses before any provider subprocess.
     # This checks the real opted-in CLI and dependency refusal.
     completed = subprocess.run(
@@ -825,15 +876,9 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
             "--mode",
             "diagnostic_override",
             "--source-head",
-            subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=root, check=True,
-                text=True, capture_output=True,
-            ).stdout.strip(),
+            source_head,
             "--source-tree",
-            subprocess.run(
-                ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
-                text=True, capture_output=True,
-            ).stdout.strip(),
+            source_tree,
         ],
         cwd=root,
         env=environment,
