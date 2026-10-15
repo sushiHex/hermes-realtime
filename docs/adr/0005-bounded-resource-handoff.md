@@ -54,13 +54,13 @@ currently sends the objective as `input` and does not send `conversation_history
 ([adapter](../../src/hermes_realtime/integration/api.py)). Passing `session_id` is
 not a resource binding: when explicit history is absent, Runs may load stored
 messages for that session; when omitted, Hermes gives the run its own session ID.
-([Runs request fields](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3024-L3084),
-[session behavior](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3131-L3240)).
+([Runs request fields](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L480-L546),
+[session behavior](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L600-L614)).
 
 Hermes already selects multiplexed profiles through a `/p/<profile>/` URL prefix
 and carries that request profile into the background Runs agent
 ([profile middleware](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server.py#L2100-L2206),
-[Runs profile scope](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L3397-L3467)).
+[Runs profile scope](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/gateway/platforms/api_server_runs.py#L719-L823)).
 The current realtime API client accepts only a loopback origin, so it cannot
 currently select that prefix
 ([client configuration](../../src/hermes_realtime/integration/api.py)). Hermes
@@ -68,6 +68,10 @@ already has file-reading and terminal tools, but their availability, backend and
 working directory depend on the selected profile's tool configuration
 ([file tools](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/file_tools.py),
 [terminal tool](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/terminal_tool.py)).
+The terminal configuration also has a
+[process-level environment bridge](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/terminal_tool.py#L1712-L1761).
+The witness below uses explicit locators; it does not establish per-profile working
+directory propagation or exclusive filesystem permissions.
 Review must choose and bound the existing content carrier and settle how the host
 binds it to the correct local profile before deciding whether any new Hermes API
 surface is needed.
@@ -96,12 +100,24 @@ A witness through the actual pinned Hermes Runs route and selected profile must
 then demonstrate that admitted references arrive unchanged and identify resources
 that the background executor can use. A direct terminal read alone is insufficient;
 neither successful transport nor a working-directory setting proves this handoff.
-The planned witness uses an isolated Runs fixture and a deterministic test model to
-request one read-only call to an existing, profile-enabled file or terminal tool
-against a canary resource. It must verify the exact reference at the tool boundary,
-the selected profile and backend, and the canary result. This is a real fixture Run
-through Hermes's handler and tool dispatch, without external inference or a user
-gateway. It has not yet been executed.
+The [existing-carrier witness](https://github.com/sushiHex/hermes-realtime/pull/269#issuecomment-6189897265)
+now demonstrates this mechanism in two isolated profiles: two real Runs completed,
+two registered `read_file` calls returned their known canaries, and four deterministic
+stand-in completion requests used no external inference. Exact supplied reference
+content reached the model; actual tool arguments, selected profile and local backend
+matched. An unknown profile returned 404. Original handlers and dispatch were not
+replaced; a passive observer retained tool-boundary metadata. The public owner
+verified its Job empty, and both listeners were separately observed absent.
+
+The initial fixture Run remains failed: its checker omitted a trailing empty line
+from the expected pinned formatter output. A subsequent wrong-class formatter
+preflight refused before any Run. Both are preserved separately from the successful
+successor, which first checked the actual pinned formatter under the hidden owner.
+These are fixture corrections, not a reinterpretation of earlier routing results.
+
+This proves the existing explicit-history carrier for these configured profiles and
+locators, not the realtime foreground handoff or approval to forward whole history.
+The chosen host binding and wire contract still need their own reviewed witness.
 
 Actual-adapter qualification must separately assess routing, objective fidelity,
 resource sufficiency and truthful lifecycle claims. Real execution and voice gates
