@@ -1,16 +1,131 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from scripts import qualification_launch as launch
+
+
+def _receipt_fields(path: Path) -> list[dict[str, object]]:
+    stages = {
+        "reserved",
+        "started",
+        "complete",
+        "incomplete",
+        "refused",
+        "observer_timeout",
+        "observer_interrupted",
+    }
+    categories = {
+        "complete",
+        "refused",
+        "guardian_timeout",
+        "interrupted",
+        "breakaway_not_permitted",
+        "guardian_spawn_failed",
+        "guardian_inherited_job",
+        "timed_out",
+        "invalid_input",
+        "execution_failed",
+    }
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            return [{"stage": "unreadable"}]
+        rows = [json.loads(line) for line in raw.splitlines()]
+        if len(rows) > 8 or any(type(row) is not dict for row in rows):
+            return [{"stage": "unreadable"}]
+        result = []
+        for row in rows:
+            safe: dict[str, object] = {}
+            for key, allowed in (("stage", stages), ("category", categories)):
+                if key in row:
+                    value = row[key]
+                    safe[key] = value if type(value) is str and value in allowed else "unrecognized"
+            for key in ("controller_completed", "cleanup_verified"):
+                if key in row:
+                    safe[key] = row[key] if type(row[key]) is bool else None
+            result.append(safe)
+        return result
+    except (OSError, ValueError):
+        return [{"stage": "unreadable"}]
+
+
+@pytest.fixture(autouse=True)
+def _show_closed_receipt_fields(tmp_path: Path) -> Iterator[None]:
+    yield
+    # Pytest shows captured teardown output on failure; paths and controller
+    # output remain local. No receipt is interpreted as qualification success.
+    for path in sorted(tmp_path.glob("*.jsonl"))[:4]:
+        print("[qualification-launch-test] " + json.dumps(_receipt_fields(path)))
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "private_values", "private_flags", "oversize", "rows", "shape", "malformed"]
+)
+def test_receipt_diagnostics_keep_only_bounded_closed_fields(tmp_path: Path, fault: str) -> None:
+    receipt = tmp_path / "receipt.jsonl"
+    row = {
+        "stage": "incomplete",
+        "category": "execution_failed",
+        "controller_completed": False,
+        "cleanup_verified": False,
+        "private_output": "PRIVATE_SENTINEL",
+        "pid": 12345,
+    }
+    if fault == "private_values":
+        row.update(stage="PRIVATE_SENTINEL", category="PRIVATE_SENTINEL")
+    if fault == "private_flags":
+        row.update(controller_completed="PRIVATE_SENTINEL", cleanup_verified="PRIVATE_SENTINEL")
+    receipt.write_bytes(
+        b" " * 65535 + b"{}"
+        if fault == "oversize"
+        else (json.dumps(row) + "\n").encode() * 9
+        if fault == "rows"
+        else b"[]\n"
+        if fault == "shape"
+        else b"{"
+        if fault == "malformed"
+        else (json.dumps(row) + "\n").encode()
+    )
+    actual = _receipt_fields(receipt)
+    if fault in {"oversize", "rows", "shape", "malformed"}:
+        assert actual == [{"stage": "unreadable"}]
+    else:
+        assert actual == [
+            {
+                "stage": "unrecognized" if fault == "private_values" else "incomplete",
+                "category": "unrecognized" if fault == "private_values" else "execution_failed",
+                "controller_completed": None if fault == "private_flags" else False,
+                "cleanup_verified": None if fault == "private_flags" else False,
+            }
+        ]
+    assert "PRIVATE_SENTINEL" not in json.dumps(actual)
+
+
+def test_receipt_diagnostics_read_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested = []
+
+    class Stream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            requested.append(size)
+            return super().read(size)
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: Stream(b"{}"))
+    assert _receipt_fields(tmp_path / "receipt.jsonl") == [{}]
+    assert requested == [65537]
 
 
 def _binding(tmp_path: Path) -> tuple[Path, str]:
