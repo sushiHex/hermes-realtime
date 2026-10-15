@@ -170,9 +170,9 @@ On Windows, opt into the independent base-Python guardian with the same binding:
 python -m scripts.evaluate_natural_work_routing \
   --source-head "$(git rev-parse HEAD)" \
   --source-tree "$(git rev-parse 'HEAD^{tree}')" \
-  --launch-binding interpreter-binding.json \
+  --launch-binding PRIVATE_DIR/interpreter-binding.json \
   --launch-binding-sha256 APPROVED_SHA256 \
-  --launch-receipt private-launch.jsonl \
+  --launch-receipt PRIVATE_DIR/private-launch.jsonl \
   --provider ollama --mode diagnostic_override \
   --model SELECTED_MODEL
 ```
@@ -181,6 +181,9 @@ The private binding has exactly this versioned shape; supply absolute local path
 and SHA-256s of their exact executable bytes. The guardian must be the current
 interpreter's `sys._base_executable`; the controller must be `sys.executable`.
 Keep this file, receipt and retained output private; do not commit local paths.
+`PRIVATE_DIR` must be a directory outside the checkout. The entrypoint requires a clean
+worktree, untracked files included, before and after the run, so a binding or receipt
+inside the repository refuses the run.
 
 ```json
 {"schema_version":1,"guardian":{"path":"ABSOLUTE_BASE_PYTHON","sha256":"SHA256"},"controller":{"path":"ABSOLUTE_CONTROLLER_PYTHON","sha256":"SHA256"}}
@@ -288,7 +291,8 @@ override is accepted in this mode.
 python -m scripts.evaluate_natural_work_scenario \
   --development-fixture tests/fixtures/natural_work_development_cases.json \
   --source-head APPROVED_CLEAN_HEAD --model SELECTED_MODEL \
-  --base-url http://127.0.0.1:11437 --private-receipt private-development.jsonl --live
+  --base-url http://127.0.0.1:11437 --private-receipt PRIVATE_DIR/private-development.jsonl \
+  --live
 ```
 
 The runtime must already be owned by the caller. For owned Windows execution, pass
