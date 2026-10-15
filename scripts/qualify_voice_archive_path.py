@@ -414,15 +414,19 @@ def _qualify(hermes_python: Path) -> None:
             evidence["passed"] = False
             raise
         finally:
-            try:
-                for owned in spawned:
-                    if owned.process.poll() is None:
+            # One failed stop must neither strand later companions nor replace the
+            # qualification's own failure; its category becomes evidence instead.
+            cleanup_failures = []
+            for owned in spawned:
+                if owned.process.poll() is None:
+                    try:
                         owned.stop()
-            finally:
-                print(
-                    _PREFIX + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
-                    flush=True,
-                )
+                    except Exception as error:
+                        cleanup_failures.append(type(error).__name__)
+            if cleanup_failures:
+                evidence["cleanup_failures"] = cleanup_failures
+                evidence["passed"] = False
+            print(_PREFIX + json.dumps(evidence, separators=(",", ":"), sort_keys=True), flush=True)
     if evidence["passed"] is not True:
         raise SystemExit(1)
 

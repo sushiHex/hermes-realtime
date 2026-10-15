@@ -186,8 +186,11 @@ def test_an_unfrozen_first_send_fails_the_qualification() -> None:
     assert _SCRIPT._passed(evidence, _BASELINE) is False
 
 
+@pytest.mark.parametrize("primary_stop_fails", [False, True])
 def test_a_contender_that_never_exits_is_stopped_with_the_primary(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    primary_stop_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     spawned: list[Any] = []
 
@@ -210,6 +213,8 @@ def test_a_contender_that_never_exits_is_stopped_with_the_primary(
             return 1
 
         def stop(self) -> int:
+            if primary_stop_fails and self.process.mode == "own":
+                raise OSError("stop file not writable")
             self.process.returncode = 0
             return 0
 
@@ -221,6 +226,7 @@ def test_a_contender_that_never_exits_is_stopped_with_the_primary(
         _SCRIPT._qualify(Path("hermes-python"))
 
     assert [owned.process.mode for owned in spawned] == ["own", "contend"]
-    assert [owned.process.returncode for owned in spawned] == [0, 0]
-    marker = capsys.readouterr().out.strip().removeprefix(_SCRIPT._PREFIX)
-    assert _SCRIPT.json.loads(marker)["failure"] == "TimeoutExpired"
+    assert spawned[1].process.returncode == 0
+    marker = _SCRIPT.json.loads(capsys.readouterr().out.strip().removeprefix(_SCRIPT._PREFIX))
+    assert marker["failure"] == "TimeoutExpired"
+    assert marker.get("cleanup_failures", []) == (["OSError"] if primary_stop_fails else [])
