@@ -1,12 +1,338 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import io
+import json
+import os
+import sys
 import tarfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture
+def native_git_installation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    program_files = tmp_path / "native-program-files"
+    program_files.mkdir()
+    validations, invocations = [], []
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.setattr(
+        fast_track.candidate_source_archive_oracle,
+        "_known_program_files",
+        lambda: program_files,
+    )
+    monkeypatch.setattr(
+        fast_track.candidate_source_archive_oracle,
+        "_validate_public_git_location",
+        lambda path: validations.append(path),
+    )
+
+    def version(command, **kwargs):
+        invocations.append(command)
+        assert validations == [Path(command[0])]
+        return SimpleNamespace(stdout=b"git version 2.56.0.windows.2\n")
+
+    monkeypatch.setattr(fast_track.subprocess, "run", version)
+    monkeypatch.setattr(
+        fast_track,
+        "GitExecutablePinV1",
+        lambda path, sha256, version, links: SimpleNamespace(
+            path=path, sha256=sha256, version=version, link_count=links
+        ),
+    )
+    return program_files, validations, invocations
+
+
+@pytest.mark.parametrize("layout", ["mingw64", "ucrt64"])
+def test_default_git_measures_the_unique_native_image(native_git_installation, layout: str) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    program_files, validations, invocations = native_git_installation
+    executable = program_files / "Git" / layout / "bin/git.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic native Git image")
+
+    pin = fast_track._measure_git_pin(None)
+
+    assert pin.path == executable
+    assert pin.sha256 == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert pin.version == "git version 2.56.0.windows.2"
+    assert pin.link_count == executable.stat().st_nlink
+    assert validations == [executable]
+    assert invocations == [(str(executable), "--version")]
+
+
+@pytest.mark.parametrize("layouts", [(), ("mingw64", "ucrt64")], ids=["missing", "ambiguous"])
+def test_default_git_refuses_missing_or_ambiguous_images(
+    native_git_installation, layouts: tuple[str, ...], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    program_files, validations, invocations = native_git_installation
+    for layout in layouts:
+        executable = program_files / "Git" / layout / "bin/git.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"synthetic image")
+
+    with pytest.raises(ValueError, match="--git-executable"):
+        fast_track._measure_git_pin(None)
+
+    assert validations == invocations == []
+    output = capsys.readouterr().out
+    assert output.startswith("[native-git-discovery] ") and output.count("\n") == 1
+    marker = json.loads(output.removeprefix("[native-git-discovery] "))
+    assert marker == {
+        "version": 1,
+        "candidates": len(layouts),
+        "category": "ambiguous" if layouts else "missing",
+    }
+    assert str(program_files) not in output
+
+
+def test_default_git_ignores_environment_and_launcher_decoys(
+    native_git_installation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    program_files, _, invocations = native_git_installation
+    for executable in (
+        tmp_path / "path/git.exe",
+        tmp_path / "environment-program-files/Git/ucrt64/bin/git.exe",
+        program_files / "Git/cmd/git.exe",
+        program_files / "Git/bin/git.exe",
+    ):
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_bytes(b"synthetic decoy")
+    monkeypatch.setenv("PATH", str(tmp_path / "path"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "environment-program-files"))
+    with pytest.raises(ValueError, match="--git-executable"):
+        fast_track._measure_git_pin(None)
+    assert invocations == []
+
+
+def test_default_git_refuses_native_location_validation_before_execution(
+    native_git_installation, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    program_files, _, invocations = native_git_installation
+    executable = program_files / "Git/ucrt64/bin/git.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic image")
+
+    def refused(path):
+        raise ValueError("synthetic native authority refusal")
+
+    monkeypatch.setattr(
+        fast_track.candidate_source_archive_oracle, "_validate_public_git_location", refused
+    )
+    with pytest.raises(ValueError, match="synthetic native authority refusal"):
+        fast_track._measure_git_pin(None)
+    assert invocations == []
+    marker = json.loads(capsys.readouterr().out.removeprefix("[native-git-discovery] "))
+    assert marker == {"version": 1, "candidates": 1, "category": "location_refused"}
+
+
+def test_default_git_preserves_native_authority_refusal(
+    native_git_installation, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    _, validations, invocations = native_git_installation
+
+    def refused():
+        raise fast_track.candidate_source_archive_oracle.CandidateSourceArchiveError(
+            "synthetic native authority refusal"
+        )
+
+    monkeypatch.setattr(fast_track.candidate_source_archive_oracle, "_known_program_files", refused)
+    with pytest.raises(
+        fast_track.candidate_source_archive_oracle.CandidateSourceArchiveError,
+        match="synthetic native authority refusal",
+    ):
+        fast_track._measure_git_pin(None)
+    assert validations == invocations == []
+    marker = json.loads(capsys.readouterr().out.removeprefix("[native-git-discovery] "))
+    assert marker == {"version": 1, "candidates": 0, "category": "authority_refused"}
+
+
+def test_explicit_git_path_is_never_replaced_by_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    def no_discovery():
+        raise AssertionError("explicit image must not use discovery")
+
+    monkeypatch.setattr(
+        fast_track.candidate_source_archive_oracle, "_known_program_files", no_discovery
+    )
+    missing = tmp_path / "missing/git.exe"
+    with pytest.raises(FileNotFoundError):
+        fast_track._measure_git_pin(missing)
+    executable = tmp_path / "selected/git.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"explicit image")
+    observed = []
+    monkeypatch.setattr(
+        fast_track.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            observed.append(command) or SimpleNamespace(stdout=b"git version 2.55.0.windows.5\n")
+        ),
+    )
+    monkeypatch.setattr(fast_track, "GitExecutablePinV1", lambda *fields: fields)
+    pin = fast_track._measure_git_pin(executable)
+    assert pin == (
+        executable,
+        hashlib.sha256(b"explicit image").hexdigest(),
+        "git version 2.55.0.windows.5",
+        executable.stat().st_nlink,
+    )
+    assert observed == [(str(executable), "--version")]
+
+
+def test_git_version_probe_is_bounded_noninteractive_and_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"synthetic native image")
+    observed = []
+    monkeypatch.setattr(
+        fast_track.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            observed.append((command, kwargs))
+            or SimpleNamespace(stdout=b"git version 2.56.0.windows.2\n")
+        ),
+    )
+    monkeypatch.setattr(fast_track, "GitExecutablePinV1", lambda *fields: fields)
+
+    fast_track._measure_git_pin(executable)
+
+    assert observed == [
+        (
+            (str(executable), "--version"),
+            {
+                "capture_output": True,
+                "check": True,
+                "stdin": fast_track.subprocess.DEVNULL,
+                "timeout": 30.0,
+                "creationflags": fast_track.subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            },
+        )
+    ]
+
+
+def test_git_version_probe_preserves_timeout_with_bounded_final_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"synthetic native image")
+    failure = fast_track.subprocess.TimeoutExpired((str(executable), "--version"), 30.0)
+
+    def expired(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(fast_track.subprocess, "run", expired)
+    with pytest.raises(fast_track.subprocess.TimeoutExpired) as observed:
+        fast_track._measure_git_pin(executable)
+    assert observed.value is failure
+    output = capsys.readouterr().out
+    assert output.startswith("[native-git-probe] ") and output.count("\n") == 1
+    assert json.loads(output.removeprefix("[native-git-probe] ")) == {
+        "version": 1,
+        "calls": 1,
+        "category": "timeout",
+    }
+    assert str(executable) not in output
+
+
+_GIT_CONSUMERS = (
+    "candidate_e2e_fast_track",
+    "qualify_capacity_rollover",
+    "qualify_deterministic_equivalence",
+    "qualify_full_purge_cleanup",
+    "qualify_over_budget_turn",
+    "qualify_owned_close_faults",
+    "qualify_revoke_race",
+    "qualify_spool_crash_matrix",
+    "qualify_synthetic_fault_matrix",
+)
+
+
+@pytest.mark.parametrize("consumer", _GIT_CONSUMERS)
+@pytest.mark.parametrize("explicit", [False, True], ids=["discover", "explicit"])
+def test_git_cli_consumers_deliver_the_measured_image_to_the_archive_oracle(
+    native_git_installation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+    explicit: bool,
+) -> None:
+    from scripts import candidate_e2e_fast_track as fast_track
+
+    module = importlib.import_module("scripts." + consumer)
+    program_files, validations, invocations = native_git_installation
+    executable = program_files / "Git/ucrt64/bin/git.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic selected image")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    arguments = [consumer, "--candidate", str(candidate)]
+    if explicit:
+        arguments += ["--git-executable", str(executable)]
+        # The existing explicit-path pin validates authority in its constructor.
+        validations.append(executable)
+    if consumer not in {
+        "candidate_e2e_fast_track",
+        "qualify_full_purge_cleanup",
+        "qualify_spool_crash_matrix",
+        "qualify_synthetic_fault_matrix",
+    }:
+        arguments += ["--livekit-executable", "livekit-server.exe", "--livekit-sha256", "a" * 64]
+    if consumer not in {"candidate_e2e_fast_track", "qualify_deterministic_equivalence"}:
+        arguments += ["--candidate-wheel", "candidate.whl", "--wheel-sha256", "b" * 64]
+    monkeypatch.setattr(sys, "argv", arguments)
+    identity, captured = object(), []
+
+    class ArchiveReached(Exception):
+        pass
+
+    def capture(root, observed_identity, pin):
+        assert root == candidate and observed_identity is identity
+        captured.append(pin)
+        raise ArchiveReached
+
+    if consumer == "candidate_e2e_fast_track":
+        monkeypatch.setattr(
+            fast_track.task13_artifact_orchestrator,
+            "verify_clean_tracked_candidate",
+            lambda *args: identity,
+        )
+        monkeypatch.setattr(fast_track.release_gate, "scan_git_blobs", lambda *args: None)
+        monkeypatch.setattr(
+            fast_track.candidate_source_archive_oracle, "capture_candidate_source_archive", capture
+        )
+    else:
+        monkeypatch.setattr(module, "verify_clean_tracked_candidate", lambda *args: identity)
+        monkeypatch.setattr(module, "capture_candidate_source_archive", capture)
+    with pytest.raises(ArchiveReached):
+        module.main()
+    assert len(captured) == 1
+    assert captured[0].path == executable
+    assert captured[0].sha256 == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert invocations == [(str(executable), "--version")]
 
 
 def _archive() -> tuple[bytes, object]:

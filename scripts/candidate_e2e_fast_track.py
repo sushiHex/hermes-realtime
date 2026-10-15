@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -42,15 +44,63 @@ _MAX_FILE_BYTES = 4 * 1024 * 1024
 _MAX_TREE_BYTES = candidate_source_archive_oracle._MAX_CANDIDATE_TREE_BYTES
 
 
-def _measure_git_pin(executable: Path) -> GitExecutablePinV1:
+def _discover_native_git() -> Path:
+    """Select one direct x64 image using native Program Files authority, not PATH."""
+    count = 0
+    category: str | None = "authority_refused"
+    try:
+        installation = candidate_source_archive_oracle._known_program_files() / "Git"
+        # Git for Windows 2.56 migrated from MINGW64 to UCRT64. Both are native
+        # images; cmd/bin launchers would introduce another executable identity.
+        candidates = tuple(
+            installation / layout / "bin/git.exe"
+            for layout in ("ucrt64", "mingw64")
+            if (installation / layout / "bin/git.exe").is_file()
+        )
+        count = len(candidates)
+        if count != 1:
+            category = "missing" if count == 0 else "ambiguous"
+            raise ValueError(
+                "Native Git discovery requires exactly one supported image; "
+                "select it explicitly with --git-executable"
+            )
+        category = "location_refused"
+        candidate_source_archive_oracle._validate_public_git_location(candidates[0])
+        category = None
+        return candidates[0]
+    finally:
+        if category is not None:
+            print(
+                "[native-git-discovery] "
+                + json.dumps({"version": 1, "candidates": count, "category": category})
+            )
+
+
+def _measure_git_pin(executable: Path | None) -> GitExecutablePinV1:
     """Measure one Git executable; the oracle retains and rechecks the exact file."""
 
+    if executable is None:
+        executable = _discover_native_git()
     executable = executable.resolve(strict=True)
-    completed = subprocess.run(
-        (str(executable), "--version"),
-        capture_output=True,
-        check=True,
-    )
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            (str(executable), "--version"),
+            capture_output=True,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            timeout=candidate_source_archive_oracle._CHILD_TIMEOUT_SECONDS,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        raise
+    finally:
+        if timed_out:
+            print(
+                "[native-git-probe] "
+                + json.dumps({"version": 1, "calls": 1, "category": "timeout"})
+            )
     try:
         version = completed.stdout.removesuffix(b"\n").decode("ascii", "strict")
     except UnicodeDecodeError as error:
@@ -68,7 +118,7 @@ def _measure_git_pin(executable: Path) -> GitExecutablePinV1:
 def run_fast_track(
     candidate: Path,
     *,
-    git_executable: Path,
+    git_executable: Path | None,
     require_livekit: bool = False,
     livekit_executable: Path | None = None,
     livekit_executable_sha256: str | None = None,
@@ -163,11 +213,7 @@ def _materialize_archive(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", type=Path, default=Path.cwd())
-    parser.add_argument(
-        "--git-executable",
-        type=Path,
-        default=Path(r"C:\Program Files\Git\mingw64\bin\git.exe"),
-    )
+    parser.add_argument("--git-executable", type=Path)
     parser.add_argument("--require-livekit", action="store_true")
     parser.add_argument("--livekit-executable", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--livekit-executable-sha256", help=argparse.SUPPRESS)
