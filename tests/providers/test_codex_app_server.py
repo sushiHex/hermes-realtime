@@ -146,7 +146,9 @@ async def test_codex_request_carries_lifecycle_framing_without_granting_authorit
         "was approved, or completed merely because the user requested it; report lifecycle "
         "changes only from trusted acknowledged task state."
     )
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+        "start_work", "task_status",
+    ]
     assert handler.starts == handler.cancels == handler.exact_cancels == []
 
 
@@ -165,7 +167,9 @@ async def test_codex_outbound_work_request_carries_objective_context_contract() 
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     assert request["params"]["baseInstructions"].count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+        "start_work", "task_status",
+    ]
     assert handler.starts == handler.cancels == handler.exact_cancels == []
 
 
@@ -405,7 +409,9 @@ async def test_legacy_work_handler_binds_without_advertising_model_cancellation(
     ] == ["Four."]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert [tool["name"] for tool in thread_request["params"]["dynamicTools"]] == ["start_work"]
+    assert [tool["name"] for tool in thread_request["params"]["dynamicTools"]] == [
+        "start_work", "task_status",
+    ]
     await inference.close()
 
 
@@ -1981,7 +1987,7 @@ async def test_codex_process_with_a_valid_login_is_kept() -> None:
 
 
 def _snapshot(*, active_task: bool = False) -> ConversationContextSnapshot:
-    return ConversationContextSnapshot(
+    return ConversationInferenceRequest(
         revision=1,
         messages=(ConversationMessage(role="user", text="What is two plus two?"),),
         active_tasks=(
@@ -2501,6 +2507,10 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
                 },
             },
         },
+        {"type": "function", "name": "task_status",
+         "description": "Report host-owned background task status and explicit Cancel controls.",
+         "inputSchema": {"type": "object", "additionalProperties": False,
+                         "required": [], "properties": {}}},
     ]
     serialized_params = json.dumps(
         thread_request["params"],
@@ -3086,7 +3096,9 @@ async def test_codex_bound_work_tools_omit_cancel_without_active_work() -> None:
     assert [
         tool["name"]
         for tool in thread_request["params"]["dynamicTools"]  # type: ignore[index]
-    ] == ["start_work"]
+    ] == [
+        "start_work", "task_status",
+    ]
     await inference.close()
 
 

@@ -62,7 +62,9 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+        "start_work", "task_status",
+    ]
     assert "cancel_active_work" not in request["params"]["baseInstructions"]
     assert "Decide from the current user's intent" in request["params"]["baseInstructions"]
     assert "Do not require explicit background-task wording or confirmation" in (
@@ -267,6 +269,8 @@ async def test_codex_natural_current_request_can_start_after_terminal_work(
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == ["start_work"]
+    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+        "start_work", "task_status",
+    ]
     if utterance == "Please find out what public hearings are happening in Anaheim.":
         assert "delegate appropriate research through it" in request["params"]["baseInstructions"]

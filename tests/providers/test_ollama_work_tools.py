@@ -96,6 +96,11 @@ def start_schema() -> dict[str, object]:
                 "type": "string", "minLength": 1, "maxLength": 64}}}
 
 
+def status_schema() -> dict[str, object]:
+    return {"type": "object", "additionalProperties": False, "required": ["kind"],
+            "properties": {"kind": {"const": "task_status"}}}
+
+
 def request() -> ConversationInferenceRequest:
     return ConversationInferenceRequest(revision=1,
         messages=(ConversationMessage("user", "Please inspect the release."),), active_tasks=())
@@ -150,7 +155,7 @@ async def test_ollama_request_carries_lifecycle_framing_without_granting_authori
         "changes only from trusted acknowledged task state."
     )
     assert handler.calls == []
-    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema()]}
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
     assert "tools" not in sent[0]
 
 
@@ -167,7 +172,7 @@ async def test_ollama_outbound_work_request_carries_objective_context_contract()
     instructions = sent[0]["messages"][0]["content"]
     assert instructions.count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
     assert handler.calls == []
-    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema()]}
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
 
 
 @pytest.mark.asyncio
@@ -255,7 +260,7 @@ async def test_constrained_start_advertises_exact_union_and_waits_for_acceptance
     assert body["truncate"] is False
     assert body["options"] == {"num_ctx": 16384, "num_predict": 1024}
     assert "tools" not in body
-    assert body["format"] == {"oneOf": [reply_schema(), start_schema()]}
+    assert body["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
 
 
 
@@ -294,7 +299,7 @@ async def test_constrained_start_preserves_selected_context_delivery_and_complet
     assert body["options"] == {"num_ctx": 4096, "num_predict": 1024}
     assert body["shift"] is False and body["truncate"] is False
     assert "tools" not in body
-    assert body["format"] == {"oneOf": [reply_schema(), start_schema()]}
+    assert body["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
     messages = body["messages"]
     assert messages[1:] == [
         {"role": message.role, "content": message.text} for message in snapshot.messages
@@ -947,9 +952,10 @@ async def test_whole_decision_deadline_bounds_many_fast_individual_reads() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["start_work", "reply"])
+@pytest.mark.parametrize("kind", ["start_work", "reply", "task_status"])
 async def test_deadline_expired_before_admission_has_no_dispatch_effect(kind) -> None:
-    value = {"kind": kind, "text" if kind == "reply" else "objective": "Inspect release"}
+    value = ({"kind": kind} if kind == "task_status" else
+             {"kind": kind, "text" if kind == "reply" else "objective": "Inspect release"})
     inference, handler, _, _ = adapter([
         decision_frame(value)], request_timeout_seconds=0.05)
 

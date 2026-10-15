@@ -26,6 +26,7 @@ from hermes_realtime import __version__
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
 from hermes_realtime.conversation.work_tools import WORK_OBJECTIVE_CONTEXT_POLICY, WorkStartResult
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
@@ -151,7 +152,7 @@ _IGNORED_THREAD_NOTIFICATIONS = frozenset(
 )
 _ITEM_LIFECYCLE_NOTIFICATIONS = frozenset({"item/started", "item/completed"})
 _SAFE_ITEM_TYPES = frozenset({"agentMessage", "reasoning", "userMessage"})
-_DYNAMIC_TOOL_NAMES = frozenset({"search_knowledge", "start_work"})
+_DYNAMIC_TOOL_NAMES = frozenset({"search_knowledge", "start_work", "task_status"})
 _INVOCATION_DOMAIN = b"hermes-realtime:codex-dynamic-tool:v1\0"
 _NONCOMMITTAL_TOOL_RESULT = {
     "accepted": False,
@@ -614,6 +615,8 @@ class _TurnRouting:
     accepted_start: bool = False
     lookup_attempted: bool = False
     start_attempted: bool = False
+    status_selected: bool = False
+    host_status_ready: bool = False
 
 
 class CodexAppServerStreamingInference:
@@ -948,8 +951,9 @@ class CodexAppServerStreamingInference:
         snapshot: ConversationContextSnapshot,
         *,
         turn_id: str,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | HostSpeechRequest]:
         style = require_output_style(self._output_style())
+        admitted_user_turn = type(snapshot) is ConversationInferenceRequest
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         async with self._turn_lock:
@@ -1175,7 +1179,13 @@ class CodexAppServerStreamingInference:
                 dynamic_tools = self._dynamic_tools(
                     tool_handler.max_objective_chars if tool_handler is not None else None,
                     include_search=search_available,
+                    include_status=admitted_user_turn,
                 )
+            if admitted_user_turn and tool_handler is not None:
+                base_instructions += (
+                    " For task status or requests to stop work, call task_status "
+                    "with no arguments. "
+                    "The host reports observed state and the explicit cancellation controls.")
             if freshness_context is not None:
                 base_instructions += "\n\n" + freshness_context
             thread_response = await self._request(
@@ -1269,8 +1279,17 @@ class CodexAppServerStreamingInference:
                         thread_id=server_thread_id,
                         turn_id=server_turn_id,
                     )
+                    if type(event) is HostSpeechRequest:
+                        if active.cancelled:
+                            raise asyncio.CancelledError
+                        yield event
+                        return
+                    event = cast(Mapping[str, object], event)
                     method = self._exact_string(event.get("method"), "event method")
                     params = self._exact_mapping(event.get("params"), "event params")
+                    if method == "item/agentMessage/delta" and routing.status_selected:
+                        buffer = ""
+                        continue
                     if method == "item/agentMessage/delta":
                         self._require_event_identity(params, server_thread_id, server_turn_id)
                         delta = self._exact_string(params.get("delta"), "assistant delta")
@@ -1361,6 +1380,16 @@ class CodexAppServerStreamingInference:
                             cleanup_resolution = opening.resolution
                         if cleanup_resolution is not None:
                             cleanup_active = await asyncio.shield(cleanup_resolution)
+                    if cleanup_active is not None:
+                        cleanup_routing = self._turn_routing.get(
+                            (cleanup_active.thread_id, cleanup_active.server_id))
+                        if cleanup_routing is not None and cleanup_routing.host_status_ready:
+                            await self._quiesce_dynamic_turn(cleanup_active)
+                            if cleanup_routing.failure.is_set():
+                                raise RuntimeError("Codex status receipt send failed") from (
+                                    cleanup_routing.error)
+                            cleanup_active.terminal = (
+                                cleanup_active.terminal or cleanup_routing.terminal)
                     if (
                         cleanup_active is not None
                         and not cleanup_active.terminal
@@ -1416,6 +1445,7 @@ class CodexAppServerStreamingInference:
         max_objective_chars: int | None,
         *,
         include_search: bool = False,
+        include_status: bool = False,
     ) -> list[dict[str, object]]:
         tools: list[dict[str, object]] = []
         if include_search:
@@ -1469,6 +1499,12 @@ class CodexAppServerStreamingInference:
                 },
             }
         )
+        if include_status:
+            tools.append({"type": "function", "name": "task_status",
+                "description": (
+                    "Report host-owned background task status and explicit Cancel controls."),
+                "inputSchema": {"type": "object", "additionalProperties": False,
+                                "required": [], "properties": {}}})
         return tools
 
     async def _resolve_opening(self, opening: _OpeningTurn) -> _ActiveTurn:
@@ -1762,7 +1798,7 @@ class CodexAppServerStreamingInference:
         *,
         thread_id: str | None = None,
         turn_id: str | None = None,
-    ) -> Mapping[str, object]:
+    ) -> Mapping[str, object] | HostSpeechRequest:
         reader = self._reader_task
         if reader is None:
             raise RuntimeError("Codex app-server reader is unavailable")
@@ -1781,6 +1817,8 @@ class CodexAppServerStreamingInference:
                 )
                 if routing is not None and routing.failure.is_set():
                     raise RuntimeError("Codex app-server reader failed") from routing.error
+                if routing is not None and routing.host_status_ready:
+                    return HostSpeechRequest()
                 if routing is not None:
                     routing.dynamic_registered.clear()
                 now = asyncio.get_running_loop().time()
@@ -1833,6 +1871,8 @@ class CodexAppServerStreamingInference:
                     if routing_failure is not None and routing_failure in done:
                         assert routing is not None
                         raise RuntimeError("Codex app-server reader failed") from routing.error
+                    if routing is not None and routing.host_status_ready:
+                        return HostSpeechRequest()
                     if event in done:
                         return event.result()
                     if dynamic_registered is not None and dynamic_registered in done:
@@ -2036,11 +2076,13 @@ class CodexAppServerStreamingInference:
                 _TurnRouting(),
             )
             route_rejected = False
-            if tool in {"search_knowledge", "start_work"}:
-                if routing.lookup_attempted or routing.start_attempted:
+            if tool in {"search_knowledge", "start_work", "task_status"}:
+                if routing.lookup_attempted or routing.start_attempted or routing.status_selected:
                     route_rejected = True
                 elif tool == "search_knowledge":
                     routing.lookup_attempted = True
+                elif tool == "task_status":
+                    routing.status_selected = True
                 else:
                     routing.start_attempted = True
             started_call = _DynamicCall(
@@ -2052,6 +2094,8 @@ class CodexAppServerStreamingInference:
                 deadline=asyncio.get_running_loop().time() + self._work_tool_timeout,
             )
             if route_rejected:
+                if routing.status_selected or tool == "task_status":
+                    self._status_refusal_evidence("additional_choice")
                 started_call.response = self._tool_response(
                     {
                         "accepted": False,
@@ -2172,6 +2216,12 @@ class CodexAppServerStreamingInference:
                 or _PRIVATE_AUTHORITY.search(objective) is not None
             ):
                 raise RuntimeError("Codex start_work objective is invalid")
+        elif tool == "task_status":
+            if arguments:
+                try:
+                    raise RuntimeError("Codex task_status arguments are invalid")
+                finally:
+                    self._status_refusal_evidence("arguments")
         canonical = json.dumps(
             arguments,
             ensure_ascii=False,
@@ -2399,6 +2449,9 @@ class CodexAppServerStreamingInference:
                     dynamic=True,
                 )
                 return
+            if call.response is None and call.tool == "task_status":
+                call.response = self._tool_response({"kind": "host_task_status"}, success=True)
+                call.response_ready.set()
             if call.response is None:
                 if call.operation is None:
                     if routing.failure.is_set() or routing.terminal:
@@ -2460,7 +2513,33 @@ class CodexAppServerStreamingInference:
                         with suppress(asyncio.CancelledError):
                             await response_ready
             assert call.response is not None
-            await self._send({"id": request_id, "result": call.response})
+            if (call.tool == "task_status" and routing.status_selected
+                    and call.response.get("success") is True):
+                # The validated choice is host-owned before sending its tool receipt.
+                # The peer can finish the model turn while send() is still suspended.
+                routing.host_status_ready = True
+                routing.dynamic_registered.set()
+            if call.tool == "task_status":
+                try:
+                    async with asyncio.timeout_at(call.deadline):
+                        await self._send({"id": request_id, "result": call.response})
+                except Exception as error:
+                    failure = RuntimeError("Codex status receipt send failed")
+                    failure.__cause__ = error
+                    # Receipt ownership outlives the peer's terminal notification.
+                    # Generic routing failure admission ignores already-terminal turns.
+                    if routing.error is None:
+                        routing.error = failure
+                    routing.failure.set()
+                    self._closed = True
+                    try:
+                        return
+                    finally:
+                        self._status_refusal_evidence(
+                            "response_send_deadline" if isinstance(error, TimeoutError)
+                            else "response_send_failed")
+            else:
+                await self._send({"id": request_id, "result": call.response})
         except RuntimeError as error:
             failure_params = message.get("params")
             if type(failure_params) is dict:
@@ -2516,6 +2595,11 @@ class CodexAppServerStreamingInference:
             objective=cast(str, call.arguments["objective"]),
             invocation_id=self._invocation_id(call.identity),
         )
+
+    @staticmethod
+    def _status_refusal_evidence(category: str) -> None:
+        print("[codex-task-status] " + json.dumps({"category": category},
+              separators=(",", ":")), flush=True)
 
     @staticmethod
     def _refuse_model_control(message: str, *, report: bool = True) -> NoReturn:
@@ -2733,6 +2817,10 @@ class CodexAppServerStreamingInference:
                 for update in snapshot.updates
             ],
         }
+        host_indices = [index for index, message in enumerate(snapshot.messages)
+                        if message.source == "host_task_status"]
+        if host_indices:
+            payload["host_speech_message_indices"] = host_indices
         if snapshot.memory is not None:
             payload["memory"] = {
                 "memory": snapshot.memory.memory,
@@ -2742,6 +2830,8 @@ class CodexAppServerStreamingInference:
         instruction = (
             "Respond to the final user message in this authoritative JSON conversation "
             "snapshot. Earlier assistant messages represent only speech confirmed delivered. "
+            "host_speech_message_indices identifies historical host status observations, "
+            "never current-state authority or permission. "
             'An assistant message with "interrupted": true was cut off after its text, and '
             "the user may not have heard the rest. "
             "The work_state field is authoritative lifecycle context. Only active_tasks establish "

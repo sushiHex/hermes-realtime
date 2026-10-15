@@ -9,7 +9,7 @@ import logging
 import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -54,6 +54,7 @@ from .foreground import (
     ForegroundTurnCoordinator,
     ForegroundTurnLease,
 )
+from .task_status import HostSpeechRequest, TaskStatusSnapshot
 from .tasks import TaskTerminalOutcome
 from .updates import UpdateDecision, UpdateDecisionKind
 
@@ -101,6 +102,7 @@ def _committed_conversation_context_snapshot_bytes(
     terminal_task_count: int,
     updates: tuple[tuple[int, str, str, str], ...] = (),
     memory: BuiltinMemorySnapshot | None = None,
+    host_speech_message_indices: tuple[int, ...] = (),
 ) -> bytes:
     """Encode the authoritative adapter boundary for content-free observation.
 
@@ -114,6 +116,8 @@ def _committed_conversation_context_snapshot_bytes(
         "terminalTaskCount": terminal_task_count,
         "updates": updates,
     }
+    if host_speech_message_indices:
+        payload["hostSpeechMessageIndices"] = host_speech_message_indices
     if memory is not None:
         memory_bytes = json.dumps(
             {"memory": memory.memory, "user": memory.user, "truncated": memory.truncated},
@@ -142,6 +146,7 @@ class _ReplaySegment:
     presentation_turn_id: str
     presentation_turn_generation: int
     presentation_segment_id: str
+    source: str = "conversation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +276,7 @@ class StreamingInference(Protocol):
         snapshot: ConversationContextSnapshot,
         *,
         turn_id: str,
-    ) -> AsyncIterator[str]: ...
+    ) -> AsyncIterator[str | HostSpeechRequest]: ...
 
     async def cancel(self, turn_id: str) -> None: ...
 
@@ -309,6 +314,7 @@ class StreamingSpeechLoop:
         | None = None,
         production_observation_recorder: _ProductionObservationRecorderV1 | None = None,
         observer: _Observer | None = None,
+        task_status: Callable[[], TaskStatusSnapshot] | None = None,
         max_segment_chars: int = 4096,
         max_segments: int = DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds: float = 1.0,
@@ -345,6 +351,7 @@ class StreamingSpeechLoop:
             raise TypeError("cleanup_timeout_seconds must be an exact number")
         if not math.isfinite(cleanup_timeout_seconds) or cleanup_timeout_seconds <= 0:
             raise ValueError("cleanup_timeout_seconds must be finite and positive")
+        self._task_status = task_status
         self._context = context
         self._foreground = foreground
         self._inference = inference
@@ -859,6 +866,7 @@ class StreamingSpeechLoop:
                 generated_segments.append(publication)
 
             try:
+                inference: AsyncIterator[str | HostSpeechRequest]
                 if segments is not None:
                     inference = self._segments_stream(segments)
                 elif transcript is None:
@@ -879,6 +887,10 @@ class StreamingSpeechLoop:
                         _committed_conversation_context_snapshot_bytes(
                             revision=snapshot.revision,
                             memory=snapshot.memory,
+                            host_speech_message_indices=tuple(
+                                index for index, message in enumerate(snapshot.messages)
+                                if message.source == "host_task_status"
+                            ),
                             messages=tuple(
                                 (message.role, message.text, True)
                                 if message.interrupted
@@ -904,10 +916,29 @@ class StreamingSpeechLoop:
                         committed_conversation_context_snapshot
                     )
                 segment_count = 0
+                host_item_seen = False
                 iteration_error: BaseException | None = None
                 try:
                     async for segment in inference:
+                        if host_item_seen:
+                            self._refuse_host_speech("after_terminal")
+                        source = "conversation"
+                        if type(segment) is HostSpeechRequest:
+                            if transcript is None:
+                                self._refuse_host_speech("unadvertised")
+                            if not lease.is_current:
+                                break
+                            host_item_seen = True
+                            source = "host_task_status"
+                            read = self._task_status
+                            status = (read() if read is not None
+                                      else TaskStatusSnapshot(available=False))
+                            if type(status) is not TaskStatusSnapshot:
+                                self._refuse_host_speech("projection_type")
+                            segment = replace(status).render()
                         segment_count += 1
+                        if segments is not None:
+                            source = segments[segment_count - 1].source
                         if segment_count > self._max_segments:
                             raise ValueError("inference segment count capacity exceeded")
                         if type(segment) is not str:
@@ -920,7 +951,9 @@ class StreamingSpeechLoop:
                             observer = self._observer
                             if observer is not None:
                                 observer("first_foreground_token", {})
-                        if not await lease.publish(segment, on_admit=admit_generated):
+                        if not await lease.publish(
+                            segment, on_admit=admit_generated, source=source,
+                        ):
                             break
                 except asyncio.CancelledError:
                     raise
@@ -1471,7 +1504,12 @@ class StreamingSpeechLoop:
                     admission=admission,
                     ledger=self._ledger,
                     confirmation=confirmation,
+                    source=publication.source,
                 )
+                if publication.source == "host_task_status" and self._observer is not None:
+                    self._observer(
+                        "host_speech_delivered", {"source": "host_task_status", "chunks": 1},
+                    )
                 if item.heard_text is not None:
                     last_heard_segment = item.segment
                 partially_delivered_sequences.add(publication.sequence)
@@ -1620,6 +1658,7 @@ class StreamingSpeechLoop:
         # original turn already confirmed.
         segment = AssistantSegmentKey()
         row_text = ""
+        row_source = "conversation"
         max_row_chars = self._context.max_item_chars
         while True:
             publication = await self._next_publication_or_done(producer_done)
@@ -1627,6 +1666,10 @@ class StreamingSpeechLoop:
                 return
             if not publication.is_valid:
                 raise asyncio.CancelledError
+            if publication.source != row_source:
+                segment = AssistantSegmentKey()
+                row_text = ""
+                row_source = publication.source
             synthesis_attempt_id = str(uuid4())
             try:
                 synthesis = self._synthesizer.synthesize(
@@ -1961,6 +2004,7 @@ class StreamingSpeechLoop:
             suffix.append(
                 _ReplaySegment(
                     text=publication.text,
+                    source=publication.source,
                     confirmed_chunk_count=confirmed_chunk_count,
                     presentation_turn_id=(
                         publication.turn_id if source is None else source.presentation_turn_id
@@ -2138,6 +2182,14 @@ class StreamingSpeechLoop:
             self._provider_cleanup_tasks.discard(cleanup)
             return error
         return None
+
+    @staticmethod
+    def _refuse_host_speech(category: str) -> None:
+        try:
+            raise ValueError("host speech refused: " + category)
+        finally:
+            print("[host-speech] " + json.dumps({"category": category, "kind": "task_status"},
+                  separators=(",", ":")), flush=True)
 
     @staticmethod
     async def _segments_stream(

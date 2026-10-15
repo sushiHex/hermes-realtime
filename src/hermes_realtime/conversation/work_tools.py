@@ -7,7 +7,7 @@ import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
 
@@ -16,6 +16,7 @@ from .context import (
     ConversationContextStore,
     PrivateRunDisclosureError,
 )
+from .task_status import TaskStatusSnapshot
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 
 WORK_OBJECTIVE_CONTEXT_POLICY = (
@@ -241,6 +242,24 @@ class ConversationWorkControlSurface:
         self._owned_operations: set[asyncio.Task[Any]] = set()
         self._pending_starts: dict[str, _PendingStart] = {}
         self._close_operation: asyncio.Task[None] | None = None
+
+    def task_status(self) -> TaskStatusSnapshot:
+        """Read the controller, never infer authority from model-visible summaries."""
+        if self._health is not WorkControlHealth.OPEN:
+            return TaskStatusSnapshot(available=False)
+        read = getattr(self._controller, "task_status", None)
+        if not callable(read):
+            return TaskStatusSnapshot(available=False)
+        status = read()
+        if type(status) is not TaskStatusSnapshot:
+            return TaskStatusSnapshot(available=False)
+        # A surface-owned start can be queued before dispatch reserves its identity.
+        if self._pending_starts and not status.pending:
+            return TaskStatusSnapshot(available=False)
+        try:
+            return replace(status)
+        except (TypeError, ValueError):
+            return TaskStatusSnapshot(available=False)
 
     @property
     def health(self) -> WorkControlHealth:

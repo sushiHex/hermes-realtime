@@ -1,5 +1,6 @@
 """Bounded immutable context exposed to latency-critical model adapters."""
 
+import json
 import re
 from collections import deque
 from collections.abc import Callable
@@ -61,6 +62,21 @@ class AssistantTextCapacityError(RuntimeError):
     """Raised instead of retaining unbounded pre-playback admissions."""
 
 
+def validate_speech_source(source: str, *, role: str = "assistant") -> None:
+    """Validate internal provenance before publication or confirmation consumption."""
+    category = None
+    if type(source) is not str or source not in ("conversation", "host_task_status"):
+        category = "unsupported_source"
+    elif source == "host_task_status" and role != "assistant":
+        category = "non_assistant_source"
+    if category is not None:
+        try:
+            raise ValueError("conversation source is invalid")
+        finally:
+            print("[speech-source] " + json.dumps({"category": category},
+                  separators=(",", ":")), flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationMessage:
     """One compact model-visible conversation item.
@@ -72,6 +88,7 @@ class ConversationMessage:
     role: str
     text: str
     interrupted: bool = False
+    source: str = "conversation"
 
     def __post_init__(self) -> None:
         if type(self.role) is not str:
@@ -82,6 +99,7 @@ class ConversationMessage:
             raise TypeError("conversation interrupted flag must be an exact boolean")
         if self.role not in (ConversationRole.USER.value, ConversationRole.ASSISTANT.value):
             raise ValueError("conversation role is not supported")
+        validate_speech_source(self.source, role=self.role)
         if self.interrupted and self.role != ConversationRole.ASSISTANT.value:
             raise ValueError("only assistant messages may be interrupted")
         if not self.text.strip():
@@ -173,6 +191,7 @@ class ConversationContextSnapshot:
                 role=message.role,
                 text=message.text,
                 interrupted=message.interrupted,
+                source=message.source,
             )
             for message in self.messages
         )
@@ -396,9 +415,11 @@ class ConversationContextStore:
         admission: AssistantTextAdmission,
         ledger: DeliveredSpeechLedger,
         confirmation: DeliveredSpeechConfirmation,
+        source: str = "conversation",
     ) -> str:
         """Upsert only heard text bound before playback and confirmed by its ledger."""
 
+        validate_speech_source(source)
         if type(ledger) is not DeliveredSpeechLedger:
             raise TypeError("ledger must be an exact DeliveredSpeechLedger")
         expected_text, segment, heard_text = self._resolve_assistant_admission(admission)
@@ -417,7 +438,9 @@ class ConversationContextStore:
         delivered_text = ledger.consume_delivery_confirmation(confirmation, admission)
         del self._assistant_admissions_by_object_id[id(admission)]
         if heard_text is not None:
-            message = ConversationMessage(role=ConversationRole.ASSISTANT.value, text=heard_text)
+            message = ConversationMessage(
+                role=ConversationRole.ASSISTANT.value, text=heard_text, source=source,
+            )
             if replaces_open_row:
                 self._window_chars += len(message.text) - len(self._messages[-1].text)
                 self._messages[-1] = message
@@ -439,6 +462,7 @@ class ConversationContextStore:
             role=ConversationRole.ASSISTANT.value,
             text=open_row.text,
             interrupted=True,
+            source=open_row.source,
         )
         self._revision += 1
         self._notify_change()
@@ -478,6 +502,7 @@ class ConversationContextStore:
                     role=message.role,
                     text=message.text,
                     interrupted=message.interrupted or message is open_row,
+                    source=message.source,
                 )
                 for message in self._messages
             ),
@@ -519,6 +544,7 @@ class ConversationContextStore:
                     role=message.role,
                     text=message.text,
                     interrupted=message.interrupted,
+                    source=message.source,
                 )
             except (TypeError, PrivateRunDisclosureError) as error:
                 raise ValueError("restored message is invalid") from error
@@ -704,6 +730,7 @@ class ConversationContextStore:
                     role=message.role,
                     text=message.text,
                     interrupted=message.interrupted,
+                    source=message.source,
                 )
                 for message in self._messages
             ),

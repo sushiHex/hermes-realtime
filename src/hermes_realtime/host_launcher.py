@@ -2480,6 +2480,7 @@ def build_local_host_launcher(
         synthesizer=synthesizer,
         playback=serialized_playback,
         ledger=DeliveredSpeechLedger(),
+        task_status=work_surface.task_status,
         observer=observe,
         max_segments=DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds=10.0,
