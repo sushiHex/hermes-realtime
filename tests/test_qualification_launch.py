@@ -15,6 +15,125 @@ import pytest
 from scripts import qualification_launch as launch
 
 
+def _probe_launch_capability() -> str:
+    # Independent of production guardian code: a successful explicit breakaway
+    # can still leave a process in a more restrictive ancestor Job.
+    program = (
+        "import ctypes,json\n"
+        "k=ctypes.WinDLL('kernel32',use_last_error=True)\n"
+        "k.GetCurrentProcess.restype=ctypes.c_void_p\n"
+        "k.IsProcessInJob.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.POINTER(ctypes.c_int)]\n"
+        "k.IsProcessInJob.restype=ctypes.c_int\nf=ctypes.c_int()\n"
+        "if not k.IsProcessInJob(k.GetCurrentProcess(),None,ctypes.byref(f)):"
+        "raise OSError('probe_membership_failed')\n"
+        "print(json.dumps(not bool(f.value)))\n"
+    )
+    try:
+        result = subprocess.run(
+            (sys._base_executable, "-B", "-c", program),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            creationflags=0x1000000 | 0x200 | 0x8000000,
+        )
+    except OSError as error:
+        if getattr(error, "winerror", None) == 5:
+            return "breakaway_not_permitted"
+        raise
+    assert result.returncode == 0, "independent_breakaway_probe_failed"
+    assert len(result.stdout) <= 16, "independent_breakaway_probe_output"
+    outside = json.loads(result.stdout)
+    assert type(outside) is bool, "independent_breakaway_probe_shape"
+    return "outside" if outside else "guardian_inherited_job"
+
+
+def _assert_host_refusal(receipt: Path, capability: str) -> None:
+    rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
+    final = rows[-1]
+    assert [row["stage"] for row in rows] == [
+        "reserved",
+        "refused" if capability == "breakaway_not_permitted" else "incomplete",
+    ]
+    assert final["category"] == capability
+    assert final["controller_completed"] is False
+    assert final["cleanup_verified"] is (None if capability == "breakaway_not_permitted" else False)
+
+
+@pytest.fixture(scope="module")
+def launch_capability(tmp_path_factory: pytest.TempPathFactory) -> str:
+    capability = _probe_launch_capability()
+    print("[qualification-launch-capability] " + json.dumps({"capability": capability}))
+    if capability != "outside":
+        folder = tmp_path_factory.mktemp("verified-host-refusal")
+        marker = folder / "controller-started"
+        script = folder / "controller.py"
+        script.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        binding, digest = _binding(folder)
+        receipt = folder / "receipt.jsonl"
+        with pytest.raises(RuntimeError):
+            launch.run_owned_controller(
+                script,
+                (),
+                binding_path=binding,
+                binding_sha256=digest,
+                receipt=receipt,
+                timeout_seconds=10,
+            )
+        _assert_host_refusal(receipt, capability)
+        assert not marker.exists(), "constrained_host_executed_controller"
+    return capability
+
+
+@pytest.fixture
+def native_completion_host(launch_capability: str) -> None:
+    if launch_capability != "outside":
+        pytest.skip("Verified host refusal; controller-dependent native fault not exercised")
+
+
+@pytest.mark.parametrize(
+    "observation,expected",
+    [(b"true", "outside"), (b"false", "guardian_inherited_job"), (5, "breakaway_not_permitted")],
+)
+def test_independent_capability_probe_has_only_closed_host_outcomes(
+    monkeypatch: pytest.MonkeyPatch, observation: bytes | int, expected: str
+) -> None:
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert args[0][0] == sys._base_executable
+        assert kwargs["creationflags"] == 0x1000000 | 0x200 | 0x8000000
+        assert kwargs["timeout"] == 10 and kwargs["stdin"] is subprocess.DEVNULL
+        if type(observation) is int:
+            error = OSError("synthetic")
+            error.winerror = observation
+            raise error
+        return subprocess.CompletedProcess(args[0], 0, observation, b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _probe_launch_capability() == expected
+
+
+@pytest.mark.parametrize(
+    "observation", [b'"false"', b"{}", b"null", b"x", b"nonzero", b" " * 16 + b"true", 87]
+)
+def test_capability_probe_unknown_failure_never_becomes_constrained(
+    monkeypatch: pytest.MonkeyPatch, observation: bytes | int
+) -> None:
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if type(observation) is int:
+            error = OSError("synthetic")
+            error.winerror = observation
+            raise error
+        return subprocess.CompletedProcess(
+            args[0],
+            1 if observation == b"nonzero" else 0,
+            b"true" if observation == b"nonzero" else observation,
+            b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises((AssertionError, ValueError, OSError)):
+        _probe_launch_capability()
+
+
 def _receipt_fields(path: Path) -> list[dict[str, object]]:
     stages = {
         "reserved",
@@ -431,19 +550,37 @@ def test_lifecycle_record_is_exclusive_bounded_and_synced(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job ownership")
-def test_default_launch_uses_base_guardian_and_explicit_controller(tmp_path: Path) -> None:
+def test_default_launch_uses_base_guardian_and_explicit_controller(
+    tmp_path: Path, launch_capability: str
+) -> None:
     binding, digest = _binding(tmp_path)
     script = tmp_path / "controller.py"
+    marker = tmp_path / "controller-started"
     script.write_text(
-        "import json, sys\n"
+        "import json, sys\nfrom pathlib import Path\n"
+        f"Path({str(marker)!r}).touch()\n"
         "print(json.dumps({'pass':False,'venv':sys.prefix!=sys.base_prefix}))\n"
         "raise SystemExit(1)\n"
     )
     receipt = tmp_path / "receipt.jsonl"
+    if launch_capability != "outside":
+        with pytest.raises(RuntimeError):
+            launch.run_owned_controller(
+                script,
+                (),
+                binding_path=binding,
+                binding_sha256=digest,
+                receipt=receipt,
+                timeout_seconds=30,
+            )
+        _assert_host_refusal(receipt, launch_capability)
+        assert not marker.exists()
+        return
     result = launch.run_owned_controller(
         script, (), binding_path=binding, binding_sha256=digest, receipt=receipt, timeout_seconds=30
     )
     assert result.exit_code == 1
+    assert marker.exists()
     assert json.loads(result.stdout)["pass"] is False
     rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
     assert [row["stage"] for row in rows] == ["reserved", "started", "complete"]
@@ -465,7 +602,9 @@ def test_default_launch_uses_base_guardian_and_explicit_controller(tmp_path: Pat
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job ownership")
-def test_controller_death_retains_incomplete_receipt(tmp_path: Path) -> None:
+def test_controller_death_retains_incomplete_receipt(
+    tmp_path: Path, native_completion_host: None
+) -> None:
     binding, digest = _binding(tmp_path)
     script = tmp_path / "controller.py"
     script.write_text("import os\nos._exit(0)\n")
@@ -541,7 +680,9 @@ def test_legacy_cli_does_not_claim_owned_launch(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
-def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(tmp_path: Path) -> None:
+def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
+    tmp_path: Path, launch_capability: str
+) -> None:
     binding, digest = _binding(tmp_path)
     receipt = tmp_path / "cli-receipt.jsonl"
     root = Path(__file__).resolve().parents[1]
@@ -576,6 +717,10 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(tmp_path
     )
     assert completed.returncode == 2
     assert json.loads(completed.stdout)["pass"] is False
+    if launch_capability != "outside":
+        assert json.loads(completed.stdout)["error"]["code"] == "evaluation_failed"
+        _assert_host_refusal(receipt, launch_capability)
+        return
     assert json.loads(completed.stdout)["error"]["code"] == "codex_setup_failed"
     rows = [json.loads(row) for row in receipt.read_bytes().splitlines()]
     assert rows[-1]["stage"] == "complete" and rows[-1]["exit_code"] == 2
@@ -610,8 +755,14 @@ def test_evaluator_refuses_already_loaded_wrong_source_before_evaluation(tmp_pat
     "fault", ["plan", "launcher", "script", "result", "result_size", "breakaway"]
 )
 def test_launch_rejects_bound_artifact_or_spawn_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    capsys: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
 ) -> None:
+    if fault in {"launcher", "script", "result", "result_size"}:
+        request.getfixturevalue("native_completion_host")
     binding, digest = _binding(tmp_path)
     script = tmp_path / "controller.py"
     script.write_text("print('harmless')\n")
@@ -668,6 +819,12 @@ def test_launch_rejects_bound_artifact_or_spawn_failure(
         final = json.loads(receipt.read_bytes().splitlines()[-1])
         assert final["stage"] == "refused" and final["category"] == "breakaway_not_permitted"
         assert "breakaway_not_permitted" in capsys.readouterr().err
+    elif fault == "plan":
+        # The digest check precedes guardian capability admission. A refusal
+        # from a later guard must not masquerade as this check being reached.
+        assert [json.loads(row)["stage"] for row in receipt.read_bytes().splitlines()] == [
+            "reserved"
+        ]
 
 
 @pytest.mark.parametrize(
@@ -750,7 +907,7 @@ def test_guardian_watchdog_persists_timeout_even_when_cleanup_fails(
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows caller-interruption proof")
 def test_caller_interruption_keeps_guardian_inputs_until_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_completion_host: None
 ) -> None:
     binding, digest = _binding(tmp_path)
     script = tmp_path / "short.py"
@@ -791,6 +948,7 @@ def test_caller_interruption_keeps_guardian_inputs_until_completion(
 @pytest.mark.skipif(os.name != "nt", reason="native Windows ownership fault injection")
 def test_launcher_loss_preserves_guardian_then_guardian_loss_exits_descendants(
     tmp_path: Path,
+    native_completion_host: None,
 ) -> None:
     import ctypes
 

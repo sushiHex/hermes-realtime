@@ -177,6 +177,16 @@ controller completion record, retained exit evidence, and an observed empty owne
 Job. Completion is containment/quiescence evidence, not a model/scoring pass or an
 authenticated inventory of all descendant images.
 
+An explicit breakaway can succeed while leaving the guardian in a
+[restrictive ancestor Job](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs).
+That host receives `guardian_inherited_job` before controller
+execution; it is not a supported fallback execution mode. Windows tests use an
+independent base-Python/Win32 capability probe and verify the actual API and CLI
+refuse without starting a controller on constrained hosts. Controller-dependent
+native fault tests are then explicitly reported as unexercised, rather than
+claimed as completion coverage. Supported hosts still run those paths; synthetic
+kernel, binding and watchdog checks remain independent of host capability.
+
 The fresh receipt and adjacent `.work` directory are retained, including after
 caller interruption. Missing final evidence remains incomplete; do not infer
 cleanup or automatically retry. The guardian has its own bounded deadline
