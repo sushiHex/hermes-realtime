@@ -27,6 +27,7 @@ from hermes_realtime.conversation.context import (
     ConversationMessage,
 )
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
 from hermes_realtime.host_launcher import (
     _build_streaming_inference,
@@ -127,6 +128,7 @@ class CaseObservation:
     tool_call_latencies_ms: tuple[float, ...]
     first_speakable_latency_ms: float | None
     unauthorized_continuation_claim: bool | None = None
+    host_status_request_latency_ms: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.case_id) is not str or _CASE_ID.fullmatch(self.case_id) is None:
@@ -145,6 +147,10 @@ class CaseObservation:
             _validate_latency(latency)
         if self.first_speakable_latency_ms is not None:
             _validate_latency(self.first_speakable_latency_ms)
+        if self.host_status_request_latency_ms is not None:
+            _validate_latency(self.host_status_request_latency_ms)
+            if self.observed_tools:
+                raise ValueError("host status request cannot share lifecycle effects")
         if (
             self.unauthorized_continuation_claim is not None
             and type(self.unauthorized_continuation_claim) is not bool
@@ -603,6 +609,7 @@ class ShadowWorkHandler:
         self._started_at: float | None = None
         self._tools: list[str] = []
         self._latencies_ms: list[float] = []
+        self._host_status_request_latency_ms: float | None = None
 
     @property
     def has_recorded_tools(self) -> bool:
@@ -619,6 +626,17 @@ class ShadowWorkHandler:
         self._started_at = started_at
         self._tools.clear()
         self._latencies_ms.clear()
+        self._host_status_request_latency_ms = None
+
+    def observe_host_status_request(self) -> None:
+        """Record selection only, without rendering or asserting any real task state."""
+        if self._case_id is None or self._started_at is None:
+            raise RuntimeError("host status request arrived outside an active case")
+        if self._host_status_request_latency_ms is not None:
+            raise RuntimeError("duplicate terminal status request")
+        if self._tools:
+            raise RuntimeError("host status request cannot share lifecycle effects")
+        self._host_status_request_latency_ms = (time.perf_counter() - self._started_at) * 1000
 
     async def start_work(self, *, objective: str, invocation_id: str) -> WorkStartResult:
         if (
@@ -670,11 +688,13 @@ class ShadowWorkHandler:
             tool_call_latencies_ms=tuple(self._latencies_ms),
             first_speakable_latency_ms=first_speakable_latency_ms,
             unauthorized_continuation_claim=unauthorized_continuation_claim,
+            host_status_request_latency_ms=self._host_status_request_latency_ms,
         )
         self._case_id = None
         self._started_at = None
         self._tools.clear()
         self._latencies_ms.clear()
+        self._host_status_request_latency_ms = None
         return observation
 
     def abandon_case(self) -> None:
@@ -682,10 +702,13 @@ class ShadowWorkHandler:
         self._started_at = None
         self._tools.clear()
         self._latencies_ms.clear()
+        self._host_status_request_latency_ms = None
 
     def _record(self, tool: str, invocation_id: str) -> None:
         if self._case_id is None or self._started_at is None:
             raise RuntimeError("shadow tool call arrived outside an active case")
+        if self._host_status_request_latency_ms is not None:
+            raise RuntimeError("lifecycle effect followed terminal status request")
         if type(invocation_id) is not str or _INVOCATION_ID.fullmatch(invocation_id) is None:
             raise ValueError("shadow invocation_id is invalid")
         if tool not in _TOOLS:
@@ -858,6 +881,7 @@ async def run_evaluation(
         started_at = time.perf_counter()
         handler.begin_case(case.case_id, started_at=started_at)
         first_speakable: float | None = None
+        status_requested = False
         attempt_error: Exception | None = None
         try:
             async with asyncio.timeout_at(
@@ -866,6 +890,12 @@ async def run_evaluation(
                 async for segment in inference.stream(
                     snapshot, turn_id=f"turn_eval_{case.case_id.replace('-', '_')}_1",
                 ):
+                    if status_requested:
+                        raise RuntimeError("qualification output followed terminal status request")
+                    if type(segment) is HostSpeechRequest:
+                        handler.observe_host_status_request()
+                        status_requested = True
+                        continue
                     if type(segment) is not str:
                         raise RuntimeError("qualification decision emitted unsupported output")
                     if first_speakable is None and _is_speakable(segment):
@@ -924,7 +954,19 @@ async def run_evaluation(
         retried_case_ids=(),
     )
     report.update({
-        "schema_version": 4,
+        "schema_version": 5,
+        "host_status_requests": {
+            "scope": "selection_only",
+            "count": sum(row.host_status_request_latency_ms is not None for row in observations),
+            "case_ids": [
+                row.case_id for row in observations
+                if row.host_status_request_latency_ms is not None
+            ],
+            "latency_ms": latency_distribution([
+                row.host_status_request_latency_ms for row in observations
+                if row.host_status_request_latency_ms is not None
+            ]),
+        },
         "provider": provider,
         "mode": mode,
         "attempt_policy": "single_attempt_per_case",
@@ -1037,7 +1079,7 @@ def _verify_controller_source() -> None:
     import scripts
     from hermes_realtime import __file__ as package_file
     from hermes_realtime import host_launcher
-    from hermes_realtime.conversation import context, streaming, work_tools
+    from hermes_realtime.conversation import context, streaming, task_status, work_tools
     from hermes_realtime.providers import codex_app_server, ollama
     from scripts import qualification_launch
 
@@ -1046,6 +1088,7 @@ def _verify_controller_source() -> None:
         (context.__file__, "conversation/context.py"),
         (work_tools.__file__, "conversation/work_tools.py"),
         (streaming.__file__, "conversation/streaming.py"),
+        (task_status.__file__, "conversation/task_status.py"),
         (codex_app_server.__file__, "providers/codex_app_server.py"),
         (ollama.__file__, "providers/ollama.py"),
         (host_launcher.__file__, "host_launcher.py"),
@@ -1064,6 +1107,7 @@ def _verify_controller_source() -> None:
         or build_local_host_launcher is not host_launcher.build_local_host_launcher
         or CodexAppServerStreamingInference is not codex_app_server.CodexAppServerStreamingInference
         or OllamaStreamingInference is not ollama.OllamaStreamingInference
+        or HostSpeechRequest is not task_status.HostSpeechRequest
     ):
         raise ValueError("evaluator_script_binding")
 
@@ -1263,7 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
     except SourceBindingFailure:
         category = "source_binding_failed"
         report = {
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "error",
             "pass": False,
             "error": {"code": "source_binding_failed"},
@@ -1276,7 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1289,7 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1305,7 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
                 marker_secondary.append("source_binding_failed")
             public_error["secondary_categories"] = marker_secondary
         report = {
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1318,7 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "error",
             "pass": False,
             "error": public_error,

@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from scripts import evaluate_natural_work_routing as evaluator
@@ -36,6 +37,254 @@ class _Inference:
 
     async def close(self) -> None:
         self.events.append(("close", None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["ollama", "codex"])
+async def test_status_request_is_separate_from_model_prose_and_effects(
+    monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    one_case = dataclasses.replace(corpus, cases=corpus.cases[:1])
+    instances: list[_Inference] = []
+
+    class Status(_Inference):
+        async def stream(self, snapshot: object, *, turn_id: str):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+            else:
+                yield HostSpeechRequest()
+
+    def factory(**_options: object) -> Status:
+        instance = Status()
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", factory)
+    monkeypatch.setattr(evaluator, "_resolve_codex_executable", lambda _value: "synthetic")
+    monkeypatch.setattr(evaluator, "_codex_version", lambda _value: "1.0.0")
+    report = await evaluator.run_evaluation(
+        corpus=one_case, provider=provider, model="synthetic:latest", effort="low",
+        codex_executable=None,
+    )
+    assert report["schema_version"] == 5
+    status = report["host_status_requests"]
+    assert status["count"] == 1 and status["case_ids"] == ["nw-001"]
+    assert status["scope"] == "selection_only"
+    assert status["latency_ms"]["count"] == 1
+    assert report["tool_calls"]["total"] == 0
+    assert report["latency_ms"]["first_speakable"]["count"] == 0
+    assert report["metrics"]["positive_start"]["correct"] == 0
+    assert report["semantic_review"]["status"] == "pending"
+    assert report["status"] == "failed"
+    assert len(instances) == 1 and instances[0].events[-1] == ("close", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later", [HostSpeechRequest(), "Later prose.", object()])
+async def test_status_request_is_terminal_for_evaluator_output(
+    monkeypatch: pytest.MonkeyPatch, later: object,
+) -> None:
+    class Status(_Inference):
+        async def stream(self, snapshot: object, *, turn_id: str):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+            else:
+                yield HostSpeechRequest()
+                yield later
+
+    instance = Status()
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: instance)
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    with pytest.raises(evaluator.EvaluationFailure) as failure:
+        await evaluator.run_evaluation(
+            corpus=dataclasses.replace(corpus, cases=corpus.cases[:1]),
+            provider="ollama", model="synthetic:latest", effort="low", codex_executable=None,
+        )
+    assert str(failure.value.__cause__) == "qualification output followed terminal status request"
+    assert failure.value.public_error()["completed_cases"] == 0
+    assert instance.events[-1] == ("close", None)
+
+
+@pytest.mark.parametrize("value", [True, -1.0, float("inf"), float("nan"), "0"])
+def test_host_status_request_latency_is_strict(value: object) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        evaluator.CaseObservation(
+            "nw-001", (), (), None, host_status_request_latency_ms=value,
+        )
+
+
+def test_status_observation_requires_owned_case_and_no_lifecycle_effects() -> None:
+    handler = evaluator.ShadowWorkHandler(can_cancel_work=False)
+    with pytest.raises(RuntimeError, match="active case"):
+        handler.observe_host_status_request()
+    handler.begin_case("nw-001", started_at=time.perf_counter())
+    handler.observe_host_status_request()
+    with pytest.raises(RuntimeError, match="terminal status"):
+        handler.observe_host_status_request()
+    with pytest.raises(RuntimeError, match="terminal status"):
+        handler._record("start_work", "tool_" + "a" * 32)
+    observation = handler.finish_case(first_speakable_latency_ms=None)
+    assert observation.host_status_request_latency_ms is not None
+    handler.begin_case("nw-002", started_at=time.perf_counter())
+    handler._record("start_work", "tool_" + "a" * 32)
+    with pytest.raises(RuntimeError, match="lifecycle"):
+        handler.observe_host_status_request()
+    handler.abandon_case()
+    handler.begin_case("nw-003", started_at=time.perf_counter())
+    reset = handler.finish_case(first_speakable_latency_ms=None)
+    assert reset.host_status_request_latency_ms is None
+
+
+def test_observation_host_status_latency_control_and_mixed_effect_refusal() -> None:
+    assert evaluator.CaseObservation(
+        "nw-001", (), (), None, host_status_request_latency_ms=0.0,
+    ).host_status_request_latency_ms == 0.0
+    with pytest.raises(ValueError, match="lifecycle"):
+        evaluator.CaseObservation(
+            "nw-001", ("start_work",), (0.0,), None, host_status_request_latency_ms=0.0,
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["module_path", "class_identity"])
+def test_status_source_binding_is_exact(
+    monkeypatch: pytest.MonkeyPatch, mismatch: str,
+) -> None:
+    from hermes_realtime.conversation import task_status
+
+    evaluator._verify_controller_source()
+    if mismatch == "module_path":
+        monkeypatch.setattr(task_status, "__file__", __file__)
+    else:
+        monkeypatch.setattr(evaluator, "HostSpeechRequest", type("Other", (), {}))
+    with pytest.raises(ValueError, match="evaluator_(source|script)_binding"):
+        evaluator._verify_controller_source()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_prose", [False, True])
+async def test_real_ollama_status_selection_reports_no_rendered_host_speech(
+    monkeypatch: pytest.MonkeyPatch, prior_prose: bool,
+) -> None:
+    if prior_prose:
+        class Prior(_Inference):
+            async def stream(self, snapshot: object, *, turn_id: str):
+                if turn_id == "turn_preflight":
+                    yield "Ready."
+                else:
+                    yield "Earlier model prose."
+                    yield HostSpeechRequest()
+
+        monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: Prior())
+    else:
+        async def metadata(_self: OllamaModelClient, endpoint: str, body: object) -> bytes:
+            return b'{"version":"0.34.4"}'
+
+        def opening(request: object, _timeout: float) -> io.BytesIO:
+            body = json.loads(request.data)  # type: ignore[attr-defined]
+            content = json.dumps({"kind": "task_status"}) if "format" in body else "Ready."
+            return io.BytesIO(json.dumps({
+                "message": {"content": content}, "done": True, "done_reason": "stop",
+            }).encode() + b"\n")
+
+        monkeypatch.setattr(OllamaModelClient, "_read_request", metadata)
+        monkeypatch.setattr(OllamaStreamingInference, "_urlopen", staticmethod(opening))
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    report = await evaluator.run_evaluation(
+        corpus=dataclasses.replace(corpus, cases=corpus.cases[:2]),
+        provider="ollama", model="synthetic:latest", effort="low", codex_executable=None,
+    )
+    assert report["host_status_requests"]["count"] == 2
+    assert report["host_status_requests"]["case_ids"] == ["nw-001", "nw-002"]
+    assert report["host_status_requests"]["latency_ms"]["count"] == 2
+    assert report["latency_ms"]["first_speakable"]["count"] == (2 if prior_prose else 0)
+    assert report["tool_calls"]["total"] == 0
+    assert report["semantic_review"]["status"] == "pending"
+    assert "Earlier model prose." not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_status_marker_subclass_is_not_admitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Untrusted(HostSpeechRequest):
+        pass
+
+    class Invalid(_Inference):
+        async def stream(self, snapshot: object, *, turn_id: str):
+            yield "Ready." if turn_id == "turn_preflight" else Untrusted()
+
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: Invalid())
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    with pytest.raises(evaluator.EvaluationFailure) as failure:
+        await evaluator.run_evaluation(
+            corpus=dataclasses.replace(corpus, cases=corpus.cases[:1]),
+            provider="ollama", model="synthetic:latest", effort="low", codex_executable=None,
+        )
+    assert str(failure.value.__cause__) == "qualification decision emitted unsupported output"
+
+
+@pytest.mark.asyncio
+async def test_status_report_equals_only_marker_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Mixed(_Inference):
+        async def stream(self, snapshot: object, *, turn_id: str):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+            elif "nw_002" in turn_id:
+                yield HostSpeechRequest()
+            else:
+                yield "Ordinary model prose."
+
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: Mixed())
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    report = await evaluator.run_evaluation(
+        corpus=dataclasses.replace(corpus, cases=corpus.cases[:2]),
+        provider="ollama", model="synthetic", effort="low", codex_executable=None,
+    )
+    status = report["host_status_requests"]
+    assert status["case_ids"] == ["nw-002"]
+    assert status["count"] == status["latency_ms"]["count"] == 1
+    assert report["latency_ms"]["first_speakable"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_real_codex_transport_status_selection_remains_effect_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+    from tests.providers.test_codex_app_server import (
+        DynamicStartCodexTransport,
+        FakeCodexTransport,
+    )
+
+    class ReadyThenStatus(DynamicStartCodexTransport):
+        def __init__(self) -> None:
+            super().__init__(tool="task_status", arguments={})
+            self.turns = 0
+
+        async def send(self, message):
+            if message.get("method") == "turn/start":
+                self.turns += 1
+                if self.turns == 1:
+                    await FakeCodexTransport.send(self, message)
+                    return
+            await super().send(message)
+
+    transport = ReadyThenStatus()
+    monkeypatch.setattr(evaluator, "_resolve_codex_executable", lambda _value: "synthetic")
+    monkeypatch.setattr(evaluator, "_codex_version", lambda _value: "1.0.0")
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options:
+        CodexAppServerStreamingInference(
+            model="synthetic", effort="low", transport_factory=lambda: transport,
+        )
+    )
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    report = await evaluator.run_evaluation(
+        corpus=dataclasses.replace(corpus, cases=corpus.cases[:1]),
+        provider="codex", model="synthetic", effort="low", codex_executable=None,
+    )
+    assert report["host_status_requests"]["case_ids"] == ["nw-001"]
+    assert report["tool_calls"]["total"] == 0
+    assert report["latency_ms"]["first_speakable"]["count"] == 0
+    assert transport.closed is True
 
 
 @pytest.mark.asyncio
@@ -83,14 +332,14 @@ async def test_failed_readiness_closes_adapter_without_tool_authority(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unspeakable", ["", "  ", object()])
+@pytest.mark.parametrize("unspeakable", ["", "  ", object(), HostSpeechRequest()])
 async def test_preflight_refuses_non_speech_before_tool_binding(
     monkeypatch: pytest.MonkeyPatch, unspeakable: object,
 ) -> None:
     class Invalid(_Inference):
         async def stream(self, snapshot: object, *, turn_id: str):
             self.events.append(("stream", turn_id))
-            if type(unspeakable) is object:
+            if type(unspeakable) is not str:
                 yield "Ready."
             yield unspeakable
 
@@ -150,6 +399,9 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
     assert report["provider"] == "ollama"
     assert report["mode"] == "diagnostic_override"
     assert report["tool_calls"]["by_tool"]["start_work"] == 1
+    assert report["host_status_requests"]["count"] == 0
+    assert report["host_status_requests"]["case_ids"] == []
+    assert report["host_status_requests"]["latency_ms"]["count"] == 0
     assert report["process_evidence"]["external_runtime_cache"] == "unknown"
     assert "A" * 5000 not in str(report)
     assert len(instances) == 1

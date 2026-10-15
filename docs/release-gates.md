@@ -148,6 +148,22 @@ readiness call, binds the shared effect-free work handler, then makes one decisi
 per corpus case. This is a source-bound synthetic routing check, not a real-Hermes
 dispatch, voice, or semantic lifecycle review. A failed case is never retried.
 
+The schema-five routing report accepts the exact internal `HostSpeechRequest` as a
+terminal selection and reports its count, case IDs and request latency separately in
+`host_status_requests`. This is request-only evidence: the evaluator renders no host status,
+consults no live task controller and delivers no audio. The effect-free shadow handler owns
+the active case and refuses a status request mixed with recorded lifecycle calls. A later
+stream item, an unknown item or a marker subclass fails the attempt; readiness continues to
+accept speech strings only. Earlier model prose remains ordinary unreviewed prose.
+
+A status request never counts as a lifecycle tool call, a successful start or legacy
+string-stream `first_speakable` latency. That string stream still includes the existing
+fixed start acknowledgments; #272 separately owns their provenance. A status request does
+not satisfy the separate lifecycle-claim review. The corpus, routing thresholds and pending
+semantic review remain unchanged. Task-state
+projection, current foreground rendering and heard provenance are covered by the host's
+deterministic tests and require their own installed and voice qualification.
+
 On Windows, opt into the independent base-Python guardian with the same binding:
 
 ```sh
