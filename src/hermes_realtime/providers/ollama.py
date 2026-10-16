@@ -20,7 +20,11 @@ from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
-from hermes_realtime.conversation.work_tools import WORK_OBJECTIVE_CONTEXT_POLICY, WorkStartResult
+from hermes_realtime.conversation.work_tools import (
+    WORK_OBJECTIVE_CONTEXT_POLICY,
+    WORK_ROUTING_POLICY,
+    WorkStartResult,
+)
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.ollama_models import (
@@ -62,7 +66,7 @@ _WORK_REPLY_POLICY = (
     "or other text outside the object."
 )
 _WORK_POLICY = (
-    " For task status or requests to stop work, select kind task_status with no other fields. "
+    " For task status requests, select kind task_status with no other fields. "
     "The host will report its observed state and explicit cancellation controls. "
     " For the current user's request, use kind start_work with the complete objective when "
     "background research, inspection, "
@@ -380,13 +384,16 @@ class OllamaStreamingInference:
             }
             deadline = asyncio.get_running_loop().time() + self._request_timeout
             if handler is not None:
-                body["options"] = {"num_ctx": self._num_ctx, "num_predict": 1024}
+                # One structured decision per turn: decode it deterministically so the same
+                # input cannot route differently from run to run.
+                body["options"] = {"num_ctx": self._num_ctx, "num_predict": 1024, "temperature": 0}
                 body["format"] = self._work_response_schema(
                     handler.max_objective_chars, can_start=can_start,
                 )
                 messages[0]["content"] = messages[0]["content"].replace(
                     "\n\nReference data:\n",
-                    _WORK_REPLY_POLICY + (_WORK_POLICY if can_start else "")
+                    _WORK_REPLY_POLICY
+                    + (_WORK_POLICY + " " + WORK_ROUTING_POLICY if can_start else "")
                     + " " + WORK_OBJECTIVE_CONTEXT_POLICY
                     + " Response schema: " + json.dumps(body["format"], separators=(",", ":"))
                     + "\n\nReference data:\n", 1,

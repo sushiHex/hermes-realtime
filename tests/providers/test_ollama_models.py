@@ -601,7 +601,7 @@ async def test_inflight_configuration_and_request_share_the_admission_lock(natur
     await configuration
     assert await stream == ["Ready."]
     assert bodies[0]["options"] == {
-        "num_ctx": 4096, **({"num_predict": 1024} if natural_tools else {}),
+        "num_ctx": 4096, **({"num_predict": 1024, "temperature": 0} if natural_tools else {}),
     }
     await inference.close()
 
