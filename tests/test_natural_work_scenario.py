@@ -559,6 +559,18 @@ def test_heldout_cases_declare_expectations_and_active_work(tmp_path: Path) -> N
     assert report["maximum_decisions"] == 4
 
 
+def test_heldout_task_state_comes_only_from_its_declaration(tmp_path: Path) -> None:
+    # nw-098 is a legacy-corpus id with hard-coded terminal history; a declared case
+    # must not inherit it.
+    path, sha = _heldout(tmp_path, cases=[
+        {"id": "nw-098", "category": "status", "utterance": "Anything running?",
+         "expected": "task_status", "active_work": False},
+    ])
+    value = scenario.load_heldout(path, sha)
+    _, request = scenario.make_context(value.cases[0], 1, (), active=False)
+    assert (request.active_tasks, request.terminal_task_count) == ((), 0)
+
+
 @pytest.mark.parametrize("change", [
     {"extra": 1},
     {"schema_version": 2},

@@ -268,7 +268,12 @@ def make_context(
     if active is None:
         active = case.case_id == "host_status" or None
     if active is not None:
-        canonical = replace(canonical, active_tasks=(legacy._ACTIVE_TASK,) if active else ())
+        # A declared state replaces every id-dependent legacy field, not only active work.
+        canonical = replace(
+            canonical,
+            active_tasks=(legacy._ACTIVE_TASK,) if active else (),
+            terminal_task_count=0,
+        )
     context = ConversationContextStore()
     for text in (*prior, case.utterance):
         context.record_user_transcript(Transcript(text=text, final=True))
