@@ -11,6 +11,7 @@ from hermes_realtime.conversation import ConversationContextSnapshot, Conversati
 from hermes_realtime.host_launcher import _build_streaming_inference
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
+from tests.support.ollama_metadata import supported_ollama_row
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("deny_uninjected_ollama_metadata")]
 ORIGIN = "http://127.0.0.1:11434"
@@ -85,7 +86,7 @@ async def test_runtime_proof_is_cached_across_turns_and_explicit_configuration(c
         elif endpoint == "show":
             payload = {"capabilities": ["completion"], "model_info": {}}
         else:
-            payload = {"models": [{"name": "test:latest", "digest": "a" * 64}]}
+            payload = {"models": [supported_ollama_row("test:latest")]}
         return json.dumps(payload).encode()
 
     def opening(request, timeout):
@@ -101,7 +102,9 @@ async def test_runtime_proof_is_cached_across_turns_and_explicit_configuration(c
             await adapter.configure_context(4096, client=client)
         assert await consume(adapter) == ["Ready."]
         assert await consume(adapter, "turn_two") == ["Ready."]
-        assert requests == (["version", "tags", "show", "tags"] if configured else ["version"])
+        assert requests == (
+            ["version", "tags", "tags", "show", "tags"] if configured else ["version", "tags"]
+        )
         assert len(bodies) == 2
         assert all(body["truncate"] is False and body["shift"] is False for body in bodies)
         categories = [
@@ -129,6 +132,8 @@ async def test_concurrent_first_turns_share_one_successful_runtime_proof():
         requests.append(endpoint)
         entered.set()
         await release.wait()
+        if endpoint == "tags":
+            return json.dumps({"models": [supported_ollama_row("test")]}).encode()
         return b'{"version":"0.34.4"}'
 
     def opening(request, timeout):
@@ -149,7 +154,7 @@ async def test_concurrent_first_turns_share_one_successful_runtime_proof():
         assert openings == []
         release.set()
         assert await asyncio.gather(first, second) == [["Ready."], ["Ready."]]
-        assert requests == ["version"]
+        assert requests == ["version", "tags"]
         assert len(openings) == 2
     finally:
         release.set()
@@ -166,6 +171,8 @@ async def test_cancelled_runtime_proof_does_not_cache_or_start_inference():
         if len(requests) == 1:
             entered.set()
             await asyncio.Event().wait()
+        if endpoint == "tags":
+            return json.dumps({"models": [supported_ollama_row("test")]}).encode()
         return b'{"version":"0.34.4"}'
 
     def opening(request, timeout):
@@ -187,7 +194,7 @@ async def test_cancelled_runtime_proof_does_not_cache_or_start_inference():
         assert not adapter._inference_started
         assert openings == []
         assert await consume(adapter) == ["Ready."]
-        assert requests == ["version", "version"]
+        assert requests == ["version", "version", "tags"]
         assert len(openings) == 1
     finally:
         await adapter.close()

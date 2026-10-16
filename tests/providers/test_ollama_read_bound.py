@@ -66,7 +66,7 @@ async def test_reader_requests_at_most_one_byte_past_the_advertised_bound() -> N
     response = RecordingResponse(
         [json.dumps({"message": {"content": "Hello."}, "done": True}).encode("utf-8") + b"\n"]
     )
-    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("test-model"),
         base_url="http://127.0.0.1:11434",
         model="test-model",
         open_request=lambda _request, _timeout: response,
@@ -85,7 +85,7 @@ async def test_record_at_the_exact_byte_bound_is_accepted(newline: bool) -> None
     response = RecordingResponse(
         [_valid_record_with_size(_MAX_RESPONSE_LINE_BYTES, newline=newline)]
     )
-    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("test-model"),
         base_url="http://127.0.0.1:11434",
         model="test-model",
         open_request=lambda _request, _timeout: response,
@@ -106,7 +106,7 @@ async def test_overlong_newline_free_record_is_rejected_before_parsing() -> None
     # rejection occurs after MAX + 1 bytes rather than materialising the record.
     record = b"{" + b"a" * (_MAX_RESPONSE_LINE_BYTES * 2)
     response = RecordingResponse([record])
-    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("test-model"),
         base_url="http://127.0.0.1:11434",
         model="test-model",
         open_request=lambda _request, _timeout: response,

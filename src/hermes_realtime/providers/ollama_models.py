@@ -26,7 +26,6 @@ _CATALOG_TIMEOUT_SECONDS = 8.0
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 # Source-reviewed on #249 (0.34.4) and #282 (0.40.4), with refusal witnesses on each.
 _REVIEWED_RUNTIMES = frozenset({"0.34.4", "0.40.4"})
-_REVIEWED_RUNNERS = frozenset({"llamacpp", "ggml"})
 
 
 _ReadRequest = Callable[[str, dict[str, object] | None], Awaitable[bytes]]
@@ -68,11 +67,12 @@ def _advertised_capacity(info: object) -> int | None:
 
 
 def _require_local(row: dict[str, object]) -> None:
-    """Refuse metadata that declares a path outside the source review.
+    """Refuse metadata that declares weights outside the source review.
 
-    The review covers local GGUF weights on the llama.cpp runner. A declaration of
-    anything else is refused wherever it appears; an absent field declares nothing.
-    0.40.4 can run MLX weights through an unreviewed runner, which no version check excludes.
+    The review covers local GGUF weights, which both reviewed runtimes run through
+    llama.cpp. 0.40.4 sends safetensors weights to its unreviewed MLX runner, and no
+    version check excludes that. Real tags, show and ps rows always carry
+    ``details.format``.
     """
 
     for field in ("remote_host", "remote_model"):
@@ -80,10 +80,6 @@ def _require_local(row: dict[str, object]) -> None:
             raise ValueError("context configuration requires local model weights")
     if not _reviewed_weights(row):
         raise ValueError("context safety is source-reviewed only for GGUF model weights")
-    if "runner" in row and (
-        type(row["runner"]) is not str or row["runner"] not in _REVIEWED_RUNNERS
-    ):
-        raise ValueError("context safety is source-reviewed only for the llama.cpp runner")
 
 
 def _reviewed_weights(row: dict[str, object]) -> bool:
@@ -415,12 +411,18 @@ class OllamaModelClient:
         _require_local(row)
         return _optional_capacity(row.get("context_length"))
 
-    async def require_context_contract(self) -> None:
-        # Exact source-reviewed runtime contract, independent of model identity.
-        # Unknown/older servers may silently ignore the no-truncation fields.
+    async def require_context_contract(self, model: str) -> None:
+        """Prove a source-reviewed runtime and local GGUF weights before any prompt.
+
+        Every Ollama path runs this once before its first request, so the weight check
+        cannot depend on whether a context size was configured. Unknown or older servers
+        may silently ignore the no-truncation fields.
+        """
+
         version = (await self._request("version")).get("version")
         if type(version) is not str or version not in _REVIEWED_RUNTIMES:
             raise ValueError(
                 "context safety requires a source-reviewed Ollama runtime: "
                 + ", ".join(sorted(_REVIEWED_RUNTIMES))
             )
+        await self.identity(model)

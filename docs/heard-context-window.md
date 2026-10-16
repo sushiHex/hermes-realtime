@@ -133,9 +133,11 @@ This control does not fit prompts automatically or change the retained foregroun
 An oversized request still fails explicitly under the no-truncation contract below.
 
 Every Ollama adapter requires a source-qualified Ollama runtime, 0.34.4 or 0.40.4, before
-its first prompt, including default and legacy launcher paths. Model metadata that declares
-non-GGUF weights or a runner other than llama.cpp is refused wherever it appears, and the
-installed-model catalog leaves such models out. Successful validation is cached
+its first prompt, including default and legacy launcher paths. The same step requires the
+selected model's installed row to declare local GGUF weights, because 0.40.4 sends
+safetensors weights to an unreviewed MLX runner. Discovery refuses such models too, and the
+installed-model catalog leaves them out. Ollama's native-chat path is not refused yet
+([#285](https://github.com/sushiHex/hermes-realtime/issues/285)). Successful validation is cached
 for that adapter; later turns do not repeat the metadata read. Recreate the session after
 replacing or upgrading the backend. Unknown runtimes are refused rather than assumed to
 honor no-truncation flags. Explicit context configuration supplies

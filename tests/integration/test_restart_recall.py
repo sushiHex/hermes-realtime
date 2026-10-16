@@ -100,7 +100,7 @@ def _loop(store: ConversationContextStore, ollama: _FakeOllama) -> StreamingSpee
     return StreamingSpeechLoop(
         context=store,
         foreground=ForegroundTurnCoordinator(),
-        inference=OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+        inference=OllamaStreamingInference(metadata_client=supported_ollama_metadata("stand-in"),
             base_url="http://127.0.0.1:11434", model="stand-in", open_request=ollama
         ),
         synthesizer=_Synthesizer(),

@@ -22,6 +22,7 @@ from hermes_realtime.providers.ollama_models import (
     OllamaModelClient,
     OllamaModelMetadata,
 )
+from tests.support.ollama_metadata import supported_ollama_tags
 
 pytestmark = pytest.mark.asyncio
 
@@ -212,7 +213,14 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
         return web.Response(status=status, body=payload, headers={"Location": "/redirect"})
 
     app = web.Application()
+    tags_payload = supported_ollama_tags("test:latest")
+
+    async def tags(request):
+        requests.append(request.path)
+        return web.Response(body=tags_payload)
+
     app.router.add_get("/api/version", response)
+    app.router.add_get("/api/tags", tags)
     app.router.add_get("/redirect", response)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -223,18 +231,20 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
         await web.SockSite(runner, listener).start()
         client = OllamaModelClient(base_url=f"http://127.0.0.1:{port}")
         if status == 200:
-            await client.require_context_contract()
+            await client.require_context_contract("test:latest")
+            # A supported version proceeds to the identity read; a refused one reads nothing more.
+            assert requests == ["/api/version", "/api/tags"]
         else:
             with pytest.raises(aiohttp.ClientResponseError) as refusal:
-                await client.require_context_contract()
+                await client.require_context_contract("test:latest")
             assert refusal.value.status == status
-        assert requests == ["/api/version"]
+            assert requests == ["/api/version"]
         reports = [
             json.loads(line.removeprefix("[ollama-metadata] "))
             for line in capsys.readouterr().out.splitlines()
             if line.startswith("[ollama-metadata] ")
         ]
-        assert reports == [
+        expected = [
             {
                 "version": 1,
                 "kind": "version",
@@ -242,6 +252,11 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
                 "bytes": len(payload) if status == 200 else 0,
             }
         ]
+        if status == 200:
+            expected.append(
+                {"version": 1, "kind": "tags", "category": "accepted", "bytes": len(tags_payload)}
+            )
+        assert reports == expected
     finally:
         await runner.cleanup()
         listener.close()
@@ -293,15 +308,21 @@ async def test_effective_context_requires_exact_digest():
 
 
 async def test_runtime_contract_rejects_unknown_versions():
-    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=Backend())
-    await client.require_context_contract()
+    backend = Backend()
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=backend)
+    await client.require_context_contract("test:latest")
+    assert [request[0] for request in backend.requests] == ["version", "tags"]
+
+    refused = []
 
     async def old_runtime(endpoint, body):
+        refused.append(endpoint)
         return b'{"version":"0.1.0"}'
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=old_runtime)
     with pytest.raises(ValueError, match="runtime"):
-        await client.require_context_contract()
+        await client.require_context_contract("test:latest")
+    assert refused == ["version"]
 
 
 async def test_small_model_requires_explicit_smaller_context():

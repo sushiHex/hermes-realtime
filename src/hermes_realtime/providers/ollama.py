@@ -239,7 +239,7 @@ class OllamaStreamingInference:
                     raise ValueError("verified session metadata client is already bound")
                 category = "cached"
                 return metadata_client
-            await metadata_client.require_context_contract()
+            await metadata_client.require_context_contract(self._model)
             self._model_client = metadata_client
             self._context_contract_verified = True
             category = "verified"
