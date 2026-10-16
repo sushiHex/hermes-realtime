@@ -511,6 +511,8 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
             str(msvcrt.get_osfhandle(resume_read_fd)),
             "--qualification-checkpoint-nonce",
             "a" * 64,
+            "--ollama-base-url",
+            "http://127.0.0.1:11437",
         ]
     )
     captured: dict[str, object] = {}
@@ -561,6 +563,7 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
     assert "qualification_no_hermes_tasks" not in captured
     assert captured["private_no_tasks"] is True
     assert captured["closed"] is True
+    assert captured["ollama_base_url"] == "http://127.0.0.1:11437"
 
 
 def test_evidence_database_path_uses_only_custom_or_localappdata_root() -> None:
