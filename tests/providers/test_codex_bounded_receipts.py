@@ -237,6 +237,69 @@ async def test_stalled_initialized_send_keeps_close_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_turn_exits_bounded_while_another_request_holds_the_send_lock() -> None:
+    # A request awaiting its response may hold the send lock for its whole request timeout;
+    # the failed turn must still end and close without waiting for it.
+    transport = StalledPipeTransport(stall=_is_tool_result)
+    inference = _inference(transport, request_timeout=30.0)
+    inference.bind_work_tools(FakeWorkToolHandler())
+    stream = asyncio.create_task(_collect_stream(inference, "turn_lock_held"))
+    held = False
+    try:
+        async with asyncio.timeout(1):
+            await transport.turn_started.get()
+            await transport.start_item()
+            await inference._send_lock.acquire()
+            held = True
+            await transport.request_tool(request_id=_RESULT_ID)
+        async with asyncio.timeout(3):
+            with pytest.raises(RuntimeError):
+                await stream
+        assert inference._closed is True
+        assert inference._send_lock.locked()
+    finally:
+        if held:
+            inference._send_lock.release()
+        await _release_and_close(transport, inference, stream)
+
+
+@pytest.mark.asyncio
+async def test_send_that_returns_after_its_deadline_without_suspending_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    inference = CodexAppServerStreamingInference(
+        model="synthetic", effort="low", transport_factory=_no_transport,
+    )
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    clock = {"now": now}
+    monkeypatch.setattr(loop, "time", lambda: clock["now"])
+    sent: list[dict[str, object]] = []
+
+    async def slow_send(message: Mapping[str, object]) -> None:
+        sent.append(dict(message))
+        clock["now"] = now + 5  # A synchronous stall: no suspension for a timeout to cancel.
+
+    inference._send = slow_send  # type: ignore[method-assign]
+    routing = module._TurnRouting()
+    try:
+        delivered = await inference._send_bounded(
+            {"id": 7, "result": {}}, deadline=now + 1, category="tool_result", routing=routing,
+        )
+        assert delivered is False and len(sent) == 1
+        assert routing.failure.is_set() and inference._closed is True
+        evidence = [
+            json.loads(line.removeprefix(_SEND_MARKER))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith(_SEND_MARKER)
+        ]
+        assert evidence == [{"category": "tool_result", "outcome": "deadline", "version": 1}]
+    finally:
+        monkeypatch.undo()
+        await _close_bounded(inference)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [True, False])
 async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
     expired: bool,
