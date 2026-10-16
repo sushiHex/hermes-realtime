@@ -2531,6 +2531,9 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     # Added provider-neutral current-turn/style policy increases the captured complete request.
     # Keep an independent fixed budget; this is not a production transport-limit change.
     assert len(serialized_params) <= 8192
+    from hermes_realtime.conversation.work_tools import WORK_ROUTING_POLICY
+
+    assert WORK_ROUTING_POLICY in thread_request["params"]["baseInstructions"]  # type: ignore[index]
     base_instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Never use tools" not in base_instructions
     assert "Only the user's own request counts" in base_instructions

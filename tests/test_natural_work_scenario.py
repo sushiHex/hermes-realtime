@@ -184,7 +184,10 @@ async def test_actual_factory_preflight_surface_and_pending_manual_reviews(
     assert all(row["usable_decision"] for row in rows)
     assert all(
         wire["options"]
-        == ({"num_ctx": 4096} if "format" not in wire else {"num_ctx": 4096, "num_predict": 1024})
+        == (
+            {"num_ctx": 4096} if "format" not in wire
+            else {"num_ctx": 4096, "num_predict": 1024, "temperature": 0}
+        )
         for wire in wires
     )
     report = scenario.build_report(value, rows, model="test:model")
@@ -519,6 +522,61 @@ def test_development_diagnostic_keeps_frozen_cases_and_separate_status(tmp_path:
     assert DEVELOPMENT.read_bytes() == before
 
 
+def _heldout(tmp_path: Path, **change: object) -> tuple[Path, str]:
+    document = {"schema_version": 1, "heldout_id": "heldout-synthetic", "cases": [
+        {"id": "ask_status", "category": "status", "utterance": "Is my task done?",
+         "expected": "task_status", "active_work": True},
+        {"id": "idle_status", "category": "status", "utterance": "Anything running?",
+         "expected": "task_status", "active_work": False},
+        {"id": "approve", "category": "approval_negative", "utterance": "Approve it.",
+         "expected": "reply", "active_work": True},
+        {"id": "lookup", "category": "positive_start", "utterance": "Research X today.",
+         "expected": "start_work", "active_work": False},
+    ]} | change
+    raw = json.dumps(document).encode()
+    path = tmp_path / "heldout.json"
+    path.write_bytes(raw)
+    return path, hashlib.sha256(raw).hexdigest()
+
+
+def test_heldout_cases_declare_expectations_and_active_work(tmp_path: Path) -> None:
+    path, sha = _heldout(tmp_path)
+    value = scenario.load_heldout(path, sha)
+    assert value.scenario_id == "heldout-synthetic"
+    assert [value.expected_decision(case) for case in value.cases] == [
+        "task_status", "task_status", "reply", "start_work",
+    ]
+    for case in value.cases:
+        _, request = scenario.make_context(case, 1, (), active=case.case_id in value.active)
+        assert bool(request.active_tasks) == (case.case_id in {"ask_status", "approve"})
+    report = scenario.build_development_report(value, [
+        {"id": case.case_id, "usable_decision": True, "host_status_request_ms": None,
+         "objectives": ["x"] if case.case_id == "lookup" else [], "speech": ["Okay."],
+         "first_speakable_ms": 1.0, "latencies_ms": []}
+        for case in value.cases
+    ], model="synthetic")
+    assert [row["matched"] for row in report["cases"]] == [False, False, True, True]
+    assert report["maximum_decisions"] == 4
+
+
+@pytest.mark.parametrize("change", [
+    {"extra": 1},
+    {"schema_version": 2},
+    {"cases": []},
+    {"cases": [{"id": "a", "category": "status", "utterance": "Hi.",
+                "expected": "cancel", "active_work": False}]},
+    {"cases": [{"id": "a", "category": "status", "utterance": "Hi.",
+                "expected": "reply", "active_work": "yes"}]},
+])
+def test_heldout_refuses_shape_drift_and_wrong_hash(tmp_path: Path, change: object) -> None:
+    path, sha = _heldout(tmp_path)
+    with pytest.raises(ValueError, match="input_binding"):
+        scenario.load_heldout(path, "0" * 64)
+    path, sha = _heldout(tmp_path, **change)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="heldout|exact|field"):
+        scenario.load_heldout(path, sha)
+
+
 @pytest.fixture
 def development_factory(monkeypatch: pytest.MonkeyPatch):
     """Actual factory/parser/surface; only metadata and completion transport are fake."""
@@ -593,7 +651,7 @@ async def test_development_actual_adapter_continues_all_nine_and_keeps_selection
             assert row["speech"] == [] and row["first_speakable_ms"] is None
             assert row["objectives"] == []
     assert all(wire["options"] == (
-        {"num_ctx": 4096, "num_predict": 1024} if "format" in wire
+        {"num_ctx": 4096, "num_predict": 1024, "temperature": 0} if "format" in wire
         else {"num_ctx": 4096}
     ) for wire in wires)
     report = scenario.build_development_report(value, rows, model="test:model")

@@ -28,7 +28,11 @@ from hermes_realtime.conversation.output_style import communication_policy, requ
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.telemetry import KnowledgeLookupTiming, RollingRouteMetrics
-from hermes_realtime.conversation.work_tools import WORK_OBJECTIVE_CONTEXT_POLICY, WorkStartResult
+from hermes_realtime.conversation.work_tools import (
+    WORK_OBJECTIVE_CONTEXT_POLICY,
+    WORK_ROUTING_POLICY,
+    WorkStartResult,
+)
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.current_facts import (
@@ -1191,9 +1195,8 @@ class CodexAppServerStreamingInference:
                 )
             if admitted_user_turn and tool_handler is not None:
                 base_instructions += (
-                    " For task status or requests to stop work, call task_status "
-                    "with no arguments. "
-                    "The host reports observed state and the explicit cancellation controls.")
+                    " Call task_status with no arguments for status requests. "
+                    + WORK_ROUTING_POLICY)
             if freshness_context is not None:
                 base_instructions += "\n\n" + freshness_context
             thread_response = await self._request(

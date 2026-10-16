@@ -258,7 +258,7 @@ async def test_constrained_start_advertises_exact_union_and_waits_for_acceptance
     body = sent[0]
     assert body["shift"] is False
     assert body["truncate"] is False
-    assert body["options"] == {"num_ctx": 16384, "num_predict": 1024}
+    assert body["options"] == {"num_ctx": 16384, "num_predict": 1024, "temperature": 0}
     assert "tools" not in body
     assert body["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
 
@@ -296,7 +296,7 @@ async def test_constrained_start_preserves_selected_context_delivery_and_complet
     assert await collect(inference, snapshot) == ["I've started that background task."]
     assert len(handler.calls) == 1
     body = sent[0]
-    assert body["options"] == {"num_ctx": 4096, "num_predict": 1024}
+    assert body["options"] == {"num_ctx": 4096, "num_predict": 1024, "temperature": 0}
     assert body["shift"] is False and body["truncate"] is False
     assert "tools" not in body
     assert body["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
@@ -454,6 +454,23 @@ async def test_without_current_user_request_no_work_schema_or_effect(snapshot) -
     assert "tools" not in sent[0]
     assert sent[0]["format"] == reply_schema()
     assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_routing_policy_is_offered_exactly_with_start_and_status() -> None:
+    from hermes_realtime.conversation.work_tools import WORK_ROUTING_POLICY
+
+    offered, _, offered_sent, _ = adapter([decision_frame({"kind": "reply", "text": "Okay."})])
+    withheld, _, withheld_sent, _ = adapter([decision_frame({"kind": "reply", "text": "Okay."})])
+    try:
+        await collect(offered)
+        await collect(withheld, ConversationContextSnapshot(
+            revision=1, messages=request().messages, active_tasks=()))
+    finally:
+        await offered.close()
+        await withheld.close()
+    assert WORK_ROUTING_POLICY in offered_sent[0]["messages"][0]["content"]
+    assert WORK_ROUTING_POLICY not in withheld_sent[0]["messages"][0]["content"]
 
 
 _INVALID_DECISIONS = [

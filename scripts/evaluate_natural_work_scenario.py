@@ -108,6 +108,64 @@ class DevelopmentDiagnostic:
     cases: tuple[legacy.IntentCase, ...]
     bindings: dict[str, str]
     scenario_id: str = "natural-work-development-nine-v1"
+    # Each case's expected decision and whether one synthetic task is active. The nine
+    # development cases derive these from their ids; a held-out file declares them.
+    expected: dict[str, str] | None = None
+    active: frozenset[str] = frozenset({"host_status"})
+
+    def expected_decision(self, case: legacy.IntentCase) -> str:
+        if self.expected is not None:
+            return self.expected[case.case_id]
+        return ("start_work" if case.expected_tool == "start_work" else (
+            "task_status" if case.case_id in ("cancel_model_authority", "host_status")
+            else "reply"))
+
+
+_HELDOUT_CATEGORIES = frozenset(
+    {"positive_start", "clarification", "status", "approval_negative", "negative"}
+)
+_DECISIONS = frozenset({"reply", "start_work", "task_status"})
+
+
+def load_heldout(path: Path, expected_sha256: str) -> DevelopmentDiagnostic:
+    """Load a separately authored, hash-pinned case file that declares its own expectations."""
+    if type(expected_sha256) is not str or SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("heldout_binding_refused")
+    document, observed = read_json(path, expected_sha256)
+    if (
+        set(document) != {"schema_version", "heldout_id", "cases"}
+        or type(document["schema_version"]) is not int or document["schema_version"] != 1
+        or type(document["heldout_id"]) is not str
+        or not PUBLIC_ID.fullmatch(document["heldout_id"])
+    ):
+        raise ValueError("heldout_schema_refused")
+    rows = document["cases"]
+    if type(rows) is not list or not 1 <= len(rows) <= 64:
+        raise ValueError("heldout_schema_refused")
+    cases, expected, active = [], {}, set()
+    for row in rows:
+        if type(row) is not dict or set(row) != {
+            "id", "category", "utterance", "expected", "active_work",
+        }:
+            raise ValueError("heldout_case_refused")
+        if (
+            type(row["id"]) is not str or not PUBLIC_ID.fullmatch(row["id"])
+            or row["id"] in expected or row["category"] not in _HELDOUT_CATEGORIES
+            or row["expected"] not in _DECISIONS or type(row["active_work"]) is not bool
+        ):
+            raise ValueError("heldout_case_refused")
+        ConversationContextStore().validate_user_text(row["utterance"])
+        cases.append(legacy.IntentCase(
+            row["id"], "positive" if row["expected"] == "start_work" else "negative",
+            row["utterance"], "start_work" if row["expected"] == "start_work" else None,
+        ))
+        expected[row["id"]] = row["expected"]
+        if row["active_work"]:
+            active.add(row["id"])
+    return DevelopmentDiagnostic(
+        tuple(cases), {str(path.resolve()): observed}, document["heldout_id"],
+        expected, frozenset(active),
+    )
 
 
 def load_development(path: Path) -> DevelopmentDiagnostic:
@@ -202,10 +260,15 @@ def verify_access(path: Path, expected: str, scenario_sha: str, scenario_id: str
         raise ValueError("access_proof_refused")
 
 
-def make_context(case: legacy.IntentCase, revision: int, prior: tuple[str, ...]):
+def make_context(
+    case: legacy.IntentCase, revision: int, prior: tuple[str, ...],
+    active: bool | None = None,
+):
     canonical = legacy._snapshot(case, revision)
-    if case.case_id == "host_status":
-        canonical = replace(canonical, active_tasks=(legacy._ACTIVE_TASK,))
+    if active is None:
+        active = case.case_id == "host_status" or None
+    if active is not None:
+        canonical = replace(canonical, active_tasks=(legacy._ACTIVE_TASK,) if active else ())
     context = ConversationContextStore()
     for text in (*prior, case.utterance):
         context.record_user_transcript(Transcript(text=text, final=True))
@@ -298,7 +361,11 @@ async def run_cases(
         ]
     results = observations if observations is not None else []
     for revision, (case, prior, cohort) in enumerate(sequence, 1):
-        context, request = make_context(case, revision, prior)
+        declared = isinstance(value, DevelopmentDiagnostic) and value.expected is not None
+        context, request = make_context(
+            case, revision, prior,
+            active=(case.case_id in value.active) if declared else None,  # type: ignore[union-attr]
+        )
         recorder = Recorder()
         surface = ConversationWorkControlSurface(
             controller=recorder,
@@ -445,9 +512,7 @@ def build_development_report(
         raise ValueError("complete_order_required")
     observations, selections = [], []
     for case, row in zip(value.cases, rows, strict=True):
-        expected = ("start_work" if case.expected_tool == "start_work" else (
-            "task_status" if case.case_id in ("cancel_model_authority", "host_status")
-            else "reply"))
+        expected = value.expected_decision(case)
         observed = ("task_status" if row["host_status_request_ms"] is not None else (
             "start_work" if row["objectives"] else (
                 "reply" if any(legacy._is_speakable(text) for text in row["speech"])
@@ -470,7 +535,7 @@ def build_development_report(
             latency for row in rows for latency in row["latencies_ms"]]),
         "real_effects": 0, "runtime_ownership": "external",
         "attempt_policy": "single_attempt_per_case", "context_tokens": 4096,
-        "maximum_readiness": 9, "maximum_decisions": 9,
+        "maximum_readiness": len(value.cases), "maximum_decisions": len(value.cases),
     }
 
 
@@ -563,6 +628,8 @@ def main(argv: list[str] | None = None) -> int:
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--scenario", type=Path)
     inputs.add_argument("--development-fixture", type=Path)
+    inputs.add_argument("--heldout-fixture", type=Path)
+    parser.add_argument("--heldout-sha256")
     parser.add_argument("--access-proof", type=Path)
     parser.add_argument("--access-proof-sha")
     parser.add_argument("--source-head", required=True)
@@ -583,10 +650,14 @@ def main(argv: list[str] | None = None) -> int:
         if not PUBLIC_ID.fullmatch(args.model):
             raise ValueError("execution_binding_refused")
         value: Scenario | DevelopmentDiagnostic
-        if args.development_fixture is not None:
+        if (args.heldout_fixture is None) != (args.heldout_sha256 is None):
+            raise ValueError("heldout_binding_refused")
+        if args.development_fixture is not None or args.heldout_fixture is not None:
             if args.access_proof is not None or args.access_proof_sha is not None:
                 raise ValueError("development_resource_override_refused")
-            value = load_development(args.development_fixture)
+            value = (load_development(args.development_fixture)
+                     if args.development_fixture is not None
+                     else load_heldout(args.heldout_fixture, args.heldout_sha256))
         else:
             if args.access_proof is None or args.access_proof_sha is None:
                 raise ValueError("scenario_access_required")
@@ -620,7 +691,10 @@ def main(argv: list[str] | None = None) -> int:
                                 observations=rows,
                                 private_sink=receipt,
                             ),
-                            1300 if isinstance(value, DevelopmentDiagnostic)
+                            # The nine development cases keep their 1300 s bound; larger
+                            # declared sets scale at the same per-case allowance.
+                            max(1300, 140 * len(value.cases) + 40)
+                            if isinstance(value, DevelopmentDiagnostic)
                             else (100 + len(value.controls)) * 140 + 240,
                         )
                     )
