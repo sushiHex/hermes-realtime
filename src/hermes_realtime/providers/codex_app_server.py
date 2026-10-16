@@ -51,6 +51,7 @@ _MAX_PROTOCOL_LINE_BYTES = 1_048_576
 _MIN_SESSION_ACCESS_SECONDS = 3600
 _SESSION_AUTH_REFUSAL_PREFIX = "[codex-session-auth] "
 _TOOL_REFUSAL_PREFIX = "[codex-tool-refusal] "
+_SEND_REFUSAL_PREFIX = "[codex-send-bound] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -619,6 +620,10 @@ class _TurnRouting:
     failure: asyncio.Event = field(default_factory=asyncio.Event)
     dynamic_registered: asyncio.Event = field(default_factory=asyncio.Event)
     error: BaseException | None = None
+    # Minted once when a failure, or a call that outlived its own deadline, takes ownership of
+    # the turn's cleanup; every later send for the turn (late answers, rejections, duplicates,
+    # the interrupt) shares it, so retries cannot renew it.
+    cleanup_deadline: float | None = None
     terminal: bool = False
     accepted_start: bool = False
     lookup_attempted: bool = False
@@ -1621,19 +1626,32 @@ class CodexAppServerStreamingInference:
                 raise RuntimeError("Codex status admission cleanup failed") from routing.error
             return
         if routing is not None and routing.failure.is_set():
-            async with self._send_lock:
-                request_id = self._next_request_id
-                self._next_request_id += 1
-                await self._send(
-                    {
-                        "id": request_id,
-                        "method": "turn/interrupt",
-                        "params": {
-                            "threadId": active.thread_id,
-                            "turnId": active.server_id,
+            deadline = self._cleanup_deadline(routing)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._send_lock.acquire()
+            except TimeoutError as error:
+                # Another sender has held the pipe for the whole budget: a stalled transport.
+                self._fail_send(routing, "turn/interrupt", error)
+            else:
+                try:
+                    request_id = self._next_request_id
+                    self._next_request_id += 1
+                    await self._send_bounded(
+                        {
+                            "id": request_id,
+                            "method": "turn/interrupt",
+                            "params": {
+                                "threadId": active.thread_id,
+                                "turnId": active.server_id,
+                            },
                         },
-                    }
-                )
+                        deadline=deadline,
+                        category="turn/interrupt",
+                        routing=routing,
+                    )
+                finally:
+                    self._send_lock.release()
             raise RuntimeError("Codex app-server reader failed") from routing.error
         if routing is not None and routing.host_status_ready:
             async with self._send_lock:
@@ -1678,13 +1696,30 @@ class CodexAppServerStreamingInference:
             ):
                 return
             if operation is None or operation.done():
-                self._closed = True
-                operation = asyncio.create_task(
-                    self._close_owned(),
-                    name="codex-app-server-close",
-                )
-                self._close_operation = operation
+                operation = self._begin_close()
         await asyncio.shield(operation)
+
+    def _begin_close(self) -> asyncio.Task[None]:
+        """Close the adapter without awaiting it, so a failing sender never waits on itself.
+
+        A failed or expired send leaves the pipe stalled. Closing the transport ends the
+        process after its close timeout, and that connection loss wakes every pending drain,
+        which is what bounds the response-task gathers. The task is single-flight; ``close``
+        awaits whichever one is live.
+        """
+
+        self._closed = True
+        operation = self._close_operation
+        if operation is None or operation.done():
+            operation = asyncio.create_task(self._close_owned(), name="codex-app-server-close")
+            operation.add_done_callback(self._consume_close_operation)
+            self._close_operation = operation
+        return operation
+
+    @staticmethod
+    def _consume_close_operation(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
     async def _close_owned(self) -> None:
         async with self._state_lock:
@@ -1797,7 +1832,12 @@ class CodexAppServerStreamingInference:
                     "capabilities": {"experimentalApi": True},
                 },
             )
-            await self._send({"method": "initialized"})
+            if not await self._send_bounded(
+                {"method": "initialized"},
+                deadline=asyncio.get_running_loop().time() + self._request_timeout,
+                category="initialized",
+            ):
+                raise RuntimeError("Codex app-server initialized send failed")
 
     async def _retire_transport_locked(self) -> None:
         transport, reader = self._transport, self._reader_task
@@ -1819,16 +1859,23 @@ class CodexAppServerStreamingInference:
     ) -> Mapping[str, object]:
         request_id = self._next_request_id
         self._next_request_id += 1
-        future: asyncio.Future[Mapping[str, object]] = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Mapping[str, object]] = loop.create_future()
         self._pending[request_id] = future
+        deadline = loop.time() + self._request_timeout
         try:
-            await self._send({"id": request_id, "method": method, "params": dict(params)})
+            if not await self._send_bounded(
+                {"id": request_id, "method": method, "params": dict(params)},
+                deadline=deadline,
+                category=method,
+            ):
+                raise RuntimeError(f"Codex app-server {method} send failed")
             reader = self._reader_task
             if reader is None:
                 raise RuntimeError("Codex app-server reader is unavailable")
             done, _pending = await asyncio.wait(
                 (future, reader),
-                timeout=self._request_timeout,
+                timeout=max(0.0, deadline - loop.time()),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if future in done:
@@ -1961,6 +2008,73 @@ class CodexAppServerStreamingInference:
         if transport is None:
             raise RuntimeError("Codex app-server transport is unavailable")
         await transport.send(message)
+
+    async def _send_within(self, message: Mapping[str, object], *, deadline: float) -> None:
+        """Send one message within an existing budget, or raise ``TimeoutError``.
+
+        The clock checks bracket the timeout because a transport that never suspends is never
+        cancelled by it. A line that was written is queued, not delivered; an expired send is
+        uncertain either way, and its caller must treat the pipe as stalled.
+        """
+
+        loop = asyncio.get_running_loop()
+        if loop.time() >= deadline:
+            raise TimeoutError("Codex send budget expired before the send")
+        async with asyncio.timeout_at(deadline):
+            await self._send(message)
+        if loop.time() >= deadline:
+            raise TimeoutError("Codex send budget expired during the send")
+
+    async def _send_bounded(
+        self,
+        message: Mapping[str, object],
+        *,
+        deadline: float,
+        category: str,
+        routing: _TurnRouting | None = None,
+    ) -> bool:
+        """Send within ``deadline``; on expiry or error, fail closed and report ``False``.
+
+        Errors are consumed here so that a caller never answers the same request twice after
+        an attempt began. Cancellation is not a send failure and passes through untouched.
+        """
+
+        try:
+            await self._send_within(message, deadline=deadline)
+        except Exception as error:
+            self._fail_send(routing, category, error)
+            return False
+        return True
+
+    def _fail_send(
+        self, routing: _TurnRouting | None, category: str, error: Exception,
+    ) -> None:
+        outcome = "deadline" if type(error) is TimeoutError else "send_failed"
+        try:
+            if routing is not None:
+                self._cleanup_deadline(routing)
+                if routing.error is None:
+                    failure = RuntimeError("Codex send failed: " + category)
+                    failure.__cause__ = error
+                    routing.error = failure
+                routing.failure.set()
+            self._begin_close()
+        finally:
+            print(
+                _SEND_REFUSAL_PREFIX
+                + json.dumps(
+                    {"category": category, "outcome": outcome, "version": 1},
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+
+    def _cleanup_deadline(self, routing: _TurnRouting) -> float:
+        if routing.cleanup_deadline is None:
+            routing.cleanup_deadline = asyncio.get_running_loop().time() + min(
+                self._request_timeout, 1.0
+            )
+        return routing.cleanup_deadline
 
     async def _read_messages(self) -> None:
         transport = self._transport
@@ -2384,42 +2498,72 @@ class CodexAppServerStreamingInference:
         request_id: _RequestId,
         *,
         dynamic: bool,
+        deadline: float,
+        routing: _TurnRouting | None = None,
     ) -> None:
         if dynamic:
-            await self._send(
+            await self._send_bounded(
                 {
                     "id": request_id,
                     "result": self._tool_response(
                         _REJECTED_TOOL_RESULT,
                         success=False,
                     ),
-                }
+                },
+                deadline=deadline,
+                category="tool_rejection",
+                routing=routing,
             )
             return
-        await self._send(
+        await self._send_bounded(
             {
                 "id": request_id,
                 "error": {
                     "code": -32601,
                     "message": "server request prohibited",
                 },
-            }
+            },
+            deadline=deadline,
+            category="prohibited_request",
+            routing=routing,
         )
 
     async def _route_server_request(self, message: Mapping[str, object]) -> None:
         current = asyncio.current_task()
         assert current is not None
         request_id = cast(_RequestId, message["id"])
+        # A request without a registered call has no deadline of its own; its answer lives
+        # for one bounded admission lifetime, owned by this task.
+        admission_deadline = asyncio.get_running_loop().time() + min(self._request_timeout, 1.0)
         dynamic = message.get("method") == "item/tool/call"
         if not dynamic:
             await self._send_rejected_server_request(
                 request_id,
                 dynamic=False,
+                deadline=admission_deadline,
             )
             return
 
         call: _DynamicCall | None = None
         routing: _TurnRouting | None = None
+
+        def send_deadline() -> float:
+            if routing is not None and routing.cleanup_deadline is not None:
+                return routing.cleanup_deadline
+            if call is not None and asyncio.get_running_loop().time() < call.deadline:
+                return call.deadline
+            if routing is not None:
+                # The call outlived its own budget, so its answer is turn cleanup.
+                return self._cleanup_deadline(routing)
+            return admission_deadline
+
+        async def respond(response: dict[str, object]) -> None:
+            await self._send_bounded(
+                {"id": request_id, "result": response},
+                deadline=send_deadline(),
+                category="tool_result",
+                routing=routing,
+            )
 
         async def reject() -> None:
             if call is not None and call.tool == "task_status" and routing is not None:
@@ -2429,7 +2573,9 @@ class CodexAppServerStreamingInference:
                     self._tool_response(_REJECTED_TOOL_RESULT, success=False),
                 )
             else:
-                await self._send_rejected_server_request(request_id, dynamic=True)
+                await self._send_rejected_server_request(
+                    request_id, dynamic=True, deadline=send_deadline(), routing=routing,
+                )
 
         try:
             params = self._exact_mapping(message.get("params"), "dynamic tool request")
@@ -2490,11 +2636,11 @@ class CodexAppServerStreamingInference:
                     )
                 except TimeoutError:
                     self._settle_noncommittal(call, "deadline")
+                    assert call.response is not None
                     if call.tool == "task_status":
-                        assert call.response is not None
                         await self._send_status_receipt(request_id, call, routing, call.response)
                     else:
-                        await self._send({"id": request_id, "result": call.response})
+                        await respond(call.response)
                     return
             if (
                 routing.failure.is_set()
@@ -2569,7 +2715,7 @@ class CodexAppServerStreamingInference:
                     request_id, call, routing, call.response,
                 )
             else:
-                await self._send({"id": request_id, "result": call.response})
+                await respond(call.response)
         except RuntimeError as error:
             failure_params = message.get("params")
             if type(failure_params) is dict:
@@ -2593,9 +2739,8 @@ class CodexAppServerStreamingInference:
         if routing.error is None:
             routing.error = failure
         routing.failure.set()
-        self._closed = True
         try:
-            return
+            self._begin_close()
         finally:
             self._status_refusal_evidence(category)
 
@@ -2612,11 +2757,10 @@ class CodexAppServerStreamingInference:
             routing.host_status_ready = True
             routing.dynamic_registered.set()
         try:
-            async with asyncio.timeout_at(call.deadline):
-                await self._send({"id": request_id, "result": response})
+            await self._send_within({"id": request_id, "result": response}, deadline=call.deadline)
         except Exception as error:
             self._fail_status_receipt(
-                routing, "response_send_deadline" if isinstance(error, TimeoutError)
+                routing, "response_send_deadline" if type(error) is TimeoutError
                 else "response_send_failed", error,
             )
 
@@ -2629,9 +2773,7 @@ class CodexAppServerStreamingInference:
             self._fail_status_receipt(routing, "deadline")
             return
         if routing.error is None:
-            routing.error = _StatusAdmissionExpired(
-                asyncio.get_running_loop().time() + min(self._request_timeout, 1.0)
-            )
+            routing.error = _StatusAdmissionExpired(self._cleanup_deadline(routing))
             routing.failure.set()
             self._status_refusal_evidence("admission_deadline")
         assert type(routing.error) is _StatusAdmissionExpired
@@ -2639,12 +2781,7 @@ class CodexAppServerStreamingInference:
         call.response = self._tool_response(_NONCOMMITTAL_TOOL_RESULT, success=False)
         call.response_ready.set()
         try:
-            async with asyncio.timeout_at(deadline):
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("status cleanup deadline expired")
-                await self._send({"id": request_id, "result": call.response})
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("status cleanup deadline expired")
+            await self._send_within({"id": request_id, "result": call.response}, deadline=deadline)
         except BaseException as error:
             self._fail_status_receipt(routing, "admission_cleanup_receipt_failed")
             if not isinstance(error, Exception):
