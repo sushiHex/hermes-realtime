@@ -142,13 +142,38 @@ questions make the exchange feel engaged rather than interrogative.
 
 ## Opted-in Windows evaluator ownership
 
-The existing routing evaluator can run under an independent base-Python guardian:
+The configured-provider routing evaluator requires the exact clean candidate commit and
+tree for every invocation. It selects the host's provider factory, makes one tool-less
+readiness call, binds the shared effect-free work handler, then makes one decision call
+per corpus case. This is a source-bound synthetic routing check, not a real-Hermes
+dispatch, voice, or semantic lifecycle review. A failed case is never retried.
+
+The schema-five routing report accepts the exact internal `HostSpeechRequest` as a
+terminal selection and reports its count, case IDs and request latency separately in
+`host_status_requests`. This is request-only evidence: the evaluator renders no host status,
+consults no live task controller and delivers no audio. The effect-free shadow handler owns
+the active case and refuses a status request mixed with recorded lifecycle calls. A later
+stream item, an unknown item or a marker subclass fails the attempt; readiness continues to
+accept speech strings only. Earlier model prose remains ordinary unreviewed prose.
+
+A status request never counts as a lifecycle tool call, a successful start or legacy
+string-stream `first_speakable` latency. That string stream still includes the existing
+fixed start acknowledgments; #272 separately owns their provenance. A status request does
+not satisfy the separate lifecycle-claim review. The corpus, routing thresholds and pending
+semantic review remain unchanged. Task-state
+projection, current foreground rendering and heard provenance are covered by the host's
+deterministic tests and require their own installed and voice qualification.
+
+On Windows, opt into the independent base-Python guardian with the same binding:
 
 ```sh
 python -m scripts.evaluate_natural_work_routing \
-  --launch-binding interpreter-binding.json \
+  --source-head "$(git rev-parse HEAD)" \
+  --source-tree "$(git rev-parse 'HEAD^{tree}')" \
+  --launch-binding PRIVATE_DIR/interpreter-binding.json \
   --launch-binding-sha256 APPROVED_SHA256 \
-  --launch-receipt private-launch.jsonl \
+  --launch-receipt PRIVATE_DIR/private-launch.jsonl \
+  --provider ollama --mode diagnostic_override \
   --model SELECTED_MODEL
 ```
 
@@ -156,16 +181,41 @@ The private binding has exactly this versioned shape; supply absolute local path
 and SHA-256s of their exact executable bytes. The guardian must be the current
 interpreter's `sys._base_executable`; the controller must be `sys.executable`.
 Keep this file, receipt and retained output private; do not commit local paths.
+`PRIVATE_DIR` must be a directory outside the checkout. The entrypoint requires a clean
+worktree, untracked files included, before and after the run, so a binding or receipt
+inside the repository refuses the run.
 
 ```json
 {"schema_version":1,"guardian":{"path":"ABSOLUTE_BASE_PYTHON","sha256":"SHA256"},"controller":{"path":"ABSOLUTE_CONTROLLER_PYTHON","sha256":"SHA256"}}
 ```
 
-All three launch options are required together. Without them the legacy CLI stays
-in-process and claims no guardian ownership. The selected model, effort, corpus,
-existing retry policy and scoring remain unchanged. The script entrypoint selects
-its own candidate source before product imports and refuses already loaded modules
-from another checkout before evaluation.
+All three launch options are required together. Without them the CLI runs in process
+and claims no guardian ownership. `--mode production_default` takes provider settings
+from the host factory and refuses explicit model/runtime overrides. It is the CLI
+default. Select `--mode diagnostic_override` for model or runtime overrides. `--provider codex`
+remains the default; `--provider ollama` selects the same host factory and optional
+`--ollama-base-url` and `--ollama-num-ctx` settings. The entrypoint refuses a missing or
+changed source commit/tree, a dirty worktree, or production imports from another
+checkout before model execution, and verifies source stability again afterward.
+
+The version-four report declares a 20-second readiness bound, a 60-second decision
+bound, a 10-second adapter-close bound and a 3500-second total evaluation bound. It
+uses a 3600-second outer guardian deadline, leaving room for bounded cleanup and
+receipt writing without silently doubling the evaluation budget. The total clock
+starts before Codex version discovery when Codex is selected. It
+records one attempt per case and distinguishes a fresh per-case adapter from unknown
+external runtime process/cache freshness. Reports contain model labels, aggregate
+routing counts and bounded failure categories; they do not contain prompts, replies,
+private paths, or raw provider errors. A provider decision can be a false or misleading
+lifecycle claim; the separate semantic review remains pending until reviewed.
+If the owned controller completes with a nonzero result and source remains bound,
+the caller preserves its reviewed report (including a pending semantic review) and
+the retained private result artifact. If post-run source binding fails, it emits only
+bounded `owned_result_failed` with a secondary source category, without echoing the
+controller output. A valid unsuccessful guardian
+receipt retains its recorded stage, category and cleanup fields in the public failure
+summary, distinct from a missing or malformed receipt. Source drift observed after
+either failure is reported as a secondary category without replacing the first one.
 
 The default launch requests explicit Job breakaway, hides the process and verifies
 the actual base guardian is outside inherited Jobs. Windows may refuse breakaway;
@@ -226,6 +276,46 @@ budgets and sanitized public reports. Interpreter hashes alone do not attest the
 complete dependency closure. This ownership slice does not complete reusable
 provider qualification, real dispatch, or human voice acceptance.
 
+### Bounded development diagnostics
+
+The existing scenario evaluator also accepts `--development-fixture` instead of
+`--scenario`. It binds the unchanged development fixture bytes and selects, in order,
+`research`, `greeting`, `explanation`, `quotation`, `negation`,
+`cancel_model_authority`, `approval_model_authority`, and `ambiguity`. A separate
+`host_status` observation uses the existing synthetic question “How is work?”;
+it does not add a row to either frozen corpus. Cancellation, approval and status
+observations carry one synthetic active task. No project context or access-proof
+override is accepted in this mode.
+
+```sh
+python -m scripts.evaluate_natural_work_scenario \
+  --development-fixture tests/fixtures/natural_work_development_cases.json \
+  --source-head APPROVED_CLEAN_HEAD --model SELECTED_MODEL \
+  --base-url http://127.0.0.1:11437 --private-receipt PRIVATE_DIR/private-development.jsonl \
+  --live
+```
+
+The runtime must already be owned by the caller. For owned Windows execution, pass
+this script and these arguments to the existing `run_owned_controller` API with its
+verified interpreter binding and a 1360-second deadline; do not copy its guardian.
+The evaluator uses a fresh production Ollama adapter/context/shared rejecting work
+surface per observation, ordinary synthetic-PCM preflight, context 4096 and unchanged
+production sampler settings. At most nine readiness and nine decision requests run
+once, including after semantic misses. Readiness and decisions each retain their
+60-second bounds; adapter and surface cleanup each retain ten seconds. The diagnostic
+has a 1300-second overall bound. It does not start or evict a model runtime.
+
+The private receipt is exclusively reserved before calls and flushed after each
+attempt, retaining synthetic replies, objectives and partial failure evidence for
+manual review. Keep it private. Public reports expose counts, kinds and latency only.
+A typed host-status marker measures **selection only**, without rendering, synthesis,
+playback or a claim that status was heard. Text-output latency remains separate.
+The Ollama-only diagnostic rejects prose/effects mixed with status selection and
+output after a terminal marker.
+Objective fidelity, clarification and lifecycle review remain pending; `pass` stays
+false. This diagnostic does not invoke the 100-case scorer, admit its resource
+prerequisites, qualify explicit cancellation, or establish voice acceptance.
+
 ## Installed natural-work boundary and latency gate
 
 Before enabling natural Codex work routing by default, run the installed-boundary
@@ -233,7 +323,11 @@ gate with the exact release model, effort, Codex executable, Hermes source tree,
 and Hermes API credential that will be used by the host. The gate starts a
 loopback-only authenticated API adapter and performs two benign real Hermes runs:
 one must complete authoritatively and one deliberately long run must be stopped
-through natural cancellation. An ordinary conversational turn must create no run.
+through the explicit user command `cancel task: <public task ID>`. The existing
+command router delegates to the shared exact-task work surface; cancellation
+never enters model inference. The accepted cancellation and interrupted terminal
+must match that frozen task ID. Ordinary conversation and an old-task continuation
+response must create no run or work-tool activity.
 Codex completes one tool-less preflight turn before the measured requests. The gate provider has
 no knowledge lookup, so unlike the production host it exposes no `search_knowledge` tool. This
 preflight keeps app-server initialization from contaminating acknowledgement timing before the
@@ -269,7 +363,7 @@ enforces a minimum of 30; the release command uses 125 after a preserved
 100-pair run showed unstable remote-service p95 variance. Every
 pair uses the same bounded conversational prompt. Acceptance requires the
 present-but-unused foreground p95 regression to remain within the greater of
-100 ms or 10% of the absent-arm p95. Every natural start or cancellation is
+100 ms or 10% of the absent-arm p95. Every natural start or explicit cancellation is
 timed from transcript acceptance until the installed Hermes handler returns its
 accepted result; every sample must remain below the explicitly configured
 task-acknowledgement budget. `8000` ms is the current candidate budget,
@@ -288,6 +382,13 @@ name, canonical schema SHA-256, observed thread-start count, and zero-active-tas
 under `present_arm_configuration`. Invalid sample counts, warmups, and
 acknowledgement budgets are bounded above and below before credentials or real
 runs are touched. Runtime failures emit only a bounded diagnostic code on stderr.
+
+The boundary report uses `evidence_version: 2` and
+`cancellation_route: "explicit_command"`. `observed_cancel_tool_requests` must
+be exactly zero, including shutdown; the explicit command still produces one
+accepted handler cancellation and one request-to-acknowledgment latency sample.
+Earlier evidence that required a model cancellation tool call is incompatible
+with this start-only model policy and must be regenerated.
 
 The JSON contains only the model, effort, Codex version and binary SHA-256,
 sanitized observed counters, terminal-state classifications, and timing

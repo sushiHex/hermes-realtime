@@ -1335,8 +1335,8 @@ def _bind_natural_work_tools(
         raise TypeError("natural_work_tools must be an exact boolean")
     if not enabled:
         return
-    if type(inference) is not CodexAppServerStreamingInference:
-        raise TypeError("natural work tools require exact Codex app-server inference")
+    if type(inference) not in (CodexAppServerStreamingInference, OllamaStreamingInference):
+        raise TypeError("natural work tools require exact Codex or Ollama inference")
     if type(surface) is not ConversationWorkControlSurface:
         raise TypeError("natural work tools require an exact work-control surface")
     inference.bind_work_tools(surface)
@@ -1378,7 +1378,7 @@ async def _run_full_host_preflight(
     surface: ConversationWorkControlSurface,
     natural_work_tools: bool,
 ) -> SpeechChunk:
-    """Warm tool-less dependencies, then grant the exact Codex instance work authority."""
+    """Warm tool-less dependencies, then bind the exact provider's work surface."""
 
     await _start_host_task_session(task_session)
     cue = await _run_inference_speech_readiness(inference, synthesizer)
@@ -2009,8 +2009,6 @@ def build_local_host_launcher(
         require_num_ctx(ollama_num_ctx)
         if inference_provider != "ollama":
             raise ValueError("--ollama-num-ctx requires --inference-provider ollama")
-    if natural_work_tools and inference_provider != "codex":
-        raise ValueError("--natural-work-tools requires --inference-provider codex")
     if type(public_search) is not bool:
         raise TypeError("public_search must be an exact boolean")
     if public_search and inference_provider != "codex":
@@ -2319,6 +2317,9 @@ def build_local_host_launcher(
         async def selected_readiness(candidate: OllamaStreamingInference) -> None:
             nonlocal readiness_cue_template
             readiness_cue_template = await _run_inference_speech_readiness(candidate, synthesizer)
+            _bind_natural_work_tools(
+                inference=candidate, surface=work_surface, enabled=natural_work_tools,
+            )
 
         local_selection_owner = OllamaSessionSelection(
             client=metadata_client,
@@ -2479,6 +2480,7 @@ def build_local_host_launcher(
         synthesizer=synthesizer,
         playback=serialized_playback,
         ledger=DeliveredSpeechLedger(),
+        task_status=work_surface.task_status,
         observer=observe,
         max_segments=DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds=10.0,
@@ -3549,7 +3551,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--natural-work-tools",
         action="store_true",
         dest="natural_work_tools",
-        help="enable experimental natural Hermes work routing for Codex app-server",
+        help="enable automatic Hermes task starts; cancellation stays an explicit user action",
     )
     natural_work_group.add_argument(
         "--no-natural-work-tools",

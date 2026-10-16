@@ -81,6 +81,7 @@ def _trusted_snapshot(snapshot: ConversationContextSnapshot) -> ConversationCont
                 role=message.role,
                 text=message.text,
                 interrupted=message.interrupted,
+                source=message.source,
             )
             for message in snapshot.messages
         ),

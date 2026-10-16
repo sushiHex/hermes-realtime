@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "provenance": "Authored synthetic input records about the declared project. These are not captured production logs, actual incidents or evidence that the source fails.",
+  "reports": [
+    {
+      "name": "windows_validation",
+      "description": "A fictional operator reports that a Windows package-validation attempt did not finish.",
+      "cause": "Unestablished",
+      "observations": ["The operator did not retain a command exit code or a complete build log."]
+    },
+    {
+      "name": "resume_observation",
+      "description": "A fictional observer reports hearing a repeated chunk after disconnect and resume.",
+      "cause": "Unestablished",
+      "sequence": ["connect", "receive chunk alpha", "disconnect", "resume", "observer reports chunk alpha again"],
+      "reproduction_scope": "A scenario sequence to investigate against the real source; no reproduced defect is claimed."
+    }
+  ],
+  "sample_log": [
+    {"relative_day": "previous scenario day", "offset_ms": 0, "event": "session_open"},
+    {"relative_day": "previous scenario day", "offset_ms": 17, "event": "peer_disconnected"},
+    {"relative_day": "previous scenario day", "offset_ms": 31, "event": "observer_reports_missing_audio"}
+  ],
+  "sample_timing_trace": [
+    {"offset_ms": 0, "event": "transcript_final"},
+    {"offset_ms": 7, "event": "inference_request"},
+    {"offset_ms": 24, "event": "text_segment"},
+    {"offset_ms": 41, "event": "first_audio"}
+  ],
+  "timing_scope": "Illustrative synthetic event timings; not a physical voice-latency measurement."
+}

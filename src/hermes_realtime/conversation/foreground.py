@@ -10,6 +10,8 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
+from .context import validate_speech_source
+
 logger = logging.getLogger(__name__)
 
 TurnRunner = Callable[["ForegroundTurnLease"], Awaitable[None]]
@@ -46,6 +48,7 @@ class ForegroundPublication:
     generation: int
     text: str
     sequence: int = 1
+    source: str = "conversation"
     _invalidated: asyncio.Event = field(
         default_factory=asyncio.Event,
         compare=False,
@@ -106,10 +109,11 @@ class ForegroundTurnLease:
         text: str,
         *,
         on_admit: Callable[[ForegroundPublication], None] | None = None,
+        source: str = "conversation",
     ) -> bool:
         """Atomically enqueue one bounded, generation-labelled publication."""
 
-        return await self._coordinator._publish(self, text, on_admit=on_admit)
+        return await self._coordinator._publish(self, text, on_admit=on_admit, source=source)
 
     def invalidate_publications(self) -> None:
         """Fail closed before an owning producer begins asynchronous cleanup."""
@@ -294,7 +298,9 @@ class ForegroundTurnCoordinator:
         text: str,
         *,
         on_admit: Callable[[ForegroundPublication], None] | None = None,
+        source: str = "conversation",
     ) -> bool:
+        validate_speech_source(source)
         if type(text) is not str:
             raise TypeError("foreground publication must be text")
         if not text:
@@ -315,6 +321,7 @@ class ForegroundTurnCoordinator:
                 generation=lease.generation,
                 text=text,
                 sequence=sequence,
+                source=source,
                 _invalidated=lease._invalidated,
             )
             if on_admit is not None:

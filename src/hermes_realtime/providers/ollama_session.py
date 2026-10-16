@@ -10,6 +10,7 @@ from typing import cast
 
 from hermes_realtime.client.session import BrowserModelConfiguration
 from hermes_realtime.conversation import ConversationContextSnapshot, ConversationInferenceRequest
+from hermes_realtime.conversation.task_status import HostSpeechRequest
 
 from .ollama import OllamaStreamingInference
 from .ollama_models import (
@@ -287,7 +288,7 @@ class OllamaSessionSelection:
         snapshot: ConversationContextSnapshot | ConversationInferenceRequest,
         *,
         turn_id: str,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | HostSpeechRequest]:
         self.require_prepared()
         adapter = cast(OllamaStreamingInference, self._adapter)
         self._active_streams += 1

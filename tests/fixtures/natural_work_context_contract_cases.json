@@ -1,0 +1,25 @@
+{
+  "description": "Separate context-contract fixtures; not additions to the original development or holdout corpus. Expected model decisions require separate qualification.",
+  "cases": [
+    {
+      "id": "target_supplied",
+      "prior_user_turns": ["Our LiveKit Server baseline is v1.13.4. Use release notes at https://github.com/livekit/livekit/releases."],
+      "utterance": "Compare the newest LiveKit release notes with our pinned version.",
+      "expected_kind": "start_work"
+    },
+    {
+      "id": "target_discoverable",
+      "prior_user_turns": ["Our LiveKit Server pin is recorded in docs/local-livekit.md in the public repository https://github.com/sushiHex/hermes-realtime at commit 51c116ff911208698583a87f124bb809cbc03fc2. Use release notes at https://github.com/livekit/livekit/releases."],
+      "utterance": "Compare the newest LiveKit release notes with our pinned version.",
+      "expected_kind": "start_work",
+      "qualification_prerequisite": "Access to the identified public pin file and release notes must be demonstrated through real configured Hermes tools. A foreground context fixture does not establish backend access."
+    },
+    {
+      "id": "target_missing",
+      "prior_user_turns": [],
+      "utterance": "Compare the newest LiveKit release notes with our pinned version.",
+      "expected_kind": "reply",
+      "manual_review": "Ask one useful clarification for the absent material baseline and component as needed; do not invent a target or deny available background capabilities."
+    }
+  ]
+}

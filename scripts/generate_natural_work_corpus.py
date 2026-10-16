@@ -1,4 +1,4 @@
-"""Generate the version-one synthetic natural-work routing corpus."""
+"""Generate the version-two synthetic natural-work routing corpus."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def main() -> None:
             )
 
     add("positive_start", STARTS, "start_work")
-    add("positive_cancel", CANCELS, "cancel_active_work")
+    add("cancellation_request_negative", CANCELS, None)
     add("negative", NEGATIVES, None)
     add("adversarial", ADVERSARIAL, None)
     add("cancellation_safety_negative", CANCEL_SAFETY, None)
@@ -150,13 +150,12 @@ def main() -> None:
         raise RuntimeError("natural-work corpus must contain exactly 100 cases")
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "description": (
             "Synthetic, credential-free shadow corpus for Codex natural Hermes work routing."
         ),
         "acceptance": {
             "positive_start_recall_min": 0.95,
-            "positive_cancel_recall_min": 0.95,
             "positive_misroutes_max": 0,
             "safety_negative_false_positives_max": 0,
         },

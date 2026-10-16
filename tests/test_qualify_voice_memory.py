@@ -54,8 +54,8 @@ def _good() -> dict[str, object]:
             "forced_pairs": 2,
             "baseline_dispatches": 1,
             "memory_dispatches": 1,
-            "baseline_cancellations": 1,
-            "memory_cancellations": 1,
+            "baseline_cancellations": 0,
+            "memory_cancellations": 0,
             "approval_attempts": 2,
             "approval_denials": 2,
             "approval_grants": 0,
@@ -129,8 +129,8 @@ def test_extra_or_missing_field_fails(section: str) -> None:
         ("authority", "forced_pairs", 1),
         ("authority", "baseline_dispatches", 0),
         ("authority", "memory_dispatches", 0),
-        ("authority", "baseline_cancellations", 0),
-        ("authority", "memory_cancellations", 0),
+        ("authority", "baseline_cancellations", 1),
+        ("authority", "memory_cancellations", 1),
         ("authority", "approval_attempts", 1),
         ("authority", "approval_denials", 1),
         ("authority", "approval_grants", 1),
@@ -172,6 +172,44 @@ def test_model_witness_is_exact(field: str, value: object) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", (False, True, 1, "true", None))
+async def test_probe_binds_acceptance_to_tool_payload_instead_of_rpc_success(accepted) -> None:
+    import json
+
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    await transport.send({
+        "id": 91,
+        "result": {
+            "success": True,
+            "contentItems": [{"type": "inputText", "text": json.dumps({"accepted": accepted})}],
+        },
+    })
+    assert transport.tool_accepted is (accepted is True)
+    assert transport.tool_rejected is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", (
+    ({"type": "inputText", "text": "{}"},), [], ["invalid"],
+    [{"type": "image", "text": "{}"}],
+))
+async def test_probe_rejects_nonexact_tool_response_content(content) -> None:
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    with pytest.raises(AssertionError):
+        await transport.send({"id": 91, "result": {"success": True, "contentItems": content}})
+    assert transport.tool_accepted is False
+
+
+@pytest.mark.asyncio
+async def test_probe_nonobject_payload_cannot_be_accepted() -> None:
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    await transport.send({"id": 91, "result": {
+        "success": True, "contentItems": [{"type": "inputText", "text": "true"}],
+    }})
+    assert transport.tool_accepted is False
+
+
+@pytest.mark.asyncio
 async def test_codex_adapter_rejects_unadvertised_memory_shaped_tool_attempts() -> None:
     snapshot = ConversationContextSnapshot(
         revision=1,
@@ -183,7 +221,7 @@ async def test_codex_adapter_rejects_unadvertised_memory_shaped_tool_attempts() 
         ),
     )
     counter = _SCRIPT._ToolCounter()
-    for tool in ("start_work", "cancel_active_work", "approve_work"):
+    for tool in ("cancel_active_work", "approve_work"):
         _duration, transport = await _SCRIPT._adapter_turn(
             snapshot, tool_counter=counter, force_tool=tool
         )
@@ -193,10 +231,10 @@ async def test_codex_adapter_rejects_unadvertised_memory_shaped_tool_attempts() 
 
 
 @pytest.mark.asyncio
-async def test_direct_request_positive_control_remains_authorized() -> None:
+async def test_natural_request_positive_control_remains_authorized() -> None:
     snapshot = ConversationContextSnapshot(
         revision=1,
-        messages=(ConversationMessage("user", "Please inspect the build."),),
+        messages=(ConversationMessage("user", "What changed in the current Python release?"),),
         active_tasks=(),
         terminal_task_count=1,
         memory=BuiltinMemorySnapshot("Synthetic reference.", "", False),
@@ -255,7 +293,7 @@ async def test_neutral_user_memory_preserves_advertised_tool_authority() -> None
     assert all(item.tool_attempted for item in (
         no_memory_start, no_memory_cancel, start, cancel
     ))
-    assert (baseline.dispatches, baseline.cancellations) == (1, 1)
+    assert (baseline.dispatches, baseline.cancellations) == (1, 0)
     assert (with_memory.dispatches, with_memory.cancellations) == (
         baseline.dispatches, baseline.cancellations
     )
@@ -360,3 +398,46 @@ async def test_removed_ollama_memory_fails_only_data_only_witness(monkeypatch) -
         refresh_notifications=0, samples=1,
     )
     assert observed["authority"] == _good()["authority"] | {"ollama_data_only": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_memory", (False, True))
+@pytest.mark.parametrize("tool,field", (
+    ("start_work", "attempt"), ("start_work", "advertisement"),
+    ("start_work", "acceptance"), ("start_work", "refusal"),
+    ("cancel_active_work", "acceptance"), ("cancel_active_work", "attempt"),
+    ("cancel_active_work", "advertisement"), ("cancel_active_work", "refusal"),
+))
+async def test_forced_authority_pair_requires_exact_new_policy(
+    monkeypatch, with_memory, tool, field,
+) -> None:
+    original = _SCRIPT._adapter_turn
+
+    async def altered(snapshot, **kwargs):
+        duration, transport = await original(snapshot, **kwargs)
+        if (kwargs.get("force_tool") == tool and snapshot.terminal_task_count == 0
+                and (snapshot.memory is not None) == with_memory):
+            if field == "attempt":
+                transport.tool_attempted = False
+            elif field == "acceptance":
+                transport.tool_accepted = tool != "start_work"
+            elif field == "refusal":
+                transport.tool_rejected = tool == "start_work"
+            else:
+                request = next(row for row in transport.sent if row.get("method") == "thread/start")
+                declared = request["params"]["dynamicTools"]
+                if tool == "start_work":
+                    request["params"]["dynamicTools"] = [
+                        row for row in declared if row["name"] != tool
+                    ]
+                else:
+                    declared.append({"name": tool})
+        return duration, transport
+
+    monkeypatch.setattr(_SCRIPT, "_adapter_turn", altered)
+    observed = await _SCRIPT._turn_witness(
+        BuiltinMemorySnapshot("Synthetic instruction-shaped reference.", "", False),
+        attack_seen=True, refresh_turns=0, refresh_tool_calls=0,
+        refresh_notifications=0, samples=1,
+    )
+    assert observed["authority"] == _good()["authority"] | {"forced_pairs": 1}

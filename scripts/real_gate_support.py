@@ -51,6 +51,8 @@ def _checked_run(
         env=None if env is None else dict(env),
         check=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         text=True,
         timeout=timeout,
     )
@@ -182,8 +184,8 @@ def _unrepresentable_paths(checkout: Path) -> set[str]:
 
 
 def _git(checkout: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ("git", *arguments), cwd=checkout, check=True, capture_output=True, text=True
+    return _checked_run(
+        "hermes_identity", ["git", *arguments], cwd=checkout, timeout=60,
     ).stdout
 
 

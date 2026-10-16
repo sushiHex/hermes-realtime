@@ -7,7 +7,7 @@ from typing import Any
 _CORPUS = Path(__file__).parent / "fixtures" / "natural_work_intent_cases.json"
 _EXPECTED_COUNTS = {
     "positive_start": 20,
-    "positive_cancel": 20,
+    "cancellation_request_negative": 20,
     "negative": 25,
     "adversarial": 20,
     "cancellation_safety_negative": 15,
@@ -16,6 +16,7 @@ _SAFETY_CATEGORIES = {
     "negative",
     "adversarial",
     "cancellation_safety_negative",
+    "cancellation_request_negative",
 }
 
 
@@ -28,7 +29,7 @@ def _load() -> dict[str, Any]:
 def test_natural_work_intent_corpus_is_bounded_and_complete() -> None:
     corpus = _load()
     assert set(corpus) == {"schema_version", "description", "acceptance", "cases"}
-    assert corpus["schema_version"] == 1
+    assert corpus["schema_version"] == 2
     cases = corpus["cases"]
     assert type(cases) is list
     assert len(cases) == 100
@@ -50,8 +51,6 @@ def test_natural_work_intent_corpus_is_bounded_and_complete() -> None:
         assert expected in {None, "start_work", "cancel_active_work"}
         if category == "positive_start":
             assert expected == "start_work"
-        elif category == "positive_cancel":
-            assert expected == "cancel_active_work"
         else:
             assert expected is None
 
@@ -63,10 +62,9 @@ def test_natural_work_safety_denominator_and_thresholds_are_explicit() -> None:
     acceptance = corpus["acceptance"]
     assert acceptance == {
         "positive_start_recall_min": 0.95,
-        "positive_cancel_recall_min": 0.95,
         "positive_misroutes_max": 0,
         "safety_negative_false_positives_max": 0,
     }
     safety_cases = [case for case in corpus["cases"] if case["category"] in _SAFETY_CATEGORIES]
-    assert len(safety_cases) == 60
+    assert len(safety_cases) == 80
     assert all(case["expected_tool"] is None for case in safety_cases)

@@ -738,12 +738,18 @@ def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
         return launch.LaunchResult(1, b'{"pass":false}\n')
 
     monkeypatch.setattr(launch, "run_owned_controller", run)
-    monkeypatch.setattr(evaluator, "_verify_controller_source", lambda: None)
+    monkeypatch.setattr(evaluator, "_verify_source_binding", lambda _head, _tree: None)
     binding, digest = _binding(tmp_path)
     code = evaluator.main(
         [
             "--model",
             "synthetic",
+            "--mode",
+            "diagnostic_override",
+            "--source-head",
+            "a" * 40,
+            "--source-tree",
+            "b" * 40,
             "--launch-binding",
             str(binding),
             "--launch-binding-sha256",
@@ -754,17 +760,24 @@ def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
     )
     assert code == 1 and json.loads(capsys.readouterr().out) == {"pass": False}
     assert seen[0][0].resolve() == Path(evaluator.__file__).resolve()
+    assert seen[0][2]["timeout_seconds"] == 3600
     assert seen[0][1] == (
         "--corpus",
         str(evaluator._DEFAULT_CORPUS),
+        "--provider",
+        "codex",
+        "--mode",
+        "diagnostic_override",
+        "--source-head",
+        "a" * 40,
+        "--source-tree",
+        "b" * 40,
         "--model",
         "synthetic",
-        "--effort",
-        "low",
     )
 
 
-def test_legacy_cli_does_not_claim_owned_launch(
+def test_unbound_cli_refuses_before_claiming_owned_launch(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from scripts import evaluate_natural_work_routing as evaluator
@@ -777,8 +790,43 @@ def test_legacy_cli_does_not_claim_owned_launch(
     monkeypatch.setattr(
         launch, "run_owned_controller", lambda *a, **k: pytest.fail("legacy invoked owner")
     )
-    assert evaluator.main([]) == 0
+    assert evaluator.main([]) == 2
     assert "owned" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
+def test_materialized_evaluator_refuses_owned_cli_without_git_source(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    if (root / ".git").exists():
+        pytest.skip("Git-less materialized candidate required; checkout witness runs separately")
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "archive-cli-receipt.jsonl"
+    wrong = tmp_path / "wrong"
+    (wrong / "hermes_realtime").mkdir(parents=True)
+    (wrong / "hermes_realtime/__init__.py").write_text(
+        "raise RuntimeError('wrong source imported')"
+    )
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join((str(wrong), str(root))))
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.evaluate_natural_work_routing",
+            "--launch-binding", str(binding),
+            "--launch-binding-sha256", digest,
+            "--launch-receipt", str(receipt),
+            "--codex-executable", str(tmp_path / "absent.exe"),
+            "--mode", "diagnostic_override",
+            "--source-head", "a" * 40,
+            "--source-tree", "b" * 40,
+        ],
+        cwd=root, env=environment, stdin=subprocess.DEVNULL,
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=30,
+    )
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["error"]["code"] == "source_binding_failed"
+    assert not receipt.exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows default CLI launch")
@@ -788,12 +836,28 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
     binding, digest = _binding(tmp_path)
     receipt = tmp_path / "cli-receipt.jsonl"
     root = Path(__file__).resolve().parents[1]
+    if not (root / ".git").exists():
+        pytest.skip("Git checkout required; materialized archive refusal runs separately")
+    from tests.test_candidate_source_archive_oracle import GIT
+
+    source_head = subprocess.run(
+        [str(GIT), "rev-parse", "HEAD"], cwd=root, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    source_tree = subprocess.run(
+        [str(GIT), "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
     wrong = tmp_path / "wrong"
     (wrong / "hermes_realtime").mkdir(parents=True)
     (wrong / "hermes_realtime/__init__.py").write_text(
         "raise RuntimeError('wrong source imported')"
     )
-    environment = dict(os.environ, PYTHONPATH=os.pathsep.join((str(wrong), str(root))))
+    environment = dict(
+        os.environ,
+        PYTHONPATH=os.pathsep.join((str(wrong), str(root))),
+        PATH=os.pathsep.join((str(GIT.parent), os.environ.get("PATH", ""))),
+    )
     # A deliberately absent executable refuses before any provider subprocess.
     # This checks the real opted-in CLI and dependency refusal.
     completed = subprocess.run(
@@ -809,6 +873,12 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
             str(receipt),
             "--codex-executable",
             str(tmp_path / "absent.exe"),
+            "--mode",
+            "diagnostic_override",
+            "--source-head",
+            source_head,
+            "--source-tree",
+            source_tree,
         ],
         cwd=root,
         env=environment,

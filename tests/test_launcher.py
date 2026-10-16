@@ -1689,19 +1689,19 @@ async def test_qualification_no_task_composition_does_not_require_public_task_op
     await launcher.close()
 
 
-def test_full_host_rejects_natural_work_tools_for_non_codex_before_loading_providers(
+def test_full_host_allows_ollama_natural_work_composition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def forbidden_provider_loading(**_kwargs: object) -> object:
-        raise AssertionError("unsupported natural work routing must fail before providers load")
+    def provider_loading(**_kwargs: object) -> object:
+        raise RuntimeError("reached provider composition")
 
     monkeypatch.setattr(
         host_launcher_module,
         "_build_streaming_inference",
-        forbidden_provider_loading,
+        provider_loading,
     )
 
-    with pytest.raises(ValueError, match="requires.*codex"):
+    with pytest.raises(RuntimeError, match="reached provider composition"):
         build_local_host_launcher(
             hermes_api_bearer="host-test-bearer-value-32-characters",
             inference_provider="ollama",

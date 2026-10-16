@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "provenance": "Synthetic project schedule, not a personal calendar or account export.",
+  "location": "Los Angeles",
+  "timezone": "America/Los_Angeles",
+  "events": [
+    {"title": "Documentation review", "local_time": "09:00", "recurrence": "daily"},
+    {"title": "Maintenance planning", "local_time": "15:00", "recurrence": "daily"}
+  ]
+}

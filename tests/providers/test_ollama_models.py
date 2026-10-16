@@ -548,7 +548,8 @@ async def test_session_setting_reaches_inference_and_freezes_identity():
 
 
 @pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
-async def test_inflight_configuration_and_request_share_the_admission_lock():
+@pytest.mark.parametrize("natural_tools", [False, True])
+async def test_inflight_configuration_and_request_share_the_admission_lock(natural_tools):
     entered = asyncio.Event()
     release = asyncio.Event()
     backend = Backend()
@@ -562,11 +563,22 @@ async def test_inflight_configuration_and_request_share_the_admission_lock():
 
     def generate(request, timeout):
         bodies.append(json.loads(request.data))
-        return io.BytesIO(b'{"message":{"content":"Ready."},"done":true}\n')
+        text = json.dumps({"kind": "reply", "text": "Ready."}) if natural_tools else "Ready."
+        return io.BytesIO(json.dumps({
+            "message": {"content": text}, "done": True, "done_reason": "stop",
+        }).encode() + b"\n")
 
     inference = OllamaStreamingInference(
         base_url="http://127.0.0.1:11434", model="test:latest", open_request=generate
     )
+    if natural_tools:
+        class Handler:
+            max_objective_chars = 128
+
+            async def start_work(self, **kwargs):
+                raise AssertionError("this synthetic reply has no work call")
+
+        inference.bind_work_tools(Handler())
     configuration = asyncio.create_task(
         inference.configure_context(
             4096, client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
@@ -588,7 +600,9 @@ async def test_inflight_configuration_and_request_share_the_admission_lock():
     release.set()
     await configuration
     assert await stream == ["Ready."]
-    assert bodies[0]["options"] == {"num_ctx": 4096}
+    assert bodies[0]["options"] == {
+        "num_ctx": 4096, **({"num_predict": 1024} if natural_tools else {}),
+    }
     await inference.close()
 
 

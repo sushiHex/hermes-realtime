@@ -449,8 +449,9 @@ when browser storage is unavailable. An unresolved input can retire only its own
 An ordinary media reconnect keeps the admitted typed-input and approval counters;
 only a fresh view or a new session starts those counters again.
 
-With Codex and `--natural-work-tools`, ordinary language may invoke the
-same authoritative start/cancel surface; without that flag, ordinary speech and typed text remain
+With Codex or Ollama and `--natural-work-tools`, ordinary language may request a background
+task through the same authoritative work surface. Model cancellation and approval are unavailable;
+use explicit user commands or the task's Cancel control. Without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,
 provider, or unauthenticated fallback.

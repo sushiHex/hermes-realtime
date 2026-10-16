@@ -60,9 +60,11 @@ def test_local_selection_cannot_replace_qualification_provider_overrides(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shutdown_state", ["active", "preparing"])
+@pytest.mark.parametrize("natural_tools", [False, True])
 async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     shutdown_state: str,
+    natural_tools: bool,
 ) -> None:
     from hermes_realtime.providers.ollama_models import (
         OllamaContextConfiguration,
@@ -125,6 +127,8 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
 
     async def stream(self, request: object, *, turn_id: str):  # type: ignore[no-untyped-def]
         assert self._model == metadata.model
+        if turn_id == "turn_preflight":
+            assert self._work_tool_handler is None
         events.append("inference:" + turn_id)
         if shutdown_state == "preparing" or turn_id != "turn_preflight":
             turn_started.set()
@@ -142,6 +146,12 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
 
     original_speech = host.StreamingSpeechLoop
     original_actions_close = host.ConversationUpdateExecutor.close
+    original_binding = host.OllamaStreamingInference.bind_work_tools
+
+    def binding(self, handler):  # type: ignore[no-untyped-def]
+        events.append("tools_bound")
+        captured["work_handler"] = handler
+        original_binding(self, handler)
 
     async def actions_close(self):  # type: ignore[no-untyped-def]
         events.append("actions_closed")
@@ -171,10 +181,12 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     monkeypatch.setattr(host.OllamaStreamingInference, "observe_context", observe)
     monkeypatch.setattr(host.OllamaStreamingInference, "stream", stream)
     monkeypatch.setattr(host.OllamaStreamingInference, "cancel", adapter_cancel)
+    monkeypatch.setattr(host.OllamaStreamingInference, "bind_work_tools", binding)
     monkeypatch.setattr(host.OllamaStreamingInference, "close", adapter_close)
     launcher = host.build_local_host_launcher(
         hermes_api_bearer="x" * 32, allow_unsandboxed_tasks=True,
         local_model_selection=True,
+        natural_work_tools=natural_tools,
     )
     owner = captured["local_model_selection"]
     assert type(owner) is host.OllamaSessionSelection
@@ -194,7 +206,10 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
     if shutdown_state == "active":
         await owner.prepare(metadata.model, metadata.digest, 4096)
         assert events == ["tasks_started", "metadata", "configured",
-                          "inference:turn_preflight", "tts_ready", "observed"]
+                          "inference:turn_preflight", "tts_ready",
+                          *(["tools_bound"] if natural_tools else []), "observed"]
+        if natural_tools:
+            assert owner._adapter._work_tool_handler is captured["work_handler"]
         assert owner.require_prepared().model == metadata.model
         await owner.prepare(metadata.model, metadata.digest, 4096)
         assert events.count("tasks_started") == events.count("configured") == 1

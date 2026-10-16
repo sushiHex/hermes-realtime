@@ -140,7 +140,7 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     if authority != {
         "data_only": 1, "ollama_data_only": 1, "forced_pairs": 2,
         "baseline_dispatches": 1, "memory_dispatches": 1,
-        "baseline_cancellations": 1, "memory_cancellations": 1,
+        "baseline_cancellations": 0, "memory_cancellations": 0,
         "approval_attempts": 2, "approval_denials": 2,
         "approval_grants": 0, "direct_dispatches": 1,
         "refresh_turns": 0, "refresh_tool_calls": 0,
@@ -239,6 +239,7 @@ class _ProbeTransport:
         self.force_tool = force_tool
         self.tool_attempted = False
         self.tool_rejected = False
+        self.tool_accepted = False
         self.approval_attempted = False
         self.approval_denied = False
         self.approval_granted = False
@@ -326,6 +327,11 @@ class _ProbeTransport:
             result = copied["result"]
             assert type(result) is dict
             self.tool_rejected = result.get("success") is False
+            content = result["contentItems"]
+            assert type(content) is list and len(content) == 1
+            assert type(content[0]) is dict and content[0].get("type") == "inputText"
+            payload = json.loads(content[0]["text"])
+            self.tool_accepted = type(payload) is dict and payload.get("accepted") is True
             await self.incoming.put({"method": "turn/completed", "params": {
                 "threadId": "thread_m4",
                 "turn": {"id": "turn_m4", "items": [], "status": "completed"},
@@ -560,12 +566,15 @@ async def _turn_witness(
 
     forced_pairs = sum(int(
         baseline_forced.tool_attempted and memory_forced.tool_attempted
-        and was_advertised(baseline_forced, name)
-        and was_advertised(memory_forced, name)
-        and baseline_forced.tool_rejected == memory_forced.tool_rejected
-    ) for baseline_forced, memory_forced, name in (
-        (baseline_forced_start, memory_forced_start, "start_work"),
-        (baseline_forced_cancel, memory_forced_cancel, "cancel_active_work"),
+        and was_advertised(baseline_forced, name) is expected_accepted
+        and was_advertised(memory_forced, name) is expected_accepted
+        and baseline_forced.tool_accepted is expected_accepted
+        and memory_forced.tool_accepted is expected_accepted
+        and baseline_forced.tool_rejected is not expected_accepted
+        and memory_forced.tool_rejected is not expected_accepted
+    ) for baseline_forced, memory_forced, name, expected_accepted in (
+        (baseline_forced_start, memory_forced_start, "start_work", True),
+        (baseline_forced_cancel, memory_forced_cancel, "cancel_active_work", False),
     ))
     baseline_us: list[int] = []
     recalled_us: list[int] = []

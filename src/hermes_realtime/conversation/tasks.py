@@ -28,6 +28,7 @@ from hermes_realtime.protocol import (
 )
 
 from .context import ConversationContextStore, PrivateRunDisclosureError, TaskAdmission
+from .task_status import TaskStatusSnapshot
 
 _TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _RUN_ID_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
@@ -249,6 +250,32 @@ class ConversationTaskController:
         self._close_operation: asyncio.Task[None] | None = None
         self._detached_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
+
+    def task_status(self) -> TaskStatusSnapshot:
+        """Observe authority without advancing lifecycle or exposing private identities."""
+        if self._closed or self._terminal_error is not None:
+            return TaskStatusSnapshot(available=False)
+        if any(
+            task_id in self._active_run_ids and operation.done()
+            and (operation.cancelled() or operation.exception() is not None)
+            for task_id, operation in self._cancel_operations.items()
+        ):
+            return TaskStatusSnapshot(available=False)
+        cancelling = sum(
+            task_id in self._active_run_ids and operation.done()
+            and not operation.cancelled() and operation.exception() is None
+            and operation.result().accepted
+            for task_id, operation in self._cancel_operations.items()
+        )
+        cancel_pending = sum(
+            task_id in self._active_run_ids and not operation.done()
+            for task_id, operation in self._cancel_operations.items()
+        )
+        return TaskStatusSnapshot(
+            pending=len(self._pending_dispatches),
+            active=len(self._active_run_ids) - cancelling - cancel_pending,
+            cancel_pending=cancel_pending, cancelling=cancelling,
+        )
 
     def start(self) -> None:
         """Start the single controller-owned terminal consumer."""

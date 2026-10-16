@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "description": "Synthetic, credential-free shadow corpus for Codex natural Hermes work routing.",
   "acceptance": {
     "positive_start_recall_min": 0.95,
-    "positive_cancel_recall_min": 0.95,
     "positive_misroutes_max": 0,
     "safety_negative_false_positives_max": 0
   },
@@ -125,128 +124,128 @@
     {
       "id": "nw-020",
       "category": "positive_start",
-      "utterance": "Start a background task, to analyze the Hermes real time. Read me, file, and summarize its architecture.",
+      "utterance": "Trace the end-to-end latency from transcript finalization to first audio.",
       "expected_tool": "start_work"
     },
     {
       "id": "nw-021",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Stop that.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-022",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Cancel the background task.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-023",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Cancel the active work.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-024",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Please stop the research job.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-025",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Never mind, cancel what you just started.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-026",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Abort the ongoing task.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-027",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Stop the build running in the background.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-028",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Cancel that work now.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-029",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "I changed my mind; stop the active task.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-030",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Terminate the background analysis.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-031",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Please cancel the current Hermes job.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-032",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Stop working on that request.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-033",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Cancel the task you launched a moment ago.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-034",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Quit the ongoing repository scan.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-035",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "End the active background operation.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-036",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Stop it before it makes more changes.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-037",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Cancel the running benchmark.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-038",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Abort that download task.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-039",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Please halt the current long-running work.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-040",
-      "category": "positive_cancel",
+      "category": "cancellation_request_negative",
       "utterance": "Don't continue that task; cancel it.",
-      "expected_tool": "cancel_active_work"
+      "expected_tool": null
     },
     {
       "id": "nw-041",

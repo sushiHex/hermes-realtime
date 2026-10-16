@@ -27,6 +27,26 @@ from scripts.synthetic_fault_oracle import (
     scan_rejected_source,
 )
 
+_STAGE_CODES = tuple(bytes((code,)) for code in b"ICOSFDRPUEZ")
+_stage_count = 0
+
+
+def _stage(code: bytes) -> None:
+    """Best-effort fixed progress bytes; never synchronize or authorize work."""
+    global _stage_count
+    try:
+        if code not in _STAGE_CODES or _stage_count >= 11:
+            return
+        _stage_count += 1
+        fd = getattr(sys, "_storage_phase_fd", None)
+        if fd is not None:
+            os.write(fd, code)
+    except Exception:
+        pass
+
+
+_stage(b"I")
+
 
 class _InjectedConnection(sqlite3.Connection):
     inject = False
@@ -262,14 +282,18 @@ def _run(case: Path, case_id: str, prepared: Callable[[], None]) -> dict[str, An
         "synthetic case ownership differs",
     )
     source = ""
+    _stage(b"O")
     if case_id == "writer_drain_blocked":
+        _stage(b"F")
         before, fault = _blocked_drain(case)
     else:
         clock = driver._Clock()
         owned = _spool(case, clock)
         try:
+            _stage(b"S")
             seed = _seed(owned, case, queue=case_id == "queue_capacity_coupled")
             before = observe_database(case)
+            _stage(b"F")
             if case_id == "queue_capacity_coupled":
                 fault, source = _queue(owned, seed)
             else:
@@ -299,7 +323,9 @@ def _run(case: Path, case_id: str, prepared: Callable[[], None]) -> dict[str, An
                 }
         finally:
             owned.close()
+    _stage(b"D")
     after = observe_database(case)
+    _stage(b"R")
     scan = scan_rejected_source(case, source) if source else {}
     # Exact synthetic deletion fixtures make all six pre-purge file identities
     # observable by the retained parent. They make no journal-recovery claim.
@@ -308,6 +334,7 @@ def _run(case: Path, case_id: str, prepared: Callable[[], None]) -> dict[str, An
             file.write(b"synthetic-sidecar")
     cleanup_before = inventory(case)
     prepared()
+    _stage(b"U")
     purger = _spool(case, driver._Clock(driver.START + timedelta(hours=2)))
     try:
         if case_id == "clock_rollback":
@@ -378,6 +405,7 @@ def main() -> None:
         )
         workspace = Path(config["workspace"]).resolve(strict=True)
         _require(workspace == Path.cwd().resolve(strict=True), "synthetic workspace differs")
+        _stage(b"C")
 
         def send(observation: dict[str, Any]) -> None:
             _write_frame(
@@ -387,6 +415,7 @@ def main() -> None:
             )
 
         def prepared() -> None:
+            _stage(b"P")
             send({"phase": "prepared"})
             _require_ack(_read_frame(request, time.monotonic() + 10), config["nonce"], 0)
 
@@ -405,12 +434,20 @@ def main() -> None:
                 "source_line": traceback.extract_tb(error.__traceback__)[-1].lineno,
             }
             failed = True
+        _stage(b"E")
         send(observation)
         _require_ack(_read_frame(request, time.monotonic() + 10), config["nonce"], 1)
         _require(not failed, "synthetic worker failed")
+        _stage(b"Z")
     finally:
         os.close(request)
         os.close(response)
+        try:
+            fd = getattr(sys, "_storage_phase_fd", None)
+            if fd is not None:
+                os.close(fd)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
