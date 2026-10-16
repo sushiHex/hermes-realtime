@@ -2523,8 +2523,12 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
          "inputSchema": {"type": "object", "additionalProperties": False,
                          "required": [], "properties": {}}},
     ]
+    # The budget measures this repository's request, not the machine: cwd is the host's
+    # temporary directory, whose length differs between developer machines and CI runners.
+    measured = dict(thread_request["params"])  # type: ignore[call-overload]
+    measured["cwd"] = "C:\\TEMP"
     serialized_params = json.dumps(
-        thread_request["params"],
+        measured,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
