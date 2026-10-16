@@ -3135,6 +3135,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             browser_private_key_file=private_key_file,
             bootstrap_ttl_seconds=args.bootstrap_ttl_seconds,
             inference_provider=args.inference_provider,
+            ollama_base_url=args.ollama_base_url,
             ollama_model=args.ollama_model,
             ollama_num_ctx=args.ollama_num_ctx,
             local_model_selection=args.local_model_selection,
@@ -3528,6 +3529,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ollama-model",
         default="hermes-4.3-36b-iq4xs-16k:latest",
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        default="http://127.0.0.1:11434",
+        help="loopback Ollama endpoint, e.g. a separately run source-reviewed runtime",
     )
     parser.add_argument("--ollama-num-ctx", type=int,
         help="explicit per-session Ollama context (2048–262144); metadata/runtime validated")

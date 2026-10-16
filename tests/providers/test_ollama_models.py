@@ -982,6 +982,10 @@ async def test_host_context_cli_and_browser_configuration_are_opt_in():
     parser = _build_argument_parser()
     assert parser.parse_args([]).ollama_num_ctx is None
     assert parser.parse_args(["--ollama-num-ctx", "4096"]).ollama_num_ctx == 4096
+    assert parser.parse_args([]).ollama_base_url == "http://127.0.0.1:11434"
+    assert parser.parse_args(
+        ["--ollama-base-url", "http://127.0.0.1:11437"]
+    ).ollama_base_url == "http://127.0.0.1:11437"
     inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test:latest")
     await inference.configure_context(
         4096, client=OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=Backend())
