@@ -27,6 +27,12 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
     "required detail is neither supplied nor discoverable from an identified resource, ask "
     "one clarifying question instead of starting work."
 )
+# Offered only on turns where starting work and task status are both available.
+WORK_ROUTING_POLICY = (
+    "Unresolved references (our, the pinned, that one) need a clarifying reply first; "
+    "objectives never hold questions. Never claim you lack research or current-information "
+    "access. Asking if work is running or done, or to stop it, is a status request."
+)
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _TASK_ID = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")

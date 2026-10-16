@@ -77,6 +77,24 @@ validated objective; only its accepted acknowledgment produces started speech.
 Disabling natural work preserves explicit commands. This decision does not
 silently change an already running session.
 
+The bound Ollama decision is decoded deterministically (`temperature` 0). With
+default sampling, the same model and input routed differently between runs
+(#226), and a lifecycle decision must not depend on that. Codex exposes no
+equivalent sampling control on this path, so this applies to Ollama only.
+
+When starting work and task status are both offered, both providers receive one
+shared routing rule (`WORK_ROUTING_POLICY`, #280):
+- a reference the conversation does not resolve takes precedence over
+  discoverability, and is asked about in a reply before any start;
+- objectives never carry questions to the user;
+- the model must not claim to lack research or current-information access that
+  background work provides;
+- questions about whether work is running or done, and stop requests, are task
+  status requests.
+
+These rules are instructions, not a validator, and they do not guarantee model
+obedience.
+
 ## Host-authored task status
 
 The owner approved the bounded status path in #270 on 2026-10-15. An admitted
