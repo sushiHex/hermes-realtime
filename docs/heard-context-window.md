@@ -132,8 +132,10 @@ selection the host confirms; it never restores readiness from a cached form snap
 This control does not fit prompts automatically or change the retained foreground window.
 An oversized request still fails explicitly under the no-truncation contract below.
 
-Every Ollama adapter requires the source-qualified Ollama 0.34.4 API contract before its
-first prompt, including default and legacy launcher paths. Successful validation is cached
+Every Ollama adapter requires a source-qualified Ollama runtime, 0.34.4 or 0.40.4, before
+its first prompt, including default and legacy launcher paths. Model metadata that declares
+non-GGUF weights or a runner other than llama.cpp is refused wherever it appears, and the
+installed-model catalog leaves such models out. Successful validation is cached
 for that adapter; later turns do not repeat the metadata read. Recreate the session after
 replacing or upgrading the backend. Unknown runtimes are refused rather than assumed to
 honor no-truncation flags. Explicit context configuration supplies
@@ -179,11 +181,15 @@ overflow limit also applied to the previous separate system messages. Request as
 does not establish which complete sections the model evaluated.
 
 **Explicit overflow refusal.** The adapter sends top-level `truncate: false` and
-`shift: false`. The first disables the message-trimming loop in `chatPrompt`; the second
-prevents residual token-overflow truncation. At the pinned 0.34.4 GGUF source, the
+`shift: false`. `truncate: false` disables the message-trimming loop in `chatPrompt`, and
+Go then skips its own token-level truncation. An oversized prompt therefore reaches
+llama-server, whose own context check refuses it with HTTP 400 whether or not context
+shifting is on. At the pinned 0.34.4 GGUF source, the
 [`Shift` request field](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/api/types.go#L160-L166)
-sets the runner's context-shift configuration, and the residual token-overflow path above
-returns HTTP 400 instead of cutting the rendered policy/reference prompt. The adapter
+sets the runner's context-shift configuration. `shift: false` leaves out `--context-shift`,
+which prevents generation-time token discarding. Neither flag cuts the rendered
+policy/reference prompt. `LLAMA_ARG_CONTEXT_SHIFT` in Ollama's environment could still turn
+shifting on, so it must stay unset. The adapter
 propagates an opening refusal without a reply or automatic retry. This is source-based
 qualification. An isolated paired-options check at realtime commit `43b28a7` on Ollama
 0.34.4 completed a 372-token synthetic prompt and refused a 6,138-token prompt at a
@@ -194,7 +200,13 @@ case's refusal, not every backend or model. The cold positive took 64.716 second
 host-readiness or voice-latency qualification.
 The [source-bound result and limits](https://github.com/sushiHex/hermes-realtime/issues/249#issuecomment-6115056437)
 remain in the owning issue.
-Older versions and native, MLX or cloud model paths remain unqualified. Disabling shifting
+Ollama 0.40.4 was admitted after a
+[source comparison](https://github.com/sushiHex/hermes-realtime/issues/282#issuecomment-6206646192)
+and [paired witnesses](https://github.com/sushiHex/hermes-realtime/issues/282#issuecomment-6226666160).
+Both versions gave the same `prompt_eval_count`, the same HTTP 400 on overflow and the same
+trimmed count in a truncate-omitted control. The error text differs between versions, so
+nothing may key on it. Other versions and native-chat, MLX or cloud model paths remain
+unqualified. Disabling shifting
 can also end generation at the context limit; it does not reserve reply tokens or prove
 model obedience. A change to this flag can
 [`reload an already loaded runner`](https://github.com/ollama/ollama/blob/b2da9e468af2479058ae18c6d908ed29de410684/server/sched.go#L1422-L1427).

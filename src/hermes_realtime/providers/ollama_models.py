@@ -24,6 +24,9 @@ _REQUEST_TIMEOUT_SECONDS = 5.0
 _DISCOVERY_TIMEOUT_SECONDS = 10.0
 _CATALOG_TIMEOUT_SECONDS = 8.0
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+# Source-reviewed on #249 (0.34.4) and #282 (0.40.4), with refusal witnesses on each.
+_REVIEWED_RUNTIMES = frozenset({"0.34.4", "0.40.4"})
+_REVIEWED_RUNNERS = frozenset({"llamacpp", "ggml"})
 
 
 _ReadRequest = Callable[[str, dict[str, object] | None], Awaitable[bytes]]
@@ -65,9 +68,29 @@ def _advertised_capacity(info: object) -> int | None:
 
 
 def _require_local(row: dict[str, object]) -> None:
+    """Refuse metadata that declares a path outside the source review.
+
+    The review covers local GGUF weights on the llama.cpp runner. A declaration of
+    anything else is refused wherever it appears; an absent field declares nothing.
+    0.40.4 can run MLX weights through an unreviewed runner, which no version check excludes.
+    """
+
     for field in ("remote_host", "remote_model"):
         if field in row and row[field] != "":
             raise ValueError("context configuration requires local model weights")
+    if not _reviewed_weights(row):
+        raise ValueError("context safety is source-reviewed only for GGUF model weights")
+    if "runner" in row and (
+        type(row["runner"]) is not str or row["runner"] not in _REVIEWED_RUNNERS
+    ):
+        raise ValueError("context safety is source-reviewed only for the llama.cpp runner")
+
+
+def _reviewed_weights(row: dict[str, object]) -> bool:
+    if "details" not in row:
+        return True
+    details = row["details"]
+    return type(details) is dict and details.get("format", "gguf") == "gguf"
 
 
 def _completion_capability(payload: dict[str, object]) -> bool:
@@ -304,7 +327,9 @@ class OllamaModelClient:
 
                 async def discover(name: str, row: dict[str, object]) -> OllamaModelMetadata | None:
                     nonlocal excluded, refused_capacity
-                    if any(row.get(field, "") != "" for field in ("remote_host", "remote_model")):
+                    if not _reviewed_weights(row) or any(
+                        row.get(field, "") != "" for field in ("remote_host", "remote_model")
+                    ):
                         excluded += 1
                         return None
                     async with semaphore:
@@ -393,5 +418,9 @@ class OllamaModelClient:
     async def require_context_contract(self) -> None:
         # Exact source-reviewed runtime contract, independent of model identity.
         # Unknown/older servers may silently ignore the no-truncation fields.
-        if (await self._request("version")).get("version") != "0.34.4":
-            raise ValueError("context safety requires source-reviewed Ollama runtime 0.34.4")
+        version = (await self._request("version")).get("version")
+        if type(version) is not str or version not in _REVIEWED_RUNTIMES:
+            raise ValueError(
+                "context safety requires a source-reviewed Ollama runtime: "
+                + ", ".join(sorted(_REVIEWED_RUNTIMES))
+            )
