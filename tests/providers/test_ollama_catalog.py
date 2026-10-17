@@ -9,13 +9,15 @@ from hermes_realtime.providers.ollama_models import OllamaModelClient, OllamaMod
 
 pytestmark = pytest.mark.asyncio
 
+GGUF = {"format": "gguf"}
+
 
 class CatalogBackend:
     def __init__(self):
         self.rows = [
-            {"name": "small", "model": "small", "digest": "a" * 64},
-            {"name": "embedding", "digest": "b" * 64},
-            {"name": "cloud", "digest": "c" * 64, "remote_host": "remote"},
+            {"name": "small", "model": "small", "digest": "a" * 64, "details": GGUF},
+            {"name": "embedding", "digest": "b" * 64, "details": GGUF},
+            {"name": "cloud", "digest": "c" * 64, "details": GGUF, "remote_host": "remote"},
         ]
         self.requests = []
         self.active = self.peak = 0
@@ -39,6 +41,7 @@ class CatalogBackend:
                     "capabilities": ["embedding"]
                     if body["model"] == "embedding"
                     else ["completion"],
+                    "details": GGUF,
                     "model_info": {
                         "general.architecture": "generic",
                         "generic.context_length": 4096,
@@ -73,7 +76,9 @@ async def test_catalog_identity_snapshot_requires_equality():
 
 async def test_catalog_bounds_concurrency():
     backend = CatalogBackend()
-    backend.rows = [{"name": str(index), "digest": "a" * 64} for index in range(12)]
+    backend.rows = [
+        {"name": str(index), "digest": "a" * 64, "details": GGUF} for index in range(12)
+    ]
     assert len(await backend.client().installed_models()) == 12
     assert backend.peak == 4
 

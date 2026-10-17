@@ -41,7 +41,7 @@ def _inference(payload: dict[str, object]) -> OllamaStreamingInference:
         return _Response(payload)
 
     return OllamaStreamingInference(
-        metadata_client=supported_ollama_metadata(),
+        metadata_client=supported_ollama_metadata("synthetic-model"),
         base_url="http://127.0.0.1:11434",
         model="synthetic-model",
         open_request=open_request,

@@ -129,10 +129,20 @@ async def test_actual_factory_preflight_surface_and_pending_manual_reviews(
                 {"version": "0.34.4"}
                 if endpoint == "version"
                 else (
-                    {"models": [{"name": "test:model", "model": "test:model", "digest": "a" * 64}]}
+                    {
+                        "models": [
+                            {
+                                "name": "test:model",
+                                "model": "test:model",
+                                "digest": "a" * 64,
+                                "details": {"format": "gguf"},
+                            }
+                        ]
+                    }
                     if endpoint == "tags"
                     else {
                         "capabilities": ["completion"],
+                        "details": {"format": "gguf"},
                         "model_info": {
                             "general.architecture": "gemma4",
                             "gemma4.context_length": 131072,
@@ -604,9 +614,11 @@ def development_factory(monkeypatch: pytest.MonkeyPatch):
         async def metadata(endpoint, body):
             return json.dumps(
                 {"version": "0.34.4"} if endpoint == "version" else (
-                    {"models": [{"name": "test:model", "digest": "a" * 64}]}
+                    {"models": [{"name": "test:model", "digest": "a" * 64,
+                                 "details": {"format": "gguf"}}]}
                     if endpoint == "tags" else {
                         "capabilities": ["completion"],
+                        "details": {"format": "gguf"},
                         "model_info": {"general.architecture": "phi3",
                                        "phi3.context_length": 131072},
                     }

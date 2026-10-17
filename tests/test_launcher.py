@@ -2070,11 +2070,12 @@ async def test_full_host_context_setting_precedes_warmup_and_browser_publication
         if endpoint == "version":
             payload = {"version": "0.34.4"}
         elif endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": {
+            payload = {"capabilities": ["completion"], "details": {"format": "gguf"},
+                "model_info": {
                 "general.architecture": "synthetic", "synthetic.context_length": 4096}}
         else:
             payload = {"models": [{"name": "synthetic:latest", "model": "synthetic:latest",
-                "digest": digest, "context_length": 4096}]}
+                "digest": digest, "context_length": 4096, "details": {"format": "gguf"}}]}
         return json.dumps(payload).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=metadata)
@@ -2102,7 +2103,7 @@ async def test_full_host_context_setting_precedes_warmup_and_browser_publication
     try:
         await launcher.start()
         assert bodies[0]["options"] == {"num_ctx": 4096}
-        assert metadata_calls == ["version", "tags", "show", "tags", "tags", "ps"]
+        assert metadata_calls == ["version", "tags", "tags", "show", "tags", "tags", "ps"]
         assert configuration.public_data() == {
             "authentication": "local", "contextWindowTokens": None, "effort": None,
             "model": "synthetic:latest", "provider": "ollama", "reportsTokenUsage": False,

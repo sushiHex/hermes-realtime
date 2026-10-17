@@ -22,10 +22,12 @@ from hermes_realtime.providers.ollama_models import (
     OllamaModelClient,
     OllamaModelMetadata,
 )
+from tests.support.ollama_metadata import supported_ollama_tags
 
 pytestmark = pytest.mark.asyncio
 
 DIGEST = "a" * 64
+GGUF = {"format": "gguf"}
 
 
 class Backend:
@@ -44,6 +46,7 @@ class Backend:
                     "synthetic.context_length": self.maximum,
                 },
                 "capabilities": ["completion"],
+                "details": GGUF,
             }
         elif path == "version":
             payload = {"version": "0.34.4"}
@@ -55,6 +58,7 @@ class Backend:
                         "name": "test:latest",
                         "model": "test:latest",
                         "digest": digest,
+                        "details": GGUF,
                         "context_length": 4096,
                     }
                 ]
@@ -212,7 +216,14 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
         return web.Response(status=status, body=payload, headers={"Location": "/redirect"})
 
     app = web.Application()
+    tags_payload = supported_ollama_tags("test:latest")
+
+    async def tags(request):
+        requests.append(request.path)
+        return web.Response(body=tags_payload)
+
     app.router.add_get("/api/version", response)
+    app.router.add_get("/api/tags", tags)
     app.router.add_get("/redirect", response)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -223,18 +234,20 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
         await web.SockSite(runner, listener).start()
         client = OllamaModelClient(base_url=f"http://127.0.0.1:{port}")
         if status == 200:
-            await client.require_context_contract()
+            await client.require_context_contract("test:latest")
+            # A supported version proceeds to the identity read; a refused one reads nothing more.
+            assert requests == ["/api/version", "/api/tags"]
         else:
             with pytest.raises(aiohttp.ClientResponseError) as refusal:
-                await client.require_context_contract()
+                await client.require_context_contract("test:latest")
             assert refusal.value.status == status
-        assert requests == ["/api/version"]
+            assert requests == ["/api/version"]
         reports = [
             json.loads(line.removeprefix("[ollama-metadata] "))
             for line in capsys.readouterr().out.splitlines()
             if line.startswith("[ollama-metadata] ")
         ]
-        assert reports == [
+        expected = [
             {
                 "version": 1,
                 "kind": "version",
@@ -242,6 +255,11 @@ async def test_metadata_transport_requires_http_200_before_reading(status, capsy
                 "bytes": len(payload) if status == 200 else 0,
             }
         ]
+        if status == 200:
+            expected.append(
+                {"version": 1, "kind": "tags", "category": "accepted", "bytes": len(tags_payload)}
+            )
+        assert reports == expected
     finally:
         await runner.cleanup()
         listener.close()
@@ -293,15 +311,21 @@ async def test_effective_context_requires_exact_digest():
 
 
 async def test_runtime_contract_rejects_unknown_versions():
-    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=Backend())
-    await client.require_context_contract()
+    backend = Backend()
+    client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=backend)
+    await client.require_context_contract("test:latest")
+    assert [request[0] for request in backend.requests] == ["version", "tags"]
+
+    refused = []
 
     async def old_runtime(endpoint, body):
+        refused.append(endpoint)
         return b'{"version":"0.1.0"}'
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=old_runtime)
     with pytest.raises(ValueError, match="runtime"):
-        await client.require_context_contract()
+        await client.require_context_contract("test:latest")
+    assert refused == ["version"]
 
 
 async def test_small_model_requires_explicit_smaller_context():
@@ -364,7 +388,7 @@ async def test_discovery_has_one_deadline_across_metadata_requests(monkeypatch):
         [],
         [{"name": "test:latest", "digest": DIGEST}] * 2,
         [{"name": "test:latest", "model": "different", "digest": DIGEST}],
-        [{"name": "test:latest", "digest": "invalid"}],
+        [{"name": "test:latest", "digest": "invalid", "details": GGUF}],
         [{"name": "test:latest", "digest": DIGEST}]
         + [{"name": f"other_{index}", "digest": DIGEST} for index in range(256)],
         [False],
@@ -423,8 +447,8 @@ async def test_multiple_effective_allocations_are_refused():
     ids=["stale-after", "stale-before", "conflicting-name", "conflicting-model", "unrelated"],
 )
 async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, expected, boundary):
-    selected = {"name": "test:latest", "digest": DIGEST, "context_length": 4096}
-    rows = [selected, {**extra, "context_length": 16384}]
+    selected = {"name": "test:latest", "digest": DIGEST, "details": GGUF, "context_length": 4096}
+    rows = [selected, {**extra, "details": GGUF, "context_length": 16384}]
     if reverse:
         rows.reverse()
 
@@ -471,7 +495,8 @@ async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, ex
 async def test_selected_model_requires_one_consistent_row(row, expected, boundary):
     async def read(endpoint, body):
         assert (endpoint, body) == (boundary, None)
-        return json.dumps({"models": [{"digest": DIGEST, "context_length": 4096, **row}]}).encode()
+        selected = {"digest": DIGEST, "details": GGUF, "context_length": 4096, **row}
+        return json.dumps({"models": [selected]}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     if boundary == "tags":
@@ -498,9 +523,8 @@ async def test_selected_model_requires_one_consistent_row(row, expected, boundar
 )
 async def test_effective_context_refuses_invalid_capacity(capacity):
     async def read(endpoint, body):
-        return json.dumps(
-            {"models": [{"name": "test:latest", "digest": DIGEST, "context_length": capacity}]}
-        ).encode()
+        row = {"name": "test:latest", "digest": DIGEST, "details": GGUF, "context_length": capacity}
+        return json.dumps({"models": [row]}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     with pytest.raises(ValueError, match="capacity"):
