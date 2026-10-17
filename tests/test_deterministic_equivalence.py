@@ -58,7 +58,7 @@ def _arm(name: str, *, shutdown: bool = False) -> dict[str, Any]:
         "records": records,
         "consent_path": "activated"
         if name in {"consented", "blocked", "faulted", "shutdown_consented"}
-        else None,
+        else "not_requested",
         "terminals": (
             [{"disposition": "cancelled", "reason": "host_shutdown", "contextCommitted": False}]
             if name == "shutdown_consented"
@@ -136,7 +136,7 @@ def test_expected_close_inserts_consent_settlement_only_for_a_settled_consent(na
         *activated[position:],
     ]
     assert all(item["stage"] != "consent_settlement" for item in activated)
-    for invalid in (None, "settled", True, ["activated"]):
+    for invalid in ("not_requested", None, "settled", True, ["activated"]):
         with pytest.raises(ValueError):
             expected_close(name, consent=invalid)
 
@@ -148,14 +148,24 @@ def test_expected_close_inserts_consent_settlement_only_for_a_settled_consent(na
 def test_expected_close_refuses_a_consent_path_for_an_unconsented_arm(name: str) -> None:
     expected_close = _module()._expected_close
 
-    assert all(item["stage"] != "consent_settlement" for item in expected_close(name, consent=None))
-    for invalid in ("activated", "settled_after_timeout"):
+    unconsented = expected_close(name, consent="not_requested")
+    assert all(item["stage"] != "consent_settlement" for item in unconsented)
+    # None is refused too: the archived worker pipe cannot carry a null.
+    for invalid in ("activated", "settled_after_timeout", None, ["not_requested"]):
         with pytest.raises(ValueError):
             expected_close(name, consent=invalid)
 
 
 def test_validator_accepts_only_the_complete_ordered_comparison_with_negative_control() -> None:
     assert _module()._validate_trace_set(_observations()) is None
+
+
+def test_every_accepted_arm_crosses_the_archived_worker_pipe() -> None:
+    from scripts import qualify_evidence_slice_zero as core
+
+    # The archived worker frames each row as canonical JSON, which forbids null.
+    for row in _observations():
+        core.canonical_json_bytes(row)
 
 
 @pytest.mark.parametrize(

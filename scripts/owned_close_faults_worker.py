@@ -129,7 +129,7 @@ async def _run_arm(name: str, workspace: Path, livekit_url: str, key: bytes) -> 
         raw: tuple[object, ...],
         metadata: tuple[object, ...],
         complete: bool,
-        consent_path: str | None,
+        consent_path: str,
     ) -> None:
         observed.append(
             _observation(name, raw, metadata, key, complete, consent_path=consent_path)

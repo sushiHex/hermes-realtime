@@ -181,9 +181,12 @@ def _observations() -> dict:
 
 
 def test_rollover_validator_accepts_a_durable_transition_and_equal_source() -> None:
+    from scripts import qualify_evidence_slice_zero as core
     from scripts.capacity_rollover import _validate_observations
 
     _validate_observations(_observations())
+    # The archived worker frames the row as canonical JSON, which forbids null.
+    core.canonical_json_bytes(_observations())
 
 
 @pytest.mark.parametrize("stored_source", ["typed", "microphone"])

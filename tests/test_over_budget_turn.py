@@ -34,8 +34,8 @@ def _observations() -> dict:
         complete=True,
         records=records,
         terminals=[],
-        close=_expected_close("disabled", consent=None),
-        consent_path=None,
+        close=_expected_close("disabled", consent="not_requested"),
+        consent_path="not_requested",
         user=users,
         completed_inputs=[1, 2],
     )
@@ -131,6 +131,13 @@ def test_overflow_accepts_equal_conversation_and_excluded_durable_prefix() -> No
     from scripts.over_budget_turn import _validate_observations
 
     _validate_observations(_observations())
+
+
+def test_accepted_overflow_crosses_the_archived_worker_pipe() -> None:
+    from scripts import qualify_evidence_slice_zero as core
+
+    # The archived worker frames the row as canonical JSON, which forbids null.
+    core.canonical_json_bytes(_observations())
 
 
 @pytest.mark.parametrize(

@@ -537,7 +537,7 @@ async def _run_non_mutation_arm(
     typed_stimulus: str = "paired typed stimulus",
     synthesizer_factory: Callable[[], Any] = _Synthesizer,
     close_driver: Callable[[Any, Any], Awaitable[None]] | None = None,
-    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1 | None], None]
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1], None]
     | None = None,
 ) -> tuple[object, ...]:
     """Run one real host/browser/LiveKit flow with fixed typed and PCM stimuli."""
@@ -582,7 +582,7 @@ async def _run_non_mutation_arm(
     )
     room = rtc.Room()
     running: object | None = None
-    consent_path: ConsentPathV1 | None = None
+    consent_path: ConsentPathV1 = "not_requested"
     try:
         running = await composition.start_host(registration)
         origin, token, source = await _connect_and_activate(
@@ -774,9 +774,9 @@ async def _run_active_response_host_shutdown_arm(
     capture: bool,
     consent: bool,
     livekit_url: str = "ws://127.0.0.1:7880",
-    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1 | None], None]
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1], None]
     | None = None,
-) -> tuple[tuple[object, ...], tuple[object, ...], Path, ConsentPathV1 | None]:
+) -> tuple[tuple[object, ...], tuple[object, ...], Path, ConsentPathV1]:
     suffix, port = uuid.uuid4().hex[:10], _available_port()
     database = tmp_path / suffix / "capture-v1.sqlite3"
     database.parent.mkdir()
@@ -809,7 +809,7 @@ async def _run_active_response_host_shutdown_arm(
     room = rtc.Room()
     running: object | None = None
     closed = False
-    consent_path: ConsentPathV1 | None = None
+    consent_path: ConsentPathV1 = "not_requested"
     try:
         running = await composition.start_host(registration)
         origin, token, _source = await _connect_and_activate(
@@ -867,7 +867,7 @@ async def test_full_host_active_response_host_shutdown_is_capture_equivalent(
     disabled_raw, disabled_metadata, disabled_database, disabled_path = disabled
     unconsented_raw, unconsented_metadata, unconsented_database, unconsented_path = unconsented
     consented_raw, consented_metadata, consented_database, consented_path = consented
-    assert disabled_path is None and unconsented_path is None
+    assert disabled_path == unconsented_path == "not_requested"
     assert not disabled_database.exists()
     assert not unconsented_database.exists()
     assert disabled_raw == unconsented_raw == consented_raw
@@ -1014,7 +1014,8 @@ class _BlockRevokeAndDrainTransport:
 # tests do since #196.  The bound itself stays covered deterministically.
 _CONSENT_SETTLEMENT_HANG_BOUND_SECONDS = 30.0
 # What the driver observed; the packaged validators derive the expected close from it.
-ConsentPathV1 = Literal["activated", "settled_after_timeout"]
+# Never null: archived workers frame rows as canonical JSON, which forbids null.
+ConsentPathV1 = Literal["not_requested", "activated", "settled_after_timeout"]
 _CONSENT_ACTIVATED = {"captureState": "active", "result": "consent_activated", "sequence": 1}
 _CONSENT_CONTROL_TIMEOUT = {"captureState": "idle", "error": "control_timeout", "sequence": 1}
 _CONSENT_ERRORS = frozenset({error.value for error in ControlError} | {"request_rejected"})
@@ -1466,3 +1467,61 @@ async def test_full_host_consented_arm_close_matches_a_consent_settled_after_con
     close, consent_path = observed[0]
     assert consent_path == "settled_after_timeout"
     assert close == _expected_close(name, consent="settled_after_timeout")
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "deterministic_equivalence",
+        "revoke_race",
+        "capacity_rollover",
+        "over_budget_turn",
+        "owned_close_faults",
+    ],
+)
+async def test_full_host_scenario_worker_rows_cross_the_archived_pipe_and_validate(
+    tmp_path: Path, scenario: str
+) -> None:
+    """Each packaged worker entry point emits frameable rows its own validator accepts.
+
+    The archived worker frames every row as bounded canonical JSON, which forbids
+    null, before the parent validates it.  Equivalence, over-budget and owned-close
+    cover consenting and non-consenting arms; revoke and rollover always consent.
+    """
+
+    from scripts import qualify_evidence_slice_zero as core
+    from scripts.equivalence_process import _MAX_FRAME
+
+    url = "ws://127.0.0.1:7880"
+
+    def framed(row: dict[str, Any]) -> dict[str, Any]:
+        assert len(core.canonical_json_bytes(row)) <= _MAX_FRAME
+        return row
+
+    if scenario == "deterministic_equivalence":
+        from scripts.deterministic_equivalence import _validate_trace_set
+        from scripts.equivalence_worker import _run_arms
+
+        rows: list[dict[str, Any]] = []
+        await _run_arms(tmp_path, url, lambda _name, row: rows.append(framed(row)))
+        _validate_trace_set(rows)
+    elif scenario == "revoke_race":
+        from scripts.revoke_race import _validate_observations as validate_revoke
+        from scripts.revoke_race_worker import observe_revoke_race
+
+        validate_revoke(framed(await observe_revoke_race(tmp_path, url)))
+    elif scenario == "capacity_rollover":
+        from scripts.capacity_rollover import _validate_observations as validate_rollover
+        from scripts.capacity_rollover_worker import observe_capacity_rollover
+
+        validate_rollover(framed(await observe_capacity_rollover(tmp_path, url)))
+    elif scenario == "over_budget_turn":
+        from scripts.over_budget_turn import _validate_observations as validate_overflow
+        from scripts.over_budget_turn_worker import observe_over_budget_turn
+
+        validate_overflow(framed(await observe_over_budget_turn(tmp_path, url)))
+    else:
+        from scripts.owned_close_faults import _validate_observations as validate_owned
+        from scripts.owned_close_faults_worker import observe_owned_close_faults
+
+        validate_owned(framed(await observe_owned_close_faults(tmp_path, url)))

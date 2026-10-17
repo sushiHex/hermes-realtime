@@ -45,7 +45,7 @@ def _observation(
     key: bytes,
     complete: bool,
     *,
-    consent_path: str | None,
+    consent_path: str,
 ) -> dict[str, Any]:
     from hermes_realtime.production_observation import (
         CloseStageObservationV1,
@@ -129,7 +129,7 @@ async def _run_arms(workspace: Path, livekit_url: str, emit: Any) -> None:
             raw: tuple[object, ...],
             metadata: tuple[object, ...],
             complete: bool,
-            consent_path: str | None,
+            consent_path: str,
             *,
             arm_name: str = name,
             output: list[dict[str, Any]] = observed,

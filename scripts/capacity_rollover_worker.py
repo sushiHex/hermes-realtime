@@ -358,7 +358,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         writer_transport_factory=writer_factory,
     )
     room, running = rtc.Room(), None
-    consent_path: str | None = None
+    consent_path = "not_requested"
     inputs = []
     try:
         running = await composition.start_host(registration)

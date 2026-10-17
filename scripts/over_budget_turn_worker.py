@@ -294,7 +294,7 @@ async def _arm(workspace: Path, url: str, capture: bool, key: bytes) -> dict[str
     completions: list[int] = []
     snapshots: list[dict[str, Any]] = []
     consent: dict[str, Any] = {}
-    consent_path: str | None = None
+    consent_path = "not_requested"
     try:
         running = await composition.start_host(registration)
         origin, token, _ = await ingress._connect_and_activate(

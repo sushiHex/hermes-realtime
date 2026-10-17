@@ -29,7 +29,7 @@ def _observations():
             {"kind": kind, "value": f"{index + 1:064x}"}
             for index, kind in enumerate(_CONVERSATION_KINDS[:-1])
         ] + [{"kind": "host_return", "value": outcome}]
-        consent_path = "activated" if consented else None
+        consent_path = "activated" if consented else "not_requested"
         close = _expected_close(
             "consented" if consented else "disabled", consent=consent_path
         )
@@ -83,6 +83,16 @@ def test_registration_is_canonical_and_supplied_rows_cannot_mint_receipts() -> N
         validate_owned_close_faults_v1(_observations())
     with pytest.raises(ValueError, match="unregistered"):
         validate_owned_close_faults_v1(object.__new__(ObservedOwnedCloseFaultsV1))
+
+
+def test_accepted_close_matrix_crosses_the_archived_worker_pipe() -> None:
+    from scripts import qualify_evidence_slice_zero as core
+    from scripts.owned_close_faults import _validate_observations
+
+    row = _observations()
+    _validate_observations(row)
+    # The archived worker frames the row as canonical JSON, which forbids null.
+    core.canonical_json_bytes(row)
 
 
 @pytest.mark.parametrize(

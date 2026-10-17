@@ -144,7 +144,7 @@ async def observe_revoke_race(workspace: Path, livekit_url: str) -> dict[str, An
         writer_transport_factory=writer_factory,
     )
     room, running = rtc.Room(), None
-    consent_path: str | None = None
+    consent_path = "not_requested"
     snapshots: list[dict[str, Any]] = []
 
     def capacity_view() -> tuple[_QualificationCapacityObservationV1, ...]:

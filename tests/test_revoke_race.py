@@ -358,9 +358,12 @@ def _observations() -> dict:
 
 
 def test_revoke_validator_derives_durability_admission_closure_and_verified_purge() -> None:
+    from scripts import qualify_evidence_slice_zero as core
     from scripts.revoke_race import _validate_observations
 
     _validate_observations(_observations())
+    # The archived worker frames the row as canonical JSON, which forbids null.
+    core.canonical_json_bytes(_observations())
 
 
 _ACTIVATED_CLOSE = (
@@ -416,6 +419,7 @@ def _close(stages: tuple[str, ...], settlement: str = "succeeded") -> list[dict[
         ),
         pytest.param(_MISSING, _close(_ACTIVATED_CLOSE), False, id="path-missing"),
         pytest.param(None, _close(_ACTIVATED_CLOSE), False, id="path-none"),
+        pytest.param("not_requested", _close(_ACTIVATED_CLOSE), False, id="path-not-requested"),
         pytest.param("settled", _close(_SETTLED_CLOSE), False, id="path-unknown"),
         pytest.param(["activated"], _close(_ACTIVATED_CLOSE), False, id="path-not-a-string"),
     ],

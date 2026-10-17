@@ -58,12 +58,14 @@ _ORDINARY_CLOSE = (
 )
 
 
-ConsentPathV1 = Literal["activated", "settled_after_timeout"]
+# A closed string enum, never null: the archived worker frames rows as canonical
+# JSON, which forbids null.  "not_requested" marks an arm whose driver never consented.
+ConsentPathV1 = Literal["not_requested", "activated", "settled_after_timeout"]
 _CONSENT_PATHS = ("activated", "settled_after_timeout")
 _CONSENTED_CLOSES = frozenset({"consented", "blocked", "faulted", "shutdown_consented"})
 
 
-def _expected_close(name: str, *, consent: ConsentPathV1 | None) -> list[dict[str, str]]:
+def _expected_close(name: str, *, consent: ConsentPathV1) -> list[dict[str, str]]:
     """Derive one arm's complete ordered close from the consent path its driver observed.
 
     A consent answered 503 control_timeout leaves the host's retained settlement
@@ -77,7 +79,10 @@ def _expected_close(name: str, *, consent: ConsentPathV1 | None) -> list[dict[st
             "consented close has no observed consent path",
         )
     else:
-        _require(consent is None, "unconsented close cannot carry a consent path")
+        _require(
+            type(consent) is str and consent == "not_requested",
+            "unconsented close must report that consent was not requested",
+        )
     settlement = ("consent_settlement",) if consent == "settled_after_timeout" else ()
     evidence: tuple[str, ...]
     if name == "faulted":
