@@ -294,6 +294,7 @@ async def _arm(workspace: Path, url: str, capture: bool, key: bytes) -> dict[str
     completions: list[int] = []
     snapshots: list[dict[str, Any]] = []
     consent: dict[str, Any] = {}
+    consent_path = "not_requested"
     try:
         running = await composition.start_host(registration)
         origin, token, _ = await ingress._connect_and_activate(
@@ -301,7 +302,9 @@ async def _arm(workspace: Path, url: str, capture: bool, key: bytes) -> dict[str
         )
         if capture:
             live_binding = await _live_browser_binding(running._host, key)
-            accepted = await _accept_consent(port=port, origin=origin, token=token, key=key)
+            accepted, consent_path = await _accept_consent(
+                port=port, origin=origin, token=token, key=key
+            )
             live_bindings = [live_binding, await _live_browser_binding(running._host, key)]
             _require(
                 live_bindings[0] == live_bindings[1], "overflow live binding changed during consent"
@@ -382,6 +385,7 @@ async def _arm(workspace: Path, url: str, capture: bool, key: bytes) -> dict[str
         metadata.records(),
         key,
         composition.trace.status().trace_complete and metadata.status().trace_complete,
+        consent_path=consent_path,
     )
     generated = [
         item.generated_text

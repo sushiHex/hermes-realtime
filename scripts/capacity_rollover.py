@@ -147,6 +147,7 @@ def _validate_observations(row: Any) -> None:
             "trace_complete",
             "host_return",
             "close",
+            "consent_path",
         },
     )
     _require(row["arm"] == "capacity_rollover", "rollover scenario differs")
@@ -434,7 +435,7 @@ def _validate_observations(row: Any) -> None:
         row["all_capacity_released"] is True
         and row["trace_complete"] is True
         and row["host_return"] == ["returned"]
-        and row["close"] == _expected_close("consented"),
+        and row["close"] == _expected_close("consented", consent=row["consent_path"]),
         "rollover observation or owned cleanup is incomplete",
     )
 

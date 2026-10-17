@@ -12,7 +12,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from weakref import WeakKeyDictionary
 
 from scripts import qualify_evidence_slice_zero as core
@@ -58,7 +58,32 @@ _ORDINARY_CLOSE = (
 )
 
 
-def _expected_close(name: str) -> list[dict[str, str]]:
+# A closed string enum, never null: the archived worker frames rows as canonical
+# JSON, which forbids null.  "not_requested" marks an arm whose driver never consented.
+ConsentPathV1 = Literal["not_requested", "activated", "settled_after_timeout"]
+_CONSENT_PATHS = ("activated", "settled_after_timeout")
+_CONSENTED_CLOSES = frozenset({"consented", "blocked", "faulted", "shutdown_consented"})
+
+
+def _expected_close(name: str, *, consent: ConsentPathV1) -> list[dict[str, str]]:
+    """Derive one arm's complete ordered close from the consent path its driver observed.
+
+    A consent answered 503 control_timeout leaves the host's retained settlement
+    task, which close observes first among the evidence stages.  ``consent`` is
+    what the driver saw (200, or 503 then settlement), never the close itself.
+    """
+
+    if name in _CONSENTED_CLOSES:
+        _require(
+            type(consent) is str and consent in _CONSENT_PATHS,
+            "consented close has no observed consent path",
+        )
+    else:
+        _require(
+            type(consent) is str and consent == "not_requested",
+            "unconsented close must report that consent was not requested",
+        )
+    settlement = ("consent_settlement",) if consent == "settled_after_timeout" else ()
     evidence: tuple[str, ...]
     if name == "faulted":
         evidence = ("retention_cancellation", "writer_drain", "evidence_runtime")
@@ -77,7 +102,7 @@ def _expected_close(name: str) -> list[dict[str, str]]:
     failed = {"writer_drain", "evidence_runtime", "launcher"} if name == "faulted" else set()
     return [
         {"stage": stage, "result": "failed" if stage in failed else "succeeded"}
-        for stage in (*_ORDINARY_CLOSE, *evidence, "launcher")
+        for stage in (*_ORDINARY_CLOSE, *settlement, *evidence, "launcher")
     ]
 
 
@@ -94,7 +119,7 @@ def _validate_trace_set(rows: Any) -> None:
     """Independently derive equality; plain observations never mint run authority."""
     _require(type(rows) is list and len(rows) == len(ARMS_V1), "incomplete comparison matrix")
     for name, row in zip(ARMS_V1, rows, strict=True):
-        _keys(row, {"arm", "complete", "records", "close", "terminals"})
+        _keys(row, {"arm", "complete", "records", "close", "terminals", "consent_path"})
         _require(row["arm"] == name and row["complete"] is True, "wrong or incomplete arm")
         terminals = row["terminals"]
         expected_terminals = (
@@ -143,7 +168,7 @@ def _validate_trace_set(rows: Any) -> None:
             "conversation lifecycle observations are missing, duplicated, or reordered",
         )
         _require(
-            row["close"] == _expected_close(name),
+            row["close"] == _expected_close(name, consent=row["consent_path"]),
             "close lifecycle differs from the complete ordered production contract",
         )
     baseline = rows[0]["records"]

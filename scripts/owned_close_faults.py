@@ -32,7 +32,10 @@ def _validate_observations(row: Any) -> None:
     cases = row["cases"]
     _require(type(cases) is list and len(cases) == len(ARMS_V1), "close matrix is incomplete")
     for name, case in zip(ARMS_V1, cases, strict=True):
-        _keys(case, {"arm", "complete", "records", "terminals", "close", "owner_events"})
+        _keys(
+            case,
+            {"arm", "complete", "records", "terminals", "close", "consent_path", "owner_events"},
+        )
         _require(case["arm"] == name and case["complete"] is True, "close arm is incomplete")
         consented = name.endswith("consented")
         retry, cancelled = name.startswith("retry"), name.startswith("cancelled")
@@ -59,7 +62,9 @@ def _validate_observations(row: Any) -> None:
                 and terminal["contextCommitted"] is True,
                 "close changed a completed conversation terminal",
             )
-        close = _expected_close("consented" if consented else "disabled")
+        close = _expected_close(
+            "consented" if consented else "disabled", consent=case["consent_path"]
+        )
         if retry:
             close.insert(-1, {"stage": "launcher", "result": "failed"})
             events = [

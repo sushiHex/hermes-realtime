@@ -39,7 +39,13 @@ def _redirect_diagnostics() -> None:
 
 
 def _observation(
-    name: str, records: tuple[object, ...], metadata: tuple[object, ...], key: bytes, complete: bool
+    name: str,
+    records: tuple[object, ...],
+    metadata: tuple[object, ...],
+    key: bytes,
+    complete: bool,
+    *,
+    consent_path: str,
 ) -> dict[str, Any]:
     from hermes_realtime.production_observation import (
         CloseStageObservationV1,
@@ -89,6 +95,8 @@ def _observation(
             for item in metadata
             if type(item) is CloseStageObservationV1
         ],
+        # Only what the consent driver observed; never derived from the close.
+        "consent_path": consent_path,
     }
 
 
@@ -121,11 +129,14 @@ async def _run_arms(workspace: Path, livekit_url: str, emit: Any) -> None:
             raw: tuple[object, ...],
             metadata: tuple[object, ...],
             complete: bool,
+            consent_path: str,
             *,
             arm_name: str = name,
             output: list[dict[str, Any]] = observed,
         ) -> None:
-            output.append(_observation(arm_name, raw, metadata, key, complete))
+            output.append(
+                _observation(arm_name, raw, metadata, key, complete, consent_path=consent_path)
+            )
 
         if name.startswith("shutdown_"):
             await _run_active_response_host_shutdown_arm(
