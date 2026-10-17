@@ -235,9 +235,9 @@ class _ConsentHost:
         return status, dict(payload)
 
 
-async def _consent(host: _ConsentHost, monkeypatch: pytest.MonkeyPatch) -> None:
+async def _consent(host: _ConsentHost, monkeypatch: pytest.MonkeyPatch) -> object:
     monkeypatch.setattr(full_host_ingress, "_request", host.request)
-    await full_host_ingress._consent_capture(
+    return await full_host_ingress._consent_capture(
         port=1, origin="http://127.0.0.1:1", token="test-token"
     )
 
@@ -259,8 +259,9 @@ async def test_consent_capture_settles_a_control_timeout_to_the_same_active_capt
 ) -> None:
     host = _ConsentHost(answers, settled_state="active")
 
-    await _consent(host, monkeypatch)
+    sent = await _consent(host, monkeypatch)
 
+    assert sent == host.consent_bodies[0]
     assert host.answers == []
     assert len(host.consent_bodies) == len(answers)
     assert all(body == host.consent_bodies[0] for body in host.consent_bodies)
@@ -304,6 +305,12 @@ async def test_consent_capture_settles_a_control_timeout_to_the_same_active_capt
             None,
             "consent answered HTTP 200 with error absent",
             id="wrong-sequence",
+        ),
+        pytest.param(
+            [(200, {"captureState": "active", "result": "consent_activated", "sequence": True})],
+            None,
+            "consent answered HTTP 200 with error absent",
+            id="boolean-sequence",
         ),
         pytest.param(
             [_CONSENT_TIMED_OUT],

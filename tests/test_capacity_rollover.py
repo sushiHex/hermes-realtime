@@ -259,7 +259,9 @@ def test_coordinated_store_consent_changes_cannot_replace_the_accepted_request()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("acknowledgment", ["accepted", "pending", "bool_sequence"])
+@pytest.mark.parametrize(
+    "acknowledgment", ["accepted", "settled_after_timeout", "pending", "bool_sequence"]
+)
 async def test_consent_source_commitment_requires_the_exact_dispatched_request_ack(
     monkeypatch: pytest.MonkeyPatch,
     acknowledgment: str,
@@ -275,15 +277,17 @@ async def test_consent_source_commitment_requires_the_exact_dispatched_request_a
 
     async def event(**kwargs):
         assert kwargs["kind"] in {"voice_ready", "capture_status"}
-        return {
-            "data": {"generation": 42}
-            if kwargs["kind"] == "voice_ready"
-            else {"disclosureDigest": "b" * 64}
-        }
+        if kwargs["kind"] == "voice_ready":
+            return {"data": {"generation": 42}, "sequence": 2}
+        if kwargs.get("after", 0) == 0:
+            return {"data": {"disclosureDigest": "b" * 64}, "sequence": 3}
+        return {"data": {"captureState": "active"}, "sequence": 4}
 
     async def request(**kwargs):
         assert kwargs["path"] == "/api/v1/evidence-consent"
         requests.append(json.loads(kwargs["body"]))
+        if acknowledgment == "settled_after_timeout" and len(requests) == 1:
+            return 503, {"captureState": "idle", "error": "control_timeout", "sequence": 1}
         return (202 if acknowledgment == "pending" else 200), {
             "captureState": "active",
             "result": "consent_activated",
@@ -295,12 +299,17 @@ async def test_consent_source_commitment_requires_the_exact_dispatched_request_a
     arguments = dict(
         port=1, origin="https://example.invalid", token="synthetic", key=b"synthetic key"
     )
-    if acknowledgment != "accepted":
-        with pytest.raises(ValueError, match="not accepted"):
+    if acknowledgment in {"pending", "bool_sequence"}:
+        # The shared settling consent helper names only the status and error enum.
+        status = 202 if acknowledgment == "pending" else 200
+        with pytest.raises(AssertionError) as failure:
             await _accept_consent(**arguments)
+        assert str(failure.value) == f"consent answered HTTP {status} with error absent"
         return
     commitment = await _accept_consent(**arguments)
-    assert len(requests) == 1
+    # A settled control timeout replays the identical request once.
+    assert len(requests) == (2 if acknowledgment == "settled_after_timeout" else 1)
+    assert all(replayed == requests[0] for replayed in requests)
     sent = requests[0]
     assert sent == {
         "accepted": True,

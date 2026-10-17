@@ -410,26 +410,7 @@ async def test_full_host_consented_typed_and_livekit_pcm_ingress_are_durable(
         capture = await _wait_event(port=port, origin=origin, token=token, kind="capture_status")
         capture_data = capture["data"]
         assert type(capture_data) is dict and capture_data["captureState"] == "idle"
-        consent = {
-            "sequence": 1,
-            "accepted": True,
-            "consentVersion": "realtime-evidence-consent-v1",
-            "disclosureDigest": capture_data["disclosureDigest"],
-            "retentionHours": 24,
-            "sources": {"microphone": True, "typed": True},
-        }
-        status, consent_result = await _request(
-            port=port,
-            origin=origin,
-            path="/api/v1/evidence-consent",
-            bearer=token,
-            body=json.dumps(consent, separators=(",", ":")).encode(),
-        )
-        assert status == 200 and consent_result == {
-            "captureState": "active",
-            "result": "consent_activated",
-            "sequence": 1,
-        }
+        await _consent_capture(port=port, origin=origin, token=token)
         status, _ = await _request(
             port=port,
             origin=origin,
@@ -605,33 +586,7 @@ async def _run_non_mutation_arm(
             port=port, launch_url=running.url, room=room
         )
         if consent:
-            capture_status = await _wait_event(
-                port=port, origin=origin, token=token, kind="capture_status"
-            )
-            capture_data = capture_status["data"]
-            assert type(capture_data) is dict
-            status, result = await _request(
-                port=port,
-                origin=origin,
-                path="/api/v1/evidence-consent",
-                bearer=token,
-                body=json.dumps(
-                    {
-                        "sequence": 1,
-                        "accepted": True,
-                        "consentVersion": "realtime-evidence-consent-v1",
-                        "disclosureDigest": capture_data["disclosureDigest"],
-                        "retentionHours": 24,
-                        "sources": {"microphone": True, "typed": True},
-                    },
-                    separators=(",", ":"),
-                ).encode(),
-            )
-            assert status == 200 and result == {
-                "captureState": "active",
-                "result": "consent_activated",
-                "sequence": 1,
-            }
+            await _consent_capture(port=port, origin=origin, token=token)
         status, result = await _request(
             port=port,
             origin=origin,
@@ -853,33 +808,7 @@ async def _run_active_response_host_shutdown_arm(
             port=port, launch_url=running.url, room=room
         )
         if consent:
-            capture_status = await _wait_event(
-                port=port, origin=origin, token=token, kind="capture_status"
-            )
-            capture_data = capture_status["data"]
-            assert type(capture_data) is dict
-            status, result = await _request(
-                port=port,
-                origin=origin,
-                path="/api/v1/evidence-consent",
-                bearer=token,
-                body=json.dumps(
-                    {
-                        "sequence": 1,
-                        "accepted": True,
-                        "consentVersion": "realtime-evidence-consent-v1",
-                        "disclosureDigest": capture_data["disclosureDigest"],
-                        "retentionHours": 24,
-                        "sources": {"microphone": True, "typed": True},
-                    },
-                    separators=(",", ":"),
-                ).encode(),
-            )
-            assert status == 200 and result == {
-                "captureState": "active",
-                "result": "consent_activated",
-                "sequence": 1,
-            }
+            await _consent_capture(port=port, origin=origin, token=token)
         status, result = await _request(
             port=port,
             origin=origin,
@@ -1076,6 +1005,18 @@ _CONSENT_ERRORS = frozenset({error.value for error in ControlError} | {"request_
 _CAPTURE_STATES = frozenset(state.value for state in CaptureState)
 
 
+def _is_consent_answer(
+    status: int, result: dict[str, object], expected_status: int, expected: dict[str, object]
+) -> bool:
+    """Match one exact consent answer; a boolean sequence must not pass as one."""
+
+    return (
+        status == expected_status
+        and type(result.get("sequence")) is int
+        and result == expected
+    )
+
+
 def _bounded_enum(value: object, allowed: frozenset[str]) -> str:
     """Name a public enum value for a diagnostic without echoing any other content."""
 
@@ -1084,9 +1025,10 @@ def _bounded_enum(value: object, allowed: frozenset[str]) -> str:
     return value if type(value) is str and value in allowed else "unrecognized"
 
 
-async def _consent_capture(*, port: int, origin: str, token: str) -> None:
+async def _consent_capture(*, port: int, origin: str, token: str) -> bytes:
     """Activate capture at sequence one, settling a lawful control timeout.
 
+    Returns the exact request bytes dispatched, so a caller can commit to them.
     Each failure raises from its own line: the archived qualification workers
     report only the failure kind and source line, never the message.
     """
@@ -1108,9 +1050,9 @@ async def _consent_capture(*, port: int, origin: str, token: str) -> None:
     ).encode()
     path = "/api/v1/evidence-consent"
     status, result = await _request(port=port, origin=origin, path=path, bearer=token, body=body)
-    if status == 200 and result == _CONSENT_ACTIVATED:
-        return
-    if status != 503 or result != _CONSENT_CONTROL_TIMEOUT:
+    if _is_consent_answer(status, result, 200, _CONSENT_ACTIVATED):
+        return body
+    if not _is_consent_answer(status, result, 503, _CONSENT_CONTROL_TIMEOUT):
         error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
         raise AssertionError(f"consent answered HTTP {status} with error {error}")
     bound = _CONSENT_SETTLEMENT_HANG_BOUND_SECONDS
@@ -1138,9 +1080,9 @@ async def _consent_capture(*, port: int, origin: str, token: str) -> None:
             status, result = await _request(
                 port=port, origin=origin, path=path, bearer=token, body=body
             )
-            if status == 200 and result == _CONSENT_ACTIVATED:
-                return
-            if status != 503 or result != _CONSENT_CONTROL_TIMEOUT:
+            if _is_consent_answer(status, result, 200, _CONSENT_ACTIVATED):
+                return body
+            if not _is_consent_answer(status, result, 503, _CONSENT_CONTROL_TIMEOUT):
                 error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
                 raise AssertionError(f"consent retry answered HTTP {status} with error {error}")
             await asyncio.sleep(0.05)
