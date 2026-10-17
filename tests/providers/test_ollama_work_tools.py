@@ -275,9 +275,10 @@ async def test_constrained_start_preserves_selected_context_delivery_and_complet
         if endpoint == "tags":
             assert body is None
             return json.dumps({"models": [{"name": "test", "model": "test",
-                                            "digest": "a" * 64}]}).encode()
+                                            "digest": "a" * 64,
+                                            "details": {"format": "gguf"}}]}).encode()
         assert (endpoint, body) == ("show", {"model": "test"})
-        return b'{"capabilities":["completion"],"model_info":{}}'
+        return b'{"capabilities":["completion"],"details":{"format":"gguf"},"model_info":{}}'
 
     inference, handler, sent, _ = adapter([
         {**start_frame(), "prompt_eval_count": 321,
