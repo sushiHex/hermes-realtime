@@ -27,7 +27,12 @@ from hermes_realtime.evidence.admission import (
     MAX_QUEUE_PHYSICAL_ITEMS,
     MAX_QUEUE_RECORDS,
 )
-from hermes_realtime.evidence.models import DrainDisposition, TerminalReason
+from hermes_realtime.evidence.models import (
+    CaptureState,
+    ControlError,
+    DrainDisposition,
+    TerminalReason,
+)
 from hermes_realtime.host_launcher import build_local_host_launcher
 from hermes_realtime.production_observation import (
     CloseResultV1,
@@ -1059,32 +1064,86 @@ class _BlockRevokeAndDrainTransport:
         return cast(Any, self._delegate).drain_and_close(command)
 
 
+# Bounds a hung SQLite daemon, not latency.  Past its two-second control bound
+# the host answers consent 503 control_timeout and its retained activation
+# settles later.  Hosted Windows runners have stalled one first store create for
+# seconds (#73), so the drivers wait for that settlement, as the real-daemon
+# tests do since #196.  The bound itself stays covered deterministically.
+_CONSENT_SETTLEMENT_HANG_BOUND_SECONDS = 30.0
+_CONSENT_ACTIVATED = {"captureState": "active", "result": "consent_activated", "sequence": 1}
+_CONSENT_CONTROL_TIMEOUT = {"captureState": "idle", "error": "control_timeout", "sequence": 1}
+_CONSENT_ERRORS = frozenset({error.value for error in ControlError} | {"request_rejected"})
+_CAPTURE_STATES = frozenset(state.value for state in CaptureState)
+
+
+def _bounded_enum(value: object, allowed: frozenset[str]) -> str:
+    """Name a public enum value for a diagnostic without echoing any other content."""
+
+    if value is None:
+        return "absent"
+    return value if type(value) is str and value in allowed else "unrecognized"
+
+
 async def _consent_capture(*, port: int, origin: str, token: str) -> None:
+    """Activate capture at sequence one, settling a lawful control timeout.
+
+    Each failure raises from its own line: the archived qualification workers
+    report only the failure kind and source line, never the message.
+    """
+
     capture = await _wait_event(port=port, origin=origin, token=token, kind="capture_status")
     data = capture["data"]
-    assert type(data) is dict
-    status, result = await _request(
-        port=port,
-        origin=origin,
-        path="/api/v1/evidence-consent",
-        bearer=token,
-        body=json.dumps(
-            {
-                "sequence": 1,
-                "accepted": True,
-                "consentVersion": "realtime-evidence-consent-v1",
-                "disclosureDigest": data["disclosureDigest"],
-                "retentionHours": 24,
-                "sources": {"microphone": True, "typed": True},
-            },
-            separators=(",", ":"),
-        ).encode(),
-    )
-    assert status == 200 and result == {
-        "captureState": "active",
-        "result": "consent_activated",
-        "sequence": 1,
-    }
+    cursor = capture["sequence"]
+    assert type(data) is dict and type(cursor) is int
+    body = json.dumps(
+        {
+            "sequence": 1,
+            "accepted": True,
+            "consentVersion": "realtime-evidence-consent-v1",
+            "disclosureDigest": data["disclosureDigest"],
+            "retentionHours": 24,
+            "sources": {"microphone": True, "typed": True},
+        },
+        separators=(",", ":"),
+    ).encode()
+    path = "/api/v1/evidence-consent"
+    status, result = await _request(port=port, origin=origin, path=path, bearer=token, body=body)
+    if status == 200 and result == _CONSENT_ACTIVATED:
+        return
+    if status != 503 or result != _CONSENT_CONTROL_TIMEOUT:
+        error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
+        raise AssertionError(f"consent answered HTTP {status} with error {error}")
+    bound = _CONSENT_SETTLEMENT_HANG_BOUND_SECONDS
+    async with asyncio.timeout(bound):
+        while True:
+            settled = await _wait_event(
+                port=port,
+                origin=origin,
+                token=token,
+                kind="capture_status",
+                after=cursor,
+                timeout=bound,
+            )
+            settled_data, cursor = settled["data"], settled["sequence"]
+            assert type(settled_data) is dict and type(cursor) is int
+            state = settled_data["captureState"]
+            if state == "active":
+                break
+            if state != "idle":
+                state = _bounded_enum(state, _CAPTURE_STATES)
+                raise AssertionError(f"consent settlement published capture state {state}")
+        # The published status precedes the session recording the settled result,
+        # so replay the identical request until it returns that recorded result.
+        while True:
+            status, result = await _request(
+                port=port, origin=origin, path=path, bearer=token, body=body
+            )
+            if status == 200 and result == _CONSENT_ACTIVATED:
+                return
+            if status != 503 or result != _CONSENT_CONTROL_TIMEOUT:
+                error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
+                raise AssertionError(f"consent retry answered HTTP {status} with error {error}")
+            await asyncio.sleep(0.05)
 
 
 def _capacity_vector(
