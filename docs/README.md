@@ -21,6 +21,7 @@ boundaries. Use these pages to choose work and understand the implementation:
 | Hermes dispatch, approvals, and cancellation | [Hermes bridge and API integration](hermes-bridge.md) |
 | Dependency upgrades, security assessment, and serial landing | [Dependency maintenance](dependency-maintenance.md) |
 | Conversation continuity: realtime converses, Hermes keeps the turns | [Accepted continuity design and qualification evidence](adr/0003-hermes-owned-conversation-continuity.md) |
+| Proposed explicit resource context across a background-work handoff | [Proposed bounded resource handoff](adr/0005-bounded-resource-handoff.md) |
 | Foreground lookup, consent, and latency | [Source-backed routing](source-backed-latency.md) |
 | Candidate-bound source conversation comparison | [Deterministic equivalence](deterministic-equivalence.md) |
 | Wheel binding, revocation, admission closure, and purge | [Packaged revocation race](revoke-race.md) |
