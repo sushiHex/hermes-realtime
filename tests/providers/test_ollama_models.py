@@ -27,6 +27,7 @@ from tests.support.ollama_metadata import supported_ollama_tags
 pytestmark = pytest.mark.asyncio
 
 DIGEST = "a" * 64
+GGUF = {"format": "gguf"}
 
 
 class Backend:
@@ -45,6 +46,7 @@ class Backend:
                     "synthetic.context_length": self.maximum,
                 },
                 "capabilities": ["completion"],
+                "details": GGUF,
             }
         elif path == "version":
             payload = {"version": "0.34.4"}
@@ -56,6 +58,7 @@ class Backend:
                         "name": "test:latest",
                         "model": "test:latest",
                         "digest": digest,
+                        "details": GGUF,
                         "context_length": 4096,
                     }
                 ]
@@ -385,7 +388,7 @@ async def test_discovery_has_one_deadline_across_metadata_requests(monkeypatch):
         [],
         [{"name": "test:latest", "digest": DIGEST}] * 2,
         [{"name": "test:latest", "model": "different", "digest": DIGEST}],
-        [{"name": "test:latest", "digest": "invalid"}],
+        [{"name": "test:latest", "digest": "invalid", "details": GGUF}],
         [{"name": "test:latest", "digest": DIGEST}]
         + [{"name": f"other_{index}", "digest": DIGEST} for index in range(256)],
         [False],
@@ -444,8 +447,8 @@ async def test_multiple_effective_allocations_are_refused():
     ids=["stale-after", "stale-before", "conflicting-name", "conflicting-model", "unrelated"],
 )
 async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, expected, boundary):
-    selected = {"name": "test:latest", "digest": DIGEST, "context_length": 4096}
-    rows = [selected, {**extra, "context_length": 16384}]
+    selected = {"name": "test:latest", "digest": DIGEST, "details": GGUF, "context_length": 4096}
+    rows = [selected, {**extra, "details": GGUF, "context_length": 16384}]
     if reverse:
         rows.reverse()
 
@@ -492,7 +495,8 @@ async def test_selected_model_counts_all_rows_referring_to_it(extra, reverse, ex
 async def test_selected_model_requires_one_consistent_row(row, expected, boundary):
     async def read(endpoint, body):
         assert (endpoint, body) == (boundary, None)
-        return json.dumps({"models": [{"digest": DIGEST, "context_length": 4096, **row}]}).encode()
+        selected = {"digest": DIGEST, "details": GGUF, "context_length": 4096, **row}
+        return json.dumps({"models": [selected]}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     if boundary == "tags":
@@ -519,9 +523,8 @@ async def test_selected_model_requires_one_consistent_row(row, expected, boundar
 )
 async def test_effective_context_refuses_invalid_capacity(capacity):
     async def read(endpoint, body):
-        return json.dumps(
-            {"models": [{"name": "test:latest", "digest": DIGEST, "context_length": capacity}]}
-        ).encode()
+        row = {"name": "test:latest", "digest": DIGEST, "details": GGUF, "context_length": capacity}
+        return json.dumps({"models": [row]}).encode()
 
     client = OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
     with pytest.raises(ValueError, match="capacity"):

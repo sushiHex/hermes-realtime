@@ -63,11 +63,20 @@ async def test_context_contract_refuses_every_other_runtime_before_reading_model
     assert requests == ["version"]
 
 
-@pytest.mark.parametrize(
-    "details",
-    [{"format": "safetensors"}, {"format": None}, {"format": ["gguf"]}, ["gguf"], "gguf"],
-)
-async def test_context_contract_refuses_unreviewed_weights(details: object) -> None:
+_UNREVIEWED_DETAILS = [
+    None,  # no details at all
+    {},
+    {"format": ""},
+    {"format": "safetensors"},
+    {"format": "GGUF"},
+    {"format": ["gguf"]},
+    ["gguf"],
+    "gguf",
+]
+
+
+@pytest.mark.parametrize("details", _UNREVIEWED_DETAILS)
+async def test_context_contract_refuses_unreviewed_or_undeclared_weights(details: object) -> None:
     with pytest.raises(ValueError, match="GGUF"):
         await _contract_client("0.40.4", details).require_context_contract(MODEL)
 
@@ -103,8 +112,10 @@ async def test_default_path_refuses_unreviewed_weights_before_any_prompt() -> No
 
 
 def _metadata(*, tags: dict[str, object], show: dict[str, object]) -> OllamaModelClient:
+    gguf = {"details": {"format": "gguf"}}
+
     async def read(endpoint: str, body: dict[str, object] | None) -> bytes:
-        row: dict[str, object] = {"name": MODEL, "model": MODEL, "digest": DIGEST}
+        row: dict[str, object] = {"name": MODEL, "model": MODEL, "digest": DIGEST, **gguf}
         if endpoint == "show":
             return json.dumps(
                 {
@@ -113,6 +124,7 @@ def _metadata(*, tags: dict[str, object], show: dict[str, object]) -> OllamaMode
                         "synthetic.context_length": 131072,
                     },
                     "capabilities": ["completion"],
+                    **gguf,
                     **show,
                 }
             ).encode()
@@ -122,9 +134,15 @@ def _metadata(*, tags: dict[str, object], show: dict[str, object]) -> OllamaMode
     return OllamaModelClient(base_url="http://127.0.0.1:11434", read_request=read)
 
 
+async def test_discovery_admits_declared_gguf_weights() -> None:
+    model = await _metadata(tags={}, show={}).discover(MODEL)
+    assert (model.model, model.digest) == (MODEL, DIGEST)
+
+
 @pytest.mark.parametrize("endpoint", ["tags", "show"])
-async def test_discovery_refuses_unreviewed_weights(endpoint: str) -> None:
-    fields = {"details": {"format": "safetensors"}}
+@pytest.mark.parametrize("details", [{"format": "safetensors"}, {}])
+async def test_discovery_refuses_unreviewed_weights(endpoint: str, details: object) -> None:
+    fields = {"details": details}
     client = _metadata(
         tags=fields if endpoint == "tags" else {},
         show=fields if endpoint == "show" else {},

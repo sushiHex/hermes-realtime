@@ -84,7 +84,11 @@ async def test_runtime_proof_is_cached_across_turns_and_explicit_configuration(c
         if endpoint == "version":
             payload = {"version": "0.34.4"}
         elif endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": {}}
+            payload = {
+                "capabilities": ["completion"],
+                "details": {"format": "gguf"},
+                "model_info": {},
+            }
         else:
             payload = {"models": [supported_ollama_row("test:latest")]}
         return json.dumps(payload).encode()
@@ -244,7 +248,7 @@ async def test_successful_runtime_proof_cannot_be_reused_with_another_client():
             return b'{"version":"0.34.4"}'
         if endpoint == "show":
             raise ValueError("synthetic discovery refusal")
-        return json.dumps({"models": [{"name": "test", "digest": "a" * 64}]}).encode()
+        return json.dumps({"models": [supported_ollama_row("test")]}).encode()
 
     first = OllamaModelClient(base_url=ORIGIN, read_request=read)
     second = OllamaModelClient(base_url=ORIGIN, read_request=read)

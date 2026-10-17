@@ -15,9 +15,11 @@ from hermes_realtime.providers.ollama_models import (
     OllamaModelClient,
     OllamaModelMetadata,
 )
+from tests.support.ollama_metadata import supported_ollama_row
 
 pytestmark = pytest.mark.asyncio
-MODEL = OllamaModelMetadata("synthetic:latest", "a" * 64, 1_048_576)
+GGUF = {"format": "gguf"}
+MODEL =OllamaModelMetadata("synthetic:latest", "a" * 64, 1_048_576)
 CONFIGURATION = OllamaContextConfiguration(MODEL, 4096)
 OBSERVATION = OllamaContextObservation(CONFIGURATION, 4096)
 
@@ -76,12 +78,12 @@ async def test_malformed_model_rows_make_optional_allocation_unknown():
         if endpoint == "version":
             payload = {"version": "0.34.4"}
         elif endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": {}}
+            payload = {"capabilities": ["completion"], "details": GGUF, "model_info": {}}
         elif endpoint == "ps":
             payload = {"models": [False]}
         else:
             payload = {
-                "models": [{"name": MODEL.model, "model": MODEL.model, "digest": MODEL.digest}]
+                "models": [supported_ollama_row(MODEL.model)]
             }
         return json.dumps(payload).encode()
 
@@ -105,10 +107,10 @@ async def test_malformed_model_rows_make_optional_allocation_unknown():
 async def test_capacity_stays_unknown_without_bounded_architecture_metadata(info, capsys):
     async def read(endpoint, body):
         if endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": info}
+            payload = {"capabilities": ["completion"], "details": GGUF, "model_info": info}
         else:
             payload = {
-                "models": [{"name": MODEL.model, "model": MODEL.model, "digest": MODEL.digest}]
+                "models": [supported_ollama_row(MODEL.model)]
             }
         return json.dumps(payload).encode()
 
@@ -134,10 +136,10 @@ async def test_closed_adapter_refuses_context_configuration_before_metadata_io()
         if endpoint == "version":
             payload = {"version": "0.34.4"}
         elif endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": {}}
+            payload = {"capabilities": ["completion"], "details": GGUF, "model_info": {}}
         else:
             payload = {
-                "models": [{"name": MODEL.model, "model": MODEL.model, "digest": MODEL.digest}]
+                "models": [supported_ollama_row(MODEL.model)]
             }
         return json.dumps(payload).encode()
 
@@ -300,7 +302,7 @@ async def test_metadata_http_failure_never_becomes_an_installed_identity(monkeyp
             if self.sent:
                 return b""
             self.sent = True
-            return json.dumps({"models": [{"name": MODEL.model, "digest": MODEL.digest}]}).encode()
+            return json.dumps({"models": [supported_ollama_row(MODEL.model)]}).encode()
 
     class Client:
         def __init__(self, **kwargs):

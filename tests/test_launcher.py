@@ -2070,7 +2070,8 @@ async def test_full_host_context_setting_precedes_warmup_and_browser_publication
         if endpoint == "version":
             payload = {"version": "0.34.4"}
         elif endpoint == "show":
-            payload = {"capabilities": ["completion"], "model_info": {
+            payload = {"capabilities": ["completion"], "details": {"format": "gguf"},
+                "model_info": {
                 "general.architecture": "synthetic", "synthetic.context_length": 4096}}
         else:
             payload = {"models": [{"name": "synthetic:latest", "model": "synthetic:latest",

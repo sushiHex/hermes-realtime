@@ -71,8 +71,8 @@ def _require_local(row: dict[str, object]) -> None:
 
     The review covers local GGUF weights, which both reviewed runtimes run through
     llama.cpp. 0.40.4 sends safetensors weights to its unreviewed MLX runner, and no
-    version check excludes that. Real tags, show and ps rows always carry
-    ``details.format``.
+    version check excludes that. A row must declare ``details.format`` as ``gguf``;
+    both reviewed runtimes always send it, so a missing declaration is refused.
     """
 
     for field in ("remote_host", "remote_model"):
@@ -83,10 +83,9 @@ def _require_local(row: dict[str, object]) -> None:
 
 
 def _reviewed_weights(row: dict[str, object]) -> bool:
-    if "details" not in row:
-        return True
-    details = row["details"]
-    return type(details) is dict and details.get("format", "gguf") == "gguf"
+    # Fail closed: only an explicit GGUF declaration proves the reviewed path.
+    details = row.get("details")
+    return type(details) is dict and details.get("format") == "gguf"
 
 
 def _completion_capability(payload: dict[str, object]) -> bool:

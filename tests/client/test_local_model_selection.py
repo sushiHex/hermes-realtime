@@ -127,13 +127,23 @@ def selection_owner():
         elif endpoint == "show":
             payload = {
                 "capabilities": ["completion"],
+                "details": {"format": "gguf"},
                 "model_info": {
                     "general.architecture": "generic",
                     "generic.context_length": 4096,
                 },
             }
         else:
-            payload = {"models": [{"name": "small", "digest": "a" * 64, "context_length": 4096}]}
+            payload = {
+                "models": [
+                    {
+                        "name": "small",
+                        "digest": "a" * 64,
+                        "details": {"format": "gguf"},
+                        "context_length": 4096,
+                    }
+                ]
+            }
         return json.dumps(payload).encode()
 
     async def ready(adapter):
