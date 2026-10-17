@@ -144,6 +144,7 @@ async def observe_revoke_race(workspace: Path, livekit_url: str) -> dict[str, An
         writer_transport_factory=writer_factory,
     )
     room, running = rtc.Room(), None
+    consent_path: str | None = None
     snapshots: list[dict[str, Any]] = []
 
     def capacity_view() -> tuple[_QualificationCapacityObservationV1, ...]:
@@ -162,7 +163,7 @@ async def observe_revoke_race(workspace: Path, livekit_url: str) -> dict[str, An
             launch_url=running.url,
             room=room,
         )
-        await _consent_capture(port=port, origin=origin, token=token)
+        _, consent_path = await _consent_capture(port=port, origin=origin, token=token)
         status, result = await _request(
             port=port,
             origin=origin,
@@ -273,4 +274,6 @@ async def observe_revoke_race(workspace: Path, livekit_url: str) -> dict[str, An
             for item in observations.records()
             if type(item) is CloseStageObservationV1
         ],
+        # Only what the consent driver observed; never derived from the close.
+        "consent_path": consent_path,
     }

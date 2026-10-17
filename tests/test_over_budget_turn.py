@@ -34,12 +34,17 @@ def _observations() -> dict:
         complete=True,
         records=records,
         terminals=[],
-        close=_expected_close("disabled"),
+        close=_expected_close("disabled", consent=None),
+        consent_path=None,
         user=users,
         completed_inputs=[1, 2],
     )
     captured = copy.deepcopy(baseline)
-    captured.update(arm="consented", close=_expected_close("consented"))
+    captured.update(
+        arm="consented",
+        close=_expected_close("consented", consent="activated"),
+        consent_path="activated",
+    )
     sample = rollover()
     session = sample["snapshots"][0]["sessions"][0]
     session.update(

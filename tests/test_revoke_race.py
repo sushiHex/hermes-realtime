@@ -352,7 +352,8 @@ def _observations() -> dict:
         all_capacity_released=True,
         trace_complete=True,
         host_return="returned",
-        close=_expected_close("consented"),
+        close=_expected_close("consented", consent="activated"),
+        consent_path="activated",
     )
 
 
@@ -360,6 +361,81 @@ def test_revoke_validator_derives_durability_admission_closure_and_verified_purg
     from scripts.revoke_race import _validate_observations
 
     _validate_observations(_observations())
+
+
+_ACTIVATED_CLOSE = (
+    "browser_client",
+    "foreground_close",
+    "speech_loop",
+    "update_executor",
+    "binding_cleanup",
+    "livekit_worker",
+    "retention_cancellation",
+    "writer_drain",
+    "writer_stop",
+    "transport_close",
+    "evidence_runtime",
+    "launcher",
+)
+_SETTLED_CLOSE = (*_ACTIVATED_CLOSE[:6], "consent_settlement", *_ACTIVATED_CLOSE[6:])
+_MISSING = object()
+
+
+def _close(stages: tuple[str, ...], settlement: str = "succeeded") -> list[dict[str, str]]:
+    return [
+        {"stage": stage, "result": settlement if stage == "consent_settlement" else "succeeded"}
+        for stage in stages
+    ]
+
+
+@pytest.mark.parametrize(
+    ("consent_path", "close", "accepted"),
+    [
+        pytest.param("activated", _close(_ACTIVATED_CLOSE), True, id="activated"),
+        pytest.param(
+            "settled_after_timeout", _close(_SETTLED_CLOSE), True, id="settled-with-stage"
+        ),
+        pytest.param("activated", _close(_SETTLED_CLOSE), False, id="stage-without-settlement"),
+        pytest.param(
+            "settled_after_timeout",
+            _close(_ACTIVATED_CLOSE),
+            False,
+            id="settlement-without-stage",
+        ),
+        pytest.param(
+            "settled_after_timeout",
+            _close(_SETTLED_CLOSE, "failed"),
+            False,
+            id="settlement-failed",
+        ),
+        pytest.param(
+            "settled_after_timeout",
+            _close(_SETTLED_CLOSE, "cancelled"),
+            False,
+            id="settlement-cancelled",
+        ),
+        pytest.param(_MISSING, _close(_ACTIVATED_CLOSE), False, id="path-missing"),
+        pytest.param(None, _close(_ACTIVATED_CLOSE), False, id="path-none"),
+        pytest.param("settled", _close(_SETTLED_CLOSE), False, id="path-unknown"),
+        pytest.param(["activated"], _close(_ACTIVATED_CLOSE), False, id="path-not-a-string"),
+    ],
+)
+def test_revoke_close_admits_consent_settlement_only_when_consent_settled_after_timeout(
+    consent_path: object, close: list[dict[str, str]], accepted: bool
+) -> None:
+    from scripts.revoke_race import _validate_observations
+
+    row = _observations()
+    row["close"] = close
+    if consent_path is _MISSING:
+        row.pop("consent_path", None)
+    else:
+        row["consent_path"] = consent_path
+    if accepted:
+        _validate_observations(row)
+    else:
+        with pytest.raises(ValueError):
+            _validate_observations(row)
 
 
 @pytest.mark.parametrize(

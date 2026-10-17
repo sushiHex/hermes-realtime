@@ -175,7 +175,8 @@ def _observations() -> dict:
         ordinary_rejections=0,
         trace_complete=True,
         host_return=["returned"],
-        close=_expected_close("consented"),
+        close=_expected_close("consented", consent="activated"),
+        consent_path="activated",
     )
 
 
@@ -306,7 +307,10 @@ async def test_consent_source_commitment_requires_the_exact_dispatched_request_a
             await _accept_consent(**arguments)
         assert str(failure.value) == f"consent answered HTTP {status} with error absent"
         return
-    commitment = await _accept_consent(**arguments)
+    commitment, consent_path = await _accept_consent(**arguments)
+    assert consent_path == (
+        "settled_after_timeout" if acknowledgment == "settled_after_timeout" else "activated"
+    )
     # A settled control timeout replays the identical request once.
     assert len(requests) == (2 if acknowledgment == "settled_after_timeout" else 1)
     assert all(replayed == requests[0] for replayed in requests)

@@ -61,6 +61,7 @@ def _validate_observations(row: Any) -> None:
             "trace_complete",
             "host_return",
             "close",
+            "consent_path",
         },
         "revocation observation fields are not closed",
     )
@@ -149,7 +150,10 @@ def _validate_observations(row: Any) -> None:
         and row["host_return"] == "returned",
         "revocation host cleanup is incomplete",
     )
-    _require(row["close"] == _expected_close("consented"), "revocation close stages differ")
+    _require(
+        row["close"] == _expected_close("consented", consent=row["consent_path"]),
+        "revocation close stages differ",
+    )
 
 
 class ObservedRevokeRaceV1:

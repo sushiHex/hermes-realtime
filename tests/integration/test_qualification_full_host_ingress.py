@@ -10,12 +10,13 @@ import socket
 import sqlite3
 import struct
 import sys
+import time
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import closing
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from livekit import rtc
@@ -536,7 +537,8 @@ async def _run_non_mutation_arm(
     typed_stimulus: str = "paired typed stimulus",
     synthesizer_factory: Callable[[], Any] = _Synthesizer,
     close_driver: Callable[[Any, Any], Awaitable[None]] | None = None,
-    observe: Callable[[tuple[object, ...], tuple[object, ...], bool], None] | None = None,
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1 | None], None]
+    | None = None,
 ) -> tuple[object, ...]:
     """Run one real host/browser/LiveKit flow with fixed typed and PCM stimuli."""
 
@@ -580,13 +582,14 @@ async def _run_non_mutation_arm(
     )
     room = rtc.Room()
     running: object | None = None
+    consent_path: ConsentPathV1 | None = None
     try:
         running = await composition.start_host(registration)
         origin, token, source = await _connect_and_activate(
             port=port, launch_url=running.url, room=room
         )
         if consent:
-            await _consent_capture(port=port, origin=origin, token=token)
+            _, consent_path = await _consent_capture(port=port, origin=origin, token=token)
         status, result = await _request(
             port=port,
             origin=origin,
@@ -660,6 +663,7 @@ async def _run_non_mutation_arm(
             composition.trace.records(),
             observations.records(),
             composition.trace.status().trace_complete and observations.status().trace_complete,
+            consent_path,
         )
     return composition.trace.records()
 
@@ -728,6 +732,8 @@ class _ResponseCheckpointInference:
 
 _EVIDENCE_ONLY_CLOSE_STAGES = frozenset(
     {
+        # Present only when consent settled after its control timeout.
+        CloseStageV1.CONSENT_SETTLEMENT,
         CloseStageV1.WRITER_DRAIN,
         CloseStageV1.WRITER_STOP,
         CloseStageV1.TRANSPORT_CLOSE,
@@ -768,8 +774,9 @@ async def _run_active_response_host_shutdown_arm(
     capture: bool,
     consent: bool,
     livekit_url: str = "ws://127.0.0.1:7880",
-    observe: Callable[[tuple[object, ...], tuple[object, ...], bool], None] | None = None,
-) -> tuple[tuple[object, ...], tuple[object, ...], Path]:
+    observe: Callable[[tuple[object, ...], tuple[object, ...], bool, ConsentPathV1 | None], None]
+    | None = None,
+) -> tuple[tuple[object, ...], tuple[object, ...], Path, ConsentPathV1 | None]:
     suffix, port = uuid.uuid4().hex[:10], _available_port()
     database = tmp_path / suffix / "capture-v1.sqlite3"
     database.parent.mkdir()
@@ -802,13 +809,14 @@ async def _run_active_response_host_shutdown_arm(
     room = rtc.Room()
     running: object | None = None
     closed = False
+    consent_path: ConsentPathV1 | None = None
     try:
         running = await composition.start_host(registration)
         origin, token, _source = await _connect_and_activate(
             port=port, launch_url=running.url, room=room
         )
         if consent:
-            await _consent_capture(port=port, origin=origin, token=token)
+            _, consent_path = await _consent_capture(port=port, origin=origin, token=token)
         status, result = await _request(
             port=port,
             origin=origin,
@@ -830,8 +838,9 @@ async def _run_active_response_host_shutdown_arm(
                 composition.trace.records(),
                 observations.records(),
                 composition.trace.status().trace_complete and observations.status().trace_complete,
+                consent_path,
             )
-        return composition.trace.records(), observations.records(), database
+        return composition.trace.records(), observations.records(), database, consent_path
     finally:
         for checkpoint in checkpoints:
             checkpoint.release.set()
@@ -855,9 +864,10 @@ async def test_full_host_active_response_host_shutdown_is_capture_equivalent(
         tmp_path=tmp_path, capture=True, consent=True
     )
 
-    disabled_raw, disabled_metadata, disabled_database = disabled
-    unconsented_raw, unconsented_metadata, unconsented_database = unconsented
-    consented_raw, consented_metadata, consented_database = consented
+    disabled_raw, disabled_metadata, disabled_database, disabled_path = disabled
+    unconsented_raw, unconsented_metadata, unconsented_database, unconsented_path = unconsented
+    consented_raw, consented_metadata, consented_database, consented_path = consented
+    assert disabled_path is None and unconsented_path is None
     assert not disabled_database.exists()
     assert not unconsented_database.exists()
     assert disabled_raw == unconsented_raw == consented_raw
@@ -904,11 +914,15 @@ async def test_full_host_active_response_host_shutdown_is_capture_equivalent(
             )
         else:
             assert browser_ingress_close < close_stages.index(CloseStageV1.SPEECH_LOOP)
+    from scripts.deterministic_equivalence import _expected_close
+
     consented_close = [
-        record for record in consented_metadata if type(record) is CloseStageObservationV1
+        {"stage": record.stage.value, "result": record.result.value}
+        for record in consented_metadata
+        if type(record) is CloseStageObservationV1
     ]
-    for stage in _EVIDENCE_ONLY_CLOSE_STAGES:
-        assert consented_close.count(CloseStageObservationV1(stage, CloseResultV1.SUCCEEDED)) == 1
+    # The one expected-close mechanism, keyed by the consent path the driver observed.
+    assert consented_close == _expected_close("shutdown_consented", consent=consented_path)
     assert (
         _normalized_production_records(consented_metadata, remove_evidence_only=True)
         == disabled_metadata
@@ -999,6 +1013,8 @@ class _BlockRevokeAndDrainTransport:
 # seconds (#73), so the drivers wait for that settlement, as the real-daemon
 # tests do since #196.  The bound itself stays covered deterministically.
 _CONSENT_SETTLEMENT_HANG_BOUND_SECONDS = 30.0
+# What the driver observed; the packaged validators derive the expected close from it.
+ConsentPathV1 = Literal["activated", "settled_after_timeout"]
 _CONSENT_ACTIVATED = {"captureState": "active", "result": "consent_activated", "sequence": 1}
 _CONSENT_CONTROL_TIMEOUT = {"captureState": "idle", "error": "control_timeout", "sequence": 1}
 _CONSENT_ERRORS = frozenset({error.value for error in ControlError} | {"request_rejected"})
@@ -1025,10 +1041,14 @@ def _bounded_enum(value: object, allowed: frozenset[str]) -> str:
     return value if type(value) is str and value in allowed else "unrecognized"
 
 
-async def _consent_capture(*, port: int, origin: str, token: str) -> bytes:
+async def _consent_capture(
+    *, port: int, origin: str, token: str
+) -> tuple[bytes, ConsentPathV1]:
     """Activate capture at sequence one, settling a lawful control timeout.
 
-    Returns the exact request bytes dispatched, so a caller can commit to them.
+    Returns the exact request bytes dispatched, so a caller can commit to them,
+    and the consent path this driver observed: ``activated`` for a 200, or
+    ``settled_after_timeout`` for a 503 control_timeout that later settled.
     Each failure raises from its own line: the archived qualification workers
     report only the failure kind and source line, never the message.
     """
@@ -1051,7 +1071,7 @@ async def _consent_capture(*, port: int, origin: str, token: str) -> bytes:
     path = "/api/v1/evidence-consent"
     status, result = await _request(port=port, origin=origin, path=path, bearer=token, body=body)
     if _is_consent_answer(status, result, 200, _CONSENT_ACTIVATED):
-        return body
+        return body, "activated"
     if not _is_consent_answer(status, result, 503, _CONSENT_CONTROL_TIMEOUT):
         error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
         raise AssertionError(f"consent answered HTTP {status} with error {error}")
@@ -1081,7 +1101,7 @@ async def _consent_capture(*, port: int, origin: str, token: str) -> bytes:
                 port=port, origin=origin, path=path, bearer=token, body=body
             )
             if _is_consent_answer(status, result, 200, _CONSENT_ACTIVATED):
-                return body
+                return body, "settled_after_timeout"
             if not _is_consent_answer(status, result, 503, _CONSENT_CONTROL_TIMEOUT):
                 error = _bounded_enum(result.get("error"), _CONSENT_ERRORS)
                 raise AssertionError(f"consent retry answered HTTP {status} with error {error}")
@@ -1367,3 +1387,82 @@ async def test_full_host_owner_close_coalesces_drain_and_releases(tmp_path: Path
         await room.disconnect()
         if running is not None and not running._closed:
             await composition.close_host(running)
+
+
+# Longer than the host's two-second consent control bound: the real first store
+# create then outlives it, consent answers 503 control_timeout and settles later,
+# as on a hosted runner that stalls the first SQLite create (#73).
+_STALLED_FIRST_CREATE_SECONDS = 2.5
+
+
+def _stall_first_store_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermes_realtime.evidence.sqlite_spool import SQLiteEvidenceWriterDaemonV1
+
+    create_epoch = SQLiteEvidenceWriterDaemonV1.create_epoch
+
+    def stalled_create_epoch(self: Any, command: Any) -> Any:
+        time.sleep(_STALLED_FIRST_CREATE_SECONDS)
+        return create_epoch(self, command)
+
+    monkeypatch.setattr(SQLiteEvidenceWriterDaemonV1, "create_epoch", stalled_create_epoch)
+
+
+async def test_full_host_revoke_race_validates_a_consent_settled_after_control_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The packaged revoke race's own validator accepts the lawful settled-consent close."""
+
+    from scripts.revoke_race import _validate_observations
+    from scripts.revoke_race_worker import observe_revoke_race
+
+    _stall_first_store_create(monkeypatch)
+    row = await observe_revoke_race(tmp_path, "ws://127.0.0.1:7880")
+
+    _validate_observations(row)
+    assert row["consent_path"] == "settled_after_timeout"
+    assert {"stage": "consent_settlement", "result": "succeeded"} in row["close"]
+
+
+@pytest.mark.parametrize("name", ["consented", "blocked", "faulted", "shutdown_consented"])
+async def test_full_host_consented_arm_close_matches_a_consent_settled_after_control_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Each consented equivalence arm's real close matches the one expected-close mechanism."""
+
+    from scripts.deterministic_equivalence import _expected_close
+
+    observed: list[tuple[list[dict[str, str]], object]] = []
+
+    def observe(
+        _raw: tuple[object, ...],
+        metadata: tuple[object, ...],
+        complete: bool,
+        consent_path: object,
+    ) -> None:
+        assert complete
+        close = [
+            {"stage": item.stage.value, "result": item.result.value}
+            for item in cast(list[Any], list(metadata))
+            if type(item) is CloseStageObservationV1
+        ]
+        observed.append((close, consent_path))
+
+    _stall_first_store_create(monkeypatch)
+    if name == "shutdown_consented":
+        await _run_active_response_host_shutdown_arm(
+            tmp_path=tmp_path, capture=True, consent=True, observe=observe
+        )
+    else:
+        await _run_non_mutation_arm(
+            tmp_path=tmp_path,
+            capture=True,
+            consent=True,
+            writer_fault=name == "faulted",
+            writer_block=name == "blocked",
+            observe=observe,
+        )
+
+    assert len(observed) == 1
+    close, consent_path = observed[0]
+    assert consent_path == "settled_after_timeout"
+    assert close == _expected_close(name, consent="settled_after_timeout")

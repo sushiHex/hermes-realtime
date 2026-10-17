@@ -29,7 +29,10 @@ def _observations():
             {"kind": kind, "value": f"{index + 1:064x}"}
             for index, kind in enumerate(_CONVERSATION_KINDS[:-1])
         ] + [{"kind": "host_return", "value": outcome}]
-        close = _expected_close("consented" if consented else "disabled")
+        consent_path = "activated" if consented else None
+        close = _expected_close(
+            "consented" if consented else "disabled", consent=consent_path
+        )
         if name.startswith("retry"):
             close.insert(-1, {"stage": "launcher", "result": "failed"})
             events = [
@@ -54,6 +57,7 @@ def _observations():
                  "contextCommitted": True},
             ] * 2 if consented else [],
             "close": close,
+            "consent_path": consent_path,
             "owner_events": events,
         })
     return {"arm": "owned_close_faults", "cases": cases}

@@ -261,7 +261,11 @@ async def test_consent_capture_settles_a_control_timeout_to_the_same_active_capt
 
     sent = await _consent(host, monkeypatch)
 
-    assert sent == host.consent_bodies[0]
+    # The path is what the driver observed: the first answer, not the end state.
+    assert sent == (
+        host.consent_bodies[0],
+        "activated" if len(answers) == 1 else "settled_after_timeout",
+    )
     assert host.answers == []
     assert len(host.consent_bodies) == len(answers)
     assert all(body == host.consent_bodies[0] for body in host.consent_bodies)
