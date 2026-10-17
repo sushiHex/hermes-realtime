@@ -237,9 +237,10 @@ async def test_stalled_initialized_send_keeps_close_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_turn_exits_bounded_while_another_request_holds_the_send_lock() -> None:
-    # A request awaiting its response may hold the send lock for its whole request timeout;
-    # the failed turn must still end and close without waiting for it.
+async def test_failed_turn_closes_bounded_while_another_request_holds_the_send_lock() -> None:
+    # A request awaiting its response may hold the send lock for its whole request timeout.
+    # close() waits for the failed turn's interrupt before closing the transport, so the
+    # interrupt must give up on the lock at the cleanup deadline; nothing else can wake it.
     transport = StalledPipeTransport(stall=_is_tool_result)
     inference = _inference(transport, request_timeout=30.0)
     inference.bind_work_tools(FakeWorkToolHandler())
@@ -255,7 +256,8 @@ async def test_failed_turn_exits_bounded_while_another_request_holds_the_send_lo
         async with asyncio.timeout(3):
             with pytest.raises(RuntimeError):
                 await stream
-        assert inference._closed is True
+            await inference.close()
+        assert inference._closed is True and transport.closed
         assert inference._send_lock.locked()
     finally:
         if held:

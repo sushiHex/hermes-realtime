@@ -1629,23 +1629,34 @@ class CodexAppServerStreamingInference:
                 raise RuntimeError("Codex status admission cleanup failed") from routing.error
             return
         if routing is not None and routing.failure.is_set():
-            # Every lock holder is a bounded request, and the close a failure begins wakes it.
-            async with self._send_lock:
-                request_id = self._next_request_id
-                self._next_request_id += 1
-                await self._send_bounded(
-                    {
-                        "id": request_id,
-                        "method": "turn/interrupt",
-                        "params": {
-                            "threadId": active.thread_id,
-                            "turnId": active.server_id,
+            # A lock holder may be a request awaiting its response for its whole timeout, and
+            # close() waits for this interrupt before it closes the transport that would wake
+            # the holder. So the lock wait itself must end at the cleanup deadline.
+            deadline = self._cleanup_deadline(routing)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._send_lock.acquire()
+            except TimeoutError as error:
+                self._fail_send(routing, "turn/interrupt", error)
+            else:
+                try:
+                    request_id = self._next_request_id
+                    self._next_request_id += 1
+                    await self._send_bounded(
+                        {
+                            "id": request_id,
+                            "method": "turn/interrupt",
+                            "params": {
+                                "threadId": active.thread_id,
+                                "turnId": active.server_id,
+                            },
                         },
-                    },
-                    deadline=self._cleanup_deadline(routing),
-                    category="turn/interrupt",
-                    routing=routing,
-                )
+                        deadline=deadline,
+                        category="turn/interrupt",
+                        routing=routing,
+                    )
+                finally:
+                    self._send_lock.release()
             raise RuntimeError("Codex app-server reader failed") from routing.error
         if routing is not None and routing.host_status_ready:
             async with self._send_lock:
