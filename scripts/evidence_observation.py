@@ -90,42 +90,16 @@ def _payload_commitment(key: bytes, command: Any) -> str:
     )
 
 
-async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> dict[str, str]:
+async def _accept_consent(
+    *, port: int, origin: str, token: str, key: bytes
+) -> tuple[dict[str, str], str]:
+    """Return the consent commitments and the consent path the driver observed."""
+
     from tests.integration import test_qualification_full_host_ingress as ingress
 
-    capture = await ingress._wait_event(
-        port=port, origin=origin, token=token, kind="capture_status"
-    )
-    data = capture["data"]
-    _require(type(data) is dict, "capture status is malformed")
-    assert type(data) is dict
-    request = {
-        "sequence": 1,
-        "accepted": True,
-        "consentVersion": "realtime-evidence-consent-v1",
-        "disclosureDigest": data["disclosureDigest"],
-        "retentionHours": 24,
-        "sources": {"microphone": True, "typed": True},
-    }
-    raw = json.dumps(request, separators=(",", ":")).encode("utf-8")
-    status, result = await ingress._request(
-        port=port,
-        origin=origin,
-        path="/api/v1/evidence-consent",
-        bearer=token,
-        body=raw,
-    )
-    _require(
-        status == 200
-        and type(result.get("sequence")) is int
-        and result
-        == {
-            "captureState": "active",
-            "result": "consent_activated",
-            "sequence": 1,
-        },
-        "consent request was not accepted",
-    )
+    # The shared driver settles a lawful consent control timeout; any other
+    # answer fails there with a bounded diagnostic.
+    raw, consent_path = await ingress._consent_capture(port=port, origin=origin, token=token)
     # Anchor the receipt to the bytes actually dispatched through the host API,
     # independently of every subsequently observed SQLite row.
     sent = json.loads(raw)
@@ -146,7 +120,7 @@ async def _accept_consent(*, port: int, origin: str, token: str, key: bytes) -> 
     return {
         "consent": consent,
         "request": _request_commitment(key, sent["sequence"], fingerprint),
-    }
+    }, consent_path
 
 
 def _consent_callback_observation(runtime: Any, key: bytes) -> dict[str, str]:

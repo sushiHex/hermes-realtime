@@ -14,6 +14,7 @@ from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from scripts import evaluate_natural_work_routing as evaluator
+from tests.support.ollama_metadata import supported_ollama_tags
 
 
 class _Inference:
@@ -178,6 +179,8 @@ async def test_real_ollama_status_selection_reports_no_rendered_host_speech(
         monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: Prior())
     else:
         async def metadata(_self: OllamaModelClient, endpoint: str, body: object) -> bytes:
+            if endpoint == "tags":
+                return supported_ollama_tags("synthetic:latest")
             return b'{"version":"0.34.4"}'
 
         def opening(request: object, _timeout: float) -> io.BytesIO:
@@ -420,7 +423,10 @@ async def test_real_host_ollama_adapter_observes_effect_free_ack(
     requests: list[dict[str, object]] = []
 
     async def metadata(_self: OllamaModelClient, endpoint: str, body: object) -> bytes:
-        assert (endpoint, body) == ("version", None)
+        assert body is None
+        if endpoint == "tags":
+            return supported_ollama_tags("synthetic:latest")
+        assert endpoint == "version"
         return b'{"version":"0.34.4"}'
 
     def opening(request: object, _timeout: float) -> io.BytesIO:
@@ -470,7 +476,10 @@ async def test_real_ollama_adapter_retains_provider_response_bound_without_captu
     calls = 0
 
     async def metadata(_self: OllamaModelClient, endpoint: str, body: object) -> bytes:
-        assert (endpoint, body) == ("version", None)
+        assert body is None
+        if endpoint == "tags":
+            return supported_ollama_tags("synthetic:latest")
+        assert endpoint == "version"
         return b'{"version":"0.34.4"}'
 
     def opening(request: object, _timeout: float) -> io.BytesIO:

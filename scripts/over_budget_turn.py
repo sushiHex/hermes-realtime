@@ -70,7 +70,16 @@ def _validate_capacity(rows: Any) -> None:
 def _validate_observations(row: Any) -> None:
     _keys(row, {"arm", "baseline", "captured"})
     _require(row["arm"] == "over_budget_turn", "overflow scenario differs")
-    common = {"arm", "complete", "records", "terminals", "close", "user", "completed_inputs"}
+    common = {
+        "arm",
+        "complete",
+        "records",
+        "terminals",
+        "close",
+        "consent_path",
+        "user",
+        "completed_inputs",
+    }
     extra = {
         "consent",
         "snapshots",
@@ -101,7 +110,7 @@ def _validate_observations(row: Any) -> None:
             arm["arm"] == name
             and arm["complete"] is True
             and arm["terminals"] == []
-            and arm["close"] == _expected_close(name)
+            and arm["close"] == _expected_close(name, consent=arm["consent_path"])
             and type(arm["completed_inputs"]) is list
             and all(type(n) is int for n in arm["completed_inputs"])
             and arm["completed_inputs"] == [1, 2],

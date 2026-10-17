@@ -358,6 +358,7 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
         writer_transport_factory=writer_factory,
     )
     room, running = rtc.Room(), None
+    consent_path = "not_requested"
     inputs = []
     try:
         running = await composition.start_host(registration)
@@ -367,7 +368,9 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             room=room,
         )
         live_binding = await _live_browser_binding(running._host, key)
-        accepted_consent = await _accept_consent(port=port, origin=origin, token=token, key=key)
+        accepted_consent, consent_path = await _accept_consent(
+            port=port, origin=origin, token=token, key=key
+        )
         live_bindings = [live_binding, await _live_browser_binding(running._host, key)]
         _require(live_bindings[0] == live_bindings[1], "live binding changed during consent")
         _require(len(thread_owners) == len(reservations) == 1, "writer ownership is ambiguous")
@@ -513,4 +516,6 @@ async def observe_capacity_rollover(workspace: Path, livekit_url: str) -> dict[s
             for item in observations.records()
             if type(item) is CloseStageObservationV1
         ],
+        # Only what the consent driver observed; never derived from the close.
+        "consent_path": consent_path,
     }

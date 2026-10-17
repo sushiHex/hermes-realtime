@@ -284,7 +284,7 @@ def test_the_host_child_observes_exactly_the_prompt_the_adapter_sends(
         responses.append(Response())
         return responses[-1]
 
-    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata("m"),
         base_url="http://127.0.0.1:11434", model="m", open_request=open_request
     )
     snapshot = ConversationContextSnapshot(
@@ -361,7 +361,7 @@ def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
         bodies.append(json.loads(request.data))  # type: ignore[arg-type]
         return Response()
 
-    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata(),
+    adapter = OllamaStreamingInference(metadata_client=supported_ollama_metadata("stand-in"),
         base_url="http://127.0.0.1:11434", model="stand-in", open_request=open_request
     )
 

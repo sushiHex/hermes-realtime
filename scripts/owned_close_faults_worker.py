@@ -126,9 +126,14 @@ async def _run_arm(name: str, workspace: Path, livekit_url: str, key: bytes) -> 
         return synthesizer
 
     def observe(
-        raw: tuple[object, ...], metadata: tuple[object, ...], complete: bool,
+        raw: tuple[object, ...],
+        metadata: tuple[object, ...],
+        complete: bool,
+        consent_path: str,
     ) -> None:
-        observed.append(_observation(name, raw, metadata, key, complete))
+        observed.append(
+            _observation(name, raw, metadata, key, complete, consent_path=consent_path)
+        )
 
     await _run_non_mutation_arm(
         tmp_path=workspace,
