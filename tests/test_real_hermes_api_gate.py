@@ -20,6 +20,7 @@ import pytest_asyncio
 from aiohttp import web
 
 import hermes_realtime
+from hermes_realtime import host_launcher
 from hermes_realtime.companion.attestation import attest_runtime
 from hermes_realtime.protocol import BRIDGE_PROTOCOL_VERSION
 from tests.support import bridge_hello
@@ -878,6 +879,30 @@ async def test_cleanup_retains_close_failure_alongside_readback_failure(
         assert evidence["left_running"] == 0
     assert evidence["events"]["cancellation"] == {"run_cancelled": 1}
     assert "private" not in json.dumps(evidence)
+
+
+@pytest.mark.asyncio
+async def test_optional_host_composition_passes_real_builder_validation_without_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CompositionBoundary(RuntimeError):
+        pass
+
+    def inference_boundary(**kwargs: Any) -> None:
+        assert kwargs["inference_provider"] == "codex"
+        raise CompositionBoundary
+
+    monkeypatch.setattr(host_launcher, "_build_streaming_inference", inference_boundary)
+
+    # The actual builder must pass configuration validation before this guarded boundary.
+    # Stop before constructing inference, speech providers, or starting any service.
+    with pytest.raises(CompositionBoundary):
+        await _GATE._compose_host(
+            _GATE.HermesApiConfig(
+                base_url="http://127.0.0.1:8642",
+                bearer=_KEY,
+            )
+        )
 
 
 @pytest.mark.asyncio
