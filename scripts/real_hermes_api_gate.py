@@ -23,7 +23,8 @@ under test:
 
 It prints exactly one line: the JSON record (versions, kinds, statuses and counts) on a pass,
 or one ``[real-hermes-gate]`` marker with the stage, a category and the failure's type on a
-refusal, including runs left running once any were admitted. Nothing goes to stderr.
+refusal, including observed event counts by phase and runs left running once any were
+admitted. Event counts are diagnostics, not acceptance evidence. Nothing goes to stderr.
 """
 
 from __future__ import annotations
@@ -96,6 +97,43 @@ _MAX_COMPONENT_MARKERS = 8
 _MAX_COMPONENT_MARKER_CHARS = 512
 # Library log records at WARNING and above are counted by logger and level, never printed.
 _MAX_LOGGERS = 16
+# Fixed categories and saturating counts bound refusal evidence independently of runtime input.
+_MAX_EVENT_COUNT = 65535
+_EVENT_KINDS = {
+    "approval.request": "approval_requested",
+    "approval.responded": "approval_responded",
+    "run.completed": "run_completed",
+    "run.failed": "run_failed",
+    "run.cancelled": "run_cancelled",
+}
+
+
+class _EventWitness:
+    """Count identity-checked events, not accepted behavior, retaining no runtime text."""
+
+    def __init__(self, evidence: Mapping[str, object]) -> None:
+        self._evidence = evidence
+        self._counts: dict[str, Counter[str]] = {}
+
+    def __call__(self, event: str, tool: str | None) -> None:
+        stage = self._evidence.get("stage")
+        phase = (
+            stage
+            if type(stage) is str and stage in ("completion", "approval", "cancellation")
+            else "other"
+        )
+        if event in {"tool.started", "tool.completed"}:
+            category = "terminal" if tool == "terminal" else "other"
+            kind = category + ("_tool_started" if event == "tool.started" else "_tool_completed")
+        else:
+            kind = _EVENT_KINDS.get(event, "other")
+        counts = self._counts.setdefault(phase, Counter())
+        counts[kind] = min(counts[kind] + 1, _MAX_EVENT_COUNT)
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        return {
+            phase: dict(sorted(counts.items())) for phase, counts in sorted(self._counts.items())
+        }
 
 
 class _LogCount(logging.Handler):
@@ -274,11 +312,13 @@ async def qualify(home: Path, api_url: str, evidence: dict[str, object]) -> dict
             raise Refusal("restart_gateway")
         record["discovery"] = {"capabilities": capabilities}
         witness = _ApprovalWitness()
+        events = _EventWitness(evidence)
         session = HermesApiTaskSession(
             config=config,
             session_id="session_real_api_gate",
             private_id_factory=iter(("completion_gate", "approval_gate", "cancel_gate")).__next__,
             approval_observer=witness,
+            event_observer=events,
         )
         try:
             record["behaviors"] = await _behaviors(session, witness, evidence)
@@ -286,6 +326,7 @@ async def qualify(home: Path, api_url: str, evidence: dict[str, object]) -> dict
             try:
                 await session.close()
             finally:
+                evidence["events"] = events.snapshot()
                 statuses = await _read_back(client, config, session.admitted_run_ids)
                 evidence["left_running"] = statuses[_NOT_TERMINAL]
         evidence["stage"] = "cleanup"

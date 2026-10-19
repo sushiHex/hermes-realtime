@@ -168,6 +168,7 @@ class _Hermes:
     status_answers: dict[str, str] = field(default_factory=dict)
     terminals: dict[str, str] = field(default_factory=dict)
     approval_skipped: bool = False
+    approval_tool_events: bool = False
     finished_before_stop: bool = False
     health_status: int = 200
     reject_runs: bool = False
@@ -206,6 +207,17 @@ class _Hermes:
         if run_id == _RUN_IDS[0]:
             await self._finish(response, run_id, "completed", "The gate passed.")
         elif run_id == _RUN_IDS[1]:
+            if self.approval_tool_events:
+                for kind in ("tool.started", "tool.completed"):
+                    await self._send(
+                        response,
+                        {
+                            "event": kind,
+                            "run_id": run_id,
+                            "tool": "terminal",
+                            "preview": "private command output",
+                        },
+                    )
             if not self.approval_skipped:
                 await self._send(
                     response,
@@ -729,6 +741,103 @@ async def test_a_refused_gate_still_counts_the_runs_it_left_running(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_called", [False, True])
+async def test_refused_approval_records_whether_terminal_was_observed(
+    tool_called: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
+) -> None:
+    install = _install(tmp_path, monkeypatch)
+    _write_env(install.home, companion_port=gateway.companion_port)
+    gateway.hermes.approval_skipped = True
+    gateway.hermes.approval_tool_events = tool_called
+
+    error, evidence = await _refused(install.home, gateway.api_url)
+
+    assert _category(error) == "behavior" and evidence["stage"] == "approval"
+    assert evidence["events"] == {
+        "completion": {"run_completed": 1},
+        "approval": {"run_completed": 1}
+        | ({"terminal_tool_started": 1, "terminal_tool_completed": 1} if tool_called else {}),
+    }
+    assert evidence["left_running"] == 0
+    assert gateway.hermes.runs == list(_RUN_IDS[:2])
+
+
+def test_event_witness_keeps_only_bounded_categories() -> None:
+    phase: dict[str, object] = {"stage": "approval"}
+    witness = _GATE._EventWitness(phase)
+    witness("tool.started", "terminal")
+    witness("tool.completed", "private tool name")
+    witness("approval.request", None)
+    witness("approval.responded", None)
+    witness("run.failed", None)
+    witness("run.cancelled", None)
+    witness("private event name", "private tool name")
+    phase["stage"] = "private phase name"
+    for _ in range(_GATE._MAX_EVENT_COUNT + 1):
+        witness("private event name", "private tool name")
+
+    assert witness.snapshot() == {
+        "approval": {
+            "terminal_tool_started": 1,
+            "other_tool_completed": 1,
+            "approval_requested": 1,
+            "approval_responded": 1,
+            "run_failed": 1,
+            "run_cancelled": 1,
+            "other": 1,
+        },
+        "other": {"other": _GATE._MAX_EVENT_COUNT},
+    }
+
+
+@pytest.mark.asyncio
+async def test_healthy_gate_retains_phase_counts_without_changing_its_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
+) -> None:
+    install = _install(tmp_path, monkeypatch)
+    _write_env(install.home, companion_port=gateway.companion_port)
+    evidence: dict[str, object] = {}
+
+    record = await qualify(install.home, gateway.api_url, evidence)
+
+    assert record["gate"] == "passed"
+    assert "events" not in record
+    assert evidence["events"] == {
+        "completion": {"run_completed": 1},
+        "approval": {"approval_requested": 1, "run_completed": 1},
+        "cancellation": {"run_cancelled": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_event_counts_survive_cleanup_readback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
+) -> None:
+    install = _install(tmp_path, monkeypatch)
+    _write_env(install.home, companion_port=gateway.companion_port)
+
+    async def unreadable(*args: object) -> None:
+        raise OSError("private readback detail")
+
+    monkeypatch.setattr(_GATE, "_read_back", unreadable)
+    error, evidence = await _refused(install.home, gateway.api_url)
+
+    assert type(error) is OSError
+    assert evidence["events"] == {
+        "completion": {"run_completed": 1},
+        "approval": {"approval_requested": 1, "run_completed": 1},
+        "cancellation": {"run_cancelled": 1},
+    }
+
+
+@pytest.mark.asyncio
 async def test_the_gate_refuses_a_gateway_that_restarted_during_the_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
 ) -> None:
@@ -823,9 +932,27 @@ async def test_the_command_prints_one_record_line_on_a_pass(
                 "category": "behavior",
                 "stage": "completion",
                 "left_running": 0,
+                "events": {},
                 "log": {"hermes_realtime.integration.api": {"WARNING": 1}},
             },
             id="non-202-dispatch",
+        ),
+        pytest.param(
+            {"approval_skipped": True, "approval_tool_events": True},
+            {
+                "category": "behavior",
+                "stage": "approval",
+                "left_running": 0,
+                "events": {
+                    "completion": {"run_completed": 1},
+                    "approval": {
+                        "terminal_tool_started": 1,
+                        "terminal_tool_completed": 1,
+                        "run_completed": 1,
+                    },
+                },
+            },
+            id="terminal-without-approval",
         ),
     ],
 )
