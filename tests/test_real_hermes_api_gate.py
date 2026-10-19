@@ -838,6 +838,49 @@ async def test_event_counts_survive_cleanup_readback_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("readback_fails", [False, True])
+async def test_cleanup_retains_close_failure_alongside_readback_failure(
+    readback_fails: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Gateway,
+) -> None:
+    install = _install(tmp_path, monkeypatch)
+    _write_env(install.home, companion_port=gateway.companion_port)
+    original_close = _GATE.HermesApiTaskSession.close
+    original_readback = _GATE._read_back
+    readback_attempted = False
+
+    async def close(session: object) -> None:
+        await original_close(session)
+        raise ValueError("private close detail")
+
+    async def readback(*args: object) -> object:
+        nonlocal readback_attempted
+        readback_attempted = True
+        if readback_fails:
+            raise OSError("private readback detail")
+        return await original_readback(*args)
+
+    monkeypatch.setattr(_GATE.HermesApiTaskSession, "close", close)
+    monkeypatch.setattr(_GATE, "_read_back", readback)
+    error, evidence = await _refused(install.home, gateway.api_url)
+
+    assert readback_attempted
+    assert evidence["cleanup_failures"] == ["session_close"] + (
+        ["read_back"] if readback_fails else []
+    )
+    if readback_fails:
+        assert type(error) is ExceptionGroup
+        assert [type(item) for item in error.exceptions] == [ValueError, OSError]
+    else:
+        assert type(error) is ValueError
+        assert evidence["left_running"] == 0
+    assert evidence["events"]["cancellation"] == {"run_cancelled": 1}
+    assert "private" not in json.dumps(evidence)
+
+
+@pytest.mark.asyncio
 async def test_the_gate_refuses_a_gateway_that_restarted_during_the_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: _Gateway
 ) -> None:

@@ -23,8 +23,9 @@ under test:
 
 It prints exactly one line: the JSON record (versions, kinds, statuses and counts) on a pass,
 or one ``[real-hermes-gate]`` marker with the stage, a category and the failure's type on a
-refusal, including observed event counts by phase and runs left running once any were
-admitted. Event counts are diagnostics, not acceptance evidence. Nothing goes to stderr.
+refusal, including observed event counts by phase, fixed cleanup failure categories and
+runs left running once any were admitted. Event counts are diagnostics, not acceptance
+evidence. Nothing goes to stderr.
 """
 
 from __future__ import annotations
@@ -323,12 +324,28 @@ async def qualify(home: Path, api_url: str, evidence: dict[str, object]) -> dict
         try:
             record["behaviors"] = await _behaviors(session, witness, evidence)
         finally:
+            cleanup_errors: list[BaseException] = []
             try:
                 await session.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+                evidence["cleanup_failures"] = ["session_close"]
             finally:
                 evidence["events"] = events.snapshot()
-                statuses = await _read_back(client, config, session.admitted_run_ids)
-                evidence["left_running"] = statuses[_NOT_TERMINAL]
+                try:
+                    statuses = await _read_back(client, config, session.admitted_run_ids)
+                    evidence["left_running"] = statuses[_NOT_TERMINAL]
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    evidence["cleanup_failures"] = (
+                        ["session_close", "read_back"]
+                        if len(cleanup_errors) == 2
+                        else ["read_back"]
+                    )
+            if len(cleanup_errors) == 2:
+                raise BaseExceptionGroup("Hermes gate cleanup failed", cleanup_errors)
+            if cleanup_errors:
+                raise cleanup_errors[0]
         evidence["stage"] = "cleanup"
         if evidence["left_running"] != 0:
             raise Refusal("left_running")
