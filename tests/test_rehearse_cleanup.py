@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import ctypes
-import importlib.util
+import importlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "rehearse_desktop_mvp.py"
 sys.path.insert(0, str(_PATH.parent))
-_SPEC = importlib.util.spec_from_file_location("cleanup_rehearsal", _PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-rehearsal = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(rehearsal)
+rehearsal = importlib.import_module("rehearse_desktop_mvp")
 
 
 def test_empty_cleanup_is_a_healthy_control(tmp_path, monkeypatch, capsys):
@@ -30,9 +28,9 @@ def test_empty_cleanup_is_a_healthy_control(tmp_path, monkeypatch, capsys):
     [
         ("exited", False, {}),
         ("running_or_terminating", False, {"private-image.exe": 1}),
-        ("unknown", False, {"unknown": 1}),
+        ("unknown", False, {"<unknown>": 1}),
         ("identity_changed", False, {}),
-        ("exited", True, {"unknown": 1}),
+        ("exited", True, {"<unknown>": 1}),
     ],
 )
 def test_job_only_cleanup_is_classified_at_refusal(
@@ -69,6 +67,42 @@ def test_cleanup_retains_the_first_refusal(tmp_path, monkeypatch, capsys):
     assert owner.first_cleanup_refusal == first == records[0]["current"]
     assert records[1]["first_refusal"] == first
     assert first["tracked"]["running_or_terminating"] == 1
+
+
+@pytest.mark.asyncio
+async def test_close_and_emitted_summary_keep_first_cleanup_refusal(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("private-image.exe", 42)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {101: (99, "private-image.exe")})
+    states = iter(["running_or_terminating", "exited"])
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
+    monkeypatch.setattr(owner, "stop_all", lambda: None)
+    monkeypatch.setattr(rehearsal, "listeners", lambda port: [])
+    assert owner.survivors(None)
+    first = owner.first_cleanup_refusal
+    run = object.__new__(rehearsal.Rehearsal)
+    run.browser = run.playwright = run.containment = None
+    run.processes = owner
+    run.stand_in = SimpleNamespace(close=AsyncMock())
+    run.api_port, run.companion_port, run.host_port = 1, 2, 3
+    record = await run.close()
+    assert record["processes_left"] == {}
+    assert record["first_cleanup_refusal"] == first
+    rehearsal._emit({"name": "summary"} | record)
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1].removeprefix(rehearsal._PREFIX))
+    assert summary["first_cleanup_refusal"] == first
+    assert "private" not in json.dumps(summary)
+
+
+def test_unknown_cleanup_category_cannot_collide_with_an_image(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    states = iter(["running_or_terminating", "unknown"])
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
+    containment = SimpleNamespace(_job=66, members=lambda: {101, 102})
+    monkeypatch.setattr(
+        rehearsal, "process_table", lambda: {101: (99, "unknown"), 102: (99, "other")}
+    )
+    assert owner.survivors(containment) == {"unknown": 1, "<unknown>": 1}
 
 
 def test_absent_historical_identity_does_not_become_perpetually_unknown(
@@ -109,16 +143,17 @@ def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, b
     else:
         monkeypatch.setattr(rehearsal, "process_table", lambda: {})
         containment = SimpleNamespace(members=lambda: set(range(10000, 14097)))
-    assert owner.survivors(containment) == {"unknown": 1}
+    assert owner.survivors(containment) == {"<unknown>": 1}
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
     assert record["current"]["observation_failed"] == 1
     assert "private" not in json.dumps(record)
 
 
 class _Kernel:
-    def __init__(self, *, wait=258, start=42, member=True, opened=True, times=True):
+    def __init__(self, *, wait=258, start=42, member=True, opened=True, times=True, job_query=True):
         self.wait, self.start, self.member = wait, start, member
         self.opened, self.times = opened, times
+        self.job_query = job_query
         self.closed = []
         self.access = None
         self.OpenProcess = self.open
@@ -136,7 +171,7 @@ class _Kernel:
     def IsProcessInJob(self, handle, job, member):
         assert job.value == 66
         member._obj.value = self.member
-        return True
+        return self.job_query
 
     def WaitForSingleObject(self, handle, timeout):
         assert handle.value == 55
@@ -159,6 +194,8 @@ class _Kernel:
         ({}, None, 66, "running_or_terminating"),
         ({"member": False}, None, 66, "identity_changed"),
         ({"start": 43}, 42, 66, "running_or_terminating"),
+        ({"job_query": False}, None, 66, "unknown"),
+        ({"wait": -1}, 42, None, "unknown"),
     ],
 )
 def test_cleanup_uses_one_identity_checked_native_handle(
@@ -177,6 +214,29 @@ def test_cleanup_uses_one_identity_checked_native_handle(
     assert kernel.closed == ([55] if kernel.opened else [])
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, 42),
+        ({"wait": 0}, None),
+        ({"wait": -1}, None),
+        ({"times": False}, None),
+        ({"opened": False}, None),
+    ],
+)
+def test_started_at_uses_the_same_zero_time_handle_liveness(monkeypatch, kwargs, expected):
+    kernel = _Kernel(**kwargs)
+
+    def open_process(*args):
+        return kernel.open(*args)
+
+    kernel.OpenProcess = open_process
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kw: kernel, raising=False)
+    assert rehearsal.started_at(101) == expected
+    assert kernel.access == 0x00101000
+    assert kernel.closed == ([55] if kernel.opened else [])
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows process handles")
 def test_cleanup_native_wait_recognizes_held_exited_handle_even_exit_259():
     child = subprocess.Popen(
@@ -190,8 +250,7 @@ def test_cleanup_native_wait_recognizes_held_exited_handle_even_exit_259():
         child.wait(timeout=20)
         assert child.returncode == 259
         # Popen keeps the exited process object/identity alive until its handle closes.
-        # The old exit-code-only predicate incorrectly treats this real exit as active.
-        assert type(rehearsal.started_at(child.pid)) is int
+        assert rehearsal.started_at(child.pid) is None
         assert rehearsal._cleanup_process_state(child.pid, None, None) == "exited"
     finally:
         if child.poll() is None:

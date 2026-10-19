@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
+import importlib
 import inspect
 import json
 import os
@@ -20,11 +20,7 @@ pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
 _PATH = Path(__file__).resolve().parents[1] / "scripts" / "rehearse_desktop_mvp.py"
 sys.path.insert(0, str(_PATH.parent))
-_SPEC = importlib.util.spec_from_file_location("rehearse_desktop_mvp", _PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-rehearsal = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = rehearsal
-_SPEC.loader.exec_module(rehearsal)
+rehearsal = importlib.import_module("rehearse_desktop_mvp")
 
 _TERMINAL = [{"type": "function", "function": {"name": "terminal", "parameters": {}}}]
 _MEMORY = [{"type": "function", "function": {"name": "memory", "parameters": {}}}]

@@ -458,15 +458,12 @@ def started_at(pid: int) -> int | None:
 
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.restype = ctypes.c_void_p
-    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel.OpenProcess(0x00101000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
     if not handle:
         return None
     try:
-        code = ctypes.c_uint32()
         times = [ctypes.c_uint64() for _ in range(4)]
-        if not kernel.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
-            return None
-        if code.value != 259:  # STILL_ACTIVE: an exited process can still have handles.
+        if kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0) != 258:
             return None
         if not kernel.GetProcessTimes(
             ctypes.c_void_p(handle), *(ctypes.byref(time) for time in times)
@@ -732,10 +729,10 @@ class Processes:
                 if state == "running_or_terminating":
                     left[table[pid][1]] += 1
                 elif state == "unknown":
-                    left["unknown"] += 1
+                    left["<unknown>"] += 1
         except OSError:
             snapshot["observation_failed"] = 1
-            left["unknown"] += 1
+            left["<unknown>"] += 1
         finally:
             if left and self.first_cleanup_refusal is None:
                 self.first_cleanup_refusal = snapshot
@@ -2825,6 +2822,7 @@ class Rehearsal:
         ports = [7880, self.api_port, self.companion_port, self.host_port]
         return {
             "processes_left": self.processes.survivors(self.containment),
+            "first_cleanup_refusal": self.processes.first_cleanup_refusal,
             "contained": self.containment is not None,
             "ports_listening": sum(1 for port in ports if listeners(port)),
         }
