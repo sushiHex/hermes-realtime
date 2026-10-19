@@ -58,6 +58,45 @@ test installation, these rules override its setup and process-control examples:
 Do not execute a diagnostic recovery instruction against the personal gateway
 when a test endpoint refuses. Diagnose and correct only the isolated setup.
 
+These separate-home and process-ownership rules take precedence over the
+diagnostic guide's default-home and gateway-stop examples. Follow it for the
+detailed Hermes, wheel, `.env`, and LiveKit setup, but keep `HERMES_HOME` in the
+session's PowerShell process environment. Do not run its global `hermes gateway
+stop`, `hermes gateway uninstall`, or process-name kill examples; preserve any
+personal gateway. Start and restart only the gateway installed under the test
+home, and stop only processes owned by this session.
+
+For the candidate in the current [#159 acceptance handoff](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6275503278),
+record Phi at context 4096, Ollama 0.40.4, and the pinned Hermes commit
+`29112bef099274229cadff79cdff7bf7b99c4b77` as the intended profile. This is a
+candidate selection for qualification; it does not change project defaults or
+claim that human acceptance has passed. Record the exact model identifier and
+effective context reported by the host. Use the already-qualified Ollama
+installation and the model name shown by `ollama list`; do not infer the model
+name from “Phi.”
+
+After the installed gate and wheel equality check pass, launch the verified
+host installation's console script directly. The wheel defines
+`hermes-realtime-host` as its Windows console entry point; `<host-venv>` must be
+the interpreter whose installed package was compared with the candidate wheel.
+The following shows the executable and arguments; start it under the hidden,
+stdin-disconnected process ownership rules above:
+
+```powershell
+$env:HERMES_HOME = "<test-home>"
+& "<host-venv>\Scripts\hermes-realtime-host.exe" `
+  --hermes-env-file "$env:HERMES_HOME\.env" `
+  --inference-provider ollama `
+  --ollama-model "<exact name from ollama list>" `
+  --ollama-num-ctx 4096 `
+  --persistent-loopback-launch `
+  --allow-unsandboxed-hermes-tasks
+```
+
+Keep the test home's API URL, separate free API and companion ports, and
+session-owned state paths from the isolated setup above. Do not substitute the
+diagnostic guide's `uv run` checkout command for this installed-host launch.
+
 Run the installed-runtime gate from the same clean candidate, with its installed
 interpreter, before starting the host. A stand-in Hermes model does not complete
 [#67](https://github.com/sushiHex/hermes-realtime/issues/67)'s real-model gate.
@@ -103,8 +142,14 @@ recording `as_expected`, `different`, `failed` or `not_run` for each. In particu
 
 - Confirm actual microphone input and audible typed/spoken replies. Synthetic
   browser audio is not a substitute for either observation.
-- Observe accepted task acknowledgment before active status, exact task
-  cancellation, and speech interruption leaving unrelated work active.
+- Exercise the spoken command `start task <objective>` and the typed `task:`
+  form. For cancellation, say `cancel task` when exactly one acknowledged task
+  is active; when there are zero or several, verify the no-task guidance or use
+  **Cancel** on the intended task card. Also exercise the typed
+  `cancel task: <task-id>` form. Record accepted task acknowledgment before
+  active status, exact cancellation and terminal settlement, and speech
+  interruption leaving unrelated work active. The spoken grammar and its
+  ambiguity behavior are detailed in [local-livekit.md](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate).
 - Observe Stop/Connect, reload during the readiness cue, and host restart.
   Check context without restating the fact being tested. Record a recall failure
   even when the corresponding history is present.
