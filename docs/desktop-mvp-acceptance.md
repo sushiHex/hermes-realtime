@@ -88,8 +88,8 @@ The selected two-model profile uses **Phi only for the Realtime foreground** and
 **Qwen3.5 9B for Hermes background work**. They run in separate, session-owned
 Ollama processes. A foreground context of 4096 is not a suitable replacement for
 Hermes's resolved background context of 64000. The pinned Hermes
-[minimum-context policy](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/model_metadata.py#L413)
-and [route resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L2414)
+[minimum-context policy](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/model_metadata.py#L410-L413)
+and [route resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L2414-L2439)
 remain authoritative. [#292](https://github.com/sushiHex/hermes-realtime/issues/292)
 tracks a general server-authoritative preflight; these settings describe one
 explicit local route and do not replace that resolver.
@@ -187,9 +187,9 @@ model:
 
 The frozen candidate omitted the `memory` section. An absent `memory.provider`
 leaves the
-[external provider inactive](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L1900);
+[external provider inactive](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L1905-L1907);
 omitted `memory_enabled` and `user_profile_enabled` use the
-[pinned enabled defaults](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/memory_tool.py#L1198).
+[pinned enabled defaults](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/memory_tool.py#L1198-L1204).
 Record a config-only inspection as such. It does not establish a running
 gateway's effective memory state or prove that no data left the machine.
 The diagnostic guide's `hermes memory off` / `status` commands belong to
