@@ -73,6 +73,11 @@ After the installed gate and wheel equality check pass, launch the verified
 host installation's console script directly. The wheel defines
 `hermes-realtime-host` as its Windows console entry point; `<host-venv>` must be
 the interpreter whose installed package was compared with the candidate wheel.
+Replace every placeholder below with this session's values. Set
+`--hermes-api-url` to the same owned literal-loopback API URL passed to the
+installed gate, and use a dedicated existing `<test-state>` directory for both
+state files; the explicit arguments prevent fallback to the personal API or
+default state paths.
 The following shows the executable and arguments; start it under the hidden,
 stdin-disconnected process ownership rules above:
 
@@ -80,6 +85,9 @@ stdin-disconnected process ownership rules above:
 $env:HERMES_HOME = "<test-home>"
 & "<host-venv>\Scripts\hermes-realtime-host.exe" `
   --hermes-env-file "$env:HERMES_HOME\.env" `
+  --hermes-api-url "<test-api-url>" `
+  --hermes-run-record "<test-state>\hermes-runs-v1.json" `
+  --voice-tail "<test-state>\voice-tail-v1.json" `
   --inference-provider ollama `
   --ollama-model "<exact name from ollama list>" `
   --ollama-num-ctx 4096 `
@@ -136,7 +144,7 @@ recording `as_expected`, `different`, `failed` or `not_run` for each. In particu
   active status, exact cancellation and terminal settlement, and speech
   interruption leaving unrelated work active. The spoken grammar and its
   ambiguity behavior are detailed in [local-livekit.md](local-livekit.md#full-loopback-host-and-constrained-desktop-human-gate).
-- Observe Stop/Connect, reload during the readiness cue, and host restart.
+- Observe Disconnect/Connect, reload during the readiness cue, and host restart.
   Check context without restating the fact being tested. Record a recall failure
   even when the corresponding history is present.
 - Exercise deletion only on the synthetic test conversation. Verify the stated
