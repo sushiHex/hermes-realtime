@@ -38,8 +38,8 @@ test installation, these rules override its setup and process-control examples:
 
 - Set `HERMES_HOME` only in this session's child-process environment. Install the
   pinned checkout and its own `venv` under that home, and install the frozen wheel
-  there. Do not switch the user's profile, overwrite their configuration, or run
-  the guide's global gateway `stop`, `uninstall` or process-name kill commands.
+  there. Do not switch the user's profile, overwrite their configuration, stop
+  or uninstall a personal gateway, or kill processes by name.
 - Allocate separate available literal-loopback API and companion ports. Pass
   the test home and its API URL to the installed gate; pass the same API URL and
   the test home's `.env` to the host. Keep the test voice tail and run record in
@@ -55,25 +55,19 @@ test installation, these rules override its setup and process-control examples:
   only this session's host and stop only this session's gateway/LiveKit. A healthy
   preexisting gateway remaining at cleanup is expected, not a leak.
 
-Do not execute a diagnostic recovery instruction against the personal gateway
-when a test endpoint refuses. Diagnose and correct only the isolated setup.
+These separate-home and process-ownership rules override the default-home and
+process-control examples in the [diagnostic guide](desktop-mvp-diagnostic.md).
+Follow that guide for detailed Hermes, wheel, `.env`, and LiveKit setup. Diagnose
+endpoint refusals within the isolated setup; start, restart, and stop only
+processes owned by this session.
 
-These separate-home and process-ownership rules take precedence over the
-diagnostic guide's default-home and gateway-stop examples. Follow it for the
-detailed Hermes, wheel, `.env`, and LiveKit setup, but keep `HERMES_HOME` in the
-session's PowerShell process environment. Do not run its global `hermes gateway
-stop`, `hermes gateway uninstall`, or process-name kill examples; preserve any
-personal gateway. Start and restart only the gateway installed under the test
-home, and stop only processes owned by this session.
-
-For the candidate in the current [#159 acceptance handoff](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6275503278),
-record Phi at context 4096, Ollama 0.40.4, and the pinned Hermes commit
-`29112bef099274229cadff79cdff7bf7b99c4b77` as the intended profile. This is a
-candidate selection for qualification; it does not change project defaults or
-claim that human acceptance has passed. Record the exact model identifier and
-effective context reported by the host. Use the already-qualified Ollama
-installation and the model name shown by `ollama list`; do not infer the model
-name from “Phi.”
+The candidate profile follows the [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445):
+phi4-mini at context 4096 with Ollama 0.40.4 and pinned Hermes commit
+`29112bef099274229cadff79cdff7bf7b99c4b77`. This is a qualification candidate;
+it does not change the project default or claim that human acceptance has
+passed. Record the exact model identifier and effective context reported by the
+host. Use the qualified Ollama installation and exact model name shown by
+`ollama list`.
 
 After the installed gate and wheel equality check pass, launch the verified
 host installation's console script directly. The wheel defines
@@ -106,27 +100,19 @@ diagnostic and leave acceptance pending.
 
 Use the diagnostic guide's initial profile: Windows Chrome, literal loopback,
 built-in memory, evidence capture and public search off, and explicit task
-commands with natural work tools disabled. Acceptance of
-[ADR 0004](adr/0004-model-action-authority.md) records automatic natural task starts
-and explicit user task cancellation. It requires no confirmation click for a
-model-proposed start and grants the model no cancellation or downstream approval
-authority. Design acceptance does not establish implemented routing, actual-model
-qualification, live activation or physical voice acceptance. The separately
-scoped implementation and its candidate-bound evidence belong to
-[#226](https://github.com/sushiHex/hermes-realtime/issues/226) and
-[#248](https://github.com/sushiHex/hermes-realtime/pull/248).
+commands with natural work tools disabled. The current [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
+keeps natural routing off and starts work only through deterministic explicit
+commands. The model default remains unchanged unless and until this owner
+acceptance passes and a separate default-change is made.
 
-A later automatic-routing acceptance session must first freeze a separately
-reviewed and qualified candidate, its natural-work setting, model artifact and
-provider/runtime configuration. Its observations extend this procedure: appropriate
-natural requests start work once with the intended objective; conversation,
-explanation, quotation, negation and instruction-shaped reference data are measured
-separately for unintended starts. Record denominators, failures and latency.
-Require an accepted acknowledgment with a run ID before active status, and test
-exact explicit-user cancellation with unrelated work active. Model cancellation
-and approval must have zero effect. Speech interruption must leave admitted
-background work independent. A finite corpus or stand-in pass does not prove
-arbitrary intent recognition, injection resistance or operator acceptance.
+[ADR 0004](adr/0004-model-action-authority.md) remains the design record for
+model-proposed work. If natural routing is considered again, the [#284 owner
+decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
+requires explicit user confirmation of the proposed objective before dispatch.
+That future flow is outside this MVP acceptance procedure and needs its own
+implementation and qualification; it grants no model cancellation or approval
+authority. Current acceptance covers explicit task commands, task-card Cancel,
+and interruption independence only.
 
 Before starting, declare the observations: final transcript to first token,
 first token to audio, task acknowledgment/completion/cancellation, and reconnect
