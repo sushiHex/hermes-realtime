@@ -46,10 +46,13 @@ test installation, these rules override its setup and process-control examples:
   separate state paths. A refused API or companion bind is a setup finding;
   select another free port instead of terminating its listener.
 - Reuse the pinned shared LiveKit executable through the existing verified
-  resolver. This procedure uses the documented default LiveKit/host ports; it
-  does not add an alternate LiveKit launch mode. If either is occupied, mark
-  setup `not_run` and defer the session rather than replacing its listener.
-  No new binary path or firewall rule is needed for this session.
+  resolver at its documented endpoint; this procedure does not add an
+  alternate LiveKit launch mode. If the shared LiveKit endpoint is occupied or
+  unavailable, mark setup `not_run` and defer rather than replacing its
+  listener. If host port 8765 is occupied, choose a free literal-loopback host
+  port with `--port`; the browser origin is derived from that port. Do not pass
+  `--browser-origin` in loopback mode. No new binary path or firewall rule is
+  needed for this session.
 - Start owned long-lived processes without visible console windows, with stdin
   disconnected. Keep exact process ownership for restart and cleanup; restart
   only this session's host and stop only this session's gateway/LiveKit. A healthy
@@ -77,7 +80,8 @@ Replace every placeholder below with this session's values. Set
 `--hermes-api-url` to the same owned literal-loopback API URL passed to the
 installed gate, and use a dedicated existing `<test-state>` directory for both
 state files; the explicit arguments prevent fallback to the personal API or
-default state paths.
+default state paths. Set `<test-host-port>` to a free numeric loopback port;
+the printed browser URL will use that port.
 The following shows the executable and arguments; start it under the hidden,
 stdin-disconnected process ownership rules above:
 
@@ -88,6 +92,7 @@ $env:HERMES_HOME = "<test-home>"
   --hermes-api-url "<test-api-url>" `
   --hermes-run-record "<test-state>\hermes-runs-v1.json" `
   --voice-tail "<test-state>\voice-tail-v1.json" `
+  --port "<test-host-port>" `
   --inference-provider ollama `
   --ollama-model "<exact name from ollama list>" `
   --ollama-num-ctx 4096 `
