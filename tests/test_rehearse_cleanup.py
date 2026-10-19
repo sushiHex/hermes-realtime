@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import ctypes
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+_PATH = Path(__file__).resolve().parents[1] / "scripts" / "rehearse_desktop_mvp.py"
+sys.path.insert(0, str(_PATH.parent))
+_SPEC = importlib.util.spec_from_file_location("cleanup_rehearsal", _PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+rehearsal = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(rehearsal)
+
+
+def test_empty_cleanup_is_a_healthy_control(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    assert owner.survivors(SimpleNamespace(members=lambda: {os.getpid()})) == {}
+
+
+@pytest.mark.parametrize(
+    ("state", "missing", "expected"),
+    [
+        ("exited", False, {}),
+        ("running_or_terminating", False, {"private-image.exe": 1}),
+        ("unknown", False, {"unknown": 1}),
+        ("identity_changed", False, {}),
+        ("exited", True, {"unknown": 1}),
+    ],
+)
+def test_job_only_cleanup_is_classified_at_refusal(
+    tmp_path, monkeypatch, capsys, state, missing, expected
+):
+    owner = rehearsal.Processes(tmp_path)
+    table = {} if missing else {101: (99, "private-image.exe")}
+    monkeypatch.setattr(rehearsal, "process_table", lambda: table)
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: state)
+    assert owner.survivors(SimpleNamespace(_job=66, members=lambda: {os.getpid(), 101})) == expected
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    observed = "unknown" if missing else state
+    assert record["current"]["job_only"][observed] == 1
+    assert record["current"]["tracked"] == dict.fromkeys(
+        ("exited", "running_or_terminating", "identity_changed", "unknown"), 0
+    )
+    assert "private" not in json.dumps(record)
+    assert "101" not in json.dumps(record)
+
+
+def test_cleanup_retains_the_first_refusal(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("private-image.exe", 42)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {101: (99, "private-image.exe")})
+    states = iter(["running_or_terminating", "exited"])
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
+    assert owner.survivors(None) == {"private-image.exe": 1}
+    first = owner.first_cleanup_refusal
+    assert owner.survivors(None) == {}
+    records = [
+        json.loads(row.removeprefix("[desktop-mvp-cleanup] "))
+        for row in capsys.readouterr().out.splitlines()
+    ]
+    assert owner.first_cleanup_refusal == first == records[0]["current"]
+    assert records[1]["first_refusal"] == first
+    assert first["tracked"]["running_or_terminating"] == 1
+
+
+def test_absent_historical_identity_does_not_become_perpetually_unknown(
+    tmp_path, monkeypatch, capsys
+):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("private-image.exe", 42)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    assert owner.survivors(None) == {}
+    assert owner.first_cleanup_refusal is None
+
+
+def test_reused_tracked_pid_still_has_independent_job_authority(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("old-private-image.exe", 42)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {101: (99, "new-private-image.exe")})
+
+    def state(pid, expected_start, job):
+        assert (pid, expected_start, job) == (101, 42, 66)
+        return "running_or_terminating"
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", state)
+    assert owner.survivors(SimpleNamespace(_job=66, members=lambda: {101})) == {
+        "new-private-image.exe": 1
+    }
+
+
+@pytest.mark.parametrize("broken", ["snapshot", "bound"])
+def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, broken):
+    owner = rehearsal.Processes(tmp_path)
+    if broken == "snapshot":
+
+        def snapshot():
+            raise OSError("private native details")
+
+        monkeypatch.setattr(rehearsal, "process_table", snapshot)
+        containment = None
+    else:
+        monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+        containment = SimpleNamespace(members=lambda: set(range(10000, 14097)))
+    assert owner.survivors(containment) == {"unknown": 1}
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    assert record["current"]["observation_failed"] == 1
+    assert "private" not in json.dumps(record)
+
+
+class _Kernel:
+    def __init__(self, *, wait=258, start=42, member=True, opened=True, times=True):
+        self.wait, self.start, self.member = wait, start, member
+        self.opened, self.times = opened, times
+        self.closed = []
+        self.access = None
+        self.OpenProcess = self.open
+
+    def open(self, access, inherit, pid):
+        self.access = access
+        assert inherit is False
+        assert pid == 101
+        return 55 if self.opened else 0
+
+    def GetProcessTimes(self, handle, created, *unused):
+        created._obj.value = self.start
+        return self.times
+
+    def IsProcessInJob(self, handle, job, member):
+        assert job.value == 66
+        member._obj.value = self.member
+        return True
+
+    def WaitForSingleObject(self, handle, timeout):
+        assert handle.value == 55
+        assert timeout == 0
+        return self.wait
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle.value)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_start", "job", "expected"),
+    [
+        ({}, 42, None, "running_or_terminating"),
+        ({"wait": 0}, 42, None, "exited"),
+        ({"wait": 0xFFFFFFFF}, 42, None, "unknown"),
+        ({"start": 43}, 42, None, "identity_changed"),
+        ({"times": False}, 42, None, "unknown"),
+        ({"opened": False}, 42, None, "unknown"),
+        ({}, None, 66, "running_or_terminating"),
+        ({"member": False}, None, 66, "identity_changed"),
+        ({"start": 43}, 42, 66, "running_or_terminating"),
+    ],
+)
+def test_cleanup_uses_one_identity_checked_native_handle(
+    monkeypatch, kwargs, expected_start, job, expected
+):
+    kernel = _Kernel(**kwargs)
+
+    # Functions on a real WinDLL allow assigning restype.
+    def open_process(*args):
+        return kernel.open(*args)
+
+    kernel.OpenProcess = open_process
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kw: kernel, raising=False)
+    assert rehearsal._cleanup_process_state(101, expected_start, job) == expected
+    assert kernel.access == 0x00101000
+    assert kernel.closed == ([55] if kernel.opened else [])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows process handles")
+def test_cleanup_native_wait_recognizes_held_exited_handle_even_exit_259():
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import os; os._exit(259)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        child.wait(timeout=20)
+        assert child.returncode == 259
+        # Popen keeps the exited process object/identity alive until its handle closes.
+        # The old exit-code-only predicate incorrectly treats this real exit as active.
+        assert type(rehearsal.started_at(child.pid)) is int
+        assert rehearsal._cleanup_process_state(child.pid, None, None) == "exited"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=20)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows Job and process handles")
+def test_normal_hidden_owned_child_cleanup_with_populated_seen_is_clean(tmp_path):
+    probe = tmp_path / "cleanup.py"
+    probe.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(_PATH.parent)!r})\n"
+        "import rehearse_desktop_mvp as r\n"
+        "job = r.Containment()\n"
+        f"owner = r.Processes(Path({str(tmp_path)!r}))\n"
+        "owner.spawn('tiny', [sys.executable, '-c', "
+        "'import threading; threading.Event().wait()'], env=os.environ, log=Path(os.devnull))\n"
+        "assert owner.seen\n"
+        "owner.stop_all()\n"
+        "assert owner.survivors(job) == {}\n"
+        "print(json.dumps({'clean': True, 'seenPopulated': bool(owner.seen)}))\n",
+        encoding="utf-8",
+    )
+    base = getattr(sys, "_base_executable", sys.executable)
+    completed = subprocess.run(
+        [base, str(probe)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.splitlines()[-1]) == {"clean": True, "seenPopulated": True}

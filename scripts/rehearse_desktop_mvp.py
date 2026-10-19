@@ -541,6 +541,47 @@ class Containment:
         return {int(pid) for pid in ids}
 
 
+def _cleanup_process_state(pid: int, expected_start: int | None, job: int | None) -> str:
+    """Observe one identity through one handle; never wait, terminate, or infer exit from 259.
+
+    A nonsignaled handle cannot distinguish execution from asynchronous termination.
+    https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
+    """
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel.OpenProcess(0x00101000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+    if not handle:
+        return "unknown"
+    try:
+        owned = expected_start is None and job is None
+        if expected_start is not None:
+            times = [ctypes.c_uint64() for _ in range(4)]
+            if not kernel.GetProcessTimes(
+                ctypes.c_void_p(handle), *(ctypes.byref(value) for value in times)
+            ):
+                return "unknown"
+            owned = times[0].value == expected_start
+        if job is not None:
+            member = ctypes.c_int()
+            if not kernel.IsProcessInJob(
+                ctypes.c_void_p(handle), ctypes.c_void_p(job), ctypes.byref(member)
+            ):
+                return "unknown"
+            # Job membership remains authoritative even if a tracked PID was reused.
+            owned |= bool(member.value)
+        if not owned:
+            return "identity_changed"
+        wait = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+        if wait == 0:  # WAIT_OBJECT_0: the process object is signaled.
+            return "exited"
+        if wait == 258:  # WAIT_TIMEOUT: executing or termination has not finished.
+            return "running_or_terminating"
+        return "unknown"
+    finally:
+        kernel.CloseHandle(ctypes.c_void_p(handle))
+
+
 def descendants(table: Mapping[int, tuple[int, str]], roots: set[int]) -> set[int]:
     """The roots that are alive and every process below them."""
 
@@ -562,6 +603,7 @@ class Processes:
         # survivor whose root already exited is still found, and a reused pid is not.
         self.seen: dict[int, tuple[str, int]] = {}
         self._logs: list[TextIO | Any] = []
+        self.first_cleanup_refusal: dict[str, Any] | None = None
 
     def spawn(
         self,
@@ -656,14 +698,51 @@ class Processes:
                 stream.close()
 
     def survivors(self, containment: Containment | None) -> dict[str, int]:
-        """What is left running, by image name: every process still in the job, and any
-        process seen in an owned tree, so nothing that escaped either view is missed."""
+        """Count live/unknown owned processes, retaining evidence at this exact boundary.
 
-        table = process_table()
-        left = {pid for pid, _ in self.alive()}
-        if containment is not None:
-            left |= containment.members() - {os.getpid()}
-        return dict(Counter(table[pid][1] for pid in left if pid in table))
+        An exited process object can outlive its execution while handles remain open.
+        Job membership and a Toolhelp row alone therefore do not establish liveness.
+        """
+
+        states = ("exited", "running_or_terminating", "identity_changed", "unknown")
+        snapshot: dict[str, Any] = {
+            "tracked": dict.fromkeys(states, 0),
+            "job_only": dict.fromkeys(states, 0),
+            "observation_failed": 0,
+        }
+        left: Counter[str] = Counter()
+        try:
+            table = process_table()
+            # A historical identity absent from this successful native snapshot is not
+            # running at this boundary. A Job-listed PID missing from it stays unknown.
+            tracked = self.seen.keys() & table.keys()
+            members = containment.members() - {os.getpid()} if containment is not None else set()
+            candidates = tracked | members
+            if len(candidates) > 4096:
+                raise OSError("cleanup process observation bound exceeded")
+            for pid in sorted(candidates):
+                kind = "tracked" if pid in tracked else "job_only"
+                expected_start = self.seen[pid][1] if pid in tracked else None
+                job = containment._job if containment is not None and pid in members else None
+                state = (
+                    _cleanup_process_state(pid, expected_start, job)
+                    if pid in table else "unknown"
+                )
+                snapshot[kind][state] += 1
+                if state == "running_or_terminating":
+                    left[table[pid][1]] += 1
+                elif state == "unknown":
+                    left["unknown"] += 1
+        except OSError:
+            snapshot["observation_failed"] = 1
+            left["unknown"] += 1
+        finally:
+            if left and self.first_cleanup_refusal is None:
+                self.first_cleanup_refusal = snapshot
+            print("[desktop-mvp-cleanup] " + json.dumps({
+                "current": snapshot, "first_refusal": self.first_cleanup_refusal,
+            }, separators=(",", ":")), flush=True)
+        return dict(left)
 
 
 def listeners(port: int) -> list[str]:
