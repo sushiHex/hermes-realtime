@@ -98,6 +98,75 @@ async def test_close_and_emitted_summary_keep_first_cleanup_refusal(tmp_path, mo
     assert "private" not in json.dumps(summary)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_refusal", [False, True])
+async def test_public_summary_refuses_stop_error_even_after_healthy_query(
+    tmp_path, monkeypatch, capsys, prior_refusal
+):
+    owner = rehearsal.Processes(tmp_path)
+    if prior_refusal:
+        owner.seen[101] = ("private.exe", 42)
+        monkeypatch.setattr(rehearsal, "process_table", lambda: {101: (99, "private.exe")})
+        monkeypatch.setattr(
+            rehearsal, "_cleanup_process_state", lambda *args: "running_or_terminating"
+        )
+        assert owner.survivors(None)
+    first = owner.first_cleanup_refusal
+    queries = []
+
+    def healthy_query():
+        queries.append(True)
+        return {}
+
+    monkeypatch.setattr(rehearsal, "process_table", healthy_query)
+    ports = []
+    monkeypatch.setattr(rehearsal, "listeners", lambda port: ports.append(port) or [])
+
+    def stop_error(*args):
+        raise OSError("private path, process ID and exception detail")
+
+    monkeypatch.setattr(owner, "stop_all", stop_error)
+    run = object.__new__(rehearsal.Rehearsal)
+    run.browser = run.playwright = run.containment = None
+    run.processes = owner
+    run.stand_in = SimpleNamespace(close=AsyncMock(), requests={})
+    run.api_port, run.companion_port, run.host_port = 1, 2, 3
+    run.home, run.logs_dir, run.state_dir = (tmp_path / name for name in ("home", "logs", "state"))
+    run.records = [{"step": "1", "outcome": "as_expected"}]
+    for name in (
+        "setup",
+        "gate",
+        "start_and_talk",
+        "typed",
+        "delegate",
+        "interrupt",
+        "cancel",
+        "reconnect",
+        "restart",
+        "delete",
+        "reload_inputs",
+        "cleanup",
+    ):
+        monkeypatch.setattr(run, name, AsyncMock())
+    monkeypatch.setattr(rehearsal, "Rehearsal", lambda *args: run)
+    monkeypatch.setattr(rehearsal, "Containment", lambda: None)
+    monkeypatch.setattr(rehearsal, "_synthesize_clips", AsyncMock(return_value={}))
+    assert await rehearsal._rehearse(tmp_path, "stand-in") == 1
+    run.stand_in.close.assert_awaited_once()
+    assert queries == [True]
+    assert ports == [7880, 1, 2, 3]
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1].removeprefix(rehearsal._PREFIX))
+    assert summary["processes_left"] == {"<unknown>": 1}
+    assert summary["cleanup_stop_failed"] is True
+    assert summary["ports_listening"] == 0
+    assert summary["first_cleanup_refusal"] is not None
+    if prior_refusal:
+        assert summary["first_cleanup_refusal"] == first
+    else:
+        assert summary["first_cleanup_refusal"]["stop_failed"] == 1
+    assert "private" not in json.dumps(summary)
+
+
 def test_unknown_cleanup_category_cannot_collide_with_an_image(tmp_path, monkeypatch, capsys):
     owner = rehearsal.Processes(tmp_path)
     states = iter(["running_or_terminating", "unknown"])

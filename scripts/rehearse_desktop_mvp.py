@@ -603,6 +603,7 @@ class Processes:
         self.seen: dict[int, tuple[str, int]] = {}
         self._logs: list[TextIO | Any] = []
         self.first_cleanup_refusal: dict[str, Any] | None = None
+        self.cleanup_stop_failed = False
 
     def spawn(
         self,
@@ -749,6 +750,7 @@ class Processes:
             "tracked": dict.fromkeys(states, 0),
             "job_only": dict.fromkeys(states, 0),
             "observation_failed": 0,
+            "stop_failed": int(self.cleanup_stop_failed),
         }
         left: Counter[str] = Counter()
         try:
@@ -770,6 +772,9 @@ class Processes:
             snapshot["observation_failed"] = 1
             left["<unknown>"] += 1
         finally:
+            # A later successful query must not erase a failed stop/settlement call.
+            if self.cleanup_stop_failed:
+                left["<unknown>"] = max(1, left["<unknown>"])
             if left and self.first_cleanup_refusal is None:
                 self.first_cleanup_refusal = snapshot
             print("[desktop-mvp-cleanup] " + json.dumps({
@@ -2853,12 +2858,16 @@ class Rehearsal:
         with contextlib.suppress(Exception):
             if self.playwright is not None:
                 await self.playwright.stop()
-        self.processes.stop_all(self.containment)
+        try:
+            self.processes.stop_all(self.containment)
+        except OSError:
+            self.processes.cleanup_stop_failed = True
         await self.stand_in.close()
         ports = [7880, self.api_port, self.companion_port, self.host_port]
         return {
             "processes_left": self.processes.survivors(self.containment),
             "first_cleanup_refusal": self.processes.first_cleanup_refusal,
+            "cleanup_stop_failed": self.processes.cleanup_stop_failed,
             "contained": self.containment is not None,
             "ports_listening": sum(1 for port in ports if listeners(port)),
         }
