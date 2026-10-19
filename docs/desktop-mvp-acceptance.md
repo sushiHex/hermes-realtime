@@ -45,6 +45,12 @@ test installation, these rules override its setup and process-control examples:
   the test home's `.env` to the host. Keep the test voice tail and run record in
   separate state paths. A refused API or companion bind is a setup finding;
   select another free port instead of terminating its listener.
+- Start the API through the pinned Hermes gateway (`hermes gateway run`), which
+  enables its approval notification path. A standalone API adapter is not an
+  equivalent acceptance setup. Use explicit `approvals.mode: manual`, no YOLO
+  override and no command allowlist in the isolated profile; verify that the
+  API toolset exposes `terminal` before the installed gate. This tests top-level
+  API runs, not delegated subagents, whose approval policy is different.
 - Reuse the pinned shared LiveKit executable through the existing verified
   resolver at its documented endpoint; this procedure does not add an
   alternate LiveKit launch mode. If the shared LiveKit endpoint is occupied or
@@ -69,8 +75,31 @@ phi4-mini at context 4096 with Ollama 0.40.4 and pinned Hermes commit
 `29112bef099274229cadff79cdff7bf7b99c4b77`. This is a qualification candidate;
 it does not change the project default or claim that human acceptance has
 passed. Record the exact model identifier and effective context reported by the
-host. Use the qualified Ollama installation and exact model name shown by
-`ollama list`.
+host. Use the exact model name shown by `ollama list`. Run the foreground's
+Ollama 0.40.4 as a session-owned process with `OLLAMA_GO_TEMPLATE=1`; leave
+`LLAMA_ARG_CONTEXT_SHIFT` and `OLLAMA_CONTEXT_LENGTH` unset in that process
+environment. Do not change a preexisting Ollama service. These are the
+source-backed launch preconditions for this Phi artifact's Go-template path,
+not a universal model-metadata context guard.
+
+Qualify the installed Hermes API first, in its own interpreter. Under the
+hidden process ownership rules above, use the frozen candidate script:
+
+```powershell
+& "<test-home>\hermes-agent\venv\Scripts\python.exe" `
+  "<candidate>\scripts\real_hermes_api_gate.py" `
+  --hermes-home "<test-home>" `
+  --hermes-api-url "<test-api-url>"
+```
+
+Leave `HERMES_REALTIME_LIVEKIT_LOCAL` unset for this API gate. Its optional
+legacy Codex host-composition probe is a different configuration and is not
+required for #67. Do not install the speech stack into Hermes merely to run
+that probe. The API gate performs real background inference; its pass is not
+voice-host acceptance. Test the selected voice host separately below, using
+its own verified installation. Record both models and contexts. Declared tool
+support does not establish that a model will produce the required tool call
+or approval request.
 
 After the installed gate and wheel equality check pass, launch the verified
 host installation's console script directly. The wheel defines
@@ -94,6 +123,7 @@ $env:HERMES_HOME = "<test-home>"
   --voice-tail "<test-state>\voice-tail-v1.json" `
   --port "<test-host-port>" `
   --inference-provider ollama `
+  --ollama-base-url "<test-ollama-url>" `
   --ollama-model "<exact name from ollama list>" `
   --ollama-num-ctx 4096 `
   --persistent-loopback-launch `
