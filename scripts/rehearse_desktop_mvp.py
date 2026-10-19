@@ -538,8 +538,10 @@ class Containment:
         return {int(pid) for pid in ids}
 
 
-def _cleanup_process_state(pid: int, expected_start: int | None, job: int | None) -> str:
-    """Observe one identity through one handle; never wait, terminate, or infer exit from 259.
+def _cleanup_process_state(
+    pid: int, expected_start: int | None, job: int | None, wait_ms: int = 0
+) -> str:
+    """Observe one identity through one handle; never terminate or infer exit from 259.
 
     A nonsignaled handle cannot distinguish execution from asynchronous termination.
     https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
@@ -569,7 +571,7 @@ def _cleanup_process_state(pid: int, expected_start: int | None, job: int | None
             owned |= bool(member.value)
         if not owned:
             return "identity_changed"
-        wait = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+        wait = kernel.WaitForSingleObject(ctypes.c_void_p(handle), wait_ms)
         if wait == 0:  # WAIT_OBJECT_0: the process object is signaled.
             return "exited"
         if wait == 258:  # WAIT_TIMEOUT: executing or termination has not finished.
@@ -677,8 +679,12 @@ class Processes:
         except subprocess.TimeoutExpired:
             return None
 
-    def stop_all(self) -> None:
-        """Kill every owned tree, then any process from one that outlived its root."""
+    def stop_all(self, containment: Containment | None = None) -> None:
+        """Kill owned trees, then give their native handles one shared five-second wait budget.
+
+        Termination is asynchronous. This wait budget does not bound query/termination
+        overhead or establish atomic cleanup. The caller must requery with survivors().
+        """
 
         for name in reversed(list(self.roots)):
             self.kill(name)
@@ -693,6 +699,43 @@ class Processes:
         for stream in self._logs:
             with contextlib.suppress(OSError):
                 stream.close()
+        observation = {
+            "wait_budget_ms": 5000, "candidates": 0, "exited": 0,
+            "running_or_terminating": 0, "identity_changed": 0, "unknown": 0,
+            "observation_failed": 0,
+        }
+        deadline = time.monotonic() + observation["wait_budget_ms"] / 1000
+        try:
+            table, tracked, members, candidates = self._cleanup_candidates(containment)
+            observation["candidates"] = len(candidates)
+            for pid in sorted(candidates):
+                wait_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                expected_start = self.seen[pid][1] if pid in tracked else None
+                job = containment._job if containment is not None and pid in members else None
+                state = (
+                    _cleanup_process_state(pid, expected_start, job, wait_ms)
+                    if pid in table else "unknown"
+                )
+                observation[state] += 1
+        except OSError:
+            observation["observation_failed"] = 1
+            raise
+        finally:
+            print("[desktop-mvp-cleanup-settlement] " + json.dumps(
+                observation, separators=(",", ":")), flush=True)
+
+    def _cleanup_candidates(
+        self, containment: Containment | None
+    ) -> tuple[dict[int, tuple[int, str]], set[int], set[int], set[int]]:
+        table = process_table()
+        # A historical identity absent from this successful native snapshot is not
+        # running at this boundary. A Job-listed PID missing from it stays unknown.
+        tracked = self.seen.keys() & table.keys()
+        members = containment.members() - {os.getpid()} if containment is not None else set()
+        candidates = tracked | members
+        if len(candidates) > 4096:
+            raise OSError("cleanup process observation bound exceeded")
+        return table, tracked, members, candidates
 
     def survivors(self, containment: Containment | None) -> dict[str, int]:
         """Count live/unknown owned processes, retaining evidence at this exact boundary.
@@ -709,14 +752,7 @@ class Processes:
         }
         left: Counter[str] = Counter()
         try:
-            table = process_table()
-            # A historical identity absent from this successful native snapshot is not
-            # running at this boundary. A Job-listed PID missing from it stays unknown.
-            tracked = self.seen.keys() & table.keys()
-            members = containment.members() - {os.getpid()} if containment is not None else set()
-            candidates = tracked | members
-            if len(candidates) > 4096:
-                raise OSError("cleanup process observation bound exceeded")
+            table, tracked, members, candidates = self._cleanup_candidates(containment)
             for pid in sorted(candidates):
                 kind = "tracked" if pid in tracked else "job_only"
                 expected_start = self.seen[pid][1] if pid in tracked else None
@@ -2817,7 +2853,7 @@ class Rehearsal:
         with contextlib.suppress(Exception):
             if self.playwright is not None:
                 await self.playwright.stop()
-        self.processes.stop_all()
+        self.processes.stop_all(self.containment)
         await self.stand_in.close()
         ports = [7880, self.api_port, self.companion_port, self.host_port]
         return {

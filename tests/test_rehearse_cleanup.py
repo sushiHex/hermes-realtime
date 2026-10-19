@@ -76,16 +76,20 @@ async def test_close_and_emitted_summary_keep_first_cleanup_refusal(tmp_path, mo
     monkeypatch.setattr(rehearsal, "process_table", lambda: {101: (99, "private-image.exe")})
     states = iter(["running_or_terminating", "exited"])
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
-    monkeypatch.setattr(owner, "stop_all", lambda: None)
+    containment = SimpleNamespace(_job=66, members=lambda: set())
+    stops = []
+    monkeypatch.setattr(owner, "stop_all", lambda *args: stops.append(args))
     monkeypatch.setattr(rehearsal, "listeners", lambda port: [])
     assert owner.survivors(None)
     first = owner.first_cleanup_refusal
     run = object.__new__(rehearsal.Rehearsal)
-    run.browser = run.playwright = run.containment = None
+    run.browser = run.playwright = None
+    run.containment = containment
     run.processes = owner
     run.stand_in = SimpleNamespace(close=AsyncMock())
     run.api_port, run.companion_port, run.host_port = 1, 2, 3
     record = await run.close()
+    assert stops == [(containment,)]
     assert record["processes_left"] == {}
     assert record["first_cleanup_refusal"] == first
     rehearsal._emit({"name": "summary"} | record)
@@ -237,6 +241,95 @@ def test_started_at_uses_the_same_zero_time_handle_liveness(monkeypatch, kwargs,
     assert kernel.closed == ([55] if kernel.opened else [])
 
 
+@pytest.mark.parametrize(
+    ("now", "expected_waits"), [([10, 11, 13], [4000, 2000]), ([10, 11, 16], [4000, 0])]
+)
+def test_cleanup_settlement_shares_one_wait_budget_including_job_only(
+    tmp_path, monkeypatch, capsys, now, expected_waits
+):
+    owner = rehearsal.Processes(tmp_path)
+    owner.seen[101] = ("private.exe", 42)
+    monkeypatch.setattr(owner, "alive", lambda: [])
+    monkeypatch.setattr(
+        rehearsal, "process_table", lambda: {101: (99, "private.exe"), 102: (99, "private.exe")}
+    )
+    ticks = iter(now)
+    monkeypatch.setattr(rehearsal.time, "monotonic", lambda: next(ticks))
+    calls = []
+
+    def state(pid, expected_start, job, wait_ms=0):
+        calls.append((pid, expected_start, job, wait_ms))
+        return "exited" if pid == 101 else "running_or_terminating"
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", state)
+    owner.stop_all(SimpleNamespace(_job=66, members=lambda: {102}))
+    assert calls == [(101, 42, None, expected_waits[0]), (102, None, 66, expected_waits[1])]
+    assert owner.first_cleanup_refusal is None
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup-settlement] "))
+    assert record == {
+        "wait_budget_ms": 5000,
+        "candidates": 2,
+        "exited": 1,
+        "running_or_terminating": 1,
+        "identity_changed": 0,
+        "unknown": 0,
+        "observation_failed": 0,
+    }
+    assert "private" not in json.dumps(record)
+
+
+def test_cleanup_settlement_waits_on_the_identity_checked_handle(monkeypatch):
+    kernel = _Kernel(wait=0)
+
+    def open_process(*args):
+        return kernel.open(*args)
+
+    kernel.OpenProcess = open_process
+    waits = []
+    kernel.WaitForSingleObject = lambda handle, ms: waits.append((handle.value, ms)) or 0
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kw: kernel, raising=False)
+    assert rehearsal._cleanup_process_state(101, 42, None, wait_ms=1234) == "exited"
+    assert waits == [(55, 1234)]
+    assert kernel.closed == [55]
+
+
+@pytest.mark.parametrize("state", ["running_or_terminating", "unknown"])
+def test_final_cleanup_requeries_new_job_child_after_settlement(
+    tmp_path, monkeypatch, capsys, state
+):
+    owner = rehearsal.Processes(tmp_path)
+    tables = iter(
+        [{101: (99, "private.exe")}, {101: (99, "private.exe"), 202: (101, "new-private.exe")}]
+    )
+    members = iter([{101}, {101, 202}])
+    monkeypatch.setattr(rehearsal, "process_table", lambda: next(tables))
+    monkeypatch.setattr(
+        rehearsal, "_cleanup_process_state", lambda pid, *args: "exited" if pid == 101 else state
+    )
+    containment = SimpleNamespace(_job=66, members=lambda: next(members))
+    owner.stop_all(containment)
+    assert owner.first_cleanup_refusal is None
+    assert owner.survivors(containment) == (
+        {"new-private.exe": 1} if state == "running_or_terminating" else {"<unknown>": 1}
+    )
+    assert owner.first_cleanup_refusal["job_only"][state] == 1
+
+
+def test_cleanup_settlement_reports_native_failure_without_masking(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+
+    def broken():
+        raise OSError("private query detail")
+
+    monkeypatch.setattr(rehearsal, "process_table", broken)
+    with pytest.raises(OSError):
+        owner.stop_all(None)
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup-settlement] "))
+    assert record["observation_failed"] == 1
+    assert owner.first_cleanup_refusal is None
+    assert "private" not in json.dumps(record)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows process handles")
 def test_cleanup_native_wait_recognizes_held_exited_handle_even_exit_259():
     child = subprocess.Popen(
@@ -271,7 +364,7 @@ def test_normal_hidden_owned_child_cleanup_with_populated_seen_is_clean(tmp_path
         "owner.spawn('tiny', [sys.executable, '-c', "
         "'import threading; threading.Event().wait()'], env=os.environ, log=Path(os.devnull))\n"
         "assert owner.seen\n"
-        "owner.stop_all()\n"
+        "owner.stop_all(job)\n"
         "assert owner.survivors(job) == {}\n"
         "print(json.dumps({'clean': True, 'seenPopulated': bool(owner.seen)}))\n",
         encoding="utf-8",
