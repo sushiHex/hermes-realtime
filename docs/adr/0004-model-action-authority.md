@@ -90,8 +90,11 @@ Neither mechanism currently supplies #284's confirmation boundary.
 Add a separate host-owned pending proposal ahead of the existing work surface:
 
 - Keep at most one immutable, bounded objective, bound to its source user turn,
-  session/control generation and host-issued proposal identity. Creating,
-  presenting or declining it must perform no dispatch or task cancellation.
+  authenticated participant, session generation and host-issued proposal identity.
+  Use the worker's `session_generation`, not the foreground lease generation
+  that changes between turns. Creating, presenting or declining a proposal must
+  perform no dispatch or task cancellation. A proposal is not a `_PendingStart`,
+  an active task, or a reservation in task-status/capacity accounting.
 - Deterministic readback/presentation and dispatch must use the same exact stored
   objective by equality. An edit or replacement needs a new proposal and fresh
   confirmation; duplicate-objective normalization is not confirmation equality.
@@ -100,6 +103,11 @@ Add a separate host-owned pending proposal ahead of the existing work surface:
   existing start path; recheck session, proposal, expiry and work-control health
   at admission. Replayed, stale or unrelated yes grants no authority. Model text,
   history, memory and work results cannot confirm a proposal.
+- Require complete presentation of the bound objective before confirmation can
+  be admitted. A speech path needs all expected readback chunks transport-confirmed,
+  using the delivery ledger's accounting rather than a foreground turn-end event.
+  A text control must present the full objective and bind its action to that
+  proposal. Presentation/delivery evidence does not prove human comprehension.
 - Define how a spoken yes binds to the exact objective when readback is
   interrupted, another user turn intervenes, or the connection/session changes.
   Also define rejection, expiry, replacement and replay behavior. A plain yes
@@ -107,6 +115,10 @@ Add a separate host-owned pending proposal ahead of the existing work surface:
   design requirements, not properties of the current speech path. Speech design
   must also account for recognition of the host's own readback and any TTS
   normalization that changes what is heard relative to the stored objective.
+  Existing echo suppression and optional speech-presence verification do not
+  establish that a short yes is the user's confirmation. Edge and Kokoro can
+  transform text before synthesis, so stored-text equality alone does not prove
+  an equivalent audible readback.
 - Reuse the existing controller's objective, identity, capacity, replay and
   acknowledgment checks after confirmation. Proposal, confirmation and command
   admission are not accepted task starts. Report started only after Hermes's
@@ -116,6 +128,11 @@ Add a separate host-owned pending proposal ahead of the existing work surface:
   grants only dispatch of the stored objective, never realtime cancellation or
   downstream approval authority; existing explicit controls and Hermes policy
   continue to decide those effects.
+
+The [browser approval intake](../../src/hermes_realtime/client/session.py)
+offers an existing pattern for participant/session binding and sequenced,
+idempotent decisions. Reuse that pattern where appropriate, not its downstream
+approval authority: proposal confirmation must be a distinct operation.
 
 The first production slice should establish this effect boundary and its isolated
 mutation/control checks before voice integration. Provider framing, proposal
