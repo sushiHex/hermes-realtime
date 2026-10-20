@@ -12,8 +12,8 @@ The owner approved a resource-first qualification-contract correction on
 The [owner decision on 2026-10-16](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
 supersedes automatic natural starts: the model may propose an objective, but the
 user must explicitly confirm that exact objective before dispatch. This policy
-is accepted; the implementation boundary below is proposed, not implemented or
-qualified. The [MVP decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
+is accepted; the confirmation contract below is implemented in the candidate and
+requires its separate deterministic, model, backend and human qualifications. The [MVP decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
 keeps natural routing off and uses explicit task commands with phi4-mini. This
 amendment neither changes a model default nor authorizes activation.
 
@@ -74,86 +74,104 @@ and ambiguity checks. Model text is never routed back as a user command.
 Speaking interrupts speech and the foreground turn, not background tasks.
 Interruption after work admission must not cancel independently owned work.
 
-## Proposed implementation boundary
+## Confirmation contract
 
-This section recommends the smallest implementation slice for #284. It does not
-approve a wire schema, confirmation grammar, expiry duration or voice interaction.
-These details need review before implementation or another model experiment.
+The host owns one immutable pending proposal ahead of the existing
+[work surface](../../src/hermes_realtime/conversation/work_tools.py), separate
+from dispatched tasks and its acknowledgment-waiting `_PendingStart`. The
+[proposal boundary](../../src/hermes_realtime/conversation/task_proposals.py)
+retains the exact objective, authenticated participant, worker session generation
+and a host-issued identity. A random host prefix plus monotonically increasing
+browser-safe serial prevents identity reuse with constant retained state. The
+foreground lease changes between turns and is not the confirmation binding.
 
-The current [work surface](../../src/hermes_realtime/conversation/work_tools.py)
-dispatches an admitted start immediately. Its `_PendingStart` tracks a dispatch
-awaiting acknowledgment, including explicit cancellation after acknowledgment; it
-is not a user-confirmable proposal. The existing
-[command router](../../src/hermes_realtime/conversation/commands.py) consumes
-explicit start/cancel commands before inference and has no confirmation route.
-Neither mechanism currently supplies #284's confirmation boundary.
+A proposal is limited to 1,024 Unicode code points, independently of any larger
+explicit-command capacity. Providers advertise that same bound. The full text
+card, deterministic readback and confirmed dispatch all use the same stored
+objective, without trimming, Markdown removal or semantic rewriting. A new or
+changed objective requires a new proposal and fresh confirmation. A proposal
+reserves no task capacity, dispatches nothing, and cannot cancel any work.
 
-Add a separate host-owned pending proposal ahead of the existing work surface:
+Both providers keep the historical `start_work` wire selection name, but emit
+only a terminal internal `HostTaskProposalRequest`; neither calls task dispatch
+or consumes task acknowledgments. The current host foreground lease must admit
+that item before it can create a proposal. The host reads it back as
+`Proposed background task. {objective} Shall I send this task?` The fixed template
+contains no assent examples. The model cannot confirm its own objective.
 
-- Keep at most one immutable, bounded objective, bound to its source user turn,
-  authenticated participant, session generation and host-issued proposal identity.
-  Use the worker's `session_generation`, not the foreground lease generation
-  that changes between turns. Creating, presenting or declining a proposal must
-  perform no dispatch or task cancellation. A proposal is not a `_PendingStart`,
-  an active task, or a reservation in task-status/capacity accounting.
-- Deterministic readback/presentation and dispatch must use the same exact stored
-  objective by equality. An edit or replacement needs a new proposal and fresh
-  confirmation; duplicate-objective normalization is not confirmation equality.
-- Admit confirmation only from trusted user input or a proposal-specific host control
-  that identifies the current proposal. Consume it once before invoking the
-  existing start path; recheck session, proposal, expiry and work-control health
-  at admission. Replayed, stale or unrelated yes grants no authority. Model text,
-  history, memory and work results cannot confirm a proposal.
-- Require complete presentation of the bound objective before confirmation can
-  be admitted. A speech path needs all expected readback chunks transport-confirmed,
-  using the delivery ledger's accounting rather than a foreground turn-end event:
-  after the complete bound readback is queued, require nonzero queued chunks and
-  `transport_confirmed_full_count == queued_chunk_count`. Interrupted readback,
-  including a yes that interrupts it, cannot be confirmed.
-  A text control must present the full objective and bind its action to that
-  proposal. Presentation/delivery evidence does not prove human comprehension.
-- Define how a spoken yes binds to the exact objective when readback is
-  interrupted, another user turn intervenes, or the connection/session changes.
-  Also define rejection, expiry, replacement and replay behavior. A plain yes
-  without that host-established binding must not dispatch. These are unresolved
-  design requirements, not properties of the current speech path. Speech design
-  must also account for recognition of the host's own readback and any TTS
-  normalization that changes what is heard relative to the stored objective.
-  Existing echo suppression and optional speech-presence verification do not
-  establish that a short yes is the user's confirmation. Edge and Kokoro can
-  transform text before synthesis, so stored-text equality alone does not prove
-  an equivalent audible readback. Keep assent examples out of the fixed readback
-  template; quoted objective content cannot confirm itself. Assistant or host
-  speech between readback and assent must invalidate the spoken-confirmation
-  binding, or be deferred while that binding is live. This includes idle mentions
-  and background-result announcements.
-- Reuse the existing controller's objective, identity, capacity, replay and
-  acknowledgment checks after confirmation. Proposal, confirmation and command
-  admission are not accepted task starts. Report started only after Hermes's
-  validated accepted acknowledgment; rejection and uncertainty remain distinct.
-- Keep proposal retirement separate from named-task cancellation. Readback or
-  foreground interruption cannot cancel admitted background work. Confirmation
-  grants only dispatch of the stored objective, never realtime cancellation or
-  downstream approval authority; existing explicit controls and Hermes policy
-  continue to decide those effects.
+The exact full-text card offers Confirm and Decline through a separate sequenced,
+authenticated `/api/v1/task-proposal-decision` operation. The request carries the
+proposal identity, objective, worker generation, decision and sequence. Server
+binding, proposal identity and exact objective equality are rechecked before the
+proposal is consumed. A settled HTTP request means admission was attempted; it
+is not an accepted task acknowledgment. This protocol adds a strict public event
+kind and endpoint; an older browser that does not recognize the event fails
+closed and must refresh to the matching bundled client.
 
-The [browser approval intake](../../src/hermes_realtime/client/session.py)
-offers an existing pattern for participant/session binding and sequenced,
-idempotent decisions. Reuse that pattern where appropriate, not its downstream
-approval authority: proposal confirmation must be a distinct operation.
+Spoken confirmation requires all of these conditions:
 
-The first production slice should establish this effect boundary and its isolated
-mutation/control checks before voice integration. Provider framing, proposal
-presentation and confirmation intake must then use the same host-owned boundary;
-neither provider may retain a direct model-to-dispatch route. The choice of UI or
-spoken confirmation transport remains open. This document adds no implementation.
+- The complete readback is queued, the ledger's queued count is nonzero, and
+  its `transport_confirmed_full_count == queued_chunk_count`. The joined
+  transport-confirmed readback must also equal the complete expected readback.
+- The exact configured Edge or Kokoro text projection leaves that readback
+  unchanged. Emphasis stripping, pronunciation substitutions, unknown TTS
+  projection, missing or interrupted chunks do not qualify spoken confirmation;
+  the full-text card remains available. Delivery is not proof of hearing.
+- At captured speech onset, the worker latches a clean binding: an echo guard
+  exists, playback is neither active nor retained by that guard, the onset is not
+  echo dominated, no foreground speech is being interrupted, and retained
+  pre-roll frames were captured without foreground or recent playback. Delayed
+  transcription cannot upgrade an ineligible onset after the echo tail expires.
+- No assistant or host audio begins after readback completion or between captured
+  onset and the final transcript. This includes idle and result announcements,
+  readiness cues and late chunks bearing the same proposal tag. Such audio clears
+  the spoken binding. A repeated completion cannot rearm it or renew expiry.
+- The entire final utterance matches one of `yes`, `yeah`, `yep`, `sure`, `okay`,
+  `go ahead`, `do it`, or `please do`, ignoring case, outer whitespace and trailing
+  `.`, `!` or `?` only. Quoted, wrapped, extended or negated utterances do not match.
+  There is no substring classifier, second inference or model assent authority.
+
+An early or noisy affirmative is refused with a visible retry reason and leaves
+that proposal available until expiry; it is not recorded as a decline. Another
+nonaffirmative final user input retires the proposal. A typed affirmative can
+confirm the already projected full-text card using its authenticated worker
+binding; it does not assert audio delivery. Decline, participant/session changes,
+media reconnection, session retirement and expiry remove proposal authority
+without touching independently admitted background tasks. A fresh foreground
+turn alone does not retire a proposal before its confirmation is routed.
+
+The initial deadline is 60 seconds after successful card publication. A first
+complete, exact, unexpired readback extends it once to 60 seconds after that
+completion. Partial or expired readback cannot extend it; duplicate completion
+cannot extend or revive it. Confirmation consumes the proposal synchronously
+before any suspension in ordinary work admission. Stale or replayed decisions
+cannot dispatch it again, and no historical proposal registry grants authority.
+
+Browser mute and gain remain playback preferences. The host does not treat a
+client audibility assertion as authorization. Transport confirmation, a clean
+onset and an exact displayed card are bounded interaction evidence, not speaker
+identification, hearing or informed comprehension. The echo guard's configured
+retention is an engineering assumption; late echoes, transcription errors and
+bystander assent remain residual risks requiring human voice acceptance. A magic
+confirmation phrase would not establish speaker identity or eliminate those
+risks. Recognition of objective text by itself grants no authority.
+
+Only confirmed ordinary admission reaches the existing controller's objective,
+identity, capacity, replay and acknowledgment checks. A confirmed card or command
+is not active work. The existing task card reports active only after Hermes's
+validated accepted acknowledgment; rejection and uncertainty remain distinct.
+This slice adds no spoken-start acknowledgment. Existing completion speech and
+explicit task commands/cancellation remain available. Confirmation grants neither
+realtime task cancellation nor downstream approval authority; Hermes policy still
+governs delegated effects. Natural routing remains off by default and requires
+an explicit candidate configuration and its independent promotion gates.
 
 ## Existing provider framing
 
-The following describes the implemented automatic-start transport. Its direct
-model-start authority is superseded by the confirmation decision above and must
-be replaced before natural routing is enabled. Existing tool names and response
-shapes do not themselves implement a proposal or a confirmation grant.
+The historical wire selection names remain for compatibility with the retained
+corpora. They now select effect-free proposals, not automatic starts. Their old
+scores remain historical automatic-start observations and are not confirmation
+qualification.
 
 Provider tool handling is bounded and fail-closed. Unknown tools, malformed or
 multiple start calls, cancelled turns and invalid arguments produce no new
@@ -168,11 +186,11 @@ The schema is supplied through Ollama's documented
 Only an admitted user turn is offered the start branch. Other bound turns have
 the reply shape only; tool-less readiness retains its ordinary speech response.
 
-Ollama buffers and validates the entire response before any speech or dispatch.
+Ollama buffers and validates the entire response before any speech or proposal.
 Duplicate keys, extra fields, invalid types, incomplete or truncated responses,
 and unexpected native calls are refused. No textual-call recovery, second model
-call, or fallback transport is attempted. The existing controller admits a
-validated objective; only its accepted acknowledgment produces started speech.
+call, or fallback transport is attempted. Selection returns a typed proposal to
+the host; only user-confirmed admission can reach the existing controller.
 Disabling natural work preserves explicit commands. This decision does not
 silently change an already running session.
 
@@ -253,7 +271,7 @@ separately. No phrase filter, routing model or semantic guarantee is added.
 
 ## Trust and limits
 
-Under the proposed path, the foreground model would still propose objectives
+Under this path, the foreground model still proposes objectives
 whose fidelity the host cannot establish semantically. The required confirmation
 boundary removes the model's authority to dispatch
 an unconfirmed proposal; it does not make the proposal safe, prove informed user

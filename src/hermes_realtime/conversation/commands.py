@@ -18,6 +18,7 @@ from hermes_realtime.evidence import (
 from hermes_realtime.evidence.lifecycle import EvidenceConversationAuthorityV1
 
 from .context import ActiveTaskIdentityError, PrivateRunDisclosureError
+from .task_proposals import ConversationTaskProposals
 from .tasks import TaskCancelOutcome, TaskDispatchOutcome
 from .work_tools import WorkCommandAdmission
 
@@ -90,6 +91,7 @@ class ConversationTaskCommandRouter:
         on_command_accepted: _CommandAcceptedHook | None = None,
         validate_user_input: Callable[[str], None] | None = None,
         record_user_input: Callable[[str], Awaitable[None]] | None = None,
+        task_proposals: ConversationTaskProposals | None = None,
     ) -> None:
         if validate_user_input is not None and not callable(validate_user_input):
             raise TypeError("validate_user_input must be callable or None")
@@ -128,6 +130,7 @@ class ConversationTaskCommandRouter:
         self._on_command_accepted = on_command_accepted
         self._validate_user_input = validate_user_input
         self._record_user_input = record_user_input
+        self._task_proposals = task_proposals
 
     async def _recorded(self, text: str) -> bool:
         """Record one command's user row; False only when the text is refused as invalid."""
@@ -164,6 +167,14 @@ class ConversationTaskCommandRouter:
 
         if type(text) is not str:
             raise TypeError("command text must be an exact built-in string")
+        proposals = self._task_proposals
+        if proposals is not None and proposals.has_pending:
+            if proposals.is_confirmation(text):
+                if not await self._recorded(text):
+                    return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
+                admission = await proposals.consume_input(text)
+                return self._surface_admission_result(admission, authority)
+            proposals.intervening_input()
         stripped = text.strip()
         folded = stripped.casefold()
         spoken_start = _SPOKEN_START.fullmatch(stripped)

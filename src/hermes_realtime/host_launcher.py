@@ -76,6 +76,7 @@ from hermes_realtime.conversation import (
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import OutputStyleSelection
+from hermes_realtime.conversation.task_proposals import ConversationTaskProposals
 from hermes_realtime.evidence import (
     CaptureState,
     ConsentDisposition,
@@ -150,6 +151,7 @@ from hermes_realtime.providers import (
     SileroSpeechPresenceVerifier,
     WebRtcVoiceActivityDetector,
 )
+from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 from hermes_realtime.providers.codex_app_server import (
     CodexModelConfiguration,
     CodexTokenUsage,
@@ -1342,6 +1344,15 @@ def _bind_natural_work_tools(
     inference.bind_work_tools(surface)
 
 
+def _proposal_spoken_text(synthesizer: object, text: str) -> str | None:
+    """Project through the exact known TTS path; unknown providers cannot arm voice assent."""
+    if type(synthesizer) is KokoroSynthesizer:
+        return synthesizer._project_spoken_text(text)
+    if type(synthesizer) is EdgeTtsSynthesizer:
+        return strip_markdown_emphasis_for_speech(text)
+    return None
+
+
 def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | None:
     """Tell the operator once what a start settled from a crashed session's run record."""
     if settlement is None or settlement.stopped + settlement.unknown == 0:
@@ -2069,6 +2080,7 @@ def build_local_host_launcher(
         api_secret=livekit_api_secret,
     )
     projection = BrowserEventProjection()
+    proposals: ConversationTaskProposals | None = None
     usage_accumulator = _SessionTokenUsageAccumulator()
     production_observations, production_observation_recorder = _new_observation_channel()
     consent_dependencies = _HostEvidenceConsentDependenciesV1(
@@ -2144,6 +2156,8 @@ def build_local_host_launcher(
         projected_data = _renderer_yield_event_data(kind, data, active_renderer_authority)
         if kind in {"interrupt_requested", "session_stopped"}:
             speech_generations.clear()
+        if kind == "session_stopped" and proposals is not None:
+            proposals.close_binding()
         if _renderer_authority_ends(kind, data, active_renderer_presentation):
             active_renderer_authority = None
             active_renderer_presentation = None
@@ -2272,6 +2286,14 @@ def build_local_host_launcher(
         reserve_observer_capacity=projection.ensure_capacity,
         utterance_id_factory=lambda: uuid.uuid4().hex,
     )
+    def observe_proposal(kind: str, data: dict[str, _PublicValue]) -> None:
+        projection.publish(kind, data)
+
+    if natural_work_tools:
+        proposals = ConversationTaskProposals(
+            surface=work_surface, observer=observe_proposal,
+            speech_projection=lambda text: _proposal_spoken_text(synthesizer, text),
+        )
 
     async def record_command_input(text: str) -> None:
         await speech.record_user_input(Transcript(text=text, final=True))
@@ -2288,6 +2310,7 @@ def build_local_host_launcher(
         ),
         validate_user_input=context.validate_user_text,
         record_user_input=record_command_input,
+        task_proposals=proposals,
     )
     search_egress_authority, current_fact_lookup, knowledge_coordinator = (
         _compose_public_search(
@@ -2446,6 +2469,8 @@ def build_local_host_launcher(
                     media_incarnation,
                 ):
                     return
+                if proposals is not None:
+                    proposals.speech_started()
                 await _play_readiness_cue(
                     conversation=conversation,
                     playback=playback,
@@ -2481,6 +2506,7 @@ def build_local_host_launcher(
         playback=serialized_playback,
         ledger=DeliveredSpeechLedger(),
         task_status=work_surface.task_status,
+        task_proposals=proposals,
         observer=observe,
         max_segments=DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds=10.0,
@@ -2567,6 +2593,7 @@ def build_local_host_launcher(
             actions=shared_actions,
             stt_streams_partials=stt_provider == "moonshine",
             command_router=command_router,
+            task_proposals=proposals,
             evidence_lifecycle_resolver=(
                 (lambda: evidence_runtime.evidence_lifecycle)
                 if evidence_runtime is not None
@@ -2601,6 +2628,9 @@ def build_local_host_launcher(
         media_incarnation: int,
     ) -> None:
         previous_incarnation = media_incarnations.get(generation)
+        if (proposals is not None and previous_incarnation is not None
+                and previous_incarnation != media_incarnation):
+            proposals.retire("media_changed")
         await conversation.activate_media(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -2617,6 +2647,19 @@ def build_local_host_launcher(
     def session_started(participant_identity: str, generation: int) -> None:
         media_incarnations.clear()
         usage_accumulator.reset(participant_identity, generation)
+        if proposals is not None:
+            proposals.bind(participant_identity, generation)
+
+    async def decide_task_proposal(
+        participant_identity: str, generation: int, proposal_id: str,
+        objective: str, decision: str,
+    ) -> object:
+        if proposals is None:
+            raise PermissionError("natural task proposals are disabled")
+        return await proposals.decide(
+            participant=participant_identity, generation=generation,
+            proposal_id=proposal_id, objective=objective, decision=decision,
+        )
 
     async def decide_approval(
         participant_identity: str,
@@ -2802,6 +2845,7 @@ def build_local_host_launcher(
         worker_identity=worker_identity,
         worker=livekit_worker,
         approval=decide_approval,
+        task_proposal_decision=decide_task_proposal if proposals is not None else None,
         static_root=Path(__file__).resolve().parent / "client" / "static",
         host=browser_host,
         port=browser_port,
