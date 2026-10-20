@@ -274,6 +274,20 @@ iPhone's ineffective `HTMLMediaElement.volume`. Local onset never calls the yiel
 transcripts, or gains task authority. The explicit **Stop speaking** control still submits an
 immediate exact `(turn, generation, chunk, stream)` yield claim.
 
+The **Speaker** slider and **Mute** button beside Voice adjust assistant output immediately,
+including spoken task results, through the existing LiveKit track's
+[`setVolume`](https://docs.livekit.io/reference/client-sdk-js/classes/RemoteAudioTrack.html#setVolume)
+path. The slider supports the keyboard's native range controls. Volume (0–100%) and mute
+are saved in this browser's local storage across Disconnect/Connect and page refresh;
+invalid saved preferences use the previous 100% playback level. Unmute restores the selected
+level, and changing the slider while muted keeps output muted. If storage is blocked,
+the controls still work for this page and report **not saved** after a change.
+The selected level multiplies temporary speech attenuation and cannot undo committed
+silence. Microphone capture and task/session controls keep their existing behavior.
+[Preference tests](../web/tests/playback-volume.dom.test.ts) and the
+[mounted playback test](../web/tests/connection-main.dom.test.ts) cover gain setting,
+restoration and output-only wiring; they do not establish human audibility.
+
 Pass `projection.publish` as the observer when constructing both `ConversationSessionWorker` and `StreamingSpeechLoop`. This projects admitted user transcripts, delivered assistant transcript segments, first foreground token, and first playable audio without exposing internal turn, delegation, or run handles. Task and approval owners publish `task_state`, `completion_received`, `notification_queued`, and actionable `approval_state` events only after their own authoritative transitions; the browser runtime does not duplicate that authority.
 
 Loopback composition derives an `http://127.0.0.1:<port>` origin. Keep the launch capability in the URL fragment; the client removes it from browser history before its first request. `BrowserClientRuntime.start()` returns that launch URL, and `close()` settles the HTTP server and LiveKit worker. The runtime is one-shot: terminal stop or inactivity cleanup closes that worker rather than attempting to reuse it for another bootstrap.

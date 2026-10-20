@@ -1,12 +1,13 @@
 import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { RemoteAudioTrack, RoomEvent, Track } from "livekit-client";
 
 const media = vi.hoisted(() => ({
   connect: vi.fn<() => Promise<void>>(),
   disconnect: vi.fn<() => Promise<void>>(),
   microphone: vi.fn<() => Promise<undefined>>(),
-  rooms: [] as Array<{ emit: (event: string, participant: { identity: string } | string) => void }>,
+  rooms: [] as Array<{ emit: (event: string, ...args: unknown[]) => void }>,
 }));
 vi.mock("livekit-client", async (original) => ({
   ...await original<typeof import("livekit-client")>(),
@@ -15,13 +16,13 @@ vi.mock("livekit-client", async (original) => ({
       trackPublications: new Map(),
       setMicrophoneEnabled: media.microphone,
     };
-    handlers = new Map<string, (participant: { identity: string } | string) => void>();
+    handlers = new Map<string, (...args: unknown[]) => void>();
     constructor() { media.rooms.push(this); }
-    on(event: string, handler: (participant: { identity: string } | string) => void) {
+    on(event: string, handler: (...args: unknown[]) => void) {
       this.handlers.set(event, handler);
       return this;
     }
-    emit(event: string, participant: { identity: string } | string) { this.handlers.get(event)?.(participant); }
+    emit(event: string, ...args: unknown[]) { this.handlers.get(event)?.(...args); }
     connect = media.connect;
     disconnect = media.disconnect;
   },
@@ -111,6 +112,58 @@ function normalRequest(path: string): Response | Promise<Response> {
   if (path.startsWith("/api/v1/events")) return new Promise(() => {});
   return new Response(null, { status: 503 });
 }
+
+it("applies live speaker preference to the existing track across replacement and reconnect", async () => {
+  const { toggle, fetch } = await mount(normalRequest);
+  const slider = dom.window.document.querySelector<HTMLInputElement>("#speaker-volume")!;
+  const mute = dom.window.document.querySelector<HTMLButtonElement>("#speaker-mute")!;
+  const audio = dom.window.document.querySelector<HTMLAudioElement>("#remote-audio")!;
+  const choose = (value: string) => {
+    slider.value = value;
+    slider.dispatchEvent(new dom.window.Event("input"));
+  };
+  const subscribe = () => {
+    // Exercise the production instanceof route without opening media or an AudioContext.
+    const track = Object.assign(Object.create(RemoteAudioTrack.prototype) as RemoteAudioTrack, {
+      kind: Track.Kind.Audio,
+      setVolume: vi.fn(), attach: vi.fn(), detach: vi.fn(),
+    });
+    Object.defineProperty(track, "mediaStreamTrack", { value: { enabled: true } });
+    media.rooms.at(-1)!.emit(RoomEvent.TrackSubscribed, track, {
+      source: Track.Source.Microphone, trackName: "synthetic-output",
+    }, { identity: credential.workerIdentity });
+    expect(track.attach).toHaveBeenCalledExactlyOnceWith(audio);
+    return track;
+  };
+  choose("40");
+  expect(audio.volume).toBe(0.4);
+  toggle.click();
+  await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+  const first = subscribe();
+  expect(first.setVolume).toHaveBeenLastCalledWith(0.4);
+  fetch.mockClear();
+  choose("25");
+  expect(first.setVolume).toHaveBeenLastCalledWith(0.25);
+  mute.click();
+  expect(first.setVolume).toHaveBeenLastCalledWith(0);
+  const replacement = subscribe();
+  expect(first.detach).toHaveBeenCalledExactlyOnceWith(audio);
+  expect(replacement.setVolume).toHaveBeenLastCalledWith(0);
+  expect(replacement.mediaStreamTrack.enabled).toBe(true);
+  expect(media.microphone).toHaveBeenCalledOnce();
+  expect(media.connect).toHaveBeenCalledOnce();
+  expect(media.disconnect).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+  toggle.click();
+  await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+  toggle.click();
+  await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+  const reconnected = subscribe();
+  expect(reconnected.setVolume).toHaveBeenLastCalledWith(0);
+  mute.click();
+  expect(reconnected.setVolume).toHaveBeenLastCalledWith(0.25);
+  expect(reconnected.mediaStreamTrack.enabled).toBe(true);
+});
 
 function localModelOptions(advertisedContextTokens: number | null = 32768) {
   return {
