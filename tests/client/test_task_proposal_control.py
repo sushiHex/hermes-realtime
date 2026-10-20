@@ -499,7 +499,9 @@ async def test_real_runtime_constructor_routes_optional_proposal_control_without
 
     worker.connect = MethodType(connect, worker)
     worker.close = MethodType(close, worker)
-    (tmp_path / "index.html").write_text("<!doctype html><title>Synthetic</title>", encoding="utf-8")
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><title>Synthetic</title>", encoding="utf-8",
+    )
     runtime = BrowserClientRuntime(
         connection=LiveKitConnection("wss://livekit.test", "key", "synthetic-secret" * 3),
         room_name="room",
