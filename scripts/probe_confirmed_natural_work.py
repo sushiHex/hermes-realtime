@@ -227,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
                 finally:
                     record_unrun(rows, receipt)
             report = build_report(rows)
+            report["status"] = (
+                "completed" if report["attempts"] == 8 and report["errors"] == 0
+                else "attempt_failed"
+            )
         after = harness.source_binding()
         after["probe_sha256"] = harness.digest(Path(__file__))
         if after != before:
@@ -237,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         report.update(source_binding=before, model=args.model, model_digest=args.model_digest,
                       natural_routing_qualified=False)
         print("[confirmed-natural-probe] " + json.dumps(report, sort_keys=True))
-    return 0 if report.get("status") == "prepared_only" else 1
+    return 0 if report.get("status") in {"prepared_only", "completed"} else 1
 
 
 if __name__ == "__main__":

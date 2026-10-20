@@ -186,3 +186,41 @@ def test_aborted_tail_is_explicit_in_receipt_and_eight_case_denominator(
         8, 1, 7, 1,
     )
     assert len(report["case_outcomes"]) == 8
+
+
+@pytest.mark.parametrize("outcome", ["healthy", "partial", "error", "drift"])
+def test_live_operational_completion_is_separate_from_qualification(
+    monkeypatch, tmp_path, capsys, outcome,
+):
+    async def synthetic_attempts(**kwargs):
+        cases = probe.qualification.load_preregistration()["model_cases"]
+        for case in cases[:1] if outcome == "partial" else cases:
+            row = {"id": case["id"], "expected": case["expected"], "status": "attempted",
+                   "error": "attempt_failed" if outcome == "error" else None,
+                   "selection": "reply", "dispatches": 0, "timings": []}
+            kwargs["observations"].append(row)
+            probe.harness.write_private_row(kwargs["private_sink"], row)
+        return kwargs["observations"]
+
+    calls = 0
+
+    def binding():
+        nonlocal calls
+        calls += 1
+        return {"head": "a" * 40, "dirty": False,
+                "tree": "d" * 40 if outcome == "drift" and calls == 2 else "b" * 40}
+
+    monkeypatch.setattr(probe.harness, "verify_imports", lambda: None)
+    monkeypatch.setattr(probe.harness, "source_binding", binding)
+    monkeypatch.setattr(probe, "run_cases", synthetic_attempts)
+    code = probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(tmp_path / "receipt"), "--live",
+    ])
+    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    assert code == (0 if outcome == "healthy" else 1)
+    assert report["status"] == ("completed" if outcome == "healthy" else "attempt_failed")
+    assert report["natural_routing_qualified"] is False
+    assert report["objective_fidelity"] == report["lifecycle_claims"] == "pending"
+    assert report["denominator"] == 8
