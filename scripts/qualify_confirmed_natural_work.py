@@ -23,7 +23,7 @@ from hermes_realtime.conversation.tasks import TaskDispatchOutcome
 from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/confirmed_natural_work_v1.json"
-FIXTURE_SHA256 = "3f440f27ef52d7e8d43043d6f85f37aaf512da4fad6be701b1172531ebe6a464"
+FIXTURE_SHA256 = "b1fac791df13cf682fa03fae06fda8c751bf231690d937335d24d67fd605963e"
 
 
 def load_preregistration(path: Path = FIXTURE) -> dict[str, Any]:
