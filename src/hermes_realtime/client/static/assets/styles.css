@@ -177,6 +177,7 @@ h2 { margin-bottom: 0; font-size: 15px; font-weight: 580; letter-spacing: -0.012
 .speaker-controls input { width: 90px; margin: 0; accent-color: var(--accent); }
 .speaker-controls button { min-width: 66px; }
 .speaker-controls output { grid-column: 2 / -1; }
+.proposal-objective { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .button {
   display: inline-flex;
   align-items: center;

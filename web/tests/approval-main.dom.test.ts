@@ -49,6 +49,7 @@ async function mount(
       workerIdentity: "worker_hermes_browser", expiresInSeconds: 60, token: "synthetic.token.value" };
   };
   const decisions: Array<{ approvalId: string; decision: string; sequence: number }> = [];
+  const proposalDecisions: Array<Record<string, unknown>> = [];
   vi.stubGlobal("fetch", vi.fn((path: string, options: RequestInit) => {
     if (path === "/api/v1/local-models") return Response.json({ version: 1, available: false });
     if (path === "/api/v1/stable-bootstrap") {
@@ -72,6 +73,12 @@ async function mount(
       emit = (events) => resolve(Response.json({ version: 1, events }));
     });
     if (path === "/api/v1/approval") { decisions.push(JSON.parse(options.body as string)); return decide(); }
+    if (path === "/api/v1/task-proposal-decision") {
+      const body = JSON.parse(options.body as string) as Record<string, unknown>;
+      proposalDecisions.push(body);
+      return Response.json({version:1, proposalId:body.proposalId, generation:body.generation,
+        decision:body.decision, sequence:body.sequence});
+    }
     if (path === "/api/v1/voice-delete/status") return Response.json({ version: 1, available: true });
     if (path === "/api/v1/voice-delete") return Response.json({ version: 1 });
     return new Response(null, { status: 503 });
@@ -111,11 +118,52 @@ async function mount(
   const approve = () => card().querySelector<HTMLButtonElement>(".approve")!;
   await connect();
   await approval();
-  return { connect, stop, rebind, event, batch, approval, card, approve, decisions, toggle,
+  return { connect, stop, rebind, event, batch, approval, card, approve, decisions, proposalDecisions, toggle,
     refresh: () => refresh() };
 }
 
 afterEach(() => { dom?.window.close(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it("routes full proposal controls through authenticated intake independently of approvals and speaker mute", async () => {
+  const view = await mount();
+  const proposal = {proposalId:"proposal_12345678", objective:"Exact **objective**\nall details.",
+    generation:1, status:"pending", reason:null};
+  await view.event("task_proposal", proposal);
+  const item = dom.window.document.querySelector<HTMLElement>('[data-operation="task-proposal"]')!;
+  expect(item.querySelector(".proposal-objective")!.textContent).toBe(proposal.objective);
+  dom.window.document.querySelector<HTMLButtonElement>("#speaker-mute")!.click();
+  const confirm = item.querySelector<HTMLButtonElement>('[data-decision="confirm"]')!;
+  confirm.click(); confirm.click();
+  await vi.waitFor(() => expect(view.proposalDecisions).toEqual([{proposalId:proposal.proposalId,
+    objective:proposal.objective, generation:1, decision:"confirm", sequence:1}]));
+  expect(view.decisions).toEqual([]);
+  const fetchMock = vi.mocked(fetch);
+  const call = fetchMock.mock.calls.find(([path]) => path === "/api/v1/task-proposal-decision")!;
+  expect(call[1]?.headers).toMatchObject({Authorization:"Bearer synthetic.token.value"});
+  expect(item.textContent).not.toContain("started");
+  await view.event("task_proposal", {...proposal, status:"confirmed"});
+  expect(confirm.disabled).toBe(true);
+  await view.stop(); await view.connect();
+  expect(confirm.disabled).toBe(true);
+  await view.event("task_proposal", {...proposal, proposalId:"proposal_87654321", generation:2});
+  const next = dom.window.document.querySelector<HTMLButtonElement>('[data-proposal-id="proposal_87654321"] [data-decision="decline"]')!;
+  next.click();
+  await vi.waitFor(() => expect(view.proposalDecisions[1]).toEqual({proposalId:"proposal_87654321",
+    objective:proposal.objective, generation:2, decision:"decline", sequence:1}));
+});
+
+it("keeps the full pending proposal actionable when voice history is cleared", async () => {
+  const view = await mount();
+  const proposal = {proposalId:"proposal_12345678", objective:"Exact objective remains visible",
+    generation:1, status:"pending", reason:null};
+  await view.event("task_proposal", proposal);
+  const item = dom.window.document.querySelector<HTMLElement>('[data-operation="task-proposal"]')!;
+  await view.event("voice_conversation_cleared", {});
+  expect(item.isConnected).toBe(true);
+  expect(item.querySelector(".proposal-objective")!.textContent).toBe(proposal.objective);
+  item.querySelector<HTMLButtonElement>('[data-decision="decline"]')!.click();
+  await vi.waitFor(() => expect(view.proposalDecisions).toHaveLength(1));
+});
 
 describe("durable mounted approval identity", () => {
   it.each(["pending", "approve", "reject"])("reconciles %s replay into the same card after stop/start", async (state) => {
