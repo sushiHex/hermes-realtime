@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
@@ -417,7 +418,7 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("accept", [True, False])
-async def test_real_host_ollama_adapter_observes_effect_free_ack(
+async def test_real_host_ollama_adapter_proposes_without_ack_or_effect(
     monkeypatch: pytest.MonkeyPatch, accept: bool,
 ) -> None:
     requests: list[dict[str, object]] = []
@@ -456,13 +457,12 @@ async def test_real_host_ollama_adapter_observes_effect_free_ack(
         handler.begin_case("nw-001", started_at=time.perf_counter())
         case = evaluator.load_corpus(evaluator._DEFAULT_CORPUS).cases[0]
         snapshot = evaluator._snapshot(case, 1)
-        spoken = [part async for part in inference.stream(snapshot, turn_id="turn_ack")]
-        assert spoken == [
-            "I've started that background task." if accept
-            else "The background task was not accepted."
-        ]
-        observation = handler.finish_case(first_speakable_latency_ms=0.0)
-        assert observation.observed_tools == ("start_work",)
+        output = [part async for part in inference.stream(snapshot, turn_id="turn_proposal")]
+        assert output == [HostTaskProposalRequest("Inspect synthetic release")]
+        # Even a synthetic accepting handler has no model-callable effect authority.
+        observation = handler.finish_case(first_speakable_latency_ms=None)
+        assert observation.observed_tools == ()
+        assert observation.first_speakable_latency_ms is None
         assert len(requests) == 2
         assert "format" not in requests[0] and "format" in requests[1]
     finally:
