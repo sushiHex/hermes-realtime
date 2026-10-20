@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import threading
 import time
@@ -87,7 +86,7 @@ def start_frame(**completion: object) -> dict[str, object]:
 
 def expected_proposal(objective="Inspect release"):
     return HostTaskProposalRequest(
-        objective, "ollama_work_" + hashlib.sha256(b"turn_test").hexdigest(),
+        objective,
     )
 
 

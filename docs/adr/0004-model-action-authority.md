@@ -113,8 +113,9 @@ Spoken confirmation requires all of these conditions:
 - The complete readback is queued, the ledger's queued count is nonzero, and
   its `transport_confirmed_full_count == queued_chunk_count`. The joined
   transport-confirmed readback must also equal the complete expected readback.
-- The exact configured Edge or Kokoro text projection leaves that readback
-  unchanged. Emphasis stripping, pronunciation substitutions, unknown TTS
+- The configured synthesizer exposes a canonical `project_spoken_text` capability
+  and that projection leaves the readback unchanged. Edge and Kokoro expose the
+  same transformations their synthesis paths use. Emphasis stripping, pronunciation substitutions, unknown TTS
   projection, missing or interrupted chunks do not qualify spoken confirmation;
   the full-text card remains available. Delivery is not proof of hearing.
 - At captured speech onset, the worker latches a clean binding: an echo guard
@@ -311,6 +312,9 @@ Include leaked own-readback yes, legitimate assent matching readback wording,
 idle/background speech between readback and assent, wrong participants, and
 objectives containing emphasis markers. Check presentation fidelity separately
 from exact stored-objective equality and zero unauthorized dispatch.
+
+The separate eight-case proposal diagnostic does not satisfy or replace the historical
+automatic-start 19/20 and safety thresholds retained below.
 
 Preserve the existing corpora, labels, thresholds and recorded failures. Their
 automatic-start routing scores are historical evidence, not confirmation tests.

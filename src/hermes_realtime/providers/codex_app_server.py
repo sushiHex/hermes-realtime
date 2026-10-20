@@ -2810,7 +2810,6 @@ class CodexAppServerStreamingInference:
             raise RuntimeError("work tool handler is unavailable")
         return HostTaskProposalRequest(
             objective=cast(str, call.arguments["objective"]),
-            invocation_id=self._invocation_id(call.identity),
         )
 
     @staticmethod

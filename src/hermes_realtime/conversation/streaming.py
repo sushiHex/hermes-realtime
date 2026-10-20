@@ -1609,6 +1609,9 @@ class StreamingSpeechLoop:
         except BaseException as error:
             if proposal_readback and self._task_proposals is not None:
                 self._task_proposals.speech_started()
+                self._task_proposals.complete_readback(
+                    proposal_readback[0], "", queued_chunks=0, confirmed_chunks=0,
+                )
             interruption_marker_error: BaseException | None = None
             if last_heard_segment is not None:
                 # The turn did not complete normally after some speech was heard:

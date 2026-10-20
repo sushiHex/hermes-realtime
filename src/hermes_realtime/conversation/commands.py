@@ -169,10 +169,11 @@ class ConversationTaskCommandRouter:
             raise TypeError("command text must be an exact built-in string")
         proposals = self._task_proposals
         if proposals is not None and proposals.has_pending:
-            if proposals.is_confirmation(text):
+            confirmation = proposals.confirmation_target(text)
+            if confirmation is not None:
                 if not await self._recorded(text):
                     return self._closed_nonaccepted_result(authority, CommandRoutingOutcome.INVALID)
-                admission = await proposals.consume_input(text)
+                admission = await proposals.consume_input(text, expected_proposal=confirmation)
                 return self._surface_admission_result(admission, authority)
             proposals.intervening_input()
         stripped = text.strip()

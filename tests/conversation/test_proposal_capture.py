@@ -35,7 +35,7 @@ async def test_only_clean_onset_can_confirm_after_complete_readback(blocker):
         surface=surface, observer=lambda *_: None, speech_projection=lambda text: text
     )
     proposals.bind("browser_user", 1)
-    proposal = proposals.offer(HostTaskProposalRequest("Inspect release", "call"))
+    proposal = proposals.offer(HostTaskProposalRequest("Inspect release"))
     proposals.complete_readback(proposal, proposal.readback, queued_chunks=1, confirmed_chunks=1)
     actions, _cancelled, _responses = action_executor_probe()
     actions._speech.foreground_active = blocker == "interrupting"
@@ -71,6 +71,7 @@ async def test_only_clean_onset_can_confirm_after_complete_readback(blocker):
             await worker.receive_audio("browser_user", 1, frame)
             guard._recent_playback = False
         await worker.receive_audio("browser_user", 1, frame)
+        assert (proposals._capture_binding is proposal) == (blocker is None)
         # The output tail can expire while STT runs; it must not upgrade onset.
         guard._recent_playback = False
         await worker.receive_audio("browser_user", 1, frame)

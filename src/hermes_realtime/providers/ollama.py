@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import re
@@ -540,7 +539,6 @@ class OllamaStreamingInference:
                     # presents this exact objective and owns later confirmation.
                     yield HostTaskProposalRequest(
                         objective=objective,
-                        invocation_id="ollama_work_" + hashlib.sha256(turn_id.encode()).hexdigest(),
                     )
                     return
                 if handler is not None and has_background_work_claim(buffer):

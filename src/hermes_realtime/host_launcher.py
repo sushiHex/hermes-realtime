@@ -28,6 +28,7 @@ from collections.abc import (
 )
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -76,7 +77,11 @@ from hermes_realtime.conversation import (
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import OutputStyleSelection
-from hermes_realtime.conversation.task_proposals import ConversationTaskProposals
+from hermes_realtime.conversation.task_proposals import (
+    MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
+    ConversationTaskProposals,
+)
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.evidence import (
     CaptureState,
     ConsentDisposition,
@@ -151,7 +156,6 @@ from hermes_realtime.providers import (
     SileroSpeechPresenceVerifier,
     WebRtcVoiceActivityDetector,
 )
-from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 from hermes_realtime.providers.codex_app_server import (
     CodexModelConfiguration,
     CodexTokenUsage,
@@ -776,6 +780,7 @@ async def _play_readiness_cue(
     participant_identity: str,
     generation: int,
     is_valid: Callable[[], bool],
+    task_proposals: ConversationTaskProposals | None = None,
 ) -> None:
     """Play the readiness cue with this binding's audio input suppressed.
 
@@ -791,6 +796,8 @@ async def _play_readiness_cue(
         speech=asyncio.current_task(),
     )
     try:
+        if task_proposals is not None:
+            task_proposals.speech_started()
         await playback.play(chunk, is_valid=is_valid)
     finally:
         resume_task = asyncio.create_task(
@@ -1327,6 +1334,11 @@ def _build_streaming_inference(
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkProposalBounds:
+    max_objective_chars: int
+
+
 def _bind_natural_work_tools(
     *,
     inference: OllamaStreamingInference | CodexAppServerStreamingInference,
@@ -1341,16 +1353,21 @@ def _bind_natural_work_tools(
         raise TypeError("natural work tools require exact Codex or Ollama inference")
     if type(surface) is not ConversationWorkControlSurface:
         raise TypeError("natural work tools require an exact work-control surface")
-    inference.bind_work_tools(surface)
+    inference.bind_work_tools(_WorkProposalBounds(
+        min(surface.max_objective_chars, MAX_TASK_PROPOSAL_OBJECTIVE_CHARS),
+    ))
 
 
 def _proposal_spoken_text(synthesizer: object, text: str) -> str | None:
-    """Project through the exact known TTS path; unknown providers cannot arm voice assent."""
-    if type(synthesizer) is KokoroSynthesizer:
-        return synthesizer._project_spoken_text(text)
-    if type(synthesizer) is EdgeTtsSynthesizer:
-        return strip_markdown_emphasis_for_speech(text)
-    return None
+    """Use optional canonical synthesis projection; failure cannot arm spoken assent."""
+    try:
+        project = getattr(synthesizer, "project_spoken_text", None)
+        if not callable(project):
+            return None
+        projected = project(text)
+    except Exception:
+        return None
+    return projected if type(projected) is str else None
 
 
 def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | None:
@@ -2469,14 +2486,13 @@ def build_local_host_launcher(
                     media_incarnation,
                 ):
                     return
-                if proposals is not None:
-                    proposals.speech_started()
                 await _play_readiness_cue(
                     conversation=conversation,
                     playback=playback,
                     chunk=chunk,
                     participant_identity=participant_identity,
                     generation=generation,
+                    task_proposals=proposals,
                     is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
                 )
 
@@ -2653,7 +2669,7 @@ def build_local_host_launcher(
     async def decide_task_proposal(
         participant_identity: str, generation: int, proposal_id: str,
         objective: str, decision: str,
-    ) -> object:
+    ) -> WorkCommandAdmission:
         if proposals is None:
             raise PermissionError("natural task proposals are disabled")
         return await proposals.decide(

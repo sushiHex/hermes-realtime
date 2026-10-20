@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from .work_tools import WorkCommandAdmission, _validate_exact_text, _validate_identifier
+from .work_tools import WorkCommandAdmission, _validate_exact_text
 
 _AFFIRMATIVES = frozenset({"yes", "yeah", "yep", "sure", "okay", "go ahead", "do it", "please do"})
 _PublicValue = str | int | bool | None
@@ -25,11 +25,9 @@ class HostTaskProposalRequest:
     """An effect-free, terminal provider selection; not an admission receipt."""
 
     objective: str
-    invocation_id: str
 
     def __post_init__(self) -> None:
         _validate_exact_text(self.objective, "objective", maximum=MAX_TASK_PROPOSAL_OBJECTIVE_CHARS)
-        _validate_identifier(self.invocation_id, "invocation_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,8 +119,7 @@ class ConversationTaskProposals:
         self._readback_settled = True
         project = self._speech_projection
         if (
-            proposal is self._pending
-            and self._deadline is not None
+            self._deadline is not None
             and self._clock() < self._deadline
             and confirmed_text == proposal.readback
             and type(queued_chunks) is int
@@ -140,6 +137,8 @@ class ConversationTaskProposals:
 
     def speech_started(self, proposal: TaskProposal | None = None) -> None:
         """Any other host/assistant speech invalidates the spoken binding."""
+        if self._pending is None:
+            return
         self._readback_complete = None
         self._capture_binding = None
         if proposal is None or self._readback_settled:
@@ -171,19 +170,35 @@ class ConversationTaskProposals:
     def intervening_input(self) -> None:
         self.retire("intervening_input")
 
-    async def consume_input(self, text: str) -> WorkCommandAdmission:
-        proposal, capture = self._pending, self._capture_binding
+    def confirmation_target(self, text: str) -> TaskProposal | None:
+        """Freeze the exact pending object before user-input recording can suspend."""
+        return self._pending if self.is_confirmation(text) else None
+
+    async def consume_input(
+        self,
+        text: str,
+        *,
+        expected_proposal: TaskProposal,
+    ) -> WorkCommandAdmission:
+        proposal = self._pending
+        if proposal is None or expected_proposal is not proposal or not self.is_confirmation(text):
+            self._evidence("stale_confirmation_input")
+            return WorkCommandAdmission.REFUSED
+        capture = self._capture_binding
         self._capture_binding = None
-        if not self.is_confirmation(text) or proposal is None:
-            raise ValueError("input is not a current proposal confirmation")
         if self._deadline is None or self._clock() >= self._deadline:
             self.retire("expired")
             return WorkCommandAdmission.REFUSED
         if capture is not proposal:
+            reason = (
+                "use_confirmation_card"
+                if self._readback_settled and self._readback_complete is not proposal
+                else "spoken_confirmation_not_ready"
+            )
             try:
-                self._publish(proposal, "pending", reason="spoken_confirmation_not_ready")
+                self._publish(proposal, "pending", reason=reason)
             finally:
-                self._evidence("spoken_confirmation_not_ready")
+                self._evidence(reason)
             return WorkCommandAdmission.REFUSED
         return await self.decide(
             participant=proposal.participant,
@@ -248,15 +263,14 @@ class ConversationTaskProposals:
                 or type(proposal_id) is not str
                 or type(objective) is not str
                 or self._binding != (participant, generation)
-                or (proposal.participant, proposal.generation) != (participant, generation)
                 or proposal.proposal_id != proposal_id
                 or proposal.objective != objective
             ):
-                raise PermissionError("confirmation does not match the exact current proposal")
+                return WorkCommandAdmission.REFUSED
             if self._deadline is None or self._clock() >= self._deadline:
                 category = "expired"
                 self.retire("expired")
-                raise PermissionError("proposal has expired")
+                return WorkCommandAdmission.REFUSED
             # Consume synchronously before projection or admission can suspend/fail.
             self._pending = None
             self._readback_complete = None

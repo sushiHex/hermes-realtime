@@ -18,7 +18,7 @@ from tests.conversation.test_task_proposals import Surface
 
 class ProposalInference:
     async def stream(self, _snapshot, *, turn_id):
-        yield HostTaskProposalRequest("Inspect **the exact** release", "call_" + turn_id)
+        yield HostTaskProposalRequest("Inspect **the exact** release")
 
     async def cancel(self, turn_id):
         pass
@@ -48,8 +48,10 @@ async def test_loop_renders_host_readback_and_arms_only_after_playback():
     ]
     assert surface.calls == []
     assert context.snapshot().messages[-1].source == "host_task_proposal"
+    proposal = proposals.confirmation_target("yes")
+    assert proposal is not None
     proposals.capture_started(participant="participant", generation=1, clean=True)
-    await proposals.consume_input("yes")
+    await proposals.consume_input("yes", expected_proposal=proposal)
     assert surface.calls[0][0] == "Inspect **the exact** release"
 
 
@@ -76,6 +78,8 @@ async def test_interrupted_readback_never_arms_confirmation():
     )
     with pytest.raises(RuntimeError, match="synthetic playback failure"):
         await loop.respond("turn_propose", Transcript(text="Inspect release", final=True))
+    proposal = proposals.confirmation_target("yes")
+    assert proposal is not None
     proposals.capture_started(participant="participant", generation=1, clean=True)
-    await proposals.consume_input("yes")
+    await proposals.consume_input("yes", expected_proposal=proposal)
     assert surface.calls == []
