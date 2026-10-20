@@ -206,6 +206,8 @@ def test_reused_tracked_pid_still_has_independent_job_authority(tmp_path, monkey
 @pytest.mark.parametrize("broken", ["snapshot", "bound"])
 def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, broken):
     owner = rehearsal.Processes(tmp_path)
+    # Native runners can place the controller inside the synthetic PID range.
+    monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
     if broken == "snapshot":
 
         def snapshot():
@@ -215,11 +217,25 @@ def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, b
         containment = None
     else:
         monkeypatch.setattr(rehearsal, "process_table", lambda: {})
-        containment = SimpleNamespace(members=lambda: set(range(10000, 14097)))
+        controller = os.getpid()
+        containment = SimpleNamespace(
+            _job=66, members=lambda: set(range(controller + 1, controller + 4098))
+        )
     assert owner.survivors(containment) == {"<unknown>": 1}
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
     assert record["current"]["observation_failed"] == 1
     assert "private" not in json.dumps(record)
+
+
+def test_cleanup_allows_exact_non_controller_observation_bound(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    containment = SimpleNamespace(_job=66, members=lambda: set(range(10000, 14097)))
+    assert owner.survivors(containment) == {"<unknown>": 4096}
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    assert record["current"]["observation_failed"] == 0
+    assert record["current"]["job_only"]["unknown"] == 4096
 
 
 class _Kernel:
