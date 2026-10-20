@@ -473,6 +473,7 @@ class BrowserSessionDirector:
         self._task_proposal_decision = task_proposal_decision
         self._proposal_decision_binding: tuple[str, int] | None = None
         self._last_proposal_decision: TaskProposalDecision | None = None
+        self._last_proposal_failure: Exception | None = None
         self._projection = projection
         self._speech_runtime = speech_runtime or BrowserSpeechRuntime(
             stt_provider="unavailable",
@@ -1058,6 +1059,7 @@ class BrowserSessionDirector:
             self._last_input_sequence = 0
             self._proposal_decision_binding = None
             self._last_proposal_decision = None
+            self._last_proposal_failure = None
             self._last_approval_sequence = 0
             self._last_evidence_control_sequence = 0
             self._projection_resync_consumed = False
@@ -1303,6 +1305,7 @@ class BrowserSessionDirector:
         self._last_approval_request = None
         self._proposal_decision_binding = None
         self._last_proposal_decision = None
+        self._last_proposal_failure = None
 
     async def _rebind_after_model_operations(
         self,
@@ -1677,27 +1680,37 @@ class BrowserSessionDirector:
                 if request == previous:
                     self._touch_activity()
                     category = "replayed"
+                    if self._last_proposal_failure is not None:
+                        raise self._last_proposal_failure.with_traceback(None)
                     return
                 category = "sequence_refused"
                 if sequence != (previous.sequence + 1 if previous is not None else 1):
                     raise RuntimeError("proposal decision sequence is not the next expected value")
-                decide = self._task_proposal_decision
-                category = "unavailable"
-                if decide is None:
-                    raise RuntimeError("proposal confirmation is unavailable")
-                category = "projection_capacity"
-                self._projection.ensure_capacity()
-                category = "authority_refused"
-                result = await decide(identity, generation, proposal_id, objective, decision)
-                expected = (
-                    WorkCommandAdmission.ADMITTED if decision == "confirm"
-                    else WorkCommandAdmission.REFUSED
-                )
-                if result is not expected:
-                    category = "admission_refused"
-                    raise PermissionError("proposal decision was not admitted")
+                # Authenticated, well-formed in-order actions consume their sequence even
+                # when proposal authority refuses. Reserve before awaiting any side effect.
                 self._proposal_decision_binding = binding
                 self._last_proposal_decision = request
+                self._last_proposal_failure = PermissionError("proposal outcome is uncertain")
+                try:
+                    decide = self._task_proposal_decision
+                    category = "unavailable"
+                    if decide is None:
+                        raise RuntimeError("proposal confirmation is unavailable")
+                    category = "projection_capacity"
+                    self._projection.ensure_capacity()
+                    category = "authority_refused"
+                    result = await decide(identity, generation, proposal_id, objective, decision)
+                    expected = (
+                        WorkCommandAdmission.ADMITTED if decision == "confirm"
+                        else WorkCommandAdmission.REFUSED
+                    )
+                    if result is not expected:
+                        category = "admission_refused"
+                        raise PermissionError("proposal decision was not admitted")
+                except Exception as error:
+                    self._last_proposal_failure = error.with_traceback(None)
+                    raise
+                self._last_proposal_failure = None
                 self._touch_activity()
                 category = "settled"
         finally:
@@ -2115,6 +2128,7 @@ class BrowserSessionDirector:
         self._last_approval_request = None
         self._proposal_decision_binding = None
         self._last_proposal_decision = None
+        self._last_proposal_failure = None
         self._audio_diagnostics.clear()
         self._last_activity = None
 

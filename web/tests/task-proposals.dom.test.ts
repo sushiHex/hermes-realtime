@@ -48,6 +48,15 @@ describe("task proposal controls", () => {
     view.dom.window.close();
   });
 
+  it("discloses bounded confirmation validity even before an expiry event arrives", () => {
+    const view = mount();
+    view.controls.project(proposal);
+    expect(view.card().textContent).toContain("Confirmation expires; expired proposals require a new proposal.");
+    view.controls.project({...proposal, reason:"use_confirmation_card"});
+    expect(view.card().textContent).toContain("Confirmation expires; expired proposals require a new proposal.");
+    view.dom.window.close();
+  });
+
   it("retains one in-flight action through pending replay and ignores stale settlement after rebinding", async () => {
     let resolve!: (reply: Record<string, unknown>) => void;
     const submit = vi.fn(() => new Promise<Record<string, unknown>>(done => {resolve=done;}));

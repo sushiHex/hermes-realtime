@@ -72,7 +72,10 @@ export class TaskProposalControls {
       decline.dataset.decision = "decline"; decline.textContent = "Decline";
       decline.setAttribute("aria-describedby", objective.id);
       buttons.append(confirm, decline);
-      item.append(label, objective, status, buttons);
+      const validity = this.document.createElement("p");
+      validity.className = "operation-detail";
+      validity.textContent = "Confirmation expires; expired proposals require a new proposal.";
+      item.append(label, objective, validity, status, buttons);
       view = {data, participantIdentity:this.options.credential()?.participantIdentity ?? null,
         item, objective, status, confirm, decline, pending:data.status === "pending", busy:false};
       this.views.set(data.proposalId, view);

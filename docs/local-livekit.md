@@ -478,8 +478,12 @@ The full card supports confirmation even while speaker output is muted. Spoken c
 has its own complete-readback and causal-capture checks; playback delivery does not prove
 that the operator heard it. An early or noisy spoken response leaves the proposal pending.
 If the host says **Use Confirm on this task card**, that proposal requires the visible control.
+Confirmation expires; expired proposals require a new proposal. The visible controls do not
+guarantee that a proposal is still valid: the host checks expiry when an action arrives.
 A changed binding or expired/retired proposal cannot be confirmed. Uncertain browser decisions
 stay disabled and are never retried automatically; reconnect to reconcile authoritative state.
+An authenticated, well-formed in-order decision consumes its sequence even if refused;
+replaying that exact action reproduces its recorded outcome without another dispatch.
 Same-binding token refresh retains the decision sequence; a fresh view or changed binding
 starts its own sequence. Open stale browser tabs must reload after this update: the version-1
 event contract rejects an unknown `task_proposal` kind or a partial proposal shape rather

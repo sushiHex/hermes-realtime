@@ -177,10 +177,89 @@ async def test_invalid_or_mismatched_decision_dispatches_nothing(change):
     with pytest.raises((TypeError, ValueError, PermissionError, RuntimeError)):
         await request(app, credential.token, decision(proposal, **change))
     assert dispatched == approvals == []
-    await request(app, credential.token, decision(proposal))
+    semantic_refusal = (
+        "proposalId" in change and change["proposalId"] != "invalid"
+        or change.get("objective") == "changed"
+    )
+    await request(app, credential.token, decision(proposal, sequence=2 if semantic_refusal else 1))
     assert len(dispatched) == 1
     await director.stop(participant_identity=credential.participant_identity)
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement", ["expired", "superseded"])
+async def test_refused_proposal_consumes_sequence_and_replays_without_redispatch(retirement):
+    director, app, proposals, _projection, dispatched, approvals = setup()
+    credential = await director.start()
+    now = 0.0
+    proposals._clock = lambda: now
+    old = proposals.offer(HostTaskProposalRequest("Old exact objective"))
+    if retirement == "expired":
+        now = 61.0
+    else:
+        proposals.retire("intervening_input")
+    calls = []
+    authority = director._task_proposal_decision
+
+    async def observe(*args):
+        calls.append(args)
+        return await authority(*args)
+
+    director._task_proposal_decision = observe
+    refused = decision(old)
+    with pytest.raises(PermissionError):
+        await request(app, credential.token, refused)
+    fresh = proposals.offer(HostTaskProposalRequest("New exact objective"))
+    # Replay must reproduce the refusal without consulting current proposal authority.
+    with pytest.raises(PermissionError):
+        await request(app, credential.token, refused)
+    assert len(calls) == 1
+    accepted = await request(app, credential.token, decision(fresh, sequence=2))
+    assert accepted.status == 202
+    assert len(calls) == 2
+    assert [objective for objective, _ in dispatched] == [fresh.objective]
+    assert approvals == []
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "cancelled", "unavailable", "capacity"])
+async def test_in_order_failure_is_recorded_before_await_and_next_sequence_can_progress(failure):
+    director, app, proposals, projection, dispatched, _approvals = setup()
+    credential = await director.start()
+    proposal = proposals.offer(HostTaskProposalRequest("Exact objective"))
+    calls = []
+    authority = director._task_proposal_decision
+    capacity = projection.ensure_capacity
+
+    async def fail(*args):
+        calls.append(args)
+        if failure == "cancelled":
+            raise asyncio.CancelledError()
+        raise RuntimeError("synthetic authority failure")
+
+    def no_capacity():
+        raise RuntimeError("synthetic capacity failure")
+
+    director._task_proposal_decision = None if failure == "unavailable" else fail
+    if failure == "capacity":
+        projection.ensure_capacity = no_capacity
+    first_error = asyncio.CancelledError if failure == "cancelled" else RuntimeError
+    with pytest.raises(first_error):
+        await request(app, credential.token, decision(proposal))
+    director._task_proposal_decision = authority
+    projection.ensure_capacity = capacity
+    replay_error = PermissionError if failure == "cancelled" else RuntimeError
+    with pytest.raises(replay_error):
+        await request(app, credential.token, decision(proposal))
+    assert len(calls) == (0 if failure in ("unavailable", "capacity") else 1)
+    assert dispatched == []
+    assert (await request(app, credential.token, decision(proposal, sequence=2))).status == 202
+    # A successful next action must clear the previous failure outcome.
+    assert (await request(app, credential.token, decision(proposal, sequence=2))).status == 202
+    assert len(dispatched) == 1
+    await director.stop(participant_identity=credential.participant_identity)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
