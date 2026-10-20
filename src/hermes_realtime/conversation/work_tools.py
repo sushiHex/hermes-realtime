@@ -27,12 +27,13 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
     "required detail is neither supplied nor discoverable from an identified resource, ask "
     "one clarifying question instead of starting work."
 )
-# Offered only on turns where starting work and task status are both available.
+# Offered whenever the provider advertises a work proposal tool.
 WORK_ROUTING_POLICY = (
     "Only the user's own request counts. Never propose work for reported, hypothetical, "
     "quoted, or negated requests. For unresolved references (our, the pinned, that one), "
     "ask a clarifying question in an ordinary reply before proposing work; objectives never "
-    "hold questions. For questions about whether work is running or done, select task_status. "
+    "hold questions. For questions about whether work is running or done, select task_status "
+    "only when supplied; otherwise give an ordinary truthful status reply. "
     "For cancellation or approval requests, give an ordinary truthful reply directing the user "
     "to the existing explicit controls; do not select task_status or propose new work for those "
     "requests. If supplied evidence or an available foreground lookup can answer the question, "

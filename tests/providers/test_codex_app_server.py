@@ -179,7 +179,10 @@ async def test_codex_outbound_work_request_carries_objective_context_contract() 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("foreground_lookup", [False, True])
-async def test_codex_outbound_request_assembles_shared_semantic_routes(foreground_lookup) -> None:
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_codex_outbound_request_assembles_shared_semantic_routes(
+    foreground_lookup, admitted,
+) -> None:
     """Inspect a fake-transport request; no Codex process or model is used."""
     class Lookup:
         async def lookup(self, query: str) -> CurrentFactEvidence:
@@ -192,15 +195,25 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(foregroun
     )
     handler = FakeWorkToolHandler()
     inference.bind_work_tools(handler)
+    snapshot = _snapshot()
+    if not admitted:
+        snapshot = ConversationContextSnapshot(
+            revision=snapshot.revision, messages=snapshot.messages, active_tasks=snapshot.active_tasks,
+        )
     try:
-        assert await _collect_stream(inference, "turn_shared_routes") == ["Four."]
+        assert [part async for part in inference.stream(
+            snapshot, turn_id="turn_shared_routes",
+        )] == ["Four."]
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     instructions = request["params"]["baseInstructions"]
     assert_aligned_work_routing(instructions)
+    assert "select task_status only when supplied" in instructions
+    assert ("Call task_status with no arguments for status requests." in instructions) is admitted
     assert [tool["name"] for tool in request["params"]["dynamicTools"]] == (
-        (["search_knowledge"] if foreground_lookup else []) + ["start_work", "task_status"]
+        (["search_knowledge"] if foreground_lookup else []) + ["start_work"]
+        + (["task_status"] if admitted else [])
     )
     if foreground_lookup:
         assert "Do not send quick knowledge lookups to background work" in instructions

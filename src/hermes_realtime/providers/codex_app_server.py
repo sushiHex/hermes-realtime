@@ -1170,10 +1170,10 @@ class CodexAppServerStreamingInference:
                     include_search=search_available,
                     include_status=admitted_user_turn,
                 )
-            if admitted_user_turn and tool_handler is not None:
-                base_instructions += (
-                    " Call task_status with no arguments for status requests. "
-                    + WORK_ROUTING_POLICY)
+            if tool_handler is not None:
+                if admitted_user_turn:
+                    base_instructions += " Call task_status with no arguments for status requests. "
+                base_instructions += " " + WORK_ROUTING_POLICY
             if freshness_context is not None:
                 base_instructions += "\n\n" + freshness_context
             thread_response = await self._request(
