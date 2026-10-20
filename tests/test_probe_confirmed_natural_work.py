@@ -7,6 +7,94 @@ from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from scripts import probe_confirmed_natural_work as probe
 
 
+def test_v2_is_hash_bound_exposed_comparison_with_exact_v1_cases():
+    v1 = probe.load_fixture("v1")
+    v2 = probe.load_fixture("v2")
+    assert v2["model_cases"] == v1["model_cases"]
+    assert v2["scenario_id"] == "confirmed-natural-work-v2"
+    assert v2["development_preregistration"]["comparison_fixture_sha256"] == (
+        probe.qualification.FIXTURE_SHA256
+    )
+    assert set(v2["development_preregistration"]["branch_falsifiers"]) == {
+        "natural_current_weather", "cancel", "approval",
+    }
+    assert v2["development_preregistration"]["expected_branches"] == {
+        "natural_current_weather": "proposal", "cancel": "reply", "approval": "reply",
+    }
+    report = probe.build_report([], fixture_version="v2")
+    assert report["scenario_id"] == v2["scenario_id"]
+    assert report["fixture_sha256"] == probe.V2_FIXTURE_SHA256
+    assert report["evaluation_kind"] == "exposed_development_comparison"
+    assert report["denominator"] == report["unrun"] == 8
+    assert report["objective_fidelity"] == "pending"
+    assert report["natural_routing_qualified"] is False
+
+
+def test_v2_changed_fixture_is_refused(monkeypatch):
+    monkeypatch.setattr(probe, "V2_FIXTURE_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="preregistration_binding"):
+        probe.load_fixture("v2")
+
+
+def test_v2_selected_through_main_and_aborted_tail(monkeypatch, tmp_path, capsys):
+    versions = []
+    fixture_loads = []
+    original = probe.load_fixture
+
+    def load(version):
+        fixture_loads.append(version)
+        return original(version)
+
+    async def failed_attempt(**kwargs):
+        versions.append(kwargs["fixture_version"])
+        raise RuntimeError("synthetic failure before first case")
+
+    monkeypatch.setattr(probe.harness, "verify_imports", lambda: None)
+    monkeypatch.setattr(probe.harness, "source_binding", lambda: {
+        "head": "a" * 40, "tree": "b" * 40, "dirty": False,
+    })
+    monkeypatch.setattr(probe, "run_cases", failed_attempt)
+    monkeypatch.setattr(probe, "load_fixture", load)
+    receipt = tmp_path / "receipt"
+    assert probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(receipt), "--fixture-version", "v2", "--live",
+    ]) == 1
+    assert versions == ["v2"]
+    assert fixture_loads == ["v2", "v2"]
+    rows = [json.loads(line) for line in receipt.read_bytes().splitlines()]
+    assert len(rows) == 8 and all(row["status"] == "not_run" for row in rows)
+    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    assert report["scenario_id"] == "confirmed-natural-work-v2"
+    assert report["fixture_sha256"] == probe.V2_FIXTURE_SHA256
+
+
+def test_v2_fixture_drift_after_preparation_is_refused(monkeypatch, tmp_path, capsys):
+    loads = 0
+    original = probe.load_fixture
+
+    def changed_fixture(version):
+        nonlocal loads
+        loads += 1
+        if loads == 2:
+            raise ValueError("preregistration_binding")
+        return original(version)
+
+    monkeypatch.setattr(probe, "load_fixture", changed_fixture)
+    monkeypatch.setattr(probe.harness, "verify_imports", lambda: None)
+    monkeypatch.setattr(probe.harness, "source_binding", lambda: {
+        "head": "a" * 40, "tree": "b" * 40, "dirty": False,
+    })
+    assert probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(tmp_path / "receipt"), "--fixture-version", "v2",
+    ]) == 1
+    assert '"status": "attempt_failed"' in capsys.readouterr().out
+    assert not (tmp_path / "receipt").exists()
+
+
 def test_prompt_timing_sink_keeps_only_numeric_fields():
     sink = probe.PromptTimingSink()
     sink.write("private unrelated diagnostic\n")
@@ -29,7 +117,15 @@ def test_prompt_timing_sink_rejects_unbounded_line():
 
 
 @pytest.mark.asyncio
-async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatch):
+@pytest.mark.parametrize("fixture_version", ["v1", "v2"])
+async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatch, fixture_version):
+    fixture_loads = []
+    original = probe.load_fixture
+
+    def load(version):
+        fixture_loads.append(version)
+        return original(version)
+
     class Inference:
         async def configure_context(self, size):
             assert size == 4096
@@ -50,12 +146,15 @@ async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatc
     monkeypatch.setattr(probe, "factory", lambda **kwargs: Inference())
     monkeypatch.setattr(probe, "preflight", preflight)
     monkeypatch.setattr(probe, "OllamaStreamingInference", Inference)
+    monkeypatch.setattr(probe, "load_fixture", load)
     receipt = io.BytesIO()
     rows = await probe.run_cases(model="phi4-mini:latest", base_url="http://127.0.0.1:1",
-                                 private_sink=receipt, model_digest="a" * 64)
+                                 private_sink=receipt, model_digest="a" * 64,
+                                 fixture_version=fixture_version)
     assert len(rows) == 8
+    assert fixture_loads == [fixture_version]
     assert all(row["selection"] == "proposal" for row in rows)
-    report = probe.build_report(rows)
+    report = probe.build_report(rows, fixture_version=fixture_version)
     assert report["unwanted_proposals"] == 5
     assert report["missed_proposals"] == 0
     assert report["dispatches"] == 0

@@ -10,13 +10,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
@@ -30,6 +31,38 @@ from hermes_realtime.providers.ollama import OllamaStreamingInference
 from scripts import evaluate_natural_work_routing as legacy
 from scripts import evaluate_natural_work_scenario as harness
 from scripts import qualify_confirmed_natural_work as qualification
+
+V2_FIXTURE = ROOT / "tests/fixtures/confirmed_natural_work_v2.json"
+V2_FIXTURE_SHA256 = "6b6034f58ac5a3be65b80c257154e83186d0174ccefb3b94cc485eaed99eed53"
+
+
+def load_fixture(version: str = "v1") -> dict[str, Any]:
+    if version == "v1":
+        return qualification.load_preregistration()
+    admitted = False
+    try:
+        if version != "v2":
+            raise ValueError("preregistration_binding")
+        raw = V2_FIXTURE.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != V2_FIXTURE_SHA256:
+            raise ValueError("preregistration_binding")
+        result = cast(dict[str, Any], json.loads(raw))
+        admitted = True
+        return result
+    finally:
+        if not admitted:
+            print('[confirmed-preregistration] {"category":"binding_refused","count":1}')
+
+
+def fixture_metadata(version: str) -> dict[str, Any]:
+    return {
+        "scenario_id": "confirmed-natural-work-" + version,
+        "fixture_sha256": V2_FIXTURE_SHA256 if version == "v2" else qualification.FIXTURE_SHA256,
+        "evaluation_kind": (
+            "exposed_development_comparison" if version == "v2" else "frozen_initial_diagnostic"
+        ),
+    }
+
 
 _NUMERIC = frozenset({
     "load_duration_ns", "prompt_eval_duration_ns", "eval_duration_ns", "total_duration_ns",
@@ -94,8 +127,9 @@ async def collect_decision(inference: Any, request: Any, turn_id: str,
 
 async def run_cases(*, model: str, base_url: str, private_sink: Any,
                     model_digest: str, observations: list[dict[str, Any]] | None = None,
+                    fixture_version: str = "v1",
                     ) -> list[dict[str, Any]]:
-    fixture = qualification.load_preregistration()
+    fixture = load_fixture(fixture_version)
     rows = observations if observations is not None else []
     for revision, case in enumerate(fixture["model_cases"], 1):
         context, request = harness.make_context(
@@ -156,9 +190,10 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
     return rows
 
 
-def record_unrun(rows: list[dict[str, Any]], private_sink: Any) -> None:
+def record_unrun(rows: list[dict[str, Any]], private_sink: Any,
+                 *, fixture_version: str = "v1") -> None:
     """Preserve the frozen tail after an aborted attempt without executing it."""
-    cases = qualification.load_preregistration()["model_cases"]
+    cases = load_fixture(fixture_version)["model_cases"]
     for case in cases[len(rows):]:
         row = {"id": case["id"], "expected": case["expected"], "status": "not_run",
                "error": None, "selection": None, "dispatches": 0, "timings": []}
@@ -166,12 +201,11 @@ def record_unrun(rows: list[dict[str, Any]], private_sink: Any) -> None:
         harness.write_private_row(private_sink, row)
 
 
-def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_report(rows: list[dict[str, Any]], *, fixture_version: str = "v1") -> dict[str, Any]:
     attempted = [row for row in rows if row["status"] == "attempted"]
     usable = [row for row in attempted if row["error"] is None]
     return {
-        "schema_version": 1, "scenario_id": "confirmed-natural-work-v1",
-        "fixture_sha256": qualification.FIXTURE_SHA256,
+        "schema_version": 1, **fixture_metadata(fixture_version),
         "denominator": 8, "attempts": len(attempted), "unrun": 8 - len(attempted),
         "errors": len(attempted) - len(usable),
         "readiness_attempts": sum(row.get("readiness_attempted", False) for row in attempted),
@@ -202,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-digest", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--private-receipt", type=Path, required=True)
+    parser.add_argument("--fixture-version", choices=("v1", "v2"), default="v1")
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args(argv)
     rows: list[dict[str, Any]] = []
@@ -215,28 +250,32 @@ def main(argv: list[str] | None = None) -> int:
         if (before["tree"] != args.source_tree
                 or harness.SHA256.fullmatch(args.model_digest) is None):
             raise ValueError("execution_binding_refused")
-        qualification.load_preregistration()
-        report = {"status": "prepared_only", "fixture_sha256": qualification.FIXTURE_SHA256}
+        load_fixture(args.fixture_version)
+        report = {"status": "prepared_only", **fixture_metadata(args.fixture_version)}
         if args.live:
             with args.private_receipt.open("xb", buffering=0) as receipt:
                 try:
                     asyncio.run(asyncio.wait_for(run_cases(
                         model=args.model, base_url=args.base_url, model_digest=args.model_digest,
                         private_sink=receipt, observations=rows,
+                        fixture_version=args.fixture_version,
                     ), 1000))
                 finally:
-                    record_unrun(rows, receipt)
-            report = build_report(rows)
+                    record_unrun(rows, receipt, fixture_version=args.fixture_version)
+            report = build_report(rows, fixture_version=args.fixture_version)
             report["status"] = (
                 "completed" if report["attempts"] == 8 and report["errors"] == 0
                 else "attempt_failed"
             )
         after = harness.source_binding()
         after["probe_sha256"] = harness.digest(Path(__file__))
+        load_fixture(args.fixture_version)
         if after != before:
             raise ValueError("execution_input_drift")
     except Exception:
-        report = build_report(rows) | {"status": "attempt_failed"}
+        report = build_report(rows, fixture_version=args.fixture_version) | {
+            "status": "attempt_failed",
+        }
     finally:
         report.update(source_binding=before, model=args.model, model_digest=args.model_digest,
                       natural_routing_qualified=False)
