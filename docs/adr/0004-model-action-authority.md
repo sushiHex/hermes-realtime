@@ -1,6 +1,7 @@
 # ADR 0004: Confirmed natural task proposals, explicit task cancellation
 
-Status: Accepted by owner decision on 2026-10-10; implementation tracked in
+Status: Accepted by owner decision on 2026-10-10, amended on 2026-10-16;
+implementation tracked in
 [#226](https://github.com/sushiHex/hermes-realtime/issues/226).
 [Decision record](https://github.com/sushiHex/hermes-realtime/issues/205#issuecomment-6096188370).
 The owner approved the provider framing correction on 2026-10-13; the
@@ -105,7 +106,10 @@ Add a separate host-owned pending proposal ahead of the existing work surface:
   history, memory and work results cannot confirm a proposal.
 - Require complete presentation of the bound objective before confirmation can
   be admitted. A speech path needs all expected readback chunks transport-confirmed,
-  using the delivery ledger's accounting rather than a foreground turn-end event.
+  using the delivery ledger's accounting rather than a foreground turn-end event:
+  after the complete bound readback is queued, require nonzero queued chunks and
+  `transport_confirmed_full_count == queued_chunk_count`. Interrupted readback,
+  including a yes that interrupts it, cannot be confirmed.
   A text control must present the full objective and bind its action to that
   proposal. Presentation/delivery evidence does not prove human comprehension.
 - Define how a spoken yes binds to the exact objective when readback is
@@ -118,7 +122,11 @@ Add a separate host-owned pending proposal ahead of the existing work surface:
   Existing echo suppression and optional speech-presence verification do not
   establish that a short yes is the user's confirmation. Edge and Kokoro can
   transform text before synthesis, so stored-text equality alone does not prove
-  an equivalent audible readback.
+  an equivalent audible readback. Keep assent examples out of the fixed readback
+  template; quoted objective content cannot confirm itself. Assistant or host
+  speech between readback and assent must invalidate the spoken-confirmation
+  binding, or be deferred while that binding is live. This includes idle mentions
+  and background-result announcements.
 - Reuse the existing controller's objective, identity, capacity, replay and
   acknowledgment checks after confirmation. Proposal, confirmation and command
   admission are not accepted task starts. Report started only after Hermes's
@@ -256,6 +264,8 @@ intent or injection resistance. A confirmed dispatch remains subject to Hermes's
 execution and approval policy; it grants no additional lifecycle authority.
 This amendment does not establish which lifecycle or approval interfaces a
 delegated Hermes run can reach.
+Exactness binds the stored objective text submitted to Hermes. Audible readback
+is a rendering of that text, not proof that every stored character was heard.
 Measure false starts, missed starts, objective fidelity and latency with the
 actual foreground model. Memory, history and results remain reference data,
 never trusted cancellation or approval events.
@@ -279,6 +289,10 @@ an accepted acknowledgment permits started reporting. Prove every changed guard
 with an isolated failing mutation and a passing valid control. Exercise readback
 interruption, intervening turns, reconnect and session retirement under the
 reviewed confirmation contract, while unrelated active tasks remain independent.
+Include leaked own-readback yes, legitimate assent matching readback wording,
+idle/background speech between readback and assent, wrong participants, and
+objectives containing emphasis markers. Check presentation fidelity separately
+from exact stored-objective equality and zero unauthorized dispatch.
 
 Preserve the existing corpora, labels, thresholds and recorded failures. Their
 automatic-start routing scores are historical evidence, not confirmation tests.
