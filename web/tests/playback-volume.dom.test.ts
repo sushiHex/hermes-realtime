@@ -3,7 +3,7 @@ import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
 import { PlaybackVolumeControls, PLAYBACK_VOLUME_KEY } from "../src/playback-volume";
 
-function mount(saved?: string, storageBlocked = false) {
+function mount(saved?: string, storageBlocked: boolean | "write" = false) {
   const dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
     url: "http://localhost/",
   });
@@ -14,8 +14,14 @@ function mount(saved?: string, storageBlocked = false) {
   const status = dom.window.document.querySelector<HTMLOutputElement>("#speaker-volume-status")!;
   const write = vi.fn();
   const control = new PlaybackVolumeControls(slider, mute, status, () => {
-    if (storageBlocked) throw new Error("storage blocked");
-    return storage;
+    if (storageBlocked === true) throw new Error("storage blocked");
+    return {
+      getItem: (key: string) => storage.getItem(key),
+      setItem: (key: string, value: string) => {
+        if (storageBlocked === "write") throw new Error("storage blocked");
+        storage.setItem(key, value);
+      },
+    };
   }, write);
   const choose = (value: string) => {
     slider.value = value;
@@ -25,6 +31,30 @@ function mount(saved?: string, storageBlocked = false) {
 }
 
 describe("speaker volume preference", () => {
+  it("records only a fixed category for rejected preferences and storage failures", () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const normal = mount();
+    expect(info).not.toHaveBeenCalled();
+    const valid = mount('{"volume":0.5,"muted":false}');
+    expect(info).not.toHaveBeenCalled();
+    for (const saved of ["{synthetic-invalid", '{"volume":-0.1,"muted":false}']) {
+      const rejected = mount(saved);
+      expect(info.mock.calls).toEqual([['[playback-volume-preference] {"category":"invalid"}']]);
+      info.mockClear();
+      rejected.dom.window.close();
+    }
+    const unreadable = mount(undefined, true);
+    expect(info.mock.calls).toEqual([['[playback-volume-preference] {"category":"storage_unavailable"}']]);
+    info.mockClear();
+    const unwritable = mount(undefined, "write");
+    expect(info).not.toHaveBeenCalled();
+    unwritable.choose("30");
+    expect(info.mock.calls).toEqual([['[playback-volume-preference] {"category":"storage_unavailable"}']]);
+    expect(unwritable.status.textContent).toBe("30% · not saved");
+    info.mockRestore();
+    for (const view of [normal, valid, unreadable, unwritable]) view.dom.window.close();
+  });
+
   it("labels native keyboard controls and applies input immediately", () => {
     const view = mount();
     expect(view.slider.type).toBe("range");

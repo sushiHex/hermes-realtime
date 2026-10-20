@@ -1,5 +1,9 @@
 export const PLAYBACK_VOLUME_KEY = "hermes-realtime.playback-volume.v1";
 
+function reportPreferenceFailure(category: "invalid" | "storage_unavailable"): void {
+  console.info(`[playback-volume-preference] ${JSON.stringify({ category })}`);
+}
+
 export class PlaybackVolumeControls {
   private volume = 1;
   private muted = false;
@@ -13,19 +17,28 @@ export class PlaybackVolumeControls {
     private readonly storage: () => Pick<Storage, "getItem" | "setItem">,
     private readonly write: (volume: number) => void,
   ) {
+    let failure: "invalid" | "storage_unavailable" | null = null;
     try {
-      const preference = JSON.parse(this.storage().getItem(PLAYBACK_VOLUME_KEY) ?? "null") as Record<string, unknown>;
-      if (
-        Object.keys(preference).sort().join(",") === "muted,volume" &&
-        typeof preference.volume === "number" &&
-        preference.volume >= 0 && preference.volume <= 1 &&
-        typeof preference.muted === "boolean"
-      ) {
-        this.volume = preference.volume;
-        this.muted = preference.muted;
+      const stored = this.storage().getItem(PLAYBACK_VOLUME_KEY);
+      if (stored !== null) {
+        failure = "invalid";
+        const preference = JSON.parse(stored) as Record<string, unknown>;
+        if (
+          Object.keys(preference).sort().join(",") === "muted,volume" &&
+          typeof preference.volume === "number" &&
+          preference.volume >= 0 && preference.volume <= 1 &&
+          typeof preference.muted === "boolean"
+        ) {
+          this.volume = preference.volume;
+          this.muted = preference.muted;
+          failure = null;
+        }
       }
     } catch {
       // Storage may be unavailable; a malformed preference also retains unity gain.
+      failure ??= "storage_unavailable";
+    } finally {
+      if (failure !== null) reportPreferenceFailure(failure);
     }
     this.slider.addEventListener("input", () => {
       this.volume = this.slider.valueAsNumber / 100;
@@ -49,6 +62,8 @@ export class PlaybackVolumeControls {
       this.saved = true;
     } catch {
       this.saved = false;
+    } finally {
+      if (!this.saved) reportPreferenceFailure("storage_unavailable");
     }
     this.render();
   }

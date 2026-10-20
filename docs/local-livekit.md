@@ -274,7 +274,7 @@ iPhone's ineffective `HTMLMediaElement.volume`. Local onset never calls the yiel
 transcripts, or gains task authority. The explicit **Stop speaking** control still submits an
 immediate exact `(turn, generation, chunk, stream)` yield claim.
 
-The **Speaker** slider and **Mute** button beside Voice adjust assistant output immediately,
+The **Speaker** slider and **Mute** button beside Voice update assistant output gain during playback,
 including spoken task results, through the existing LiveKit track's
 [`setVolume`](https://docs.livekit.io/reference/client-sdk-js/classes/RemoteAudioTrack.html#setVolume)
 path. The slider supports the keyboard's native range controls. Volume (0–100%) and mute
@@ -287,6 +287,7 @@ silence. Microphone capture and task/session controls keep their existing behavi
 [Preference tests](../web/tests/playback-volume.dom.test.ts) and the
 [mounted playback test](../web/tests/connection-main.dom.test.ts) cover gain setting,
 restoration and output-only wiring; they do not establish human audibility.
+LiveKit smooths gain changes, so a zero target does not establish instantaneous acoustic silence.
 
 Pass `projection.publish` as the observer when constructing both `ConversationSessionWorker` and `StreamingSpeechLoop`. This projects admitted user transcripts, delivered assistant transcript segments, first foreground token, and first playable audio without exposing internal turn, delegation, or run handles. Task and approval owners publish `task_state`, `completion_received`, `notification_queued`, and actionable `approval_state` events only after their own authoritative transitions; the browser runtime does not duplicate that authority.
 
