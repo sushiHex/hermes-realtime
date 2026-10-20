@@ -18,6 +18,9 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, cast
+from urllib.error import HTTPError, URLError
+
+import aiohttp
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
@@ -69,6 +72,24 @@ _NUMERIC = frozenset({
     "prompt_eval_count", "num_ctx", "prompt_bytes", "prompt_chars", "messages",
     "timing_invalid_count",
 })
+
+
+def failure_diagnostic(error: Exception, *, stage: str, started: float) -> dict[str, Any]:
+    """Classify exposed exception types only; never inspect text or chained causes.
+
+    Preflight currently exposes readiness refusals as generic RuntimeError, so
+    they remain `other` at stage `readiness`, rather than inferring a cause.
+    """
+    if isinstance(error, TimeoutError):
+        category = "timeout"
+    elif isinstance(error, (HTTPError, aiohttp.ClientResponseError)):
+        category = "http"
+    elif isinstance(error, (aiohttp.ClientError, URLError, ConnectionError)):
+        category = "transport"
+    else:
+        category = "other"
+    return {"stage": stage, "category": category,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
 
 
 class PromptTimingSink(io.TextIOBase):
@@ -148,8 +169,11 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
         row = {"id": case["id"], "expected": case["expected"], "error": None,
                "status": "attempted",
                "readiness_attempted": False, "decision_attempted": False,
-               "selection": None, "dispatches": 0, "timings": []}
+               "selection": None, "dispatches": 0, "timings": [],
+               "operational_failure": None, "cleanup_failures": []}
         timing = PromptTimingSink()
+        stage = "configuration"
+        started = time.monotonic()
         try:
             with contextlib.redirect_stdout(timing), contextlib.redirect_stderr(timing):
                 if type(inference) is not OllamaStreamingInference:
@@ -157,28 +181,37 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
                 await inference.configure_context(4096)
                 if inference.context_public_data()["modelDigest"] != model_digest:
                     raise ValueError("model_digest_refused")
+                stage = "readiness"
+                started = time.monotonic()
                 row["readiness_attempted"] = True
                 await asyncio.wait_for(preflight(
                     task_session=harness.ReadinessDouble(), inference=inference,
                     synthesizer=harness.ReadinessDouble(), surface=surface, natural_work_tools=True,
                 ), 60)
+                stage = "decision"
+                started = time.monotonic()
                 timing.stage = "decision"
                 row["decision_attempted"] = True
                 await asyncio.wait_for(collect_decision(
                     inference, request, f"confirmed_probe_{revision}", row,
                 ), 60)
-        except Exception:
+        except Exception as error:
             row["error"] = "attempt_failed"
+            row["operational_failure"] = failure_diagnostic(error, stage=stage, started=started)
             raise
         finally:
             try:
                 with contextlib.redirect_stdout(timing), contextlib.redirect_stderr(timing):
                     failures = []
                     for owner in (inference, surface):
+                        cleanup_started = time.monotonic()
                         try:
                             await asyncio.wait_for(owner.close(), 10)
                         except Exception as error:
                             failures.append(error)
+                            row["cleanup_failures"].append(failure_diagnostic(
+                                error, stage="cleanup", started=cleanup_started,
+                            ))
                     if failures:
                         row["error"] = "cleanup_failed"
                         raise ExceptionGroup("probe cleanup failed", failures)
@@ -210,7 +243,9 @@ def build_report(rows: list[dict[str, Any]], *, fixture_version: str = "v1") -> 
         "errors": len(attempted) - len(usable),
         "readiness_attempts": sum(row.get("readiness_attempted", False) for row in attempted),
         "decision_attempts": sum(row.get("decision_attempted", False) for row in attempted),
-        "case_outcomes": [{"id": row["id"], "status": row["status"], "error": row["error"]}
+        "case_outcomes": [{"id": row["id"], "status": row["status"], "error": row["error"],
+                           "operational_failure": row.get("operational_failure"),
+                           "cleanup_failures": row.get("cleanup_failures", [])}
                           for row in rows],
         "selections": dict(Counter(row["selection"] for row in usable)),
         "unwanted_proposals": sum(row["selection"] == "proposal" and row["expected"] != "proposal"

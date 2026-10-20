@@ -323,3 +323,162 @@ def test_live_operational_completion_is_separate_from_qualification(
     assert report["natural_routing_qualified"] is False
     assert report["objective_fidelity"] == report["lifecycle_claims"] == "pending"
     assert report["denominator"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["configuration", "readiness", "decision"])
+@pytest.mark.parametrize("fault,category", [
+    ("timeout", "timeout"), ("connection", "transport"), ("url", "transport"),
+    ("http", "http"), ("aiohttp_http", "http"), ("aiohttp", "transport"),
+    ("unknown", "other"),
+])
+async def test_operational_diagnostics_are_typed_staged_and_private(
+    monkeypatch, stage, fault, category,
+):
+    from urllib.error import HTTPError, URLError
+
+    import aiohttp
+
+    marker = "PRIVATE_exception_path_token_transcript"
+    failures = {
+        "timeout": TimeoutError(marker), "connection": ConnectionError(marker),
+        "url": URLError(marker), "http": HTTPError(marker, 503, marker, {}, None),
+        "aiohttp_http": aiohttp.ClientResponseError(None, (), status=503, message=marker),
+        "aiohttp": aiohttp.ClientConnectionError(marker), "unknown": RuntimeError(marker),
+    }
+    clock = [10.0]
+    calls = []
+
+    def fail_at(current):
+        calls.append(current)
+        if stage == current:
+            clock[0] += 0.125
+            raise failures[fault]
+        clock[0] += 0.25
+
+    class Inference:
+        async def configure_context(self, size):
+            fail_at("configuration")
+
+        def context_public_data(self):
+            return {"modelDigest": "a" * 64}
+
+        async def stream(self, request, turn_id):
+            fail_at("decision")
+            yield "Synthetic reply"
+
+        async def close(self):
+            calls.append("close")
+
+    async def preflight(**kwargs):
+        fail_at("readiness")
+
+    monkeypatch.setattr(probe, "factory", lambda **kwargs: Inference())
+    monkeypatch.setattr(probe, "preflight", preflight)
+    monkeypatch.setattr(probe, "OllamaStreamingInference", Inference)
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+    receipt = io.BytesIO()
+    rows = []
+    with pytest.raises(type(failures[fault])):
+        await probe.run_cases(model="phi4-mini:latest", base_url="http://127.0.0.1:1",
+                              private_sink=receipt, model_digest="a" * 64, observations=rows)
+    probe.record_unrun(rows, receipt)
+    report = probe.build_report(rows)
+    outcome = report["case_outcomes"][0]
+    assert outcome["operational_failure"] == {
+        "stage": stage, "category": category, "elapsed_ms": 125.0,
+    }
+    assert outcome["cleanup_failures"] == []
+    assert (report["denominator"], report["attempts"], report["errors"], report["unrun"]) == (
+        8, 1, 1, 7,
+    )
+    assert [row["status"] for row in rows] == ["attempted"] + ["not_run"] * 7
+    assert report["dispatches"] == 0
+    assert calls.count(stage) == calls.count("close") == 1
+    assert marker not in json.dumps(report)
+    assert marker.encode() not in receipt.getvalue()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operational_failure", [False, True])
+async def test_cleanup_diagnostics_preserve_both_owners_and_primary_failure(
+    monkeypatch, operational_failure,
+):
+    clock = [0.0]
+    closed = []
+
+    class Inference:
+        async def configure_context(self, size):
+            pass
+
+        def context_public_data(self):
+            return {"modelDigest": "a" * 64}
+
+        async def stream(self, request, turn_id):
+            yield "Synthetic reply"
+
+        async def close(self):
+            closed.append("inference")
+            clock[0] += 0.025
+            raise TimeoutError("PRIVATE_cleanup_inference")
+
+    async def close_surface(self):
+        closed.append("surface")
+        clock[0] += 0.05
+        raise RuntimeError("PRIVATE_cleanup_surface")
+
+    async def preflight(**kwargs):
+        if operational_failure:
+            clock[0] += 0.125
+            raise ConnectionError("PRIVATE_primary")
+
+    monkeypatch.setattr(probe, "factory", lambda **kwargs: Inference())
+    monkeypatch.setattr(probe, "preflight", preflight)
+    monkeypatch.setattr(probe, "OllamaStreamingInference", Inference)
+    monkeypatch.setattr(probe.ConversationWorkControlSurface, "close", close_surface)
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+    rows = []
+    with pytest.raises(ExceptionGroup):
+        await probe.run_cases(model="phi4-mini:latest", base_url="http://127.0.0.1:1",
+                              private_sink=io.BytesIO(), model_digest="a" * 64, observations=rows)
+    report = probe.build_report(rows)
+    outcome = report["case_outcomes"][0]
+    assert closed == ["inference", "surface"]
+    assert outcome["error"] == "cleanup_failed"
+    assert outcome["cleanup_failures"] == [
+        {"stage": "cleanup", "category": "timeout", "elapsed_ms": 25.0},
+        {"stage": "cleanup", "category": "other", "elapsed_ms": 50.0},
+    ]
+    assert outcome["operational_failure"] == (
+        {"stage": "readiness", "category": "transport", "elapsed_ms": 125.0}
+        if operational_failure else None
+    )
+    assert "PRIVATE" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_untyped_readiness_refusal_remains_other_without_text_inference(monkeypatch):
+    class Inference:
+        async def configure_context(self, size):
+            pass
+
+        def context_public_data(self):
+            return {"modelDigest": "a" * 64}
+
+        async def stream(self, request, turn_id):
+            if False:
+                yield ""
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(probe, "factory", lambda **kwargs: Inference())
+    monkeypatch.setattr(probe, "OllamaStreamingInference", Inference)
+    rows = []
+    with pytest.raises(RuntimeError, match="preflight produced no speakable output"):
+        await probe.run_cases(model="phi4-mini:latest", base_url="http://127.0.0.1:1",
+                              private_sink=io.BytesIO(), model_digest="a" * 64, observations=rows)
+    outcome = probe.build_report(rows)["case_outcomes"][0]
+    assert outcome["operational_failure"]["category"] == "other"
+    assert outcome["operational_failure"]["stage"] == "readiness"
+    assert outcome["operational_failure"]["elapsed_ms"] >= 0
