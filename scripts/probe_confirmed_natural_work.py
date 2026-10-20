@@ -112,6 +112,8 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
             codex_model="", codex_effort="", codex_executable=None,
         )
         row = {"id": case["id"], "expected": case["expected"], "error": None,
+               "status": "attempted",
+               "readiness_attempted": False, "decision_attempted": False,
                "selection": None, "dispatches": 0, "timings": []}
         timing = PromptTimingSink()
         try:
@@ -121,11 +123,13 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
                 await inference.configure_context(4096)
                 if inference.context_public_data()["modelDigest"] != model_digest:
                     raise ValueError("model_digest_refused")
+                row["readiness_attempted"] = True
                 await asyncio.wait_for(preflight(
                     task_session=harness.ReadinessDouble(), inference=inference,
                     synthesizer=harness.ReadinessDouble(), surface=surface, natural_work_tools=True,
                 ), 60)
                 timing.stage = "decision"
+                row["decision_attempted"] = True
                 await asyncio.wait_for(collect_decision(
                     inference, request, f"confirmed_probe_{revision}", row,
                 ), 60)
@@ -152,12 +156,28 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
     return rows
 
 
+def record_unrun(rows: list[dict[str, Any]], private_sink: Any) -> None:
+    """Preserve the frozen tail after an aborted attempt without executing it."""
+    cases = qualification.load_preregistration()["model_cases"]
+    for case in cases[len(rows):]:
+        row = {"id": case["id"], "expected": case["expected"], "status": "not_run",
+               "error": None, "selection": None, "dispatches": 0, "timings": []}
+        rows.append(row)
+        harness.write_private_row(private_sink, row)
+
+
 def build_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    usable = [row for row in rows if row["error"] is None]
+    attempted = [row for row in rows if row["status"] == "attempted"]
+    usable = [row for row in attempted if row["error"] is None]
     return {
         "schema_version": 1, "scenario_id": "confirmed-natural-work-v1",
         "fixture_sha256": qualification.FIXTURE_SHA256,
-        "attempts": len(rows), "unrun": 8 - len(rows), "errors": len(rows) - len(usable),
+        "denominator": 8, "attempts": len(attempted), "unrun": 8 - len(attempted),
+        "errors": len(attempted) - len(usable),
+        "readiness_attempts": sum(row.get("readiness_attempted", False) for row in attempted),
+        "decision_attempts": sum(row.get("decision_attempted", False) for row in attempted),
+        "case_outcomes": [{"id": row["id"], "status": row["status"], "error": row["error"]}
+                          for row in rows],
         "selections": dict(Counter(row["selection"] for row in usable)),
         "unwanted_proposals": sum(row["selection"] == "proposal" and row["expected"] != "proposal"
                                   for row in usable),
@@ -199,10 +219,13 @@ def main(argv: list[str] | None = None) -> int:
         report = {"status": "prepared_only", "fixture_sha256": qualification.FIXTURE_SHA256}
         if args.live:
             with args.private_receipt.open("xb", buffering=0) as receipt:
-                asyncio.run(asyncio.wait_for(run_cases(
-                    model=args.model, base_url=args.base_url, model_digest=args.model_digest,
-                    private_sink=receipt, observations=rows,
-                ), 1000))
+                try:
+                    asyncio.run(asyncio.wait_for(run_cases(
+                        model=args.model, base_url=args.base_url, model_digest=args.model_digest,
+                        private_sink=receipt, observations=rows,
+                    ), 1000))
+                finally:
+                    record_unrun(rows, receipt)
             report = build_report(rows)
         after = harness.source_binding()
         after["probe_sha256"] = harness.digest(Path(__file__))

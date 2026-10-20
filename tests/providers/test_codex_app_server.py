@@ -2055,15 +2055,13 @@ async def _collect_stream(
 
 def _assert_proposal(
     rows: list[Any], inference: CodexAppServerStreamingInference,
-    *, objective: str = "Inspect the build", invocation_id: str | None = None,
+    *, objective: str = "Inspect the build",
 ) -> HostTaskProposalRequest:
     # A terminal typed selection cannot leak model commentary as accepted speech.
     assert len(rows) == 1
     assert type(rows[0]) is HostTaskProposalRequest
     proposal = rows[0]
     assert proposal.objective == objective
-    if invocation_id is not None:
-        assert proposal.invocation_id == invocation_id
     handler = inference._work_tool_handler
     if isinstance(handler, FakeWorkToolHandler):
         assert handler.starts == handler.cancels == handler.exact_cancels == []
@@ -3200,7 +3198,7 @@ async def test_codex_registered_start_work_returns_only_exact_proposal() -> None
 
     _assert_proposal([
         segment async for segment in inference.stream(_snapshot(), turn_id="turn_dynamic_start")
-    ], inference, invocation_id="tool_38abdb91db99f7c621bebf24a28ce714")
+    ], inference)
     response = next(item for item in transport.sent if item.get("id") == 91)
     assert response == {
         "id": 91,
@@ -3982,7 +3980,7 @@ async def test_codex_consecutive_turns_may_reuse_dynamic_call_id() -> None:
     )
     inference.bind_work_tools(handler)
 
-    invocations = []
+    proposals = []
     for number in (1, 2):
         stream_task = asyncio.create_task(_collect_stream(inference, f"turn_reuse_{number}"))
         await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
@@ -3992,10 +3990,10 @@ async def test_codex_consecutive_turns_may_reuse_dynamic_call_id() -> None:
         await transport.complete_item(response, call_id="call_1")
         await transport.complete_turn(delta=f"Done {number}.")
         proposal = _assert_proposal(await asyncio.wait_for(stream_task, timeout=0.2), inference)
-        invocations.append(proposal.invocation_id)
+        proposals.append(proposal)
 
     assert handler.starts == []
-    assert len(set(invocations)) == 2
+    assert len(proposals) == 2
     assert inference._dynamic_calls == {}
     await inference.close()
 

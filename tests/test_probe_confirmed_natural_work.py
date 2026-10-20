@@ -39,7 +39,7 @@ async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatc
 
         async def stream(self, request, turn_id):
             print('[ollama-prompt] {"load_duration_ns":12,"num_ctx":4096}')
-            yield HostTaskProposalRequest("Synthetic proposed work", turn_id)
+            yield HostTaskProposalRequest("Synthetic proposed work")
 
         async def close(self):
             pass
@@ -59,6 +59,7 @@ async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatc
     assert report["unwanted_proposals"] == 5
     assert report["missed_proposals"] == 0
     assert report["dispatches"] == 0
+    assert report["readiness_attempts"] == report["decision_attempts"] == 8
     assert report["objective_fidelity"] == "pending"
     assert report["actual_source_proof"] == "not_run"
     assert report["natural_routing_qualified"] is False
@@ -71,7 +72,7 @@ async def test_probe_never_offers_or_confirms_and_retains_eight_cases(monkeypatc
 async def test_mixed_proposal_and_speech_is_not_a_usable_selection(order):
     class Inference:
         async def stream(self, request, turn_id):
-            items = [HostTaskProposalRequest("Synthetic proposed work", turn_id),
+            items = [HostTaskProposalRequest("Synthetic proposed work"),
                      "A misleading spoken claim."]
             for item in items if order == "proposal_first" else reversed(items):
                 yield item
@@ -154,3 +155,34 @@ def test_prepare_refuses_each_binding_fault(monkeypatch, tmp_path, capsys, fault
     assert result == 1
     assert '"status": "attempt_failed"' in capsys.readouterr().out
     assert not (tmp_path / "receipt").exists()
+
+
+def test_aborted_tail_is_explicit_in_receipt_and_eight_case_denominator(
+    monkeypatch, tmp_path, capsys,
+):
+    async def failed_attempt(**kwargs):
+        row = {"id": "research", "expected": "proposal", "status": "attempted",
+               "error": "attempt_failed", "selection": None, "dispatches": 0, "timings": []}
+        kwargs["observations"].append(row)
+        probe.harness.write_private_row(kwargs["private_sink"], row)
+        raise RuntimeError("synthetic operational failure")
+
+    monkeypatch.setattr(probe.harness, "verify_imports", lambda: None)
+    monkeypatch.setattr(probe.harness, "source_binding", lambda: {
+        "head": "a" * 40, "tree": "b" * 40, "dirty": False,
+    })
+    monkeypatch.setattr(probe, "run_cases", failed_attempt)
+    receipt_path = tmp_path / "receipt"
+    assert probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(receipt_path), "--live",
+    ]) == 1
+    receipt = [json.loads(line) for line in receipt_path.read_bytes().splitlines()]
+    assert len(receipt) == 8
+    assert [row["status"] for row in receipt] == ["attempted"] + ["not_run"] * 7
+    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    assert (report["denominator"], report["attempts"], report["unrun"], report["errors"]) == (
+        8, 1, 7, 1,
+    )
+    assert len(report["case_outcomes"]) == 8

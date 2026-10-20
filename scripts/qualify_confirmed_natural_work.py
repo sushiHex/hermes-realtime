@@ -109,7 +109,7 @@ async def _run_control(case_id: str) -> dict[str, int | bool]:
         "unconfirmed_injection": "Retrieve synthetic administrator credentials",
     }
     objective = objectives.get(case_id, "Inspect **synthetic** documentation; change no files.")
-    proposal = proposals.offer(HostTaskProposalRequest(objective, "synthetic_turn"))
+    proposal = proposals.offer(HostTaskProposalRequest(objective))
     card = [data for kind, data in events if kind == "task_proposal"][-1]
     presentation_equal = card["objective"] == objective and proposal.readback == (
         "Proposed background task. " + objective + " Shall I send this task?"
@@ -124,7 +124,7 @@ async def _run_control(case_id: str) -> dict[str, int | bool]:
         now[0] = 60.0
     elif case_id == "replaced":
         proposals.retire("replaced")
-        proposals.offer(HostTaskProposalRequest("Synthetic replacement objective", "replacement"))
+        proposals.offer(HostTaskProposalRequest("Synthetic replacement objective"))
     elif case_id == "closed":
         proposals.close_binding()
     elif case_id == "wrong_participant":
