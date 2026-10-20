@@ -99,10 +99,8 @@ async def _run_control(case_id: str) -> dict[str, int | bool]:
         reserve_observer_capacity=lambda: None,
     )
     now = [0.0]
-    identities = iter(("proposal_synthetic1", "proposal_synthetic2"))
     proposals = ConversationTaskProposals(
         surface=surface, observer=observe, clock=lambda: now[0],
-        id_factory=lambda: next(identities),
     )
     proposals.bind("participant", 1)
     objectives = {
@@ -114,7 +112,7 @@ async def _run_control(case_id: str) -> dict[str, int | bool]:
     proposal = proposals.offer(HostTaskProposalRequest(objective, "synthetic_turn"))
     card = [data for kind, data in events if kind == "task_proposal"][-1]
     presentation_equal = card["objective"] == objective and proposal.readback == (
-        "Proposed background task. " + objective + " End of proposed task."
+        "Proposed background task. " + objective + " Shall I send this task?"
     )
     arguments: dict[str, Any] = dict(
         participant="participant", generation=1, proposal_id=proposal.proposal_id,
