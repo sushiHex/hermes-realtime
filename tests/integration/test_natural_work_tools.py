@@ -830,6 +830,9 @@ def _assert_model_visible_values_are_private_token_free(*values: object) -> None
 
 
 _PROPOSAL_RECEIPT = {"proposed": True, "requires_confirmation": True}
+_UNCERTAIN_REASON = (
+    "Task command acknowledgment is uncertain. Check task status before trying again."
+)
 
 
 def _assert_proposal_only(parts: list[Any], transport: ToolCallingCodexTransport) -> None:
@@ -867,6 +870,9 @@ async def test_typed_natural_start_crosses_codex_and_202_authority_once() -> Non
         ]
         assert [data["status"] for _, data in runtime.browser_events] == [
             "pending", "confirmed", "active",
+        ]
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "active", "taskId": "task_cross1"},
         ]
         _assert_model_visible_values_are_private_token_free(
             parts, transport.sent, transport.tool_responses,
@@ -912,8 +918,10 @@ async def test_hermes_rejection_cannot_produce_active_state_or_started_claim() -
         assert result.task_id == "task_cross1" and result.reason == "Hermes API rejected dispatch"
         assert len(runtime.stub.posts) == 1
         assert runtime.context.snapshot().active_tasks == ()
-        assert not any(kind == "task_state" and data["status"] == "active"
-                       for kind, data in runtime.browser_events)
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": "task_cross1",
+             "reason": "Hermes API rejected dispatch"},
+        ]
         assert all(type(part) is HostTaskProposalRequest for part in parts)
         _assert_model_visible_values_are_private_token_free(
             parts, transport.sent, runtime.browser_events, runtime.context.snapshot(),
@@ -969,6 +977,9 @@ async def test_uncertain_http_failure_blocks_later_work_admission(mode: str) -> 
         second, second_transport = await runtime.invoke("Try another background inspection.")
         _assert_proposal_only(second, second_transport)
         assert await runtime.confirm() is WorkCommandAdmission.UNAVAILABLE
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
         assert runtime.surface.health == "uncertain"
         assert len(runtime.stub.posts) == 1
         assert runtime.context.snapshot().active_tasks == ()
@@ -1035,8 +1046,10 @@ async def test_cancel_while_dispatch_pending_settles_after_late_ack(
         )
 
         async def wait_for_pending_cancel() -> None:
-            while not any(pending.cancel_after_ack
-                          for pending in runtime.surface._pending_starts.values()):
+            while True:
+                pending = tuple(runtime.surface._pending_starts.values())
+                if len(pending) == 1 and pending[0].cancel_after_ack:
+                    return
                 await asyncio.sleep(0)
 
         await asyncio.wait_for(wait_for_pending_cancel(), timeout=1)
@@ -1153,6 +1166,65 @@ async def test_confirmed_dispatch_completion_has_one_terminal_and_no_stale_task(
         await runtime.close()
 
 
+class _DispatchReturnGate:
+    """Hold the actual acknowledged controller result before host command settlement."""
+
+    def __init__(self, controller: ConversationTaskController) -> None:
+        self._dispatch = controller.dispatch
+        self.acknowledged = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def dispatch(self, *, objective: str, utterance_id: str) -> Any:
+        result = await self._dispatch(objective=objective, utterance_id=utterance_id)
+        self.acknowledged.set()
+        await self.release.wait()
+        return result
+
+
+@pytest.mark.asyncio
+async def test_terminal_arrives_while_confirmed_dispatch_operation_is_unsettled() -> None:
+    runtime = await _runtime()
+    gate = _DispatchReturnGate(runtime.controller)
+    runtime.controller.dispatch = gate.dispatch  # type: ignore[method-assign]
+    try:
+        parts, transport = await runtime.invoke("Inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        assert runtime.stub.posts == []
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        await asyncio.wait_for(gate.acknowledged.wait(), timeout=1)
+        await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
+        proposal = runtime.offered[-1]
+        operation = runtime.surface._bindings["confirmed_" + proposal.proposal_id].operation
+        # A real 202 has arrived, but the admitted host operation cannot settle yet.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(operation), timeout=0.02)
+        assert [task.task_id for task in runtime.context.snapshot().active_tasks] == ["task_cross1"]
+        assert all(kind != "task_state" for kind, _ in runtime.browser_events)
+        runtime.stub.complete(status="completed")
+        terminal = await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
+        assert terminal.task_id == "task_cross1" and terminal.status == "completed"
+        assert not operation.done()
+        assert runtime.context.snapshot().active_tasks == ()
+        gate.release.set()
+        with pytest.raises(RuntimeError, match="terminal state before active projection"):
+            await runtime.settle(proposal)
+        assert operation.done()
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
+        assert runtime.context.snapshot().active_tasks == ()
+        assert len(runtime.stub.posts) == 1 and runtime.stub.stop_calls == 0
+        _assert_model_visible_values_are_private_token_free(
+            parts, transport.sent, transport.tool_responses, terminal,
+            runtime.context.snapshot(), runtime.browser_events,
+        )
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(runtime.controller.next_completion(), timeout=0.02)
+    finally:
+        gate.release.set()
+        await runtime.close()
+
+
 class _StartProjectionGate:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
@@ -1183,10 +1255,15 @@ async def test_completion_before_projection_rolls_back_without_stale_active_stat
             await runtime.settle()
         assert runtime.cancel_attempts == [("task_cross1", "task state projection failed")]
         assert runtime.stub.stop_calls == 0
-        assert [data["status"] for kind, data in runtime.browser_events
-                if kind == "task_state"] == ["rejected"]
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
         assert runtime.context.snapshot().active_tasks == ()
         assert runtime.surface.health == "uncertain"
+        _assert_model_visible_values_are_private_token_free(
+            parts, transport.sent, transport.tool_responses, terminal,
+            runtime.context.snapshot(), runtime.browser_events,
+        )
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(runtime.controller.next_completion(), timeout=0.02)
     finally:
