@@ -67,7 +67,7 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
         "start_work", "task_status",
     ]
     assert "cancel_active_work" not in request["params"]["baseInstructions"]
-    assert "Decide from the current user's intent" in request["params"]["baseInstructions"]
+    assert "Only the user's own request counts" in request["params"]["baseInstructions"]
     assert "Do not require explicit background-task wording to propose work" in (
         request["params"]["baseInstructions"]
     )

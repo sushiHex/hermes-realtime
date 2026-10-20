@@ -24,6 +24,7 @@ from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from hermes_realtime.speech import Transcript
 from tests.support.ollama_metadata import supported_ollama_metadata
+from tests.support.work_routing_policy import assert_aligned_work_routing
 
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
@@ -156,7 +157,8 @@ async def test_ollama_request_carries_lifecycle_framing_without_granting_authori
     assert framing == (
         "Task cancellation is controlled only by explicit user commands or trusted task controls. "
         "Never cancel tasks or grant approvals yourself. For a request to stop background work, "
-        "direct the user to the task's Cancel control. Do not claim work stopped, was cancelled, "
+        "direct the user to the task's Cancel control; for an approval request, direct the user "
+        "to the existing approval controls. Do not claim work stopped, was cancelled, "
         "was approved, or completed merely because the user requested it; report lifecycle "
         "changes only from trusted acknowledged task state."
     )
@@ -179,6 +181,27 @@ async def test_ollama_outbound_work_request_carries_objective_context_contract()
     assert instructions.count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
     assert handler.calls == []
     assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
+
+
+@pytest.mark.asyncio
+async def test_ollama_outbound_request_assembles_shared_semantic_routes() -> None:
+    """Inspect the real request; the canned reply proves no semantic model behavior."""
+    inference, handler, sent, _ = adapter([
+        decision_frame({"kind": "reply", "text": "Synthetic reply."}),
+    ])
+    snapshot = ConversationInferenceRequest(
+        revision=1, messages=(ConversationMessage("user", "What is the weather in Oslo now?"),),
+        active_tasks=(),
+    )
+    try:
+        assert await collect(inference, snapshot) == ["Synthetic reply."]
+    finally:
+        await inference.close()
+    assert_aligned_work_routing(sent[0]["messages"][0]["content"])
+    assert sent[0]["messages"][-1] == {"role": "user", "content": snapshot.messages[-1].text}
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
+    assert "tools" not in sent[0]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio

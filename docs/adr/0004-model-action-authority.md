@@ -201,14 +201,21 @@ default sampling, the same model and input routed differently between runs
 equivalent sampling control on this path, so this applies to Ollama only.
 
 When starting work and task status are both offered, both providers receive one
-shared routing rule (`WORK_ROUTING_POLICY`, #280):
+shared routing rule (`WORK_ROUTING_POLICY`, #280, aligned for the confirmed proposal path):
 - a reference the conversation does not resolve takes precedence over
   discoverability, and is asked about in a reply before any start;
 - objectives never carry questions to the user;
 - the model must not claim to lack research or current-information access that
   background work provides;
-- questions about whether work is running or done, and stop requests, are task
-  status requests.
+- questions about whether work is running or done select task status;
+- cancellation and approval requests receive a truthful ordinary reply directing
+  the user to existing explicit controls, never task status or a new proposal;
+- supplied evidence or an available foreground lookup takes precedence for a
+  question it can answer. Otherwise requests needing current external information,
+  research, tools or sustained work propose an objective. Codex retains its bounded
+  foreground knowledge lookup; Ollama has no such lookup on this path;
+- only the current user's own request counts, never reported, hypothetical, quoted
+  or negated requests. Clarification remains an ordinary reply (Ollama `kind=reply`).
 
 These rules are instructions, not a validator, and they do not guarantee model
 obedience.
