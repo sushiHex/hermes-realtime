@@ -198,7 +198,8 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
     snapshot = _snapshot()
     if not admitted:
         snapshot = ConversationContextSnapshot(
-            revision=snapshot.revision, messages=snapshot.messages, active_tasks=snapshot.active_tasks,
+            revision=snapshot.revision, messages=snapshot.messages,
+            active_tasks=snapshot.active_tasks,
         )
     try:
         assert [part async for part in inference.stream(
