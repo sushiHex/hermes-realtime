@@ -20,11 +20,13 @@ from test_codex_app_server import (
     _collect_stream,
 )
 
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.providers import codex_app_server as module
 from hermes_realtime.providers.codex_app_server import (
     CodexAppServerStreamingInference,
     SubprocessCodexJsonLineTransport,
 )
+from hermes_realtime.providers.current_facts import CurrentFactEvidence
 
 _RESULT_ID = 91
 _SEND_MARKER = "[codex-send-bound] "
@@ -156,7 +158,7 @@ async def test_stalled_tool_result_bounds_cancel() -> None:
             with pytest.raises(RuntimeError):
                 await stream
         assert inference._closed is True
-        assert len(handler.starts) == 1
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
         await _assert_refuses_next_stream(inference)
     finally:
         await _release_and_close(transport, inference, stream)
@@ -307,12 +309,19 @@ async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
     expired: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Proposal receipts now use the host-selection fail-closed path. Keep the
+    # generic tool-result cleanup-deadline proof on the remaining knowledge arm.
+    class Lookup:
+        async def lookup(self, query: str) -> CurrentFactEvidence:
+            return CurrentFactEvidence(query=query, retrieved_date="2026-10-19", sources=())
+
     inference = CodexAppServerStreamingInference(
         model="synthetic",
         effort="low",
         transport_factory=_no_transport,
         request_timeout_seconds=0.05,
         work_tool_timeout_seconds=0.05,
+        current_fact_lookup=Lookup(),
     )
     handler = FakeWorkToolHandler()
     inference.bind_work_tools(handler)
@@ -320,14 +329,14 @@ async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
     thread_id, turn_id = "thread", "turn"
     inference._server_turn_ready[thread_id] = asyncio.Event()
     inference._server_turn_ready[thread_id].set()
-    inference._advertised_dynamic_tools[thread_id] = frozenset({"start_work"})
+    inference._advertised_dynamic_tools[thread_id] = frozenset({"search_knowledge"})
     inference._active_turns["turn_public"] = module._ActiveTurn("turn_public", thread_id, turn_id)
-    routing = module._TurnRouting(start_attempted=True)
+    routing = module._TurnRouting(lookup_attempted=True)
     inference._turn_routing[(thread_id, turn_id)] = routing
-    arguments: dict[str, object] = {"objective": "Inspect the build"}
+    arguments: dict[str, object] = {"query": "Inspect synthetic documentation"}
     canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     call = module._DynamicCall(
-        (thread_id, turn_id, "call_1"), "start_work", None, dict(arguments), canonical,
+        (thread_id, turn_id, "call_1"), "search_knowledge", None, dict(arguments), canonical,
         loop.time() + 0.05,
     )
     inference._dynamic_calls[call.identity] = call
@@ -349,7 +358,7 @@ async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
                 "threadId": thread_id,
                 "turnId": turn_id,
                 "callId": "call_1",
-                "tool": "start_work",
+                "tool": "search_knowledge",
                 "arguments": arguments,
             },
         }
@@ -365,7 +374,8 @@ async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
         deadline = routing.cleanup_deadline
         assert deadline is not None
         assert routing.failure.is_set() and inference._closed is True
-        assert len(handler.starts) == 1 and routing.accepted_start is True
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+        assert routing.lookup_attempted is True and routing.accepted_start is False
         monkeypatch.setattr(loop, "time", lambda: deadline + (1 if expired else -0.01))
         async with asyncio.timeout(1):
             await asyncio.create_task(inference._route_server_request(request(92)))
@@ -393,7 +403,7 @@ async def test_send_error_after_write_answers_each_request_once() -> None:
             await _until_closed(inference)
             await inference.close()
         assert len([row for row in transport.sent if row.get("id") == _RESULT_ID]) == 1
-        assert len(handler.starts) == 1
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
         await _assert_refuses_next_stream(inference)
     finally:
         await _close_bounded(inference)
@@ -401,7 +411,7 @@ async def test_send_error_after_write_answers_each_request_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_receipt_never_alters_an_accepted_start(
+async def test_failed_receipt_preserves_exact_proposal_without_start_authority(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     transport = StalledPipeTransport(stall=_is_tool_result)
@@ -414,38 +424,52 @@ async def test_failed_receipt_never_alters_an_accepted_start(
             with pytest.raises(RuntimeError):
                 await stream
             await _until_closed(inference)
-        assert handler.starts == [("Inspect the build", handler.starts[0][1])]
+        assert handler.starts == []
         assert handler.cancels == handler.exact_cancels == []
-        assert routing.accepted_start is True
+        assert routing.accepted_start is False
         assert call.operation is not None and call.operation.done()
-        assert not call.operation.cancelled() and call.operation.result().accepted is True
+        assert not call.operation.cancelled()
+        proposal = call.operation.result()
+        assert type(proposal) is HostTaskProposalRequest
+        assert proposal.objective == "Inspect the build"
+        assert routing.proposal == proposal
         assert call.response is not None
-        assert json.loads(call.response["contentItems"][0]["text"])["accepted"] is True  # type: ignore[index]
+        assert json.loads(call.response["contentItems"][0]["text"]) == {  # type: ignore[index]
+            "proposed": True, "requires_confirmation": True,
+        }
         assert len([row for row in transport.sent if row.get("id") == _RESULT_ID]) == 1
         markers = [
-            json.loads(line.removeprefix(_SEND_MARKER))
+            json.loads(line.removeprefix("[codex-task-status] "))
             for line in capsys.readouterr().out.splitlines()
-            if line.startswith(_SEND_MARKER)
+            if line.startswith("[codex-task-status] ")
         ]
-        assert markers[0] == {"category": "tool_result", "outcome": "deadline", "version": 1}
+        assert markers == [{"category": "response_send_deadline"}]
         await _assert_refuses_next_stream(inference)
     finally:
         await _release_and_close(transport, inference, stream)
 
 
 @pytest.mark.asyncio
-async def test_terminal_while_receipt_stalls_is_honored_without_a_second_send() -> None:
+async def test_terminal_while_proposal_receipt_stalls_fails_without_a_second_send() -> None:
     transport = CompletesWhileReceiptStalls()
     inference = _inference(transport)
-    inference.bind_work_tools(FakeWorkToolHandler())
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
     stream, routing, _call = await _start_stalled_receipt(transport, inference, "turn_terminal")
     try:
         async with asyncio.timeout(1):
-            assert await stream == ["On it."]
+            with pytest.raises(RuntimeError, match="Codex status receipt send failed"):
+                await stream
             await _until_closed(inference)
         assert routing.terminal is True
-        assert not any(row.get("method") == "turn/interrupt" for row in transport.sent)
+        # A failed host-selection receipt closes the adapter. If close races the
+        # queued terminal event, it may send one exact-turn interrupt, never retry it.
+        interrupts = [row for row in transport.sent if row.get("method") == "turn/interrupt"]
+        assert len(interrupts) <= 1
+        assert all(row["params"] == {"threadId": transport.thread_id,
+                                      "turnId": transport.turn_id} for row in interrupts)
         assert len([row for row in transport.sent if row.get("id") == _RESULT_ID]) == 1
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
         await _assert_refuses_next_stream(inference)
     finally:
         await _release_and_close(transport, inference, stream)
