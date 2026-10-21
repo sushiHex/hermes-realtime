@@ -349,6 +349,11 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
             "calls, or use skill_view, browser tools, or terminal for this lookup path."
             in instructions
         )
+        assert (
+            "Use only inline extraction output; do not call read_file or page through "
+            "stored page content."
+            in instructions
+        )
         assert "Local, runtime, file, process, build, and verification objectives" in instructions
         assert (
             "Never interpret an unavailable tool, failed command, or empty output"
