@@ -1094,6 +1094,10 @@ class CodexAppServerStreamingInference:
             handler = self._work_tool_handler
             tool_handler = handler
             current_user_turn = bool(snapshot.messages and snapshot.messages[-1].role == "user")
+            status_available = (
+                handler is not None and admitted_user_turn
+                and current_user_turn and not private_turn
+            )
             if not current_user_turn or private_turn or lookup_attempted:
                 tool_handler = None
             if bounded_lookup_failed:
@@ -1101,7 +1105,7 @@ class CodexAppServerStreamingInference:
                     "The bounded lookup reached its limit. Do not escalate this factual lookup "
                     "into background work; briefly state what could not be verified. "
                 )
-            if tool_handler is None and not search_available:
+            if tool_handler is None and not search_available and not status_available:
                 base_instructions = (
                     "You are a concise realtime conversational assistant. Never use tools. "
                     + representative_policy
@@ -1191,7 +1195,7 @@ class CodexAppServerStreamingInference:
                 dynamic_tools = self._dynamic_tools(
                     tool_handler.max_objective_chars if tool_handler is not None else None,
                     include_search=search_available,
-                    include_status=admitted_user_turn,
+                    include_status=status_available,
                 )
             if admitted_user_turn and tool_handler is not None:
                 base_instructions += (
@@ -1494,32 +1498,32 @@ class CodexAppServerStreamingInference:
                     },
                 }
             )
-        if max_objective_chars is None:
-            return tools
-        tools.append(
-            {
-                "type": "function",
-                "name": "start_work",
-                "description": (
-                    "Delegate work needed to fulfil the current user's request: research, tools, "
-                    "inspection, commands, builds, changes, or verification. "
-                    "Never use for conversation, indirect requests, "
-                    "or inactive continuation."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["objective"],
-                    "properties": {
-                        "objective": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": max_objective_chars,
-                        }
+        if max_objective_chars is not None:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "start_work",
+                    "description": (
+                        "Delegate work needed to fulfil the current user's request: research, "
+                        "tools, "
+                        "inspection, commands, builds, changes, or verification. "
+                        "Never use for conversation, indirect requests, "
+                        "or inactive continuation."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["objective"],
+                        "properties": {
+                            "objective": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": max_objective_chars,
+                            }
+                        },
                     },
-                },
-            }
-        )
+                }
+            )
         if include_status:
             tools.append({"type": "function", "name": "task_status",
                 "description": (
@@ -2244,7 +2248,9 @@ class CodexAppServerStreamingInference:
             )
             route_rejected = False
             if tool in {"search_knowledge", "start_work", "task_status"}:
-                if routing.lookup_attempted or routing.start_attempted or routing.status_selected:
+                # Lookup evidence does not spend the read-only host-status capability.
+                if (routing.start_attempted or routing.status_selected
+                        or (routing.lookup_attempted and tool != "task_status")):
                     route_rejected = True
                 elif tool == "search_knowledge":
                     routing.lookup_attempted = True
