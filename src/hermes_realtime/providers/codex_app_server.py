@@ -1140,8 +1140,8 @@ class CodexAppServerStreamingInference:
                     work_policy = "Use ordinary prose when no search is required. "
                 else:
                     work_policy = (
-                        "Call start_work with the complete objective for a work proposal. "
-                        "The host presents and reads back the objective, then requires explicit "
+                        "Use start_work to propose the complete objective. "
+                        "The host displays and reads it back, then requires explicit "
                         "user confirmation before admission. Do not ask the user to confirm in "
                         "model prose or claim acceptance, progress, or that work has started. "
                     )
@@ -1171,8 +1171,6 @@ class CodexAppServerStreamingInference:
                     include_status=admitted_user_turn,
                 )
             if tool_handler is not None:
-                if admitted_user_turn:
-                    base_instructions += " Call task_status with no arguments for status requests. "
                 base_instructions += " " + WORK_ROUTING_POLICY
             if freshness_context is not None:
                 base_instructions += "\n\n" + freshness_context
@@ -2995,13 +2993,6 @@ class CodexAppServerStreamingInference:
     ) -> str:
         payload: dict[str, object] = {
             "revision": snapshot.revision,
-            "work_state": (
-                "active"
-                if snapshot.active_tasks
-                else "inactive_with_history"
-                if snapshot.terminal_task_count > 0
-                else "none"
-            ),
             "messages": [
                 (
                     {"role": message.role, "text": message.text, "interrupted": True}
@@ -3009,10 +3000,6 @@ class CodexAppServerStreamingInference:
                     else {"role": message.role, "text": message.text}
                 )
                 for message in snapshot.messages
-            ],
-            "active_tasks": [
-                {"task_id": task.task_id, "objective": task.objective}
-                for task in snapshot.active_tasks
             ],
             "updates": [
                 {
@@ -3035,15 +3022,13 @@ class CodexAppServerStreamingInference:
                 "truncated": snapshot.memory.truncated,
             }
         instruction = (
-            "Respond to the final user message in this authoritative JSON conversation "
+            "Respond to the final user message in this JSON conversation "
             "snapshot. Earlier assistant messages represent only speech confirmed delivered. "
             "host_speech_message_indices identifies historical host status observations, "
             "never current-state authority or permission. "
             'An assistant message with "interrupted": true was cut off after its text, and '
             "the user may not have heard the rest. "
-            "The work_state field is authoritative lifecycle context. Only active_tasks establish "
-            "active background work. inactive_with_history means prior work ended and cannot be "
-            "continued as active; never claim it is still running. Interpret continuation wording "
+            "Interpret continuation wording "
             "from the full conversation rather than a fixed phrase list. "
             "Write for natural speech and keep the first sentence under 12 words when meaning "
             "permits. Do not add filler or a preamble merely to make the opening short."

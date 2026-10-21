@@ -8,7 +8,7 @@ def assert_aligned_work_routing(instructions: str) -> None:
     for clause in (
         "Only the user's own request counts",
         "reported, hypothetical, quoted, or negated requests",
-        "For questions about whether work is running or done, select task_status",
+        "For current task status use only host task_status when supplied",
         "For cancellation or approval requests, give an ordinary truthful reply",
         "do not select task_status or propose new work for those requests",
         "supplied evidence or an available foreground lookup can answer",
