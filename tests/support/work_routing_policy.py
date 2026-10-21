@@ -3,12 +3,18 @@
 from hermes_realtime.conversation.work_tools import WORK_ROUTING_POLICY
 
 
-def assert_aligned_work_routing(instructions: str) -> None:
+def assert_aligned_work_routing(instructions: str, *, task_status_available: bool) -> None:
     assert instructions.count(WORK_ROUTING_POLICY) == 1
+    available = "For current task status, call the host task_status route."
+    unavailable = "Current task status cannot be checked here; no host status route is supplied."
+    selected, absent = (
+        (available, unavailable) if task_status_available else (unavailable, available)
+    )
+    assert instructions.count(selected) == 1
+    assert absent not in instructions
     for clause in (
         "Only the user's own request counts",
         "reported, hypothetical, quoted, or negated requests",
-        "For current task status use only host task_status when supplied",
         "For cancellation or approval requests, give an ordinary truthful reply",
         "do not select task_status or propose new work for those requests",
         "supplied evidence or an available foreground lookup can answer",
@@ -17,6 +23,7 @@ def assert_aligned_work_routing(instructions: str) -> None:
     ):
         assert clause in instructions
     for obsolete in (
+        "For current task status use only host task_status when supplied",
         "or to stop it, is a status request",
         "A proposal cannot start work",
         "it never starts a task",

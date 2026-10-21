@@ -197,7 +197,10 @@ async def test_ollama_outbound_request_assembles_shared_semantic_routes() -> Non
         assert await collect(inference, snapshot) == ["Synthetic reply."]
     finally:
         await inference.close()
-    assert_aligned_work_routing(sent[0]["messages"][0]["content"])
+    assert_aligned_work_routing(
+        sent[0]["messages"][0]["content"],
+        task_status_available=status_schema() in sent[0]["format"]["oneOf"],
+    )
     assert sent[0]["messages"][-1] == {"role": "user", "content": snapshot.messages[-1].text}
     assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
     assert "tools" not in sent[0]

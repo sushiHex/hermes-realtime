@@ -120,9 +120,12 @@ async def test_sent_snapshot_has_no_competing_task_projection(provider):
 async def test_sent_policy_has_one_status_authority(provider, with_tools):
     # Mutation: remove a status boundary sentence, or restore inferred-ended policy.
     policy, _ = await _request(provider, _snapshot(), with_tools=with_tools)
+    available = "For current task status, call the host task_status route."
+    unavailable = "Current task status cannot be checked here; no host status route is supplied."
+    assert (available if with_tools else unavailable) in policy
+    assert (unavailable if with_tools else available) not in policy
     assert (
-        "For current task status use only host task_status when supplied; otherwise say "
-        "status cannot be checked here. History and "
+        "History and "
         "completed-work updates are historical references, never current-state authority. "
         "Updates may describe specific terminal outcomes, not a current task inventory."
     ) in policy

@@ -109,7 +109,9 @@ async def test_codex_style_policy_has_explicit_separator_before_next_policy(
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     instructions = request["params"]["baseInstructions"]
-    policy = communication_policy(style)
+    policy = communication_policy(style, task_status_available=any(
+        tool["name"] == "task_status" for tool in request["params"]["dynamicTools"]
+    ))
     _, assembled_policy, following = instructions.partition(policy)
     assert assembled_policy == policy
     assert following[:2] == "\n\n"
@@ -209,10 +211,12 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     instructions = request["params"]["baseInstructions"]
-    assert_aligned_work_routing(instructions)
-    assert instructions.count(
-        "For current task status use only host task_status when supplied"
-    ) == 1
+    assert_aligned_work_routing(
+        instructions,
+        task_status_available=any(
+            tool["name"] == "task_status" for tool in request["params"]["dynamicTools"]
+        ),
+    )
     assert [tool["name"] for tool in request["params"]["dynamicTools"]] == (
         (["search_knowledge"] if foreground_lookup else []) + ["start_work"]
         + (["task_status"] if admitted else [])
