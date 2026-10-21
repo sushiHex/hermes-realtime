@@ -182,7 +182,7 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
     )
     messages = OllamaStreamingInference._messages(request, output_style="learning")
     observed = rehearsal.prompt_observation(messages, "hoopoe")
-    assert observed["reference_kinds"] == ["memory", "active_work", "updates"]
+    assert observed["reference_kinds"] == ["memory", "updates"]
     assert observed["output_style"] == "learning"
     assert "Synthetic" not in json.dumps(observed)
     sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
@@ -190,7 +190,7 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
     header = messages[0]["content"].split("\n\nReference data:\n", 1)[0]
     messages[0]["content"] = header + "\n\nReference data:\n" + json.dumps(sections)
     assert rehearsal.prompt_observation(messages, "hoopoe")["reference_kinds"] == [
-        "memory", "active_work",
+        "memory",
     ]
     marker = "[rehearsal-prompt] " + json.dumps(observed, separators=(",", ":"), sort_keys=True)
     assert rehearsal.markers([marker]) == ([marker], 0)

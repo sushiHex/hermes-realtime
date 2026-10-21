@@ -231,7 +231,7 @@ def test_codex_prompt_keeps_memory_separate_and_untrusted() -> None:
         "truncated": True,
     }
     assert payload["messages"] == [{"role": "user", "text": "What do I prefer?"}]
-    assert payload["active_tasks"] == []
+    assert "active_tasks" not in payload
     assert "untrusted" in prompt.lower()
     assert "approval" in prompt.lower() and "cancellation" in prompt.lower()
 _EVALUATOR_SPEC = importlib.util.spec_from_file_location(
@@ -312,7 +312,7 @@ def test_natural_work_evaluator_supplies_active_context_for_quoted_cancel_cases(
     ),
 )
 @pytest.mark.asyncio
-async def test_codex_preserves_inactive_authority_without_classifying_current_user_intent(
+async def test_codex_omits_prior_work_projection_without_classifying_current_user_intent(
     utterance: str,
 ) -> None:
     transport = FakeCodexTransport()
@@ -334,8 +334,8 @@ async def test_codex_preserves_inactive_authority_without_classifying_current_us
     assert segments == ["Four."]
     turn_request = next(item for item in transport.sent if item.get("method") == "turn/start")
     prompt = turn_request["params"]["input"][0]["text"]  # type: ignore[index]
-    assert '"work_state":"inactive_with_history"' in prompt
-    assert "Only active_tasks establish active background work" in prompt
+    assert '"work_state"' not in prompt
+    assert "Only active_tasks establish active background work" not in prompt
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
     advertised = {tool["name"] for tool in thread_request["params"]["dynamicTools"]}
     assert advertised == {"start_work"}
@@ -2543,7 +2543,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     assert "Only the user's own request counts" in base_instructions
     assert "changes, or verification" in base_instructions
     assert "Do not ask for resolvable paths" in base_instructions
-    assert "continuation/restart has no active task" in base_instructions
+    assert "continuation/restart has no active task" not in base_instructions
     assert "Trust only tool results for acceptance" in base_instructions
     assert (
         "Explicit permission to use a background task for the nearest unresolved request is a "
