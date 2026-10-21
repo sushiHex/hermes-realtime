@@ -30,7 +30,7 @@ def test_empty_cleanup_is_a_healthy_control(tmp_path, monkeypatch, capsys):
         ("running_or_terminating", False, {"private-image.exe": 1}),
         ("unknown", False, {"<unknown>": 1}),
         ("identity_changed", False, {}),
-        ("exited", True, {"<unknown>": 1}),
+        ("exited", True, {}),
     ],
 )
 def test_job_only_cleanup_is_classified_at_refusal(
@@ -42,8 +42,7 @@ def test_job_only_cleanup_is_classified_at_refusal(
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: state)
     assert owner.survivors(SimpleNamespace(_job=66, members=lambda: {os.getpid(), 101})) == expected
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
-    observed = "unknown" if missing else state
-    assert record["current"]["job_only"][observed] == 1
+    assert record["current"]["job_only"][state] == 1
     assert record["current"]["tracked"] == dict.fromkeys(
         ("exited", "running_or_terminating", "identity_changed", "unknown"), 0
     )
@@ -231,11 +230,62 @@ def test_cleanup_allows_exact_non_controller_observation_bound(tmp_path, monkeyp
     owner = rehearsal.Processes(tmp_path)
     monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
     monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: "unknown")
     containment = SimpleNamespace(_job=66, members=lambda: set(range(10000, 14097)))
     assert owner.survivors(containment) == {"<unknown>": 4096}
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
     assert record["current"]["observation_failed"] == 0
     assert record["current"]["job_only"]["unknown"] == 4096
+
+
+@pytest.mark.parametrize(
+    "state", ["exited", "identity_changed", "unknown", "running_or_terminating"],
+)
+def test_missing_table_job_candidate_uses_native_handle_at_refusal(
+    tmp_path, monkeypatch, capsys, state,
+):
+    """Mutation: gate the authoritative native handle query on an earlier snapshot row."""
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    calls = []
+
+    def native(pid, expected_start, job):
+        calls.append((pid, expected_start, job))
+        return state
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", native)
+    containment = SimpleNamespace(_job=66, members=lambda: {101})
+    assert owner.survivors(containment) == (
+        {"<unknown>": 1} if state in {"unknown", "running_or_terminating"} else {}
+    )
+    assert calls == [(101, None, 66)]
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    assert record["current"]["job_only"][state] == 1
+
+
+@pytest.mark.parametrize(
+    "state", ["exited", "identity_changed", "unknown", "running_or_terminating"],
+)
+def test_missing_table_job_candidate_uses_native_handle_at_settlement(
+    tmp_path, monkeypatch, capsys, state,
+):
+    """Mutation: omit the bounded native wait for a member missing from the prior snapshot."""
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    calls = []
+
+    def native(pid, expected_start, job, wait_ms):
+        assert 0 <= wait_ms <= 5000
+        calls.append((pid, expected_start, job))
+        return state
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", native)
+    owner.stop_all(SimpleNamespace(_job=66, members=lambda: {101}))
+    assert calls == [(101, None, 66)]
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup-settlement] "))
+    assert record[state] == 1
+    assert record["candidates"] == 1
+    assert record["wait_budget_ms"] == 5000
 
 
 class _Kernel:
