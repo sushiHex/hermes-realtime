@@ -313,6 +313,56 @@ def test_the_host_child_observes_exactly_the_prompt_the_adapter_sends(
     assert observed[0]["fact_rows"] == 1
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_prompt_observer_preserves_renderer_options(
+    available, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutation: drop or override capability/style while observing the renderer."""
+    from hermes_realtime.conversation.context import ConversationMessage
+    from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    snapshot = ConversationInferenceRequest(
+        revision=1, active_tasks=(),
+        messages=(ConversationMessage("user", "My favorite bird is the hoopoe."),),
+    )
+    options = {"output_style": "learning", "task_status_available": available}
+    expected = OllamaStreamingInference._messages(snapshot, **options)
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    monkeypatch.setenv("HERMES_REHEARSAL_RECALL_TRIALS", "0")
+    rehearsal._observe_prompts()
+
+    assert OllamaStreamingInference._messages(snapshot, **options) == expected
+    observed = [json.loads(line.removeprefix("[rehearsal-prompt] "))
+                for line in capsys.readouterr().out.splitlines()
+                if line.startswith("[rehearsal-prompt] ")]
+    assert observed == [rehearsal.prompt_observation(expected, "hoopoe")]
+
+
+def test_prompt_observer_preserves_renderer_argument_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutation: coerce a non-boolean capability instead of forwarding it unchanged."""
+    from hermes_realtime.conversation.context import ConversationContextSnapshot
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    rehearsal._observe_prompts()
+
+    with pytest.raises(TypeError, match="exact boolean"):
+        OllamaStreamingInference._messages(
+            ConversationContextSnapshot(revision=1, messages=(), active_tasks=()),
+            task_status_available=1,
+        )
+    assert capsys.readouterr().out == (
+        '[status-policy-refusal] {"count":1,"category":"invalid_availability"}\n'
+    )
+
+
 def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
