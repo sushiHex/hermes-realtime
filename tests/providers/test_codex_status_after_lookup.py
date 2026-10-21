@@ -22,6 +22,15 @@ from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
 from tests.conversation.test_streaming import RecordingPlayback, SegmentSynthesizer
 
 
+@pytest.fixture(autouse=True)
+def synthetic_codex_executable(monkeypatch):
+    # The real factory resolves its executable before we replace its transport.
+    monkeypatch.setattr(
+        "hermes_realtime.providers.codex_app_server._resolve_codex_executable",
+        lambda _explicit: "synthetic-codex",
+    )
+
+
 class Lookup:
     def __init__(self, *, failed=False):
         self.queries = []

@@ -23,6 +23,15 @@ AVAILABLE = "For current task status, call the host task_status route."
 UNAVAILABLE = "Current task status cannot be checked here; no host status route is supplied."
 
 
+@pytest.fixture(autouse=True)
+def synthetic_codex_executable(monkeypatch):
+    # Keep executable discovery hermetic while retaining the real host factory.
+    monkeypatch.setattr(
+        "hermes_realtime.providers.codex_app_server._resolve_codex_executable",
+        lambda _explicit: "synthetic-codex",
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["codex", "ollama"])
 @pytest.mark.parametrize("mode", ["bound", "unbound", "private", "nonuser", "legacy",
