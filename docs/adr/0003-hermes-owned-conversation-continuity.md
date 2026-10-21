@@ -343,8 +343,9 @@ arrived, and the frozen batch is resent unchanged. *Absent* is never computed: r
 reads the voice session, so no resend is keyed on a negative read.
 
 Work from before a restart is ended history, never active. A restored tail with `prior_work`,
-or a restart settlement that stopped work or left it unknown, marks it ended, once, so the
-prompt's `work_state` reads `inactive_with_history`. After a settlement, one fixed
+or a restart settlement that stopped work or left it unknown, records prior work once without
+restoring an active task. Provider prompts omit the host task inventory and derived work state;
+current status is available only through the host `task_status` route. After a settlement, one fixed
 announcement with counts only is spoken once voice input is ready and nothing else holds the
 floor. It becomes a context row like any other speech.
 

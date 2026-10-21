@@ -114,7 +114,7 @@ def _reply(topic: int) -> str:
 
 
 @pytest.mark.asyncio
-async def test_idle_speech_cancel_preserves_active_work_reference_in_next_prompt() -> None:
+async def test_idle_speech_cancel_preserves_host_task_state_without_prompt_inventory() -> None:
     store = ConversationContextStore()
     store.record_user_transcript(Transcript(text="Synthetic earlier topic.", final=True))
     store.record_task_accepted(task_id="task_1", run_id="deleg_1", objective="Synthetic objective.")
@@ -127,8 +127,9 @@ async def test_idle_speech_cancel_preserves_active_work_reference_in_next_prompt
     await loop.close()
     messages = cast(list[dict[str, str]], ollama.bodies[0]["messages"])
     sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
-    assert sections["active_work"] == [{"task_id": "task_1", "objective": "Synthetic objective."}]
-    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == ["active_work"]
+    assert sections == {}
+    assert store.snapshot().active_tasks[0].task_id == "task_1"
+    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == []
     assert messages[-1] == {"role": "user", "content": "Synthetic current question."}
 
 
