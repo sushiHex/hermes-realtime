@@ -106,7 +106,9 @@ async def test_codex_style_policy_has_explicit_separator_before_next_policy(
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     instructions = request["params"]["baseInstructions"]
-    policy = communication_policy(style)
+    policy = communication_policy(style, task_status_available=any(
+        tool["name"] == "task_status" for tool in request["params"]["dynamicTools"]
+    ))
     _, assembled_policy, following = instructions.partition(policy)
     assert assembled_policy == policy
     assert following[:2] == "\n\n"
