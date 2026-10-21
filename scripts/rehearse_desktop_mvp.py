@@ -3028,8 +3028,8 @@ def _observe_prompts() -> None:
         with opener.open(request, timeout=120) as response:
             return str(json.loads(response.read())["message"]["content"])
 
-    def observed(snapshot: Any, *, output_style: str = "default") -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = render(snapshot, output_style=output_style)
+    def observed(snapshot: Any, **render_options: Any) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = render(snapshot, **render_options)
         marker("rehearsal-prompt", prompt_observation(messages, phrase))
         # The leading policy/reference message leaves conversational rows in order.
         users = [message["content"] for message in messages if message["role"] == "user"]

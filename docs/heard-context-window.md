@@ -234,16 +234,17 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
 - **Tokens.** At an estimated 3 characters per token, that is about 11,200 tokens. The chat
   template adds about 6 tokens for each of 33 messages (about 200), for about 11,400 in all.
   For comparison, English filler measured 5.5 characters per token here.
-- **Estimated headroom.** `num_ctx` 16,384 leaves about 5,000 tokens for active-task and update reference
+- **Estimated headroom.** `num_ctx` 16,384 leaves about 5,000 tokens for update reference
   sections and for the reply.
-- **What it doesn't cover.** Every bound at once, such as 8 maximal task objectives plus 16
+- **What it doesn't cover.** Every bound at once, such as maximal memory plus 16
   maximal updates, would not fit. Neither would text in a script denser than 3 characters per
   token, which may need a larger `num_ctx`.
 - **The marker.** Every completed request prints `[ollama-prompt]` with the prompt's message
   count, characters and UTF-8 bytes, the `num_ctx` requested, and Ollama's
   `prompt_eval_count`, plus the captured output-style enum and actual rendered reference-section
-  kinds (`memory`, `active_work`, `updates`). It carries no text. The desktop rehearsal records
-  those kinds for each context check; one combined system message is no longer a count of notes.
+  kinds (for example `memory`, `updates`, `host_speech_message_indices`). It carries no text.
+  The desktop rehearsal records those kinds for each context check; one combined system message
+  is no longer a count of notes.
   Conversation-context equality evidence remains separate and does not bind the selected style.
 - **It is a request, not a guarantee.** The server may cap it, for example at a model's
   trained context length, and the marker shows only what was requested. So the evidence is
@@ -255,12 +256,18 @@ followed by the unchanged ordered conversational rows. Reference text adds no wo
   value, such as a `-32k` model variant's. The window estimate targets 16,384; it is not an
   exact token bound or a guarantee for every supported model and input.
 
+Active task identities and terminal counts remain in the host's internal conversation snapshot,
+but both provider prompts omit that task inventory and any derived current work state. Current
+task status comes only from the host `task_status` route when supplied; without that route the
+model cannot check current status. Completed-work updates retain their specific terminal outcomes
+as historical result evidence, rather than establishing the current task inventory.
+
 ## Codex
 
-The Codex adapter sends the whole snapshot as one prompt. About 30,000 characters is roughly
+The Codex adapter renders the conversation snapshot as one prompt. About 30,000 characters is roughly
 10,000 tokens. The default model, `gpt-5.6-terra`, reports a context window of 272,000 tokens
-in the local Codex model catalog, so the snapshot is under 4% of it. Nothing changes for
-Codex.
+in the local Codex model catalog, so the snapshot is under 4% of it. No context-window override
+is required for Codex.
 
 ## Review windows within the companion's byte budget
 

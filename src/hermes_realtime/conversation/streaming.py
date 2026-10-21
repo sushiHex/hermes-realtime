@@ -104,8 +104,9 @@ def _committed_conversation_context_snapshot_bytes(
     memory: BuiltinMemorySnapshot | None = None,
     host_speech_message_indices: tuple[int, ...] = (),
 ) -> bytes:
-    """Encode the authoritative adapter boundary for content-free observation.
+    """Encode the internal snapshot supplied to an adapter for content-free observation.
 
+    Provider rendering may omit fields; this is not the model-visible prompt.
     An interrupted assistant row carries a trailing ``True``; other rows are pairs.
     """
 
