@@ -74,6 +74,55 @@ _NUMERIC = frozenset({
 })
 
 
+def codex_error_diagnostic(message: object) -> dict[str, object] | None:
+    """Project a Codex 0.145.0 ``error`` notification without retaining its text.
+
+    The pinned app-server's generated v2/ErrorNotification schema defines these
+    codexErrorInfo variants and nullable uint16 httpStatusCode fields. This is
+    evidence only: it does not validate, suppress, retry or reinterpret provider
+    events. Unknown/malformed codes stay unknown. Stage and cleanup ownership
+    remain with the caller, separately from this content-free projection.
+    """
+    if (type(message) is not dict or type(message.get("method")) is not str
+            or message.get("method") != "error"):
+        return None
+    result: dict[str, object] = {"category": "provider_error", "code": "unknown"}
+    params = message.get("params")
+    if type(params) is not dict:
+        return result
+    if type(params.get("willRetry")) is bool:
+        result["will_retry"] = params["willRetry"]
+    error = params.get("error")
+    if type(error) is not dict:
+        return result
+    info = error.get("codexErrorInfo")
+    if type(info) is str:
+        if info in {
+            "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded",
+            "serverOverloaded", "cyberPolicy", "internalServerError", "unauthorized",
+            "badRequest", "threadRollbackFailed", "sandboxError", "other",
+        }:
+            result["code"] = info
+    elif type(info) is dict and len(info) == 1:
+        code, detail = next(iter(info.items()))
+        if type(code) is not str or type(detail) is not dict:
+            return result
+        if code in {
+            "httpConnectionFailed", "responseStreamConnectionFailed",
+            "responseStreamDisconnected", "responseTooManyFailedAttempts",
+        }:
+            status = detail.get("httpStatusCode")
+            if status is not None and (type(status) is not int or not 0 <= status <= 65535):
+                return result
+            result["code"] = code
+            if status is not None:
+                result["http_status_code"] = status
+        elif (code == "activeTurnNotSteerable" and type(detail.get("turnKind")) is str
+              and detail.get("turnKind") in {"review", "compact"}):
+            result["code"] = code
+    return result
+
+
 def failure_diagnostic(error: Exception, *, stage: str, started: float) -> dict[str, Any]:
     """Classify exposed exception types only; never inspect text or chained causes.
 
