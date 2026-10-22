@@ -132,6 +132,8 @@ _INVALID_RESULTS = [
     pytest.param(_envelope(voice="Line one.\u2028Line two."), "voice", id="voice_unicode_line"),
     pytest.param(_envelope(voice="<b>Voice.</b>"), "voice", id="voice_html"),
     pytest.param(_envelope(voice="**Voice.**"), "voice", id="voice_bold"),
+    pytest.param(_envelope(voice="_Voice._"), "voice", id="voice_underscore_emphasis"),
+    pytest.param(_envelope(voice="__Voice.__"), "voice", id="voice_underscore_strong"),
     pytest.param(_envelope(voice="`Voice.`"), "voice", id="voice_code"),
     pytest.param(_envelope(voice="[Voice](https://example.com)."), "voice", id="voice_link"),
     pytest.param(_envelope(voice="  # The check passed."), "voice", id="voice_leading_heading"),
@@ -143,6 +145,16 @@ _INVALID_RESULTS = [
     pytest.param(_envelope(detail="x" * 1801), "detail", id="long_detail"),
     pytest.param(_envelope(detail="<voice>Nested.</voice>"), "detail", id="nested_voice"),
     pytest.param(_envelope(detail="<detail>Nested.</detail>"), "detail", id="nested_detail"),
+    *[
+        pytest.param(
+            _envelope(**{field: "Text" + chr(codepoint) + "text."}),
+            field,
+            id=f"{field}_control_{codepoint:04x}",
+        )
+        for field in ("voice", "detail")
+        for codepoint in [*range(32), *range(127, 160), 0xD800, 0xDFFF]
+        if not (field == "detail" and codepoint in (9, 10, 13))
+    ],
 ]
 
 
@@ -183,8 +195,28 @@ async def test_invalid_api_result_is_never_presented(
         _envelope(voice="x" * 220, detail="x" * 1800),
         _envelope(detail="**Detail**\n\nMore context."),
         _envelope(voice="  The check passed. "),
+        _envelope(voice="release_candidate_build passed."),
+        _envelope(voice="release__candidate__build passed."),
+        _envelope(voice="release_candidate_ passed."),
+        _envelope(voice="_release_candidate passed."),
+        _envelope(voice="release__candidate__ passed."),
+        _envelope(voice="__release__candidate passed."),
+        _envelope(voice="Café 👩\u200d💻 passed.", detail="日本語 café 👩\u200d💻."),
+        _envelope(detail="One\tcolumn.\r\nNext line.\nFinal line.\rDone."),
     ],
-    ids=["exact_limits", "detail_markup", "voice_whitespace"],
+    ids=[
+        "exact_limits",
+        "detail_markup",
+        "voice_whitespace",
+        "intraword_underscore",
+        "intraword_double_underscore",
+        "underscore_opening_boundary",
+        "underscore_closing_boundary",
+        "double_underscore_opening_boundary",
+        "double_underscore_closing_boundary",
+        "unicode_joiner",
+        "detail_whitespace",
+    ],
 )
 @pytest.mark.asyncio
 async def test_valid_api_result_preserves_exact_text(

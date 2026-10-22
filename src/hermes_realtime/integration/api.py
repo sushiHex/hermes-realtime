@@ -77,7 +77,9 @@ _BACKGROUND_RESULT = re.compile(
     r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
 )
 _BACKGROUND_VOICE_MARKUP = re.compile(
-    r"[<>`]|\*\*|__|~~|\*[^*]+\*|_[^_]+_|\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
+    r"[<>`]|\*\*|~~|\*[^*]+\*"
+    r"|(?<!\w)__(?=\S).+?(?<=\S)__(?!\w)|(?<!\w)_(?=\S)[^_]+?(?<=\S)_(?!\w)"
+    r"|\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
     r"|\A(?:#{1,6}|[-+*]|\d+[.)])\s"
 )
 _BACKGROUND_DETAIL_PROTOCOL_TAG = re.compile(r"</?(?:voice|detail)\b", re.IGNORECASE)
@@ -108,6 +110,17 @@ _BACKGROUND_INSTRUCTIONS = (
     "expand voice but must not replace its important findings. Do not put line breaks or "
     "markup inside voice, or text outside these elements."
 )
+
+
+def _has_result_controls(text: str, *, detail: bool = False) -> bool:
+    """Reject non-text controls and surrogates; retain normal detail whitespace."""
+    for character in text:
+        if detail and character in "\t\n\r":
+            continue
+        codepoint = ord(character)
+        if codepoint < 32 or 127 <= codepoint <= 159 or 0xD800 <= codepoint <= 0xDFFF:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1473,6 +1486,7 @@ class HermesApiTaskSession:
             if (
                 not voice.strip()
                 or len(voice) > 220
+                or _has_result_controls(voice)
                 or voice.splitlines() != [voice]
                 or _BACKGROUND_VOICE_MARKUP.search(voice.lstrip()) is not None
             ):
@@ -1481,6 +1495,7 @@ class HermesApiTaskSession:
             if (
                 not detail.strip()
                 or len(detail) > 1800
+                or _has_result_controls(detail, detail=True)
                 or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
             ):
                 return _UNUSABLE_RESULT_SUMMARY
