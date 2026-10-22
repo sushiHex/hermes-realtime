@@ -79,6 +79,33 @@ def test_local_replace_refs_cannot_override_pinned_objects(committed, tmp_path):
     assert (destination / "module.py").read_bytes() == b"PINNED = True\n"
 
 
+def test_export_creates_each_parent_once_without_changing_payload(committed, tmp_path):
+    # Mutation: perform the parent mkdir for every blob instead of once per parent.
+    repository, _ = committed
+    nested = repository / "package"
+    nested.mkdir()
+    for name in ("a.py", "b.py", "c.py"):
+        (nested / name).write_bytes(b"SYNTHETIC = True\n")
+    git(repository, "add", ".")
+    git(repository, "commit", "-qm", "nested synthetic source")
+    pin = git(repository, "rev-parse", "HEAD").decode().strip()
+    destination = tmp_path / "export"
+    original = Path.mkdir
+    created = []
+
+    def mkdir(path, *args, **kwargs):
+        created.append(path)
+        return original(path, *args, **kwargs)
+
+    with patch.object(Path, "mkdir", mkdir):
+        manifest = source.export_tree(repository, pin, destination)
+    assert created == [destination, destination / "package"]
+    assert manifest["source_export_files"] == 6
+    assert [(destination / "package" / name).read_bytes() for name in ("a.py", "b.py", "c.py")] == [
+        b"SYNTHETIC = True\n"
+    ] * 3
+
+
 def test_existing_destination_refused_before_any_write(committed, tmp_path):
     repository, pin = committed
     destination = tmp_path / "export"

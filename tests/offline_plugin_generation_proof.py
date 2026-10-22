@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import types
 from pathlib import Path
@@ -120,6 +121,78 @@ def python_manifest(source):
     }
 
 
+@contextlib.contextmanager
+def proof_profile(receipt, result):
+    """Keep semantic evidence pending until the disposable profile is removed."""
+    directory = tempfile.TemporaryDirectory(prefix="hr-plugin-proof-")
+    started = time.monotonic()
+    try:
+        yield directory.name
+    except BaseException as exc:
+        result["ok"] = False
+        result.setdefault("error_kind", type(exc).__name__)
+        raise
+    finally:
+        result["semantic_ok"] = result["ok"]
+        result["proof_stage"] = result["stage"]
+        result.update(ok=False, stage="profile-cleanup", profile_cleanup="pending")
+        pending_recorded = False
+        try:
+            receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            pending_recorded = True
+        except BaseException as exc:
+            result.update(
+                receipt_category="proof-receipt-refused", receipt_error_kind=type(exc).__name__
+            )
+        cleanup_started = time.monotonic()
+        try:
+            directory.cleanup()
+            result.update(
+                ok=result["semantic_ok"] and pending_recorded, profile_cleanup="completed"
+            )
+        except BaseException as exc:
+            result.update(
+                ok=False,
+                profile_cleanup="refused",
+                cleanup_category="profile-cleanup-refused",
+                cleanup_error_kind=type(exc).__name__,
+            )
+        result["profile_elapsed_seconds"] = round(time.monotonic() - started, 3)
+        result["profile_cleanup_seconds"] = round(time.monotonic() - cleanup_started, 3)
+        result["stage"] = "finished"
+        if pending_recorded:
+            try:
+                receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            except BaseException as exc:
+                result.update(
+                    ok=False,
+                    receipt_category="proof-receipt-refused",
+                    receipt_error_kind=type(exc).__name__,
+                )
+        print(
+            "[plugin-seam-proof] "
+            + json.dumps(
+                {
+                    "ok": result["ok"],
+                    "case": result["case"],
+                    "mutation": result["mutation"],
+                    "profile_cleanup": result["profile_cleanup"],
+                    "category": result.get(
+                        "receipt_category",
+                        result.get(
+                            "cleanup_category",
+                            result.get(
+                                "category",
+                                result.get("assertion", result.get("error_kind", "passed")),
+                            ),
+                        ),
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+
+
 def main():
     args = arguments()
     args.hermes_source = args.hermes_source.resolve()
@@ -153,12 +226,13 @@ def main():
         args.receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
         return 1
     with (
-        tempfile.TemporaryDirectory(prefix="hr-plugin-proof-") as profile,
+        proof_profile(args.receipt, result) as profile,
         contextlib.ExitStack() as restore,
     ):
         restore.callback(os.chdir, Path.cwd())
         home = Path(profile)
         exported = home / "committed-source"
+        preparation_started = time.monotonic()
         try:
             source_helper, result["source_export_helper_sha256"] = load_reviewed(
                 "generation_source"
@@ -175,11 +249,11 @@ def main():
                 imports_helper.configure_imports(exported, args.hermes_source, PROOF_ROOT)
             )
             result.update(python_manifest(exported))
+            result["source_preparation_seconds"] = round(time.monotonic() - preparation_started, 3)
         except BaseException as exc:
             result.update(stage="source-import-refused", error_kind=type(exc).__name__)
             if "source_helper" in locals() and isinstance(exc, source_helper.SourceExportError):
                 result["category"] = exc.category
-            args.receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
             return 1
         fixture = PROOF_ROOT / "fixtures" / "plugin_generation_candidate"
         plugin_home = home / "plugins" / "plugin-generation-candidate"
@@ -278,6 +352,7 @@ def main():
                     raise RuntimeError("offline-network-block")
 
         sys.addaudithook(no_external)
+        proof_started = time.monotonic()
         try:
             result["stage"] = "native-proof"
             result.update(loop.run_until_complete(cases_helper.prove(port, key, result, args.case)))
@@ -309,20 +384,7 @@ def main():
                 result.update(
                     ok=False, category="source-import-refused", error_kind=type(exc).__name__
                 )
-            args.receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
-            print(
-                "[plugin-seam-proof] "
-                + json.dumps(
-                    {
-                        "ok": result["ok"],
-                        "case": args.case,
-                        "mutation": args.mutation,
-                        "category": result.get("assertion", result.get("error_kind", "passed")),
-                        "native_completed": result.get("native_completed", 0),
-                    },
-                    sort_keys=True,
-                )
-            )
+            result["native_proof_seconds"] = round(time.monotonic() - proof_started, 3)
     return 0 if result["ok"] else 1
 
 

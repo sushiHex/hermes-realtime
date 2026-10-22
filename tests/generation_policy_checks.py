@@ -257,12 +257,13 @@ async def evaluate(name, cls, installed, completion):
         run="unit-run",
         replayed=False,
         before=None,
+        objective="Synthetic input.",
     ):
         app = web.Application()
         g.wire(app, None)
 
         async def body():
-            return {"input": "Synthetic input."}
+            return {"input": objective}
 
         req = SimpleNamespace(
             method=method,
@@ -343,7 +344,16 @@ async def evaluate(name, cls, installed, completion):
                 await request(run="unit-next", before=lambda: setattr(g, "closed", True))
             ).status == 503
         if name == "replay-conflict":
-            return (await request(selected="")).status == 409
+            same = await request(replayed=True)
+            changed = await request(replayed=True, objective="Different synthetic input.")
+            return (
+                same.status == 202
+                and g.budgets["unit-run"] is row
+                and changed.status == 409
+                and g.budgets["unit-run"] is row
+                and len(g.members) == 1
+                and row["reserved"] == 0
+            )
         if name == "replay-old":
             return (await request(run="unit-old", replayed=True)).status == 409
         if name == "stop-status":

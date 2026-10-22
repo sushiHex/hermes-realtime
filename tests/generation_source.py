@@ -161,9 +161,12 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
         raise SourceExportError("source_export_blob_invalid")
     destination.mkdir()
     manifest = []
+    created_parents = {destination}
     for path, mode, content in blobs:
         target = destination.joinpath(*path.split("/"))
-        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent not in created_parents:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created_parents.add(target.parent)
         with target.open("xb") as stream:
             stream.write(content)
         if os.name != "nt":
