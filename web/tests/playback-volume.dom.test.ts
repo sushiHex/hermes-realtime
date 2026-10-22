@@ -1,7 +1,40 @@
 import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
-import { PlaybackVolumeControls, PLAYBACK_VOLUME_KEY } from "../src/playback-volume";
+import { PlaybackOutputGate, PlaybackVolumeControls, PLAYBACK_VOLUME_KEY } from "../src/playback-volume";
+
+describe("speaker output permission", () => {
+  it("keeps ordinary positive gain enabled without changing its level", () => {
+    const write = vi.fn();
+    const gate = new PlaybackOutputGate(write);
+    gate.setVolume(0.18);
+    expect(write.mock.calls).toEqual([[0.18, true]]);
+  });
+
+  it("disables zero output through speech recovery and restores the chosen gain", () => {
+    const write = vi.fn();
+    const gate = new PlaybackOutputGate(write);
+    gate.setVolume(0);
+    expect(write).toHaveBeenLastCalledWith(0, false);
+    gate.setRendererEnabled(false);
+    gate.setRendererEnabled(true);
+    expect(write).toHaveBeenLastCalledWith(0, false);
+    gate.setVolume(0.5);
+    expect(write).toHaveBeenLastCalledWith(0.5, true);
+  });
+
+  it("preserves denied speech permission through mute and unmute", () => {
+    const write = vi.fn();
+    const gate = new PlaybackOutputGate(write);
+    gate.setRendererEnabled(false);
+    expect(write).toHaveBeenLastCalledWith(1, false);
+    gate.setVolume(0);
+    gate.setVolume(0.5);
+    expect(write).toHaveBeenLastCalledWith(0.5, false);
+    gate.setRendererEnabled(true);
+    expect(write).toHaveBeenLastCalledWith(0.5, true);
+  });
+});
 
 function mount(saved?: string, storageBlocked: boolean | "write" = false) {
   const dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {

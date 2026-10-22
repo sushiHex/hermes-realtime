@@ -283,11 +283,15 @@ invalid saved preferences use the previous 100% playback level. Unmute restores 
 level, and changing the slider while muted keeps output muted. If storage is blocked,
 the controls still work for this page and report **not saved** after a change.
 The selected level multiplies temporary speech attenuation and cannot undo committed
-silence. Microphone capture and task/session controls keep their existing behavior.
+silence. Muted or zero-level output also disables the existing remote media track before
+attachment, so a newly created SDK gain node cannot bypass the zero setting. Speech's
+existing renderer permission remains independent; unmuting cannot revive stopped speech.
+Microphone capture and task/session controls keep their existing behavior.
 [Preference tests](../web/tests/playback-volume.dom.test.ts) and the
 [mounted playback test](../web/tests/connection-main.dom.test.ts) cover gain setting,
 restoration and output-only wiring; they do not establish human audibility.
-LiveKit smooths gain changes, so a zero target does not establish instantaneous acoustic silence.
+LiveKit smooths gain changes. Track gating does not establish instantaneous acoustic silence
+from audio already buffered downstream; human audibility remains a separate observation.
 
 Pass `projection.publish` as the observer when constructing both `ConversationSessionWorker` and `StreamingSpeechLoop`. This projects admitted user transcripts, delivered assistant transcript segments, first foreground token, and first playable audio without exposing internal turn, delegation, or run handles. Task and approval owners publish `task_state`, `completion_received`, `notification_queued`, and actionable `approval_state` events only after their own authoritative transitions; the browser runtime does not duplicate that authority.
 

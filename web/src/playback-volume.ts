@@ -1,5 +1,26 @@
 export const PLAYBACK_VOLUME_KEY = "hermes-realtime.playback-volume.v1";
 
+export class PlaybackOutputGate {
+  private volume = 1;
+  private rendererEnabled = true;
+
+  constructor(private readonly write: (volume: number, enabled: boolean) => void) {}
+
+  setVolume(volume: number): void {
+    this.volume = volume;
+    this.apply();
+  }
+
+  setRendererEnabled(enabled: boolean): void {
+    this.rendererEnabled = enabled;
+    this.apply();
+  }
+
+  private apply(): void {
+    this.write(this.volume, this.rendererEnabled && this.volume > 0);
+  }
+}
+
 function reportPreferenceFailure(category: "invalid" | "storage_unavailable"): void {
   console.info(`[playback-volume-preference] ${JSON.stringify({ category })}`);
 }
