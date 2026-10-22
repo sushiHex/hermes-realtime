@@ -141,7 +141,7 @@ refusal remains required; their surviving removals are not called killed mutants
 Exact-type validation remains in the policy. This map does not claim every
 syntactic boolean is independently observable or prove the full product.
 
-The corrected source-bound run recorded all 49 expected groups: 46 isolated
+The earlier source-bound run recorded all 49 expected groups: 46 isolated
 omissions changed the target outcome while both healthy controls passed; the
 three redundant omissions above retained refusal. The receipt was written after
 executor shutdown and final import-origin verification, with zero provider calls,
@@ -149,8 +149,25 @@ native Runs or denied network attempts. Its outer launch nevertheless exceeded t
 60-second deadline afterward, while leaving the disposable-profile context.
 This is completed semantic evidence plus a failed cleanup deadline, **not an
 overall passing invocation or verified cleanup**. No retry extended that bound.
-The replay-conflict target covers an omitted policy header; same-version replay
-with a changed objective is not qualified by this direct matrix.
+Its replay-conflict target covered an omitted policy header.
+
+The cleanup correction at source commit
+`d86d5df5bc5ea188f62f73cbf2690e9d49437536` keeps overall success false until
+profile deletion completes, retains pending semantic evidence, and preserves
+primary failures when either evidence write fails. Export parent directories
+are created once without changing the projection. Its 72 focused ordinary tests
+and 10 isolated omission checks with two healthy controls each passed. The replay
+target now checks same-version changed-objective conflict and unchanged budget
+identity; that added direct case has not completed under the native bootstrap.
+
+The single corrected run used exact committed LF bytes and the same 60-second
+bound. It timed out without a receipt. Read-only residual inspection found all
+9,990 projected files (167,002,541 bytes), no fixture files and no native profile
+artifacts. This does not identify the precise preparation substage or establish
+native execution or cleanup. No retry or remaining five-case smoke was run.
+The next diagnostic is retained, content-free stage checkpoints around export,
+import/bootstrap, Python manifest, test and cleanup; it is not implemented here.
+The PR remains draft: source-bound native smoke and cleanup are unqualified.
 
 ## Preserved evidence boundary
 
