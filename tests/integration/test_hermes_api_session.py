@@ -338,6 +338,22 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         assert isinstance(instructions, str)
         assert "one parallel batch" in instructions
         assert "no more than five web_search calls" in instructions
+        assert (
+            "Answer from those results when they contain the facts needed for the objective. "
+            "Otherwise, make at most one web_extract call for no more than three distinct URLs "
+            "returned by that search batch, then answer."
+            in instructions
+        )
+        assert (
+            "Do not retry lookup tools, perform follow-up searches or additional extraction "
+            "calls, or use skill_view, browser tools, or terminal for this lookup path."
+            in instructions
+        )
+        assert (
+            "Use only inline extraction output; do not call read_file or page through "
+            "stored page content."
+            in instructions
+        )
         assert "Local, runtime, file, process, build, and verification objectives" in instructions
         assert (
             "Never interpret an unavailable tool, failed command, or empty output"
