@@ -68,6 +68,12 @@ async def prove(port, key, witness, case):
                 assert ready["policy"] == "ordinary-lookup/v1" and len(ready["generation"]) == 32, (
                     "readiness-binding"
                 )
+            if case == "guard-matrix":
+                async with http.get(base + "/generation-proof/guard-checks") as reply:
+                    checked = await reply.json()
+                    witness["direct_guard_matrix"] = checked
+                    assert reply.status == 200 and checked["ok"], "direct-guard-matrix"
+                return {"cases": 1, "native_completed": 0, "stand_in_calls": 0}
             if case in {"readiness", "builtins"}:
                 if case == "builtins":
                     __import__("model_tools")  # Public import triggers normal builtin discovery.

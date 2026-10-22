@@ -48,7 +48,7 @@ policy refusal does not pass useful acceptance. SSE/client integration is absent
 
 Use an already prepared, disposable, pinned Hermes environment. Do not install or
 upgrade packages to run this proof. From the repository root, provide these local
-environment variables: `HERMES_PROOF_PYTHON` (that environment's interpreter),
+environment variables: `HERMES_PROOF_PYTHON` (that environment's venv interpreter),
 `HERMES_PROOF_SOURCE` (its checkout), and `HERMES_PROOF_RECEIPT` (a new output file).
 Optional `HERMES_PROOF_CASE` and `HERMES_PROOF_MUTATION` default to `healthy` and
 `none`. Run the following with an ordinary Python interpreter; it launches the
@@ -67,7 +67,8 @@ receipt = Path(os.environ["HERMES_PROOF_RECEIPT"])
 if receipt.exists():
     raise RuntimeError("receipt-exists")
 command = [
-    os.environ["HERMES_PROOF_PYTHON"], "tests/offline_plugin_generation_proof.py",
+    os.environ["HERMES_PROOF_PYTHON"], "-I", "-S", "-B",
+    "tests/offline_plugin_generation_proof.py",
     "--hermes-source", os.environ["HERMES_PROOF_SOURCE"],
     "--receipt", str(receipt),
     "--case", os.environ.get("HERMES_PROOF_CASE", "healthy"),
@@ -97,11 +98,59 @@ retry or repair automatically. `--help` lists cases; mutations are defined in
 `tests/generation_policy_mutations.py` and affect only the copied disposable
 policy. For example, `rewrite` with mutation `final-arguments` must fail
 `exact-policy-effects`; the same mutation with `healthy` or `readiness` must pass.
-The runner rejects optimized Python, verifies upstream origin/HEAD/unchanged
-tracked Python before importing it, verifies native import origin and binds its
-sources in the receipt. Its audit barrier denies subprocesses and non-test
+The runner requires isolated, no-site, no-bytecode startup and rejects optimized
+Python. It verifies upstream origin/HEAD/unchanged tracked Python, then exports
+committed Git blobs into its disposable profile. Only the exact pinned
+`contributors/emails` attribution-metadata subtree is omitted: its case aliases
+cannot be represented on Windows. The receipt binds the full tree, the omitted
+subtree OID `04e3b76fdc46dc1c6b36fd6f4b94701bf975f51d`, its count and the projected
+payload manifest. No runtime source is excluded; no collision check is relaxed.
+
+The original checkout, its ignored files and caches never supply runtime imports.
+The runner derives the existing venv site directory from the lexical interpreter
+path, without relying on Python 3.11 `-S` prefixes or resolving a Linux venv symlink
+to the base interpreter. It adds that prepared dependency directory without
+processing `.pth` files. Unsupported finders or preloaded upstream modules refuse.
+Loaded upstream module origins must stay inside the projected source. The prepared
+interpreter/dependencies remain trusted prerequisites, not attested outputs.
+Reviewed proof helpers execute their exact source bytes; only named reviewed
+fixture files are copied, so neighboring extension/bytecode overlays cannot enter.
+Their actual executed bytes and the projection are bound in the receipt.
+
+The audit barrier denies subprocesses and non-test
 connections, except narrow stdlib loopback self-pipe setup. Denied constructor
 metadata/pricing attempts are classified; unclassified attempts must be zero.
+The outer deadline bounds the proof child; it is not evidence of descendant
+settlement if interrupted during Git preparation. No complete process-owner
+cleanup qualification is claimed by this command.
+
+## Finite defensive-guard map
+
+`tests/generation_policy_checks.py` is the fixed direct-policy target map. Each
+named term uses the same candidate class, installed registration handles and
+public approval context, with synthetic request/callback/result inputs. Its
+matrix runs a baseline, one source-copy omission and two healthy controls for
+each target. The final installer group uses a public, disposable registration
+override to verify unsupported captured handler shape is refused and restored.
+These checks do not dispatch native Runs or invoke a provider.
+
+Three term omissions are explicitly non-independent: non-object arguments still
+fail argument access, missing tickets still fail subsequent ticket access, and
+non-string extraction URLs still fail returned-string membership. Their baseline
+refusal remains required; their surviving removals are not called killed mutants.
+Exact-type validation remains in the policy. This map does not claim every
+syntactic boolean is independently observable or prove the full product.
+
+The corrected source-bound run recorded all 49 expected groups: 46 isolated
+omissions changed the target outcome while both healthy controls passed; the
+three redundant omissions above retained refusal. The receipt was written after
+executor shutdown and final import-origin verification, with zero provider calls,
+native Runs or denied network attempts. Its outer launch nevertheless exceeded the
+60-second deadline afterward, while leaving the disposable-profile context.
+This is completed semantic evidence plus a failed cleanup deadline, **not an
+overall passing invocation or verified cleanup**. No retry extended that bound.
+The replay-conflict target covers an omitted policy header; same-version replay
+with a changed objective is not qualified by this direct matrix.
 
 ## Preserved evidence boundary
 
@@ -115,7 +164,10 @@ groups reached their expected outcomes:
 | Alias correction | 17: 8 baselines, 3 isolated mutations, 6 controls | `2e8caf397143195a663709722c34361195a484d23aadc2d26f72f70c0798bf21` |
 | Alias authorization | 4: baseline, repeated authorization mutation, 2 controls | `2061edf29366b931d6e7161a31679ec280d36e4f2d9a1ae79ff5db7917c4f8b8` |
 
-The main group predates the small alias correction, with its own archived policy
+All three groups predate the clean-source-export correction. Their original
+HEAD/tracked-file checks did not exclude ignored import overlays; those historical
+receipts are not retroactively given the stronger import-source qualification.
+The main group also predates the small alias correction, with its own archived policy
 SHA `c6f467b9ff7d0b81a04797385766500939cd1b3f1b33d17aa362b46358d422e1`.
 The alias groups bind current policy SHA
 `7967d036cb9117f8a927cd950d81f690307f7ef49700fbf558228fde1e34733b`.

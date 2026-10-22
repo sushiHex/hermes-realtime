@@ -173,6 +173,21 @@ def register(ctx):
 
         app.router.add_get("/generation-proof/error", native_error)
 
+        async def guard_checks(request):
+            if not authorized(request):
+                return web.json_response({}, status=401)
+            from pathlib import Path
+
+            from .generation_policy_checks import run_matrix
+
+            return web.json_response(
+                await run_matrix(
+                    generation, completion, Path(__file__).with_name("policy.py"), install, ctx
+                )
+            )
+
+        app.router.add_get("/generation-proof/guard-checks", guard_checks)
+
     def provider_response(**kw):
         run_id = get_current_session_key(default="")
         with generation.lock:
