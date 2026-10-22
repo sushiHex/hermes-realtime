@@ -133,6 +133,11 @@ _INVALID_RESULTS = [
     pytest.param(_envelope(voice="<b>Voice.</b>"), "voice", id="voice_html"),
     pytest.param(_envelope(voice="**Voice.**"), "voice", id="voice_bold"),
     pytest.param(_envelope(voice="_Voice._"), "voice", id="voice_underscore_emphasis"),
+    pytest.param(
+        _envelope(voice="_release_candidate_ passed."),
+        "voice",
+        id="voice_outer_underscore_emphasis",
+    ),
     pytest.param(_envelope(voice="__Voice.__"), "voice", id="voice_underscore_strong"),
     pytest.param(_envelope(voice="`Voice.`"), "voice", id="voice_code"),
     pytest.param(_envelope(voice="[Voice](https://example.com)."), "voice", id="voice_link"),
