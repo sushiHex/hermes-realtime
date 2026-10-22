@@ -102,6 +102,7 @@ import {
 import { mountTypedComposerEnterSubmission } from "./typed-composer";
 import { mountTaskCancelControl } from "./task-controls";
 import { VoiceDeleteControls } from "./voice-delete-controls";
+import { PlaybackOutputGate, PlaybackVolumeControls } from "./playback-volume";
 import {
   parseBootstrapCredential,
   parseCaptureStatus,
@@ -1054,6 +1055,14 @@ let activeKaraokeElements: HTMLSpanElement[] = [];
 let activeKaraokeGaps: HTMLSpanElement[] = [];
 let activeKaraokeIndex = -1;
 let activeRemoteTrack: RemoteTrack | null = null;
+const playbackOutputGate = new PlaybackOutputGate(writeSpeechRendererOutput);
+const playbackVolumeControls = new PlaybackVolumeControls(
+  element<HTMLInputElement>("speaker-volume"),
+  element<HTMLButtonElement>("speaker-mute"),
+  element<HTMLOutputElement>("speaker-volume-status"),
+  () => window.localStorage,
+  writeSpeechRendererVolume,
+);
 
 function boundedMapSet<Key, Value>(map: Map<Key, Value>, key: Key, value: Value, limit = 32): void {
   if (map.has(key)) map.delete(key);
@@ -1304,6 +1313,17 @@ function clearProvisionalSpeechQuietTimer(): void {
 }
 
 function setSpeechRendererVolume(volume: number): void {
+  playbackVolumeControls.setAttenuation(volume);
+}
+
+function writeSpeechRendererVolume(volume: number): void {
+  playbackOutputGate.setVolume(volume);
+}
+
+function writeSpeechRendererOutput(volume: number, enabled: boolean): void {
+  if (activeRemoteTrack !== null) {
+    activeRemoteTrack.mediaStreamTrack.enabled = enabled;
+  }
   if (activeRemoteTrack instanceof RemoteAudioTrack) {
     activeRemoteTrack.setVolume(volume);
   } else {
@@ -1312,9 +1332,7 @@ function setSpeechRendererVolume(volume: number): void {
 }
 
 function setSpeechRendererEnabled(enabled: boolean): void {
-  if (activeRemoteTrack !== null) {
-    activeRemoteTrack.mediaStreamTrack.enabled = enabled;
-  }
+  playbackOutputGate.setRendererEnabled(enabled);
 }
 
 function beginProvisionalSpeechYield(startedAt = performance.now()): void {
