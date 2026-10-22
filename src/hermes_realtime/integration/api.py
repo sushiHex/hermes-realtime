@@ -10,12 +10,13 @@ import math
 import re
 import secrets
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -34,6 +35,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkTerminalStatus,
 )
+from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,17 @@ _DISPATCH_RECOVERY_PREFIX = "[hermes-dispatch-recovery] "
 _RESTART_SETTLEMENT_PREFIX = "[hermes-restart-settlement] "
 _RUN_RECORD_LOCK_PREFIX = "[hermes-run-record-lock] "
 _MAX_RUN_RECORD_BYTES = run_record.max_run_record_bytes(_MAX_ACTIVE_RUNS, _MAX_HTTP_BODY_BYTES)
+_RESULT_REFUSAL_PREFIX = "[hermes-result-refusal] "
+_UNUSABLE_RESULT_SUMMARY = "The task finished, but its result could not be used."
+_BACKGROUND_RESULT = re.compile(
+    r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
+)
+_BACKGROUND_VOICE_MARKUP = re.compile(
+    r"[<>`]|~~"
+    r"|\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
+    r"|\A(?:#{1,6}|[-+*]|\d+[.)])\s"
+)
+_BACKGROUND_DETAIL_PROTOCOL_TAG = re.compile(r"</?(?:voice|detail)\b", re.IGNORECASE)
 # Path() constructs the platform's concrete class, which is the only accepted record path type.
 _CONCRETE_PATH = type(Path())
 _BACKGROUND_INSTRUCTIONS = (
@@ -78,10 +91,13 @@ _BACKGROUND_INSTRUCTIONS = (
     "Stay exactly within the requested scope; do not add a topic, domain, category, "
     "constraint, source, or entity the user did not request. Ask for approval normally "
     "when Hermes policy requires it. For a simple external current-information lookup, make "
-    "exactly one parallel batch of no more than five web_search calls, then answer immediately "
-    "from those results. For that lookup path, do not call skill_view, web_extract, browser "
-    "tools, terminal, or perform follow-up searches unless the objective explicitly requires "
-    "page-level validation that search results cannot provide. Local, runtime, file, process, "
+    "exactly one parallel batch of no more than five web_search calls. Answer from those "
+    "results when they contain the facts needed for the objective. Otherwise, make at most "
+    "one web_extract call for no more than three distinct URLs returned by that search batch, "
+    "then answer. Use only inline extraction output; do not call read_file or page through "
+    "stored page content. Do not retry lookup tools, perform follow-up searches or additional "
+    "extraction calls, or use skill_view, browser tools, or terminal for this lookup path. "
+    "Local, runtime, file, process, "
     "build, and verification objectives are operational work, not external current-information "
     "lookups; use the tools needed to inspect them directly. Never interpret an unavailable "
     "tool, failed command, or empty output as a negative finding; state the failure or "
@@ -95,6 +111,24 @@ _BACKGROUND_INSTRUCTIONS = (
     "expand voice but must not replace its important findings. Do not put line breaks or "
     "markup inside voice, or text outside these elements."
 )
+
+
+def _has_result_text(text: str) -> bool:
+    """Require content beyond whitespace and Unicode format characters."""
+    return any(
+        not character.isspace() and unicodedata.category(character) != "Cf" for character in text
+    )
+
+
+def _has_result_controls(text: str, *, detail: bool = False) -> bool:
+    """Reject non-text controls and surrogates; retain normal detail whitespace."""
+    for character in text:
+        if detail and character in "\t\n\r":
+            continue
+        codepoint = ord(character)
+        if codepoint < 32 or 127 <= codepoint <= 159 or 0xD800 <= codepoint <= 0xDFFF:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -1100,7 +1134,7 @@ class HermesApiTaskSession:
         if event not in {"run.completed", "run.failed", "run.cancelled"}:
             return
         if event == "run.completed":
-            output = self._bounded_terminal_text(payload.get("output"), "summary")
+            output = self._completed_result_text(payload.get("output"))
             status = WorkTerminalStatus.COMPLETED
             terminal_payload = WorkCompletedPayload(status=status, summary=output)
         elif event == "run.failed":
@@ -1440,6 +1474,57 @@ class HermesApiTaskSession:
         if trusted.payload.scope is not CancelScope.TASK:
             raise ValueError("Hermes API session only accepts task cancellation")
         return trusted
+
+    @staticmethod
+    def _completed_result_text(value: object) -> str:
+        """Accept the requested API envelope or a fixed host notice, never repair model text."""
+        category: str | None = "terminal_text"
+        try:
+            try:
+                HermesApiTaskSession._bounded_terminal_text(value, "summary")
+            except RuntimeError:
+                return _UNUSABLE_RESULT_SUMMARY
+            text = cast(str, value)
+            category = "envelope"
+            envelope = _BACKGROUND_RESULT.fullmatch(text)
+            if envelope is None:
+                return _UNUSABLE_RESULT_SUMMARY
+            voice, detail = envelope.group("voice", "detail")
+            category = "voice"
+            if (
+                not _has_result_text(voice)
+                or len(voice) > 220
+                or _has_result_controls(voice)
+                or voice.splitlines() != [voice]
+                or strip_markdown_emphasis_for_speech(voice) != voice
+                or _BACKGROUND_VOICE_MARKUP.search(voice.lstrip()) is not None
+            ):
+                return _UNUSABLE_RESULT_SUMMARY
+            category = "detail"
+            if (
+                not _has_result_text(detail)
+                or len(detail) > 1800
+                or _has_result_controls(detail, detail=True)
+                or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
+            ):
+                return _UNUSABLE_RESULT_SUMMARY
+            category = None
+            return text
+        finally:
+            if category is not None:
+                evidence = {
+                    "category": category,
+                    "characters": min(len(value), _MAX_TERMINAL_TEXT_CHARS + 1)
+                    if type(value) is str else 0,
+                    "version": 1,
+                }
+                # Refusal reporting must not turn completed work into settlement/cancellation.
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        _RESULT_REFUSAL_PREFIX
+                        + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                        flush=True,
+                    )
 
     @staticmethod
     def _bounded_terminal_text(value: object, field_name: str) -> str:

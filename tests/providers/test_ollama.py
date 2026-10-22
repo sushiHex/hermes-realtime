@@ -62,7 +62,7 @@ async def test_concise_spoken_contract_reaches_actual_request_without_truncation
     assert "accepted dispatch" in common
     assert instruction in presentation
     assert "one or two short sentences for simple turns" not in presentation
-    assert json.loads(references) == {"work_state": "none"}
+    assert json.loads(references) == {}
     assert request["messages"][1:] == [
         {"role": "user", "content": "Explain the example in detail."},
     ]
@@ -103,10 +103,10 @@ async def test_output_style_and_reference_kinds_bind_to_the_sent_prompt(style, c
     assert sent[0]["content"].startswith(f"Output style: {style}.\n")
     sections = json.loads(sent[0]["content"].split("\n\nReference data:\n", 1)[1])
     assert sections["memory"]["memory"] == "Synthetic memory."
-    assert sections["active_work"] == [{"task_id": "task_1", "objective": "Synthetic objective."}]
+    assert "active_work" not in sections
     assert sections["updates"][0]["text"] == "Synthetic finding."
     report = json.loads(capsys.readouterr().out.split("[ollama-prompt] ")[1])
-    assert report["reference_kinds"] == ["memory", "active_work", "updates"]
+    assert report["reference_kinds"] == ["memory", "updates"]
     assert report["output_style"] == style
     assert "Synthetic" not in json.dumps(report)
 
@@ -136,7 +136,6 @@ def test_ollama_renders_memory_as_separate_untrusted_context() -> None:
     assert "untrusted reference data" in messages[0]["content"]
     payload = messages[0]["content"].split("\n\nReference data:\n", 1)[1]
     assert json.loads(payload) == {
-        "work_state": "none",
         "memory": {"memory": "Prefers concise replies.", "user": "Ari", "truncated": False},
     }
 
@@ -214,9 +213,7 @@ async def test_ollama_streams_bounded_speakable_segments_without_tool_schema() -
         {"role": "assistant", "content": "The bridge is complete."},
     ]
     sections = json.loads(body["messages"][0]["content"].split("\n\nReference data:\n", 1)[1])
-    assert sections["active_work"] == [
-        {"task_id": "task_review", "objective": "Review the release"}
-    ]
+    assert sections == {}
     assert "tools" not in body
     assert "tool_choice" not in body
 
@@ -387,7 +384,7 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
         if line.startswith("[ollama-prompt] ")
     ]
     assert reports[0] == {
-        "output_style": "default", "reference_kinds": ["active_work"],
+        "output_style": "default", "reference_kinds": [],
         "messages": len(sent),
         "num_ctx": 16_384,
         "prompt_bytes": len(content.encode("utf-8")),
@@ -861,6 +858,4 @@ def test_reference_kinds_equal_every_section_actually_sent() -> None:
     sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
 
     assert "host_speech_message_indices" in sections
-    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == [
-        kind for kind in sections if kind != "work_state"
-    ]
+    assert OllamaStreamingInference.prompt_metadata(messages)["reference_kinds"] == list(sections)

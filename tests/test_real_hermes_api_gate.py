@@ -247,6 +247,7 @@ class _Hermes:
         self.statuses[run_id] = status
         event: dict[str, object] = {"event": f"run.{status}", "run_id": run_id}
         if status == "completed":
+            output = f"<voice>{output}</voice><detail>{output}</detail>"
             self.outputs[run_id] = event["output"] = output
         elif status == "failed":
             event["error"] = output
@@ -275,7 +276,7 @@ class _Hermes:
         if self.finished_before_stop and run_id == _RUN_IDS[2]:
             self.terminals[run_id] = "completed"
             self.statuses[run_id] = "completed"
-            self.outputs[run_id] = "Finished first."
+            self.outputs[run_id] = "<voice>Finished first.</voice><detail>Finished first.</detail>"
             self.stopped.set()
         if self.statuses[run_id] in _TERMINAL:
             return web.json_response(self._status(run_id))
