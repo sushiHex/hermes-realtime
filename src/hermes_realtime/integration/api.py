@@ -10,6 +10,7 @@ import math
 import re
 import secrets
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkTerminalStatus,
 )
+from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +79,7 @@ _BACKGROUND_RESULT = re.compile(
     r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
 )
 _BACKGROUND_VOICE_MARKUP = re.compile(
-    r"[<>`]|\*\*|~~|\*[^*]+\*"
-    r"|(?<!\w)_(?=\S).+?(?<=\S)_(?!\w)"
+    r"[<>`]|~~"
     r"|\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
     r"|\A(?:#{1,6}|[-+*]|\d+[.)])\s"
 )
@@ -110,6 +111,13 @@ _BACKGROUND_INSTRUCTIONS = (
     "expand voice but must not replace its important findings. Do not put line breaks or "
     "markup inside voice, or text outside these elements."
 )
+
+
+def _has_result_text(text: str) -> bool:
+    """Require content beyond whitespace and Unicode format characters."""
+    return any(
+        not character.isspace() and unicodedata.category(character) != "Cf" for character in text
+    )
 
 
 def _has_result_controls(text: str, *, detail: bool = False) -> bool:
@@ -1484,16 +1492,17 @@ class HermesApiTaskSession:
             voice, detail = envelope.group("voice", "detail")
             category = "voice"
             if (
-                not voice.strip()
+                not _has_result_text(voice)
                 or len(voice) > 220
                 or _has_result_controls(voice)
                 or voice.splitlines() != [voice]
+                or strip_markdown_emphasis_for_speech(voice) != voice
                 or _BACKGROUND_VOICE_MARKUP.search(voice.lstrip()) is not None
             ):
                 return _UNUSABLE_RESULT_SUMMARY
             category = "detail"
             if (
-                not detail.strip()
+                not _has_result_text(detail)
                 or len(detail) > 1800
                 or _has_result_controls(detail, detail=True)
                 or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
