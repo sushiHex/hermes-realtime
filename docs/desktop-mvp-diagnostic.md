@@ -18,6 +18,20 @@ The guide links to the detailed references rather than repeating them:
 [`hermes-bridge.md`](hermes-bridge.md) for the installed-runtime gate and the bridge protocol,
 and the [README](../README.md) for building from source.
 
+The [automated rehearsal](../scripts/rehearse_desktop_mvp.py) requires successful IPv4 and
+IPv6 listener enumeration before treating a port as absent or its listeners as loopback-only.
+A nonzero exit, launch error, timeout or expired deadline refuses the whole observation and
+emits one `[desktop-mvp-listener-refusal]` line containing only a category and the completed
+family count. Preflight reports this as a failure, not a missing optional dependency.
+
+Both families share the caller's deadline: two seconds for the preflight listener check,
+the existing startup deadline for health and exposure checks, and the remaining existing
+five-second process-settlement deadline for all cleanup listener checks. Root termination
+retains its existing separate waits; this is not a total cleanup-duration bound. An unknown
+cleanup listener result is `ports_listening: null`, with a `listener_query_failure` category,
+and cannot pass overall completion. This tooling correction does not identify the cause of
+any historical refusal or qualify a live session; see [#325](https://github.com/sushiHex/hermes-realtime/issues/325).
+
 ## Output style
 
 The browser offers **Default**, **Proactive**, **Concise**, **Explanatory** and **Learning**

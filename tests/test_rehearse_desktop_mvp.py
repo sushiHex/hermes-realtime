@@ -789,8 +789,8 @@ def test_every_verdict_is_applied_where_it_is_observed() -> None:
     }
     gateway = inspect.getsource(rehearsal.Rehearsal._start_gateway)
     assert gateway.count("listener_verdict(") == 2
-    assert '"api", listeners(self.api_port)' in gateway
-    assert '"companion", listeners(self.companion_port)' in gateway
+    assert '"api", listeners(self.api_port, deadline=deadline)' in gateway
+    assert '"companion", listeners(self.companion_port, deadline=deadline)' in gateway
     assert 'listener_verdict("livekit_signaling"' in source["_start_livekit"]
     assert "step.apply(exposed)" in gateway
     assert "step.apply(exposed)" in source["_start_livekit"]
