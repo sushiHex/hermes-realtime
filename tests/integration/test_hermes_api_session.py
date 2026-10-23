@@ -3504,7 +3504,11 @@ class _LookupHermes:
         if self.fault == "unavailable":
             headers["X-Lookup-Policy-Outcome"] = "unavailable"
         response = web.json_response(
-            {"run_id": self.run_id, "status": self.status, "output": _completed_output("Authoritative result")},
+            {
+                "run_id": self.run_id,
+                "status": self.status,
+                "output": _completed_output("Authoritative result"),
+            },
             headers=headers,
         )
         if self.fault == "status-duplicate":
