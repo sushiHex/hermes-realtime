@@ -608,26 +608,47 @@ def test_audit_write_failure_cannot_leave_acceptable_stale_evidence(tmp_path):
         namespace["audit_record"](tmp_path / "audit.json", {"count": 1})
 
 
-@pytest.mark.parametrize("inside", [False, True])
-def test_process_metadata_contains_only_bounded_projected_source(tmp_path, inside):
+@pytest.mark.parametrize(
+    "origin", ["hermes", "dependency", "stdlib", "proof", "fixture", "outside", "overflow"]
+)
+def test_process_metadata_covers_trusted_sources_without_private_values(tmp_path, origin):
     namespace = profile_namespace()
-    exported = tmp_path / "projection"
-    exported.mkdir()
-    path = (exported if inside else tmp_path) / "source.py"
+    roots = {
+        name: tmp_path / name for name in ("hermes", "dependency", "stdlib", "proof", "fixture")
+    }
+    for root in roots.values():
+        root.mkdir()
+    path = (roots.get(origin, roots["hermes"] if origin == "overflow" else tmp_path)) / "source.py"
     source = (
         "def caller(depth, secret):\n"
-        "    return caller(depth-1, secret) if depth else capture(root)\n"
+        "    return caller(depth-1, secret) if depth else capture(roots, hashes)\n"
     )
     path.write_text(source)
-    scope = {"capture": namespace["process_provenance"], "root": exported}
-    exec(compile(source, str(path), "exec"), scope)
-    observed = scope["caller"](15, "private-argument-value")
-    assert len(observed["frames"]) == (12 if inside else 0)
-    assert all(
-        frame == {"module": "source.py", "function": "caller", "line": 2}
-        for frame in observed["frames"]
-    )
+    scope = {
+        "capture": namespace["process_provenance"],
+        "roots": roots,
+        "hashes": {},
+        "__file__": str(path),
+    }
+    # Installed bytecode can retain an old build path; actual module origin is authoritative.
+    filename = str(tmp_path / "old-build.py") if origin == "dependency" else str(path)
+    exec(compile(source, filename, "exec"), scope)
+    observed = scope["caller"](80 if origin == "overflow" else 2, "private-argument-value")
     payload = json.dumps(observed)
     assert "private-argument-value" not in payload and json.dumps(str(tmp_path)) not in payload
-    if not inside:
-        assert observed["outside"] == "unknown-outside"
+    concrete = [frame for frame in observed["frames"] if frame["source_sha256"] is not None]
+    if origin == "outside":
+        assert not concrete and observed["incomplete"] is True
+    else:
+        assert concrete and all(
+            frame["module"] == "source.py"
+            and frame["function"] == "caller"
+            and frame["source_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+            for frame in concrete
+        )
+        assert {frame["origin"] for frame in concrete} == {
+            "hermes" if origin == "overflow" else origin
+        }
+    assert len(observed["frames"]) <= 64
+    if origin == "overflow":
+        assert observed["truncated"] is True and observed["incomplete"] is True

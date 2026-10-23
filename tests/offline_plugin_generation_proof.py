@@ -156,30 +156,79 @@ def audit_record(path, record):
         os._exit(2)
 
 
-def process_provenance(exported):
-    """Only committed-projection source locations; never frame locals or arguments."""
+def process_provenance(roots, hashes):
+    """Bounded source identities only; prepared interpreter/dependencies stay trusted."""
     frames = []
     frame = sys._getframe(1)
-    outside = False
-    for _ in range(128):
-        if frame is None or len(frames) == 12:
+    incomplete = False
+    for _ in range(64):
+        if frame is None:
             break
+        location = {
+            "origin": "unknown-outside",
+            "module": "unknown",
+            "function": "unknown",
+            "line": 0,
+            "source_sha256": None,
+        }
         try:
-            path = Path(frame.f_code.co_filename).resolve()
-            relative = path.relative_to(exported.resolve()).as_posix()
-            if path.suffix != ".py" or not path.is_file() or len(relative) > 256:
-                raise ValueError
-            frames.append(
-                {
-                    "module": relative,
-                    "function": frame.f_code.co_name[:80],
-                    "line": min(max(frame.f_lineno, 0), 2**31 - 1),
-                }
-            )
+            filename = frame.f_code.co_filename
+            if filename.startswith("<frozen ") and filename.endswith(">"):
+                # Interpreter infrastructure is recorded, never sufficient caller evidence.
+                location.update(
+                    origin="runtime-internal",
+                    module="frozen-interpreter",
+                    function=frame.f_code.co_name[:80],
+                    line=min(max(frame.f_lineno, 0), 2**31 - 1),
+                )
+            else:
+                module_origin = getattr(frame.f_globals.get("__spec__"), "origin", None)
+                path = Path(
+                    module_origin
+                    if type(module_origin) is str and Path(module_origin).is_absolute()
+                    else frame.f_globals.get("__file__", filename)
+                ).resolve()
+                for origin, root in roots.items():
+                    if not path.is_relative_to(root):
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    if (
+                        path.suffix != ".py"
+                        or len(relative) > 256
+                        or (
+                            origin == "stdlib"
+                            and {"site-packages", "dist-packages"}.intersection(
+                                Path(relative).parts
+                            )
+                        )
+                    ):
+                        break
+                    if path not in hashes:
+                        if len(hashes) >= 128:
+                            break
+                        with path.open("rb") as stream:
+                            payload = stream.read(8 * 1024 * 1024 + 1)
+                        if len(payload) > 8 * 1024 * 1024:
+                            break
+                        hashes[path] = hashlib.sha256(payload).hexdigest()
+                    location.update(
+                        origin=origin,
+                        module=relative,
+                        function=frame.f_code.co_name[:80],
+                        line=min(max(frame.f_lineno, 0), 2**31 - 1),
+                        source_sha256=hashes[path],
+                    )
+                    break
         except Exception:
-            outside = True
+            pass
+        incomplete |= location["origin"] == "unknown-outside"
+        frames.append(location)
         frame = frame.f_back
-    return {"frames": frames, "outside": "unknown-outside" if outside else "none"}
+    return {
+        "frames": frames,
+        "truncated": frame is not None,
+        "incomplete": incomplete or frame is not None,
+    }
 
 
 def cleanup_failure_details(exc, profile):
@@ -477,6 +526,16 @@ def worker(args):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         audit_lock = threading.Lock()
+        provenance_roots = {
+            "hermes": exported.resolve(),
+            "fixture": plugin_home.resolve(),
+            "proof": PROOF_ROOT.resolve(),
+            "dependency": (
+                Path(sys.executable).absolute().parent.parent / "Lib/site-packages"
+            ).resolve(),
+            "stdlib": (Path(sys.base_prefix) / "Lib").resolve(),
+        }
+        provenance_hashes = {}
         audit_path = args.receipt.with_name(args.receipt.name + ".audit.json")
 
         def save_audit():
@@ -485,6 +544,8 @@ def worker(args):
                 {
                     "worker_nonce": args.worker_nonce,
                     "process_events": result["process_events"],
+                    "process_events_truncated": result["blocked_process_attempts"]
+                    > len(result["process_events"]),
                     **{
                         name: result[name]
                         for name in (
@@ -504,7 +565,10 @@ def worker(args):
                     result["blocked_process_attempts"] += 1
                     if len(result["process_events"]) < 8:
                         result["process_events"].append(
-                            {"event": event, **process_provenance(exported)}
+                            {
+                                "event": event,
+                                **process_provenance(provenance_roots, provenance_hashes),
+                            }
                         )
                     save_audit()
                 raise OSError("offline-process-block")
