@@ -1,9 +1,11 @@
 """Explicit Windows load-only observation for the staged native plugin.
 
 Use a reviewed clean candidate and prepared pinned Hermes interpreter. Launch the
-controller hidden with -I -S -B, DEVNULL streams, timeout=70 and check=True. Its
-unchanged 60-second controller budget covers both fresh consent profiles. It uses
-existing Processes/Containment ownership and never closes the controller's Job.
+controller hidden with -I -S -B, DEVNULL streams, timeout=70 and check=True. Both
+worker waits share an absolute deadline 60 seconds after controller preparation
+starts. Settlement and profile deletion use the caller's 70-second outer bound;
+total elapsed time may exceed 60 seconds. Existing Processes/Containment ownership
+is reused, and the controller never closes its own Job.
 No native Runs, model, retrieval, service metadata or user-profile action exists.
 This is not a live-task, transport or usefulness qualification.
 """
