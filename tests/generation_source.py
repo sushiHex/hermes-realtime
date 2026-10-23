@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -79,6 +80,20 @@ def _paths(entries: list[tuple[str, str, str]]) -> None:
             ):
                 raise SourceExportError("source_export_path_collision")
             aliases[alias] = prefix
+
+
+def _materialize_blob(payload):
+    destination, path, mode, content = payload
+    target = destination.joinpath(*path.split("/"))
+    filesystem_started = time.monotonic()
+    with target.open("xb") as stream:
+        stream.write(content)
+    if os.name != "nt":
+        target.chmod(0o755 if mode == "100755" else 0o644)
+    filesystem_seconds = time.monotonic() - filesystem_started
+    manifest_started = time.monotonic()
+    entry = [path, mode, hashlib.sha256(content).hexdigest()]
+    return entry, filesystem_seconds, time.monotonic() - manifest_started
 
 
 def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str | int | float]:
@@ -166,26 +181,25 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
     if offset != len(batch):
         raise SourceExportError("source_export_blob_invalid")
     validation_seconds = time.monotonic() - validation_started
+    materialization_started = time.monotonic()
     filesystem_started = time.monotonic()
     destination.mkdir()
-    filesystem_seconds = time.monotonic() - filesystem_started
-    manifest_seconds = 0.0
-    manifest = []
     created_parents = {destination}
-    for path, mode, content in blobs:
+    for path, _, _ in blobs:
         target = destination.joinpath(*path.split("/"))
-        filesystem_started = time.monotonic()
         if target.parent not in created_parents:
             target.parent.mkdir(parents=True, exist_ok=True)
             created_parents.add(target.parent)
-        with target.open("xb") as stream:
-            stream.write(content)
-        if os.name != "nt":
-            target.chmod(0o755 if mode == "100755" else 0o644)
-        filesystem_seconds += time.monotonic() - filesystem_started
-        manifest_started = time.monotonic()
-        manifest.append([path, mode, hashlib.sha256(content).hexdigest()])
-        manifest_seconds += time.monotonic() - manifest_started
+    filesystem_seconds = time.monotonic() - filesystem_started
+    jobs = [(destination, path, mode, content) for path, mode, content in blobs]
+    # The finite validated input is at most the already materialized Git listing.
+    # Ordered map preserves the manifest; context exit settles workers on failure.
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        materialized = list(workers.map(_materialize_blob, jobs))
+    materialization_wall_seconds = time.monotonic() - materialization_started
+    manifest = [entry for entry, _, _ in materialized]
+    filesystem_seconds += sum(seconds for _, seconds, _ in materialized)
+    manifest_seconds = sum(seconds for _, _, seconds in materialized)
     manifest_started = time.monotonic()
     digest = hashlib.sha256(json.dumps(manifest, separators=(",", ":")).encode("utf-8")).hexdigest()
     manifest_seconds += time.monotonic() - manifest_started
@@ -203,7 +217,9 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
         "source_export_metadata_seconds": round(metadata_seconds, 3),
         "source_export_blob_read_seconds": round(blob_read_seconds, 3),
         "source_export_validation_seconds": round(validation_seconds, 3),
-        "source_export_filesystem_seconds": round(filesystem_seconds, 3),
-        "source_export_manifest_seconds": round(manifest_seconds, 3),
+        "source_export_filesystem_work_seconds": round(filesystem_seconds, 3),
+        "source_export_manifest_work_seconds": round(manifest_seconds, 3),
+        "source_export_materialization_wall_seconds": round(materialization_wall_seconds, 3),
         "source_export_total_seconds": round(time.monotonic() - started, 3),
+        "source_export_timing_semantics": "overlapping_work_and_wall_v1",
     }

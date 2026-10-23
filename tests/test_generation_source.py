@@ -1,9 +1,13 @@
 """Focused clean-source export controls; no provider or runtime is executed."""
 
+import contextlib
+import hashlib
 import importlib.util
 import json
 import math
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -90,8 +94,9 @@ def test_export_timings_are_fixed_content_free_and_preserve_payload(committed, t
         "source_export_metadata_seconds",
         "source_export_blob_read_seconds",
         "source_export_validation_seconds",
-        "source_export_filesystem_seconds",
-        "source_export_manifest_seconds",
+        "source_export_filesystem_work_seconds",
+        "source_export_manifest_work_seconds",
+        "source_export_materialization_wall_seconds",
         "source_export_total_seconds",
     }
     assert all(
@@ -373,3 +378,122 @@ def test_projection_preserves_sibling_contributor_module(tmp_path):
     assert result["source_export_files"] == 2
     assert result["source_export_excluded_metadata_files"] == 935
     assert (destination / "contributors" / "runtime.py").read_bytes() == b"pinned"
+
+
+def test_parallel_export_overlaps_two_workers_and_preserves_git_order(committed, tmp_path):
+    # RED on the serial exporter; mutations: worker limit or completion-order results.
+    repository, pin = committed
+    payloads = {
+        p.name: git(repository, "show", f"{pin}:{p.name}")
+        for p in repository.iterdir()
+        if p.is_file()
+    }
+    manifest = [
+        [name, "100644", hashlib.sha256(payloads[name]).hexdigest()] for name in sorted(payloads)
+    ]
+    expected = hashlib.sha256(json.dumps(manifest, separators=(",", ":")).encode()).hexdigest()
+    destination = tmp_path / "export"
+    original_open = Path.open
+    caller = threading.current_thread()
+    barrier = threading.Barrier(2)
+    second_finished = threading.Event()
+    lock = threading.Lock()
+    active = peak = entered = 0
+    limits = []
+
+    names = sorted(payloads)
+
+    class ObservedExecutor(ThreadPoolExecutor):
+        def __init__(self, *args, **kwargs):
+            limits.append(kwargs["max_workers"])
+            super().__init__(*args, **kwargs)
+
+        def submit(self, fn, *args, **kwargs):
+            future = super().submit(fn, *args, **kwargs)
+            if args[0][1] == names[1]:
+                future.add_done_callback(lambda _future: second_finished.set())
+            return future
+
+    @contextlib.contextmanager
+    def observed_open(path, *args, **kwargs):
+        nonlocal active, peak, entered
+        with original_open(path, *args, **kwargs) as stream:
+            with lock:
+                index = names.index(path.relative_to(destination).as_posix())
+                entered += 1
+                active += 1
+                peak = max(peak, active)
+            try:
+                if threading.current_thread() is not caller and index < 2:
+                    barrier.wait(timeout=5)
+                    if index == 0:
+                        assert second_finished.wait(5)
+                yield stream
+            finally:
+                with lock:
+                    active -= 1
+
+    with (
+        patch.object(source, "ThreadPoolExecutor", ObservedExecutor, create=True),
+        patch.object(Path, "open", observed_open),
+    ):
+        result = source.export_tree(repository, pin, destination)
+    assert (limits, peak, active, entered) == ([2], 2, 0, 3)
+    assert result["source_export_manifest_sha256"] == expected
+    assert {p.name: p.read_bytes() for p in destination.iterdir()} == payloads
+
+
+def test_worker_failure_settles_peer_before_export_error(committed, tmp_path):
+    # Mutation: executor context shuts down with wait=False after a worker error.
+    repository, pin = committed
+    original_worker = source._materialize_blob
+    barrier = threading.Barrier(2)
+    release = threading.Event()
+    peer_finished = threading.Event()
+    shutdown_entered = threading.Event()
+    finished = threading.Event()
+    names = sorted(p.name for p in repository.iterdir() if p.is_file())
+    waits = []
+    outcomes = []
+
+    class ObservedExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait=True, **kwargs):
+            waits.append(wait)
+            shutdown_entered.set()
+            return super().shutdown(wait=wait, **kwargs)
+
+    def worker(payload):
+        index = names.index(payload[1])
+        if index < 2:
+            barrier.wait(timeout=5)
+        if index == 0:
+            raise OSError("synthetic worker failure")
+        if index == 1:
+            assert release.wait(5)
+            try:
+                return original_worker(payload)
+            finally:
+                peer_finished.set()
+        return original_worker(payload)
+
+    def export():
+        try:
+            source.export_tree(repository, pin, tmp_path / "export")
+        except OSError:
+            outcomes.append(peer_finished.is_set())
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=export, daemon=True)
+    with (
+        patch.object(source, "ThreadPoolExecutor", ObservedExecutor),
+        patch.object(source, "_materialize_blob", worker),
+    ):
+        try:
+            thread.start()
+            assert shutdown_entered.wait(5)
+            assert waits == [True] and not finished.is_set()
+        finally:
+            release.set()
+            thread.join(5)
+    assert not thread.is_alive() and outcomes == [True] and peer_finished.is_set()
