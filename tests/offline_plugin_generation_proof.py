@@ -196,6 +196,19 @@ def cleanup_failure_details(exc, profile):
     }
 
 
+def shutdown_logging():
+    """Stop the public queue owner before closing its handlers.
+
+    The drain is best effort; only successful profile deletion qualifies cleanup.
+    """
+    from hermes_logging import drain_log_queue
+
+    try:
+        drain_log_queue(timeout=1.0)
+    finally:
+        logging.shutdown()
+
+
 @contextlib.contextmanager
 def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
     """Keep semantic evidence pending until the disposable profile is removed."""
@@ -472,13 +485,15 @@ def main():
                     try:
                         loop.run_until_complete(loop.shutdown_asyncgens())
                     finally:
-                        loop.run_until_complete(loop.shutdown_default_executor())
+                        try:
+                            loop.run_until_complete(loop.shutdown_default_executor())
+                        finally:
+                            shutdown_logging()
             except BaseException as exc:
                 result.update(
                     ok=False, category="proof-finalization-refused", error_kind=type(exc).__name__
                 )
             loop.close()
-            logging.shutdown()
             try:
                 checkpoint(args.receipt, result, "origin-verification", started)
                 result.update(imports_helper.verify_import_origins(exported))

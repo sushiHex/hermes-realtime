@@ -10,6 +10,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -361,3 +362,31 @@ def test_cleanup_private_output_cannot_alias_receipt(tmp_path):
     ):
         pass
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize("drain_failure", [False, True])
+def test_logging_owner_drains_before_handler_close(tmp_path, drain_failure):
+    namespace = profile_namespace()
+    observed = []
+    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+
+    def drain(*, timeout):
+        observed.append(("drain", timeout))
+        if drain_failure:
+            raise RuntimeError("synthetic drain failure")
+
+    with (
+        patch.dict(sys.modules, hermes_logging=types.SimpleNamespace(drain_log_queue=drain)),
+        patch.object(namespace["logging"], "shutdown", lambda: observed.append("close")),
+    ):
+        if drain_failure:
+            with (
+                pytest.raises(RuntimeError, match="synthetic drain failure"),
+                namespace["proof_profile"](tmp_path / "receipt.json", result),
+            ):
+                namespace["shutdown_logging"]()
+        else:
+            with namespace["proof_profile"](tmp_path / "receipt.json", result):
+                namespace["shutdown_logging"]()
+    assert observed == [("drain", 1.0), "close"]
+    assert result["ok"] is (not drain_failure)
