@@ -68,7 +68,7 @@ async def test_status_request_is_separate_from_model_prose_and_effects(
         corpus=one_case, provider=provider, model="synthetic:latest", effort="low",
         codex_executable=None,
     )
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     status = report["host_status_requests"]
     assert status["count"] == 1 and status["case_ids"] == ["nw-001"]
     assert status["scope"] == "selection_only"
@@ -712,6 +712,33 @@ def test_missing_source_binding_refuses_before_provider(
     )
     assert evaluator.main(["--provider", "ollama"]) == 2
     assert '"status":"error"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure,code", [
+    (evaluator.SourceBindingFailure("source"), "source_binding_failed"),
+    (evaluator.OwnedLaunchFailure({"receipt_status": "missing_or_malformed"}),
+     "owned_launch_failed"),
+    (evaluator.OwnedResultFailure("result"), "owned_result_failed"),
+    (evaluator.EvaluationFailure("provider_readiness_failed"), "provider_readiness_failed"),
+    (RuntimeError("synthetic failure"), "evaluation_failed"),
+], ids=["source", "owned_launch", "owned_result", "provider", "unexpected"])
+def test_gpu_profile_cli_errors_use_the_new_report_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    failure: Exception, code: str,
+) -> None:
+    async def failed(**_options: object) -> dict[str, object]:
+        raise failure
+
+    monkeypatch.setattr(evaluator, "_verify_source_binding", lambda *_args: None)
+    monkeypatch.setattr(evaluator, "run_evaluation", failed)
+    assert evaluator.main([
+        "--provider", "ollama", "--mode", "diagnostic_override", "--ollama-num-gpu", "0",
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+    ]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 6
+    assert report["status"] == "error" and report["pass"] is False
+    assert report["error"]["code"] == code
 
 
 @pytest.mark.parametrize("observed", [

@@ -207,7 +207,12 @@ The entrypoint refuses a missing or
 changed source commit/tree, a dirty worktree, or production imports from another
 checkout before model execution, and verifies source stability again afterward.
 
-The version-four report declares a 20-second readiness bound, a 60-second decision
+Successful and error reports use schema version 6. Ollama reports add
+`ollama_gpu_layers` as the requested integer or `"runtime_default"` when omitted;
+CLI `configured_overrides` can include `ollama_num_gpu`. These additions replace
+the version-five report contract and do not describe observed device placement.
+
+The version-six report declares a 20-second readiness bound, a 60-second decision
 bound, a 10-second adapter-close bound and a 3500-second total evaluation bound. It
 uses a 3600-second outer guardian deadline, leaving room for bounded cleanup and
 receipt writing without silently doubling the evaluation budget. The total clock

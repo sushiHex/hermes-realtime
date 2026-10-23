@@ -46,6 +46,7 @@ _DECISION_BUDGET_SECONDS = 60.0
 _CLOSE_BUDGET_SECONDS = 10.0
 _EVALUATION_BUDGET_SECONDS = 3500.0
 _OWNED_DEADLINE_SECONDS = 3600
+_REPORT_SCHEMA_VERSION = 6
 _DEFAULT_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 
 _DEFAULT_CORPUS = _ROOT / "tests" / "fixtures" / "natural_work_intent_cases.json"
@@ -962,7 +963,7 @@ async def run_evaluation(
         retried_case_ids=(),
     )
     report.update({
-        "schema_version": 5,
+        "schema_version": _REPORT_SCHEMA_VERSION,
         "host_status_requests": {
             "scope": "selection_only",
             "count": sum(row.host_status_request_latency_ms is not None for row in observations),
@@ -1330,7 +1331,7 @@ def main(argv: list[str] | None = None) -> int:
     except SourceBindingFailure:
         category = "source_binding_failed"
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": {"code": "source_binding_failed"},
@@ -1343,7 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1356,7 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1372,7 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
                 marker_secondary.append("source_binding_failed")
             public_error["secondary_categories"] = marker_secondary
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1385,7 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
