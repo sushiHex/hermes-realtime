@@ -112,6 +112,19 @@ def test_healthy_replacement_orders_settlement_before_start(scenario):
     assert scenario.state["ready"] is True
 
 
+@pytest.mark.parametrize("boundary", ["replacement", "final"])
+def test_exited_job_member_uses_existing_survivor_verdict(scenario, boundary):
+    # A retained exited process object may remain listed; survivors owns liveness.
+    scenario.containment.members = lambda: {os.getpid(), 999999}
+    if boundary == "replacement":
+        assert replace(scenario) is scenario.child
+    else:
+        scenario.state["ready"] = False
+        with patch.object(proof, "listeners", scenario.listeners):
+            proof.settle(scenario.owner, scenario.containment, [scenario.old], 12345)
+    assert "survivors" in scenario.events and "listeners" in scenario.events
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -121,7 +134,6 @@ def test_healthy_replacement_orders_settlement_before_start(scenario):
         "root",
         "survivors",
         "cleanup-refusal",
-        "members",
         "listeners",
     ],
 )
@@ -144,8 +156,6 @@ def test_unsafe_old_generation_cannot_start_replacement(scenario, fault):
             return {}
 
         scenario.owner.survivors = survivors
-    elif fault == "members":
-        scenario.containment.members = lambda: {os.getpid(), 999999}
     else:
         scenario.listeners = lambda *_args, **_kwargs: ["occupied"]
     with pytest.raises(proof.Refusal):

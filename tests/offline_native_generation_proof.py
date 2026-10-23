@@ -61,8 +61,6 @@ def replace_generation(
     survivors = owner.survivors(containment)
     if survivors or owner.cleanup_stop_failed or owner.first_cleanup_refusal is not None:
         raise Refusal("old-generation-unsettled")
-    if containment.members() != {os.getpid()}:
-        raise Refusal("job-membership-unsettled")
     if listeners(port, deadline=deadline):
         raise Refusal("old-listener-present")
     child = start()
@@ -331,7 +329,7 @@ def settle(owner, containment, roots, port):
         or owner.first_cleanup_refusal is not None
     ):
         raise Refusal("final-generation-unsettled")
-    if containment.members() != {os.getpid()} or listeners(port, deadline=deadline):
+    if listeners(port, deadline=deadline):
         raise Refusal("final-job-or-listener")
 
 
