@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1Ã¢â‚¬â€œ5 searches may be followed by one extraction of 1Ã¢â‚¬â€œ3
+- One complete batch of 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“5 searches may be followed by one extraction of 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -99,9 +99,9 @@ The controller is the sole overall-success authority. The internal worker writes
 `<receipt>.worker.json` with `ok: false` and separate semantic results, then exits
 normally so Hermes/Python finalizers release process-owned handles. The controller
 retains its exact child handle through exit and requires matching nonce, source
-bindings, semantic success and Job membership containing only itself before one
-profile deletion. Only successful deletion permits the final receipt to become
-true. Timeout, abnormal exit, bad evidence or unsettled membership preserves the
+bindings, semantic success and no live/unknown survivors or sticky settlement refusal from
+the existing process owner before one profile deletion. Only successful deletion permits the final receipt to become
+true. Timeout, abnormal exit, bad evidence or unsettled execution preserves the
 profile and overall false. There is no per-resource teardown fallback or retry.
 The outer 60-second caller is mandatory; it bounds cleanup as well as the worker.
 Linux product behavior is unchanged; this opt-in owner composition is Windows-only.
@@ -202,6 +202,14 @@ retained, so the exact refusing guard is unknown. Receipt SHA-256:
 `8b70982d8343111036d1638b630f7b92518f54c40c68c70678ce81893d86656a`.
 The diagnostic correction records only named refusal categories, nonce-match and
 Job count/self-presence. No guard is weakened and no cleanup pass is claimed.
+
+The named diagnostic at `f88e46b6d41fdcf013489b65ed7ee6153d1a02f5` refused
+with two Job members after normal worker exit; the nonce matched. Raw membership
+was an incorrect execution-settlement proxy because exited process objects can
+remain listed. The correction reuses `Processes.survivors(containment)`:
+retained exited members are allowed, live/unknown members and sticky stop/refusal
+state remain failures. No member is filtered by a new observer or guessed wait.
+The failed diagnostic and preserved profile are not relabeled a cleanup pass.
 
 Earlier 60-second failures remain preserved, including a cleanup timeout and a
 later interruption after 7,992 files in the serial materialization/per-file-hash

@@ -420,7 +420,21 @@ def test_unsettled_child_preserves_profile_and_refuses_success(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "fault", ["none", "source", "loaded", "nonce", "job", "exit", "semantic", "timeout"]
+    "fault",
+    [
+        "none",
+        "exited",
+        "source",
+        "loaded",
+        "nonce",
+        "job",
+        "unknown",
+        "prior",
+        "stop",
+        "exit",
+        "semantic",
+        "timeout",
+    ],
 )
 def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
     namespace = profile_namespace()
@@ -485,7 +499,7 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
 
     def members():
         events.append("members")
-        return {os.getpid(), -1} if fault == "job" else {os.getpid()}
+        return {os.getpid(), -1} if fault in {"job", "exited", "unknown"} else {os.getpid()}
 
     original_remove = shutil.rmtree
 
@@ -493,6 +507,19 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
         events.append("delete")
         original_remove(path)
 
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    owner_modules = {}
+    for name in ("local_livekit", "real_gate_support", "rehearse_desktop_mvp"):
+        with patch.dict(sys.modules, owner_modules):
+            owner_module, _ = namespace["load_reviewed"](name, scripts)
+        owner_modules[name] = owner_module
+    state = (
+        "exited"
+        if fault == "exited"
+        else "unknown"
+        if fault == "unknown"
+        else "running_or_terminating"
+    )
     globals_ = namespace["run_owned_worker"].__globals__
     child = Child()
     profile = None
@@ -502,25 +529,34 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
         patch.object(subprocess, "Popen", return_value=child),
         patch.object(subprocess, "CREATE_NO_WINDOW", 0, create=True),
         patch.object(shutil, "rmtree", side_effect=remove),
+        patch.object(owner_module, "process_table", return_value={-1: (os.getpid(), "synthetic")}),
+        patch.object(owner_module, "_cleanup_process_state", return_value=state),
     ):
         try:
             with namespace["proof_profile"](receipt, result) as profile:
+                processes = owner_module.Processes(Path(profile))
+                processes.cleanup_stop_failed = fault == "stop"
+                if fault == "prior":
+                    processes.first_cleanup_refusal = {"synthetic": True}
                 try:
                     namespace["run_owned_worker"](
                         args,
                         profile,
                         result,
-                        types.SimpleNamespace(members=members),
+                        types.SimpleNamespace(members=members, _job=1),
+                        processes,
                         namespace["time"].monotonic(),
                     )
                 except (RuntimeError, subprocess.TimeoutExpired):
                     result["ok"] = False
-            if fault == "none":
-                assert events == ["wait", "members", "handle-closed", "delete"]
-                assert result["ok"] is True and not Path(profile).exists()
+            if fault in {"none", "exited"}:
+                assert result["ok"] is True and not Path(profile).exists(), (
+                    "exited-member-blocked-cleanup"
+                )
+                assert events == ["wait", "members", "members", "handle-closed", "delete"]
                 assert result["worker_nonce_match"] is True
                 assert (result["worker_job_member_count"], result["worker_job_self_present"]) == (
-                    1,
+                    2 if fault == "exited" else 1,
                     True,
                 )
             else:

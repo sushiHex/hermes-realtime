@@ -534,7 +534,7 @@ def reviewed_bindings():
     return {name: hashlib.sha256((PROOF_ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
-def run_owned_worker(args, home, result, owner, started):
+def run_owned_worker(args, home, result, owner, processes, started):
     """Keep the exact child handle through exit, then validate its evidence and Job."""
     receipt = args.receipt.with_name(args.receipt.name + ".worker.json")
     if receipt.exists():
@@ -617,7 +617,9 @@ def run_owned_worker(args, home, result, owner, started):
         result.update(
             worker_job_member_count=len(members), worker_job_self_present=os.getpid() in members
         )
-        if members != {os.getpid()}:
+        left = processes.survivors(owner)
+        result["worker_survivor_count"] = sum(left.values())
+        if left or processes.cleanup_stop_failed or processes.first_cleanup_refusal is not None:
             raise RuntimeError("worker-job-not-settled")
         # Abnormal exits preserve the profile even when the process has settled.
         if exit_code not in (0, 1) or (exit_code == 0) is not observed["semantic_ok"]:
@@ -675,9 +677,10 @@ def main():
         owner = module.Containment()  # This hidden controller joins; never close its Job here.
         result["owner_source_bindings"] = owner_bindings
         with proof_profile(args.receipt, result, started, args.private_cleanup_evidence) as home:
+            processes = module.Processes(Path(home))
             try:
                 checkpoint(args.receipt, result, "worker", started)
-                run_owned_worker(args, home, result, owner, started)
+                run_owned_worker(args, home, result, owner, processes, started)
             except BaseException as exc:
                 result.update(
                     ok=False,
