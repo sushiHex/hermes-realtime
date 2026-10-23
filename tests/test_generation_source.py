@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import math
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -77,6 +78,31 @@ def test_local_replace_refs_cannot_override_pinned_objects(committed, tmp_path):
     destination = tmp_path / "export"
     source.export_tree(repository, pin, destination)
     assert (destination / "module.py").read_bytes() == b"PINNED = True\n"
+
+
+def test_export_timings_are_fixed_content_free_and_preserve_payload(committed, tmp_path):
+    # Mutation: omit the exporter timing fields while retaining a successful export.
+    repository, pin = committed
+    first = source.export_tree(repository, pin, tmp_path / "first")
+    second = source.export_tree(repository, pin, tmp_path / "second")
+    timings = {key: value for key, value in first.items() if key.endswith("_seconds")}
+    assert set(timings) == {
+        "source_export_metadata_seconds",
+        "source_export_blob_read_seconds",
+        "source_export_validation_seconds",
+        "source_export_filesystem_seconds",
+        "source_export_manifest_seconds",
+        "source_export_total_seconds",
+    }
+    assert all(
+        type(value) is float and math.isfinite(value) and value >= 0 for value in timings.values()
+    )
+    assert {key: value for key, value in first.items() if key not in timings} == {
+        key: value for key, value in second.items() if key not in timings
+    }
+    assert (tmp_path / "first/module.py").read_bytes() == (
+        tmp_path / "second/module.py"
+    ).read_bytes()
 
 
 def test_export_creates_each_parent_once_without_changing_payload(committed, tmp_path):
