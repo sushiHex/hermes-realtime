@@ -144,8 +144,10 @@ to the base interpreter. It adds that prepared dependency directory without
 processing `.pth` files. Unsupported finders or preloaded upstream modules refuse.
 Loaded upstream module origins must stay inside the projected source. The prepared
 interpreter/dependencies remain trusted prerequisites, not attested outputs.
-Reviewed proof helpers execute their exact source bytes; only named reviewed
-fixture files are copied, so neighboring extension/bytecode overlays cannot enter.
+Reviewed proof helpers execute their exact source bytes. Their mutable tests
+directory is not an import search root; unrelated ignored files cannot shadow
+prepared dependencies or the standard library. Only named reviewed fixture files
+are copied, so neighboring extension/bytecode overlays cannot enter.
 Their actual executed bytes and the projection are bound in the receipt.
 
 Content-free stage checkpoints are retained before expensive phases. Intermediate

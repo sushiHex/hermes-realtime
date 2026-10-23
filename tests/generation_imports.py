@@ -47,7 +47,10 @@ def _within(path: Path, parent: Path) -> bool:
 
 
 def configure_imports(export: Path, original: Path, reviewed_tests: Path) -> dict[str, int | bool]:
-    """Add only exact exported source, reviewed proof helpers and prepared deps.
+    """Search only exported source, prepared dependencies and isolated stdlib.
+
+    Callers load reviewed helpers by exact file; their mutable directory is never
+    a general import root.
 
     On Python3.11 -S, prefix may be the base prefix. Derive the venv BEFORE
     resolving the executable: POSIX venv interpreters are commonly symlinks.
@@ -92,7 +95,7 @@ def configure_imports(export: Path, original: Path, reviewed_tests: Path) -> dic
             standard.append(str(path))
     if not standard:
         raise ImportBootstrapError("source_import_environment_unsupported")
-    sys.path[:] = [str(export), str(reviewed_tests), str(site), *standard]
+    sys.path[:] = [str(export), str(site), *standard]
     sys.path_importer_cache.clear()
     sys.dont_write_bytecode = True
     os.chdir(export)
