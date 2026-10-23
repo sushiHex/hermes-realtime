@@ -195,7 +195,8 @@ def _verify_resource_sources(value: Any, *, imported: bool = False) -> None:
             module_names = ("scripts",) if name == "__init__" else ("scripts." + name, name)
             modules = [sys.modules[key] for key in module_names if key in sys.modules]
             if not modules or any(
-                getattr(module, "__file__", None) is None or Path(module.__file__).resolve() != path
+                (origin := getattr(module, "__file__", None)) is None
+                or Path(origin).resolve() != path
                 for module in modules
             ):
                 raise ValueError("launch_resources_source_origin")
