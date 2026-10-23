@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import linecache
 import logging
 import os
 import shutil
@@ -81,6 +82,7 @@ def arguments():
         default="healthy",
     )
     parser.add_argument("--mutation", default="none")
+    parser.add_argument("--private-cleanup-evidence", type=Path)
     return parser.parse_args()
 
 
@@ -142,9 +144,66 @@ def checkpoint(receipt, result, stage, started):
         raise
 
 
+def cleanup_failure_details(exc, profile):
+    """Classify actual OS exception evidence without publishing target paths."""
+    detail = {
+        "cleanup_target_scope": "unknown",
+        "cleanup_target_kind": "unknown",
+        "cleanup_operation": "unknown",
+        "cleanup_operation_frames": [],
+    }
+    relative = None
+    filename = getattr(exc, "filename", None)
+    if type(filename) is str:
+        try:
+            relative = Path(filename).resolve().relative_to(Path(profile).resolve())
+            detail["cleanup_target_scope"] = "owned"
+            name = relative.as_posix()
+            detail["cleanup_target_kind"] = (
+                "source"
+                if relative.parts[:1] == ("committed-source",)
+                else "log"
+                if relative.parts[:1] == ("logs",)
+                else "lock"
+                if name.endswith(".lock")
+                else "database"
+                if name.endswith((".db", ".db-wal", ".db-shm"))
+                else "other"
+            )
+        except ValueError:
+            detail["cleanup_target_scope"] = "outside"
+        except OSError:
+            pass
+    for key in ("errno", "winerror"):
+        value = getattr(exc, key, None)
+        detail["cleanup_" + key] = value if type(value) is int and 0 <= value < 2**31 else None
+    trusted = {str(Path(tempfile.__file__).resolve()), str(Path(shutil.__file__).resolve())}
+    operations = {
+        name: getattr(os, name) for name in ("unlink", "remove", "rmdir", "chmod", "scandir")
+    }
+    for frame, lineno in traceback.walk_tb(exc.__traceback__):
+        if str(Path(frame.f_code.co_filename).resolve()) not in trusted:
+            continue
+        detail["cleanup_operation_frames"].append(frame.f_code.co_name)
+        line = linecache.getline(frame.f_code.co_filename, lineno)
+        for name, function in operations.items():
+            if frame.f_locals.get("func") is function or f".{name}(" in line:
+                detail["cleanup_operation"] = name
+    detail["cleanup_operation_frames"] = detail["cleanup_operation_frames"][-8:]
+    target = relative.as_posix() if relative is not None else None
+    return detail, {
+        "target_relative": target if target is not None and len(target) <= 512 else None
+    }
+
+
 @contextlib.contextmanager
-def proof_profile(receipt, result, started=None):
+def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
     """Keep semantic evidence pending until the disposable profile is removed."""
+    if (
+        private_cleanup_evidence is not None
+        and private_cleanup_evidence.resolve() == receipt.resolve()
+    ):
+        raise ValueError("cleanup-evidence-path-conflict")
     directory = tempfile.TemporaryDirectory(prefix="hr-plugin-proof-")
     profile_started = time.monotonic()
     started = profile_started if started is None else started
@@ -179,6 +238,18 @@ def proof_profile(receipt, result, started=None):
                 cleanup_category="profile-cleanup-refused",
                 cleanup_error_kind=type(exc).__name__,
             )
+            try:
+                detail, private_detail = cleanup_failure_details(exc, directory.name)
+            except Exception:
+                detail, private_detail = {"cleanup_evidence_category": "classification-refused"}, {}
+            result.update(detail)
+            if private_cleanup_evidence is not None:
+                try:
+                    write_receipt(
+                        private_cleanup_evidence, {**detail, **private_detail, "ok": False}
+                    )
+                except BaseException as evidence_error:
+                    result["private_cleanup_evidence_error_kind"] = type(evidence_error).__name__
         result["profile_elapsed_seconds"] = round(time.monotonic() - profile_started, 3)
         result["profile_cleanup_seconds"] = round(time.monotonic() - cleanup_started, 3)
         result["stage"] = "finished"
@@ -250,7 +321,7 @@ def main():
         write_receipt(args.receipt, result)
         return 1
     with (
-        proof_profile(args.receipt, result, started) as profile,
+        proof_profile(args.receipt, result, started, args.private_cleanup_evidence) as profile,
         contextlib.ExitStack() as restore,
     ):
         restore.callback(os.chdir, Path.cwd())

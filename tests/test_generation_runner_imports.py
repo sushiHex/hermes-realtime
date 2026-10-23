@@ -1,11 +1,13 @@
 """The reviewed proof helpers must execute source, not finder/cache overlays."""
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
 import py_compile
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -263,3 +265,99 @@ def test_cleanup_healthy_control(tmp_path, semantic_ok):
     observed = json.loads(receipt.read_bytes())
     assert observed["ok"] is semantic_ok and observed["profile_cleanup"] == "completed"
     assert not Path(profile).exists()
+
+
+@pytest.mark.parametrize("outside", [False, True])
+@pytest.mark.parametrize("write_failure", [False, True])
+def test_cleanup_target_metadata_is_owned_and_private(tmp_path, outside, write_failure):
+    namespace = profile_namespace()
+    profile = tmp_path / "profile"
+    target = (tmp_path if outside else profile) / "state.db"
+    sidecar = tmp_path / "private.json"
+    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+    error = PermissionError(errno.EACCES, "synthetic", str(target))
+    error.winerror = 32
+
+    class Directory:
+        name = str(profile)
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def cleanup(self):
+            raise error
+
+    original = namespace["write_receipt"]
+
+    def write(path, record):
+        if path == sidecar and write_failure:
+            raise OSError("synthetic diagnostic write failure")
+        original(path, record)
+
+    with (
+        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, write_receipt=write),
+        namespace["proof_profile"](
+            tmp_path / "receipt.json", result, private_cleanup_evidence=sidecar
+        ),
+    ):
+        pass
+    assert result["ok"] is False and result["cleanup_error_kind"] == "PermissionError"
+    assert result["cleanup_target_scope"] == ("outside" if outside else "owned")
+    assert result["cleanup_target_kind"] == ("unknown" if outside else "database")
+    assert (result["cleanup_errno"], result["cleanup_winerror"]) == (errno.EACCES, 32)
+    assert json.dumps(str(tmp_path)) not in json.dumps(result)
+    assert "state.db" not in json.dumps(result)
+    if write_failure:
+        assert result["private_cleanup_evidence_error_kind"] == "OSError"
+    else:
+        assert json.loads(sidecar.read_bytes())["target_relative"] == (
+            None if outside else "state.db"
+        )
+
+
+def test_cleanup_operation_uses_actual_stdlib_failure(tmp_path):
+    namespace = profile_namespace()
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    target = profile / "state.db"
+    target.write_bytes(b"synthetic")
+    error = PermissionError(errno.EACCES, "synthetic", str(target))
+    with patch.object(os, "unlink", side_effect=error), pytest.raises(PermissionError) as caught:
+        shutil.rmtree(profile)
+    detail, _ = namespace["cleanup_failure_details"](caught.value, profile)
+    assert detail["cleanup_operation"] == "unlink" and detail["cleanup_operation_frames"]
+
+
+def test_cleanup_classifier_failure_preserves_primary_refusal(tmp_path):
+    namespace = profile_namespace()
+    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+
+    class Directory:
+        name = str(tmp_path / "profile")
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def cleanup(self):
+            raise PermissionError("synthetic primary")
+
+    with (
+        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, cleanup_failure_details=lambda *_: 1 / 0),
+        namespace["proof_profile"](tmp_path / "receipt.json", result),
+    ):
+        pass
+    assert result["ok"] is False and result["cleanup_error_kind"] == "PermissionError"
+    assert result["cleanup_evidence_category"] == "classification-refused"
+
+
+def test_cleanup_private_output_cannot_alias_receipt(tmp_path):
+    namespace = profile_namespace()
+    receipt = tmp_path / "receipt.json"
+    with (
+        pytest.raises(ValueError, match="cleanup-evidence-path-conflict"),
+        namespace["proof_profile"](receipt, {"ok": True}, private_cleanup_evidence=receipt),
+    ):
+        pass
+    assert not receipt.exists()
