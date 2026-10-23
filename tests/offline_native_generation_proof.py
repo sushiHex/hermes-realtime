@@ -61,6 +61,20 @@ def listeners(*_args, **_kwargs):
     raise Refusal("owner-not-loaded")
 
 
+def final_summary(outcome):
+    summary = {"ok": outcome["ok"], "category": outcome["category"]}
+    if "profile_cleanup" in outcome:
+        summary["profile_cleanup"] = outcome["profile_cleanup"]
+    if not outcome["ok"]:
+        if "cleanup_category" in outcome:
+            summary.update(category="cleanup-refused", cleanup_kind=outcome["cleanup_category"])
+        elif outcome.get("profile_cleanup") not in {None, "completed"}:
+            summary["category"] = "profile-cleanup-refused"
+        elif outcome["category"] == "semantic-passed":
+            summary["category"] = "final-refused"
+    return summary
+
+
 def replace_generation(
     *, owner, containment, old, port, previous, nonce, publish, start, readiness
 ):
@@ -345,16 +359,15 @@ def native_child(args):
                 if reply.status != 200 or ready.get("ready") is not True:
                     raise Refusal("native-plugin-not-ready")
             origins = helper.verify_import_origins(args.exported)
-            with args.child_receipt.open("x", encoding="utf-8") as stream:
-                json.dump(
-                    {
-                        "nonce": args.nonce,
-                        "ready": ready,
-                        "executed_sources": EXECUTED_SOURCES,
-                        **origins,
-                    },
-                    stream,
-                )
+            shared.write_receipt(
+                args.child_receipt,
+                {
+                    "nonce": args.nonce,
+                    "ready": ready,
+                    "executed_sources": EXECUTED_SOURCES,
+                    **origins,
+                },
+            )
             await asyncio.sleep(120)
         finally:
             await adapter.disconnect()
@@ -726,10 +739,12 @@ def launch(args):
     finally:
         finish_profile(home, outcome)
         outcome["full_acceptance"] = False
+        summary = final_summary(outcome)
+        outcome["final_category"] = summary["category"]
         args.receipt.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
         print(
             "[native-generation-proof] "
-            + json.dumps({"ok": outcome["ok"], "category": outcome["category"]})
+            + json.dumps(summary)
         )
     return int(not outcome["ok"])
 

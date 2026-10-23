@@ -1,5 +1,6 @@
 """Deterministic owner sequencing checks; no native child or provider is launched."""
 
+import ast
 import importlib.util
 import json
 import os
@@ -14,6 +15,67 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 proof = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(proof)
+
+
+def test_readiness_is_not_visible_during_serialization(tmp_path):
+    shared = proof.load_source("offline_plugin_generation_proof", proof.ROOT / "tests")
+    tree = ast.parse(Path(proof.__file__).read_text(encoding="utf-8"))
+    publication = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.With, ast.Expr))
+        and any(
+            isinstance(child, ast.Attribute) and child.attr == "child_receipt"
+            for child in ast.walk(node)
+        )
+    )
+    receipt = tmp_path / "ready.json"
+    original = json.JSONEncoder.iterencode
+
+    def inspect_partial_write(encoder, *args, **kwargs):
+        assert not receipt.exists(), "partial-readiness-visible"
+        return original(encoder, *args, **kwargs)
+
+    with patch.object(json.JSONEncoder, "iterencode", inspect_partial_write):
+        exec(
+            compile(ast.Module(body=[publication], type_ignores=[]), proof.__file__, "exec"),
+            {
+                "args": SimpleNamespace(child_receipt=receipt, nonce="fresh"),
+                "ready": {"ready": True},
+                "origins": {},
+                "EXECUTED_SOURCES": {},
+                "shared": shared,
+                "json": json,
+            },
+        )
+    assert json.loads(receipt.read_bytes())["nonce"] == "fresh"
+
+
+@pytest.mark.parametrize("failure", ["owner", "profile", "outer", "primary", "none"])
+def test_final_marker_reports_cleanup_failure_without_losing_primary(failure):
+    outcome = {
+        "ok": failure == "none",
+        "category": "semantic-passed",
+        "profile_cleanup": "completed",
+    }
+    if failure == "owner":
+        outcome["cleanup_category"] = "OSError"
+    elif failure == "profile":
+        outcome["profile_cleanup"] = "refused"
+    elif failure == "outer":
+        outcome["controller_exit_ok"] = False
+    elif failure == "primary":
+        outcome["category"] = "TimeoutError"
+    primary = outcome["category"]
+    summary = proof.final_summary(outcome)
+    assert outcome["category"] == primary
+    assert summary["ok"] is outcome["ok"]
+    if not outcome["ok"]:
+        assert summary["category"] != "semantic-passed"
+    if failure == "owner":
+        assert summary["cleanup_kind"] == "OSError"
+    if failure == "profile":
+        assert summary["profile_cleanup"] == "refused"
 
 
 def test_failure_sites_excludes_private_exception_data():
