@@ -1,6 +1,7 @@
 """Deterministic owner sequencing checks; no native child or provider is launched."""
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,55 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 proof = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(proof)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "metadata",
+        "unknown",
+        "incomplete",
+        "stale",
+        "overflow",
+        "missing",
+        "malformed",
+        "network",
+    ],
+)
+def test_lifetime_audit_uses_shared_classification(tmp_path, fault):
+    shared = proof.load_source("offline_plugin_generation_proof", proof.ROOT / "tests")
+    fixtures = proof.load_source("test_generation_runner_imports", proof.ROOT / "tests")
+    event = fixtures.passive_metadata_event()
+    audit = dict(
+        worker_nonce="expected",
+        blocked_network_attempts=6,
+        unclassified_network_attempts=0,
+        blocked_process_attempts=0 if fault == "none" else 1,
+        process_events=[] if fault == "none" else [event],
+        process_events_truncated=False,
+    )
+    if fault == "unknown":
+        event["frames"][0]["function"] = "unclassified"
+    elif fault == "incomplete":
+        event["incomplete"] = True
+    elif fault == "stale":
+        audit["worker_nonce"] = "stale"
+    elif fault == "overflow":
+        audit["process_events_truncated"] = True
+    elif fault == "malformed":
+        audit["blocked_network_attempts"] = False
+    elif fault == "network":
+        audit["unclassified_network_attempts"] = 1
+    path = tmp_path / "audit.json"
+    if fault != "missing":
+        path.write_text(json.dumps(audit), encoding="utf-8")
+    if fault in {"none", "metadata"}:
+        _, classified = proof.inspect_native_audit(path, "expected", shared)
+        assert sum(classified.values()) == (fault == "metadata")
+    else:
+        with pytest.raises((RuntimeError, OSError)):
+            proof.inspect_native_audit(path, "expected", shared)
 
 
 @pytest.fixture
@@ -249,15 +299,23 @@ def test_native_os_system_attempt_is_denied_and_retained(tmp_path):
         hermes_source=tmp_path,
         child_receipt=tmp_path / "child.json",
         port=12345,
+        nonce="expected",
     )
     helper = SimpleNamespace(configure_imports=lambda *_args: None)
+    shared = proof.load_source("offline_plugin_generation_proof", proof.ROOT / "tests")
     hooks = []
 
     def do_not_run_native(coroutine):
         coroutine.close()
 
     with (
-        patch.object(proof, "load_source", return_value=helper),
+        patch.object(
+            proof,
+            "load_source",
+            side_effect=lambda name, _directory: (
+                shared if name == "offline_plugin_generation_proof" else helper
+            ),
+        ),
         patch.object(proof.sys, "addaudithook", side_effect=hooks.append),
         patch.object(proof.asyncio, "run", side_effect=do_not_run_native),
         patch.dict(proof.os.environ, {"HERMES_NATIVE_PROOF_KEY": "synthetic"}),
@@ -265,6 +323,7 @@ def test_native_os_system_attempt_is_denied_and_retained(tmp_path):
         assert proof.native_child(args) == 0
     with pytest.raises(proof.Refusal):
         hooks[0]("os.system", (b"synthetic-never-executed",))
-    import json
-
-    assert json.loads((tmp_path / "child.audit.json").read_bytes())["subprocess"] == 1
+    audit = json.loads((tmp_path / "child.audit.json").read_bytes())
+    assert audit["blocked_process_attempts"] == 1
+    assert audit["worker_nonce"] == "expected"
+    assert audit["process_events"][0]["event"] == "os.system"

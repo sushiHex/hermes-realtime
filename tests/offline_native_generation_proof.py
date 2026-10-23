@@ -90,14 +90,26 @@ def load_source(name, directory):
     return module
 
 
-def audit_record(path, counts):
-    """Retain a fixed category/count snapshot even when this child is stopped."""
-    temporary = path.with_suffix(".pending")
-    try:
-        temporary.write_text(json.dumps(counts, sort_keys=True), encoding="utf-8")
-        temporary.replace(path)
-    except BaseException:
-        os._exit(2)  # Missing refusal evidence cannot leave this child running.
+def inspect_native_audit(path, nonce, shared):
+    """Read lifetime evidence only after owned settlement, using the shared rule."""
+    audit = json.loads(path.read_bytes())
+    count_names = (
+        "blocked_network_attempts",
+        "unclassified_network_attempts",
+        "blocked_process_attempts",
+    )
+    if (
+        type(audit) is not dict
+        or audit.get("worker_nonce") != nonce
+        or any(
+            type(audit.get(name)) is not int or not 0 <= audit[name] < 2**31
+            for name in count_names
+        )
+    ):
+        raise Refusal("native-audit-binding")
+    if audit["unclassified_network_attempts"]:
+        raise Refusal("native-audit-refusal")
+    return audit, shared.classify_denied_processes(audit)
 
 
 def verify_repository(expected):
@@ -195,6 +207,7 @@ def sentinel_matches(process, port, nonce):
 
 def native_child(args):
     """Serve actual pinned Runs with only the existing synthetic plugin effects."""
+    shared = load_source("offline_plugin_generation_proof", ROOT / "tests")
     helper = load_source("generation_imports", ROOT / "tests")
     helper.configure_imports(args.exported, args.hermes_source, ROOT / "tests")
     os.environ.update(
@@ -205,15 +218,42 @@ def native_child(args):
     )
     key = os.environ["HERMES_NATIVE_PROOF_KEY"]
     audit_path = args.child_receipt.with_suffix(".audit.json")
-    blocked = {"metadata": 0, "unclassified": 0, "subprocess": 0}
+    blocked = {
+        "worker_nonce": args.nonce,
+        "blocked_network_attempts": 0,
+        "unclassified_network_attempts": 0,
+        "blocked_process_attempts": 0,
+        "process_events": [],
+        "process_events_truncated": False,
+    }
+    provenance_roots = {
+        "hermes": args.exported.resolve(),
+        "fixture": (args.home / "plugins/plugin-generation-candidate").resolve(),
+        "proof": (ROOT / "tests").resolve(),
+        "dependency": (
+            Path(sys.executable).absolute().parent.parent / "Lib/site-packages"
+        ).resolve(),
+        "stdlib": (Path(sys.base_prefix) / "Lib").resolve(),
+    }
+    provenance_hashes = {}
     audit_lock = threading.Lock()
-    audit_record(audit_path, blocked)
+    shared.audit_record(audit_path, blocked)
 
     def deny(event, values):
         if event in {"subprocess.Popen", "os.system"}:
             with audit_lock:
-                blocked["subprocess"] += 1
-                audit_record(audit_path, blocked)
+                blocked["blocked_process_attempts"] += 1
+                if len(blocked["process_events"]) < 8:
+                    blocked["process_events"].append(
+                        {
+                            "event": event,
+                            **shared.process_provenance(provenance_roots, provenance_hashes),
+                        }
+                    )
+                blocked["process_events_truncated"] = blocked["blocked_process_attempts"] > len(
+                    blocked["process_events"]
+                )
+                shared.audit_record(audit_path, blocked)
             raise Refusal("native-process-denied")
         if event == "socket.connect":
             address = values[1]
@@ -229,14 +269,11 @@ def native_child(args):
                 frame = frame.f_back
             if not (isinstance(address, tuple) and address == ("127.0.0.1", args.port)):
                 names = {frame.name for frame in traceback.extract_stack(limit=18)}
-                category = (
-                    "metadata"
-                    if names & {"query_ollama_num_ctx", "get_pricing_entry"}
-                    else "unclassified"
-                )
                 with audit_lock:
-                    blocked[category] += 1
-                    audit_record(audit_path, blocked)
+                    blocked["blocked_network_attempts"] += 1
+                    if not names & {"query_ollama_num_ctx", "get_pricing_entry"}:
+                        blocked["unclassified_network_attempts"] += 1
+                    shared.audit_record(audit_path, blocked)
                 raise Refusal("native-network-denied")
 
     sys.addaudithook(deny)
@@ -285,7 +322,7 @@ def native_child(args):
             await adapter.disconnect()
 
     asyncio.run(serve())
-    return int(bool(blocked["unclassified"] or blocked["subprocess"]))
+    return int(bool(blocked["unclassified_network_attempts"]))
 
 
 def prepare_profile(args, home, key):
@@ -526,13 +563,21 @@ def controller(args):
                 raise Refusal("containment-required")
             settle(owner, containment, roots, args.port)
             outcome["owned_process_cleanup"] = True
+            shared = load_source("offline_plugin_generation_proof", ROOT / "tests")
             audits = [
-                json.loads(path.with_suffix(".audit.json").read_bytes())
-                for path in (first_receipt, second_receipt)
+                inspect_native_audit(path.with_suffix(".audit.json"), nonce, shared)
+                for path, nonce in (
+                    (first_receipt, first_nonce),
+                    (second_receipt, second_nonce),
+                )
             ]
-            if any(counts["unclassified"] or counts["subprocess"] for counts in audits):
-                raise Refusal("native-audit-refusal")
-            outcome["denied_metadata_attempts"] = sum(counts["metadata"] for counts in audits)
+            outcome["denied_metadata_attempts"] = sum(
+                counts["blocked_network_attempts"] for counts, _ in audits
+            )
+            outcome["classified_process_denials"] = {
+                name: sum(classified[name] for _, classified in audits)
+                for name in ("windows-version", "python-version", "pip-version")
+            }
             outcome["retained_unclassified_attempts"] = 0
             outcome["executed_sources"] = EXECUTED_SOURCES
         except BaseException as error:
