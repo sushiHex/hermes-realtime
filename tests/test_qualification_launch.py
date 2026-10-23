@@ -726,6 +726,62 @@ def test_controller_death_retains_incomplete_receipt(
     assert final["cleanup_verified"] is True
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows guardian resource composition")
+def test_guardian_sealed_resources_compose_through_native_settlement(
+    tmp_path: Path,
+    native_completion_host: None,
+) -> None:
+    """Tiny inert files exercise wiring only; no provider, model, or GPU work."""
+    execution, inputs = tmp_path / "execution", tmp_path / "inputs"
+    execution.mkdir()
+    inputs.mkdir()
+    (execution / "inert.bin").write_bytes(b"execution")
+    (inputs / "input.bin").write_bytes(b"input")
+
+    def tree(root: Path, name: str) -> dict[str, object]:
+        raw = (root / name).read_bytes()
+        return {
+            "root": str(root),
+            "files": [
+                {"path": name, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            ],
+        }
+
+    script = tmp_path / "controller.py"
+    script.write_text(
+        "import os,sys\nfrom pathlib import Path\n"
+        f"root=Path(os.environ[{launch.EXECUTION_ROOT_ENV!r}])\n"
+        "assert (root/'inert.bin').read_bytes()==b'execution'\n"
+        "assert Path(sys.argv[1]).read_bytes()==b'input'\n"
+        "Path(sys.argv[2]).write_text(str(root))\nprint('resource-match')\n"
+    )
+    marker = tmp_path / "snapshot-marker"
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "receipt.jsonl"
+    result = launch.run_owned_controller(
+        script,
+        (str(inputs / "input.bin"), str(marker)),
+        binding_path=binding,
+        binding_sha256=digest,
+        receipt=receipt,
+        timeout_seconds=30,
+        sealed_resources={
+            "schema_version": 1,
+            "execution": tree(execution, "inert.bin"),
+            "inputs": [tree(inputs, "input.bin")],
+        },
+    )
+    assert result.exit_code == 0 and result.stdout.strip() == b"resource-match"
+    snapshot = Path(marker.read_text())
+    assert snapshot != execution and not snapshot.exists()
+    assert (execution / "inert.bin").read_bytes() == b"execution"
+    assert (inputs / "input.bin").read_bytes() == b"input"
+    final = json.loads(receipt.read_bytes().splitlines()[-1])
+    assert final["stage"] == "complete" and final["cleanup_verified"] is True
+    assert final["execution_file_count"] == final["input_file_count"] == 1
+    assert final["input_tree_count"] == 1
+
+
 def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

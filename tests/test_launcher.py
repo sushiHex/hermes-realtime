@@ -958,6 +958,8 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
         [
             "--moonshine-model-tier",
             "small",
+            "--ollama-num-gpu",
+            "0",
             "--evidence-capture",
             "--evidence-retention-hours",
             "48",
@@ -972,6 +974,7 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
         await running
 
     assert captured["moonshine_model_tier"] == "small"
+    assert captured["ollama_num_gpu"] == 0
     assert captured["knowledge_speculation"] is False
     assert captured["knowledge_recovery"] is False
     assert captured["knowledge_budget_seconds"] == 3.5
