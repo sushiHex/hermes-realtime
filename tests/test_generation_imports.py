@@ -75,7 +75,6 @@ def test_healthy_bootstrap_uses_export_and_explicit_prepared_site_without_pth(la
     result = configure(layout)
     assert sys.path == [
         str(layout.export),
-        str(layout.reviewed),
         str(layout.site),
         str(layout.base / "Lib"),
     ]
@@ -90,6 +89,29 @@ def test_healthy_bootstrap_uses_export_and_explicit_prepared_site_without_pth(la
     assert result["source_import_roots"] == 1
     assert result["source_import_prepared_site_explicit"] is True
     assert str(layout.original) not in str(result)
+
+
+
+def test_mutable_reviewed_directory_cannot_supply_imports(layout):
+    (layout.reviewed / ".gitignore").write_text("*.py\n")
+    for name, trusted in (
+        ("prepared_dependency", layout.site),
+        ("stdlib_probe", layout.base / "Lib"),
+    ):
+        (trusted / (name + ".py")).write_text("TRUSTED_SOURCE = True\n")
+        (layout.reviewed / (name + ".py")).write_text("TRUSTED_SOURCE = False\n")
+    configure(layout)
+    try:
+        import prepared_dependency
+        import stdlib_probe
+
+        assert prepared_dependency.TRUSTED_SOURCE is True
+        assert stdlib_probe.TRUSTED_SOURCE is True
+        assert Path(prepared_dependency.__file__).parent == layout.site
+        assert Path(stdlib_probe.__file__).parent == layout.base / "Lib"
+    finally:
+        sys.modules.pop("prepared_dependency", None)
+        sys.modules.pop("stdlib_probe", None)
 
 
 @pytest.mark.parametrize("flag", ["isolated", "no_site"])

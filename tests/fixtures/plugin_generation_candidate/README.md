@@ -144,8 +144,10 @@ to the base interpreter. It adds that prepared dependency directory without
 processing `.pth` files. Unsupported finders or preloaded upstream modules refuse.
 Loaded upstream module origins must stay inside the projected source. The prepared
 interpreter/dependencies remain trusted prerequisites, not attested outputs.
-Reviewed proof helpers execute their exact source bytes; only named reviewed
-fixture files are copied, so neighboring extension/bytecode overlays cannot enter.
+Reviewed proof helpers execute their exact source bytes. Their mutable tests
+directory is not an import search root; unrelated ignored files cannot shadow
+prepared dependencies or the standard library. Only named reviewed fixture files
+are copied, so neighboring extension/bytecode overlays cannot enter.
 Their actual executed bytes and the projection are bound in the receipt.
 
 Content-free stage checkpoints are retained before expensive phases. Intermediate
@@ -193,6 +195,19 @@ Direct-matrix receipt SHA-256:
 This qualifies the bounded synthetic artifact, not live providers, a useful answer,
 actual native generation replacement, or full #306 acceptance. Earlier failed
 receipts remain unchanged; the following history keeps their original boundaries.
+
+The subsequent shared bootstrap correction at
+`cbda7e4dcbba342da1c375926a87d0e3ded07406` removes the mutable tests directory
+from general import search. Exact-file helper loading and the copied fixture
+remain unchanged. An actual dependency/stdlib-shadow regression failed on the old
+source and passed after the correction; reintroducing that path failed only its
+target, with two healthy controls. All 21 affected bootstrap tests and Ruff passed.
+One native healthy requalification completed in 28.812 seconds with normal exit,
+zero canonical survivors, complete classified audit and parent profile deletion.
+Receipt SHA-256:
+`46bf5f6949ba085bc4038a9dfab49ce5fd16ae3316fcb5f076da0ce25fa301a5`.
+The policy bytes did not change; the earlier finite matrix retains its own source
+binding and was not repeated for this import-path-only correction.
 
 ## Finite defensive-guard map
 
