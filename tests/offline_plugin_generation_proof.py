@@ -667,6 +667,99 @@ def reviewed_bindings():
     return {name: hashlib.sha256((PROOF_ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
+def classify_denied_processes(audit):
+    """Shared #306 fixture rule: classify denials, never authorize a launch."""
+
+    def refuse():
+        raise RuntimeError("worker-audit-refused")
+
+    events = audit.get("process_events")
+    count = audit.get("blocked_process_attempts")
+    if (
+        type(count) is not int
+        or type(events) is not list
+        or not 0 <= count <= 8
+        or len(events) != count
+        or audit.get("process_events_truncated") is not False
+    ):
+        refuse()
+    platform_hash = "4a3cc68ba7354f8d5cc28c55315a7d77b77dcdbbaa3a092572a636b5fb5b6938"
+    aiohttp_hash = "c46842a498a119baed4422d4f0ca12792e48a9fddf269fd5beffcd252805f815"
+    probe_hash = "d46c016348a493cf26e1b0ed82c3b935672f5a9d27493d5cab2e04ecf37c34df"
+    windows = [
+        ("stdlib", "platform.py", name, line, platform_hash)
+        for name, line in (
+            ("_syscmd_ver", 284),
+            ("win32_ver", 371),
+            ("uname", 856),
+            ("system", 921),
+        )
+    ]
+    windows.append(("dependency", "aiohttp/helpers.py", "<module>", 57, aiohttp_hash))
+    chains = {"windows-version": windows}
+    for kind, function, line, caller_line in (
+        ("python-version", "_python_version_of", 145, 214),
+        ("pip-version", "_pip_python_version", 188, 216),
+    ):
+        chains[kind] = [
+            ("hermes", "tools/env_probe.py", name, number, probe_hash)
+            for name, number in (
+                ("_run", 115),
+                (function, line),
+                ("_build_probe_line", caller_line),
+                ("_probe_worker", 332),
+            )
+        ]
+    classified = dict.fromkeys(chains, 0)
+    for event in events:
+        if (
+            type(event) is not dict
+            or event.get("event") != "subprocess.Popen"
+            or event.get("incomplete") is not False
+            or event.get("truncated") is not False
+            or type(event.get("frames")) is not list
+            or not 1 <= len(event["frames"]) <= 64
+        ):
+            refuse()
+        sites = []
+        for frame in event["frames"]:
+            if type(frame) is not dict:
+                refuse()
+            origin, module = frame.get("origin"), frame.get("module")
+            function, line, digest = (
+                frame.get("function"),
+                frame.get("line"),
+                frame.get("source_sha256"),
+            )
+            if (
+                type(module) is not str
+                or not 1 <= len(module) <= 256
+                or type(function) is not str
+                or not 1 <= len(function) <= 80
+                or type(line) is not int
+                or not 0 <= line < 2**31
+            ):
+                refuse()
+            if origin == "runtime-internal":
+                if module != "frozen-interpreter" or digest is not None:
+                    refuse()
+            elif (
+                origin not in {"hermes", "fixture", "proof", "dependency", "stdlib"}
+                or type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                refuse()
+            sites.append((origin, module, function, line, digest))
+        for kind, chain in chains.items():
+            if any(sites[index : index + len(chain)] == chain for index in range(len(sites))):
+                classified[kind] += 1
+                break
+        else:
+            refuse()
+    return classified
+
+
 def run_owned_worker(args, home, result, owner, processes, started):
     """Keep the exact child handle through exit, then validate its evidence and Job."""
     receipt = args.receipt.with_name(args.receipt.name + ".worker.json")
@@ -779,8 +872,9 @@ def run_owned_worker(args, home, result, owner, processes, started):
         ):
             raise RuntimeError("worker-audit-refused")
         result["worker_audit_counts"] = {name: audit[name] for name in count_names}
-        if audit["unclassified_network_attempts"] or audit["blocked_process_attempts"]:
+        if audit["unclassified_network_attempts"]:
             raise RuntimeError("worker-audit-refused")
+        result["classified_process_denials"] = classify_denied_processes(audit)
         result.update(
             observed,
             ok=True,
