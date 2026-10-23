@@ -1,4 +1,4 @@
-"""Unlaunched, explicit Windows load-only observation for the staged native plugin.
+"""Explicit Windows load-only observation for the staged native plugin.
 
 Use a reviewed clean candidate and prepared pinned Hermes interpreter. Launch the
 controller hidden with -I -S -B, DEVNULL streams, timeout=70 and check=True. Its
