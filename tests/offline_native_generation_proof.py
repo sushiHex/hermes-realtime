@@ -313,7 +313,8 @@ def prepare_profile(args, home, key):
         "    plugin-generation-candidate:\n      allow_tool_override: true\n"
         "      settings:\n        proof_key: " + key + "\n"
         "agent:\n  max_turns: 3\nmemory:\n  memory_enabled: false\n"
-        "  user_profile_enabled: false\n",
+        "  user_profile_enabled: false\n"
+        "auxiliary:\n  title_generation:\n    enabled: false\n",
         encoding="utf-8",
     )
     return exported, binding
