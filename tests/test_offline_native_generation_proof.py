@@ -16,6 +16,19 @@ proof = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(proof)
 
 
+def test_failure_sites_excludes_private_exception_data():
+    private = "private-path-and-argument-must-not-appear"
+    with (
+        patch.object(proof.urllib.request, "Request", side_effect=TimeoutError(private)),
+        pytest.raises(TimeoutError) as caught,
+    ):
+        proof.request(12345, private, "/never-executed")
+    sites = proof.failure_sites(caught.value)
+    assert len(sites) == 1 and sites[0]["function"] == "request"
+    assert set(sites[0]) == {"function", "line"} and type(sites[0]["line"]) is int
+    assert private not in json.dumps(sites) and str(proof.ROOT) not in json.dumps(sites)
+
+
 @pytest.mark.parametrize(
     "fault",
     [

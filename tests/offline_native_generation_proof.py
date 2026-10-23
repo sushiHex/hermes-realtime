@@ -42,6 +42,21 @@ class Refusal(RuntimeError):
     pass
 
 
+def failure_sites(error):
+    """Record only bounded locations in this exact reviewed source file."""
+    sites = []
+    trace = error.__traceback__
+    for _ in range(32):
+        if trace is None or len(sites) == 4:
+            break
+        if trace.tb_frame.f_code.co_filename == str(Path(__file__).resolve()):
+            sites.append(
+                {"function": trace.tb_frame.f_code.co_name[:80], "line": trace.tb_lineno}
+            )
+        trace = trace.tb_next
+    return sites
+
+
 def listeners(*_args, **_kwargs):
     raise Refusal("owner-not-loaded")
 
@@ -557,7 +572,9 @@ def controller(args):
         )
     except BaseException as error:
         outcome.update(
-            ok=False, category=str(error) if isinstance(error, Refusal) else type(error).__name__
+            ok=False,
+            category=str(error) if isinstance(error, Refusal) else type(error).__name__,
+            failure_sites=failure_sites(error),
         )
     finally:
         try:
