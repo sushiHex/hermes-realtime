@@ -82,6 +82,14 @@ environment. Do not change a preexisting Ollama service. These are the
 source-backed launch preconditions for this Phi artifact's Go-template path,
 not a universal model-metadata context guard.
 
+An explicitly nominated configuration may also use `--ollama-num-gpu` to send a
+GPU-layer override through the normal host factory and adapter. Omission keeps
+the runtime default; 0 requests CPU layers. The accepted range 0–1024 is an
+application input bound, not a model-capability or zero-GPU guarantee. Readiness
+and subsequent inference retain the same setting, including browser-selected
+local models. A CPU candidate still needs its reviewed artifact, loader,
+environment and owned-process closure and separate unchanged qualification.
+
 Qualify the installed Hermes API first, in its own interpreter. Under the
 hidden process ownership rules above, use the frozen candidate script:
 

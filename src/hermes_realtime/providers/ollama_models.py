@@ -107,6 +107,25 @@ def require_num_ctx(value: object) -> int:
     return value
 
 
+def require_num_gpu(value: object) -> int | None:
+    """Bound a request override without claiming model capability or placement."""
+    if value is None:
+        return None
+    valid = False
+    try:
+        if type(value) is not int:
+            raise TypeError("num_gpu must be an exact integer or None")
+        # An application input bound, not Ollama's or a model's maximum layers.
+        if not 0 <= value <= 1024:
+            raise ValueError("num_gpu must be between 0 and 1024")
+        valid = True
+        return value
+    finally:
+        if not valid:
+            print('[ollama-profile] {"category":"gpu_layers_refused","count":1,"version":1}',
+                  flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class OllamaModelMetadata:
     model: str
