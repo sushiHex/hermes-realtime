@@ -29,6 +29,37 @@ def test_failure_sites_excludes_private_exception_data():
     assert private not in json.dumps(sites) and str(proof.ROOT) not in json.dumps(sites)
 
 
+@pytest.mark.parametrize("case", ["healthy", "timeout-then-pending", "expired", "late"])
+def test_pending_observation_shares_absolute_deadline(case):
+    clock = [12.0 if case == "expired" else 0.0]
+    attempts = []
+
+    def state(_port, _key, path, *, timeout=1.0):
+        assert path == "/generation-proof/state"
+        attempts.append(timeout)
+        if case == "timeout-then-pending" and len(attempts) == 1:
+            clock[0] = 11.5
+            raise TimeoutError
+        clock[0] = 12.1 if case == "late" else clock[0]
+        return 200, {"waiting": True, "counts": {"accepted": {"search": 1}}}, {}
+
+    with (
+        patch.object(proof, "request", side_effect=state),
+        patch.object(proof.time, "monotonic", side_effect=lambda: clock[0]),
+    ):
+        if case in {"expired", "late"}:
+            with pytest.raises(proof.Refusal):
+                proof.observe_pending(12345, "synthetic", "accepted", 12.0)
+        else:
+            proof.observe_pending(12345, "synthetic", "accepted", 12.0)
+    assert (
+        attempts
+        == {"healthy": [1.0], "timeout-then-pending": [1.0, 0.5], "expired": [], "late": [1.0]}[
+            case
+        ]
+    )
+
+
 @pytest.mark.parametrize(
     "fault",
     [

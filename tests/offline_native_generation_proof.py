@@ -196,6 +196,24 @@ def wait_ready(process, port, key, receipt, nonce):
     raise Refusal("native-readiness-timeout")
 
 
+def observe_pending(port, key, run_id, deadline):
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("pending-native-worker-unproven")
+        try:
+            _, snapshot, _ = request(
+                port, key, "/generation-proof/state", timeout=min(1.0, remaining)
+            )
+        except TimeoutError:
+            continue
+        if time.monotonic() >= deadline:
+            raise Refusal("pending-native-worker-unproven")
+        if snapshot["waiting"] and snapshot["counts"].get(run_id, {}).get("search") == 1:
+            return
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+
+
 def sentinel(port, nonce):
     def deny(event, _args):
         if event in {"subprocess.Popen", "socket.connect", "os.system"}:
@@ -459,7 +477,7 @@ def controller(args):
             "session_id": "synthetic-owner-session",
         }
         replay_key = secrets.token_hex(16)
-        started = time.monotonic()
+        pending_deadline = time.monotonic() + 12
         status, accepted, headers = request(
             args.port,
             key,
@@ -478,16 +496,7 @@ def controller(args):
             or headers.get("X-Lookup-Run") != accepted["run_id"]
         ):
             raise Refusal("native-admission-binding")
-        while time.monotonic() - started < 2:
-            _, snapshot, _ = request(args.port, key, "/generation-proof/state")
-            if (
-                snapshot["waiting"]
-                and snapshot["counts"].get(accepted["run_id"], {}).get("search") == 1
-            ):
-                break
-            time.sleep(0.02)
-        else:
-            raise Refusal("pending-native-worker-unproven")
+        observe_pending(args.port, key, accepted["run_id"], pending_deadline)
         request(args.port, key, "/generation-proof/control", body={"action": "lose-authority"})
         closed, _, _ = request(args.port, key, "/lookup-policy/ready")
         if closed != 503:
@@ -497,7 +506,7 @@ def controller(args):
         second_receipt = args.home / ("child-" + second_nonce + ".json")
 
         def next_start():
-            if time.monotonic() - started >= 12:
+            if time.monotonic() >= pending_deadline:
                 raise Refusal("pending-worker-window-exceeded")
             return start(second_nonce)[0]
 
