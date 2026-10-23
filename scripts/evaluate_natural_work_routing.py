@@ -39,12 +39,14 @@ from hermes_realtime.providers.codex_app_server import (
     _subscription_environment,
 )
 from hermes_realtime.providers.ollama import OllamaStreamingInference
+from hermes_realtime.providers.ollama_models import require_num_gpu
 
 _READINESS_BUDGET_SECONDS = 20.0
 _DECISION_BUDGET_SECONDS = 60.0
 _CLOSE_BUDGET_SECONDS = 10.0
 _EVALUATION_BUDGET_SECONDS = 3500.0
 _OWNED_DEADLINE_SECONDS = 3600
+_REPORT_SCHEMA_VERSION = 6
 _DEFAULT_OLLAMA_ORIGIN = "http://127.0.0.1:11434"
 
 _DEFAULT_CORPUS = _ROOT / "tests" / "fixtures" / "natural_work_intent_cases.json"
@@ -230,6 +232,7 @@ class ProviderOptions(TypedDict):
     codex_executable: str | None
     ollama_base_url: str
     ollama_num_ctx: int | None
+    ollama_num_gpu: int | None
 
 
 def _validate_latency(value: float) -> None:
@@ -767,6 +770,7 @@ async def _open_qualified_inference(
     ollama_base_url: str,
     ollama_num_ctx: int | None,
     handler: ShadowWorkHandler,
+    ollama_num_gpu: int | None = None,
     deadline: float | None = None,
 ) -> OllamaStreamingInference | CodexAppServerStreamingInference:
     """Use the host factory, then admit tools only after tool-less readiness."""
@@ -775,6 +779,7 @@ async def _open_qualified_inference(
         inference_provider=provider,
         ollama_base_url=ollama_base_url,
         ollama_model=model,
+        ollama_num_gpu=ollama_num_gpu,
         codex_model=model,
         codex_effort=effort,
         codex_executable=codex_executable,
@@ -824,6 +829,7 @@ async def run_evaluation(
     mode: str = "diagnostic_override",
     ollama_base_url: str = _DEFAULT_OLLAMA_ORIGIN,
     ollama_num_ctx: int | None = None,
+    ollama_num_gpu: int | None = None,
 ) -> dict[str, Any]:
     """Run every case sequentially through the selected production adapter."""
 
@@ -831,8 +837,9 @@ async def run_evaluation(
         "production_default", "diagnostic_override"
     ):
         raise ValueError("qualification provider or mode is invalid")
-    if provider == "codex" and ollama_num_ctx is not None:
-        raise ValueError("Ollama context is not a Codex option")
+    require_num_gpu(ollama_num_gpu)
+    if provider == "codex" and (ollama_num_ctx is not None or ollama_num_gpu is not None):
+        raise ValueError("Ollama execution configuration is not a Codex option")
     if provider == "ollama" and codex_executable is not None:
         raise ValueError("Codex executable is not an Ollama option")
     if mode == "production_default":
@@ -842,6 +849,7 @@ async def run_evaluation(
             or effort != defaults["codex_effort"]
             or ollama_base_url != defaults["ollama_base_url"]
             or ollama_num_ctx != defaults["ollama_num_ctx"]
+            or ollama_num_gpu != defaults["ollama_num_gpu"]
             or codex_executable != defaults["codex_executable"]
         ):
             raise ValueError("production_default settings differ from the host")
@@ -869,6 +877,7 @@ async def run_evaluation(
                 provider=provider, model=model, effort=effort,
                 codex_executable=executable, ollama_base_url=ollama_base_url,
                 ollama_num_ctx=ollama_num_ctx, handler=handler,
+                ollama_num_gpu=ollama_num_gpu,
                 deadline=total_deadline,
             )
         except Exception as error:
@@ -954,7 +963,7 @@ async def run_evaluation(
         retried_case_ids=(),
     )
     report.update({
-        "schema_version": 5,
+        "schema_version": _REPORT_SCHEMA_VERSION,
         "host_status_requests": {
             "scope": "selection_only",
             "count": sum(row.host_status_request_latency_ms is not None for row in observations),
@@ -989,6 +998,9 @@ async def run_evaluation(
         report["ollama_context_tokens"] = (
             ollama_num_ctx if ollama_num_ctx is not None else "adapter_default"
         )
+        report["ollama_gpu_layers"] = (
+            ollama_num_gpu if ollama_num_gpu is not None else "runtime_default"
+        )
     return report
 
 
@@ -1017,6 +1029,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-executable")
     parser.add_argument("--ollama-base-url")
     parser.add_argument("--ollama-num-ctx", type=int)
+    parser.add_argument("--ollama-num-gpu", type=int)
     parser.add_argument("--launch-binding", type=Path)
     parser.add_argument("--launch-binding-sha256")
     parser.add_argument("--launch-receipt", type=Path)
@@ -1030,7 +1043,7 @@ def _host_provider_defaults() -> dict[str, object]:
     return {
         name: parameters[name].default
         for name in (
-            "ollama_base_url", "ollama_model", "ollama_num_ctx", "codex_model",
+            "ollama_base_url", "ollama_model", "ollama_num_ctx", "ollama_num_gpu", "codex_model",
             "codex_effort", "codex_executable",
         )
     }
@@ -1040,12 +1053,15 @@ def _resolved_provider_options(arguments: argparse.Namespace) -> ProviderOptions
     defaults = _host_provider_defaults()
     explicit = {
         name for name in (
-            "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx"
+            "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx",
+            "ollama_num_gpu",
         ) if getattr(arguments, name) is not None
     }
     if arguments.mode == "production_default" and explicit:
         raise ValueError("production_default refuses diagnostic overrides")
-    if arguments.provider == "codex" and explicit & {"ollama_base_url", "ollama_num_ctx"}:
+    if arguments.provider == "codex" and explicit & {
+        "ollama_base_url", "ollama_num_ctx", "ollama_num_gpu",
+    }:
         raise ValueError("Codex refuses Ollama options")
     if arguments.provider == "ollama" and explicit & {"effort", "codex_executable"}:
         raise ValueError("Ollama refuses Codex options")
@@ -1061,6 +1077,10 @@ def _resolved_provider_options(arguments: argparse.Namespace) -> ProviderOptions
         arguments.codex_executable
         if arguments.codex_executable is not None else defaults["codex_executable"]
     ))
+    num_gpu = require_num_gpu(
+        arguments.ollama_num_gpu
+        if arguments.ollama_num_gpu is not None else defaults["ollama_num_gpu"]
+    )
     if (
         type(model) is not str or _PUBLIC_LABEL.fullmatch(model) is None
         or type(effort) is not str or _PUBLIC_LABEL.fullmatch(effort) is None
@@ -1072,6 +1092,7 @@ def _resolved_provider_options(arguments: argparse.Namespace) -> ProviderOptions
         "model": model, "effort": effort,
         "codex_executable": executable,
         "ollama_base_url": base_url, "ollama_num_ctx": num_ctx,
+        "ollama_num_gpu": num_gpu,
     }
 
 
@@ -1245,6 +1266,8 @@ def main(argv: list[str] | None = None) -> int:
                 controller_arguments += ("--ollama-base-url", arguments.ollama_base_url)
             if arguments.ollama_num_ctx is not None:
                 controller_arguments += ("--ollama-num-ctx", str(arguments.ollama_num_ctx))
+            if arguments.ollama_num_gpu is not None:
+                controller_arguments += ("--ollama-num-gpu", str(arguments.ollama_num_gpu))
             try:
                 result = run_owned_controller(
                     Path(__file__),
@@ -1300,14 +1323,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         report["configured_overrides"] = sorted(
             name for name in (
-                "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx"
+                "model", "effort", "codex_executable", "ollama_base_url", "ollama_num_ctx",
+                "ollama_num_gpu",
             ) if getattr(arguments, name) is not None
         )
         completed_cases = len(corpus.cases)
     except SourceBindingFailure:
         category = "source_binding_failed"
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": {"code": "source_binding_failed"},
@@ -1320,7 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1333,7 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1349,7 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
                 marker_secondary.append("source_binding_failed")
             public_error["secondary_categories"] = marker_secondary
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
@@ -1362,7 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
             public_error["secondary_categories"] = ["source_binding_failed"]
             marker_secondary = ["source_binding_failed"]
         report = {
-            "schema_version": 5,
+            "schema_version": _REPORT_SCHEMA_VERSION,
             "status": "error",
             "pass": False,
             "error": public_error,
