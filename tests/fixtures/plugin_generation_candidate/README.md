@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ5 searches may be followed by one extraction of 1ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ3
+- One complete batch of 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“5 searches may be followed by one extraction of 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -226,6 +226,24 @@ also disables the supported optional title-generation lane; the truncated earlie
 stack does not prove that lane caused the historical attempt. Earlier receipts
 remain unchanged, including SHA-256
 `6491e3b254b574a571159ae22226bc60b3be8a65712788b5aadae9a0cc3a4e7e`.
+
+Current lifetime-audit outcomes at
+`942bf4ca36938d54acd9d45a6f3366b3aba87414` and
+`0bab9c0fd3bf8fc9c598e1cad763edbf271f6a5f` correctly refuse overall success.
+The final observation took 15.875 seconds: normal worker exit, passing native
+semantics, zero canonical survivors and zero unclassified network attempts, but
+five blocked process attempts. Two captured callers are pinned environment
+version probes; three have only `unknown-outside` evidence. Source intent does
+not establish executable identity or authorize any launch. The barrier blocked
+all five; the zero-attempt gate remains unmet and the profile is preserved.
+Final receipt SHA-256:
+`4dc89d13736c8ca3b1880c8369fd109dc6102d079b9354a3cef9c4b514fdc0b7`.
+
+This is a bounded experimental artifact, not full native qualification. No further
+native captures, remaining smoke cases or current-source 49-group replay followed.
+PR #328 stays draft; #329 remains held. Resolving the unknown denied callers and
+completing the existing acceptance cases require the owner's next disposition.
+No historical receipt is rewritten or transferred to the current candidate.
 
 Earlier 60-second failures remain preserved, including a cleanup timeout and a
 later interruption after 7,992 files in the serial materialization/per-file-hash
