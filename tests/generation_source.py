@@ -2,6 +2,7 @@
 
 The caller verifies repository origin and pin and supplies a fresh owned directory.
 The interpreter and prepared third-party dependencies remain a separate trust boundary.
+Git must support --no-lazy-fetch; missing local objects and older Git refuse.
 No worktree overlay is imported. The one pinned attribution-metadata subtree is
 explicitly omitted; receipts describe a committed-source projection, not a full export.
 """
@@ -39,9 +40,27 @@ class SourceExportError(RuntimeError):
 
 
 def _git(source: Path, *arguments: str, payload: bytes | None = None) -> bytes:
+    # Export precedes the worker audit hook. Git must use only local objects, not
+    # spawn a demand fetch or inherit caller-selected object/config/helper paths.
+    environment = {
+        key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_SYSTEM=os.devnull,
+        GIT_ALLOW_PROTOCOL="",
+    )
     try:
         return subprocess.run(
-            ["git", "--no-replace-objects", "-C", str(source), *arguments],
+            [
+                "git",
+                "--no-replace-objects",
+                "--no-lazy-fetch",
+                "-C",
+                str(source),
+                *arguments,
+            ],
+            env=environment,
             input=payload,
             stdin=subprocess.DEVNULL if payload is None else None,
             stdout=subprocess.PIPE,
