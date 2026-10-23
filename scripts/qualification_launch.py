@@ -16,14 +16,37 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SHA = re.compile(r"[0-9a-f]{64}")
 _MAX_JSON = 65536
 _MAX_OUTPUT = 8 * 1024**2
+EXECUTION_ROOT_ENV = "HERMES_QUALIFICATION_EXECUTION_ROOT"
+# Kept alive until abrupt guardian exit when Job settlement is unproven. Never
+# finalize these generators: that would thaw/delete namespaces with live users.
+_UNSETTLED_RESOURCES: list[ExitStack] = []
+# Reviewed import-time local dependency closure of the two reused resource
+# primitives (including the PluginManager helper's dynamic authority import).
+# This follows the existing trusted, fixed-checkout bootstrap premise; checking
+# source files is not protection against concurrent hostile Python replacement.
+_RESOURCE_SOURCE_NAMES = (
+    "__init__",
+    "candidate_e2e_fast_track",
+    "candidate_source_archive_oracle",
+    "equivalence_process",
+    "qualification_execution_files",
+    "qualification_file_seals",
+    "qualify_evidence_slice_zero",
+    "qualify_hermes_v020_pluginmanager",
+    "release_gate",
+    "source_archive_authority",
+    "task13_artifact_orchestrator",
+    "windows_storage_oracle",
+)
 # Shared by the guardian and outer qualification callers/proofs. DETACHED_PROCESS
 # must not be added: Windows then ignores CREATE_NO_WINDOW for that process.
 WINDOWLESS_BREAKAWAY_FLAGS = 0x1000000 | 0x200 | 0x8000000
@@ -51,6 +74,144 @@ def _json(raw: bytes) -> Any:
         return value
 
     return json.loads(raw, object_pairs_hook=pairs)
+
+
+def _validate_sealed_resources(value: Any) -> dict[str, Any]:
+    """A bounded declarative selection; no model or launch policy is inferred."""
+    from scripts.qualification_file_seals import _relative_windows_member
+
+    if (
+        type(value) is not dict
+        or set(value) != {"schema_version", "execution", "inputs"}
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["inputs"]) is not list
+        or len(value["inputs"]) > 16
+    ):
+        raise ValueError("launch_resources_schema")
+    total_files = total_bytes = 0
+    for index, tree in enumerate([value["execution"], *value["inputs"]]):
+        if (
+            type(tree) is not dict
+            or set(tree) != {"root", "files"}
+            or type(tree["root"]) is not str
+            or "\0" in tree["root"]
+            or not Path(tree["root"]).is_absolute()
+            or ".." in Path(tree["root"]).parts
+            or tree["root"].startswith("\\\\")
+            or type(tree["files"]) is not list
+            or not 0 < len(tree["files"]) <= 16384
+        ):
+            raise ValueError("launch_resources_tree")
+        names = []
+        size = 0
+        for item in tree["files"]:
+            if (
+                type(item) is not dict
+                or set(item) != {"path", "sha256", "size_bytes"}
+                or type(item["sha256"]) is not str
+                or _SHA.fullmatch(item["sha256"]) is None
+                or type(item["size_bytes"]) is not int
+                or not 0 <= item["size_bytes"] <= (512 * 1024**2 if index == 0 else 16 * 1024**3)
+            ):
+                raise ValueError("launch_resources_file")
+            names.append(_relative_windows_member(item["path"]))
+            size += item["size_bytes"]
+        directories = {
+            str(parent)
+            for name in names
+            for parent in PurePosixPath(name).parents
+            if str(parent) != "."
+        }
+        folded = {name.casefold() for name in names}
+        if (
+            names != sorted(names)
+            or len(folded) != len(names)
+            or folded.intersection(name.casefold() for name in directories)
+            or len(directories) > 16384
+            or len({name.casefold() for name in directories}) != len(directories)
+            or (index == 0 and size > 4 * 1024**3)
+        ):
+            raise ValueError("launch_resources_inventory")
+        total_files += len(names)
+        total_bytes += size
+    if total_files > 16384 or total_bytes > 64 * 1024**3:
+        raise ValueError("launch_resources_bound")
+    # Detach the nested declaration from mutable caller-owned containers.
+    return cast(dict[str, Any], _json(json.dumps(value, allow_nan=False).encode()))
+
+
+def _acquire_sealed_resources(value: Any, owned: ExitStack) -> str:
+    from scripts.qualification_execution_files import (
+        _execution_files_for_consumer,
+        owned_execution_files,
+    )
+    from scripts.qualification_file_seals import (
+        retain_file_seals,
+        sealed_file_bytes,
+        sealed_file_metadata,
+    )
+
+    declaration = _validate_sealed_resources(value)
+    contents = {}
+    for index, tree in enumerate([declaration["execution"], *declaration["inputs"]]):
+        members = tuple(item["path"] for item in tree["files"])
+        seals = owned.enter_context(retain_file_seals(Path(tree["root"]), members))
+        expected = tuple(
+            (item["path"], item["sha256"], item["size_bytes"]) for item in tree["files"]
+        )
+        if sealed_file_metadata(seals) != expected:
+            raise ValueError("launch_resources_held_binding")
+        if index == 0:
+            for name, digest, size in expected:
+                raw = sealed_file_bytes(seals, name, size)
+                if len(raw) != size or _sha(raw) != digest:
+                    raise ValueError("launch_resources_read_binding")
+                contents[name] = raw
+    snapshot = owned.enter_context(owned_execution_files(contents))
+    return str(_execution_files_for_consumer(snapshot))
+
+
+def _resource_sources() -> dict[str, str]:
+    return {
+        name: _sha(_read(_ROOT / "scripts" / (name + ".py"), 4 * 1024**2))
+        for name in _RESOURCE_SOURCE_NAMES
+    }
+
+
+def _verify_resource_sources(value: Any, *, imported: bool = False) -> None:
+    if type(value) is not dict or set(value) != set(_RESOURCE_SOURCE_NAMES):
+        raise ValueError("launch_resources_source_schema")
+    for name in _RESOURCE_SOURCE_NAMES:
+        path = _ROOT / "scripts" / (name + ".py")
+        if (
+            path.resolve(strict=True) != path
+            or type(value[name]) is not str
+            or _SHA.fullmatch(value[name]) is None
+            or _sha(_read(path, 4 * 1024**2)) != value[name]
+        ):
+            raise ValueError("launch_resources_source_digest")
+        if imported:
+            module_names = ("scripts",) if name == "__init__" else ("scripts." + name, name)
+            modules = [sys.modules[key] for key in module_names if key in sys.modules]
+            if not modules or any(
+                (origin := getattr(module, "__file__", None)) is None
+                or Path(origin).resolve() != path
+                for module in modules
+            ):
+                raise ValueError("launch_resources_source_origin")
+
+
+def _resource_summary(value: Any) -> dict[str, Any]:
+    declaration = _validate_sealed_resources(value)
+    return {
+        "sealed_resources_sha256": _sha(
+            json.dumps(declaration, sort_keys=True, separators=(",", ":")).encode()
+        ),
+        "execution_file_count": len(declaration["execution"]["files"]),
+        "input_file_count": sum(len(tree["files"]) for tree in declaration["inputs"]),
+        "input_tree_count": len(declaration["inputs"]),
+    }
 
 
 @dataclass(frozen=True)
@@ -196,11 +357,23 @@ def _owned_controller(
     job = None
     root = None
     cleanup = False
+    settled = False
+    resources = ExitStack() if "sealed_resources" in plan else None
     primary: BaseException | None = None
     deadline = time.monotonic() + plan["timeout_seconds"]
     folder = Path(plan["work"])
     output, errors = folder / "stdout", folder / "stderr"
     try:
+        environment_values = dict(os.environ)
+        if resources is not None:
+            if any(key.casefold() == EXECUTION_ROOT_ENV.casefold() for key in environment_values):
+                raise ValueError("launch_resources_environment")
+            environment_values[EXECUTION_ROOT_ENV] = _acquire_sealed_resources(
+                plan["sealed_resources"], resources
+            )
+            _verify_resource_sources(plan["sealed_resources_sources"], imported=True)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("launch_controller_deadline")
         with open(os.devnull, "rb") as null, output.open("xb") as out, errors.open("xb") as err:
             handles = tuple(msvcrt.get_osfhandle(stream.fileno()) for stream in (null, out, err))
             for stream in (null, out, err):
@@ -208,7 +381,7 @@ def _owned_controller(
             job = kernel.create_job(core._WindowsJobLimitsV1(64, 64 * 1024**3, 128 * 1024**3))
             command = (binding.controller, "-B", "-c", _CONTROLLER, plan["plan_path"])
             environment = tuple(
-                sorted(os.environ.items(), key=lambda item: (item[0].casefold(), item[0]))
+                sorted(environment_values.items(), key=lambda item: (item[0].casefold(), item[0]))
             )
             flags = 0x4 | 0x200 | 0x400 | 0x80000 | 0x8000000
             root = kernel.create_process_suspended(
@@ -262,19 +435,34 @@ def _owned_controller(
                     if time.monotonic() >= until:
                         raise TimeoutError("launch_cleanup_deadline")
                     if active == 0:
+                        settled = True
                         cleanup = not failures
                         break
                     time.sleep(0.01)
             except BaseException as error:
                 failures.append(error)
-            if cleanup:
-                for handle in (
+            if resources is not None and not settled:
+                # Keep contexts strongly referenced and never restore/delete an
+                # executable namespace when any consumer may still be alive.
+                _UNSETTLED_RESOURCES.append(resources)
+            if cleanup or resources is not None:
+                handles_to_close = (
                     () if root is None else (root.thread_handle, root.process_handle)
-                ) + (job,):
+                ) + (job,)
+                if resources is not None and not settled:
+                    # Request kernel kill-on-close before the guardian's hard
+                    # exit. Zero is still unproven: no acceptance follows this.
+                    handles_to_close = (job,) + handles_to_close[:-1]
+                for handle in handles_to_close:
                     try:
                         kernel.close_handle(handle)
                     except BaseException as error:
                         failures.append(error)
+        if resources is not None and (job is None or settled):
+            try:
+                resources.close()
+            except BaseException as error:
+                failures.append(error)
         evidence["cleanup_verified"] = cleanup and not failures
         if primary is not None:
             failures.insert(0, primary)
@@ -308,6 +496,9 @@ def _guardian(path: Path, digest: str) -> int:
         binding = load_binding(Path(plan["binding"]), plan["binding_sha256"], controller=False)
         if _sha(_read(Path(__file__), 4 * 1024**2)) != plan["launcher_sha256"]:
             raise ValueError("launch_source_digest")
+        if "sealed_resources" in plan:
+            _verify_resource_sources(plan["sealed_resources_sources"])
+            final.update(_resource_summary(plan["sealed_resources"]))
         _record(receipt, {"stage": "started", "guardian_sha256": binding.guardian_sha256})
         stdout, completion, cleanup = _owned_controller(plan, binding, final)
         final.update(cleanup_verified=cleanup, controller_completed=completion is not None)
@@ -334,7 +525,15 @@ def _guardian(path: Path, digest: str) -> int:
             else "execution_failed"
         )
     finally:
-        _record(receipt, final)
+        try:
+            _record(receipt, final)
+        finally:
+            if _UNSETTLED_RESOURCES:
+                # Normal interpreter finalization can collect generator-based
+                # contexts and thaw namespaces. Let kernel process teardown
+                # release retained handles instead. Immutability after this
+                # unsettled exit is not established and cannot be accepted.
+                os._exit(2)
     return 0 if final["stage"] == "complete" else 2
 
 
@@ -346,8 +545,17 @@ def run_owned_controller(
     binding_sha256: str,
     receipt: Path,
     timeout_seconds: int = 14400,
+    sealed_resources: dict[str, Any] | None = None,
 ) -> LaunchResult:
-    """Caller binds its controller/dependencies; this function owns no model policy."""
+    """Run a bound controller; optional v1 resources belong to its guardian.
+
+    ``sealed_resources`` selects one execution tree and up to 16 input trees.
+    Each tree declares ``root`` and sorted ``files`` containing exactly ``path``,
+    ``sha256``, and ``size_bytes``. The controller receives the fresh execution
+    tree only through :data:`EXECUTION_ROOT_ENV`; input paths stay as declared.
+    No resource context belongs to this observing caller. This owns no model
+    policy and does not authenticate the caller's declared selection.
+    """
     category = "refused"
     try:
         if os.name != "nt":
@@ -359,6 +567,9 @@ def run_owned_controller(
         ):
             raise ValueError("launch_arguments")
         binding = load_binding(binding_path, binding_sha256)
+        resource_plan = (
+            _validate_sealed_resources(sealed_resources) if sealed_resources is not None else None
+        )
         script = script.resolve(strict=True)
         script_sha = _sha(_read(script, 4 * 1024**2))
         _record(
@@ -385,6 +596,9 @@ def run_owned_controller(
             "completion": str(folder / "completion.json"),
             "result": str(folder / "result"),
         }
+        if resource_plan is not None:
+            plan["sealed_resources"] = resource_plan
+            plan["sealed_resources_sources"] = _resource_sources()
         kernel_path = Path(__file__).with_name("qualify_evidence_slice_zero.py")
         plan.update(
             kernel_path=str(kernel_path), kernel_sha256=_sha(_read(kernel_path, 4 * 1024**2))

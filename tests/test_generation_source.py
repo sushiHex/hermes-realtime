@@ -497,3 +497,123 @@ def test_worker_failure_settles_peer_before_export_error(committed, tmp_path):
             release.set()
             thread.join(5)
     assert not thread.is_alive() and outcomes == [True] and peer_finished.is_set()
+
+
+def _missing_promisor_blob(committed, tmp_path):
+    import sys
+
+    repository, pin = committed
+    remote = tmp_path / "promisor.git"
+    git(tmp_path, "clone", "--bare", "--no-hardlinks", str(repository), str(remote))
+    marker = tmp_path / "upload-pack-called"
+    helper = tmp_path / "upload-pack.py"
+    helper.write_text(
+        "import subprocess, sys\nfrom pathlib import Path\n"
+        "Path(sys.argv[1]).write_text('called', encoding='utf-8')\n"
+        "raise SystemExit(subprocess.run(['git', 'upload-pack', *sys.argv[2:]], "
+        "stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, "
+        "timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode)\n",
+        encoding="utf-8",
+    )
+    git(repository, "config", "remote.origin.url", str(remote))
+    git(repository, "config", "remote.origin.promisor", "true")
+    git(repository, "config", "extensions.partialClone", "origin")
+    git(repository, "config", "protocol.file.allow", "always")
+    git(
+        repository,
+        "config",
+        "remote.origin.uploadpack",
+        f'"{Path(sys.executable).as_posix()}" "{helper.as_posix()}" "{marker.as_posix()}"',
+    )
+    oid = git(repository, "rev-parse", f"{pin}:module.py").decode().strip()
+    blob = repository / ".git" / "objects" / oid[:2] / oid[2:]
+    assert blob.is_file()
+    blob.chmod(0o600)
+    blob.unlink()
+    return repository, pin, oid, marker
+
+
+def _trace_git_children(monkeypatch, trace):
+    import os
+
+    original = subprocess.run
+
+    def traced(*args, **kwargs):
+        kwargs["env"] = dict(kwargs.get("env", os.environ), GIT_TRACE2_EVENT=str(trace))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(source.subprocess, "run", traced)
+
+
+def test_promisor_control_really_fetches_missing_blob_with_local_helper(committed, tmp_path):
+    repository, _pin, oid, marker = _missing_promisor_blob(committed, tmp_path)
+    assert git(repository, "cat-file", "blob", oid) == b"PINNED = True\n"
+    assert marker.read_text(encoding="utf-8") == "called"
+
+
+def test_export_missing_promisor_blob_refuses_before_any_git_child(
+    committed,
+    tmp_path,
+    monkeypatch,
+):
+    repository, pin, _oid, marker = _missing_promisor_blob(committed, tmp_path)
+    trace = tmp_path / "git-trace.jsonl"
+    _trace_git_children(monkeypatch, trace)
+    refused = None
+    try:
+        source.export_tree(repository, pin, tmp_path / "export")
+    except source.SourceExportError as error:
+        refused = error.category
+    children = sum(
+        json.loads(line).get("event") == "child_start"
+        for line in trace.read_text(encoding="utf-8").splitlines()
+    )
+    assert children == 0, "source-export-started-unobserved-git-child"
+    assert not marker.exists(), "source-export-invoked-promisor-upload-pack"
+    assert refused in {"source_export_git_failed", "source_export_blob_invalid"}
+    assert not (tmp_path / "export").exists()
+
+
+@pytest.mark.parametrize("setting", ["global", "parameters", "objects"])
+def test_export_ignores_inherited_git_config_and_object_redirects(
+    committed,
+    tmp_path,
+    monkeypatch,
+    setting,
+):
+    repository, pin = committed
+    malformed = tmp_path / "invalid.gitconfig"
+    malformed.write_text("[invalid config\n", encoding="utf-8")
+    if setting == "global":
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(malformed))
+    elif setting == "parameters":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "include.path")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(malformed))
+    else:
+        objects = tmp_path / "empty-objects"
+        objects.mkdir()
+        monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(objects))
+    destination = tmp_path / "export"
+    source.export_tree(repository, pin, destination)
+    assert (destination / "module.py").read_bytes() == b"PINNED = True\n"
+
+
+def test_git_transport_denial_cannot_run_local_remote_helper(committed, tmp_path):
+    repository, _pin, oid, marker = _missing_promisor_blob(committed, tmp_path)
+    with pytest.raises(source.SourceExportError, match="^source_export_git_failed$"):
+        source._git(repository, "fetch", "origin", oid)
+    assert not marker.exists()
+
+
+def test_export_ignores_default_home_config(committed, tmp_path, monkeypatch):
+    repository, pin = committed
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    (isolated_home / ".gitconfig").write_text("[invalid config\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated_home / "xdg"))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    destination = tmp_path / "export"
+    source.export_tree(repository, pin, destination)
+    assert (destination / "module.py").read_bytes() == b"PINNED = True\n"
