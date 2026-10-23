@@ -162,7 +162,9 @@ class HermesApiStub:
             "run_id": run_id,
         }
         if self.terminal_event == "run.completed":
-            payload["output"] = self.terminal_text
+            payload["output"] = (
+                f"<voice>{self.terminal_text}</voice><detail>{self.terminal_text}</detail>"
+            )
         elif self.terminal_event == "run.failed":
             payload["error"] = self.terminal_text
         await response.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
@@ -185,7 +187,9 @@ class HermesApiStub:
             "status": self.status,
         }
         if self.status == "completed":
-            payload["output"] = self.terminal_text
+            payload["output"] = (
+                f"<voice>{self.terminal_text}</voice><detail>{self.terminal_text}</detail>"
+            )
         return web.json_response(payload)
 
     def complete(self, *, status: str = "completed") -> None:

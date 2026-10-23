@@ -36,6 +36,7 @@ import contextlib
 import ctypes
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -680,7 +681,7 @@ class Processes:
         except subprocess.TimeoutExpired:
             return None
 
-    def stop_all(self, containment: Containment | None = None) -> None:
+    def stop_all(self, containment: Containment | None = None) -> float:
         """Kill owned trees, then give their native handles one shared five-second wait budget.
 
         Termination is asynchronous. This wait budget does not bound query/termination
@@ -721,6 +722,7 @@ class Processes:
         finally:
             print("[desktop-mvp-cleanup-settlement] " + json.dumps(
                 observation, separators=(",", ":")), flush=True)
+        return deadline
 
     def _cleanup_candidates(
         self, containment: Containment | None
@@ -777,24 +779,58 @@ class Processes:
         return dict(left)
 
 
-def listeners(port: int) -> list[str]:
-    """Local addresses listening on a TCP port."""
+class ListenerQueryFailure(RuntimeError):
+    """Enumeration was incomplete; its output cannot establish listener state."""
 
-    output = subprocess.run(
-        ("netstat", "-ano", "-p", "tcp"),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-        creationflags=0x08000000,
-    ).stdout + subprocess.run(
-        ("netstat", "-ano", "-p", "tcpv6"),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-        creationflags=0x08000000,
-    ).stdout
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
+
+
+def listeners(port: int, *, deadline: float) -> list[str]:
+    """Query both families within one caller deadline, or refuse the entire observation."""
+
+    completed = 0
+    failure: str | None = None
+    outputs: list[str] = []
+    try:
+        for family in ("tcp", "tcpv6"):
+            if type(deadline) not in (int, float):
+                raise ListenerQueryFailure("listener_query_deadline")
+            remaining = deadline - time.monotonic()
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise ListenerQueryFailure("listener_query_deadline")
+            result = subprocess.run(
+                ("netstat", "-ano", "-p", family),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=remaining,
+                creationflags=0x08000000,
+            )
+            if result.returncode != 0:
+                raise ListenerQueryFailure("listener_query_exit")
+            if time.monotonic() >= deadline:
+                raise ListenerQueryFailure("listener_query_deadline")
+            outputs.append(result.stdout)
+            completed += 1
+    except subprocess.TimeoutExpired:
+        failure = "listener_query_timeout"
+        raise ListenerQueryFailure(failure) from None
+    except OSError:
+        failure = "listener_query_launch"
+        raise ListenerQueryFailure(failure) from None
+    except ListenerQueryFailure as error:
+        failure = error.category
+        raise
+    finally:
+        if failure is not None:
+            print("[desktop-mvp-listener-refusal] " + json.dumps(
+                {"category": failure, "completed_families": completed},
+                separators=(",", ":")), flush=True)
+    output = "".join(outputs)
     found: list[str] = []
     for line in output.splitlines():
         fields = line.split()
@@ -1581,7 +1617,7 @@ def preflight(model: str | None) -> list[str]:
             names = set()
         if model not in names:
             missing.append("ollama_model")
-    if listeners(7880):
+    if listeners(7880, deadline=time.monotonic() + 2):
         missing.append("livekit_port_in_use")
     return missing
 
@@ -1628,7 +1664,9 @@ class Rehearsal:
         try:
             yield step
         except Exception as error:  # A failed step is a finding; the rehearsal continues.
-            if isinstance(error, SetupFailure):
+            if isinstance(error, ListenerQueryFailure):
+                step.fail(error.category)
+            elif isinstance(error, SetupFailure):
                 step.fail(error.category)
                 step.notes.update(error.notes)
             else:
@@ -2031,15 +2069,18 @@ class Rehearsal:
             cwd=self.home,
             log=log,
         )
+        deadline = time.monotonic() + 240
         async with asyncio.timeout(240):
             while _http(f"http://127.0.0.1:{self.api_port}/health")[0] != 200:
                 if self.processes.roots["gateway"].poll() is not None:
                     raise RuntimeError("the gateway exited before it was healthy")
                 await asyncio.sleep(0.5)
-            while not listeners(self.companion_port):
+            while not listeners(self.companion_port, deadline=deadline):
                 await asyncio.sleep(0.5)
-        exposed = listener_verdict("api", listeners(self.api_port)) + listener_verdict(
-            "companion", listeners(self.companion_port)
+        exposed = listener_verdict(
+            "api", listeners(self.api_port, deadline=deadline)
+        ) + listener_verdict(
+            "companion", listeners(self.companion_port, deadline=deadline)
         )
         step.apply(exposed)
         self.processes.observe()
@@ -2165,10 +2206,11 @@ class Rehearsal:
             env=os.environ | {"LIVEKIT_KEYS": local_livekit.DEVELOPMENT_KEYS},
             log=log,
         )
+        deadline = time.monotonic() + 30
         async with asyncio.timeout(30):
             while _http("http://127.0.0.1:7880/") != (200, b"OK"):
                 await asyncio.sleep(0.2)
-        exposed = listener_verdict("livekit_signaling", listeners(7880))
+        exposed = listener_verdict("livekit_signaling", listeners(7880, deadline=deadline))
         step.notes["livekit_signaling_loopback_only"] = not exposed
         step.apply(exposed)
         return not exposed
@@ -2852,18 +2894,26 @@ class Rehearsal:
         with contextlib.suppress(Exception):
             if self.playwright is not None:
                 await self.playwright.stop()
+        deadline = time.monotonic()  # A failed stop cannot create a fresh query allowance.
         try:
-            self.processes.stop_all(self.containment)
+            deadline = self.processes.stop_all(self.containment)
         except OSError:
             self.processes.cleanup_stop_failed = True
         await self.stand_in.close()
         ports = [7880, self.api_port, self.companion_port, self.host_port]
+        ports_listening: int | None = None
+        listener_query_failure: str | None = None
+        try:
+            ports_listening = sum(1 for port in ports if listeners(port, deadline=deadline))
+        except ListenerQueryFailure as error:
+            listener_query_failure = error.category
         return {
             "processes_left": self.processes.survivors(self.containment),
             "first_cleanup_refusal": self.processes.first_cleanup_refusal,
             "cleanup_stop_failed": self.processes.cleanup_stop_failed,
             "contained": self.containment is not None,
-            "ports_listening": sum(1 for port in ports if listeners(port)),
+            "ports_listening": ports_listening,
+            "listener_query_failure": listener_query_failure,
         }
 
 
@@ -2952,7 +3002,8 @@ async def _rehearse(run_dir: Path, model: str, recall_trials: int = 0) -> int:
             | left
         )
     clean = all(outcome == "as_expected" for outcome in outcomes.values())
-    return 0 if clean and left.get("processes_left") == {} else 1
+    complete = clean and left.get("processes_left") == {} and left.get("ports_listening") == 0
+    return 0 if complete else 1
 
 
 def _host_child(stop_file: Path, arguments: list[str]) -> int:
@@ -3083,7 +3134,12 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         return 1
-    missing = preflight(args.ollama_model)
+    try:
+        missing = preflight(args.ollama_model)
+    except ListenerQueryFailure as error:
+        _emit({"name": "preflight", "notes": {}, "outcome": "failed",
+               "step": "preflight", "version": 1, "category": error.category})
+        return 1
     if missing:
         # A listener already on 7880, such as an orphaned server, is a failure, not a skip.
         occupied = "livekit_port_in_use" in missing

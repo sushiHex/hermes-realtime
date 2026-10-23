@@ -77,8 +77,8 @@ async def test_close_and_emitted_summary_keep_first_cleanup_refusal(tmp_path, mo
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
     containment = SimpleNamespace(_job=66, members=lambda: set())
     stops = []
-    monkeypatch.setattr(owner, "stop_all", lambda *args: stops.append(args))
-    monkeypatch.setattr(rehearsal, "listeners", lambda port: [])
+    monkeypatch.setattr(owner, "stop_all", lambda *args: stops.append(args) or 10.0)
+    monkeypatch.setattr(rehearsal, "listeners", lambda port, **kwargs: [])
     assert owner.survivors(None)
     first = owner.first_cleanup_refusal
     run = object.__new__(rehearsal.Rehearsal)
@@ -119,7 +119,7 @@ async def test_public_summary_refuses_stop_error_even_after_healthy_query(
 
     monkeypatch.setattr(rehearsal, "process_table", healthy_query)
     ports = []
-    monkeypatch.setattr(rehearsal, "listeners", lambda port: ports.append(port) or [])
+    monkeypatch.setattr(rehearsal, "listeners", lambda port, **kwargs: ports.append(port) or [])
 
     def stop_error(*args):
         raise OSError("private path, process ID and exception detail")

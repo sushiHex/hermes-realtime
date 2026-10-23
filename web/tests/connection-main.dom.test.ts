@@ -122,11 +122,13 @@ it("applies live speaker preference to the existing track across replacement and
     slider.value = value;
     slider.dispatchEvent(new dom.window.Event("input"));
   };
-  const subscribe = () => {
+  const subscribe = (enabled = true) => {
     // Exercise the production instanceof route without opening media or an AudioContext.
     const track = Object.assign(Object.create(RemoteAudioTrack.prototype) as RemoteAudioTrack, {
       kind: Track.Kind.Audio,
-      setVolume: vi.fn(), attach: vi.fn(), detach: vi.fn(),
+      setVolume: vi.fn(),
+      attach: vi.fn(() => expect(track.mediaStreamTrack.enabled).toBe(enabled)),
+      detach: vi.fn(),
     });
     Object.defineProperty(track, "mediaStreamTrack", { value: { enabled: true } });
     media.rooms.at(-1)!.emit(RoomEvent.TrackSubscribed, track, {
@@ -146,10 +148,11 @@ it("applies live speaker preference to the existing track across replacement and
   expect(first.setVolume).toHaveBeenLastCalledWith(0.25);
   mute.click();
   expect(first.setVolume).toHaveBeenLastCalledWith(0);
-  const replacement = subscribe();
+  expect(first.mediaStreamTrack.enabled).toBe(false);
+  const replacement = subscribe(false);
   expect(first.detach).toHaveBeenCalledExactlyOnceWith(audio);
   expect(replacement.setVolume).toHaveBeenLastCalledWith(0);
-  expect(replacement.mediaStreamTrack.enabled).toBe(true);
+  expect(replacement.mediaStreamTrack.enabled).toBe(false);
   expect(media.microphone).toHaveBeenCalledOnce();
   expect(media.connect).toHaveBeenCalledOnce();
   expect(media.disconnect).not.toHaveBeenCalled();
@@ -158,11 +161,18 @@ it("applies live speaker preference to the existing track across replacement and
   await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
   toggle.click();
   await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
-  const reconnected = subscribe();
+  const reconnected = subscribe(false);
   expect(reconnected.setVolume).toHaveBeenLastCalledWith(0);
   mute.click();
   expect(reconnected.setVolume).toHaveBeenLastCalledWith(0.25);
   expect(reconnected.mediaStreamTrack.enabled).toBe(true);
+  choose("0");
+  expect(reconnected.mediaStreamTrack.enabled).toBe(false);
+  const zeroReplacement = subscribe(false);
+  expect(zeroReplacement.setVolume).toHaveBeenLastCalledWith(0);
+  choose("50");
+  expect(zeroReplacement.setVolume).toHaveBeenLastCalledWith(0.5);
+  expect(zeroReplacement.mediaStreamTrack.enabled).toBe(true);
 });
 
 function localModelOptions(advertisedContextTokens: number | null = 32768) {

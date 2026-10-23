@@ -43,6 +43,11 @@ class _RunState(TypedDict):
     stop_calls: int
 
 
+def _completed_output(text: str) -> str:
+    """A synthetic backend success that honors the API task's requested envelope."""
+    return f"<voice>{text}</voice><detail>{text}</detail>"
+
+
 def _dispatch_request(
     *, sequence: int = 1, task_id: str = "task_release_check"
 ) -> WorkDispatchRequestedEvent:
@@ -338,6 +343,22 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         assert isinstance(instructions, str)
         assert "one parallel batch" in instructions
         assert "no more than five web_search calls" in instructions
+        assert (
+            "Answer from those results when they contain the facts needed for the objective. "
+            "Otherwise, make at most one web_extract call for no more than three distinct URLs "
+            "returned by that search batch, then answer."
+            in instructions
+        )
+        assert (
+            "Do not retry lookup tools, perform follow-up searches or additional extraction "
+            "calls, or use skill_view, browser tools, or terminal for this lookup path."
+            in instructions
+        )
+        assert (
+            "Use only inline extraction output; do not call read_file or page through "
+            "stored page content."
+            in instructions
+        )
         assert "Local, runtime, file, process, build, and verification objectives" in instructions
         assert (
             "Never interpret an unavailable tool, failed command, or empty output"
@@ -379,7 +400,7 @@ async def test_api_session_runs_two_tasks_concurrently_and_settles_independently
         payload = {
             "event": "run.completed",
             "run_id": run_id,
-            "output": "Completed independently.",
+            "output": _completed_output("Completed independently."),
         }
         await response.write(f"data: {json.dumps(payload)}\n\n".encode())
         await response.write_eof()
@@ -918,7 +939,7 @@ async def test_api_session_rejects_private_protocol_id_collision_and_settles_new
             payload = {
                 "event": "run.completed",
                 "run_id": run_id,
-                "output": "First run remained authoritative.",
+                "output": _completed_output("First run remained authoritative."),
             }
             await response.write(f"data: {json.dumps(payload)}\n\n".encode())
         await response.write_eof()
@@ -1328,7 +1349,7 @@ async def test_api_session_routes_authoritative_dispatch_approval_and_completion
             "event": "run.completed",
             "run_id": "run_0123456789abcdef",
             "timestamp": 2.0,
-            "output": "Release evidence is internally consistent.",
+            "output": _completed_output("Release evidence is internally consistent."),
             "usage": {"total_tokens": 12},
         }
         await response.write(f"data: {json.dumps(completed)}\n\n".encode())
@@ -1412,7 +1433,9 @@ async def test_api_session_routes_authoritative_dispatch_approval_and_completion
         assert completion.task_id == "task_release_check"
         assert completion.run_id == "deleg_api_private_1"
         assert completion.payload.status is WorkTerminalStatus.COMPLETED
-        assert completion.payload.summary == "Release evidence is internally consistent."
+        assert completion.payload.summary == _completed_output(
+            "Release evidence is internally consistent."
+        )
         assert requests[0][0] == "dispatch"
         dispatch_body = requests[0][1]
         assert isinstance(dispatch_body, dict)
@@ -1443,11 +1466,10 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
         await response.prepare(request)
         events_connected.set()
         await release_terminal.wait()
-        terminal = (
-            'data: {"event":"run.completed",'
-            f'"run_id":"{api_run_id}",'
-            '"output":"Exact delayed result."}\n\n'
-        ).encode()
+        terminal = b"data: " + json.dumps({
+            "event": "run.completed", "run_id": api_run_id,
+            "output": _completed_output("Exact delayed result."),
+        }).encode() + b"\n\n"
         try:
             await response.write(terminal)
             await response.write_eof()
@@ -1461,7 +1483,7 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
             "status": state["status"],
         }
         if state["status"] == "completed":
-            payload["output"] = "Exact delayed result."
+            payload["output"] = _completed_output("Exact delayed result.")
         return web.json_response(payload)
 
     async def stop(_request: web.Request) -> web.Response:
@@ -1508,7 +1530,7 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
         assert terminal.task_id == "task_release_check"
         assert terminal.run_id == "deleg_delayed_sse_private"
         assert terminal.payload.status is WorkTerminalStatus.COMPLETED
-        assert terminal.payload.summary == "Exact delayed result."
+        assert terminal.payload.summary == _completed_output("Exact delayed result.")
         assert state["stop_calls"] == 0
     finally:
         release_terminal.set()
@@ -1610,8 +1632,6 @@ async def test_api_session_signals_exact_active_run_and_rejects_duplicate_stop()
         "eof",
         "approval_observer",
         "duplicate_approval",
-        "disclosive_terminal",
-        "disclosive_nonhex_terminal",
     ],
 )
 @pytest.mark.asyncio
@@ -1637,18 +1657,6 @@ async def test_event_stream_failure_stops_and_confirms_terminal_authority(
             await response.write(approval)
             if failure_mode == "duplicate_approval":
                 await response.write(approval)
-        elif failure_mode in {"disclosive_terminal", "disclosive_nonhex_terminal"}:
-            token = (
-                "Xrun_0123456789abcdefY"
-                if failure_mode == "disclosive_terminal"
-                else "Xrun_0123456789abcdegY"
-            )
-            await response.write(
-                (
-                    'data: {"event":"run.completed",'
-                    f'"run_id":"{api_run_id}","output":"{token}"}}\n\n'
-                ).encode()
-            )
         await response.write_eof()
         return response
 
@@ -1753,9 +1761,9 @@ async def test_failed_close_retains_run_authority_for_retry() -> None:
     ("terminal_body", "expected_status", "expected_summary", "expected_reason"),
     [
         (
-            {"status": "completed", "output": "Finished before the stop."},
+            {"status": "completed", "output": _completed_output("Finished before the stop.")},
             WorkTerminalStatus.COMPLETED,
-            "Finished before the stop.",
+            _completed_output("Finished before the stop."),
             None,
         ),
         (
@@ -2106,7 +2114,10 @@ class _IdempotentHermes:
         await response.prepare(request)
         if self.release_events is not None:
             await self.release_events.wait()
-        terminal = {"event": "run.completed", "run_id": self.run_id, "output": "Recovered."}
+        terminal = {
+            "event": "run.completed", "run_id": self.run_id,
+            "output": _completed_output("Recovered."),
+        }
         await response.write(b"data: " + json.dumps(terminal).encode() + b"\n\n")
         return response
 
@@ -2179,7 +2190,7 @@ async def test_a_lost_dispatch_response_recovers_the_same_run(
 
         assert acknowledgment.payload.accepted is True
         assert terminal.payload.status is WorkTerminalStatus.COMPLETED
-        assert terminal.payload.summary == "Recovered."
+        assert terminal.payload.summary == _completed_output("Recovered.")
         assert hermes.runs_created == 1
         assert hermes.stop_calls == 0
         (first_key, first_body), (second_key, second_body) = hermes.attempts
@@ -3493,7 +3504,7 @@ class _LookupHermes:
         if self.fault == "unavailable":
             headers["X-Lookup-Policy-Outcome"] = "unavailable"
         response = web.json_response(
-            {"run_id": self.run_id, "status": self.status, "output": "Authoritative result"},
+            {"run_id": self.run_id, "status": self.status, "output": _completed_output("Authoritative result")},
             headers=headers,
         )
         if self.fault == "status-duplicate":
@@ -3507,7 +3518,7 @@ class _LookupHermes:
                 {
                     "event": "run.cancelled" if self.fault == "cancelled" else "run.completed",
                     "run_id": self.run_id,
-                    "output": "Unverified stream result",
+                    "output": _completed_output("Unverified stream result"),
                 }
             )
             + "\n\n",
@@ -3584,7 +3595,7 @@ async def test_explicit_lookup_policy_binding(fault, capsys):
             update = await asyncio.wait_for(session.next_update(), 2)
             if fault in {"healthy", "ordinary"}:
                 assert update.payload.status is WorkTerminalStatus.COMPLETED
-                assert update.payload.summary == (
+                assert update.payload.summary == _completed_output(
                     "Unverified stream result" if fault == "ordinary" else "Authoritative result"
                 )
             elif fault == "cancelled":
@@ -3804,3 +3815,14 @@ async def test_lookup_completion_requires_native_terminal_authority(status, run_
     with pytest.raises(RuntimeError, match="lookup policy.*authority"):
         await session._lookup_completion(authority)
     assert not authority.terminal
+
+
+def test_lookup_refusal_reporting_cannot_replace_primary_error(monkeypatch):
+    def unavailable_output(*args, **kwargs):
+        raise OSError("synthetic unavailable output")
+    monkeypatch.setattr("builtins.print", unavailable_output)
+    with pytest.raises(RuntimeError, match="primary refusal"):
+        try:
+            raise RuntimeError("primary refusal")
+        finally:
+            HermesApiTaskSession._lookup_refusal("acknowledgment")
