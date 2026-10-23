@@ -13,6 +13,8 @@ import json
 import os
 import re
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -80,13 +82,28 @@ def _paths(entries: list[tuple[str, str, str]]) -> None:
             aliases[alias] = prefix
 
 
-def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str | int]:
+def _materialize_blob(payload):
+    destination, path, mode, content = payload
+    target = destination.joinpath(*path.split("/"))
+    filesystem_started = time.monotonic()
+    with target.open("xb") as stream:
+        stream.write(content)
+    if os.name != "nt":
+        target.chmod(0o755 if mode == "100755" else 0o644)
+    filesystem_seconds = time.monotonic() - filesystem_started
+    manifest_started = time.monotonic()
+    entry = [path, mode, hashlib.sha256(content).hexdigest()]
+    return entry, filesystem_seconds, time.monotonic() - manifest_started
+
+
+def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str | int | float]:
     """Materialize a declared projection of regular Git blobs, never overlays.
 
     Git archive export-ignore attributes cannot omit tracked files because this reads
     the tree/blob objects directly. Symlinks and submodules refuse rather than escape
     the owned tree. A failed partial export stays in the caller's owned temp directory.
     """
+    started = time.monotonic()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise SourceExportError("source_export_revision_invalid")
     if destination.exists() or destination.is_symlink():
@@ -130,7 +147,11 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
         entries = [entry for entry in entries if not entry[0].startswith(metadata_prefix)]
     _paths(entries)
     requests = "".join(f"{oid}\n" for _, _, oid in entries).encode("ascii")
+    metadata_seconds = time.monotonic() - started
+    blob_read_started = time.monotonic()
     batch = _git(source, "cat-file", "--batch", payload=requests)
+    blob_read_seconds = time.monotonic() - blob_read_started
+    validation_started = time.monotonic()
     offset = 0
     blobs = []
     try:
@@ -159,20 +180,29 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
         raise SourceExportError("source_export_blob_invalid") from error
     if offset != len(batch):
         raise SourceExportError("source_export_blob_invalid")
+    validation_seconds = time.monotonic() - validation_started
+    materialization_started = time.monotonic()
+    filesystem_started = time.monotonic()
     destination.mkdir()
-    manifest = []
     created_parents = {destination}
-    for path, mode, content in blobs:
+    for path, _, _ in blobs:
         target = destination.joinpath(*path.split("/"))
         if target.parent not in created_parents:
             target.parent.mkdir(parents=True, exist_ok=True)
             created_parents.add(target.parent)
-        with target.open("xb") as stream:
-            stream.write(content)
-        if os.name != "nt":
-            target.chmod(0o755 if mode == "100755" else 0o644)
-        manifest.append([path, mode, hashlib.sha256(content).hexdigest()])
+    filesystem_seconds = time.monotonic() - filesystem_started
+    jobs = [(destination, path, mode, content) for path, mode, content in blobs]
+    # The finite validated input is at most the already materialized Git listing.
+    # Ordered map preserves the manifest; context exit settles workers on failure.
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        materialized = list(workers.map(_materialize_blob, jobs))
+    materialization_wall_seconds = time.monotonic() - materialization_started
+    manifest = [entry for entry, _, _ in materialized]
+    filesystem_seconds += sum(seconds for _, seconds, _ in materialized)
+    manifest_seconds = sum(seconds for _, _, seconds in materialized)
+    manifest_started = time.monotonic()
     digest = hashlib.sha256(json.dumps(manifest, separators=(",", ":")).encode("utf-8")).hexdigest()
+    manifest_seconds += time.monotonic() - manifest_started
     return {
         "source_export_tree": tree.decode("ascii"),
         "source_export_full_tree_files": full_tree_files,
@@ -184,4 +214,12 @@ def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str
         "source_export_manifest_sha256": digest,
         "source_export_files": len(blobs),
         "source_export_bytes": sum(len(content) for _, _, content in blobs),
+        "source_export_metadata_seconds": round(metadata_seconds, 3),
+        "source_export_blob_read_seconds": round(blob_read_seconds, 3),
+        "source_export_validation_seconds": round(validation_seconds, 3),
+        "source_export_filesystem_work_seconds": round(filesystem_seconds, 3),
+        "source_export_manifest_work_seconds": round(manifest_seconds, 3),
+        "source_export_materialization_wall_seconds": round(materialization_wall_seconds, 3),
+        "source_export_total_seconds": round(time.monotonic() - started, 3),
+        "source_export_timing_semantics": "overlapping_work_and_wall_v1",
     }
