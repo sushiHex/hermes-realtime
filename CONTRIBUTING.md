@@ -85,7 +85,7 @@ Expect roughly 14 minutes, again approximate and machine-dependent.
 1. Start from current `main` and create a focused branch.
 2. For production behavior, work RED-GREEN-REFACTOR: add a failing test, make it pass with the smallest change, then improve the design without changing behavior.
 3. Make the smallest production change that satisfies the contract.
-4. Run focused tests, then the relevant broader gates.
+4. Follow the canonical [delivery and validation rules](AGENTS.md#delivery-and-validation-rules): match checks to consequences, batch review, prove the smallest real path first, and report outcomes. Run required broader gates on the final candidate; repeat only with a stated reason.
 5. Update documentation when behavior, configuration, or limitations change.
 6. Open a pull request; do not push feature work directly to `main`.
 
