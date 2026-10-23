@@ -205,7 +205,7 @@ def test_reused_tracked_pid_still_has_independent_job_authority(tmp_path, monkey
 @pytest.mark.parametrize("broken", ["snapshot", "bound"])
 def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, broken):
     owner = rehearsal.Processes(tmp_path)
-    # Native runners can place the controller inside the synthetic PID range.
+    # Fix the controller identity so the synthetic member range cannot depend on the runner PID.
     monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
     if broken == "snapshot":
 
@@ -231,6 +231,7 @@ def test_cleanup_allows_exact_non_controller_observation_bound(tmp_path, monkeyp
     monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
     monkeypatch.setattr(rehearsal, "process_table", lambda: {})
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: "unknown")
+    # The controller is removed before applying the bound to the other 4096 members.
     containment = SimpleNamespace(_job=66, members=lambda: set(range(10000, 14097)))
     assert owner.survivors(containment) == {"<unknown>": 4096}
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
