@@ -194,7 +194,16 @@ and claims no guardian ownership. `--mode production_default` takes provider set
 from the host factory and refuses explicit model/runtime overrides. It is the CLI
 default. Select `--mode diagnostic_override` for model or runtime overrides. `--provider codex`
 remains the default; `--provider ollama` selects the same host factory and optional
-`--ollama-base-url` and `--ollama-num-ctx` settings. The entrypoint refuses a missing or
+`--ollama-base-url`, `--ollama-num-ctx` and `--ollama-num-gpu` settings. The optional
+GPU-layer override accepts exact integers from 0 through 1024; 0 requests CPU
+layers. This is an application input bound, not a model-capability claim. Omission
+preserves the runtime default. Both tool-less readiness and structured decisions
+carry the same explicit override, and the report records requested layers rather
+than claiming actual placement. Other providers refuse this option. These flags
+do not establish a CPU artifact/loader closure or authorize a runtime launch.
+The legacy direct-work evaluator does not qualify the current confirmed-proposal
+admission path; that path still needs its own configured-provider evidence.
+The entrypoint refuses a missing or
 changed source commit/tree, a dirty worktree, or production imports from another
 checkout before model execution, and verifies source stability again afterward.
 

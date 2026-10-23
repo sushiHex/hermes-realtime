@@ -389,6 +389,7 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
 
     def factory(**options: object) -> Decision:
         assert options["inference_provider"] == "ollama"
+        assert options["ollama_num_gpu"] == 0
         value = Decision()
         instances.append(value)
         return value
@@ -398,9 +399,11 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
         corpus=one_case, provider="ollama", mode="diagnostic_override",
         model="synthetic:latest", effort="low", codex_executable=None,
         ollama_base_url="http://127.0.0.1:11434", ollama_num_ctx=4096,
+        ollama_num_gpu=0,
     )
     assert report["provider"] == "ollama"
     assert report["mode"] == "diagnostic_override"
+    assert report["ollama_gpu_layers"] == 0
     assert report["tool_calls"]["by_tool"]["start_work"] == 1
     assert report["host_status_requests"]["count"] == 0
     assert report["host_status_requests"]["case_ids"] == []
