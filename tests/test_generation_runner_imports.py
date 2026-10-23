@@ -137,9 +137,8 @@ def test_pending_receipt_failure_still_cleans_profile(tmp_path, capsys):
     namespace = profile_namespace()
     result = dict(ok=True, stage="native-proof", case="synthetic", mutation="none")
 
-    class BrokenReceipt:
-        def write_text(self, *_args, **_kwargs):
-            raise PermissionError("synthetic")
+    def refuse_write(*_args):
+        raise PermissionError("synthetic")
 
     class Directory:
         def __init__(self, **_kwargs):
@@ -150,8 +149,9 @@ def test_pending_receipt_failure_still_cleans_profile(tmp_path, capsys):
             Path(self.name).rmdir()
 
     with (
+        patch.dict(namespace["checkpoint"].__globals__, write_receipt=refuse_write),
         patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
-        namespace["proof_profile"](BrokenReceipt(), result) as profile,
+        namespace["proof_profile"](tmp_path / "receipt.json", result) as profile,
     ):
         assert Path(profile).is_dir()
     assert not Path(profile).exists()
@@ -181,16 +181,21 @@ def test_final_receipt_failure_cannot_publish_success(tmp_path, capsys, primary_
     namespace = profile_namespace()
     result = dict(ok=True, stage="native-proof", case="synthetic", mutation="none")
 
-    class Receipt:
-        calls = 0
+    calls = []
+    original_write = namespace["write_receipt"]
 
-        def write_text(self, *_args, **_kwargs):
-            self.calls += 1
-            if self.calls == 2:
-                raise PermissionError("synthetic")
+    def refuse_final_write(*args):
+        calls.append(1)
+        if len(calls) == 2:
+            raise PermissionError("synthetic")
+        original_write(*args)
 
     expectation = pytest.raises(ValueError) if primary_failure else contextlib.nullcontext()
-    with expectation, namespace["proof_profile"](Receipt(), result) as profile:
+    with (
+        expectation,
+        patch.dict(namespace["checkpoint"].__globals__, write_receipt=refuse_final_write),
+        namespace["proof_profile"](tmp_path / "receipt.json", result) as profile,
+    ):
         assert Path(profile).is_dir()
         if primary_failure:
             raise ValueError("synthetic")
@@ -201,6 +206,51 @@ def test_final_receipt_failure_cannot_publish_success(tmp_path, capsys, primary_
     assert (
         json.loads(capsys.readouterr().out.split(" ", 1)[1])["category"] == "proof-receipt-refused"
     )
+
+
+def test_checkpoint_precedes_work_and_never_publishes_success(tmp_path):
+    # Mutations: omit checkpoint publication or retain semantic ok=True in it.
+    namespace = profile_namespace()
+    receipt = tmp_path / "receipt.json"
+    result = dict(ok=True, stage="setup")
+    with patch.object(namespace["time"], "monotonic", side_effect=[10, 12]):
+        namespace["checkpoint"](receipt, result, "export", 5)
+        first = json.loads(receipt.read_bytes())
+        assert first["ok"] is False and first["stage"] == "export"
+        namespace["checkpoint"](receipt, result, "import-bootstrap", 5)
+    observed = json.loads(receipt.read_bytes())
+    assert observed["ok"] is False and result["ok"] is True
+    assert observed["phase_timings"] == [
+        {"stage": "export", "elapsed_seconds": 5},
+        {"stage": "import-bootstrap", "elapsed_seconds": 7},
+    ]
+
+
+@pytest.mark.parametrize("failure", ["write", "replace"])
+def test_interrupted_checkpoint_preserves_previous_evidence(tmp_path, failure):
+    # Mutation: write directly over the retained receipt instead of a temporary file.
+    namespace = profile_namespace()
+    receipt = tmp_path / "receipt.json"
+    namespace["write_receipt"](receipt, {"ok": False, "stage": "source-verification"})
+    previous = receipt.read_bytes()
+    result = dict(ok=False, stage="setup")
+    work = []
+    original_write = Path.write_text
+
+    def interrupted_write(path, *_args, **_kwargs):
+        original_write(path, "partial synthetic evidence")
+        raise PermissionError("synthetic")
+
+    fault = (
+        patch.object(Path, "write_text", interrupted_write)
+        if failure == "write"
+        else patch.object(namespace["os"], "replace", side_effect=PermissionError("synthetic"))
+    )
+    with fault, pytest.raises(PermissionError):
+        namespace["checkpoint"](receipt, result, "export", 0)
+        work.append(1)
+    assert not work and receipt.read_bytes() == previous
+    assert result["receipt_category"] == "proof-receipt-refused"
 
 
 @pytest.mark.parametrize("semantic_ok", [False, True])

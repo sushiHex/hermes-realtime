@@ -121,11 +121,33 @@ def python_manifest(source):
     }
 
 
+def write_receipt(receipt, result):
+    """Replace evidence only after a complete new snapshot has been written."""
+    pending = receipt.with_name(receipt.name + ".pending")
+    pending.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(pending, receipt)
+
+
+def checkpoint(receipt, result, stage, started):
+    result["stage"] = stage
+    result.setdefault("phase_timings", []).append(
+        {"stage": stage, "elapsed_seconds": round(time.monotonic() - started, 3)}
+    )
+    try:
+        write_receipt(receipt, {**result, "ok": False})
+    except BaseException as exc:
+        result.update(
+            receipt_category="proof-receipt-refused", receipt_error_kind=type(exc).__name__
+        )
+        raise
+
+
 @contextlib.contextmanager
-def proof_profile(receipt, result):
+def proof_profile(receipt, result, started=None):
     """Keep semantic evidence pending until the disposable profile is removed."""
     directory = tempfile.TemporaryDirectory(prefix="hr-plugin-proof-")
-    started = time.monotonic()
+    profile_started = time.monotonic()
+    started = profile_started if started is None else started
     try:
         yield directory.name
     except BaseException as exc:
@@ -138,7 +160,7 @@ def proof_profile(receipt, result):
         result.update(ok=False, stage="profile-cleanup", profile_cleanup="pending")
         pending_recorded = False
         try:
-            receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            checkpoint(receipt, result, "profile-cleanup", started)
             pending_recorded = True
         except BaseException as exc:
             result.update(
@@ -157,12 +179,12 @@ def proof_profile(receipt, result):
                 cleanup_category="profile-cleanup-refused",
                 cleanup_error_kind=type(exc).__name__,
             )
-        result["profile_elapsed_seconds"] = round(time.monotonic() - started, 3)
+        result["profile_elapsed_seconds"] = round(time.monotonic() - profile_started, 3)
         result["profile_cleanup_seconds"] = round(time.monotonic() - cleanup_started, 3)
         result["stage"] = "finished"
         if pending_recorded:
             try:
-                receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+                write_receipt(receipt, result)
             except BaseException as exc:
                 result.update(
                     ok=False,
@@ -194,6 +216,7 @@ def proof_profile(receipt, result):
 
 
 def main():
+    started = time.monotonic()
     args = arguments()
     args.hermes_source = args.hermes_source.resolve()
     args.receipt = args.receipt.resolve()
@@ -216,6 +239,7 @@ def main():
             raise RuntimeError("optimized-mode-unsupported")
         if not sys.flags.isolated or not sys.flags.no_site or not sys.dont_write_bytecode:
             raise RuntimeError("isolated-no-site-no-bytecode-required")
+        checkpoint(args.receipt, result, "source-verification", started)
         result.update(verify_source(args.hermes_source))
         result["runner_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except BaseException as exc:
@@ -223,10 +247,10 @@ def main():
         if str(exc) in {"optimized-mode-unsupported", "isolated-no-site-no-bytecode-required"}:
             result["category"] = str(exc)
         result["frames"] = [frame.name for frame in traceback.extract_tb(exc.__traceback__)[-6:]]
-        args.receipt.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+        write_receipt(args.receipt, result)
         return 1
     with (
-        proof_profile(args.receipt, result) as profile,
+        proof_profile(args.receipt, result, started) as profile,
         contextlib.ExitStack() as restore,
     ):
         restore.callback(os.chdir, Path.cwd())
@@ -242,12 +266,15 @@ def main():
             )
             cases_helper, result["cases_sha256"] = load_reviewed("generation_native_cases")
             result["reviewed_helpers_loading"] = "exact-source-bytes"
+            checkpoint(args.receipt, result, "export", started)
             result.update(
                 source_helper.export_tree(args.hermes_source, result["hermes_commit"], exported)
             )
+            checkpoint(args.receipt, result, "import-bootstrap", started)
             result.update(
                 imports_helper.configure_imports(exported, args.hermes_source, PROOF_ROOT)
             )
+            checkpoint(args.receipt, result, "python-manifest", started)
             result.update(python_manifest(exported))
             result["source_preparation_seconds"] = round(time.monotonic() - preparation_started, 3)
         except BaseException as exc:
@@ -354,7 +381,7 @@ def main():
         sys.addaudithook(no_external)
         proof_started = time.monotonic()
         try:
-            result["stage"] = "native-proof"
+            checkpoint(args.receipt, result, "test", started)
             result.update(loop.run_until_complete(cases_helper.prove(port, key, result, args.case)))
             result["ok"] = True
         except BaseException as exc:
@@ -369,9 +396,12 @@ def main():
         finally:
             try:
                 try:
-                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    checkpoint(args.receipt, result, "finalization", started)
                 finally:
-                    loop.run_until_complete(loop.shutdown_default_executor())
+                    try:
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                    finally:
+                        loop.run_until_complete(loop.shutdown_default_executor())
             except BaseException as exc:
                 result.update(
                     ok=False, category="proof-finalization-refused", error_kind=type(exc).__name__
@@ -379,6 +409,7 @@ def main():
             loop.close()
             logging.shutdown()
             try:
+                checkpoint(args.receipt, result, "origin-verification", started)
                 result.update(imports_helper.verify_import_origins(exported))
             except BaseException as exc:
                 result.update(
