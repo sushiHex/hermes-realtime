@@ -511,6 +511,7 @@ def _missing_promisor_blob(committed, tmp_path):
         "import subprocess, sys\nfrom pathlib import Path\n"
         "Path(sys.argv[1]).write_text('called', encoding='utf-8')\n"
         "raise SystemExit(subprocess.run(['git', 'upload-pack', *sys.argv[2:]], "
+        "stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr, "
         "timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode)\n",
         encoding="utf-8",
     )
