@@ -518,11 +518,29 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
             if fault == "none":
                 assert events == ["wait", "members", "handle-closed", "delete"]
                 assert result["ok"] is True and not Path(profile).exists()
+                assert result["worker_nonce_match"] is True
+                assert (result["worker_job_member_count"], result["worker_job_self_present"]) == (
+                    1,
+                    True,
+                )
             else:
                 assert "delete" not in events and Path(profile).exists()
                 assert result["ok"] is False and result["profile_cleanup"] == "preserved"
                 if fault == "timeout":
                     assert events == ["wait", "kill", "wait", "handle-closed"]
+                if fault == "nonce":
+                    assert result["worker_nonce_match"] is False
+                if fault == "job":
+                    assert (
+                        result["worker_job_member_count"],
+                        result["worker_job_self_present"],
+                    ) == (2, True)
         finally:
             if profile is not None and Path(profile).exists():
                 original_remove(profile)
+
+
+def test_worker_refusal_metadata_is_fixed_and_path_free():
+    classify = profile_namespace()["worker_refusal_category"]
+    assert classify(RuntimeError("worker-job-not-settled")) == "worker-job-not-settled"
+    assert classify(RuntimeError("private/path")) == "worker-refused"

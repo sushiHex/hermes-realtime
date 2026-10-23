@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1â€“5 searches may be followed by one extraction of 1â€“3
+- One complete batch of 1Ã¢â‚¬â€œ5 searches may be followed by one extraction of 1Ã¢â‚¬â€œ3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -186,6 +186,22 @@ run. Receipt SHA-256:
 The private parent mislabeled its category as `passed` while preserving exit 1
 and `ok: false`; that classifier was corrected separately without rewriting the
 failed receipt. This PR stays draft; native smoke, cleanup and #329 remain held.
+
+Later exception-derived diagnostics identified an owned logging lock, then an
+owned database sharing violation. The supported logging queue drain was added;
+no private database or agent state was patched. The ownership correction moves
+profile deletion after normal worker exit rather than guessing individual handle
+owners.
+
+The first parent-owned attempt at source commit
+`c1529d711f86410e41684f7e3ad7d6936f96cf98` exited overall false in 15.547 seconds.
+Its worker exited normally, completed one native Run and passed semantic checks;
+the controller refused before deletion and preserved the profile. All retained
+source/envelope values match, but the expected nonce and Job snapshot were not
+retained, so the exact refusing guard is unknown. Receipt SHA-256:
+`8b70982d8343111036d1638b630f7b92518f54c40c68c70678ce81893d86656a`.
+The diagnostic correction records only named refusal categories, nonce-match and
+Job count/self-presence. No guard is weakened and no cleanup pass is claimed.
 
 Earlier 60-second failures remain preserved, including a cleanup timeout and a
 later interruption after 7,992 files in the serial materialization/per-file-hash

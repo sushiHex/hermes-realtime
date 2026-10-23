@@ -584,6 +584,9 @@ def run_owned_worker(args, home, result, owner, started):
             raise
         result["worker_exit_code"] = exit_code
         observed = json.loads(receipt.read_bytes())
+        result["worker_nonce_match"] = (
+            type(observed) is dict and observed.get("worker_nonce") == nonce
+        )
         # The worker is never an overall-success authority, even on normal exit.
         if (
             type(observed) is not dict
@@ -610,7 +613,11 @@ def run_owned_worker(args, home, result, owner, started):
             loaded["mutations_sha256"] = "generation_policy_mutations.py"
         if any(observed.get(field) != expected.get(name) for field, name in loaded.items()):
             raise RuntimeError("worker-loaded-source-refused")
-        if owner.members() != {os.getpid()}:
+        members = owner.members()
+        result.update(
+            worker_job_member_count=len(members), worker_job_self_present=os.getpid() in members
+        )
+        if members != {os.getpid()}:
             raise RuntimeError("worker-job-not-settled")
         # Abnormal exits preserve the profile even when the process has settled.
         if exit_code not in (0, 1) or (exit_code == 0) is not observed["semantic_ok"]:
@@ -624,6 +631,18 @@ def run_owned_worker(args, home, result, owner, started):
             child_settled=True,
             worker_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
         )
+
+
+def worker_refusal_category(exc):
+    named = {
+        "worker-receipt-exists",
+        "worker-evidence-refused",
+        "worker-loaded-source-refused",
+        "worker-job-not-settled",
+        "worker-exit-refused",
+        "worker-semantic-refused",
+    }
+    return str(exc) if type(exc) is RuntimeError and str(exc) in named else "worker-refused"
 
 
 def main():
@@ -663,7 +682,7 @@ def main():
                 result.update(
                     ok=False,
                     child_settled=False,
-                    category="worker-refused",
+                    category=worker_refusal_category(exc),
                     error_kind=type(exc).__name__,
                 )
     except BaseException as exc:
