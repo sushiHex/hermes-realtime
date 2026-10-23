@@ -30,18 +30,31 @@ def test_failure_sites_excludes_private_exception_data():
 
 
 @pytest.mark.parametrize("case", ["healthy", "timeout-then-pending", "expired", "late"])
-def test_pending_observation_shares_absolute_deadline(case):
-    clock = [12.0 if case == "expired" else 0.0]
+@pytest.mark.parametrize("phase", ["pending", "completion"])
+def test_pending_observation_shares_absolute_deadline(case, phase):
+    deadline = 12.0 if phase == "pending" else 15.0
+    clock = [deadline if case == "expired" else 0.0]
     attempts = []
+    path = "/generation-proof/state" if phase == "pending" else "/v1/runs/accepted"
 
-    def state(_port, _key, path, *, timeout=1.0):
-        assert path == "/generation-proof/state"
+    def state(_port, _key, actual_path, *, timeout=1.0):
+        assert actual_path == path
         attempts.append(timeout)
         if case == "timeout-then-pending" and len(attempts) == 1:
-            clock[0] = 11.5
+            clock[0] = deadline - 0.5
             raise TimeoutError
-        clock[0] = 12.1 if case == "late" else clock[0]
-        return 200, {"waiting": True, "counts": {"accepted": {"search": 1}}}, {}
+        clock[0] = deadline + 0.1 if case == "late" else clock[0]
+        return (
+            200,
+            {"waiting": True, "counts": {"accepted": {"search": 1}}, "status": "completed"},
+            {},
+        )
+
+    def observe():
+        if phase == "pending":
+            proof.observe_pending(12345, "synthetic", "accepted", deadline)
+        else:
+            assert proof.get_before(12345, "synthetic", path, deadline)[1]["status"] == "completed"
 
     with (
         patch.object(proof, "request", side_effect=state),
@@ -49,9 +62,9 @@ def test_pending_observation_shares_absolute_deadline(case):
     ):
         if case in {"expired", "late"}:
             with pytest.raises(proof.Refusal):
-                proof.observe_pending(12345, "synthetic", "accepted", 12.0)
+                observe()
         else:
-            proof.observe_pending(12345, "synthetic", "accepted", 12.0)
+            observe()
     assert (
         attempts
         == {"healthy": [1.0], "timeout-then-pending": [1.0, 0.5], "expired": [], "late": [1.0]}[

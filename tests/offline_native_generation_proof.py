@@ -188,7 +188,7 @@ def wait_ready(process, port, key, receipt, nonce):
             raise Refusal("native-child-exited")
         if receipt.is_file():
             binding = json.loads(receipt.read_bytes())
-            status, ready, _ = request(port, key, "/lookup-policy/ready")
+            status, ready, _ = get_before(port, key, "/lookup-policy/ready", deadline)
             if status != 200 or binding["nonce"] != nonce or ready != binding["ready"]:
                 raise Refusal("native-readiness-binding")
             return {**ready, "nonce": nonce}
@@ -196,19 +196,24 @@ def wait_ready(process, port, key, receipt, nonce):
     raise Refusal("native-readiness-timeout")
 
 
-def observe_pending(port, key, run_id, deadline):
+def get_before(port, key, path, deadline):
+    """Retry only read-only GET timeouts within the caller's absolute budget."""
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise Refusal("pending-native-worker-unproven")
+            raise Refusal("native-read-deadline")
         try:
-            _, snapshot, _ = request(
-                port, key, "/generation-proof/state", timeout=min(1.0, remaining)
-            )
+            result = request(port, key, path, timeout=min(1.0, remaining))
         except TimeoutError:
             continue
         if time.monotonic() >= deadline:
-            raise Refusal("pending-native-worker-unproven")
+            raise Refusal("native-read-deadline")
+        return result
+
+
+def observe_pending(port, key, run_id, deadline):
+    while True:
+        _, snapshot, _ = get_before(port, key, "/generation-proof/state", deadline)
         if snapshot["waiting"] and snapshot["counts"].get(run_id, {}).get("search") == 1:
             return
         time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
@@ -553,7 +558,9 @@ def controller(args):
             raise Refusal("fresh-generation-dispatch")
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            _, finished, final_headers = request(args.port, key, "/v1/runs/" + fresh["run_id"])
+            _, finished, final_headers = get_before(
+                args.port, key, "/v1/runs/" + fresh["run_id"], deadline
+            )
             if finished["status"] == "completed":
                 break
             time.sleep(0.05)
