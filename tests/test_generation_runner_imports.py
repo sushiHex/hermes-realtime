@@ -80,7 +80,9 @@ def test_cleanup_pending_is_not_overall_success(tmp_path):
     # Mutation: retain ok=True in the pre-cleanup receipt.
     namespace = profile_namespace()
     receipt = tmp_path / "receipt.json"
-    result = dict(ok=True, stage="native-proof", case="synthetic", mutation="none")
+    result = dict(
+        child_settled=True, ok=True, stage="native-proof", case="synthetic", mutation="none"
+    )
     seen = []
 
     class Directory:
@@ -93,7 +95,7 @@ def test_cleanup_pending_is_not_overall_success(tmp_path):
             seen.append(json.loads(receipt.read_bytes()))
 
     with (
-        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, new_profile=Directory),
         namespace["proof_profile"](receipt, result),
     ):
         assert not receipt.exists()
@@ -107,7 +109,12 @@ def test_cleanup_failure_preserves_primary_refusal(tmp_path, capsys):
     namespace = profile_namespace()
     receipt = tmp_path / "receipt.json"
     result = dict(
-        ok=True, stage="native-proof", case="synthetic", mutation="none", error_kind="PrimaryKind"
+        child_settled=True,
+        ok=True,
+        stage="native-proof",
+        case="synthetic",
+        mutation="none",
+        error_kind="PrimaryKind",
     )
 
     class Directory:
@@ -120,7 +127,7 @@ def test_cleanup_failure_preserves_primary_refusal(tmp_path, capsys):
             raise PermissionError("synthetic")
 
     with (
-        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, new_profile=Directory),
         namespace["proof_profile"](receipt, result),
     ):
         pass
@@ -138,7 +145,9 @@ def test_cleanup_failure_preserves_primary_refusal(tmp_path, capsys):
 def test_pending_receipt_failure_still_cleans_profile(tmp_path, capsys):
     # Mutation: skip directory cleanup when the pending evidence write fails.
     namespace = profile_namespace()
-    result = dict(ok=True, stage="native-proof", case="synthetic", mutation="none")
+    result = dict(
+        child_settled=True, ok=True, stage="native-proof", case="synthetic", mutation="none"
+    )
 
     def refuse_write(*_args):
         raise PermissionError("synthetic")
@@ -153,7 +162,7 @@ def test_pending_receipt_failure_still_cleans_profile(tmp_path, capsys):
 
     with (
         patch.dict(namespace["checkpoint"].__globals__, write_receipt=refuse_write),
-        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, new_profile=Directory),
         namespace["proof_profile"](tmp_path / "receipt.json", result) as profile,
     ):
         assert Path(profile).is_dir()
@@ -169,7 +178,7 @@ def test_profile_body_failure_cannot_publish_success(tmp_path):
     # Mutation: leave the preceding successful semantic result after body failure.
     namespace = profile_namespace()
     receipt = tmp_path / "receipt.json"
-    result = dict(ok=True, stage="setup", case="synthetic", mutation="none")
+    result = dict(child_settled=True, ok=True, stage="setup", case="synthetic", mutation="none")
     with pytest.raises(ValueError), namespace["proof_profile"](receipt, result):
         raise ValueError("synthetic")
     observed = json.loads(receipt.read_bytes())
@@ -182,7 +191,9 @@ def test_profile_body_failure_cannot_publish_success(tmp_path):
 def test_final_receipt_failure_cannot_publish_success(tmp_path, capsys, primary_failure):
     # Mutation: retain successful overall state when the final evidence write fails.
     namespace = profile_namespace()
-    result = dict(ok=True, stage="native-proof", case="synthetic", mutation="none")
+    result = dict(
+        child_settled=True, ok=True, stage="native-proof", case="synthetic", mutation="none"
+    )
 
     calls = []
     original_write = namespace["write_receipt"]
@@ -215,7 +226,7 @@ def test_checkpoint_precedes_work_and_never_publishes_success(tmp_path):
     # Mutations: omit checkpoint publication or retain semantic ok=True in it.
     namespace = profile_namespace()
     receipt = tmp_path / "receipt.json"
-    result = dict(ok=True, stage="setup")
+    result = dict(child_settled=True, ok=True, stage="setup")
     with patch.object(namespace["time"], "monotonic", side_effect=[10, 12]):
         namespace["checkpoint"](receipt, result, "export", 5)
         first = json.loads(receipt.read_bytes())
@@ -236,7 +247,7 @@ def test_interrupted_checkpoint_preserves_previous_evidence(tmp_path, failure):
     receipt = tmp_path / "receipt.json"
     namespace["write_receipt"](receipt, {"ok": False, "stage": "source-verification"})
     previous = receipt.read_bytes()
-    result = dict(ok=False, stage="setup")
+    result = dict(child_settled=True, ok=False, stage="setup")
     work = []
     original_write = Path.write_text
 
@@ -260,7 +271,9 @@ def test_interrupted_checkpoint_preserves_previous_evidence(tmp_path, failure):
 def test_cleanup_healthy_control(tmp_path, semantic_ok):
     namespace = profile_namespace()
     receipt = tmp_path / "receipt.json"
-    result = dict(ok=semantic_ok, stage="native-proof", case="synthetic", mutation="none")
+    result = dict(
+        child_settled=True, ok=semantic_ok, stage="native-proof", case="synthetic", mutation="none"
+    )
     with namespace["proof_profile"](receipt, result) as profile:
         assert Path(profile).is_dir()
     observed = json.loads(receipt.read_bytes())
@@ -275,7 +288,7 @@ def test_cleanup_target_metadata_is_owned_and_private(tmp_path, outside, write_f
     profile = tmp_path / "profile"
     target = (tmp_path if outside else profile) / "state.db"
     sidecar = tmp_path / "private.json"
-    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+    result = dict(child_settled=True, ok=True, stage="test", case="synthetic", mutation="none")
     error = PermissionError(errno.EACCES, "synthetic", str(target))
     error.winerror = 32
 
@@ -296,7 +309,7 @@ def test_cleanup_target_metadata_is_owned_and_private(tmp_path, outside, write_f
         original(path, record)
 
     with (
-        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, new_profile=Directory),
         patch.dict(namespace["checkpoint"].__globals__, write_receipt=write),
         namespace["proof_profile"](
             tmp_path / "receipt.json", result, private_cleanup_evidence=sidecar
@@ -332,7 +345,7 @@ def test_cleanup_operation_uses_actual_stdlib_failure(tmp_path):
 
 def test_cleanup_classifier_failure_preserves_primary_refusal(tmp_path):
     namespace = profile_namespace()
-    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+    result = dict(child_settled=True, ok=True, stage="test", case="synthetic", mutation="none")
 
     class Directory:
         name = str(tmp_path / "profile")
@@ -344,7 +357,7 @@ def test_cleanup_classifier_failure_preserves_primary_refusal(tmp_path):
             raise PermissionError("synthetic primary")
 
     with (
-        patch.object(namespace["tempfile"], "TemporaryDirectory", Directory),
+        patch.dict(namespace["checkpoint"].__globals__, new_profile=Directory),
         patch.dict(namespace["checkpoint"].__globals__, cleanup_failure_details=lambda *_: 1 / 0),
         namespace["proof_profile"](tmp_path / "receipt.json", result),
     ):
@@ -368,7 +381,7 @@ def test_cleanup_private_output_cannot_alias_receipt(tmp_path):
 def test_logging_owner_drains_before_handler_close(tmp_path, drain_failure):
     namespace = profile_namespace()
     observed = []
-    result = dict(ok=True, stage="test", case="synthetic", mutation="none")
+    result = dict(child_settled=True, ok=True, stage="test", case="synthetic", mutation="none")
 
     def drain(*, timeout):
         observed.append(("drain", timeout))
@@ -390,3 +403,126 @@ def test_logging_owner_drains_before_handler_close(tmp_path, drain_failure):
                 namespace["shutdown_logging"]()
     assert observed == [("drain", 1.0), "close"]
     assert result["ok"] is (not drain_failure)
+
+
+def test_unsettled_child_preserves_profile_and_refuses_success(tmp_path):
+    namespace = profile_namespace()
+    result = dict(ok=True, child_settled=False, stage="worker", case="synthetic", mutation="none")
+    profile = None
+    try:
+        with namespace["proof_profile"](tmp_path / "receipt.json", result) as profile:
+            pass
+        assert Path(profile).exists(), "unsettled-profile-was-deleted"
+        assert result["ok"] is False and result["profile_cleanup"] == "preserved"
+    finally:
+        if profile is not None:
+            shutil.rmtree(profile, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "source", "loaded", "nonce", "job", "exit", "semantic", "timeout"]
+)
+def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
+    namespace = profile_namespace()
+    events = []
+    receipt = tmp_path / "receipt.json"
+    args = types.SimpleNamespace(
+        receipt=receipt, hermes_source=tmp_path, case="healthy", mutation="none"
+    )
+    result = dict(ok=False, child_settled=False, stage="worker", case="healthy", mutation="none")
+    expected = namespace["reviewed_bindings"]()
+    observed = dict(
+        ok=False,
+        semantic_ok=fault != "semantic",
+        worker_nonce="expected",
+        case="healthy",
+        mutation="none",
+        reviewed_source_bindings=expected.copy(),
+    )
+    observed.update(
+        {
+            field: expected[name]
+            for field, name in {
+                "runner_sha256": "offline_plugin_generation_proof.py",
+                "source_export_helper_sha256": "generation_source.py",
+                "source_import_helper_sha256": "generation_imports.py",
+                "cases_sha256": "generation_native_cases.py",
+                "guard_checks_sha256": "generation_policy_checks.py",
+                "fixture_sha256": "fixtures/plugin_generation_candidate/__init__.py",
+                "policy_sha256": "fixtures/plugin_generation_candidate/policy.py",
+                "entrypoint_sha256": "fixtures/plugin_generation_candidate/entrypoint.py",
+                "fixture_manifest_sha256": "fixtures/plugin_generation_candidate/plugin.yaml",
+            }.items()
+        }
+    )
+    if fault == "loaded":
+        observed["source_import_helper_sha256"] = "changed"
+    if fault == "source":
+        observed["reviewed_source_bindings"] = {"source": "changed"}
+    if fault == "nonce":
+        observed["worker_nonce"] = "stale"
+
+    class Child:
+        calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            events.append("handle-closed")
+
+        def wait(self, *, timeout):
+            assert 0 < timeout <= 60
+            self.calls += 1
+            events.append("wait")
+            if fault == "timeout" and self.calls == 1:
+                raise subprocess.TimeoutExpired("synthetic", timeout)
+            receipt.with_name(receipt.name + ".worker.json").write_text(json.dumps(observed))
+            return 2 if fault == "exit" else 1 if fault == "semantic" else 0
+
+        def kill(self):
+            events.append("kill")
+
+    def members():
+        events.append("members")
+        return {os.getpid(), -1} if fault == "job" else {os.getpid()}
+
+    original_remove = shutil.rmtree
+
+    def remove(path):
+        events.append("delete")
+        original_remove(path)
+
+    globals_ = namespace["run_owned_worker"].__globals__
+    child = Child()
+    profile = None
+    with (
+        patch.dict(globals_, reviewed_bindings=lambda: expected),
+        patch.object(namespace["secrets"], "token_hex", return_value="expected"),
+        patch.object(subprocess, "Popen", return_value=child),
+        patch.object(subprocess, "CREATE_NO_WINDOW", 0, create=True),
+        patch.object(shutil, "rmtree", side_effect=remove),
+    ):
+        try:
+            with namespace["proof_profile"](receipt, result) as profile:
+                try:
+                    namespace["run_owned_worker"](
+                        args,
+                        profile,
+                        result,
+                        types.SimpleNamespace(members=members),
+                        namespace["time"].monotonic(),
+                    )
+                except (RuntimeError, subprocess.TimeoutExpired):
+                    result["ok"] = False
+            if fault == "none":
+                assert events == ["wait", "members", "handle-closed", "delete"]
+                assert result["ok"] is True and not Path(profile).exists()
+            else:
+                assert "delete" not in events and Path(profile).exists()
+                assert result["ok"] is False and result["profile_cleanup"] == "preserved"
+                if fault == "timeout":
+                    assert events == ["wait", "kill", "wait", "handle-closed"]
+        finally:
+            if profile is not None and Path(profile).exists():
+                original_remove(profile)

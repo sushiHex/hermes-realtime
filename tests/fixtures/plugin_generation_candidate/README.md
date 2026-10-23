@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1–5 searches may be followed by one extraction of 1–3
+- One complete batch of 1â€“5 searches may be followed by one extraction of 1â€“3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -52,9 +52,12 @@ environment variables: `HERMES_PROOF_PYTHON` (that environment's venv interprete
 `HERMES_PROOF_SOURCE` (its checkout), and `HERMES_PROOF_RECEIPT` (a new output file).
 Optional `HERMES_PROOF_CASE` and `HERMES_PROOF_MUTATION` default to `healthy` and
 `none`. Run the following with an ordinary Python interpreter; it launches the
-existing runner hidden on Windows, discards standard streams, filters common
+existing Windows-only runner hidden, discards standard streams, filters common
 credential-variable names, refuses an already-existing receipt and bounds the
-whole child to 60 seconds. Use a unique receipt destination without concurrent
+whole controller, worker, export and cleanup to the same 60 seconds. The controller
+reuses the existing rehearsal kill-on-close Job; it must itself be a disposable
+hidden subprocess. It never closes that Job while it contains the controller.
+Use a unique receipt destination without concurrent
 writers; this preflight is not an atomic filesystem reservation:
 
 ```python
@@ -92,7 +95,18 @@ finally:
     print("[plugin-proof-launch] " + json.dumps({"category": category}))
 ```
 
-Inspect the bounded receipt, not just the launch category. Setup refusal, timeout,
+The controller is the sole overall-success authority. The internal worker writes
+`<receipt>.worker.json` with `ok: false` and separate semantic results, then exits
+normally so Hermes/Python finalizers release process-owned handles. The controller
+retains its exact child handle through exit and requires matching nonce, source
+bindings, semantic success and Job membership containing only itself before one
+profile deletion. Only successful deletion permits the final receipt to become
+true. Timeout, abnormal exit, bad evidence or unsettled membership preserves the
+profile and overall false. There is no per-resource teardown fallback or retry.
+The outer 60-second caller is mandatory; it bounds cleanup as well as the worker.
+Linux product behavior is unchanged; this opt-in owner composition is Windows-only.
+
+Inspect the bounded receipt and worker receipt, not just the launch category. Setup refusal, timeout,
 missing receipt and an unexpected assertion are failures, never permission to
 retry or repair automatically. `--help` lists cases; mutations are defined in
 `tests/generation_policy_mutations.py` and affect only the copied disposable

@@ -12,6 +12,7 @@ import json
 import linecache
 import logging
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -83,6 +84,8 @@ def arguments():
     )
     parser.add_argument("--mutation", default="none")
     parser.add_argument("--private-cleanup-evidence", type=Path)
+    parser.add_argument("--worker-profile", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-nonce", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -209,6 +212,12 @@ def shutdown_logging():
         logging.shutdown()
 
 
+def new_profile():
+    # No automatic finalizer: abnormal worker exit must preserve the owned profile.
+    name = tempfile.mkdtemp(prefix="hr-plugin-proof-")
+    return types.SimpleNamespace(name=name, cleanup=lambda: shutil.rmtree(name))
+
+
 @contextlib.contextmanager
 def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
     """Keep semantic evidence pending until the disposable profile is removed."""
@@ -217,7 +226,7 @@ def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
         and private_cleanup_evidence.resolve() == receipt.resolve()
     ):
         raise ValueError("cleanup-evidence-path-conflict")
-    directory = tempfile.TemporaryDirectory(prefix="hr-plugin-proof-")
+    directory = new_profile()
     profile_started = time.monotonic()
     started = profile_started if started is None else started
     try:
@@ -240,10 +249,13 @@ def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
             )
         cleanup_started = time.monotonic()
         try:
-            directory.cleanup()
-            result.update(
-                ok=result["semantic_ok"] and pending_recorded, profile_cleanup="completed"
-            )
+            if result.get("child_settled") is not True:
+                result.update(profile_cleanup="preserved", cleanup_category="worker-not-settled")
+            else:
+                directory.cleanup()
+                result.update(
+                    ok=result["semantic_ok"] and pending_recorded, profile_cleanup="completed"
+                )
         except BaseException as exc:
             result.update(
                 ok=False,
@@ -299,9 +311,8 @@ def proof_profile(receipt, result, started=None, private_cleanup_evidence=None):
         )
 
 
-def main():
+def worker(args):
     started = time.monotonic()
-    args = arguments()
     args.hermes_source = args.hermes_source.resolve()
     args.receipt = args.receipt.resolve()
     result = {
@@ -317,6 +328,8 @@ def main():
         "native_completed": 0,
         "stand_in_calls": 0,
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "reviewed_source_bindings": reviewed_bindings(),
+        "worker_nonce": args.worker_nonce,
     }
     try:
         if not __debug__:
@@ -333,12 +346,10 @@ def main():
         result["frames"] = [frame.name for frame in traceback.extract_tb(exc.__traceback__)[-6:]]
         write_receipt(args.receipt, result)
         return 1
-    with (
-        proof_profile(args.receipt, result, started, args.private_cleanup_evidence) as profile,
-        contextlib.ExitStack() as restore,
-    ):
+    with contextlib.ExitStack() as restore:
         restore.callback(os.chdir, Path.cwd())
-        home = Path(profile)
+        home = args.worker_profile
+        profile = str(home)
         exported = home / "committed-source"
         preparation_started = time.monotonic()
         try:
@@ -502,6 +513,168 @@ def main():
                     ok=False, category="source-import-refused", error_kind=type(exc).__name__
                 )
             result["native_proof_seconds"] = round(time.monotonic() - proof_started, 3)
+    result.update(semantic_ok=result["ok"], ok=False, profile_cleanup="parent-owned-pending")
+    write_receipt(args.receipt, result)
+    return 0 if result["semantic_ok"] else 1
+
+
+def reviewed_bindings():
+    names = (
+        "offline_plugin_generation_proof.py",
+        "generation_native_cases.py",
+        "generation_policy_mutations.py",
+        "generation_source.py",
+        "generation_imports.py",
+        "generation_policy_checks.py",
+        *(
+            "fixtures/plugin_generation_candidate/" + name
+            for name in ("__init__.py", "policy.py", "entrypoint.py", "plugin.yaml")
+        ),
+    )
+    return {name: hashlib.sha256((PROOF_ROOT / name).read_bytes()).hexdigest() for name in names}
+
+
+def run_owned_worker(args, home, result, owner, started):
+    """Keep the exact child handle through exit, then validate its evidence and Job."""
+    receipt = args.receipt.with_name(args.receipt.name + ".worker.json")
+    if receipt.exists():
+        raise RuntimeError("worker-receipt-exists")
+    nonce = secrets.token_hex(16)
+    expected = reviewed_bindings()
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        str(Path(__file__).resolve()),
+        "--hermes-source",
+        str(args.hermes_source),
+        "--receipt",
+        str(receipt),
+        "--case",
+        args.case,
+        "--mutation",
+        args.mutation,
+        "--worker-profile",
+        str(home),
+        "--worker-nonce",
+        nonce,
+    ]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not any(part in key.upper() for part in ("TOKEN", "API_KEY", "SECRET", "PASSWORD"))
+    }
+    with subprocess.Popen(
+        command,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    ) as child:
+        try:
+            remaining = 60 - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 60)
+            exit_code = child.wait(timeout=remaining)
+        except BaseException:
+            child.kill()
+            child.wait(timeout=max(0.001, 60 - (time.monotonic() - started)))
+            raise
+        result["worker_exit_code"] = exit_code
+        observed = json.loads(receipt.read_bytes())
+        # The worker is never an overall-success authority, even on normal exit.
+        if (
+            type(observed) is not dict
+            or observed.get("ok") is not False
+            or type(observed.get("semantic_ok")) is not bool
+            or observed.get("worker_nonce") != nonce
+            or observed.get("case") != args.case
+            or observed.get("mutation") != args.mutation
+            or observed.get("reviewed_source_bindings") != expected
+        ):
+            raise RuntimeError("worker-evidence-refused")
+        loaded = {
+            "runner_sha256": "offline_plugin_generation_proof.py",
+            "source_export_helper_sha256": "generation_source.py",
+            "source_import_helper_sha256": "generation_imports.py",
+            "cases_sha256": "generation_native_cases.py",
+            "guard_checks_sha256": "generation_policy_checks.py",
+            "fixture_sha256": "fixtures/plugin_generation_candidate/__init__.py",
+            "policy_sha256": "fixtures/plugin_generation_candidate/policy.py",
+            "entrypoint_sha256": "fixtures/plugin_generation_candidate/entrypoint.py",
+            "fixture_manifest_sha256": "fixtures/plugin_generation_candidate/plugin.yaml",
+        }
+        if args.mutation != "none":
+            loaded["mutations_sha256"] = "generation_policy_mutations.py"
+        if any(observed.get(field) != expected.get(name) for field, name in loaded.items()):
+            raise RuntimeError("worker-loaded-source-refused")
+        if owner.members() != {os.getpid()}:
+            raise RuntimeError("worker-job-not-settled")
+        # Abnormal exits preserve the profile even when the process has settled.
+        if exit_code not in (0, 1) or (exit_code == 0) is not observed["semantic_ok"]:
+            raise RuntimeError("worker-exit-refused")
+        if exit_code != 0:
+            result.update(observed, ok=False)
+            raise RuntimeError("worker-semantic-refused")
+        result.update(
+            observed,
+            ok=True,
+            child_settled=True,
+            worker_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        )
+
+
+def main():
+    args = arguments()
+    args.hermes_source = args.hermes_source.resolve()
+    args.receipt = args.receipt.resolve()
+    if args.worker_profile is not None:
+        return worker(args)
+    started = time.monotonic()
+    result = dict(
+        ok=False,
+        child_settled=False,
+        stage="controller",
+        case=args.case,
+        mutation=args.mutation,
+        complete_enforcement_qualified=False,
+    )
+    try:
+        if not __debug__:
+            raise RuntimeError("optimized-mode-unsupported")
+        if not sys.flags.isolated or not sys.flags.no_site or not sys.dont_write_bytecode:
+            raise RuntimeError("isolated-no-site-no-bytecode-required")
+        if os.name != "nt":
+            raise RuntimeError("windows-controller-required")
+        scripts = PROOF_ROOT.parent / "scripts"
+        owner_bindings = {}
+        for name in ("local_livekit", "real_gate_support", "rehearse_desktop_mvp"):
+            module, owner_bindings[name] = load_reviewed(name, scripts)
+            sys.modules[name] = module
+        owner = module.Containment()  # This hidden controller joins; never close its Job here.
+        result["owner_source_bindings"] = owner_bindings
+        with proof_profile(args.receipt, result, started, args.private_cleanup_evidence) as home:
+            try:
+                checkpoint(args.receipt, result, "worker", started)
+                run_owned_worker(args, home, result, owner, started)
+            except BaseException as exc:
+                result.update(
+                    ok=False,
+                    child_settled=False,
+                    category="worker-refused",
+                    error_kind=type(exc).__name__,
+                )
+    except BaseException as exc:
+        result.update(ok=False, category="controller-refused", error_kind=type(exc).__name__)
+        if str(exc) in {
+            "optimized-mode-unsupported",
+            "isolated-no-site-no-bytecode-required",
+            "windows-controller-required",
+        }:
+            result["category"] = str(exc)
+        write_receipt(args.receipt, result)
     return 0 if result["ok"] else 1
 
 
