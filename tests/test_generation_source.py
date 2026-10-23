@@ -510,7 +510,8 @@ def _missing_promisor_blob(committed, tmp_path):
     helper.write_text(
         "import subprocess, sys\nfrom pathlib import Path\n"
         "Path(sys.argv[1]).write_text('called', encoding='utf-8')\n"
-        "raise SystemExit(subprocess.run(['git', 'upload-pack', *sys.argv[2:]]).returncode)\n",
+        "raise SystemExit(subprocess.run(['git', 'upload-pack', *sys.argv[2:]], "
+        "timeout=5, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).returncode)\n",
         encoding="utf-8",
     )
     git(repository, "config", "remote.origin.url", str(remote))
