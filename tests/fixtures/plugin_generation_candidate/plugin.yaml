@@ -1,0 +1,3 @@
+name: plugin-generation-candidate
+version: "0.0.1"
+description: "Offline synthetic fixture only; never install in a user profile."
