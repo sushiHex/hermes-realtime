@@ -117,6 +117,18 @@ Reviewed proof helpers execute their exact source bytes; only named reviewed
 fixture files are copied, so neighboring extension/bytecode overlays cannot enter.
 Their actual executed bytes and the projection are bound in the receipt.
 
+Content-free stage checkpoints are retained before expensive phases. Intermediate
+snapshots always say `ok: false`; overall success requires final origin checks,
+profile deletion and final evidence publication. Atomic replacement preserves the
+preceding complete snapshot when evidence writing is interrupted.
+
+After complete blob/path validation, the controller prepares parent directories
+and materializes the finite input with two standard-library worker threads.
+Ordered map results preserve the manifest; the executor joins before an error can
+reach profile cleanup. `*_work_seconds` aggregate overlapping work and must not be
+added to wall durations; `source_export_materialization_wall_seconds` reports the
+materialization interval. There is no parallel cleanup or source cache.
+
 The audit barrier denies subprocesses and non-test
 connections, except narrow stdlib loopback self-pipe setup. Denied constructor
 metadata/pricing attempts are classified; unclassified attempts must be zero.
@@ -141,33 +153,33 @@ refusal remains required; their surviving removals are not called killed mutants
 Exact-type validation remains in the policy. This map does not claim every
 syntactic boolean is independently observable or prove the full product.
 
-The earlier source-bound run recorded all 49 expected groups: 46 isolated
-omissions changed the target outcome while both healthy controls passed; the
-three redundant omissions above retained refusal. The receipt was written after
-executor shutdown and final import-origin verification, with zero provider calls,
-native Runs or denied network attempts. Its outer launch nevertheless exceeded the
-60-second deadline afterward, while leaving the disposable-profile context.
-This is completed semantic evidence plus a failed cleanup deadline, **not an
-overall passing invocation or verified cleanup**. No retry extended that bound.
-Its replay-conflict target covered an omitted policy header.
+Source commit `e7c53c1a8de29cfd180d1ade0045d2a49e6083a4` completed the
+source-bound 49-group direct matrix in 16.797 seconds, including profile cleanup.
+All expected outcomes matched: 46 isolated omissions changed the target outcome
+with two healthy controls each; the three redundant removals retained refusal.
+The direct replay target includes same-version changed-objective conflict and
+retained budget identity. The receipt verified 194 upstream origins and the same
+9,990-file manifest, with zero provider/native Run/denied-network attempts.
+Receipt SHA-256: `340f5c84f514af185950418d1e456ba9ccf77e8f603b7b7f58b356cd316d1d03`.
 
-The cleanup correction at source commit
-`d86d5df5bc5ea188f62f73cbf2690e9d49437536` keeps overall success false until
-profile deletion completes, retains pending semantic evidence, and preserves
-primary failures when either evidence write fails. Export parent directories
-are created once without changing the projection. Its 72 focused ordinary tests
-and 10 isolated omission checks with two healthy controls each passed. The replay
-target now checks same-version changed-objective conflict and unchanged budget
-identity; that added direct case has not completed under the native bootstrap.
+The first subsequent native smoke completed one native Run with three synthetic
+continuations and passed its semantic checks, but profile deletion raised
+`PermissionError`. The child exited 1 with overall `ok: false` and cleanup refused;
+the smoke **failed**. The failing file/operation was not retained and cannot be
+identified from remaining files alone. The remaining four smoke cases were not
+run. Receipt SHA-256:
+`4c5acb998c902eaa84a252b1030271f83b1a57fa1bf0fb457c708c7513fc4136`.
+The private parent mislabeled its category as `passed` while preserving exit 1
+and `ok: false`; that classifier was corrected separately without rewriting the
+failed receipt. This PR stays draft; native smoke, cleanup and #329 remain held.
 
-The single corrected run used exact committed LF bytes and the same 60-second
-bound. It timed out without a receipt. Read-only residual inspection found all
-9,990 projected files (167,002,541 bytes), no fixture files and no native profile
-artifacts. This does not identify the precise preparation substage or establish
-native execution or cleanup. No retry or remaining five-case smoke was run.
-The next diagnostic is retained, content-free stage checkpoints around export,
-import/bootstrap, Python manifest, test and cleanup; it is not implemented here.
-The PR remains draft: source-bound native smoke and cleanup are unqualified.
+Earlier 60-second failures remain preserved, including a cleanup timeout and a
+later interruption after 7,992 files in the serial materialization/per-file-hash
+region. No deadline was extended. The corrective parallel-export experiment
+preserved the exact payload; its observed success is not a universal latency or
+filesystem-cause claim. The worker tests include a real serial-source RED,
+candidate GREEN and three isolated mutations with two healthy controls each.
+The affected source test file passed all 43 tests after the correction.
 
 ## Preserved evidence boundary
 
