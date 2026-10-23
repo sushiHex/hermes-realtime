@@ -1767,9 +1767,11 @@ async def test_full_host_explicit_commands_share_the_composed_work_surface(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_policy", [None, "ordinary-lookup/v1"])
 async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    lookup_policy: str | None,
 ) -> None:
     class TranscriberStub:
         async def push(self, _frame: AudioFrame) -> tuple[()]:
@@ -1799,6 +1801,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         tts_provider="edge",
         allow_unsandboxed_tasks=True,
         hermes_run_record=record,
+        hermes_lookup_policy=lookup_policy,
     )
     try:
         close_owner = next(
@@ -1807,6 +1810,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         task_session = close_owner._owners[3]
         assert type(task_session) is host_launcher_module.HermesApiTaskSession
         assert task_session._run_record_path == record
+        assert task_session._config.lookup_policy == lookup_policy
     finally:
         await launcher.close()
 
@@ -3605,3 +3609,11 @@ async def test_full_host_policy_clamps_result_after_private_handle_redaction() -
     assert type(projected) is str
     assert len(projected) <= 1024
     assert "run_a1b2c3d4" not in projected
+
+
+def test_qualification_no_task_composition_rejects_lookup_policy() -> None:
+    with (
+        host_launcher_module._qualification_no_task_composition(),
+        pytest.raises(ValueError, match="lookup policy"),
+    ):
+        build_local_host_launcher(hermes_api_bearer=None, hermes_lookup_policy="ordinary-lookup/v1")

@@ -1915,6 +1915,7 @@ def build_local_host_launcher(
     *,
     hermes_api_bearer: str | None,
     hermes_api_url: str = DEFAULT_HERMES_API_URL,
+    hermes_lookup_policy: str | None = None,
     livekit_url: str = "ws://127.0.0.1:7880",
     livekit_api_key: str = "devkey",
     livekit_api_secret: str = "local" + "-" + ("x" * 32),
@@ -1966,6 +1967,9 @@ def build_local_host_launcher(
 ) -> LocalBrowserLauncher:
     """Compose the explicit full host without provider fallback.
 
+    ``hermes_lookup_policy`` explicitly designates all background runs through this
+    host's API adapter. None preserves ordinary native runs; this does not install
+    or qualify the experimental policy plugin.
     ``voice_tail`` names the durable heard-context file; None disables it.
     ``voice_companion`` names the Hermes companion that archives the tail's outbox;
     None archives nothing. Archiving needs the tail, whose outbox it drains.
@@ -1989,6 +1993,8 @@ def build_local_host_launcher(
         if voice_tail is None:
             raise ValueError("archiving through the companion needs a voice tail")
     if qualification_no_hermes_tasks:
+        if hermes_lookup_policy is not None:
+            raise ValueError("qualification no-task composition rejects a lookup policy")
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
         if allow_unsandboxed_tasks or natural_work_tools:
@@ -2075,6 +2081,7 @@ def build_local_host_launcher(
             run_model=codex_model if inference_provider == "codex" else None,
             run_reasoning_effort=codex_effort if inference_provider == "codex" else None,
             run_service_tier="priority" if inference_provider == "codex" else None,
+            lookup_policy=hermes_lookup_policy,
         )
     )
     livekit_url = _validate_livekit_origin(livekit_url, remote_mode=remote_mode)
