@@ -156,6 +156,32 @@ def audit_record(path, record):
         os._exit(2)
 
 
+def process_provenance(exported):
+    """Only committed-projection source locations; never frame locals or arguments."""
+    frames = []
+    frame = sys._getframe(1)
+    outside = False
+    for _ in range(128):
+        if frame is None or len(frames) == 12:
+            break
+        try:
+            path = Path(frame.f_code.co_filename).resolve()
+            relative = path.relative_to(exported.resolve()).as_posix()
+            if path.suffix != ".py" or not path.is_file() or len(relative) > 256:
+                raise ValueError
+            frames.append(
+                {
+                    "module": relative,
+                    "function": frame.f_code.co_name[:80],
+                    "line": min(max(frame.f_lineno, 0), 2**31 - 1),
+                }
+            )
+        except Exception:
+            outside = True
+        frame = frame.f_back
+    return {"frames": frames, "outside": "unknown-outside" if outside else "none"}
+
+
 def cleanup_failure_details(exc, profile):
     """Classify actual OS exception evidence without publishing target paths."""
     detail = {
@@ -332,6 +358,7 @@ def worker(args):
         "stdlib_self_pipes": 0,
         "unclassified_network_attempts": 0,
         "blocked_process_attempts": 0,
+        "process_events": [],
         "case": args.case,
         "mutation": args.mutation,
         "complete_enforcement_qualified": False,
@@ -457,6 +484,7 @@ def worker(args):
                 audit_path,
                 {
                     "worker_nonce": args.worker_nonce,
+                    "process_events": result["process_events"],
                     **{
                         name: result[name]
                         for name in (
@@ -474,6 +502,10 @@ def worker(args):
             if event in {"subprocess.Popen", "os.system"}:
                 with audit_lock:
                     result["blocked_process_attempts"] += 1
+                    if len(result["process_events"]) < 8:
+                        result["process_events"].append(
+                            {"event": event, **process_provenance(exported)}
+                        )
                     save_audit()
                 raise OSError("offline-process-block")
             if event == "socket.connect":

@@ -606,3 +606,28 @@ def test_audit_write_failure_cannot_leave_acceptable_stale_evidence(tmp_path):
         pytest.raises(SystemExit, match="2"),
     ):
         namespace["audit_record"](tmp_path / "audit.json", {"count": 1})
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_process_metadata_contains_only_bounded_projected_source(tmp_path, inside):
+    namespace = profile_namespace()
+    exported = tmp_path / "projection"
+    exported.mkdir()
+    path = (exported if inside else tmp_path) / "source.py"
+    source = (
+        "def caller(depth, secret):\n"
+        "    return caller(depth-1, secret) if depth else capture(root)\n"
+    )
+    path.write_text(source)
+    scope = {"capture": namespace["process_provenance"], "root": exported}
+    exec(compile(source, str(path), "exec"), scope)
+    observed = scope["caller"](15, "private-argument-value")
+    assert len(observed["frames"]) == (12 if inside else 0)
+    assert all(
+        frame == {"module": "source.py", "function": "caller", "line": 2}
+        for frame in observed["frames"]
+    )
+    payload = json.dumps(observed)
+    assert "private-argument-value" not in payload and json.dumps(str(tmp_path)) not in payload
+    if not inside:
+        assert observed["outside"] == "unknown-outside"
