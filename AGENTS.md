@@ -4,6 +4,16 @@
 
 This repository is an independently authored realtime conversation runtime for upstream Hermes Agent. It must not copy implementation code from third-party Hermes voice projects.
 
+## Canonical session rules
+
+This file is the canonical project instruction source for every Codex and Claude Code
+session, including delegated agents. Read it before work, then read
+[the handoff](docs/AGENT_HANDOFF.md), [work tracking](docs/work-tracking.md), and the
+owning issue or PR. `CLAUDE.md` imports this file; do not maintain a second policy copy.
+The four delivery rules below are mandatory. They replace the former blanket requirement
+to mutation-prove every test or guard. Explicit task acceptance criteria and release gates
+still apply; changing them requires the owner's authorization.
+
 ## Engineering rules
 
 - Follow strict RED-GREEN-REFACTOR for production behavior.
@@ -15,14 +25,59 @@ This repository is an independently authored realtime conversation runtime for u
 - Never commit credentials, tokens, private URLs, transcripts, or user audio.
 - Support Windows development and Linux CI/deployment.
 - Prefer deterministic state machines and policies over model-controlled lifecycle state.
-- Prove every check fails. Before shipping a test or guard, name the mutation it exists to
-  catch, apply it, and confirm it fails and fails alone. A check that passes in the broken
-  state is worth nothing, and reads exactly like one that works.
 - Bind a derived value to its source by equality, not by inclusion. A subset check misses a
   stale entry; a superset check misses a new one.
 - Record a refusal's evidence rather than discarding it. Where a bound expires or a guard
   rejects, emit one bounded JSON line in a `finally`, prefixed `[marker-name]`, carrying
   counts, kinds and categories only — never transcript text, paths, process IDs or handles.
+
+## Delivery and validation rules
+
+### 1. Match validation to consequences
+
+Classify the changed behavior, not the filename or patch size. State the risk and the
+smallest sufficient verification in the issue or PR; no separate planning artifact is needed.
+
+| Change | Required verification |
+| --- | --- |
+| Authority, isolation, source integrity, or process ownership (including proof harnesses) | RED-GREEN-REFACTOR; targeted mutation proof for each new or changed consequential guard; independent review of those boundaries. Each mutation must fail its targeted test alone. |
+| Ordinary production fix | One focused regression demonstrating the broken behavior, the fix, and affected checks. Do not add a mutation campaign by default. |
+| Diagnostics, documentation, or mechanical change without consequential behavior changes | Inspection and proportionate focused checks; validate documentation links and formatting. Do not invent behavioral tests or mutation campaigns. |
+| Final candidate | Required CI and applicable qualification on the exact candidate. Run broad local checks once when ready; repeat only when changes, failures, or a named unresolved risk justify them. |
+
+A diagnostic that decides acceptance, hides failure, or changes cleanup authority belongs
+in the consequential category. Never downgrade it merely because it lives in `tests/`.
+Conversely, metadata presentation does not become an authority boundary just because it
+contains a conditional. Preserve required hosted checks; this policy removes redundant
+local work, not merge gates. Record why a broader repeat is necessary before running it.
+
+### 2. Review one coherent change
+
+Batch review around a complete, bounded candidate and its evidence. Delegate independent,
+well-scoped work; one agent owns integration. Do not create serial review rounds for each
+minor edit. Follow-up review targets changed behavior and unresolved findings; reopen wider
+review only for a consequential new risk or scope change. Fix real findings, but do not turn
+incidental cleanup into a new framework or expanded qualification campaign.
+
+### 3. Prove the smallest real path first
+
+For runtime changes, before expensive qualification, exercise the smallest native path
+that can disprove the proposed mechanism. For lifecycle failures, establish ownership and settlement before
+patching individual resources. Retain bounded, privacy-safe failure evidence on the first
+failure; distinguish the observed resource from its unproven owner or cause. Stop an
+investigation when its recorded stopping condition is met. Do not demand finer causal
+attribution unless it changes the implementation or acceptance decision. Run the broader
+matrix after the mechanism works; preserve all explicit final qualification requirements.
+
+### 4. Report outcomes and stop expanding scope
+
+Report delivered behavior, exact candidate evidence, remaining limits, and blockers with
+an owner or next decision. Test counts and review rounds are supporting evidence, never
+substitutes for delivery. If an iteration produces no progress toward acceptance, reassess
+the premise and method before repeating it. File unrelated improvements as issues rather
+than adding them to the change. End with a usable outcome or a bounded blocker, not another
+unbounded diagnostic loop. Report the actual post-merge main push result, including failure
+or an in-progress run; never imply that PR checks establish main's result.
 
 ## Working environment
 
