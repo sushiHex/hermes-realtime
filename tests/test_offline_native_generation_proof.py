@@ -292,7 +292,7 @@ def test_profile_deletion_scope_refuses_invalid_target(tmp_path, invalid):
     assert outcome["profile_cleanup"] == "preserved-path-refused"
 
 
-def test_native_os_system_attempt_is_denied_and_retained(tmp_path):
+def native_audit_hook(tmp_path):
     args = SimpleNamespace(
         home=tmp_path,
         exported=tmp_path,
@@ -321,9 +321,95 @@ def test_native_os_system_attempt_is_denied_and_retained(tmp_path):
         patch.dict(proof.os.environ, {"HERMES_NATIVE_PROOF_KEY": "synthetic"}),
     ):
         assert proof.native_child(args) == 0
-    with pytest.raises(proof.Refusal):
-        hooks[0]("os.system", (b"synthetic-never-executed",))
+    return hooks[0]
+
+
+def test_native_os_system_attempt_is_denied_and_retained(tmp_path):
+    hook = native_audit_hook(tmp_path)
+    with pytest.raises(OSError):
+        hook("os.system", (b"synthetic-never-executed",))
     audit = json.loads((tmp_path / "child.audit.json").read_bytes())
     assert audit["blocked_process_attempts"] == 1
     assert audit["worker_nonce"] == "expected"
     assert audit["process_events"][0]["event"] == "os.system"
+
+
+def test_version_probe_handles_retained_denials(tmp_path):
+    import platform
+    import subprocess
+
+    hook = native_audit_hook(tmp_path)
+
+    def denied(*_args, **_kwargs):
+        hook("subprocess.Popen", ())
+        raise AssertionError("launch-barrier-returned")
+
+    with patch.object(subprocess, "check_output", side_effect=denied) as blocked:
+        assert platform._syscmd_ver("Windows", "unknown", "unknown") == (
+            "Windows",
+            "unknown",
+            "unknown",
+        )
+    audit = json.loads((tmp_path / "child.audit.json").read_bytes())
+    assert blocked.call_count == 3 and audit["blocked_process_attempts"] == 3
+
+
+def test_early_child_failure_preserves_primary_error(tmp_path):
+    args = SimpleNamespace(
+        home=tmp_path,
+        receipt=tmp_path / "controller.json",
+        expected_head="reviewed",
+        hermes_python=Path("python.exe"),
+        hermes_source=tmp_path,
+        port=12345,
+    )
+    shared = proof.load_source("offline_plugin_generation_proof", proof.ROOT / "tests")
+    root = SimpleNamespace(poll=lambda: 1)
+
+    def spawn(_name, command, **_kwargs):
+        receipt = Path(command[command.index("--child-receipt") + 1])
+        nonce = command[command.index("--nonce") + 1]
+        receipt.with_suffix(".audit.json").write_text(
+            json.dumps(
+                dict(
+                    worker_nonce=nonce,
+                    blocked_network_attempts=0,
+                    unclassified_network_attempts=0,
+                    blocked_process_attempts=0,
+                    process_events=[],
+                    process_events_truncated=False,
+                )
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    owner = SimpleNamespace(
+        spawn=spawn,
+        stop_all=lambda _: 10.0,
+        survivors=lambda _: {},
+        cleanup_stop_failed=False,
+        first_cleanup_refusal=None,
+    )
+    module = SimpleNamespace(
+        Processes=lambda _: owner,
+        Containment=lambda: object(),
+        listeners=lambda *_a, **_k: [],
+    )
+    with (
+        patch.object(proof, "verify_repository", return_value={"source_commit": "reviewed"}),
+        patch.object(
+            proof,
+            "load_source",
+            side_effect=lambda name, _: (
+                shared if name == "offline_plugin_generation_proof" else module
+            ),
+        ),
+        patch.object(proof, "prepare_profile", return_value=(tmp_path, {})),
+        patch.object(proof, "wait_ready", side_effect=proof.Refusal("native-child-exited")),
+        patch.dict(proof.os.environ, {"HERMES_NATIVE_PROOF_KEY": "synthetic"}),
+    ):
+        assert proof.controller(args) == 1
+    outcome = json.loads(args.receipt.read_bytes())
+    assert outcome["ok"] is False and outcome["category"] == "native-child-exited"
+    assert outcome["owned_process_cleanup"] is True and "cleanup_category" not in outcome

@@ -254,7 +254,7 @@ def native_child(args):
                     blocked["process_events"]
                 )
                 shared.audit_record(audit_path, blocked)
-            raise Refusal("native-process-denied")
+            raise OSError("native-process-denied")
         if event == "socket.connect":
             address = values[1]
             frame = sys._getframe(1)
@@ -380,6 +380,7 @@ def controller(args):
     owner = owner_module.Processes(args.home)
     containment = None
     roots = []
+    started_audits = []
     outcome = {"ok": False, "category": "setup", **binding}
     key = os.environ["HERMES_NATIVE_PROOF_KEY"]
     try:
@@ -423,6 +424,7 @@ def controller(args):
                 log=Path(os.devnull),
             )
             roots.append(process)
+            started_audits.append((receipt, nonce))
             return process, receipt
 
         first_nonce = secrets.token_hex(16)
@@ -564,12 +566,11 @@ def controller(args):
             settle(owner, containment, roots, args.port)
             outcome["owned_process_cleanup"] = True
             shared = load_source("offline_plugin_generation_proof", ROOT / "tests")
+            if not started_audits:
+                raise Refusal("native-audit-unavailable")
             audits = [
                 inspect_native_audit(path.with_suffix(".audit.json"), nonce, shared)
-                for path, nonce in (
-                    (first_receipt, first_nonce),
-                    (second_receipt, second_nonce),
-                )
+                for path, nonce in started_audits
             ]
             outcome["denied_metadata_attempts"] = sum(
                 counts["blocked_network_attempts"] for counts, _ in audits
