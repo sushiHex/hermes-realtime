@@ -419,10 +419,65 @@ def test_unsettled_child_preserves_profile_and_refuses_success(tmp_path):
             shutil.rmtree(profile, ignore_errors=True)
 
 
+def passive_metadata_event(kind="windows"):
+    if kind != "windows":
+        function, line, caller_line = (
+            ("_python_version_of", 145, 214)
+            if kind == "python"
+            else ("_pip_python_version", 188, 216)
+        )
+        return dict(
+            event="subprocess.Popen",
+            incomplete=False,
+            truncated=False,
+            frames=[
+                dict(
+                    origin="hermes",
+                    module="tools/env_probe.py",
+                    function=name,
+                    line=number,
+                    source_sha256="d46c016348a493cf26e1b0ed82c3b935672f5a9d27493d5cab2e04ecf37c34df",
+                )
+                for name, number in (
+                    ("_run", 115),
+                    (function, line),
+                    ("_build_probe_line", caller_line),
+                    ("_probe_worker", 332),
+                )
+            ],
+        )
+    frames = [
+        {
+            "origin": "stdlib",
+            "module": "platform.py",
+            "function": function,
+            "line": line,
+            "source_sha256": "4a3cc68ba7354f8d5cc28c55315a7d77b77dcdbbaa3a092572a636b5fb5b6938",
+        }
+        for function, line in (
+            ("_syscmd_ver", 284),
+            ("win32_ver", 371),
+            ("uname", 856),
+            ("system", 921),
+        )
+    ]
+    frames.append(
+        {
+            "origin": "dependency",
+            "module": "aiohttp/helpers.py",
+            "function": "<module>",
+            "line": 57,
+            "source_sha256": "c46842a498a119baed4422d4f0ca12792e48a9fddf269fd5beffcd252805f815",
+        }
+    )
+    return dict(event="subprocess.Popen", frames=frames, incomplete=False, truncated=False)
+
+
 @pytest.mark.parametrize(
     "fault",
     [
         "none",
+        "metadata",
         "exited",
         "source",
         "loaded",
@@ -500,7 +555,9 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
                 worker_nonce="stale" if fault == "stale-audit" else "expected",
                 unclassified_network_attempts=1 if fault == "late-audit" else 0,
                 blocked_network_attempts=6,
-                blocked_process_attempts=0,
+                blocked_process_attempts=1 if fault == "metadata" else 0,
+                process_events=[passive_metadata_event()] if fault == "metadata" else [],
+                process_events_truncated=False,
             )
             if fault == "malformed-audit":
                 audit["blocked_process_attempts"] = False
@@ -565,7 +622,7 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
                     )
                 except (RuntimeError, subprocess.TimeoutExpired):
                     result["ok"] = False
-            if fault in {"none", "exited"}:
+            if fault in {"none", "metadata", "exited"}:
                 assert result["ok"] is True and not Path(profile).exists(), (
                     "exited-member-blocked-cleanup"
                 )
@@ -608,26 +665,117 @@ def test_audit_write_failure_cannot_leave_acceptable_stale_evidence(tmp_path):
         namespace["audit_record"](tmp_path / "audit.json", {"count": 1})
 
 
-@pytest.mark.parametrize("inside", [False, True])
-def test_process_metadata_contains_only_bounded_projected_source(tmp_path, inside):
+@pytest.mark.parametrize(
+    "origin", ["hermes", "dependency", "stdlib", "proof", "fixture", "outside", "overflow"]
+)
+def test_process_metadata_covers_trusted_sources_without_private_values(tmp_path, origin):
     namespace = profile_namespace()
-    exported = tmp_path / "projection"
-    exported.mkdir()
-    path = (exported if inside else tmp_path) / "source.py"
+    roots = {
+        name: tmp_path / name for name in ("hermes", "dependency", "stdlib", "proof", "fixture")
+    }
+    for root in roots.values():
+        root.mkdir()
+    path = (roots.get(origin, roots["hermes"] if origin == "overflow" else tmp_path)) / "source.py"
     source = (
         "def caller(depth, secret):\n"
-        "    return caller(depth-1, secret) if depth else capture(root)\n"
+        "    return caller(depth-1, secret) if depth else capture(roots, hashes)\n"
     )
     path.write_text(source)
-    scope = {"capture": namespace["process_provenance"], "root": exported}
-    exec(compile(source, str(path), "exec"), scope)
-    observed = scope["caller"](15, "private-argument-value")
-    assert len(observed["frames"]) == (12 if inside else 0)
-    assert all(
-        frame == {"module": "source.py", "function": "caller", "line": 2}
-        for frame in observed["frames"]
-    )
+    scope = {
+        "capture": namespace["process_provenance"],
+        "roots": roots,
+        "hashes": {},
+        "__file__": str(path),
+    }
+    # Installed bytecode can retain an old build path; actual module origin is authoritative.
+    filename = str(tmp_path / "old-build.py") if origin == "dependency" else str(path)
+    exec(compile(source, filename, "exec"), scope)
+    observed = scope["caller"](80 if origin == "overflow" else 2, "private-argument-value")
     payload = json.dumps(observed)
     assert "private-argument-value" not in payload and json.dumps(str(tmp_path)) not in payload
-    if not inside:
-        assert observed["outside"] == "unknown-outside"
+    concrete = [frame for frame in observed["frames"] if frame["source_sha256"] is not None]
+    if origin == "outside":
+        assert not concrete and observed["incomplete"] is True
+    else:
+        assert concrete and all(
+            frame["module"] == "source.py"
+            and frame["function"] == "caller"
+            and frame["source_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+            for frame in concrete
+        )
+        assert {frame["origin"] for frame in concrete} == {
+            "hermes" if origin == "overflow" else origin
+        }
+    assert len(observed["frames"]) <= 64
+    if origin == "overflow":
+        assert observed["truncated"] is True and observed["incomplete"] is True
+
+
+@pytest.mark.parametrize("kind", ["windows", "python", "pip"])
+def test_shared_rule_accounts_for_source_identified_metadata(kind):
+    audit = dict(
+        blocked_process_attempts=1,
+        process_events=[passive_metadata_event(kind)],
+        process_events_truncated=False,
+    )
+    result = profile_namespace()["classify_denied_processes"](audit)
+    assert sum(result.values()) == 1
+    assert (
+        result[
+            {"windows": "windows-version", "python": "python-version", "pip": "pip-version"}[kind]
+        ]
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "source",
+        "caller",
+        "incomplete",
+        "truncated",
+        "coverage",
+        "overflow",
+        "unknown",
+        "runtime-only",
+        "event",
+    ],
+)
+def test_shared_rule_refuses_unclassified_or_incomplete_attempts(fault):
+    event = passive_metadata_event()
+    audit = dict(blocked_process_attempts=1, process_events=[event], process_events_truncated=False)
+    if fault == "source":
+        event["frames"][0]["source_sha256"] = "0" * 64
+    elif fault == "caller":
+        event["frames"][0]["function"] = "_run"
+    elif fault in {"incomplete", "truncated"}:
+        event[fault] = True
+    elif fault == "coverage":
+        audit["blocked_process_attempts"] = 2
+    elif fault == "overflow":
+        audit["process_events_truncated"] = True
+    elif fault == "unknown":
+        event["frames"].append(
+            dict(
+                origin="unknown-outside",
+                module="unknown",
+                function="unknown",
+                line=0,
+                source_sha256=None,
+            )
+        )
+    elif fault == "runtime-only":
+        event["frames"] = [
+            dict(
+                origin="runtime-internal",
+                module="frozen-interpreter",
+                function="exec_module",
+                line=1,
+                source_sha256=None,
+            )
+        ]
+    else:
+        event["event"] = "os.system"
+    with pytest.raises(RuntimeError, match="worker-audit-refused"):
+        profile_namespace()["classify_denied_processes"](audit)

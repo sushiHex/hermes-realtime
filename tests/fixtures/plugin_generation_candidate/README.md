@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“5 searches may be followed by one extraction of 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“3
+- One complete batch of 1 to 5 searches may be followed by one extraction of 1 to 3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -43,6 +43,16 @@ Only the OpenAI chat-completions path has synthetic evidence. Other transports,
 active plugin removal, real model/provider access, source freshness, voice and
 useful-answer acceptance remain unqualified. A truthful native `completed` plus
 policy refusal does not pass useful acceptance. SSE/client integration is absent.
+
+The [shared fixture contract](https://github.com/sushiHex/hermes-realtime/issues/306#issuecomment-6357191962)
+permits reporting source-classified passive metadata **denials**, never launches.
+`classify_denied_processes(audit)` is the single reusable rule for these witnesses:
+exact source hashes and contiguous caller chains identify Windows, Python and pip
+version probes. Every event must have complete, bounded provenance and count
+coverage. Unknown, stale, incomplete, overflowed or provider-fallback evidence
+still refuses; generic subprocess frames or runtime-internal labels cannot classify
+an attempt. Prepared interpreter/dependencies remain trusted prerequisites, not
+part of the Hermes Git-source attestation.
 
 ## Reproduce one bounded case
 
@@ -244,6 +254,14 @@ native captures, remaining smoke cases or current-source 49-group replay followe
 PR #328 stays draft; #329 remains held. Resolving the unknown denied callers and
 completing the existing acceptance cases require the owner's next disposition.
 No historical receipt is rewritten or transferred to the current candidate.
+
+The subsequent one-shot expanded provenance capture at
+`10b03bb3900b36d333e7e05e59ae839b9214a34c` identified all five denied callers:
+three standard-library Windows-version fallbacks during an aiohttp import and two
+Hermes environment version probes. All 15 concrete source hashes matched; event
+coverage was complete with no frame/event overflow. Its earlier blanket gate still
+refused, so it is not relabeled a pass. The shared rule above implements the posted
+contract prospectively; qualification of that changed candidate is recorded separately.
 
 Earlier 60-second failures remain preserved, including a cleanup timeout and a
 later interruption after 7,992 files in the serial materialization/per-file-hash

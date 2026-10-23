@@ -156,30 +156,79 @@ def audit_record(path, record):
         os._exit(2)
 
 
-def process_provenance(exported):
-    """Only committed-projection source locations; never frame locals or arguments."""
+def process_provenance(roots, hashes):
+    """Bounded source identities only; prepared interpreter/dependencies stay trusted."""
     frames = []
     frame = sys._getframe(1)
-    outside = False
-    for _ in range(128):
-        if frame is None or len(frames) == 12:
+    incomplete = False
+    for _ in range(64):
+        if frame is None:
             break
+        location = {
+            "origin": "unknown-outside",
+            "module": "unknown",
+            "function": "unknown",
+            "line": 0,
+            "source_sha256": None,
+        }
         try:
-            path = Path(frame.f_code.co_filename).resolve()
-            relative = path.relative_to(exported.resolve()).as_posix()
-            if path.suffix != ".py" or not path.is_file() or len(relative) > 256:
-                raise ValueError
-            frames.append(
-                {
-                    "module": relative,
-                    "function": frame.f_code.co_name[:80],
-                    "line": min(max(frame.f_lineno, 0), 2**31 - 1),
-                }
-            )
+            filename = frame.f_code.co_filename
+            if filename.startswith("<frozen ") and filename.endswith(">"):
+                # Interpreter infrastructure is recorded, never sufficient caller evidence.
+                location.update(
+                    origin="runtime-internal",
+                    module="frozen-interpreter",
+                    function=frame.f_code.co_name[:80],
+                    line=min(max(frame.f_lineno, 0), 2**31 - 1),
+                )
+            else:
+                module_origin = getattr(frame.f_globals.get("__spec__"), "origin", None)
+                path = Path(
+                    module_origin
+                    if type(module_origin) is str and Path(module_origin).is_absolute()
+                    else frame.f_globals.get("__file__", filename)
+                ).resolve()
+                for origin, root in roots.items():
+                    if not path.is_relative_to(root):
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    if (
+                        path.suffix != ".py"
+                        or len(relative) > 256
+                        or (
+                            origin == "stdlib"
+                            and {"site-packages", "dist-packages"}.intersection(
+                                Path(relative).parts
+                            )
+                        )
+                    ):
+                        break
+                    if path not in hashes:
+                        if len(hashes) >= 128:
+                            break
+                        with path.open("rb") as stream:
+                            payload = stream.read(8 * 1024 * 1024 + 1)
+                        if len(payload) > 8 * 1024 * 1024:
+                            break
+                        hashes[path] = hashlib.sha256(payload).hexdigest()
+                    location.update(
+                        origin=origin,
+                        module=relative,
+                        function=frame.f_code.co_name[:80],
+                        line=min(max(frame.f_lineno, 0), 2**31 - 1),
+                        source_sha256=hashes[path],
+                    )
+                    break
         except Exception:
-            outside = True
+            pass
+        incomplete |= location["origin"] == "unknown-outside"
+        frames.append(location)
         frame = frame.f_back
-    return {"frames": frames, "outside": "unknown-outside" if outside else "none"}
+    return {
+        "frames": frames,
+        "truncated": frame is not None,
+        "incomplete": incomplete or frame is not None,
+    }
 
 
 def cleanup_failure_details(exc, profile):
@@ -477,6 +526,16 @@ def worker(args):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         audit_lock = threading.Lock()
+        provenance_roots = {
+            "hermes": exported.resolve(),
+            "fixture": plugin_home.resolve(),
+            "proof": PROOF_ROOT.resolve(),
+            "dependency": (
+                Path(sys.executable).absolute().parent.parent / "Lib/site-packages"
+            ).resolve(),
+            "stdlib": (Path(sys.base_prefix) / "Lib").resolve(),
+        }
+        provenance_hashes = {}
         audit_path = args.receipt.with_name(args.receipt.name + ".audit.json")
 
         def save_audit():
@@ -485,6 +544,8 @@ def worker(args):
                 {
                     "worker_nonce": args.worker_nonce,
                     "process_events": result["process_events"],
+                    "process_events_truncated": result["blocked_process_attempts"]
+                    > len(result["process_events"]),
                     **{
                         name: result[name]
                         for name in (
@@ -504,7 +565,10 @@ def worker(args):
                     result["blocked_process_attempts"] += 1
                     if len(result["process_events"]) < 8:
                         result["process_events"].append(
-                            {"event": event, **process_provenance(exported)}
+                            {
+                                "event": event,
+                                **process_provenance(provenance_roots, provenance_hashes),
+                            }
                         )
                     save_audit()
                 raise OSError("offline-process-block")
@@ -601,6 +665,99 @@ def reviewed_bindings():
         ),
     )
     return {name: hashlib.sha256((PROOF_ROOT / name).read_bytes()).hexdigest() for name in names}
+
+
+def classify_denied_processes(audit):
+    """Shared #306 fixture rule: classify denials, never authorize a launch."""
+
+    def refuse():
+        raise RuntimeError("worker-audit-refused")
+
+    events = audit.get("process_events")
+    count = audit.get("blocked_process_attempts")
+    if (
+        type(count) is not int
+        or type(events) is not list
+        or not 0 <= count <= 8
+        or len(events) != count
+        or audit.get("process_events_truncated") is not False
+    ):
+        refuse()
+    platform_hash = "4a3cc68ba7354f8d5cc28c55315a7d77b77dcdbbaa3a092572a636b5fb5b6938"
+    aiohttp_hash = "c46842a498a119baed4422d4f0ca12792e48a9fddf269fd5beffcd252805f815"
+    probe_hash = "d46c016348a493cf26e1b0ed82c3b935672f5a9d27493d5cab2e04ecf37c34df"
+    windows = [
+        ("stdlib", "platform.py", name, line, platform_hash)
+        for name, line in (
+            ("_syscmd_ver", 284),
+            ("win32_ver", 371),
+            ("uname", 856),
+            ("system", 921),
+        )
+    ]
+    windows.append(("dependency", "aiohttp/helpers.py", "<module>", 57, aiohttp_hash))
+    chains = {"windows-version": windows}
+    for kind, function, line, caller_line in (
+        ("python-version", "_python_version_of", 145, 214),
+        ("pip-version", "_pip_python_version", 188, 216),
+    ):
+        chains[kind] = [
+            ("hermes", "tools/env_probe.py", name, number, probe_hash)
+            for name, number in (
+                ("_run", 115),
+                (function, line),
+                ("_build_probe_line", caller_line),
+                ("_probe_worker", 332),
+            )
+        ]
+    classified = dict.fromkeys(chains, 0)
+    for event in events:
+        if (
+            type(event) is not dict
+            or event.get("event") != "subprocess.Popen"
+            or event.get("incomplete") is not False
+            or event.get("truncated") is not False
+            or type(event.get("frames")) is not list
+            or not 1 <= len(event["frames"]) <= 64
+        ):
+            refuse()
+        sites = []
+        for frame in event["frames"]:
+            if type(frame) is not dict:
+                refuse()
+            origin, module = frame.get("origin"), frame.get("module")
+            function, line, digest = (
+                frame.get("function"),
+                frame.get("line"),
+                frame.get("source_sha256"),
+            )
+            if (
+                type(module) is not str
+                or not 1 <= len(module) <= 256
+                or type(function) is not str
+                or not 1 <= len(function) <= 80
+                or type(line) is not int
+                or not 0 <= line < 2**31
+            ):
+                refuse()
+            if origin == "runtime-internal":
+                if module != "frozen-interpreter" or digest is not None:
+                    refuse()
+            elif (
+                origin not in {"hermes", "fixture", "proof", "dependency", "stdlib"}
+                or type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                refuse()
+            sites.append((origin, module, function, line, digest))
+        for kind, chain in chains.items():
+            if any(sites[index : index + len(chain)] == chain for index in range(len(sites))):
+                classified[kind] += 1
+                break
+        else:
+            refuse()
+    return classified
 
 
 def run_owned_worker(args, home, result, owner, processes, started):
@@ -715,8 +872,9 @@ def run_owned_worker(args, home, result, owner, processes, started):
         ):
             raise RuntimeError("worker-audit-refused")
         result["worker_audit_counts"] = {name: audit[name] for name in count_names}
-        if audit["unclassified_network_attempts"] or audit["blocked_process_attempts"]:
+        if audit["unclassified_network_attempts"]:
             raise RuntimeError("worker-audit-refused")
+        result["classified_process_denials"] = classify_denied_processes(audit)
         result.update(
             observed,
             ok=True,
