@@ -25,7 +25,7 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“5 searches may be followed by one extraction of 1ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“3
+- One complete batch of 1ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ5 searches may be followed by one extraction of 1ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ3
   distinct, exact URLs returned by successful searches. No classification,
   normalization, retry, extra batch or budget reset occurs.
 - Immutable designation/refusal snapshots remain for the process lifetime.
@@ -103,6 +103,13 @@ bindings, semantic success and no live/unknown survivors or sticky settlement re
 the existing process owner before one profile deletion. Only successful deletion permits the final receipt to become
 true. Timeout, abnormal exit, bad evidence or unsettled execution preserves the
 profile and overall false. There is no per-resource teardown fallback or retry.
+The parent also checks a nonce-bound audit sidecar after worker exit. Protected
+network/process denials persist fixed counters atomically throughout worker
+lifetime; write failure terminates the proof worker nonzero. Missing, malformed,
+stale or adverse audit evidence prevents success, including an event occurring
+after the worker's semantic receipt. Known blocked metadata probes are reported
+separately from unclassified provider attempts. Optional auxiliary title generation
+is disabled only in this model-free fixture; primary calls retain the stand-in.
 The outer 60-second caller is mandatory; it bounds cleanup as well as the worker.
 Linux product behavior is unchanged; this opt-in owner composition is Windows-only.
 
@@ -210,6 +217,15 @@ remain listed. The correction reuses `Processes.survivors(containment)`:
 retained exited members are allowed, live/unknown members and sticky stop/refusal
 state remain failures. No member is filtered by a new observer or guessed wait.
 The failed diagnostic and preserved profile are not relabeled a cleanup pass.
+
+At `54e19192ae0c7833da7c4fc896fe0a18fce16ef7`, canonical process settlement
+and profile deletion succeeded in 21.234 seconds. That record is **not a qualified
+proof**: one unclassified blocked provider attempt occurred after the semantic
+check. The final audit now gates parent acceptance after process exit. The fixture
+also disables the supported optional title-generation lane; the truncated earlier
+stack does not prove that lane caused the historical attempt. Earlier receipts
+remain unchanged, including SHA-256
+`6491e3b254b574a571159ae22226bc60b3be8a65712788b5aadae9a0cc3a4e7e`.
 
 Earlier 60-second failures remain preserved, including a cleanup timeout and a
 later interruption after 7,992 files in the serial materialization/per-file-hash

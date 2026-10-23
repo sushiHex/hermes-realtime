@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -145,6 +146,14 @@ def checkpoint(receipt, result, stage, started):
             receipt_category="proof-receipt-refused", receipt_error_kind=type(exc).__name__
         )
         raise
+
+
+def audit_record(path, record):
+    """A failed protected-effect snapshot cannot leave an acceptable stale zero."""
+    try:
+        write_receipt(path, record)
+    except BaseException:
+        os._exit(2)
 
 
 def cleanup_failure_details(exc, profile):
@@ -322,6 +331,7 @@ def worker(args):
         "network_categories": [],
         "stdlib_self_pipes": 0,
         "unclassified_network_attempts": 0,
+        "blocked_process_attempts": 0,
         "case": args.case,
         "mutation": args.mutation,
         "complete_enforcement_qualified": False,
@@ -406,6 +416,8 @@ def worker(args):
             + ("true" if args.case == "middleware-error" else "false")
             + "\n"
             "agent:\n  max_turns: 3\n"
+            # This fixture stands in primary calls only; disable optional auxiliary inference.
+            "auxiliary:\n  title_generation:\n    enabled: false\n"
             "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n",
             encoding="utf-8",
         )
@@ -437,9 +449,32 @@ def worker(args):
             port = listener.getsockname()[1]
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        audit_lock = threading.Lock()
+        audit_path = args.receipt.with_name(args.receipt.name + ".audit.json")
+
+        def save_audit():
+            audit_record(
+                audit_path,
+                {
+                    "worker_nonce": args.worker_nonce,
+                    **{
+                        name: result[name]
+                        for name in (
+                            "unclassified_network_attempts",
+                            "blocked_network_attempts",
+                            "blocked_process_attempts",
+                        )
+                    },
+                },
+            )
+
+        save_audit()
 
         def no_external(event, values):
-            if event == "subprocess.Popen":
+            if event in {"subprocess.Popen", "os.system"}:
+                with audit_lock:
+                    result["blocked_process_attempts"] += 1
+                    save_audit()
                 raise OSError("offline-process-block")
             if event == "socket.connect":
                 address = values[1]
@@ -457,20 +492,22 @@ def worker(args):
                 if not (
                     isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] == port
                 ):
-                    result["blocked_network_attempts"] += 1
                     names = [f.name for f in traceback.extract_stack(limit=18)[:-1]]
-                    if not any(
-                        name in names for name in ("query_ollama_num_ctx", "get_pricing_entry")
-                    ):
-                        result["unclassified_network_attempts"] += 1
-                    if len(result["network_categories"]) < 8:
-                        result["network_categories"].append(
-                            {
-                                "loopback": isinstance(address, tuple)
-                                and address[0] in {"127.0.0.1", "::1"},
-                                "frames": names,
-                            }
-                        )
+                    with audit_lock:
+                        result["blocked_network_attempts"] += 1
+                        if not any(
+                            name in names for name in ("query_ollama_num_ctx", "get_pricing_entry")
+                        ):
+                            result["unclassified_network_attempts"] += 1
+                        if len(result["network_categories"]) < 8:
+                            result["network_categories"].append(
+                                {
+                                    "loopback": isinstance(address, tuple)
+                                    and address[0] in {"127.0.0.1", "::1"},
+                                    "frames": names,
+                                }
+                            )
+                        save_audit()
                     raise RuntimeError("offline-network-block")
 
         sys.addaudithook(no_external)
@@ -627,6 +664,27 @@ def run_owned_worker(args, home, result, owner, processes, started):
         if exit_code != 0:
             result.update(observed, ok=False)
             raise RuntimeError("worker-semantic-refused")
+        try:
+            audit = json.loads(receipt.with_name(receipt.name + ".audit.json").read_bytes())
+        except (OSError, ValueError):
+            raise RuntimeError("worker-audit-refused") from None
+        count_names = (
+            "unclassified_network_attempts",
+            "blocked_network_attempts",
+            "blocked_process_attempts",
+        )
+        if (
+            type(audit) is not dict
+            or audit.get("worker_nonce") != nonce
+            or any(
+                type(audit.get(name)) is not int or not 0 <= audit[name] < 2**31
+                for name in count_names
+            )
+        ):
+            raise RuntimeError("worker-audit-refused")
+        result["worker_audit_counts"] = {name: audit[name] for name in count_names}
+        if audit["unclassified_network_attempts"] or audit["blocked_process_attempts"]:
+            raise RuntimeError("worker-audit-refused")
         result.update(
             observed,
             ok=True,
@@ -643,6 +701,7 @@ def worker_refusal_category(exc):
         "worker-job-not-settled",
         "worker-exit-refused",
         "worker-semantic-refused",
+        "worker-audit-refused",
     }
     return str(exc) if type(exc) is RuntimeError and str(exc) in named else "worker-refused"
 

@@ -434,6 +434,10 @@ def test_unsettled_child_preserves_profile_and_refuses_success(tmp_path):
         "exit",
         "semantic",
         "timeout",
+        "late-audit",
+        "missing-audit",
+        "stale-audit",
+        "malformed-audit",
     ],
 )
 def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
@@ -492,6 +496,18 @@ def test_parent_cleanup_requires_settled_bound_worker(tmp_path, fault):
             if fault == "timeout" and self.calls == 1:
                 raise subprocess.TimeoutExpired("synthetic", timeout)
             receipt.with_name(receipt.name + ".worker.json").write_text(json.dumps(observed))
+            audit = dict(
+                worker_nonce="stale" if fault == "stale-audit" else "expected",
+                unclassified_network_attempts=1 if fault == "late-audit" else 0,
+                blocked_network_attempts=6,
+                blocked_process_attempts=0,
+            )
+            if fault == "malformed-audit":
+                audit["blocked_process_attempts"] = False
+            if fault != "missing-audit":
+                receipt.with_name(receipt.name + ".worker.json.audit.json").write_text(
+                    json.dumps(audit)
+                )
             return 2 if fault == "exit" else 1 if fault == "semantic" else 0
 
         def kill(self):
@@ -580,3 +596,13 @@ def test_worker_refusal_metadata_is_fixed_and_path_free():
     classify = profile_namespace()["worker_refusal_category"]
     assert classify(RuntimeError("worker-job-not-settled")) == "worker-job-not-settled"
     assert classify(RuntimeError("private/path")) == "worker-refused"
+
+
+def test_audit_write_failure_cannot_leave_acceptable_stale_evidence(tmp_path):
+    namespace = profile_namespace()
+    with (
+        patch.dict(namespace["audit_record"].__globals__, write_receipt=lambda *_: 1 / 0),
+        patch.object(os, "_exit", side_effect=SystemExit(2)),
+        pytest.raises(SystemExit, match="2"),
+    ):
+        namespace["audit_record"](tmp_path / "audit.json", {"count": 1})
