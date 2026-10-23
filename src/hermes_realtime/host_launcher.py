@@ -2607,6 +2607,8 @@ def build_local_host_launcher(
                 )
                 schedule_restart_announcement()
 
+        if proposals is not None:
+            proposals.bind(participant_identity, generation)
         return ConversationSessionWorker(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -2670,8 +2672,6 @@ def build_local_host_launcher(
     def session_started(participant_identity: str, generation: int) -> None:
         media_incarnations.clear()
         usage_accumulator.reset(participant_identity, generation)
-        if proposals is not None:
-            proposals.bind(participant_identity, generation)
 
     async def decide_task_proposal(
         participant_identity: str, generation: int, proposal_id: str,
