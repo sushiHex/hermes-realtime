@@ -167,6 +167,33 @@ The outer deadline bounds the proof child; it is not evidence of descendant
 settlement if interrupted during Git preparation. No complete process-owner
 cleanup qualification is claimed by this command.
 
+## Current bounded outcome
+
+Source commit `b2d34c8c3b4fd2805fd6c30d40d0ac9a88c7df5f` completed the
+existing five-case smoke sequence with the expected outcomes under the unchanged
+60-second envelope. Healthy and late-rewrite baselines passed, as did both healthy
+controls for the final-argument omission. The omission itself failed only the
+intended `exact-policy-effects` assertion; its profile stayed preserved and its
+overall result stayed false. Positive cases required normal worker exit, canonical
+owned-process settlement, complete final audit and successful parent cleanup.
+
+The same committed source completed the 49-group direct matrix in 20.797 seconds,
+including cleanup: 46 meaningful omissions changed their target with healthy
+controls; three redundant removals retained refusal. The projected 9,990-file
+manifest was unchanged. All protected process attempts remained denied; complete
+source-bound evidence classified only the approved Windows/Python/pip version
+probes. Unclassified network attempts were zero. The affected runner tests passed
+63 cases and Ruff passed. Four changed audit-rule groups each failed their target
+alone with two healthy controls.
+
+Healthy receipt SHA-256:
+`a261ac52c18a1218ab32fab51a5067e625c3e9ab2c35993c198bc44665cadd25`.
+Direct-matrix receipt SHA-256:
+`ed28895280787055d44ee8efa1eddf0d9f6e89fa3ae763f2e0be3932fcb631d6`.
+This qualifies the bounded synthetic artifact, not live providers, a useful answer,
+actual native generation replacement, or full #306 acceptance. Earlier failed
+receipts remain unchanged; the following history keeps their original boundaries.
+
 ## Finite defensive-guard map
 
 `tests/generation_policy_checks.py` is the fixed direct-policy target map. Each
@@ -184,7 +211,7 @@ refusal remains required; their surviving removals are not called killed mutants
 Exact-type validation remains in the policy. This map does not claim every
 syntactic boolean is independently observable or prove the full product.
 
-Source commit `e7c53c1a8de29cfd180d1ade0045d2a49e6083a4` completed the
+An earlier source commit `e7c53c1a8de29cfd180d1ade0045d2a49e6083a4` completed the
 source-bound 49-group direct matrix in 16.797 seconds, including profile cleanup.
 All expected outcomes matched: 46 isolated omissions changed the target outcome
 with two healthy controls each; the three redundant removals retained refusal.
@@ -202,7 +229,7 @@ run. Receipt SHA-256:
 `4c5acb998c902eaa84a252b1030271f83b1a57fa1bf0fb457c708c7513fc4136`.
 The private parent mislabeled its category as `passed` while preserving exit 1
 and `ok: false`; that classifier was corrected separately without rewriting the
-failed receipt. This PR stays draft; native smoke, cleanup and #329 remain held.
+failed receipt. That failed checkpoint held native smoke, cleanup and #329.
 
 Later exception-derived diagnostics identified an owned logging lock, then an
 owned database sharing violation. The supported logging queue drain was added;
@@ -237,7 +264,7 @@ stack does not prove that lane caused the historical attempt. Earlier receipts
 remain unchanged, including SHA-256
 `6491e3b254b574a571159ae22226bc60b3be8a65712788b5aadae9a0cc3a4e7e`.
 
-Current lifetime-audit outcomes at
+Historical lifetime-audit outcomes at
 `942bf4ca36938d54acd9d45a6f3366b3aba87414` and
 `0bab9c0fd3bf8fc9c598e1cad763edbf271f6a5f` correctly refuse overall success.
 The final observation took 15.875 seconds: normal worker exit, passing native
@@ -249,11 +276,9 @@ all five; the zero-attempt gate remains unmet and the profile is preserved.
 Final receipt SHA-256:
 `4dc89d13736c8ca3b1880c8369fd109dc6102d079b9354a3cef9c4b514fdc0b7`.
 
-This is a bounded experimental artifact, not full native qualification. No further
-native captures, remaining smoke cases or current-source 49-group replay followed.
-PR #328 stays draft; #329 remains held. Resolving the unknown denied callers and
-completing the existing acceptance cases require the owner's next disposition.
-No historical receipt is rewritten or transferred to the current candidate.
+Those observations preceded the prospective shared denial-classification contract.
+They remain failed historical records; none is rewritten or transferred to the
+current candidate.
 
 The subsequent one-shot expanded provenance capture at
 `10b03bb3900b36d333e7e05e59ae839b9214a34c` identified all five denied callers:
