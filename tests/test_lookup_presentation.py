@@ -108,7 +108,10 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.row["original_response"] is s.original
     assert len(s.captured["requests"]) == 1
     body = s.captured["requests"][0]
-    assert set(body) == {"model", "messages", "response_format", "max_tokens", "stream"}
+    assert set(body) == {
+        "model", "messages", "response_format", "max_tokens", "stream", "reasoning_effort"
+    }
+    assert body["reasoning_effort"] == "none"
     assert body["response_format"]["json_schema"]["strict"] is True
     assert body["messages"][-1]["content"] == s.original.choices[0].message.content
     assert s.captured["sdk"][0]["max_retries"] == 0
@@ -116,8 +119,23 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.captured["closed"] == 2 and s.row["presentation_active"] is None
     assert s.row["presentation_evidence"]["usage"]["total_tokens"] == 7
     assert s.row["presentation_evidence"]["wire"]["tools_absent"] is True
+    assert s.row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
     assert s.row["presentation_evidence"]["wire_requests"] == 1
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
+
+
+def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
+    s = setup
+    s.request["reasoning_effort"] = "high"
+    seen = []
+
+    def native(request):
+        seen.append(dict(request))
+        return s.original
+
+    assert s.run(next_call=native) is not s.refused
+    assert seen == [s.request] and s.request["reasoning_effort"] == "high"
+    assert s.captured["requests"][0]["reasoning_effort"] == "none"
 
 
 @pytest.mark.parametrize("field", ["provider", "base_url", "model"])

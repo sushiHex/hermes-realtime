@@ -122,6 +122,7 @@ class Presentation:
                 "name": "voice_detail", "strict": True, "schema": PRESENTATION_SCHEMA}},
             "max_tokens": 1024,
             "stream": False,
+            "reasoning_effort": "none",
         }
 
         async def observe(request):
@@ -134,6 +135,7 @@ class Presentation:
                 "tools_absent": not any(name in serialized for name in (
                     "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")),
                 "nonstreaming": serialized.get("stream") is False,
+                "reasoning_effort_none": serialized.get("reasoning_effort") == "none",
                 "schema_matches": serialized.get("response_format") == body["response_format"],
                 "source_sha256": hashlib.sha256(
                     serialized["messages"][-1]["content"].encode()).hexdigest(),

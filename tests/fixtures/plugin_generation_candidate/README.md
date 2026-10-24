@@ -39,6 +39,11 @@ literal framing. Missing or incompatible validation refuses without fallback.
 This private-method coupling is an explicit compatibility limit: the plugin is
 not a standalone Hermes formatting qualification. The acceptance launcher must
 bind imports to the attested realtime payload.
+The presentation request sets `reasoning_effort: none`; native task reasoning
+is unchanged. The configured endpoint must support this request control.
+Unsupported requests fail closed without a fallback. The 1024-token cap, schema
+and admission deadline remain unchanged; wire evidence records the serialized
+control as a boolean without recording request content.
 
 `tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
 streaming producer through presentation and publication using synthetic SDK

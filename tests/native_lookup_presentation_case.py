@@ -85,8 +85,10 @@ def main():
     agent.api_mode = "chat_completions"
     with patch.object(agent, "_create_request_openai_client", return_value=client):
         original = agent._interruptible_streaming_api_call({
-            "model": "test-model", "messages": [{"role": "user", "content": "synthetic"}]})
+            "model": "test-model", "messages": [{"role": "user", "content": "synthetic"}],
+            "reasoning_effort": "high"})
     assert len(native_calls) == 1
+    assert native_calls[0]["reasoning_effort"] == "high"
     assert type(original) is SimpleNamespace
     assert not hasattr(original.choices[0].message, "refusal")
     assert not hasattr(original, "model_copy")
@@ -111,6 +113,7 @@ def main():
             forwarded.append(body)
             assert not any(key in body for key in ("tools", "tool_choice", "functions"))
             assert body["messages"][-1]["content"] == source_text
+            assert body["reasoning_effort"] == "none"
             response = sdk.model_dump(mode="json")
             response["choices"][0]["message"]["content"] = json.dumps({
                 "voice": "Short.", "detail": source_text})
@@ -155,13 +158,15 @@ def main():
                 assert result.synthetic_metadata == source.synthetic_metadata
             assert row["original_response"] is source and len(forwarded) == 1
             assert row["presentation_evidence"]["local_http_settled"] is True
-            outcomes.append({"shape": name, "passed": True, "formatter_calls": len(forwarded)})
+            assert row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
+            outcomes.append({"shape": name, "passed": True, "formatter_calls": len(forwarded),
+                             "reasoning_effort_none": True})
         finally:
             reset_current_session_key(token)
     result = {"ok": True, "native_helper_calls": len(native_calls), "cases": outcomes,
               "native_helper_sha256": helper_hash,
               "policy_sha256": hashlib.sha256(args.policy.read_bytes()).hexdigest(),
-              "model_calls": 0, "effects": effects}
+              "model_calls": 0, "task_reasoning_preserved": True, "effects": effects}
     args.receipt.write_text(json.dumps(result), encoding="utf-8")
     print("[native-presentation-response] " + json.dumps(result))
 
