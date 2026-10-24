@@ -71,7 +71,11 @@ def test_natural_work_binds_exact_ollama_only_when_enabled(
     inference = OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test")
     surface = _work_surface()
     _bind_natural_work_tools(inference=inference, surface=surface, enabled=enabled)
-    assert bound == ([surface] if enabled else [])
+    assert len(bound) == int(enabled)
+    if enabled:
+        assert bound[0].max_objective_chars == surface.max_objective_chars
+        assert not callable(getattr(bound[0], "submit_start_command", None))
+        assert not callable(getattr(bound[0], "start_work", None))
 
 
 def test_natural_work_rejects_ollama_subclass(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1144,7 +1148,8 @@ async def test_full_host_preflight_binds_once_only_after_tool_less_readiness(
     )
 
     assert cue.chunk_id == "chunk_preflight"
-    assert inference._work_tool_handler is surface
+    assert inference._work_tool_handler.max_objective_chars == surface.max_objective_chars
+    assert not callable(getattr(inference._work_tool_handler, "submit_start_command", None))
     assert events == [
         "session:start",
         "inference:preflight",

@@ -130,6 +130,7 @@ async def test_sent_policy_has_one_status_authority(provider, with_tools):
         "Updates may describe specific terminal outcomes, not a current task inventory."
     ) in policy
     assert "authoritative lifecycle context" not in policy
+    assert "otherwise give an ordinary truthful status reply" not in policy
     assert "Only active_work establishes" not in policy
     assert "continuation/restart has no active task" not in policy
 

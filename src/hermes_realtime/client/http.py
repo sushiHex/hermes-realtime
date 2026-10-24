@@ -175,6 +175,18 @@ class BrowserBootstrapApplication:
                     flush=True,
                 )
 
+        if type(path) is str and path == "/api/v1/task-proposal-decision":
+            category = "refused"
+            try:
+                response = await self._handle(
+                    method=method, path=path, headers=headers, body=body, peer=peer,
+                )
+                category = "settled"
+                return response
+            finally:
+                print("[task-proposal-http] " + json.dumps(
+                    {"category": category, "count": 1}, separators=(",", ":")), flush=True)
+
         if type(path) is not str or path != "/api/v1/output-style":
             return await self._handle(
                 method=method, path=path, headers=headers, body=body, peer=peer,
@@ -219,6 +231,7 @@ class BrowserBootstrapApplication:
             raise TypeError("body must be exact bytes")
         routes = {
             "/api/v1/approval",
+            "/api/v1/task-proposal-decision",
             "/api/v1/audio-diagnostic",
             "/api/v1/delete-voice-conversation",
             "/api/v1/events",
@@ -586,6 +599,28 @@ class BrowserBootstrapApplication:
                 text=text,
             )
             payload = {"sequence": sequence, "version": 1}
+            status = 202
+        elif path == "/api/v1/task-proposal-decision":
+            if len(body) > 8192:
+                raise ValueError("proposal decision body is outside its byte bound")
+            if headers.get("content-type") != "application/json":
+                raise ValueError("proposal decision content-type must be application/json")
+            identity = self._verifier.verify(bearer)
+            try:
+                decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValueError("proposal decision body must be strict UTF-8 JSON") from None
+            if type(decoded) is not dict or set(decoded) != {
+                "proposalId", "objective", "generation", "decision", "sequence",
+            }:
+                raise ValueError("proposal decision must have exact fields")
+            await self._sessions.decide_task_proposal(participant_identity=identity,
+                proposal_id=decoded["proposalId"], objective=decoded["objective"],
+                generation=decoded["generation"], decision=decoded["decision"],
+                sequence=decoded["sequence"])
+            payload = {"version": 1, "proposalId": decoded["proposalId"],
+                       "generation": decoded["generation"], "decision": decoded["decision"],
+                       "sequence": decoded["sequence"]}
             status = 202
         elif path == "/api/v1/approval":
             if not 1 <= len(body) <= 1024:

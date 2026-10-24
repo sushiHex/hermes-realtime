@@ -66,6 +66,55 @@ def _read_worker_stages(fd: int) -> tuple[int, str]:
         return 0, "unavailable"
 
 
+def _finalization_refusal_summary(failure: BaseException) -> dict[str, Any] | None:
+    """Project existing cleanup results only; never inspect messages or identities."""
+    operations_allowed = {
+        "pre_cleanup_snapshot", "terminate_job", "wait", "identity", "zero_active",
+        "close", "transient_close",
+    }
+    pending = [failure]
+    results = []
+    visited = 0
+    truncated = False
+    while pending and visited < 16:
+        error = pending.pop()
+        visited += 1
+        if isinstance(error, core._WindowsFinalizationError):
+            results.append(error.result)
+        elif isinstance(error, BaseExceptionGroup):
+            children = error.exceptions[:16]
+            truncated |= len(error.exceptions) > len(children)
+            pending.extend(reversed(children))
+    truncated |= bool(pending)
+    if not results:
+        return None
+    operations: dict[str, int] = {}
+    counts = {"waited_handle_count": 0, "closed_handle_count": 0, "failed_handle_count": 0}
+    for result in results:
+        truncated |= len(result.failures) > 64
+        for item in result.failures[:64]:
+            operation = item.operation if item.operation in operations_allowed else "unknown"
+            operations[operation] = operations.get(operation, 0) + 1
+        for field, handles in (
+            ("waited_handle_count", result.waited_handles),
+            ("closed_handle_count", result.closed_handles),
+            ("failed_handle_count", result.failed_handles),
+        ):
+            count = counts[field] + len(handles)
+            truncated |= count > 65535
+            counts[field] = min(count, 65535)
+    return {
+        "version": 1,
+        "finalization_count": len(results),
+        "operations": operations,
+        "terminated_job": all(result.terminated_job is True for result in results),
+        "zero_active_observed": all(result.zero_active_observed is True for result in results),
+        "closed": all(result.closed is True for result in results),
+        **counts,
+        "truncated": truncated,
+    }
+
+
 @contextmanager
 def _storage_refusal_evidence(
     fd: int | None, action: str, point: str,
@@ -106,6 +155,13 @@ def _storage_refusal_evidence(
                     + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
                     flush=True,
                 )
+                finalization = _finalization_refusal_summary(failure)
+                if finalization is not None:
+                    print(
+                        "[storage-finalization]"
+                        + json.dumps(finalization, separators=(",", ":"), sort_keys=True),
+                        flush=True,
+                    )
             except Exception:
                 pass
 

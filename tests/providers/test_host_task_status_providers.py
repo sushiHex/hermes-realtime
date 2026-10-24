@@ -3,6 +3,7 @@
 import pytest
 from test_ollama_work_tools import adapter, collect, decision_frame
 
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 
 
@@ -260,8 +261,9 @@ async def test_codex_first_admitted_choice_refuses_other_choice(first):
                 responses = [await transport.tool_responses.get() for _ in range(2)]
                 assert sum(row["result"]["success"] for row in responses) == 1
                 await transport.complete_turn(delta="Synthetic response.")
-                assert await response == ["Synthetic response."]
-                assert len(handler.starts) == 1
+                assert await response == [HostTaskProposalRequest("Inspect the build")]
+                # A valid first proposal wins selection, without adapter dispatch authority.
+                assert handler.starts == []
             assert handler.cancels == handler.exact_cancels == []
     finally:
         await inference.close()

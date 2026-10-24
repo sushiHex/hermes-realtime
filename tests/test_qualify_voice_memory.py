@@ -172,8 +172,8 @@ def test_model_witness_is_exact(field: str, value: object) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("accepted", (False, True, 1, "true", None))
-async def test_probe_binds_acceptance_to_tool_payload_instead_of_rpc_success(accepted) -> None:
+@pytest.mark.parametrize("proposed", (False, True, 1, "true", None))
+async def test_probe_binds_proposal_to_exact_confirmation_receipt(proposed) -> None:
     import json
 
     transport = _SCRIPT._ProbeTransport(force_tool="start_work")
@@ -181,10 +181,13 @@ async def test_probe_binds_acceptance_to_tool_payload_instead_of_rpc_success(acc
         "id": 91,
         "result": {
             "success": True,
-            "contentItems": [{"type": "inputText", "text": json.dumps({"accepted": accepted})}],
+            "contentItems": [{"type": "inputText", "text": json.dumps({
+                "proposed": proposed, "requires_confirmation": True,
+            })}],
         },
     })
-    assert transport.tool_accepted is (accepted is True)
+    assert transport.tool_proposed is (proposed is True)
+    assert transport.accepted_start is False
     assert transport.tool_rejected is False
 
 
@@ -197,7 +200,7 @@ async def test_probe_rejects_nonexact_tool_response_content(content) -> None:
     transport = _SCRIPT._ProbeTransport(force_tool="start_work")
     with pytest.raises(AssertionError):
         await transport.send({"id": 91, "result": {"success": True, "contentItems": content}})
-    assert transport.tool_accepted is False
+    assert transport.tool_proposed is False
 
 
 @pytest.mark.asyncio
@@ -206,7 +209,154 @@ async def test_probe_nonobject_payload_cannot_be_accepted() -> None:
     await transport.send({"id": 91, "result": {
         "success": True, "contentItems": [{"type": "inputText", "text": "true"}],
     }})
-    assert transport.tool_accepted is False
+    assert transport.tool_proposed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", (
+    {"accepted": True}, {"proposed": True},
+    {"proposed": True, "requires_confirmation": False},
+    {"proposed": True, "requires_confirmation": 1},
+    {"proposed": True, "requires_confirmation": True, "accepted": True},
+))
+async def test_legacy_or_inexact_receipt_never_establishes_proposal(payload):
+    import json
+
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    await transport.send({"id": 91, "result": {
+        "success": True, "contentItems": [{"type": "inputText", "text": json.dumps(payload)}],
+    }})
+    assert not transport.tool_proposed and not transport.accepted_start
+
+
+@pytest.mark.asyncio
+async def test_failed_rpc_does_not_establish_proposal():
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    await transport.send({"id": 91, "result": {
+        "success": False, "contentItems": [{"type": "inputText", "text":
+            '{"proposed":true,"requires_confirmation":true}'}],
+    }})
+    assert transport.tool_rejected and not transport.tool_proposed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", (
+    "healthy", "receipt", "rejected", "missing", "multiple", "speech", "objective",
+    "dispatch_before", "cancel_before", "card", "admission", "ack", "count",
+    "dispatch_objective", "post_cancel",
+))
+async def test_synthetic_confirmation_requires_exact_proposal_and_real_ack(
+    monkeypatch, capsys, fault,
+):
+    import asyncio
+
+    from hermes_realtime.conversation.task_proposals import (
+        ConversationTaskProposals,
+        HostTaskProposalRequest,
+    )
+    from hermes_realtime.conversation.tasks import TaskDispatchOutcome
+    from hermes_realtime.conversation.work_tools import WorkCommandAdmission
+
+    transport = _SCRIPT._ProbeTransport(force_tool="start_work")
+    transport.tool_proposed = fault != "receipt"
+    transport.tool_rejected = fault == "rejected"
+    transport.proposals = [HostTaskProposalRequest(
+        "Different synthetic task" if fault == "objective" else "Inspect the build",
+    )]
+    if fault == "missing":
+        transport.proposals = []
+    if fault == "multiple":
+        transport.proposals *= 2
+    if fault == "speech":
+        transport.speech = ["Unexpected mixed reply"]
+    transport.preconfirmation_dispatches = int(fault == "dispatch_before")
+    transport.preconfirmation_cancellations = int(fault == "cancel_before")
+    counter = _SCRIPT._ToolCounter()
+    original = counter.dispatch
+    publish = ConversationTaskProposals._publish
+    decide = ConversationTaskProposals.decide
+
+    def changed_card(self, proposal, status, **kwargs):
+        if fault == "card" and status == "pending":
+            self._observer("task_proposal", {"objective": "Different card"})
+        else:
+            publish(self, proposal, status, **kwargs)
+
+    async def refused_admission(self, **kwargs):
+        admitted = await decide(self, **kwargs)
+        if fault == "admission":
+            await asyncio.sleep(0)
+            return WorkCommandAdmission.REFUSED
+        return admitted
+
+    async def broken_dispatch(**kwargs):
+        if fault == "ack":
+            counter.dispatches += 1
+            counter.objectives.append(kwargs["objective"])
+            return TaskDispatchOutcome(accepted=False, reason="Synthetic rejection")
+        result = await original(**kwargs)
+        if fault == "count":
+            counter.dispatches += 1
+        if fault == "dispatch_objective":
+            counter.objectives[-1] = "Different recorded synthetic objective"
+        if fault == "post_cancel":
+            counter.cancellations += 1
+        return result
+
+    monkeypatch.setattr(ConversationTaskProposals, "_publish", changed_card)
+    monkeypatch.setattr(ConversationTaskProposals, "decide", refused_admission)
+    monkeypatch.setattr(counter, "dispatch", broken_dispatch)
+    await _SCRIPT._confirm_proposal(transport, counter, "Inspect the build")
+    assert transport.accepted_start is (fault == "healthy")
+    reaches_host = fault in {
+        "healthy", "admission", "ack", "count", "dispatch_objective", "post_cancel",
+    }
+    assert transport.confirmation_attempted is reaches_host
+    assert counter.dispatches == (2 if fault == "count" else int(reaches_host))
+    assert counter.cancellations == int(fault == "post_cancel")
+    if fault == "objective":
+        # A mismatched synthetic stimulus must never publish an actionable card,
+        # even though the independent card/admission boundary also denies it.
+        assert '[task-proposal] {"category":"offered"' not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("arbitrary", "wrong_cause", "unwrapped", "timeout"))
+async def test_forced_negative_does_not_swallow_operational_errors(monkeypatch, failure):
+    from hermes_realtime.providers import codex_app_server
+
+    class Broken:
+        def __init__(self, **kwargs):
+            pass
+
+        def bind_work_tools(self, handler):
+            pass
+
+        async def stream(self, snapshot, **kwargs):
+            if False:
+                yield ""
+            if failure == "timeout":
+                raise TimeoutError("Synthetic operational timeout")
+            if failure == "unwrapped":
+                raise RuntimeError("Codex dynamic tool is not allowlisted")
+            cause = RuntimeError(
+                "Codex dynamic tool is not allowlisted" if failure == "arbitrary"
+                else "Synthetic unrelated reader failure"
+            )
+            raise RuntimeError(
+                "Codex app-server reader failed" if failure == "wrong_cause" else "Unrelated"
+            ) from cause
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(codex_app_server, "CodexAppServerStreamingInference", Broken)
+    messages = {"timeout": "Synthetic operational timeout", "arbitrary": "Unrelated",
+                "wrong_cause": "Codex app-server reader failed",
+                "unwrapped": "Codex dynamic tool is not allowlisted"}
+    with pytest.raises(TimeoutError if failure == "timeout" else RuntimeError,
+                       match=messages[failure]):
+        await _SCRIPT._adapter_turn(None, force_tool="cancel_active_work")
 
 
 @pytest.mark.asyncio
@@ -245,6 +395,10 @@ async def test_natural_request_positive_control_remains_authorized() -> None:
     )
     assert transport.tool_attempted
     assert not transport.tool_rejected
+    assert transport.tool_proposed and len(transport.proposals) == 1
+    assert (counter.dispatches, counter.cancellations) == (0, 0)
+    await _SCRIPT._confirm_proposal(transport, counter, "Inspect the build")
+    assert transport.accepted_start
     assert (counter.dispatches, counter.cancellations) == (1, 0)
 
 
@@ -287,6 +441,10 @@ async def test_neutral_user_memory_preserves_advertised_tool_authority() -> None
     _, start = await _SCRIPT._adapter_turn(
         start_snapshot, tool_counter=with_memory, force_tool="start_work"
     )
+    assert (baseline.dispatches, with_memory.dispatches) == (0, 0)
+    assert no_memory_start.tool_proposed and start.tool_proposed
+    await _SCRIPT._confirm_proposal(no_memory_start, baseline, "Inspect the build")
+    await _SCRIPT._confirm_proposal(start, with_memory, "Inspect the build")
     _, cancel = await _SCRIPT._adapter_turn(
         cancel_snapshot, tool_counter=with_memory, force_tool="cancel_active_work"
     )
@@ -404,8 +562,8 @@ async def test_removed_ollama_memory_fails_only_data_only_witness(monkeypatch) -
 @pytest.mark.parametrize("with_memory", (False, True))
 @pytest.mark.parametrize("tool,field", (
     ("start_work", "attempt"), ("start_work", "advertisement"),
-    ("start_work", "acceptance"), ("start_work", "refusal"),
-    ("cancel_active_work", "acceptance"), ("cancel_active_work", "attempt"),
+    ("start_work", "proposal"), ("start_work", "refusal"),
+    ("cancel_active_work", "proposal"), ("cancel_active_work", "attempt"),
     ("cancel_active_work", "advertisement"), ("cancel_active_work", "refusal"),
 ))
 async def test_forced_authority_pair_requires_exact_new_policy(
@@ -419,8 +577,8 @@ async def test_forced_authority_pair_requires_exact_new_policy(
                 and (snapshot.memory is not None) == with_memory):
             if field == "attempt":
                 transport.tool_attempted = False
-            elif field == "acceptance":
-                transport.tool_accepted = tool != "start_work"
+            elif field == "proposal":
+                transport.tool_proposed = tool != "start_work"
             elif field == "refusal":
                 transport.tool_rejected = tool == "start_work"
             else:
@@ -440,4 +598,9 @@ async def test_forced_authority_pair_requires_exact_new_policy(
         attack_seen=True, refresh_turns=0, refresh_tool_calls=0,
         refresh_notifications=0, samples=1,
     )
-    assert observed["authority"] == _good()["authority"] | {"forced_pairs": 1}
+    changed = {"forced_pairs": 1}
+    if tool == "start_work" and field in {"proposal", "refusal"}:
+        # No successful proposal receipt means no synthetic confirmation and
+        # therefore no dispatch; retain that refusal evidence as well.
+        changed["memory_dispatches" if with_memory else "baseline_dispatches"] = 0
+    assert observed["authority"] == _good()["authority"] | changed

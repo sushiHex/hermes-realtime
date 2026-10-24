@@ -4,12 +4,19 @@ Offline fixture only. Active plugin removal is outside its selected lifecycle.
 No prompt classification, model names or synthetic scenario names occur here.
 """
 
+import asyncio
+import contextlib
 import contextvars
+import copy
 import hashlib
 import json
+import os
+import re
 import secrets
 import threading
+import time
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from aiohttp import web
 from tools.approval import get_current_session_key
@@ -19,14 +26,166 @@ VERSION = "ordinary-lookup/v1"
 SEARCH_LIMIT = 5
 EXTRACT_LIMIT = 3
 REFUSAL = json.dumps({"error": "policy_refused"})
+PRESENTATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "voice": {"type": "string", "minLength": 1, "maxLength": 220},
+        "detail": {"type": "string", "minLength": 1, "maxLength": 1800},
+    },
+    "required": ["voice", "detail"],
+    "additionalProperties": False,
+}
+PRESENTATION_INSTRUCTIONS = (
+    "Present the completed result faithfully as JSON with exactly voice and detail strings. "
+    "Add no facts, tools or actions. Voice must be one or two natural conversational "
+    "sentences, at most 220 characters, covering the direct answer and all material "
+    "findings from detail, including source attribution when source-backed. Detail must "
+    "be friendly, naturally written, display-ready supporting detail, at most 1800 "
+    "characters. Preserve every material finding, its useful context, uncertainty, and "
+    "source attribution; do not collapse a multi-item result into a terse headline list. "
+    "Voice and detail must be semantically consistent; detail may expand voice but must "
+    "not replace its important findings. Do not put line breaks or markup inside voice, "
+    "or voice/detail markup delimiters inside either string."
+)
 
 
 def frozen(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def response_facts(response, prefix):
+    """Content-free first-choice facts; observation never authorizes a response."""
+    choices = getattr(response, "choices", None)
+    sequence = type(choices) in (list, tuple)
+    choice = choices[0] if sequence and choices else None
+    message = getattr(choice, "message", None)
+    content = getattr(message, "content", None)
+    finish = getattr(choice, "finish_reason", None)
+    facts = {
+        "choices_count": len(choices) if sequence else 0,
+        "kind": "string" if type(content) is str else "none" if content is None else "other",
+        "length": len(content) if type(content) is str else 0,
+        "finish_reason": (
+            finish if type(finish) is str and finish in {
+                "stop", "length", "tool_calls", "content_filter", "function_call"
+            } else "missing" if finish is None else "other"
+        ),
+        "tool_calls": bool(getattr(message, "tool_calls", None)),
+        "refusal": bool(getattr(message, "refusal", None)),
+        "parsed_present": getattr(message, "parsed", None) is not None,
+    }
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(message, name, None)
+        facts[name + "_kind"] = (
+            "string" if type(value) is str else "none" if value is None else "other"
+        )
+        facts[name + "_length"] = len(value) if type(value) is str else 0
+    return {prefix + "_" + key: value for key, value in facts.items()}
+
+
+class Presentation:
+    """One explicit same-route SDK call, independent of native tool dispatch."""
+
+    def __init__(self, config):
+        keys = {"provider", "base_url", "model", "api_key_env"}
+        if type(config) is not dict or set(config) != keys or any(
+            type(config[key]) is not str or not 1 <= len(config[key]) <= 2048 for key in keys
+        ):
+            raise ValueError("presentation-config")
+        url = urlsplit(config["base_url"])
+        if (url.scheme not in {"http", "https"} or not url.hostname
+                or url.username or url.password or url.query or url.fragment
+                or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", config["api_key_env"]) is None):
+            raise ValueError("presentation-config")
+        self.config = MappingProxyType(dict(config))
+
+    def validate_route(self, kw):
+        if any(kw.get(key) != self.config[key] for key in ("provider", "base_url", "model")):
+            raise ValueError("presentation-route")
+        if kw["request"].get("model") != self.config["model"]:
+            raise ValueError("presentation-model")
+
+    async def complete(self, generation, run_id, row, source, evidence):
+        import httpx
+        from openai import AsyncOpenAI
+
+        key = os.environ.get(self.config["api_key_env"])
+        if not key:
+            raise ValueError("presentation-credential")
+        body = {
+            "model": self.config["model"],
+            "messages": [
+                {"role": "system", "content": PRESENTATION_INSTRUCTIONS},
+                {"role": "user", "content": source},
+            ],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "voice_detail", "strict": True, "schema": PRESENTATION_SCHEMA}},
+            "max_tokens": 1024,
+            "stream": False,
+        }
+
+        async def observe(request):
+            # Actual SDK serialization; fixed fields/hashes only, never prompt or auth.
+            raw = request.content
+            serialized = json.loads(raw)
+            evidence["wire"] = {
+                "body_sha256": hashlib.sha256(raw).hexdigest(),
+                "model_matches": serialized.get("model") == self.config["model"],
+                "tools_absent": not any(name in serialized for name in (
+                    "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")),
+                "nonstreaming": serialized.get("stream") is False,
+                "schema_matches": serialized.get("response_format") == body["response_format"],
+                "source_sha256": hashlib.sha256(
+                    serialized["messages"][-1]["content"].encode()).hexdigest(),
+                "instruction_sha256": hashlib.sha256(
+                    serialized["messages"][0]["content"].encode()).hexdigest(),
+            }
+            evidence["wire_requests"] += 1
+
+        active = {"loop": asyncio.get_running_loop(), "task": asyncio.current_task(),
+                  "cancel_requested": False, "closing": False}
+        settled = False
+        failure = None
+        try:
+            remaining = row["deadline"] - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("presentation-deadline")
+            async with httpx.AsyncClient(
+                follow_redirects=False, timeout=remaining, event_hooks={"request": [observe]}
+            ) as http, AsyncOpenAI(
+                base_url=self.config["base_url"], api_key=key, http_client=http,
+                max_retries=0, timeout=remaining,
+            ) as client:
+                with generation.lock:
+                    _, current = generation.scope()
+                    if current is not row or row["cancelled"] or row.get("presentation_active"):
+                        raise ValueError("presentation-ownership")
+                    remaining = row["deadline"] - time.monotonic()
+                    if remaining <= 0:
+                        raise ValueError("presentation-deadline")
+                    row["presentation_active"] = active
+                try:
+                    async with asyncio.timeout(remaining):
+                        result = await client.chat.completions.create(**body)
+                except BaseException as error:
+                    failure = error
+                finally:
+                    with generation.lock:
+                        active["closing"] = True
+            settled = True
+            if failure is not None:
+                raise failure
+            return result
+        finally:
+            # Timeout and repeat stop requests cannot cancel the context-manager cleanup.
+            evidence["local_http_settled"] = settled
+            with generation.lock:
+                if settled and row.get("presentation_active") is active:
+                    row["presentation_active"] = None
+
+
 class Generation:
-    def __init__(self, refusal):
+    def __init__(self, refusal, presentation=None):
         self.epoch = secrets.token_hex(16)
         self.lock = threading.RLock()
         self.members = MappingProxyType({})
@@ -43,6 +202,28 @@ class Generation:
         self.ticket = contextvars.ContextVar("generation-effect-ticket", default=None)
         self.late_denied = 0
         self.late_results = 0
+        self.presentation = presentation
+
+    def cancel_presentation(self, row):
+        active = row.get("presentation_active")
+        if active and not active["cancel_requested"]:
+            active["cancel_requested"] = True
+
+            def cancel():
+                with self.lock:
+                    if row.get("presentation_active") is active and not active["closing"]:
+                        active["task"].cancel()
+
+            with contextlib.suppress(RuntimeError):
+                # The owning finally may already have settled a closed event loop.
+                active["loop"].call_soon_threadsafe(cancel)
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for _, _, row in self._membership_authority.values():
+                row["closed"] = row["cancelled"] = True
+                self.cancel_presentation(row)
 
     def available(self):
         if (
@@ -87,6 +268,7 @@ class Generation:
     def wire(self, app, adapter):
         @web.middleware
         async def admission(request, handler):
+            admitted_at = time.monotonic()
             starting = request.method == "POST" and request.path == "/v1/runs"
             selected = request.headers.get("X-Lookup-Policy", "")
             reserved = False
@@ -144,6 +326,7 @@ class Generation:
                                     {"error": "policy_old_generation"}, status=409
                                 )
                             row = {
+                                "deadline": admitted_at + 120,
                                 "phase": "new",
                                 "closed": False,
                                 "cancelled": False,
@@ -180,6 +363,7 @@ class Generation:
                             and row
                         ):
                             row["closed"] = row["cancelled"] = True
+                            self.cancel_presentation(row)
                     if (
                         request.method == "GET"
                         and response.status == 200
@@ -232,6 +416,7 @@ class Generation:
         response = kw["next_call"](kw["request"])
         if row is None:
             return response
+        native_facts = response_facts(response, "source") if self.presentation is not None else None
         try:
             with self.lock:
                 _, current = self.scope()  # Replaced rows are never adopted.
@@ -282,11 +467,112 @@ class Generation:
                 row["plan"] = plan
                 row["request"] = kw["api_request_id"]
                 row["spent"], row["admitted"] = set(), set()
+            if not calls and self.presentation is not None:
+                return self.present(run_id, row, response, kw)
             return response
-        except BaseException:
+        except BaseException as error:
+            with self.lock:
+                self.refuse(run_id)
+            if native_facts is not None:
+                evidence = {"category": "refused", "stage": "native-response", "calls": 0,
+                            "wire_requests": 0, "failure_kind": type(error).__name__,
+                            **native_facts}
+                row["presentation_evidence"] = evidence
+                with contextlib.suppress(OSError, ValueError):
+                    print("[lookup-presentation] " + frozen(evidence), flush=True)
+            return self.refusal()
+
+    def present(self, run_id, row, response, kw):
+        evidence = {"category": "refused", "stage": "source", "calls": 0, "wire_requests": 0}
+        row["presentation_evidence"] = evidence
+        try:
+            evidence.update(response_facts(response, "source"))
+            message = response.choices[0].message
+            source = message.content
+            if (response.choices[0].finish_reason != "stop" or getattr(message, "refusal", None)
+                    or type(source) is not str or not source.strip() or len(source) > 4096):
+                raise ValueError("presentation-source")
+            row["original_response"] = response
+            evidence["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
+            evidence["stage"] = "route"
+            self.presentation.validate_route(kw)
+            evidence["stage"] = "worker-loop"
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise ValueError("presentation-event-loop")
+            evidence["calls"] = 1
+            evidence["stage"] = "provider"
+            formatted = asyncio.run(self.presentation.complete(self, run_id, row, source, evidence))
+            evidence["stage"] = "response-envelope"
+            evidence.update(response_facts(formatted, "response"))
+            usage = getattr(formatted, "usage", None)
+            evidence["usage"] = {
+                key: number for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if type(number := getattr(usage, key, None)) is int and 0 <= number <= 1000000000
+            }
+            reasoning_tokens = getattr(
+                getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
+            )
+            if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= 1000000000:
+                evidence["usage"]["reasoning_tokens"] = reasoning_tokens
+            if len(formatted.choices) != 1:
+                raise ValueError("presentation-envelope")
+            choice = formatted.choices[0]
+            content = choice.message.content
+            if (choice.finish_reason != "stop" or choice.message.tool_calls
+                    or getattr(choice.message, "refusal", None)
+                    or type(content) is not str or len(content) > 8192):
+                raise ValueError("presentation-envelope")
+
+            def pairs(items):
+                if len(items) != len(dict(items)):
+                    raise ValueError("presentation-duplicate-key")
+                return dict(items)
+
+            evidence["stage"] = "json"
+            value = json.loads(content, object_pairs_hook=pairs)
+            evidence["stage"] = "fields"
+            if type(value) is not dict or set(value) != {"voice", "detail"}:
+                raise ValueError("presentation-fields")
+            evidence["stage"] = "content"
+            for name, limit in (("voice", 220), ("detail", 1800)):
+                text = value[name]
+                if (type(text) is not str or not text.strip() or len(text) > limit
+                        or any(token in text for token in (
+                            "<voice>", "</voice>", "<detail>", "</detail>"))):
+                    raise ValueError("presentation-content")
+            content = ("<voice>" + value["voice"]
+                       + "</voice><detail>" + value["detail"] + "</detail>")
+            from hermes_realtime.integration.api import HermesApiTaskSession
+
+            evidence["stage"] = "terminal-contract"
+            if HermesApiTaskSession._completed_result_text(content) != content:
+                raise ValueError("presentation-terminal-contract")
+            evidence["stage"] = "publication"
+            with self.lock:
+                _, current = self.scope()
+                if (current is not row or row["cancelled"] or time.monotonic() >= row["deadline"]):
+                    raise ValueError("presentation-late-result")
+                # Retain native identity/metadata and task usage; presentation usage is separate.
+                result = copy.copy(response)
+                published_choice = copy.copy(response.choices[0])
+                published_message = copy.copy(message)
+                published_message.content = content
+                published_choice.message = published_message
+                result.choices = [published_choice]
+                evidence["category"] = "presented"
+                evidence["stage"] = "complete"
+                return result
+        except BaseException as error:
+            evidence["failure_kind"] = type(error).__name__
             with self.lock:
                 self.refuse(run_id)
             return self.refusal()
+        finally:
+            print("[lookup-presentation] " + frozen(evidence), flush=True)
 
     def tool_gate(self, **kw):
         run_id = ""

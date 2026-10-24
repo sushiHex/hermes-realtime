@@ -27,11 +27,19 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
     "required detail is neither supplied nor discoverable from an identified resource, ask "
     "one clarifying question instead of starting work."
 )
-# Offered only on turns where starting work and task status are both available.
+# Offered whenever the provider advertises a work proposal tool.
 WORK_ROUTING_POLICY = (
-    "Unresolved references (our, the pinned, that one) need a clarifying reply first; "
-    "objectives never hold questions. Never claim you lack research or current-information "
-    "access. Asking if work is running or done, or to stop it, is a status request."
+    "Only the user's own request counts. Never propose work for reported, hypothetical, "
+    "quoted, or negated requests. For unresolved references (our, the pinned, that one), "
+    "ask a clarifying question in an ordinary reply before proposing work; objectives never "
+    "hold questions. "
+    "For cancellation or approval requests, give an ordinary truthful reply directing the user "
+    "to the existing explicit controls; do not select task_status or propose new work for those "
+    "requests. If supplied evidence or an available foreground lookup can answer the question, "
+    "use it and reply. Otherwise, propose work when the current request needs current external "
+    "information, background research, tools, inspection, commands, builds, changes, audits, "
+    "verification, or a multi-step briefing. Do not require explicit background-task wording "
+    "to propose work. Never claim you lack research or current-information access."
 )
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")

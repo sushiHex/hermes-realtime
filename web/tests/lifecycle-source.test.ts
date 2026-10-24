@@ -92,7 +92,7 @@ describe("browser lifecycle wiring", () => {
     // Every pending approval keeps its own card: concurrent runs can each hold
     // one, and a live card must survive transcript eviction by repinning.
     expect(mainSource).toContain("const approvalCardViews = new Map<string, ApprovalCardView>()");
-    expect(mainSource).toContain("actionableApprovalCard(obsolete) && !repinned.has(obsolete)");
+    expect(mainSource).toContain("actionableOperationCard(obsolete) && !repinned.has(obsolete)");
     expect(mainSource).not.toContain("activeApprovalCard");
     expect(mainSource).not.toContain("Superseded by a newer approval request.");
     expect(mainSource).toContain("forgetEvictedOperationCard(obsolete)");

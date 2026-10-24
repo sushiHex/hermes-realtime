@@ -115,6 +115,12 @@ Successful workspaces are removed; failed runs retain their private temporary
 workspace for investigation. No workflow rerun or timeout change supplies
 acceptance.
 
+On a process-finalization refusal, a separate `[storage-finalization]` version-one
+JSON line reports fixed operation categories, result booleans and handle counts.
+Nested exception inspection is bounded and reports truncation. It includes no
+exception messages, handle values, process identities or paths. This diagnostic
+preserves the original refusal and does not retry cleanup or change acceptance.
+
 ## Evidence boundary
 
 This producer covers the governed packaged spool crash class. It does not supply

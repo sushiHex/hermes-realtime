@@ -28,6 +28,7 @@ from collections.abc import (
 )
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -76,6 +77,11 @@ from hermes_realtime.conversation import (
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import OutputStyleSelection
+from hermes_realtime.conversation.task_proposals import (
+    MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
+    ConversationTaskProposals,
+)
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.evidence import (
     CaptureState,
     ConsentDisposition,
@@ -775,6 +781,7 @@ async def _play_readiness_cue(
     participant_identity: str,
     generation: int,
     is_valid: Callable[[], bool],
+    task_proposals: ConversationTaskProposals | None = None,
 ) -> None:
     """Play the readiness cue with this binding's audio input suppressed.
 
@@ -790,6 +797,8 @@ async def _play_readiness_cue(
         speech=asyncio.current_task(),
     )
     try:
+        if task_proposals is not None:
+            task_proposals.speech_started()
         await playback.play(chunk, is_valid=is_valid)
     finally:
         resume_task = asyncio.create_task(
@@ -1335,6 +1344,11 @@ def _build_streaming_inference(
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkProposalBounds:
+    max_objective_chars: int
+
+
 def _bind_natural_work_tools(
     *,
     inference: OllamaStreamingInference | CodexAppServerStreamingInference,
@@ -1349,7 +1363,21 @@ def _bind_natural_work_tools(
         raise TypeError("natural work tools require exact Codex or Ollama inference")
     if type(surface) is not ConversationWorkControlSurface:
         raise TypeError("natural work tools require an exact work-control surface")
-    inference.bind_work_tools(surface)
+    inference.bind_work_tools(_WorkProposalBounds(
+        min(surface.max_objective_chars, MAX_TASK_PROPOSAL_OBJECTIVE_CHARS),
+    ))
+
+
+def _proposal_spoken_text(synthesizer: object, text: str) -> str | None:
+    """Use optional canonical synthesis projection; failure cannot arm spoken assent."""
+    try:
+        project = getattr(synthesizer, "project_spoken_text", None)
+        if not callable(project):
+            return None
+        projected = project(text)
+    except Exception:
+        return None
+    return projected if type(projected) is str else None
 
 
 def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | None:
@@ -1897,6 +1925,7 @@ def build_local_host_launcher(
     *,
     hermes_api_bearer: str | None,
     hermes_api_url: str = DEFAULT_HERMES_API_URL,
+    hermes_lookup_policy: str | None = None,
     livekit_url: str = "ws://127.0.0.1:7880",
     livekit_api_key: str = "devkey",
     livekit_api_secret: str = "local" + "-" + ("x" * 32),
@@ -1949,6 +1978,9 @@ def build_local_host_launcher(
 ) -> LocalBrowserLauncher:
     """Compose the explicit full host without provider fallback.
 
+    ``hermes_lookup_policy`` explicitly designates all background runs through this
+    host's API adapter. None preserves ordinary native runs; this does not install
+    or qualify the experimental policy plugin.
     ``voice_tail`` names the durable heard-context file; None disables it.
     ``voice_companion`` names the Hermes companion that archives the tail's outbox;
     None archives nothing. Archiving needs the tail, whose outbox it drains.
@@ -1972,6 +2004,8 @@ def build_local_host_launcher(
         if voice_tail is None:
             raise ValueError("archiving through the companion needs a voice tail")
     if qualification_no_hermes_tasks:
+        if hermes_lookup_policy is not None:
+            raise ValueError("qualification no-task composition rejects a lookup policy")
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
         if allow_unsandboxed_tasks or natural_work_tools:
@@ -2072,6 +2106,7 @@ def build_local_host_launcher(
             run_model=codex_model if inference_provider == "codex" else None,
             run_reasoning_effort=codex_effort if inference_provider == "codex" else None,
             run_service_tier="priority" if inference_provider == "codex" else None,
+            lookup_policy=hermes_lookup_policy,
         )
     )
     livekit_url = _validate_livekit_origin(livekit_url, remote_mode=remote_mode)
@@ -2094,6 +2129,7 @@ def build_local_host_launcher(
         api_secret=livekit_api_secret,
     )
     projection = BrowserEventProjection()
+    proposals: ConversationTaskProposals | None = None
     usage_accumulator = _SessionTokenUsageAccumulator()
     production_observations, production_observation_recorder = _new_observation_channel()
     consent_dependencies = _HostEvidenceConsentDependenciesV1(
@@ -2169,6 +2205,8 @@ def build_local_host_launcher(
         projected_data = _renderer_yield_event_data(kind, data, active_renderer_authority)
         if kind in {"interrupt_requested", "session_stopped"}:
             speech_generations.clear()
+        if kind == "session_stopped" and proposals is not None:
+            proposals.close_binding()
         if _renderer_authority_ends(kind, data, active_renderer_presentation):
             active_renderer_authority = None
             active_renderer_presentation = None
@@ -2297,6 +2335,14 @@ def build_local_host_launcher(
         reserve_observer_capacity=projection.ensure_capacity,
         utterance_id_factory=lambda: uuid.uuid4().hex,
     )
+    def observe_proposal(kind: str, data: dict[str, _PublicValue]) -> None:
+        projection.publish(kind, data)
+
+    if natural_work_tools:
+        proposals = ConversationTaskProposals(
+            surface=work_surface, observer=observe_proposal,
+            speech_projection=lambda text: _proposal_spoken_text(synthesizer, text),
+        )
 
     async def record_command_input(text: str) -> None:
         await speech.record_user_input(Transcript(text=text, final=True))
@@ -2313,6 +2359,7 @@ def build_local_host_launcher(
         ),
         validate_user_input=context.validate_user_text,
         record_user_input=record_command_input,
+        task_proposals=proposals,
     )
     search_egress_authority, current_fact_lookup, knowledge_coordinator = (
         _compose_public_search(
@@ -2479,6 +2526,7 @@ def build_local_host_launcher(
                     chunk=chunk,
                     participant_identity=participant_identity,
                     generation=generation,
+                    task_proposals=proposals,
                     is_valid=lambda: media_incarnations.get(generation) == media_incarnation,
                 )
 
@@ -2508,6 +2556,7 @@ def build_local_host_launcher(
         playback=serialized_playback,
         ledger=DeliveredSpeechLedger(),
         task_status=work_surface.task_status,
+        task_proposals=proposals,
         observer=observe,
         max_segments=DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds=10.0,
@@ -2585,6 +2634,8 @@ def build_local_host_launcher(
                 )
                 schedule_restart_announcement()
 
+        if proposals is not None:
+            proposals.bind(participant_identity, generation)
         return ConversationSessionWorker(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -2594,6 +2645,7 @@ def build_local_host_launcher(
             actions=shared_actions,
             stt_streams_partials=stt_provider == "moonshine",
             command_router=command_router,
+            task_proposals=proposals,
             evidence_lifecycle_resolver=(
                 (lambda: evidence_runtime.evidence_lifecycle)
                 if evidence_runtime is not None
@@ -2628,6 +2680,9 @@ def build_local_host_launcher(
         media_incarnation: int,
     ) -> None:
         previous_incarnation = media_incarnations.get(generation)
+        if (proposals is not None and previous_incarnation is not None
+                and previous_incarnation != media_incarnation):
+            proposals.retire("media_changed")
         await conversation.activate_media(
             participant_identity=participant_identity,
             session_generation=generation,
@@ -2644,6 +2699,17 @@ def build_local_host_launcher(
     def session_started(participant_identity: str, generation: int) -> None:
         media_incarnations.clear()
         usage_accumulator.reset(participant_identity, generation)
+
+    async def decide_task_proposal(
+        participant_identity: str, generation: int, proposal_id: str,
+        objective: str, decision: str,
+    ) -> WorkCommandAdmission:
+        if proposals is None:
+            raise PermissionError("natural task proposals are disabled")
+        return await proposals.decide(
+            participant=participant_identity, generation=generation,
+            proposal_id=proposal_id, objective=objective, decision=decision,
+        )
 
     async def decide_approval(
         participant_identity: str,
@@ -2829,6 +2895,7 @@ def build_local_host_launcher(
         worker_identity=worker_identity,
         worker=livekit_worker,
         approval=decide_approval,
+        task_proposal_decision=decide_task_proposal if proposals is not None else None,
         static_root=Path(__file__).resolve().parent / "client" / "static",
         host=browser_host,
         port=browser_port,

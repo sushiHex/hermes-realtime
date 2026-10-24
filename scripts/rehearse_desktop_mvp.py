@@ -714,10 +714,7 @@ class Processes:
                 wait_ms = max(0, int((deadline - time.monotonic()) * 1000))
                 expected_start = self.seen[pid][1] if pid in tracked else None
                 job = containment._job if containment is not None and pid in members else None
-                state = (
-                    _cleanup_process_state(pid, expected_start, job, wait_ms)
-                    if pid in table else "unknown"
-                )
+                state = _cleanup_process_state(pid, expected_start, job, wait_ms)
                 observation[state] += 1
         except OSError:
             observation["observation_failed"] = 1
@@ -731,8 +728,8 @@ class Processes:
         self, containment: Containment | None
     ) -> tuple[dict[int, tuple[int, str]], set[int], set[int], set[int]]:
         table = process_table()
-        # A historical identity absent from this successful native snapshot is not
-        # running at this boundary. A Job-listed PID missing from it stays unknown.
+        # Historical identities absent from this successful snapshot are not candidates.
+        # Independently listed Job members still receive native handle classification.
         tracked = self.seen.keys() & table.keys()
         members = containment.members() - {os.getpid()} if containment is not None else set()
         candidates = tracked | members
@@ -761,13 +758,10 @@ class Processes:
                 kind = "tracked" if pid in tracked else "job_only"
                 expected_start = self.seen[pid][1] if pid in tracked else None
                 job = containment._job if containment is not None and pid in members else None
-                state = (
-                    _cleanup_process_state(pid, expected_start, job)
-                    if pid in table else "unknown"
-                )
+                state = _cleanup_process_state(pid, expected_start, job)
                 snapshot[kind][state] += 1
                 if state == "running_or_terminating":
-                    left[table[pid][1]] += 1
+                    left[table[pid][1] if pid in table else "<unknown>"] += 1
                 elif state == "unknown":
                     left["<unknown>"] += 1
         except OSError:
