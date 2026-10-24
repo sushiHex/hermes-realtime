@@ -39,6 +39,20 @@ literal framing. Missing or incompatible validation refuses without fallback.
 This private-method coupling is an explicit compatibility limit: the plugin is
 not a standalone Hermes formatting qualification. The acceptance launcher must
 bind imports to the attested realtime payload.
+
+This opt-in presentation path additionally requires a nonblank source URL from
+a successful, error-free search result admitted to the same run through the
+existing tool/effect tickets. Failed, empty, unrelated or stale results cannot
+authorize presentation. Search-only evidence suffices; extraction is not required.
+The existing `row.urls` index supplies this evidence, without a separate success
+flag. Its presence records admitted search-result metadata, not page extraction,
+answer correctness, citation fidelity, source authority or freshness. Those remain
+separate acceptance checks.
+
+Generic native completion and the budget-only fixture deployment do not promise
+source support and keep their prior completion behavior. Historical bounded-tool
+qualification does not become source-backed publication qualification retroactively.
+
 The presentation request sets `reasoning_effort: none`; native task reasoning
 is unchanged. The configured endpoint must support this request control.
 Unsupported requests fail closed without a fallback. The 1024-token cap, schema

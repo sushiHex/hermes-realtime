@@ -507,6 +507,10 @@ class Generation:
                 raise ValueError("presentation-source")
             row["original_response"] = response
             evidence["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
+            evidence["stage"] = "retrieval"
+            if not row["urls"]:
+                evidence["rejection"] = "retrieval-required"
+                raise ValueError("retrieval-required")
             evidence["stage"] = "route"
             self.presentation.validate_route(kw)
             evidence["stage"] = "worker-loop"
@@ -658,7 +662,7 @@ class Generation:
                         if type(result) is not str or len(result.encode("utf-8")) > 262144:
                             raise ValueError("result-bound")
                         data = json.loads(result)
-                        if data.get("success") is True:
+                        if data.get("success") is True and not data.get("error"):
                             web_results = data["data"]["web"]
                             if type(web_results) is not list or len(web_results) > 256:
                                 raise ValueError("returned-url-bound")
@@ -667,7 +671,8 @@ class Generation:
                                 url = item["url"]
                                 if type(url) is not str or len(url.encode("utf-8")) > 8192:
                                     raise ValueError("returned-url-type-bound")
-                                urls.add(url)
+                                if url.strip():
+                                    urls.add(url)
                             if len(urls | row["urls"]) > 256:
                                 raise ValueError("returned-url-bound")
                             row["urls"].update(urls)

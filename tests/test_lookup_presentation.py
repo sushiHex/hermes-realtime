@@ -30,11 +30,35 @@ def completion(content, *, reason="stop", calls=None):
     )
 
 
+def retrieve(generation, result, before_result=None):
+    """Admit one search through the real model/tool/effect ticket chain."""
+    args = {"query": "synthetic lookup"}
+    call = SimpleNamespace(id="retrieval-call", function=SimpleNamespace(
+        name="web_search", arguments=json.dumps(args)))
+    response = completion(None, reason="tool_calls", calls=[call])
+    assert generation.model_gate(api_mode="chat_completions", api_request_id="retrieval-request",
+                                 request={}, next_call=lambda _: response) is response
+
+    def original(_args):
+        if before_result:
+            before_result()
+        return json.dumps(result)
+
+    return generation.tool_gate(
+        tool_name="web_search", tool_call_id=call.id, api_request_id="retrieval-request", args=args,
+        next_call=generation.wrap_search(original),
+    )
+
+
 @pytest.fixture
-def setup(monkeypatch):
+def setup(monkeypatch, request):
+    retrieval = getattr(request, "param", {
+        "success": True, "data": {"web": [{"url": "https://example.invalid/source"}]},
+    })
+    session = {"run": "selected"}
     for name in ("tools", "tools.approval", "tools.registry"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    sys.modules["tools.approval"].get_current_session_key = lambda **_: "selected"
+    sys.modules["tools.approval"].get_current_session_key = lambda **_: session["run"]
     sys.modules["tools.registry"].registry = SimpleNamespace(get_entry=lambda _: None)
     spec = importlib.util.spec_from_file_location("lookup_presentation_policy", SOURCE)
     module = importlib.util.module_from_spec(spec)
@@ -76,10 +100,12 @@ def setup(monkeypatch):
     g = module.Generation(lambda: refused, presentation=formatter)
     g.handles = [SimpleNamespace(active=True)]
     row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 1,
-           "phase": "search", "settled": 1, "reserved": 1, "urls": set()}
+           "phase": "new", "settled": 0, "reserved": 0, "urls": set()}
     g.budgets["selected"] = row
     g.members = MappingProxyType({"selected": (module.VERSION, "identity", row)})
     g._membership_authority = g.members
+    if retrieval is not None:
+        retrieve(g, retrieval)
     original = completion("Full source result.")
     request = {"model": "test-model", "messages": [{"role": "user", "content": "task"}],
                "tools": ["forbidden"], "tool_choice": "auto", "parallel_tool_calls": True,
@@ -93,7 +119,7 @@ def setup(monkeypatch):
         return g.model_gate(**kw)
 
     return SimpleNamespace(module=module, g=g, row=row, original=original, request=request,
-                           run=run, captured=captured, refused=refused)
+                           run=run, captured=captured, refused=refused, session=session)
 
 
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
@@ -122,6 +148,66 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
     assert s.row["presentation_evidence"]["wire_requests"] == 1
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("setup", [
+    None,
+    {"success": False, "data": {"web": [{"url": "https://example.invalid/source"}]}},
+    {"success": True, "error": "failed", "data": {"web": [{"url": "https://example.invalid/source"}]}},
+    {"success": True, "data": {"web": []}},
+    {"success": True, "data": {"web": [{"url": ""}]}},
+    {"success": True, "data": {"web": [{"url": "  "}]}},
+], indirect=True, ids=["no-retrieval", "failed", "error", "empty", "blank", "whitespace"])
+def test_presentation_requires_successful_same_run_source(setup):
+    assert setup.run() is setup.refused
+    assert not setup.row["urls"] and not setup.captured["requests"]
+    assert setup.row["presentation_evidence"]["stage"] == "retrieval"
+
+
+def test_successful_admitted_search_without_extraction_reaches_presentation(setup):
+    assert setup.row["urls"] == {"https://example.invalid/source"}
+    assert setup.row["phase"] == "search" and setup.row["settled"] == 1
+    assert setup.row["spent"] == setup.row["admitted"] == {"retrieval-call"}
+    assert setup.run() is not setup.refused and len(setup.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_other_run_retrieval_cannot_satisfy_presentation(setup):
+    s = setup
+    other = dict(s.row, urls=set())
+    s.g.budgets["other"] = other
+    s.g.members = MappingProxyType(
+        dict(s.g.members) | {"other": (s.module.VERSION, "other", other)}
+    )
+    s.g._membership_authority = s.g.members
+    s.session["run"] = "other"
+    retrieve(s.g, {"success": True, "data": {"web": [{"url": "https://example.invalid/other"}]}})
+    s.session["run"] = "selected"
+    assert other["urls"] and not s.row["urls"]
+    assert s.run() is s.refused and not s.captured["requests"]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("stale", ["cancelled", "replaced"])
+def test_stale_search_result_never_adds_source_evidence(setup, stale):
+    s = setup
+
+    def before_result():
+        if stale == "cancelled":
+            s.row["closed"] = s.row["cancelled"] = True
+        else:
+            s.g.budgets["selected"] = {}
+
+    retrieve(s.g, {"success": True, "data": {"web": [{"url": "https://example.invalid/stale"}]}},
+             before_result)
+    assert not s.row["urls"]
+    assert s.run() is s.refused and not s.captured["requests"]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_budget_only_completion_does_not_claim_or_require_retrieval(setup):
+    setup.g.presentation = None
+    assert setup.run() is setup.original and not setup.captured["requests"]
 
 
 def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
