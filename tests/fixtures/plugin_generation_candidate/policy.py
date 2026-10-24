@@ -7,6 +7,7 @@ No prompt classification, model names or synthetic scenario names occur here.
 import asyncio
 import contextlib
 import contextvars
+import copy
 import hashlib
 import json
 import os
@@ -449,7 +450,7 @@ class Generation:
         try:
             message = response.choices[0].message
             source = message.content
-            if (response.choices[0].finish_reason != "stop" or message.refusal
+            if (response.choices[0].finish_reason != "stop" or getattr(message, "refusal", None)
                     or type(source) is not str or not source.strip() or len(source) > 4096):
                 raise ValueError("presentation-source")
             row["original_response"] = response
@@ -474,7 +475,7 @@ class Generation:
             choice = formatted.choices[0]
             content = choice.message.content
             if (choice.finish_reason != "stop" or choice.message.tool_calls
-                    or choice.message.refusal
+                    or getattr(choice.message, "refusal", None)
                     or type(content) is not str or len(content) > 8192):
                 raise ValueError("presentation-envelope")
 
@@ -513,8 +514,12 @@ class Generation:
                 if (current is not row or row["cancelled"] or time.monotonic() >= row["deadline"]):
                     raise ValueError("presentation-late-result")
                 # Retain native identity/metadata and task usage; presentation usage is separate.
-                result = response.model_copy(update={"choices": [response.choices[0].model_copy(
-                    update={"message": message.model_copy(update={"content": content})})]})
+                result = copy.copy(response)
+                published_choice = copy.copy(response.choices[0])
+                published_message = copy.copy(message)
+                published_message.content = content
+                published_choice.message = published_message
+                result.choices = [published_choice]
                 evidence["category"] = "presented"
                 evidence["stage"] = "complete"
                 return result

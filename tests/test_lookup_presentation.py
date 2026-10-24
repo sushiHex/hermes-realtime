@@ -1,7 +1,6 @@
 """Model-free tests of the selected lookup's one tool-free presentation phase."""
 
 import asyncio
-import copy
 import importlib.util
 import json
 import sys
@@ -22,20 +21,10 @@ CONFIG = {
 }
 
 
-class Completion(SimpleNamespace):
-    def model_dump_json(self):
-        return json.dumps({"content": self.choices[0].message.content})
-
-    def model_copy(self, *, update):
-        result = copy.copy(self)
-        result.__dict__.update(update)
-        return result
-
-
 def completion(content, *, reason="stop", calls=None):
-    return Completion(
+    return SimpleNamespace(
         id="original-id", model="test-model", created=42,
-        choices=[Completion(finish_reason=reason, message=Completion(
+        choices=[SimpleNamespace(finish_reason=reason, message=SimpleNamespace(
             content=content, tool_calls=calls, refusal=None))],
         usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7),
     )
@@ -215,6 +204,18 @@ def test_presentation_refuses_tool_or_truncated_response(setup):
     s = setup
     s.captured["response"] = completion('{"voice":"v","detail":"d"}', reason="length")
     assert s.run() is s.refused
+
+
+def test_presentation_refuses_explicit_native_source_refusal(setup):
+    setup.original.choices[0].message.refusal = "synthetic-refusal"
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+
+
+def test_presentation_refuses_explicit_formatter_refusal(setup):
+    response = completion('{"voice":"v","detail":"d"}')
+    response.choices[0].message.refusal = "synthetic-refusal"
+    setup.captured["response"] = response
+    assert setup.run() is setup.refused
 
 
 def test_presentation_refuses_response_tool_calls(setup):

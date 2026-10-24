@@ -27,7 +27,9 @@ cleanup settles; cleanup failure retains ownership and refuses the result.
 This does not prove remote inference has stopped. Formatting refusal
 sets the policy refusal outcome without undoing tool effects or changing native
 task status. The original bounded response is retained in the row, with only
-hashes/counts/categories and separate presentation usage emitted. Structural
+hashes/counts/categories and separate presentation usage emitted. Publication
+uses copies of the native response, choice and message, preserving their metadata
+without requiring SDK-specific copy methods on Hermes streaming responses. Structural
 validation does not establish factual accuracy or semantic consistency; actual
 task acceptance still checks those. The synthetic fixture leaves this optional
 presentation dependency disabled and therefore does not qualify live formatting.
@@ -37,6 +39,12 @@ literal framing. Missing or incompatible validation refuses without fallback.
 This private-method coupling is an explicit compatibility limit: the plugin is
 not a standalone Hermes formatting qualification. The acceptance launcher must
 bind imports to the attested realtime payload.
+
+`tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
+streaming producer through presentation and publication using synthetic SDK
+transports. It checks native and SDK response metadata and original-response
+preservation. It is an explicit offline proof, not a model or gateway qualification;
+its source, policy, runtime and fresh receipt paths are supplied by the caller.
 
 ## Interface and scope
 
