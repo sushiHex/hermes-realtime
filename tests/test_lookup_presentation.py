@@ -316,6 +316,69 @@ def test_native_envelope_refusal_retains_shared_shape_without_formatter(setup):
     assert evidence["source_choices_count"] == 0 and evidence["source_kind"] == "none"
 
 
+@pytest.mark.parametrize("case,rejection", [
+    ("oversize-batch", "batch-envelope"),
+    ("missing-call-id", "call-envelope"),
+    ("empty-query", "search-arguments"),
+    ("unreturned-url", "url-membership"),
+    ("second-search", "batch-budget"),
+    ("malformed-json", "call-json"),
+    ("guard-unavailable", "generation-unavailable"),
+    ("budget-unavailable", "budget-unavailable"),
+    ("unlisted-value-error", "native-policy-error"),
+])
+def test_native_rejection_category_is_fixed_and_does_not_emit_arguments(
+    setup, capsys, case, rejection,
+):
+    s = setup
+    name = "web_search"
+    args = {"query": "SYNTHETIC_PRIVATE_QUERY"}
+    call_id = "synthetic-call"
+    if case == "missing-call-id":
+        call_id = ""
+    elif case == "empty-query":
+        args = {"query": ""}
+    elif case == "unreturned-url":
+        name, args = "web_extract", {"urls": ["https://example.invalid/SYNTHETIC_PRIVATE_URL"]}
+    elif case == "unlisted-value-error":
+        args["extra"] = float("nan")
+    arguments = "SYNTHETIC_PRIVATE_INVALID_JSON" if case == "malformed-json" else json.dumps(args)
+    call = SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=arguments))
+    s.original.choices[0].message.content = None
+    s.original.choices[0].message.tool_calls = [call] * (6 if case == "oversize-batch" else 1)
+    s.original.choices[0].finish_reason = "tool_calls"
+
+    def native(_):
+        if case == "guard-unavailable":
+            s.g.handles = []
+        elif case == "budget-unavailable":
+            s.g.budgets["selected"] = {}
+        return s.original
+
+    assert s.run(next_call=native) is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "native-response" and evidence["rejection"] == rejection
+    assert evidence["calls"] == 0 and not s.captured["requests"]
+    output = capsys.readouterr().out
+    assert "SYNTHETIC_PRIVATE" not in output and "Out of range float values" not in output
+
+
+def test_unknown_native_guard_exception_does_not_emit_its_secret_message(setup, capsys):
+    s = setup
+
+    def native(_):
+        def unknown():
+            raise ValueError("SYNTHETIC_PRIVATE_EXCEPTION")
+
+        s.g.scope = unknown
+        return s.original
+
+    assert s.run(next_call=native) is s.refused
+    assert s.row["presentation_evidence"]["rejection"] == "native-policy-error"
+    output = capsys.readouterr().out
+    assert "[lookup-presentation]" in output and "SYNTHETIC_PRIVATE_EXCEPTION" not in output
+
+
 def test_response_reasoning_facts_and_usage_are_bounded_observations(setup, capsys):
     s = setup
     response = completion(None)

@@ -474,8 +474,19 @@ class Generation:
             with self.lock:
                 self.refuse(run_id)
             if native_facts is not None:
+                rejection = "native-policy-error"
+                if (type(error) is ValueError and len(error.args) == 1
+                        and type(error.args[0]) is str and error.args[0] in {
+                            "generation-unavailable", "budget-unavailable", "budget-replaced",
+                            "batch-envelope", "call-envelope", "search-arguments",
+                            "url-membership", "batch-budget",
+                        }):
+                    rejection = error.args[0]
+                elif type(error) is json.JSONDecodeError:
+                    rejection = "call-json"
                 evidence = {"category": "refused", "stage": "native-response", "calls": 0,
                             "wire_requests": 0, "failure_kind": type(error).__name__,
+                            "rejection": rejection,
                             **native_facts}
                 row["presentation_evidence"] = evidence
                 with contextlib.suppress(OSError, ValueError):
