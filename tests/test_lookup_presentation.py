@@ -235,6 +235,9 @@ def test_source_refusal_records_only_fixed_categories_and_counts(
         "category": "refused", "stage": "source", "calls": 0, "wire_requests": 0,
         "source_kind": kind, "source_length": length, "source_finish_reason": finish,
         "source_refusal": refusal, "failure_kind": "ValueError",
+        "source_choices_count": 1, "source_tool_calls": False, "source_parsed_present": False,
+        "source_reasoning_content_kind": "none", "source_reasoning_content_length": 0,
+        "source_reasoning_kind": "none", "source_reasoning_length": 0,
     }
     output = capsys.readouterr().out
     assert "synthetic" not in output and "untrusted-finish-text" not in output
@@ -245,6 +248,90 @@ def test_presentation_refuses_explicit_formatter_refusal(setup):
     response.choices[0].message.refusal = "synthetic-refusal"
     setup.captured["response"] = response
     assert setup.run() is setup.refused
+
+
+@pytest.mark.parametrize("case,count,kind,length,finish,tools,refusal,parsed", [
+    ("zero-choices", 0, "none", 0, "missing", False, False, False),
+    ("extra-choices", 2, "string", 26, "stop", False, False, False),
+    ("none-content", 1, "none", 0, "stop", False, False, False),
+    ("other-content", 1, "other", 0, "stop", False, False, False),
+    ("oversize", 1, "string", 8193, "stop", False, False, False),
+    ("length-stop", 1, "string", 26, "length", False, False, False),
+    ("unknown-finish", 1, "string", 26, "other", False, False, False),
+    ("missing-finish", 1, "string", 26, "missing", False, False, False),
+    ("tool-call", 1, "string", 26, "stop", True, False, False),
+    ("refusal", 1, "string", 26, "stop", False, True, False),
+    ("parsed-only", 1, "none", 0, "stop", False, False, True),
+])
+def test_formatter_envelope_refusal_retains_shape_and_usage_without_content(
+    setup, capsys, case, count, kind, length, finish, tools, refusal, parsed,
+):
+    s = setup
+    response = completion('{"voice":"v","detail":"d"}')
+    message = response.choices[0].message
+    if case == "zero-choices":
+        response.choices = []
+    elif case == "extra-choices":
+        response.choices *= 2
+    elif case in {"none-content", "parsed-only"}:
+        message.content = None
+    elif case == "other-content":
+        message.content = {"private": "SYNTHETIC_SECRET"}
+    elif case == "oversize":
+        message.content = "x" * 8193
+    elif case == "length-stop":
+        response.choices[0].finish_reason = "length"
+    elif case == "unknown-finish":
+        response.choices[0].finish_reason = "SYNTHETIC_SECRET"
+    elif case == "missing-finish":
+        response.choices[0].finish_reason = None
+    elif case == "tool-call":
+        message.tool_calls = ["SYNTHETIC_SECRET"]
+    elif case == "refusal":
+        message.refusal = "SYNTHETIC_SECRET"
+    if parsed:
+        message.parsed = {"private": "SYNTHETIC_SECRET"}
+    response.usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=2)
+    s.captured["response"] = response
+    assert s.run() is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "response-envelope"
+    assert evidence["response_choices_count"] == count
+    assert evidence["response_kind"] == kind and evidence["response_length"] == length
+    assert evidence["response_finish_reason"] == finish
+    assert evidence["response_tool_calls"] is tools
+    assert evidence["response_refusal"] is refusal
+    assert evidence["response_parsed_present"] is parsed
+    assert evidence["usage"] == {"prompt_tokens": 3, "completion_tokens": 4,
+                                  "total_tokens": 7, "reasoning_tokens": 2}
+    output = capsys.readouterr().out
+    assert "SYNTHETIC_SECRET" not in output and "Full source result." not in output
+
+
+def test_native_envelope_refusal_retains_shared_shape_without_formatter(setup):
+    setup.original.choices = []
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+    evidence = setup.row["presentation_evidence"]
+    assert evidence["stage"] == "native-response"
+    assert evidence["source_choices_count"] == 0 and evidence["source_kind"] == "none"
+
+
+def test_response_reasoning_facts_and_usage_are_bounded_observations(setup, capsys):
+    s = setup
+    response = completion(None)
+    response.choices[0].message.reasoning_content = "SYNTHETIC_SECRET"
+    response.choices[0].message.reasoning = {"private": "SYNTHETIC_SECRET"}
+    response.usage = SimpleNamespace(prompt_tokens=True, completion_tokens=-1,
+                                    total_tokens=1000000001,
+                                    completion_tokens_details=SimpleNamespace(reasoning_tokens="secret"))
+    s.captured["response"] = response
+    assert s.run() is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["response_reasoning_content_kind"] == "string"
+    assert evidence["response_reasoning_content_length"] == len("SYNTHETIC_SECRET")
+    assert evidence["response_reasoning_kind"] == "other"
+    assert evidence["response_reasoning_length"] == 0 and evidence["usage"] == {}
+    assert "SYNTHETIC_SECRET" not in capsys.readouterr().out
 
 
 def test_presentation_refuses_response_tool_calls(setup):
@@ -341,9 +428,13 @@ def test_presentation_records_only_bounded_categories_counts_hashes(setup, capsy
     assert "Full source result." not in output and '"local"' not in output
     evidence = setup.row["presentation_evidence"]
     assert len(evidence["source_sha256"]) == 64
-    assert set(evidence) == {"category", "stage", "calls", "wire_requests", "source_length",
-                             "source_sha256", "wire", "usage", "local_http_settled",
-                             "source_kind", "source_finish_reason", "source_refusal"}
+    shape_keys = {prefix + "_" + field for prefix in ("source", "response") for field in (
+        "choices_count", "kind", "length", "finish_reason", "tool_calls", "refusal",
+        "parsed_present", "reasoning_content_kind", "reasoning_content_length",
+        "reasoning_kind", "reasoning_length")}
+    assert set(evidence) == shape_keys | {
+        "category", "stage", "calls", "wire_requests", "source_sha256", "wire", "usage",
+        "local_http_settled"}
 
 
 def test_presentation_cancellation_settles_client_and_never_publishes(setup):

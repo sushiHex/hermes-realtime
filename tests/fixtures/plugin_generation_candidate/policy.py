@@ -53,6 +53,36 @@ def frozen(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def response_facts(response, prefix):
+    """Content-free first-choice facts; observation never authorizes a response."""
+    choices = getattr(response, "choices", None)
+    sequence = type(choices) in (list, tuple)
+    choice = choices[0] if sequence and choices else None
+    message = getattr(choice, "message", None)
+    content = getattr(message, "content", None)
+    finish = getattr(choice, "finish_reason", None)
+    facts = {
+        "choices_count": len(choices) if sequence else 0,
+        "kind": "string" if type(content) is str else "none" if content is None else "other",
+        "length": len(content) if type(content) is str else 0,
+        "finish_reason": (
+            finish if type(finish) is str and finish in {
+                "stop", "length", "tool_calls", "content_filter", "function_call"
+            } else "missing" if finish is None else "other"
+        ),
+        "tool_calls": bool(getattr(message, "tool_calls", None)),
+        "refusal": bool(getattr(message, "refusal", None)),
+        "parsed_present": getattr(message, "parsed", None) is not None,
+    }
+    for name in ("reasoning_content", "reasoning"):
+        value = getattr(message, name, None)
+        facts[name + "_kind"] = (
+            "string" if type(value) is str else "none" if value is None else "other"
+        )
+        facts[name + "_length"] = len(value) if type(value) is str else 0
+    return {prefix + "_" + key: value for key, value in facts.items()}
+
+
 class Presentation:
     """One explicit same-route SDK call, independent of native tool dispatch."""
 
@@ -386,6 +416,7 @@ class Generation:
         response = kw["next_call"](kw["request"])
         if row is None:
             return response
+        native_facts = response_facts(response, "source") if self.presentation is not None else None
         try:
             with self.lock:
                 _, current = self.scope()  # Replaced rows are never adopted.
@@ -439,30 +470,25 @@ class Generation:
             if not calls and self.presentation is not None:
                 return self.present(run_id, row, response, kw)
             return response
-        except BaseException:
+        except BaseException as error:
             with self.lock:
                 self.refuse(run_id)
+            if native_facts is not None:
+                evidence = {"category": "refused", "stage": "native-response", "calls": 0,
+                            "wire_requests": 0, "failure_kind": type(error).__name__,
+                            **native_facts}
+                row["presentation_evidence"] = evidence
+                with contextlib.suppress(OSError, ValueError):
+                    print("[lookup-presentation] " + frozen(evidence), flush=True)
             return self.refusal()
 
     def present(self, run_id, row, response, kw):
         evidence = {"category": "refused", "stage": "source", "calls": 0, "wire_requests": 0}
         row["presentation_evidence"] = evidence
         try:
+            evidence.update(response_facts(response, "source"))
             message = response.choices[0].message
             source = message.content
-            finish = getattr(response.choices[0], "finish_reason", None)
-            evidence.update(
-                source_kind=(
-                    "string" if type(source) is str else "none" if source is None else "other"
-                ),
-                source_length=len(source) if type(source) is str else 0,
-                source_finish_reason=(
-                    finish if type(finish) is str and finish in {
-                        "stop", "length", "tool_calls", "content_filter", "function_call"
-                    } else "missing" if finish is None else "other"
-                ),
-                source_refusal=bool(getattr(message, "refusal", None)),
-            )
             if (response.choices[0].finish_reason != "stop" or getattr(message, "refusal", None)
                     or type(source) is not str or not source.strip() or len(source) > 4096):
                 raise ValueError("presentation-source")
@@ -481,6 +507,17 @@ class Generation:
             evidence["stage"] = "provider"
             formatted = asyncio.run(self.presentation.complete(self, run_id, row, source, evidence))
             evidence["stage"] = "response-envelope"
+            evidence.update(response_facts(formatted, "response"))
+            usage = getattr(formatted, "usage", None)
+            evidence["usage"] = {
+                key: number for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if type(number := getattr(usage, key, None)) is int and 0 <= number <= 1000000000
+            }
+            reasoning_tokens = getattr(
+                getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
+            )
+            if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= 1000000000:
+                evidence["usage"]["reasoning_tokens"] = reasoning_tokens
             if len(formatted.choices) != 1:
                 raise ValueError("presentation-envelope")
             choice = formatted.choices[0]
@@ -507,11 +544,6 @@ class Generation:
                         or any(token in text for token in (
                             "<voice>", "</voice>", "<detail>", "</detail>"))):
                     raise ValueError("presentation-content")
-            usage = getattr(formatted, "usage", None)
-            evidence["usage"] = {
-                key: number for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                if type(number := getattr(usage, key, None)) is int and 0 <= number <= 1000000000
-            }
             content = ("<voice>" + value["voice"]
                        + "</voice><detail>" + value["detail"] + "</detail>")
             from hermes_realtime.integration.api import HermesApiTaskSession
