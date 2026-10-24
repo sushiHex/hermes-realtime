@@ -450,13 +450,24 @@ class Generation:
         try:
             message = response.choices[0].message
             source = message.content
+            finish = getattr(response.choices[0], "finish_reason", None)
+            evidence.update(
+                source_kind=(
+                    "string" if type(source) is str else "none" if source is None else "other"
+                ),
+                source_length=len(source) if type(source) is str else 0,
+                source_finish_reason=(
+                    finish if type(finish) is str and finish in {
+                        "stop", "length", "tool_calls", "content_filter", "function_call"
+                    } else "missing" if finish is None else "other"
+                ),
+                source_refusal=bool(getattr(message, "refusal", None)),
+            )
             if (response.choices[0].finish_reason != "stop" or getattr(message, "refusal", None)
                     or type(source) is not str or not source.strip() or len(source) > 4096):
                 raise ValueError("presentation-source")
             row["original_response"] = response
-            evidence.update(
-                source_length=len(source), source_sha256=hashlib.sha256(source.encode()).hexdigest()
-            )
+            evidence["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
             evidence["stage"] = "route"
             self.presentation.validate_route(kw)
             evidence["stage"] = "worker-loop"

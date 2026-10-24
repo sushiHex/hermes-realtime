@@ -211,6 +211,35 @@ def test_presentation_refuses_explicit_native_source_refusal(setup):
     assert setup.run() is setup.refused and not setup.captured["requests"]
 
 
+@pytest.mark.parametrize("source,reason,refusal,kind,length,finish", [
+    (None, "stop", False, "none", 0, "stop"),
+    (42, "stop", False, "other", 0, "stop"),
+    ("", "stop", False, "string", 0, "stop"),
+    ("x" * 4097, "stop", False, "string", 4097, "stop"),
+    ("synthetic", "length", False, "string", 9, "length"),
+    ("synthetic", "untrusted-finish-text", False, "string", 9, "other"),
+    ("synthetic", None, False, "string", 9, "missing"),
+    ("synthetic", "stop", True, "string", 9, "stop"),
+], ids=["none", "other", "empty", "oversize", "truncated", "unknown-finish",
+        "missing-finish", "explicit-refusal"])
+def test_source_refusal_records_only_fixed_categories_and_counts(
+    setup, capsys, source, reason, refusal, kind, length, finish,
+):
+    s = setup
+    s.original.choices[0].message.content = source
+    s.original.choices[0].message.refusal = refusal
+    s.original.choices[0].finish_reason = reason
+    assert s.run() is s.refused and not s.captured["requests"]
+    evidence = s.row["presentation_evidence"]
+    assert evidence == {
+        "category": "refused", "stage": "source", "calls": 0, "wire_requests": 0,
+        "source_kind": kind, "source_length": length, "source_finish_reason": finish,
+        "source_refusal": refusal, "failure_kind": "ValueError",
+    }
+    output = capsys.readouterr().out
+    assert "synthetic" not in output and "untrusted-finish-text" not in output
+
+
 def test_presentation_refuses_explicit_formatter_refusal(setup):
     response = completion('{"voice":"v","detail":"d"}')
     response.choices[0].message.refusal = "synthetic-refusal"
@@ -313,7 +342,8 @@ def test_presentation_records_only_bounded_categories_counts_hashes(setup, capsy
     evidence = setup.row["presentation_evidence"]
     assert len(evidence["source_sha256"]) == 64
     assert set(evidence) == {"category", "stage", "calls", "wire_requests", "source_length",
-                             "source_sha256", "wire", "usage", "local_http_settled"}
+                             "source_sha256", "wire", "usage", "local_http_settled",
+                             "source_kind", "source_finish_reason", "source_refusal"}
 
 
 def test_presentation_cancellation_settles_client_and_never_publishes(setup):
