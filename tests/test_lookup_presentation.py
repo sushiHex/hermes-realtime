@@ -25,7 +25,7 @@ def completion(content, *, reason="stop", calls=None):
     return SimpleNamespace(
         id="original-id", model="test-model", created=42,
         choices=[SimpleNamespace(finish_reason=reason, message=SimpleNamespace(
-            content=content, tool_calls=calls, refusal=None))],
+            content=content, tool_calls=calls))],
         usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7),
     )
 
