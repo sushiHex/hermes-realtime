@@ -17,7 +17,8 @@ The native entrypoint additionally requires explicit plugin-local
 `api_key_env`. The named environment variable must exist; there is no ambient
 credential fallback. On a selected run's final native response, one tool-free,
 nonstreaming OpenAI SDK call presents that completed result as strict JSON
-`voice`/`detail`, then copies validated content into the existing envelope.
+`voice`/`detail` and selected `source_ids`, then copies validated content into the
+existing envelope.
 The trusted route must equal the actual middleware route and request model.
 Tools, functions, tool choice, retries and redirects are unavailable to this
 call. Its deadline is the selected admission's original 120-second deadline,
@@ -48,6 +49,20 @@ The existing `row.urls` index supplies this evidence, without a separate success
 flag. Its presence records admitted search-result metadata, not page extraction,
 answer correctness, citation fidelity, source authority or freshness. Those remain
 separate acceptance checks.
+Presentation freezes the complete admitted URL catalog in deterministic order and
+supplies it alongside the native answer. The whole JSON input must fit 16 KiB in
+UTF-8; an oversized catalog refuses without truncation or a formatter call. The
+formatter selects unique, exact integer catalog IDs. Its schema permits an empty
+selection when no source supports the answer; publication refuses that outcome.
+Only selected IDs are resolved to the exact frozen URLs, rendered as a source list
+in detail. The existing 1800-character detail limit and reserved-markup validation
+apply after rendering, including all links. Catalog drift before publication
+refuses. No URL rewriting, extra source, repair call or new semantic verifier is
+added. URL metadata establishes reference eligibility, not claim support.
+Model-written voice/detail containing case-insensitive `http://`, `https://` or
+`www.` is refused rather than repaired. Web links are rendered only by the host
+from selected catalog IDs. This is a narrow web-link syntax rule: domain names,
+source names and prose claims still require semantic review.
 
 Generic native completion and the budget-only fixture deployment do not promise
 source support and keep their prior completion behavior. Historical bounded-tool

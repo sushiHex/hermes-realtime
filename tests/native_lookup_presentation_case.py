@@ -112,11 +112,13 @@ def main():
             body = json.loads(request.content)
             forwarded.append(body)
             assert not any(key in body for key in ("tools", "tool_choice", "functions"))
-            assert body["messages"][-1]["content"] == source_text
+            payload = json.loads(body["messages"][-1]["content"])
+            assert payload == {"answer": source_text, "sources": [
+                {"id": 0, "url": "https://example.invalid/source"}]}
             assert body["reasoning_effort"] == "none"
             response = sdk.model_dump(mode="json")
             response["choices"][0]["message"]["content"] = json.dumps({
-                "voice": "Short.", "detail": source_text})
+                "voice": "Short.", "detail": source_text, "source_ids": [0]})
             return httpx.Response(200, json=response, request=request)
 
         class IsolatedHttp(real_http):
@@ -163,7 +165,8 @@ def main():
             assert result.choices[0].message is not source.choices[0].message
             assert source.choices[0].message.content == source_text
             assert result.choices[0].message.content == (
-                "<voice>Short.</voice><detail>" + source_text + "</detail>"
+                "<voice>Short.</voice><detail>" + source_text
+                + "\n\nSources:\n" + source_url + "</detail>"
             )
             assert result.id == source.id and result.model == source.model
             assert result.usage is source.usage

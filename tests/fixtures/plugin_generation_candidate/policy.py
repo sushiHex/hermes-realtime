@@ -31,12 +31,18 @@ PRESENTATION_SCHEMA = {
     "properties": {
         "voice": {"type": "string", "minLength": 1, "maxLength": 220},
         "detail": {"type": "string", "minLength": 1, "maxLength": 1800},
+        "source_ids": {"type": "array", "minItems": 0, "maxItems": 256,
+                       "items": {"type": "integer", "minimum": 0, "maximum": 255}},
     },
-    "required": ["voice", "detail"],
+    "required": ["voice", "detail", "source_ids"],
     "additionalProperties": False,
 }
 PRESENTATION_INSTRUCTIONS = (
-    "Present the completed result faithfully as JSON with exactly voice and detail strings. "
+    "Input contains a completed answer and an admitted source catalog with integer IDs. "
+    "Return JSON with exactly voice, detail and source_ids. Select only catalog IDs that "
+    "support the answer; choose an empty source_ids array if none supports it. Never invent "
+    "sources. Use unique IDs. Do not write URLs in voice or detail; the host renders the "
+    "selected URLs exactly. Present the completed answer faithfully. "
     "Add no facts, tools or actions. Voice must be one or two natural conversational "
     "sentences, at most 220 characters, covering the direct answer and all material "
     "findings from detail, including source attribution when source-backed. Detail must "
@@ -105,7 +111,7 @@ class Presentation:
         if kw["request"].get("model") != self.config["model"]:
             raise ValueError("presentation-model")
 
-    async def complete(self, generation, run_id, row, source, evidence):
+    async def complete(self, generation, run_id, row, source_input, evidence):
         import httpx
         from openai import AsyncOpenAI
 
@@ -116,7 +122,7 @@ class Presentation:
             "model": self.config["model"],
             "messages": [
                 {"role": "system", "content": PRESENTATION_INSTRUCTIONS},
-                {"role": "user", "content": source},
+                {"role": "user", "content": source_input},
             ],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "voice_detail", "strict": True, "schema": PRESENTATION_SCHEMA}},
@@ -129,6 +135,8 @@ class Presentation:
             # Actual SDK serialization; fixed fields/hashes only, never prompt or auth.
             raw = request.content
             serialized = json.loads(raw)
+            actual_input = serialized["messages"][-1]["content"]
+            payload = json.loads(actual_input)
             evidence["wire"] = {
                 "body_sha256": hashlib.sha256(raw).hexdigest(),
                 "model_matches": serialized.get("model") == self.config["model"],
@@ -138,7 +146,10 @@ class Presentation:
                 "reasoning_effort_none": serialized.get("reasoning_effort") == "none",
                 "schema_matches": serialized.get("response_format") == body["response_format"],
                 "source_sha256": hashlib.sha256(
-                    serialized["messages"][-1]["content"].encode()).hexdigest(),
+                    payload["answer"].encode()).hexdigest(),
+                "input_sha256": hashlib.sha256(actual_input.encode()).hexdigest(),
+                "catalog_sha256": hashlib.sha256(frozen(payload["sources"]).encode()).hexdigest(),
+                "catalog_count": len(payload["sources"]),
                 "instruction_sha256": hashlib.sha256(
                     serialized["messages"][0]["content"].encode()).hexdigest(),
             }
@@ -511,6 +522,16 @@ class Generation:
             if not row["urls"]:
                 evidence["rejection"] = "retrieval-required"
                 raise ValueError("retrieval-required")
+            evidence["stage"] = "catalog"
+            with self.lock:
+                catalog = tuple(sorted(row["urls"]))
+            catalog_data = [{"id": index, "url": url} for index, url in enumerate(catalog)]
+            source_input = frozen({"answer": source, "sources": catalog_data})
+            if len(source_input.encode("utf-8")) > 16384:
+                raise ValueError("presentation-input-bound")
+            evidence["input_sha256"] = hashlib.sha256(source_input.encode()).hexdigest()
+            evidence["catalog_sha256"] = hashlib.sha256(frozen(catalog_data).encode()).hexdigest()
+            evidence["catalog_count"] = len(catalog)
             evidence["stage"] = "route"
             self.presentation.validate_route(kw)
             evidence["stage"] = "worker-loop"
@@ -522,7 +543,8 @@ class Generation:
                 raise ValueError("presentation-event-loop")
             evidence["calls"] = 1
             evidence["stage"] = "provider"
-            formatted = asyncio.run(self.presentation.complete(self, run_id, row, source, evidence))
+            formatted = asyncio.run(self.presentation.complete(
+                self, run_id, row, source_input, evidence))
             evidence["stage"] = "response-envelope"
             evidence.update(response_facts(formatted, "response"))
             usage = getattr(formatted, "usage", None)
@@ -552,7 +574,7 @@ class Generation:
             evidence["stage"] = "json"
             value = json.loads(content, object_pairs_hook=pairs)
             evidence["stage"] = "fields"
-            if type(value) is not dict or set(value) != {"voice", "detail"}:
+            if type(value) is not dict or set(value) != {"voice", "detail", "source_ids"}:
                 raise ValueError("presentation-fields")
             evidence["stage"] = "content"
             for name, limit in (("voice", 220), ("detail", 1800)):
@@ -561,8 +583,28 @@ class Generation:
                         or any(token in text for token in (
                             "<voice>", "</voice>", "<detail>", "</detail>"))):
                     raise ValueError("presentation-content")
+            evidence["stage"] = "source-selection"
+            ids = value["source_ids"]
+            if type(ids) is not list or not ids:
+                raise ValueError("presentation-source-ids")
+            evidence["stage"] = "source-id-type"
+            if any(type(index) is not int for index in ids):
+                raise ValueError("presentation-source-id-type")
+            evidence["stage"] = "source-id-range"
+            if any(not 0 <= index < len(catalog) for index in ids):
+                raise ValueError("presentation-source-id-range")
+            evidence["stage"] = "source-id-unique"
+            if len(ids) != len(set(ids)):
+                raise ValueError("presentation-source-id-duplicate")
+            evidence["selected_source_count"] = len(ids)
+            evidence["stage"] = "inline-links"
+            if any(marker in (value["voice"] + "\n" + value["detail"]).casefold()
+                   for marker in ("http://", "https://", "www.")):
+                raise ValueError("presentation-inline-link")
+            detail = value["detail"] + "\n\nSources:\n" + "\n".join(catalog[index] for index in ids)
+            evidence["rendered_detail_length"] = len(detail)
             content = ("<voice>" + value["voice"]
-                       + "</voice><detail>" + value["detail"] + "</detail>")
+                       + "</voice><detail>" + detail + "</detail>")
             from hermes_realtime.integration.api import HermesApiTaskSession
 
             evidence["stage"] = "terminal-contract"
@@ -573,6 +615,9 @@ class Generation:
                 _, current = self.scope()
                 if (current is not row or row["cancelled"] or time.monotonic() >= row["deadline"]):
                     raise ValueError("presentation-late-result")
+                evidence["stage"] = "catalog-publication"
+                if set(catalog) != row["urls"]:
+                    raise ValueError("presentation-source-catalog-changed")
                 # Retain native identity/metadata and task usage; presentation usage is separate.
                 result = copy.copy(response)
                 published_choice = copy.copy(response.choices[0])
