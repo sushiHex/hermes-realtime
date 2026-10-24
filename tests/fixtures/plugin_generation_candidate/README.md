@@ -12,6 +12,32 @@ handlers and fault controls. Its separate `register(ctx)` entrypoint is source
 for review; direct packaging/loading of that entrypoint is not qualified here.
 The fixture invokes the same installer through supported Hermes plugin APIs.
 
+The native entrypoint additionally requires explicit plugin-local
+`settings.presentation` with exactly `provider`, `base_url`, `model`, and
+`api_key_env`. The named environment variable must exist; there is no ambient
+credential fallback. On a selected run's final native response, one tool-free,
+nonstreaming OpenAI SDK call presents that completed result as strict JSON
+`voice`/`detail`, then copies validated content into the existing envelope.
+The trusted route must equal the actual middleware route and request model.
+Tools, functions, tool choice, retries and redirects are unavailable to this
+call. Its deadline is the selected admission's original 120-second deadline,
+never another per-phase allowance. An authenticated native stop or unload
+cancels the owned async request. Ownership is released only after local HTTP
+cleanup settles; cleanup failure retains ownership and refuses the result.
+This does not prove remote inference has stopped. Formatting refusal
+sets the policy refusal outcome without undoing tool effects or changing native
+task status. The original bounded response is retained in the row, with only
+hashes/counts/categories and separate presentation usage emitted. Structural
+validation does not establish factual accuracy or semantic consistency; actual
+task acceptance still checks those. The synthetic fixture leaves this optional
+presentation dependency disabled and therefore does not qualify live formatting.
+Presentation lazily reuses the exact source-bound installed realtime runtime's
+`HermesApiTaskSession._completed_result_text` validator, after strict JSON and
+literal framing. Missing or incompatible validation refuses without fallback.
+This private-method coupling is an explicit compatibility limit: the plugin is
+not a standalone Hermes formatting qualification. The acceptance launcher must
+bind imports to the attested realtime payload.
+
 ## Interface and scope
 
 The exact supported source is official Hermes Agent
@@ -328,7 +354,7 @@ HEAD/tracked-file checks did not exclude ignored import overlays; those historic
 receipts are not retroactively given the stronger import-source qualification.
 The main group also predates the small alias correction, with its own archived policy
 SHA `c6f467b9ff7d0b81a04797385766500939cd1b3f1b33d17aa362b46358d422e1`.
-The alias groups bind current policy SHA
+The archived alias groups bind their then-current policy SHA
 `7967d036cb9117f8a927cd950d81f690307f7ef49700fbf558228fde1e34733b`.
 All groups bind installer SHA
 `eb998e0b8a517aa5bd6e905d17bbd0dd873e2a96961379743fafdc3bf33ac282`.
