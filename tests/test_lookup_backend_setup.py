@@ -150,6 +150,24 @@ def test_public_error_does_not_echo_valueerror(monkeypatch, tmp_path, capsys):
     assert "validation_refused" in output
 
 
+def test_public_error_retains_fixed_model_guard(monkeypatch, tmp_path, capsys):
+    import json
+
+    from scripts import lookup_backend_model as model
+    from scripts import setup_lookup_backend as setup
+
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest(tmp_path)))
+
+    def refused(*_):
+        raise ValueError("runtime-content")
+
+    assert "runtime-content" in model._REFUSALS
+    monkeypatch.setattr(setup, "prepare", refused)
+    assert setup.main(["--manifest", str(path), "--output", str(tmp_path / "output")]) == 1
+    assert '"failure_category": "runtime-content"' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "rows", [[("127.0.0.1", 9), ("127.0.0.1", 99)], [("0.0.0.0", 9), ("127.0.0.1", 9)]]
 )

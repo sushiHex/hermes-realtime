@@ -422,8 +422,18 @@ def main(argv: Any = None) -> Any:
             result = {"category": "prepared", "version": 1, "processes_started": 0}
     except Exception as error:
         result["failure_kind"] = type(error).__name__
-        if type(error) is ValueError and re.fullmatch(r"[a-z_]{1,64}", str(error)):
-            result["failure_category"] = "validation_refused"
+        result["failure_category"] = "validation_refused" if type(error) is ValueError else "other"
+        # Preserve only the model helper's existing fixed, source-owned enum.
+        # Arbitrary native ValueError text must never become public output.
+        model_module = sys.modules.get("scripts.lookup_backend_model")
+        allowed = getattr(model_module, "_REFUSALS", frozenset())
+        if (
+            type(error) in {ValueError, RuntimeError, TimeoutError}
+            and len(error.args) == 1
+            and type(error.args[0]) is str
+            and error.args[0] in allowed
+        ):
+            result["failure_category"] = error.args[0]
     print("[lookup-backend-setup] " + json.dumps(result, sort_keys=True), flush=True)
     return 0 if result["category"] in {"prepared", "completed"} else 1
 
