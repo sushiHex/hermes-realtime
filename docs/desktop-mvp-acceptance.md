@@ -223,8 +223,8 @@ record the walkthrough `not_run` with that precise gap instead of improvising
 process-name kills or claiming setup completion.
 
 Readiness metadata is not allocation proof: advertised model context and
-`/api/ps` options alone do not show the backend's actual per-sequence context or
-K/V allocation. Record bounded numeric backend witnesses for the selected run;
+`/api/ps` `context_length` (the configured value) do not show the backend's
+actual per-sequence context or K/V allocation. Record bounded numeric backend witnesses for the selected run;
 raw Ollama output can contain prompts and must not become public evidence.
 Individual offload counts and one warm overlap sample do not establish spare
 capacity, ordinary-length voice responsiveness or human acceptance. Record
@@ -237,6 +237,17 @@ application input bound, not a model-capability or zero-GPU guarantee. Readiness
 and subsequent inference retain the same setting, including browser-selected
 local models. A CPU candidate still needs its reviewed artifact, loader,
 environment and owned-process closure and separate unchanged qualification.
+
+For CPU candidates, the [accepted #315 scope](https://github.com/sushiHex/hermes-realtime/issues/315#issuecomment-6402529916)
+uses the audited CPU configuration, excluded bundled GPU backends, bound
+artifacts/environment/requests, and a sealed runtime/input namespace through
+owned settlement and complete cleanup. Disclose the compiled-loader and
+trusted-OS assumptions. This does not attest static backends or claim zero
+OS/driver-level GPU bytes or a whole-run GPU peak. The full numerical 4 GiB
+GPU-memory witness remains required for GPU candidates, not CPU admission.
+Actual backend context/K/V evidence, quality, latency, authority and human
+acceptance remain separate requirements. A CPU setting alone does not admit an
+unreviewed configuration or authorize an unfrozen runtime launch.
 
 Qualify the installed Hermes API first, in its own interpreter. Under the
 hidden process ownership rules above, use the frozen candidate script:
