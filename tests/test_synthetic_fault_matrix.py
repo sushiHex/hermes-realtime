@@ -406,7 +406,8 @@ def test_storage_timeout_reports_last_worker_stage_once(tmp_path, capsys):
         "worker_stage": "opening_storage", "stage_count": 4,
         "elapsed_ms": evidence["elapsed_ms"],
     }
-    assert type(evidence["elapsed_ms"]) is int and 10_000 <= evidence["elapsed_ms"] <= 60_000
+    # Floored floating-point milliseconds can land one tick below the 10s deadline.
+    assert type(evidence["elapsed_ms"]) is int and 9_999 <= evidence["elapsed_ms"] <= 60_000
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires retained Windows process identities")
@@ -545,7 +546,8 @@ def test_storage_refusal_normalizes_unknown_categories(capsys):
 
 
 @pytest.mark.parametrize(("clock", "expected"), [(float("nan"), 0), (float("inf"), 60_000),
-                                                  (-1, 0), (1_000_000, 60_000)])
+                                                  (-1, 0), (1_000_000, 60_000),
+                                                  (9.999999999999998, 9_999)])
 def test_storage_refusal_elapsed_is_bounded_finite(clock, expected, capsys, monkeypatch):
     import json
     from types import SimpleNamespace
