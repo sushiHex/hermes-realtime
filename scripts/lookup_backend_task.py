@@ -261,6 +261,7 @@ def run_owned(m: Any) -> Any:
         "prepared_interpreter_required",
     )
     select_runtime(m)  # Before importing the owner and its runtime dependencies.
+    sys.path.insert(1, str(ROOT / "scripts"))  # Owner's sibling imports; target stays first.
     from scripts import rehearse_desktop_mvp as owner
     from scripts.lookup_backend_logs import CappedProcesses
     from scripts.lookup_backend_model import start_model

@@ -259,3 +259,42 @@ def test_private_directory_grants_inherit_to_gateway_descendants(monkeypatch, tm
     monkeypatch.setattr(security, "_set_security", lambda handle, sddl: applied.append(sddl))
     setup.protect_directory(tmp_path)
     assert applied == ["D:P(A;OICI;FA;;;owner)"]
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="Windows-only composition")
+def test_fresh_isolated_parent_imports_owner_before_any_process(tmp_path):
+    import subprocess
+    import sys
+
+    from scripts.setup_lookup_backend import ROOT
+
+    code = f"""
+import ctypes, sys
+sys.path.insert(0, {str(ROOT)!r})
+def audit(event, args):
+    if event in {{"subprocess.Popen", "socket.bind", "socket.connect", "ctypes.dlopen"}}:
+        raise AssertionError("effect before import-only stopping point")
+sys.addaudithook(audit)
+from scripts.lookup_backend_task import run_owned
+try:
+    run_owned({{"packageRoot": {str(ROOT / "src/hermes_realtime")!r},
+               "hermes_python": sys.executable, "output": {str(tmp_path / "absent")!r}}})
+except FileNotFoundError:
+    pass
+else:
+    raise AssertionError("import-only stopping point not reached")
+assert sys.path[0] == {str(ROOT / "src")!r}
+assert sys.modules["local_livekit"].__file__ == {str(ROOT / "scripts/local_livekit.py")!r}
+assert sys.modules["real_gate_support"].__file__ == {str(ROOT / "scripts/real_gate_support.py")!r}
+print("fresh-parent-import-passed")
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "fresh-parent-import-passed"
