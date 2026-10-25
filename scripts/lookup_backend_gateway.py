@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,7 @@ def bounded_exa_send(
         receipt: dict[str, Any] = {}
         forwarded = False
         phase = "request_decode"
+        refusal: dict[str, Any] | None = None
         try:
             # Unknown traffic still refuses. This separate read-only lane is never active
             # within a provider invocation and never accepts the Exa endpoint itself.
@@ -218,21 +220,42 @@ def bounded_exa_send(
                         if phase == "request_decode"
                         else "transport_operation_error"
                     )
-                    denials.append(
-                        {
-                            "phase": phase,
-                            "category": category,
-                            "callerCategory": denial_caller_category(),
-                        }
-                    )
+                    refusal = {
+                        "phase": phase,
+                        "category": category,
+                        "callerCategory": denial_caller_category(),
+                    }
+                    denials.append(refusal)
                 else:
                     witness["transportDenialsTruncated"] = True
+                    refusal = {
+                        "phase": phase,
+                        "category": "denial_overflow",
+                        "callerCategory": "unknown",
+                    }
             raise
         finally:
             with lock:
                 if forwarded:
                     witness["transportResponses"].append(receipt)
-                save()
+                try:
+                    save()
+                finally:
+                    if refusal is not None:
+                        marker = {
+                            **refusal,
+                            "denialCount": witness["transportDenialCount"],
+                            "searchRequests": witness["searchRequests"],
+                            "extractRequests": witness["extractRequests"],
+                            "metadataRequests": witness.get("metadataRequests", 0),
+                            "forwarded": forwarded,
+                        }
+                        with suppress(OSError):
+                            print(
+                                "[lookup-transport-refusal] "
+                                + json.dumps(marker, separators=(",", ":"), sort_keys=True),
+                                flush=True,
+                            )
 
     return send
 
@@ -350,7 +373,7 @@ def main() -> Any:
         searchProviderReady=True,
         extractProviderReady=True,
         interpreterExact=Path(sys.executable).resolve()
-        == (INSTALL / "venv/Scripts/python.exe").resolve(),
+        == Path(manifest["hermes_python"]).resolve(),
         packageExact=Path(hermes_realtime.__file__).resolve().parent == package,
         recordSha256=hashlib.sha256(record.read_bytes()).hexdigest(),
         configSha256=hashlib.sha256(

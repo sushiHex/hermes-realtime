@@ -40,9 +40,10 @@ these bindings:
 
 The historical task verified the retained runtime closure, not its equality to
 that ZIP. A later comparison of the retained directory with a freshly verified
-official archive refused `runtime-content`: the executable digest matched, but
-some other bytes differed despite matching names and sizes. The cause and timing
-of that difference are not established; the historical directory was preserved.
+official archive refused `runtime-content`: the retained directory contained
+extra files not in that archive, while the selected executable digest matched.
+Changed bytes in the shared files have not been established; the historical
+directory was preserved. No causal claim follows from this inventory difference.
 The public command used a fresh extraction instead. Neither the archive pin nor
 the historical useful task is relabelled as proof of the new command's outcome.
 
