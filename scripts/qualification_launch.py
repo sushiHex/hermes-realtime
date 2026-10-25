@@ -321,6 +321,30 @@ def _resource_release_winerror(error: BaseException) -> int | None:
     return None
 
 
+def _retain_cleanup_members(kernel: Any, job: int, owned: list[int]) -> tuple[int, ...]:
+    """Pin a pre-termination Job checkpoint for synchronization, not authentication.
+
+    This does not claim to capture a process created after the checkpoint. Job
+    zero and successful physical resource removal remain mandatory acceptance.
+    """
+    api = kernel._api()
+    api.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    api.IsProcessInJob.restype = ctypes.c_int
+    for pid in kernel.query_job_processes(job):
+        handle = kernel.open_process(pid, 0x101000)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+        owned.append(handle)
+        member = ctypes.c_int()
+        if (
+            api.GetProcessId(ctypes.c_void_p(handle)) != pid
+            or not api.IsProcessInJob(
+                ctypes.c_void_p(handle), ctypes.c_void_p(job), ctypes.byref(member)
+            )
+            or not member.value
+        ):
+            raise ValueError("launch_cleanup_member_binding")
+    return tuple(owned)
+
+
 # No tooling package is imported into the external controller namespace.
 _CONTROLLER = """
 import ctypes,hashlib,json,msvcrt,os,sys
@@ -433,6 +457,15 @@ def _owned_controller(
         failures: list[BaseException] = []
         if job is not None:
             until = time.monotonic() + 30
+            member_handles: list[int] = []
+            members: tuple[int, ...] = ()
+            member_waits_complete = True
+            if resources is not None:
+                try:
+                    members = _retain_cleanup_members(kernel, job, member_handles)
+                except BaseException as error:
+                    member_waits_complete = False
+                    failures.append(error)
             try:
                 kernel.terminate_job(job)
             except BaseException as error:
@@ -441,6 +474,20 @@ def _owned_controller(
                 try:
                     kernel.wait(root.process_handle, max(1, int((until - time.monotonic()) * 1000)))
                 except BaseException as error:
+                    if resources is not None:
+                        member_waits_complete = False
+                    failures.append(error)
+            # TerminateJobObject initiates TerminateProcess for each member.
+            # Job accounting zero can precede process signaling/image teardown;
+            # retain before termination, then wait within the same cleanup bound.
+            for handle in members:
+                try:
+                    remaining = int((until - time.monotonic()) * 1000)
+                    if remaining <= 0:
+                        raise TimeoutError("launch_cleanup_deadline")
+                    kernel.wait(handle, remaining)
+                except BaseException as error:
+                    member_waits_complete = False
                     failures.append(error)
             try:
                 while True:
@@ -450,8 +497,8 @@ def _owned_controller(
                     if time.monotonic() >= until:
                         raise TimeoutError("launch_cleanup_deadline")
                     if active == 0:
-                        settled = True
-                        cleanup = not failures
+                        settled = member_waits_complete
+                        cleanup = settled and not failures
                         break
                     time.sleep(0.01)
             except BaseException as error:
@@ -463,10 +510,10 @@ def _owned_controller(
             if cleanup or resources is not None:
                 handles_to_close = (
                     () if root is None else (root.thread_handle, root.process_handle)
-                ) + (job,)
+                ) + tuple(member_handles) + (job,)
                 if resources is not None and not settled:
                     # Request kernel kill-on-close before the guardian's hard
-                    # exit. Zero is still unproven: no acceptance follows this.
+                    # exit. Complete settlement is unproven: no acceptance follows.
                     handles_to_close = (job,) + handles_to_close[:-1]
                 for handle in handles_to_close:
                     try:
