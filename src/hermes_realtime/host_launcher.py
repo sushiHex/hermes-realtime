@@ -171,6 +171,7 @@ from hermes_realtime.providers.ollama_models import (
     OllamaModelClient,
     require_num_ctx,
     require_num_gpu,
+    require_think,
 )
 from hermes_realtime.providers.ollama_session import OllamaSessionSelection
 from hermes_realtime.search_egress import SearchEgressAuthority
@@ -1295,6 +1296,7 @@ def _build_streaming_inference(
     codex_effort: str,
     codex_executable: str | None,
     ollama_num_gpu: int | None = None,
+    ollama_think: bool | None = None,
     current_fact_lookup: CurrentFactLookup | None = None,
     token_usage_observer: Callable[[str, CodexTokenUsage], None] | None = None,
     knowledge_timing_observer: Callable[[dict[str, _PublicValue]], None] | None = None,
@@ -1305,9 +1307,16 @@ def _build_streaming_inference(
     if type(inference_provider) is not str:
         raise TypeError("inference_provider must be an exact built-in string")
     require_num_gpu(ollama_num_gpu)
+    require_think(ollama_think)
     if ollama_num_gpu is not None and inference_provider != "ollama":
         try:
             raise ValueError("--ollama-num-gpu requires --inference-provider ollama")
+        finally:
+            print('[ollama-profile] {"category":"provider_refused","count":1,"version":1}',
+                  flush=True)
+    if ollama_think is not None and inference_provider != "ollama":
+        try:
+            raise ValueError("--ollama-think requires --inference-provider ollama")
         finally:
             print('[ollama-profile] {"category":"provider_refused","count":1,"version":1}',
                   flush=True)
@@ -1318,6 +1327,7 @@ def _build_streaming_inference(
             base_url=ollama_base_url,
             model=ollama_model,
             num_gpu=ollama_num_gpu,
+            think=ollama_think,
             request_timeout_seconds=60.0,
             output_style=output_style,
         )
@@ -1942,6 +1952,7 @@ def build_local_host_launcher(
     ollama_model: str = "hermes-4.3-36b-iq4xs-16k:latest",
     ollama_num_ctx: int | None = None,
     ollama_num_gpu: int | None = None,
+    ollama_think: bool | None = None,
     local_model_selection: bool = False,
     codex_model: str = "gpt-5.6-terra",
     codex_effort: str = "low",
@@ -2065,6 +2076,20 @@ def build_local_host_launcher(
         if qualification_dependencies is not None:
             try:
                 raise ValueError("GPU layers do not accept qualification provider overrides")
+            finally:
+                print('[ollama-profile] {"category":"override_refused","count":1,"version":1}',
+                      flush=True)
+    require_think(ollama_think)
+    if ollama_think is not None:
+        if inference_provider != "ollama":
+            try:
+                raise ValueError("--ollama-think requires --inference-provider ollama")
+            finally:
+                print('[ollama-profile] {"category":"provider_refused","count":1,"version":1}',
+                      flush=True)
+        if qualification_dependencies is not None:
+            try:
+                raise ValueError("thinking does not accept qualification provider overrides")
             finally:
                 print('[ollama-profile] {"category":"override_refused","count":1,"version":1}',
                       flush=True)
@@ -2382,6 +2407,7 @@ def build_local_host_launcher(
                 base_url=ollama_base_url,
                 model=model,
                 num_gpu=ollama_num_gpu,
+                think=ollama_think,
                 request_timeout_seconds=60.0,
                 metadata_client=metadata_client,
                 output_style=output_style_selection.get,
@@ -2414,6 +2440,7 @@ def build_local_host_launcher(
                 ollama_base_url=ollama_base_url,
                 ollama_model=ollama_model,
                 ollama_num_gpu=ollama_num_gpu,
+                ollama_think=ollama_think,
                 codex_model=codex_model,
                 codex_effort=codex_effort,
                 codex_executable=codex_executable,
@@ -3233,6 +3260,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             ollama_model=args.ollama_model,
             ollama_num_ctx=args.ollama_num_ctx,
             ollama_num_gpu=args.ollama_num_gpu,
+            ollama_think=args.ollama_think,
             local_model_selection=args.local_model_selection,
             codex_model=args.codex_model,
             codex_effort=args.codex_effort,
@@ -3634,6 +3662,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help="explicit per-session Ollama context (2048–262144); metadata/runtime validated")
     parser.add_argument("--ollama-num-gpu", type=int,
         help="optional GPU-layer request (0–1024; 0 selects CPU layers); default omits override")
+    parser.add_argument("--ollama-think", action=argparse.BooleanOptionalAction, default=None,
+        help="explicit model-supported thinking on/off; default omits the native request option")
     parser.add_argument("--local-model-selection", action="store_true",
         help="choose an installed Ollama model and context in the browser before connecting")
     parser.add_argument("--codex-model", default="gpt-5.6-terra")
