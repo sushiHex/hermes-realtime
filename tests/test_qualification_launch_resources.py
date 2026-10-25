@@ -226,6 +226,16 @@ def test_guardian_verifies_held_bytes_and_owns_both_resource_kinds(
         "close",
         "release",
         "env",
+        "member_open",
+        "member_identity",
+        "member_foreign",
+        "member_query",
+        "root_wait",
+        "member_wait",
+        "member_deadline_before",
+        "member_deadline",
+        "member_close",
+        "late_member",
     ],
 )
 def test_resources_survive_until_all_consumers_settle(
@@ -249,11 +259,16 @@ def test_resources_survive_until_all_consumers_settle(
         def release():
             events.append("release")
             live[0] = False
-            if fault == "release":
+            assert (
+                "member_wait" in events
+                or "job" not in events
+                or "test_consumers_stopped" in events
+            )
+            if fault in {"release", "late_member"}:
                 invalid = OSError("PRIVATE_SENTINEL")
                 invalid.winerror = 65536
                 failure = OSError("PRIVATE_SENTINEL")
-                failure.winerror = 32
+                failure.winerror = 5 if fault == "late_member" else 32
                 raise BaseExceptionGroup(
                     "PRIVATE_SENTINEL", [invalid, BaseExceptionGroup("PRIVATE_SENTINEL", [failure])]
                 )
@@ -271,8 +286,15 @@ def test_resources_survive_until_all_consumers_settle(
                 code._obj.value = 0
                 return 1
 
+            def membership(handle, job, member):
+                member._obj.value = 0 if fault == "member_foreign" else 1
+                return 0 if fault == "member_query" else 1
+
             self.api = SimpleNamespace(
-                WaitForSingleObject=lambda *a: 0, GetExitCodeProcess=exit_code
+                WaitForSingleObject=lambda *a: 0,
+                GetExitCodeProcess=exit_code,
+                GetProcessId=lambda handle: 31 if fault == "member_identity" else handle.value,
+                IsProcessInJob=membership,
             )
 
         def _api(self):
@@ -297,9 +319,35 @@ def test_resources_survive_until_all_consumers_settle(
             assert live[0]
             events.append("terminate")
 
+        def query_job_processes(self, job):
+            assert live[0] and "terminate" not in events
+            events.append("members")
+            return (30, 40)
+
+        def open_process(self, pid, access):
+            assert pid in {30, 40} and access == 0x101000
+            events.append("member_open")
+            if fault == "member_open":
+                raise OSError("synthetic open failure")
+            if fault == "member_deadline_before":
+                clock[0] = 31
+            return pid
+
         def wait(self, process, timeout):
             assert live[0]
-            events.append("wait")
+            events.append("member_wait" if process in {30, 40} else "wait")
+            assert 0 < timeout <= 30000
+            if process == 20 and fault == "root_wait":
+                raise OSError("synthetic root wait failure")
+            if process in {30, 40}:
+                assert "terminate" in events
+                if fault == "member_wait":
+                    raise OSError("synthetic member wait failure")
+                if fault == "member_deadline":
+                    clock[0] = 31
+                if fault == "none":
+                    assert timeout == (30000 if process == 30 else 20000)
+                    clock[0] = 10
 
         def query_job_active_process_count(self, job):
             assert live[0]
@@ -314,7 +362,7 @@ def test_resources_survive_until_all_consumers_settle(
         def close_handle(self, handle):
             assert live[0]
             events.append(("close", handle))
-            if fault == "close":
+            if fault == "close" or fault == "member_close" and handle == 30:
                 raise OSError("synthetic handle cleanup")
 
     monkeypatch.setattr(launch, "_acquire_sealed_resources", acquire)
@@ -358,13 +406,20 @@ def test_resources_survive_until_all_consumers_settle(
             )
             assert events[-1] == "release"
             assert evidence["cleanup_verified"] is True
+            assert events.count("member_wait") == 2
+            assert events.index("members") < events.index("terminate")
+            assert ("close", 30) in events and ("close", 40) in events
         else:
             with pytest.raises(BaseExceptionGroup):
                 launch._owned_controller(
                     plan, launch.InterpreterBinding("base", "venv", "x", "y"), evidence
                 )
             assert evidence["cleanup_verified"] is False
-            if fault in {"active", "query"}:
+            if fault in {
+                "active", "query", "member_open", "member_identity", "member_foreign",
+                "member_query", "root_wait", "member_wait", "member_deadline_before",
+                "member_deadline",
+            }:
                 assert live[0] and "release" not in events
                 assert ("close", 10) in events  # Kill-on-close before hard guardian exit.
                 assert len(launch._UNSETTLED_RESOURCES) == 1
@@ -380,16 +435,26 @@ def test_resources_survive_until_all_consumers_settle(
                 )
             else:
                 assert events[-1] == "release" and not live[0]
-            if fault == "release":
+            if fault.startswith("member_"):
+                assert "member_open" in events
+                if fault in {
+                    "member_identity", "member_foreign", "member_query", "member_deadline_before"
+                }:
+                    assert "member_wait" not in events
+                    assert ("close", 30) in events
+                if fault == "member_close":
+                    assert ("close", 30) in events
+            if fault in {"release", "late_member"}:
                 assert evidence == {
                     "cleanup_verified": False,
                     "failure_phase": "resource_release",
                     "failure_category": "cleanup_failed",
-                    "resource_release_winerror": 32,
+                    "resource_release_winerror": 5 if fault == "late_member" else 32,
                 }
                 assert "PRIVATE_SENTINEL" not in json.dumps(evidence)
     finally:
         # Synthetic consumers are now stopped. Avoid leaking test-only callbacks.
+        events.append("test_consumers_stopped")
         for stack in launch._UNSETTLED_RESOURCES:
             stack.close()
         launch._UNSETTLED_RESOURCES.clear()

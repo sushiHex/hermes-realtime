@@ -782,6 +782,66 @@ def test_guardian_sealed_resources_compose_through_native_settlement(
     assert final["input_tree_count"] == 1
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows image teardown")
+def test_guardian_waits_for_owned_child_image_teardown_before_snapshot_release(
+    tmp_path: Path,
+    native_completion_host: None,
+) -> None:
+    """A loaded system DLL exercises native teardown without a provider or model."""
+    execution = tmp_path / "execution"
+    execution.mkdir()
+    raw = (Path(os.environ["SYSTEMROOT"]) / "System32/version.dll").read_bytes()
+    (execution / "fixture.dll").write_bytes(raw)
+    loaded, marker = tmp_path / "image-loaded", tmp_path / "snapshot-root"
+    child = (
+        "import ctypes,sys,time\nfrom pathlib import Path\n"
+        "image=ctypes.WinDLL(sys.argv[1])\nPath(sys.argv[2]).touch()\ntime.sleep(60)\n"
+    )
+    script = tmp_path / "controller.py"
+    script.write_text(
+        "import os,subprocess,sys,time\nfrom pathlib import Path\n"
+        f"root=Path(os.environ[{launch.EXECUTION_ROOT_ENV!r}])\n"
+        f"Path({str(marker)!r}).write_text(str(root))\n"
+        f"child=subprocess.Popen([sys._base_executable,'-B','-c',{child!r},"
+        f"str(root/'fixture.dll'),{str(loaded)!r}],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+        "creationflags=subprocess.CREATE_NO_WINDOW)\n"
+        "deadline=time.monotonic()+5\n"
+        f"while not Path({str(loaded)!r}).exists():\n"
+        " if time.monotonic()>=deadline: raise TimeoutError('fixture_image_not_loaded')\n"
+        " time.sleep(0.01)\n"
+        "print('loaded-child-image')\n"
+    )
+    binding, digest = _binding(tmp_path)
+    receipt = tmp_path / "receipt.jsonl"
+    result = launch.run_owned_controller(
+        script,
+        (),
+        binding_path=binding,
+        binding_sha256=digest,
+        receipt=receipt,
+        timeout_seconds=30,
+        sealed_resources={
+            "schema_version": 1,
+            "execution": {
+                "root": str(execution),
+                "files": [
+                    {
+                        "path": "fixture.dll",
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "size_bytes": len(raw),
+                    }
+                ],
+            },
+            "inputs": [],
+        },
+    )
+    assert result.exit_code == 0 and result.stdout.strip() == b"loaded-child-image"
+    assert loaded.exists() and not Path(marker.read_text()).exists()
+    final = json.loads(receipt.read_bytes().splitlines()[-1])
+    assert final["cleanup_verified"] is True and final["stage"] == "complete"
+
+
 def test_evaluator_consumes_owned_launch_without_changing_model_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
