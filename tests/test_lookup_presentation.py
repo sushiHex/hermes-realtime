@@ -36,8 +36,11 @@ def retrieve(generation, result, before_result=None):
     call = SimpleNamespace(id="retrieval-call", function=SimpleNamespace(
         name="web_search", arguments=json.dumps(args)))
     response = completion(None, reason="tool_calls", calls=[call])
-    assert generation.model_gate(api_mode="chat_completions", api_request_id="retrieval-request",
-                                 request={}, next_call=lambda _: response) is response
+    response = generation.model_gate(
+        api_mode="chat_completions", api_request_id="retrieval-request",
+        request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: response)
+    call = response.choices[0].message.tool_calls[0]
 
     def original(_args):
         if before_result:
@@ -101,7 +104,8 @@ def setup(monkeypatch, request):
     g = module.Generation(lambda: refused, presentation=formatter)
     g.handles = [SimpleNamespace(active=True)]
     row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 1,
-           "phase": "new", "settled": 0, "reserved": 0, "urls": set()}
+           "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
+           "objective": "synthetic lookup"}
     g.budgets["selected"] = row
     g.members = MappingProxyType({"selected": (module.VERSION, "identity", row)})
     g._membership_authority = g.members
@@ -156,6 +160,120 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
 
 
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_initial_lookup_is_a_host_request_without_provider_call(setup):
+    s = setup
+    objective = "  exact approved lookup\n"
+    s.row["objective"] = objective
+    calls = []
+    request = {"tools": [{"type": "function", "function": {"name": "web_search"}}]}
+    result = s.run(request=request, next_call=lambda _: calls.append("provider") or s.original)
+    assert calls == []
+    assert result.policy_origin == "host-initial-retrieval" and result.usage is None
+    assert result.model == "host-policy/ordinary-lookup/v1"
+    call = result.choices[0].message.tool_calls[0]
+    assert call.id.startswith("host-search-") and call.function.name == "web_search"
+    assert json.loads(call.function.arguments) == {"query": objective}
+    assert s.row["phase"] == "search" and s.row["reserved"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("objective", [None, 7, "", " ", "x" * 1025],
+                         ids=["missing", "type", "empty", "blank", "bound"])
+async def test_invalid_host_query_is_refused_before_native_admission(setup, objective):
+    s = setup
+    app = web.Application()
+    s.g.wire(app, None)
+    async def body():
+        return {"input": objective}
+    request = SimpleNamespace(method="POST", path="/v1/runs",
+        headers={"X-Lookup-Policy": s.module.VERSION}, match_info={}, json=body)
+    calls = []
+    async def native(_):
+        calls.append("admission")
+        return web.json_response({"run_id": "new"}, status=202)
+    assert (await app.middlewares[-1](request, native)).status == 400
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_admission_freezes_exact_bounded_objective_before_native_handler(setup):
+    s = setup
+    objective = " " + "q" * 1022 + "\n"
+    data = {"input": objective}
+    app = web.Application()
+    s.g.wire(app, None)
+    async def body():
+        return data
+    request = SimpleNamespace(method="POST", path="/v1/runs",
+        headers={"X-Lookup-Policy": s.module.VERSION}, match_info={}, json=body)
+    async def native(_):
+        data["input"] = "native handler changed its parsed object"
+        return web.json_response({"run_id": "new"}, status=202)
+    assert (await app.middlewares[-1](request, native)).status == 202
+    assert s.g.budgets["new"]["objective"] == objective
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("tools", [None, [], [{"type": "function", "function": {"name": "other"}}],
+    [{"type": "other", "function": {"name": "web_search"}}],
+    [{"type": "function", "function": {"name": "web_search"}}] * 2],
+    ids=["missing", "empty", "different", "kind", "duplicate"])
+def test_host_search_requires_one_advertised_search_before_any_provider(setup, tools):
+    calls = []
+    assert setup.run(request={"tools": tools},
+        next_call=lambda _: calls.append("provider") or setup.original) is setup.refused
+    assert calls == [] and setup.row["reserved"] == 0
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("fault", ["cancelled", "deadline", "factory"])
+def test_host_preparation_failure_never_falls_through_to_provider(setup, monkeypatch, fault):
+    s = setup
+    if fault == "cancelled":
+        s.row["cancelled"] = True
+    elif fault == "deadline":
+        s.row["deadline"] = time.monotonic() - 1
+    else:
+        def failed(_):
+            raise ValueError("synthetic construction failure")
+        monkeypatch.setattr(s.module, "host_search_request", failed)
+    calls = []
+    assert s.run(request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: calls.append("provider") or s.original) is s.refused
+    assert calls == []
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("kind", ["ordinary", "budget-only"])
+def test_initial_host_request_does_not_change_unselected_or_budget_only_runs(setup, kind):
+    s = setup
+    if kind == "ordinary":
+        s.session["run"] = "ordinary"
+    else:
+        s.g.presentation = None
+    calls = []
+    assert s.run(next_call=lambda _: calls.append("provider") or s.original) is s.original
+    assert calls == ["provider"]
+
+
+@pytest.mark.parametrize("setup", [{"success": False, "data": {"web": []}}], indirect=True)
+def test_failed_initial_search_never_retries_or_calls_provider(setup):
+    calls = []
+    result = setup.run(next_call=lambda _: calls.append("provider") or setup.original)
+    assert result is setup.refused
+    assert calls == [] and not setup.captured["requests"]
+
+
+def test_successful_initial_search_returns_to_one_native_provider_call(setup):
+    calls = []
+    request = {"model": "test-model", "tools": [
+        {"type": "function", "function": {"name": "web_search"}}]}
+    result = setup.run(request=request,
+        next_call=lambda _: calls.append("provider") or setup.original)
+    assert result is not setup.refused and calls == ["provider"]
+
+
 @pytest.mark.parametrize("setup", [
     None,
     {"success": False, "data": {"web": [{"url": "https://example.invalid/source"}]}},
@@ -167,13 +285,16 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
 def test_presentation_requires_successful_same_run_source(setup):
     assert setup.run() is setup.refused
     assert not setup.row["urls"] and not setup.captured["requests"]
-    assert setup.row["presentation_evidence"]["stage"] == "retrieval"
+    if setup.row["phase"] == "new":
+        assert setup.row["closed"]  # Missing advertised search fails before any provider call.
+    else:
+        assert setup.row["presentation_evidence"]["stage"] == "retrieval"
 
 
 def test_successful_admitted_search_without_extraction_reaches_presentation(setup):
     assert setup.row["urls"] == {"https://example.invalid/source"}
     assert setup.row["phase"] == "search" and setup.row["settled"] == 1
-    assert setup.row["spent"] == setup.row["admitted"] == {"retrieval-call"}
+    assert setup.row["spent"] == setup.row["admitted"] and len(setup.row["spent"]) == 1
     assert setup.run() is not setup.refused and len(setup.captured["requests"]) == 1
 
 

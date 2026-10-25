@@ -15,7 +15,7 @@ import re
 import secrets
 import threading
 import time
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -57,6 +57,23 @@ PRESENTATION_INSTRUCTIONS = (
 
 def frozen(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def lookup_query(value):
+    if type(value) is not str or not value.strip() or len(value) > 1024:
+        raise ValueError("lookup-objective")
+    return value
+
+
+def host_search_request(query):
+    """A policy-authored request, never a provider answer or fabricated tool result."""
+    call = SimpleNamespace(id="host-search-" + secrets.token_hex(12), type="function",
+        function=SimpleNamespace(name="web_search", arguments=frozen({"query": query})))
+    return SimpleNamespace(id="host-request-" + secrets.token_hex(12), object="chat.completion",
+        created=int(time.time()), model="host-policy/" + VERSION, usage=None,
+        policy_origin="host-initial-retrieval", choices=[SimpleNamespace(index=0,
+            finish_reason="tool_calls", message=SimpleNamespace(role="assistant", content=None,
+                tool_calls=[call]))])
 
 
 def response_facts(response, prefix):
@@ -320,7 +337,14 @@ class Generation:
                         try:
                             body = await request.json()
                         except Exception:
+                            if self.presentation is not None:
+                                return web.json_response({"error": "lookup_objective"}, status=400)
                             return await call_native()
+                        if self.presentation is not None:
+                            try:
+                                objective = lookup_query(body["input"])
+                            except (KeyError, TypeError, ValueError):
+                                return web.json_response({"error": "lookup_objective"}, status=400)
                         identity = hashlib.sha256(frozen(body).encode()).hexdigest()
                 response = await call_native()
                 with self.lock:
@@ -350,6 +374,7 @@ class Generation:
                                 "reserved": 0,
                                 "settled": 0,
                                 "urls": set(),
+                                "objective": objective if self.presentation is not None else None,
                             }
                             self.budgets[run_id] = row
                             members = dict(self.members)
@@ -415,6 +440,7 @@ class Generation:
 
     def model_gate(self, **kw):
         run_id = ""
+        response = None
         try:
             with self.lock:
                 run_id, row = self.scope()
@@ -422,11 +448,31 @@ class Generation:
                     return self.refusal()
                 if row is not None and kw.get("api_mode") != "chat_completions":
                     raise ValueError("unsupported-response-mode")
+                if row is not None and self.presentation is not None:
+                    if row["cancelled"] or time.monotonic() >= row["deadline"]:
+                        raise ValueError("lookup-closed")
+                    if row["phase"] == "new":
+                        query = lookup_query(row["objective"])
+                        tools = kw["request"].get("tools")
+                        advertised = [tool for tool in tools if type(tool) is dict
+                            and type(tool.get("function")) is dict
+                            and tool["function"].get("name") == "web_search"
+                        ] if type(tools) is list else []
+                        if len(advertised) != 1 or advertised[0].get("type") != "function":
+                            raise ValueError("lookup-search-unavailable")
+                        response = host_search_request(query)
+                    elif not row["urls"]:
+                        row["presentation_evidence"] = {
+                            "category": "refused", "stage": "retrieval",
+                            "rejection": "retrieval-required",
+                            "calls": 0, "wire_requests": 0}
+                        raise ValueError("retrieval-required")
         except BaseException:
             with self.lock:
                 self.refuse(run_id)
             return self.refusal()
-        response = kw["next_call"](kw["request"])
+        if response is None:
+            response = kw["next_call"](kw["request"])
         if row is None:
             return response
         native_facts = response_facts(response, "source") if self.presentation is not None else None
@@ -482,6 +528,10 @@ class Generation:
                 row["spent"], row["admitted"] = set(), set()
             if not calls and self.presentation is not None:
                 return self.present(run_id, row, response, kw)
+            if getattr(response, "policy_origin", None) == "host-initial-retrieval":
+                with contextlib.suppress(OSError, ValueError):
+                    print("[lookup-host-request] " + frozen({"origin": "host-policy",
+                        "tool_requests": 1, "provider_calls": 0}), flush=True)
             return response
         except BaseException as error:
             with self.lock:

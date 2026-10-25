@@ -129,26 +129,26 @@ def main():
         generation = policy.Generation(lambda refusal=refusal: refusal, policy.Presentation(config))
         generation.handles = [SimpleNamespace(active=True)]
         row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 10,
-               "phase": "new", "settled": 0, "reserved": 0, "urls": set()}
+               "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
+               "objective": "synthetic lookup"}
         generation.budgets["synthetic-run"] = row
         generation.members = MappingProxyType({"synthetic-run": (policy.VERSION, "identity", row)})
         generation._membership_authority = generation.members
         token = set_current_session_key("synthetic-run")
         try:
             search_args = {"query": "synthetic lookup"}
-            search = ChatCompletion.model_validate({
-                "id": "synthetic-search", "object": "chat.completion", "created": 0,
-                "model": "test-model", "choices": [{"index": 0, "finish_reason": "tool_calls",
-                    "message": {"role": "assistant", "content": None, "tool_calls": [{
-                        "id": "synthetic-search-call", "type": "function", "function": {
-                            "name": "web_search", "arguments": json.dumps(search_args)}}]}}],
-            })
-            assert generation.model_gate(
-                api_mode="chat_completions", api_request_id="synthetic-search-request", request={},
-                next_call=lambda _, search=search: search) is search
+            def unexpected_provider(_):
+                raise AssertionError("host-initial-request-called-provider")
+            search = generation.model_gate(
+                api_mode="chat_completions", api_request_id="synthetic-search-request",
+                request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+                next_call=unexpected_provider)
+            assert search.policy_origin == "host-initial-retrieval" and search.usage is None
+            search_call = search.choices[0].message.tool_calls[0]
+            assert json.loads(search_call.function.arguments) == search_args
             source_url = "https://example.invalid/source"
             retrieved = generation.tool_gate(
-                tool_name="web_search", tool_call_id="synthetic-search-call",
+                tool_name="web_search", tool_call_id=search_call.id,
                 api_request_id="synthetic-search-request", args=search_args,
                 next_call=generation.wrap_search(lambda _, source_url=source_url: json.dumps({
                     "success": True, "data": {"web": [{"url": source_url}]}})),

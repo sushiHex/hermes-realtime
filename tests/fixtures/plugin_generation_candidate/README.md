@@ -12,6 +12,25 @@ handlers and fault controls. Its separate `register(ctx)` entrypoint is source
 for review; direct packaging/loading of that entrypoint is not qualified here.
 The fixture invokes the same installer through supported Hermes plugin APIs.
 
+For an already admitted presentation-enabled lookup, the initial `llm_execution`
+callback returns one host-authored `web_search` request using the exact accepted
+`input` string as its query. Input must be nonblank and at most 1024 characters;
+invalid input is refused before native admission, without truncation or rewriting.
+The advertised search tool must be present exactly once. This initial request has
+host-prefixed request/call IDs, `model="host-policy/ordinary-lookup/v1"`, explicit
+`policy_origin="host-initial-retrieval"`, and no provider usage. No initial provider
+call is made. Runtime observers may still count this as a logical middleware turn;
+it must not be reported as model inference or provider token usage.
+
+The request enters the existing reservation and tool/effect-ticket chain, then
+Hermes's normal conversation executor, approval and result-persistence path. It is
+not a fabricated tool result or retrieved-source claim. Only the actual admitted
+handler result may populate the same-run URL catalog. Successful retrieval allows
+normal provider execution afterward; failed/empty retrieval refuses without a
+retry or another provider call. Generic runs and budget-only deployments retain
+their existing behavior. No `tool_choice`, direct registry dispatch, new executor,
+model-specific branch or Hermes patch is used.
+
 The native entrypoint additionally requires explicit plugin-local
 `settings.presentation` with exactly `provider`, `base_url`, `model`, and
 `api_key_env`. The named environment variable must exist; there is no ambient
