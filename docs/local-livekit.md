@@ -468,8 +468,33 @@ when browser storage is unavailable. An unresolved input can retire only its own
 An ordinary media reconnect keeps the admitted typed-input and approval counters;
 only a fresh view or a new session starts those counters again.
 
-With Codex or Ollama and `--natural-work-tools`, ordinary language may request a background
-task through the same authoritative work surface. Model cancellation and approval are unavailable;
+With Codex or Ollama and `--natural-work-tools`, ordinary language may propose a background
+task. The browser shows the complete, immutable objective in a **Proposed background task**
+card with **Confirm task** and **Decline** controls. A proposal is limited to 1024 Unicode
+characters independently of the explicit work-command capacity; oversized objectives are
+refused rather than shortened. Creating or declining a proposal dispatches no work.
+Confirmation sends the exact proposal identity, objective and session generation through a
+separate authenticated, sequenced operation. It does not grant downstream Hermes approval
+or cancellation authority, and the card reports only confirmation submission; the normal
+task status must establish Hermes's accepted dispatch acknowledgment.
+
+The full card supports confirmation even while speaker output is muted. Spoken confirmation
+has its own complete-readback and causal-capture checks; playback delivery does not prove
+that the operator heard it. An early or noisy spoken response leaves the proposal pending.
+If the host says **Use Confirm on this task card**, that proposal requires the visible control.
+Confirmation expires; expired proposals require a new proposal. The visible controls do not
+guarantee that a proposal is still valid: the host checks expiry when an action arrives.
+A changed binding or expired/retired proposal cannot be confirmed. Uncertain browser decisions
+stay disabled and are never retried automatically; reconnect to reconcile authoritative state.
+An authenticated, well-formed in-order decision consumes its sequence even if refused;
+replaying that exact action reproduces its recorded outcome without another dispatch.
+Same-binding token refresh retains the decision sequence; a fresh view or changed binding
+starts its own sequence. Open stale browser tabs must reload after this update: the version-1
+event contract rejects an unknown `task_proposal` kind or a partial proposal shape rather
+than accepting a partial confirmation flow. The packaged asset parity gate binds the normal
+served browser build to its server candidate.
+
+Model cancellation and approval are unavailable;
 use explicit user commands or the task's Cancel control. Without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,

@@ -6,7 +6,7 @@ Only OpenAI chat-completions responses are supported. No user-profile install he
 from openai.types.chat import ChatCompletion
 from tools.registry import registry
 
-from .policy import Generation
+from .policy import Generation, Presentation
 
 
 def refusal_result():
@@ -62,11 +62,13 @@ def install(ctx, generation, wire=None):
         ]
     )
     ctx.register_platform_handler("api_server", wire or generation.wire)
+    generation.handles.append(ctx.on_unload(generation.close))
 
 
 def register(ctx):
     import tools.web_tools  # noqa: F401 -- shipped self-registration, no handler call.
 
     refusal = refusal_result()
-    generation = Generation(lambda: refusal)
+    presentation = Presentation(ctx.get_config("presentation"))
+    generation = Generation(lambda: refusal, presentation=presentation)
     install(ctx, generation)

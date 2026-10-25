@@ -125,7 +125,7 @@ class EdgeTtsSynthesizer:
             self._operations.clear()
 
     async def _build_chunk(self, text: str, turn_id: str) -> SpeechChunk:
-        spoken_text = strip_markdown_emphasis_for_speech(text)
+        spoken_text = self.project_spoken_text(text)
         mp3 = await self._synthesize_mp3(spoken_text, self._voice)
         if type(mp3) is not bytes:
             raise TypeError("Edge TTS backend must return exact MP3 bytes")
@@ -154,6 +154,11 @@ class EdgeTtsSynthesizer:
             text=text,
             audio=audio,
         )
+
+    @staticmethod
+    def project_spoken_text(text: str) -> str:
+        """Expose the canonical text submitted to Edge synthesis."""
+        return strip_markdown_emphasis_for_speech(text)
 
     async def _edge_synthesize(self, text: str, voice: str) -> bytes:
         try:

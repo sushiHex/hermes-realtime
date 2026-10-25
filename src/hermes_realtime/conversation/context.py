@@ -65,9 +65,11 @@ class AssistantTextCapacityError(RuntimeError):
 def validate_speech_source(source: str, *, role: str = "assistant") -> None:
     """Validate internal provenance before publication or confirmation consumption."""
     category = None
-    if type(source) is not str or source not in ("conversation", "host_task_status"):
+    if type(source) is not str or source not in (
+        "conversation", "host_task_status", "host_task_proposal",
+    ):
         category = "unsupported_source"
-    elif source == "host_task_status" and role != "assistant":
+    elif source != "conversation" and role != "assistant":
         category = "non_assistant_source"
     if category is not None:
         try:

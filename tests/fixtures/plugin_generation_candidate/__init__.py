@@ -12,7 +12,7 @@ from tools.approval import get_current_session_key
 from tools.registry import registry
 
 from .entrypoint import install
-from .policy import Generation
+from .policy import Generation, Presentation
 
 
 def completion(calls=(), refused=False):
@@ -49,9 +49,15 @@ def completion(calls=(), refused=False):
 
 def register(ctx):
     refusal = completion(refused=True)
-    generation = Generation(lambda: refusal)
+    host_initial_proof = ctx.get_config("host_initial_proof", False)
+    presentation = Presentation({
+        "provider": "custom", "base_url": "http://127.0.0.1:9/v1",
+        "model": "synthetic-proof", "api_key_env": "SYNTHETIC_PRESENTATION_KEY",
+    }) if host_initial_proof else None
+    generation = Generation(lambda: refusal, presentation=presentation)
     cases = {}
     counts = {}
+    host_results = {}
     observed = []
     release = threading.Event()
     waiting = threading.Event()
@@ -210,6 +216,25 @@ def register(ctx):
                 )
             budget = generation.budgets.get(run_id)
             urls = sorted(budget["urls"]) if budget else []
+        if scenario == "host-initial":
+            from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
+
+            # Only the actual native executor may create the tool-result message.
+            assert number == 1 and count["search"] == 1 and count["extract"] == 0
+            assert budget is not None and budget["phase"] == "search" and len(urls) == 4
+            tool_results = [message["content"] for message in kw["request"].get("messages", [])
+                            if message.get("role") == "tool"]
+            with generation.lock:
+                original_result = host_results[run_id]
+            assert tool_results == [_maybe_wrap_untrusted("web_search", original_result)]
+            original_data = json.loads(original_result)
+            assert original_data["success"] is True
+            assert {item["url"] for item in original_data["data"]["web"]} == set(urls)
+            safety["host_initial_native_result_seen"] = True
+            waiting.set()
+            if not release.wait(timeout=12):
+                raise TimeoutError("fixture-release")
+            return completion()
         if scenario == "mode-guard":
 
             def continuation(request):
@@ -292,13 +317,17 @@ def register(ctx):
         with generation.lock:
             row_for(run_id)["search"] += 1
             scenario = cases[run_id]
+            if scenario == "host-initial":
+                assert row_for(run_id)["provider"] == 0, "host-initial-no-model-before-effect"
+                assert args == {"query": "Synthetic request."}, "host-initial-admitted-objective"
+                safety["host_initial_model_before_effect"] = 0
         if scenario == "cancel-result":
             waiting.set()
             if not release.wait(timeout=12):
                 raise TimeoutError("fixture-release")
         if scenario in {"handler-error", "unscoped-error"}:
             raise ValueError("synthetic-handler-error")
-        return json.dumps(
+        result = json.dumps(
             {
                 "success": True,
                 "data": {
@@ -309,6 +338,10 @@ def register(ctx):
                 },
             }
         )
+        if scenario == "host-initial":
+            with generation.lock:
+                host_results[run_id] = result
+        return result
 
     async def extract(args, **kw):
         with generation.lock:

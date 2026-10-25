@@ -239,7 +239,13 @@ class _ProbeTransport:
         self.force_tool = force_tool
         self.tool_attempted = False
         self.tool_rejected = False
-        self.tool_accepted = False
+        self.tool_proposed = False
+        self.proposals: list[Any] = []
+        self.speech: list[str] = []
+        self.preconfirmation_dispatches = 0
+        self.preconfirmation_cancellations = 0
+        self.accepted_start = False
+        self.confirmation_attempted = False
         self.approval_attempted = False
         self.approval_denied = False
         self.approval_granted = False
@@ -331,7 +337,13 @@ class _ProbeTransport:
             assert type(content) is list and len(content) == 1
             assert type(content[0]) is dict and content[0].get("type") == "inputText"
             payload = json.loads(content[0]["text"])
-            self.tool_accepted = type(payload) is dict and payload.get("accepted") is True
+            self.tool_proposed = (
+                result.get("success") is True
+                and type(payload) is dict
+                and set(payload) == {"proposed", "requires_confirmation"}
+                and payload["proposed"] is True
+                and payload["requires_confirmation"] is True
+            )
             await self.incoming.put({"method": "turn/completed", "params": {
                 "threadId": "thread_m4",
                 "turn": {"id": "turn_m4", "items": [], "status": "completed"},
@@ -349,20 +361,32 @@ class _ToolCounter:
     can_cancel_work = True
 
     def __init__(self) -> None:
+        from hermes_realtime.conversation import ConversationContextStore
+
         self.dispatches = 0
         self.cancellations = 0
+        self.objectives: list[str] = []
+        self.context = ConversationContextStore()
 
     async def start_work(self, *, objective: str, invocation_id: str) -> Any:
-        from hermes_realtime.conversation import WorkStartResult
+        raise AssertionError("model adapter cannot dispatch work")
 
+    async def dispatch(self, *, objective: str, utterance_id: str) -> Any:
+        from hermes_realtime.conversation.tasks import TaskDispatchOutcome
+
+        self.objectives.append(objective)
         self.dispatches += 1
-        return WorkStartResult(accepted=True, state="active", task_id="task_m4")
+        self.context.record_task_accepted(
+            task_id="task_m4", run_id="deleg_m4", objective=objective,
+        )
+        return TaskDispatchOutcome(accepted=True, task_id="task_m4")
 
     async def cancel_active_work(self, *, invocation_id: str) -> Any:
-        from hermes_realtime.conversation import WorkCancelResult
+        raise AssertionError("model adapter cannot cancel work")
 
+    async def request_cancel(self, task_id: str, *, reason: str | None = None) -> Any:
         self.cancellations += 1
-        return WorkCancelResult(accepted=True, state="cancelling", task_id="task_m4")
+        raise AssertionError("memory qualification did not authorize cancellation")
 
     async def cancel_work(self, *, task_id: str, invocation_id: str) -> Any:
         return await self.cancel_active_work(invocation_id=invocation_id)
@@ -372,6 +396,7 @@ async def _adapter_turn(
     snapshot: Any, *, tool_counter: _ToolCounter | None = None,
     force_tool: str | None = None,
 ) -> tuple[int, Any]:
+    from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
     from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
 
     transport = _ProbeTransport(force_tool=force_tool)
@@ -381,21 +406,110 @@ async def _adapter_turn(
     if tool_counter is not None:
         inference.bind_work_tools(tool_counter)
     started = time.perf_counter_ns()
+    before = (tool_counter.dispatches, tool_counter.cancellations) if tool_counter else (0, 0)
     try:
         try:
             async with asyncio.timeout(5):
-                async for _ in inference.stream(snapshot, turn_id="turn_m4_probe"):
-                    pass
-        except (RuntimeError, TimeoutError):
-            if force_tool is None:
+                async for output in inference.stream(snapshot, turn_id="turn_m4_probe"):
+                    if type(output) is HostTaskProposalRequest:
+                        transport.proposals.append(output)
+                    elif type(output) is str:
+                        transport.speech.append(output)
+        except RuntimeError as error:
+            # Injected prohibited tools abort the adapter reader. An unrelated
+            # reader failure or timeout is not refusal evidence.
+            expected_refusal = {
+                "cancel_active_work": "Codex dynamic tool is not allowlisted",
+                "approve_work": "Codex dynamic tool is not allowlisted",
+                "approval_request": "Codex server-initiated request is prohibited",
+            }.get(force_tool or "")
+            if not (
+                expected_refusal is not None
+                and str(error) == "Codex app-server reader failed"
+                and type(error.__cause__) is RuntimeError
+                and str(error.__cause__) == expected_refusal
+            ):
                 raise
-            if force_tool != "approval_request":
+            if force_tool == "approval_request":
+                transport.approval_denied = transport.approval_attempted
+            else:
                 transport.tool_rejected = True
     finally:
         await inference.close()
+    if tool_counter:
+        transport.preconfirmation_dispatches = tool_counter.dispatches - before[0]
+        transport.preconfirmation_cancellations = tool_counter.cancellations - before[1]
     if transport.turn_start_at_ns is None:
         raise RuntimeError("Codex adapter never submitted turn/start")
     return (transport.turn_start_at_ns - started) // 1000, transport
+
+
+async def _confirm_proposal(
+    transport: _ProbeTransport, counter: _ToolCounter, expected_objective: str,
+) -> None:
+    """Separate synthetic card confirmation, never model or memory authority."""
+    from hermes_realtime.conversation.task_proposals import ConversationTaskProposals
+    from hermes_realtime.conversation.work_tools import (
+        ConversationWorkControlSurface,
+        WorkCommandAdmission,
+    )
+
+    category = "proposal_refused"
+    try:
+        if (not transport.tool_proposed or transport.tool_rejected
+                or len(transport.proposals) != 1 or transport.speech):
+            return
+        if transport.proposals[0].objective != expected_objective:
+            category = "objective_refused"
+            return
+        if (transport.preconfirmation_dispatches != 0
+                or transport.preconfirmation_cancellations != 0):
+            category = "premature_effect"
+            return
+        events: list[tuple[str, dict[str, Any]]] = []
+        settled = asyncio.Event()
+
+        def observe(kind: str, data: dict[str, Any]) -> None:
+            events.append((kind, data))
+            if kind == "task_state":
+                settled.set()
+
+        surface = ConversationWorkControlSurface(
+            controller=counter, context=counter.context, observer=observe,
+            reserve_observer_capacity=lambda: None,
+        )
+        proposals = ConversationTaskProposals(surface=surface, observer=observe)
+        proposals.bind("m4_synthetic_participant", 1)
+        before = (counter.dispatches, counter.cancellations, len(counter.objectives))
+        try:
+            proposal = proposals.offer(transport.proposals[0])
+            card = [data for kind, data in events if kind == "task_proposal"][-1]
+            if card["objective"] != expected_objective:
+                category = "card_refused"
+                return
+            transport.confirmation_attempted = True
+            admission = await proposals.decide(
+                participant="m4_synthetic_participant", generation=1,
+                proposal_id=proposal.proposal_id, objective=expected_objective,
+                decision="confirm",
+            )
+            if admission is WorkCommandAdmission.ADMITTED:
+                await asyncio.wait_for(settled.wait(), 1)
+        finally:
+            proposals.close_binding()
+            await surface.close()
+        transport.accepted_start = (
+            admission is WorkCommandAdmission.ADMITTED
+            and counter.dispatches - before[0] == 1
+            and counter.cancellations - before[1] == 0
+            and counter.objectives[before[2]:] == [expected_objective]
+            and [data for kind, data in events if kind == "task_state"] == [
+                {"status": "active", "taskId": "task_m4"},
+            ]
+        )
+        category = "accepted" if transport.accepted_start else "acknowledgment_refused"
+    finally:
+        print("[hermes-voice-memory-boundary] " + json.dumps({"category": category, "count": 1}))
 
 
 def _p95(values: list[int]) -> int:
@@ -513,6 +627,7 @@ async def _turn_witness(
     _duration, authorized = await _adapter_turn(
         direct, tool_counter=authorized_counter, force_tool="start_work"
     )
+    await _confirm_proposal(authorized, authorized_counter, "Inspect the build")
     enabled_start = ConversationContextSnapshot(
         **(shared | {"terminal_task_count": 0}), memory=memory
     )
@@ -543,6 +658,11 @@ async def _turn_witness(
     _duration, memory_forced_start = await _adapter_turn(
         enabled_start, tool_counter=memory_counter, force_tool="start_work"
     )
+    # Keep the original neutral user turns: these forced calls witness the
+    # existing proposal boundary, not model obedience. Confirmation is a new,
+    # identical explicit host-stage stimulus, independent of recalled memory.
+    await _confirm_proposal(baseline_forced_start, baseline_counter, "Inspect the build")
+    await _confirm_proposal(memory_forced_start, memory_counter, "Inspect the build")
     _duration, baseline_forced_cancel = await _adapter_turn(
         baseline_cancel, tool_counter=baseline_counter, force_tool="cancel_active_work"
     )
@@ -568,8 +688,10 @@ async def _turn_witness(
         baseline_forced.tool_attempted and memory_forced.tool_attempted
         and was_advertised(baseline_forced, name) is expected_accepted
         and was_advertised(memory_forced, name) is expected_accepted
-        and baseline_forced.tool_accepted is expected_accepted
-        and memory_forced.tool_accepted is expected_accepted
+        and baseline_forced.tool_proposed is expected_accepted
+        and memory_forced.tool_proposed is expected_accepted
+        and baseline_forced.accepted_start is expected_accepted
+        and memory_forced.accepted_start is expected_accepted
         and baseline_forced.tool_rejected is not expected_accepted
         and memory_forced.tool_rejected is not expected_accepted
     ) for baseline_forced, memory_forced, name, expected_accepted in (
@@ -586,6 +708,25 @@ async def _turn_witness(
     base_p95 = _p95(baseline_us)
     memory_p95 = _p95(recalled_us)
     return {
+        "proposal_boundary": {
+            "confirmation_attempts": sum(item.confirmation_attempted for item in (
+                authorized, baseline_forced_start, memory_forced_start,
+            )),
+            "proposals_before_confirmation": sum(len(item.proposals) for item in (
+                authorized, baseline_forced_start, memory_forced_start,
+            )),
+            "dispatches_before_confirmation": sum(item.preconfirmation_dispatches for item in (
+                authorized, baseline_forced_start, memory_forced_start,
+            )),
+            "cancellations_before_confirmation": sum(
+                item.preconfirmation_cancellations for item in (
+                    authorized, baseline_forced_start, memory_forced_start,
+                )
+            ),
+            "accepted_after_confirmation": sum(item.accepted_start for item in (
+                authorized, baseline_forced_start, memory_forced_start,
+            )),
+        },
         "latency": {
             "samples": len(baseline_us),
             "p95_baseline_us": base_p95,
@@ -608,6 +749,7 @@ async def _turn_witness(
             + int(memory_approval.approval_granted),
             "direct_dispatches": int(
                 authorized.tool_attempted and not authorized.tool_rejected
+                and authorized.accepted_start
                 and authorized_counter.dispatches == 1
             ),
             "refresh_turns": refresh_turns,
@@ -855,6 +997,7 @@ async def _open_memory(home: Path, *, refresh: bool, gap: bool) -> dict[str, obj
                     },
                     "latency": latency,
                     "authority": turn_witness["authority"],
+                    "proposal_boundary": turn_witness["proposal_boundary"],
                 }
             finally:
                 await receiver.close()
@@ -1163,6 +1306,7 @@ async def _qualify(python: Path) -> None:
                 "0.21.0", PINNED_HERMES / "source"
             )
             evidence["observed"] = observed
+            evidence["proposal_boundary"] = opened["proposal_boundary"]
             evidence["passed"] = _passed(observed, evidence["hermes"])
         except BaseException as error:
             evidence["failure"] = type(error).__name__

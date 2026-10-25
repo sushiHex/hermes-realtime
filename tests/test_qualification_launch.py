@@ -946,7 +946,7 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
     assert completed.returncode == 2
     assert json.loads(completed.stdout)["pass"] is False
     if launch_capability != "outside":
-        assert json.loads(completed.stdout)["error"]["code"] == "evaluation_failed"
+        assert json.loads(completed.stdout)["error"]["code"] == "owned_launch_failed"
         _assert_host_refusal(receipt, launch_capability)
         return
     assert json.loads(completed.stdout)["error"]["code"] == "codex_setup_failed"

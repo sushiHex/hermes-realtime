@@ -37,6 +37,7 @@ from hermes_realtime.speech import (
 from .actions import ConversationUpdateExecutor
 from .ingress import BoundedPcmIngress, IngressRecord
 from .knowledge import KnowledgePrefetchCoordinator
+from .task_proposals import ConversationTaskProposals
 from .telemetry import KnowledgeTurnBudget, UtteranceTicket
 
 _MAX_IDENTITY_CHARS = 128
@@ -112,6 +113,7 @@ class ConversationSessionWorker:
         actions: ConversationUpdateExecutor,
         stt_streams_partials: bool = True,
         command_router: _TaskCommandRouter | None = None,
+        task_proposals: ConversationTaskProposals | None = None,
         evidence_lifecycle: EvidenceConversationAuthorityV1 | None = None,
         evidence_lifecycle_resolver: (
             Callable[[], EvidenceConversationAuthorityV1 | None] | None
@@ -243,6 +245,7 @@ class ConversationSessionWorker:
         self._stt_streams_partials = stt_streams_partials
         self._actions = actions
         self._command_router = command_router
+        self._task_proposals = task_proposals
         self._evidence_lifecycle = evidence_lifecycle
         self._evidence_lifecycle_resolver = evidence_lifecycle_resolver
         self._production_observation_recorder = production_observation_recorder
@@ -268,6 +271,7 @@ class ConversationSessionWorker:
         self._pre_roll_frame_capacity = pre_roll_frames
         self._max_buffered_audio_bytes = max_buffered_audio_bytes
         self._pre_roll_frames: deque[AudioFrame] = deque()
+        self._pre_roll_clean: deque[bool] = deque()
         self._pre_roll_bytes = 0
         self._echo_guard = echo_guard
         self._speech_presence_verifier = speech_presence_verifier
@@ -389,6 +393,14 @@ class ConversationSessionWorker:
                     recent_playback = (
                         guard is not None and guard.has_recent_playback()
                     )
+                    proposals = self._task_proposals
+                    if proposals is not None:
+                        proposals.capture_started(
+                            participant=self._participant_identity,
+                            generation=self._session_generation, clean=(
+                            guard is not None and not interrupting and not recent_playback
+                            and not echo_dominated and all(self._pre_roll_clean)
+                        ))
                     observer = self._observer
                     confirmation_required = guard is not None and (
                         interrupting or recent_playback
@@ -742,7 +754,14 @@ class ConversationSessionWorker:
             or self._pre_roll_bytes + frame_bytes > self._max_buffered_audio_bytes
         ):
             self._pre_roll_bytes -= len(self._pre_roll_frames.popleft().pcm)
+            self._pre_roll_clean.popleft()
         self._pre_roll_frames.append(frame)
+        guard = self._echo_guard
+        self._pre_roll_clean.append(
+            guard is not None and not guard.has_recent_playback()
+            and not self._actions.foreground_active
+            if self._task_proposals is not None else False
+        )
         self._pre_roll_bytes += frame_bytes
 
     def _bounded_recent_frames(
@@ -763,6 +782,7 @@ class ConversationSessionWorker:
 
     def _clear_pre_roll(self) -> None:
         self._pre_roll_frames.clear()
+        self._pre_roll_clean.clear()
         self._pre_roll_bytes = 0
 
     def _set_echo_candidate(self, frames: tuple[AudioFrame, ...]) -> None:
@@ -827,6 +847,11 @@ class ConversationSessionWorker:
                 raise RuntimeError("conversation session worker is closed")
             self._raise_terminal_error()
             try:
+                if self._task_proposals is not None:
+                    # Freeze eligibility before cancellation can publish a later proposal.
+                    self._task_proposals.typed_input_started(
+                        participant=self._participant_identity, generation=self._session_generation,
+                    )
                 self._observe_final_transcript(transcript)
                 await self._actions.cancel_foreground()
                 self._raise_if_closed()

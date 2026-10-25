@@ -222,6 +222,46 @@ async def prove(port, key, witness, case):
                     "healthy" if case == "replay" else case,
                     replay_key="synthetic-replay" if case == "replay" else None,
                 )
+            if case == "host-initial":
+                try:
+                    snapshot = await until(
+                        lambda value: value["waiting"], "host-provider-after-retrieval"
+                    )
+                    count = snapshot["counts"][run_ids[0]]
+                    assert (count["provider"], count["search"], count["extract"]) == (1, 1, 0), (
+                        "host-initial-native-effect-counts"
+                    )
+                    assert snapshot["safety"]["host_initial_model_before_effect"] == 0
+                    assert snapshot["safety"]["host_initial_native_result_seen"] is True
+                    assert snapshot["current_wrappers"] is True
+                    assert snapshot["budgets"][run_ids[0]]["urls"] == 4
+                    async with http.post(base + "/v1/runs/" + run_ids[0] + "/stop",
+                            headers={"X-Lookup-Policy": "ordinary-lookup/v1"}) as reply:
+                        assert reply.status == 200, "host-proof-native-stop"
+                finally:
+                    await control("release")
+                for _ in range(240):
+                    async with http.get(base + "/v1/runs/" + run_ids[0]) as reply:
+                        status = (await reply.json())["status"]
+                    witness["host_proof_terminal_status"] = status
+                    if status in {"completed", "failed", "cancelled", "interrupted"}:
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("host-proof-native-stop-settlement")
+                final = await state()
+                assert final["budgets"][run_ids[0]]["closed"] is True
+                assert final["budgets"][run_ids[0]]["cancelled"] is True
+                count = final["counts"][run_ids[0]]
+                assert (count["provider"], count["search"], count["extract"]) == (1, 1, 0)
+                assert final["safety"]["fixture_failures"] == 0
+                witness["host_initial_native_chain"] = {
+                    "model_calls_before_effect": 0, "native_search_effects": 1,
+                    "subsequent_provider_calls": 1, "native_tool_result_seen": True,
+                    "terminal_status": status, "presentation_not_exercised": True,
+                }
+                return {"cases": 1, "native_completed": 0, "stand_in_calls": 1,
+                        "distinct_run_scopes": 1}
 
             if case in {"healthy", "six", "alias-status"}:
                 async with http.get(

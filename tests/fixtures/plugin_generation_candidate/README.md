@@ -12,6 +12,93 @@ handlers and fault controls. Its separate `register(ctx)` entrypoint is source
 for review; direct packaging/loading of that entrypoint is not qualified here.
 The fixture invokes the same installer through supported Hermes plugin APIs.
 
+For an already admitted presentation-enabled lookup, the initial `llm_execution`
+callback returns one host-authored `web_search` request using the exact accepted
+`input` string as its query. Input must be nonblank and at most 1024 characters;
+invalid input is refused before native admission, without truncation or rewriting.
+The advertised search tool must be present exactly once. This initial request has
+host-prefixed request/call IDs, `model="host-policy/ordinary-lookup/v1"`, explicit
+`policy_origin="host-initial-retrieval"`, and no provider usage. No initial provider
+call is made. Runtime observers may still count this as a logical middleware turn;
+it must not be reported as model inference or provider token usage.
+
+The request enters the existing reservation and tool/effect-ticket chain, then
+Hermes's normal conversation executor, approval and result-persistence path. It is
+not a fabricated tool result or retrieved-source claim. Only the actual admitted
+handler result may populate the same-run URL catalog. Successful retrieval allows
+normal provider execution afterward; failed/empty retrieval refuses without a
+retry or another provider call. Generic runs and budget-only deployments retain
+their existing behavior. No `tool_choice`, direct registry dispatch, new executor,
+model-specific branch or Hermes patch is used.
+
+The native entrypoint additionally requires explicit plugin-local
+`settings.presentation` with exactly `provider`, `base_url`, `model`, and
+`api_key_env`. The named environment variable must exist; there is no ambient
+credential fallback. On a selected run's final native response, one tool-free,
+nonstreaming OpenAI SDK call presents that completed result as strict JSON
+`voice`/`detail` and selected `source_ids`, then copies validated content into the
+existing envelope.
+The trusted route must equal the actual middleware route and request model.
+Tools, functions, tool choice, retries and redirects are unavailable to this
+call. Its deadline is the selected admission's original 120-second deadline,
+never another per-phase allowance. An authenticated native stop or unload
+cancels the owned async request. Ownership is released only after local HTTP
+cleanup settles; cleanup failure retains ownership and refuses the result.
+This does not prove remote inference has stopped. Formatting refusal
+sets the policy refusal outcome without undoing tool effects or changing native
+task status. The original bounded response is retained in the row, with only
+hashes/counts/categories and separate presentation usage emitted. Publication
+uses copies of the native response, choice and message, preserving their metadata
+without requiring SDK-specific copy methods on Hermes streaming responses. Structural
+validation does not establish factual accuracy or semantic consistency; actual
+task acceptance still checks those. The synthetic fixture leaves this optional
+presentation dependency disabled and therefore does not qualify live formatting.
+Presentation lazily reuses the exact source-bound installed realtime runtime's
+`HermesApiTaskSession._completed_result_text` validator, after strict JSON and
+literal framing. Missing or incompatible validation refuses without fallback.
+This private-method coupling is an explicit compatibility limit: the plugin is
+not a standalone Hermes formatting qualification. The acceptance launcher must
+bind imports to the attested realtime payload.
+
+This opt-in presentation path additionally requires a nonblank source URL from
+a successful, error-free search result admitted to the same run through the
+existing tool/effect tickets. Failed, empty, unrelated or stale results cannot
+authorize presentation. Search-only evidence suffices; extraction is not required.
+The existing `row.urls` index supplies this evidence, without a separate success
+flag. Its presence records admitted search-result metadata, not page extraction,
+answer correctness, citation fidelity, source authority or freshness. Those remain
+separate acceptance checks.
+Presentation freezes the complete admitted URL catalog in deterministic order and
+supplies it alongside the native answer. The whole JSON input must fit 16 KiB in
+UTF-8; an oversized catalog refuses without truncation or a formatter call. The
+formatter selects unique, exact integer catalog IDs. Its schema permits an empty
+selection when no source supports the answer; publication refuses that outcome.
+Only selected IDs are resolved to the exact frozen URLs, rendered as a source list
+in detail. The existing 1800-character detail limit and reserved-markup validation
+apply after rendering, including all links. Catalog drift before publication
+refuses. No URL rewriting, extra source, repair call or new semantic verifier is
+added. URL metadata establishes reference eligibility, not claim support.
+Model-written voice/detail containing case-insensitive `http://`, `https://` or
+`www.` is refused rather than repaired. Web links are rendered only by the host
+from selected catalog IDs. This is a narrow web-link syntax rule: domain names,
+source names and prose claims still require semantic review.
+
+Generic native completion and the budget-only fixture deployment do not promise
+source support and keep their prior completion behavior. Historical bounded-tool
+qualification does not become source-backed publication qualification retroactively.
+
+The presentation request sets `reasoning_effort: none`; native task reasoning
+is unchanged. The configured endpoint must support this request control.
+Unsupported requests fail closed without a fallback. The 1024-token cap, schema
+and admission deadline remain unchanged; wire evidence records the serialized
+control as a boolean without recording request content.
+
+`tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
+streaming producer through presentation and publication using synthetic SDK
+transports. It checks native and SDK response metadata and original-response
+preservation. It is an explicit offline proof, not a model or gateway qualification;
+its source, policy, runtime and fresh receipt paths are supplied by the caller.
+
 ## Interface and scope
 
 The exact supported source is official Hermes Agent
@@ -328,7 +415,7 @@ HEAD/tracked-file checks did not exclude ignored import overlays; those historic
 receipts are not retroactively given the stronger import-source qualification.
 The main group also predates the small alias correction, with its own archived policy
 SHA `c6f467b9ff7d0b81a04797385766500939cd1b3f1b33d17aa362b46358d422e1`.
-The alias groups bind current policy SHA
+The archived alias groups bind their then-current policy SHA
 `7967d036cb9117f8a927cd950d81f690307f7ef49700fbf558228fde1e34733b`.
 All groups bind installer SHA
 `eb998e0b8a517aa5bd6e905d17bbd0dd873e2a96961379743fafdc3bf33ac282`.

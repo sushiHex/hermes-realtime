@@ -26,6 +26,7 @@ class PendingRun:
     key: str | None
     minted_at: float
     body: dict[str, object]
+    lookup_policy: str | None = None
 
 
 def max_run_record_bytes(max_entries: int, max_request_bytes: int) -> int:
@@ -178,13 +179,20 @@ def read_run_record(path: Path, max_bytes: int) -> bytes | None:
 
 
 def run_record_bytes(pending: list[PendingRun], admitted: list[str]) -> bytes:
+    for entry in pending:
+        if entry.lookup_policy is not None and (
+            type(entry.lookup_policy) is not str or entry.lookup_policy != "ordinary-lookup/v1"
+        ):
+            raise ValueError("pending lookup policy is unsupported")
+    version = 2 if any(entry.lookup_policy is not None for entry in pending) else _VERSION
     document = {
         "admitted": admitted,
         "pending": [
             {"key": entry.key, "minted_at": entry.minted_at, "request": entry.body}
+            | ({"lookup_policy": entry.lookup_policy} if version == 2 else {})
             for entry in pending
         ],
-        "version": _VERSION,
+        "version": version,
     }
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -206,7 +214,7 @@ def parse_run_record(
     if type(document) is not dict or set(document) != {"admitted", "pending", "version"}:
         return None
     version, pending, admitted = document["version"], document["pending"], document["admitted"]
-    if type(version) is not int or version != _VERSION:
+    if type(version) is not int or version not in {_VERSION, 2}:
         return None
     if type(pending) is not list or type(admitted) is not list:
         return None
@@ -222,7 +230,11 @@ def parse_run_record(
     entries: list[PendingRun] = []
     keys: set[str] = set()
     for entry in pending:
-        if type(entry) is not dict or set(entry) != {"key", "minted_at", "request"}:
+        fields = {"key", "minted_at", "request"} | ({"lookup_policy"} if version == 2 else set())
+        if type(entry) is not dict or set(entry) != fields:
+            return None
+        policy = entry.get("lookup_policy")
+        if policy is not None and (type(policy) is not str or policy != "ordinary-lookup/v1"):
             return None
         key, minted_at, request = entry["key"], entry["minted_at"], entry["request"]
         if key is not None:
@@ -233,7 +245,7 @@ def parse_run_record(
             return None
         if not _is_run_request(request, max_request_bytes):
             return None
-        entries.append(PendingRun(key=key, minted_at=minted_at, body=request))
+        entries.append(PendingRun(key=key, minted_at=minted_at, body=request, lookup_policy=policy))
     return entries, run_ids
 
 

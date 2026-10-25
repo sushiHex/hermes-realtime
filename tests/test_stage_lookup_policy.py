@@ -125,6 +125,15 @@ async def test_staged_native_register_wires_only_real_policy_with_inert_dependen
     registrations, middleware, platforms = [], [], []
 
     class Context:
+        def get_config(self, name):
+            assert name == "presentation"
+            return {"provider": "custom", "base_url": "http://localhost/v1",
+                    "model": "test-model", "api_key_env": "LOOKUP_TEST_KEY"}
+
+        def on_unload(self, callback):
+            assert callable(callback)
+            return types.SimpleNamespace(active=True)
+
         def register_tool(self, name, toolset, schema, handler, **options):
             assert options["override"] is True
             registrations.append(name)

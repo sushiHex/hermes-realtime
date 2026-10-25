@@ -45,6 +45,7 @@ def arguments():
         "--case",
         choices=(
             "healthy",
+            "host-initial",
             "five",
             "six",
             "mixed",
@@ -485,6 +486,9 @@ def worker(args):
             + ("false" if args.case == "no-opt-in" else "true")
             + "\n"
             "      settings:\n        proof_key: " + key + "\n"
+            "        host_initial_proof: "
+            + ("true" if args.case == "host-initial" else "false")
+            + "\n"
             "        real_originals: "
             + ("true" if args.case in {"builtins", "no-opt-in"} else "false")
             + "\n"

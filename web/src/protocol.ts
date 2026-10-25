@@ -502,6 +502,7 @@ const EVENT_KINDS = new Set([
   "speech_timing",
   "speech_ended",
   "task_state",
+  "task_proposal",
   "task_result",
   "transcript_final",
   "transcript_partial",
@@ -517,6 +518,43 @@ export interface PublicEvent {
   readonly kind: string;
   readonly monotonicMs: number;
   readonly data: Readonly<Record<string, string | number | boolean | null>>;
+}
+
+export interface TaskProposal {
+  readonly proposalId: string;
+  readonly objective: string;
+  readonly generation: number;
+  readonly status: "pending" | "confirmed" | "declined" | "retired";
+  readonly reason: "spoken_confirmation_not_ready" | "use_confirmation_card" | null;
+}
+export const TASK_PROPOSAL_OBJECTIVE_MAX_CHARS = 1024;
+
+export function parseTaskProposal(value: unknown): TaskProposal {
+  let accepted = false;
+  try {
+    if (!isPlainRecord(value) || !hasExactKeys(value, ["proposalId", "objective", "generation", "status", "reason"])) {
+      throw new TypeError("task proposal shape is invalid");
+    }
+    if (typeof value.proposalId !== "string" || !/^proposal_[A-Za-z0-9_-]{8,64}$/.test(value.proposalId)) {
+      throw new TypeError("task proposal identity is invalid");
+    }
+    if (typeof value.objective !== "string" || value.objective.trim().length === 0 || Array.from(value.objective).length > TASK_PROPOSAL_OBJECTIVE_MAX_CHARS) {
+      throw new TypeError("task proposal objective is invalid");
+    }
+    if (!Number.isSafeInteger(value.generation) || (value.generation as number) <= 0) {
+      throw new TypeError("task proposal generation is invalid");
+    }
+    if (!new Set(["pending", "confirmed", "declined", "retired"]).has(value.status as string)) {
+      throw new TypeError("task proposal status is invalid");
+    }
+    if (!new Set([null, "spoken_confirmation_not_ready", "use_confirmation_card"]).has(value.reason as string | null)) {
+      throw new TypeError("task proposal reason is invalid");
+    }
+    accepted = true;
+    return value as unknown as TaskProposal;
+  } finally {
+    if (!accepted) console.info('[task-proposal-protocol] {"category":"invalid","count":1}');
+  }
 }
 
 export interface EventBatch {
@@ -583,6 +621,7 @@ function parseEvent(value: unknown): PublicEvent {
     });
   }
   if (value.kind === "capture_status") parseCaptureStatus(value.data);
+  if (value.kind === "task_proposal") parseTaskProposal(value.data);
   if (value.kind === "voice_conversation_cleared" && Object.keys(value.data).length !== 0) {
     throw new TypeError("voice delete event must be empty");
   }
