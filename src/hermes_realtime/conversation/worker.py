@@ -847,13 +847,14 @@ class ConversationSessionWorker:
                 raise RuntimeError("conversation session worker is closed")
             self._raise_terminal_error()
             try:
-                self._observe_final_transcript(transcript)
-                await self._actions.cancel_foreground()
-                self._raise_if_closed()
                 if self._task_proposals is not None:
+                    # Freeze eligibility before cancellation can publish a later proposal.
                     self._task_proposals.typed_input_started(
                         participant=self._participant_identity, generation=self._session_generation,
                     )
+                self._observe_final_transcript(transcript)
+                await self._actions.cancel_foreground()
+                self._raise_if_closed()
                 router = self._command_router
                 lifecycle = self._resolve_evidence_lifecycle()
                 user_authority: UserTurnAuthorityV1 | None = None

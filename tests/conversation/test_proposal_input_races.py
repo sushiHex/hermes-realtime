@@ -1,6 +1,7 @@
 """An assent admitted before an await cannot confirm a later proposal or binding."""
 
 import asyncio
+from types import MethodType
 
 import pytest
 
@@ -10,7 +11,63 @@ from hermes_realtime.conversation.task_proposals import (
     HostTaskProposalRequest,
 )
 from hermes_realtime.conversation.work_tools import WorkCommandAdmission
+from hermes_realtime.conversation.worker import ConversationSessionWorker
 from tests.conversation.test_proposal_capture import CommandSurface
+from tests.conversation.test_worker import (
+    FinalOnPushTranscriber,
+    SilenceVad,
+    action_executor_probe,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["late_offer", "replace", "unchanged"])
+async def test_typed_assent_cannot_gain_proposal_authority_during_foreground_cancel(change):
+    surface, entered, release = CommandSurface(), asyncio.Event(), asyncio.Event()
+    proposals = ConversationTaskProposals(surface=surface, observer=lambda *_: None)
+    proposals.bind("participant", 1)
+    if change != "late_offer":
+        proposals.offer(HostTaskProposalRequest("Previously displayed objective"))
+    actions, _, _ = action_executor_probe()
+    original_cancel = actions.cancel_foreground
+
+    async def cancel_foreground(self):
+        entered.set()
+        await release.wait()
+        await original_cancel()
+
+    actions.cancel_foreground = MethodType(cancel_foreground, actions)
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda *_: None,
+        reserve_observer_capacity=lambda: None,
+        task_proposals=proposals,
+    )
+    worker = ConversationSessionWorker(
+        participant_identity="participant", session_generation=1,
+        vad=SilenceVad(), stt=FinalOnPushTranscriber(),
+        actions=actions, command_router=router, task_proposals=proposals,
+    )
+    worker.start()
+    operation = asyncio.create_task(worker.submit_final_transcript(
+        participant_identity="participant", session_generation=1,
+        typed_sequence=1, text="yes",
+    ))
+    try:
+        await entered.wait()
+        if change == "replace":
+            proposals.retire("intervening_input")
+        if change != "unchanged":
+            proposals.offer(HostTaskProposalRequest("Published after typed assent"))
+        release.set()
+        await operation
+        assert [objective for objective, _ in surface.calls] == (
+            ["Previously displayed objective"] if change == "unchanged" else []
+        )
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await worker.close()
 
 
 @pytest.mark.asyncio
