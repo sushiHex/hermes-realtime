@@ -54,6 +54,7 @@ from .foreground import (
     ForegroundTurnCoordinator,
     ForegroundTurnLease,
 )
+from .task_proposals import ConversationTaskProposals, HostTaskProposalRequest, TaskProposal
 from .task_status import HostSpeechRequest, TaskStatusSnapshot
 from .tasks import TaskTerminalOutcome
 from .updates import UpdateDecision, UpdateDecisionKind
@@ -104,8 +105,9 @@ def _committed_conversation_context_snapshot_bytes(
     memory: BuiltinMemorySnapshot | None = None,
     host_speech_message_indices: tuple[int, ...] = (),
 ) -> bytes:
-    """Encode the authoritative adapter boundary for content-free observation.
+    """Encode the internal snapshot supplied to an adapter for content-free observation.
 
+    Provider rendering may omit fields; this is not the model-visible prompt.
     An interrupted assistant row carries a trailing ``True``; other rows are pairs.
     """
 
@@ -276,7 +278,7 @@ class StreamingInference(Protocol):
         snapshot: ConversationContextSnapshot,
         *,
         turn_id: str,
-    ) -> AsyncIterator[str | HostSpeechRequest]: ...
+    ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]: ...
 
     async def cancel(self, turn_id: str) -> None: ...
 
@@ -315,6 +317,7 @@ class StreamingSpeechLoop:
         production_observation_recorder: _ProductionObservationRecorderV1 | None = None,
         observer: _Observer | None = None,
         task_status: Callable[[], TaskStatusSnapshot] | None = None,
+        task_proposals: ConversationTaskProposals | None = None,
         max_segment_chars: int = 4096,
         max_segments: int = DEFAULT_MAX_RESPONSE_SEGMENTS,
         cleanup_timeout_seconds: float = 1.0,
@@ -352,6 +355,7 @@ class StreamingSpeechLoop:
         if not math.isfinite(cleanup_timeout_seconds) or cleanup_timeout_seconds <= 0:
             raise ValueError("cleanup_timeout_seconds must be finite and positive")
         self._task_status = task_status
+        self._task_proposals = task_proposals
         self._context = context
         self._foreground = foreground
         self._inference = inference
@@ -817,6 +821,8 @@ class StreamingSpeechLoop:
         producer_result: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         pending_admissions: list[AssistantTextAdmission] = []
         generated_segments: list[ForegroundPublication] = []
+        proposal_readback: list[TaskProposal] = []
+        proposal_confirmed_text: list[str] = []
         delivered_sequences: set[int] = set()
         delivered_chunk_counts: dict[int, int] = {}
         replay_skip_counts = (
@@ -866,7 +872,7 @@ class StreamingSpeechLoop:
                 generated_segments.append(publication)
 
             try:
-                inference: AsyncIterator[str | HostSpeechRequest]
+                inference: AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]
                 if segments is not None:
                     inference = self._segments_stream(segments)
                 elif transcript is None:
@@ -889,7 +895,7 @@ class StreamingSpeechLoop:
                             memory=snapshot.memory,
                             host_speech_message_indices=tuple(
                                 index for index, message in enumerate(snapshot.messages)
-                                if message.source == "host_task_status"
+                                if message.source in {"host_task_status", "host_task_proposal"}
                             ),
                             messages=tuple(
                                 (message.role, message.text, True)
@@ -923,7 +929,18 @@ class StreamingSpeechLoop:
                         if host_item_seen:
                             self._refuse_host_speech("after_terminal")
                         source = "conversation"
-                        if type(segment) is HostSpeechRequest:
+                        if type(segment) is HostTaskProposalRequest:
+                            if transcript is None or self._task_proposals is None:
+                                self._refuse_host_speech("unadvertised_proposal")
+                            if not lease.is_current:
+                                break
+                            host_item_seen = True
+                            source = "host_task_proposal"
+                            assert self._task_proposals is not None
+                            proposal = self._task_proposals.offer(segment)
+                            proposal_readback.append(proposal)
+                            segment = proposal.readback
+                        elif type(segment) is HostSpeechRequest:
                             if transcript is None:
                                 self._refuse_host_speech("unadvertised")
                             if not lease.is_current:
@@ -1066,6 +1083,8 @@ class StreamingSpeechLoop:
                             update_operation=update_operation,
                             evidence_lease=evidence_lease,
                             terminal_evidence=terminal_evidence,
+                            proposal_readback=proposal_readback,
+                            proposal_confirmed_text=proposal_confirmed_text,
                         ),
                         name=f"foreground-speech:{turn_id}:{lease.generation}",
                     )
@@ -1362,6 +1381,8 @@ class StreamingSpeechLoop:
         update_operation: _UpdateSpeechOperation | None,
         evidence_lease: EvidenceTurnLease | None,
         terminal_evidence: _TerminalEvidenceState,
+        proposal_readback: list[TaskProposal],
+        proposal_confirmed_text: list[str],
     ) -> None:
         first_playable_observed = False
         replay_lifecycle = replay_presentations.get(1)
@@ -1468,6 +1489,13 @@ class StreamingSpeechLoop:
                         },
                     )
                 try:
+                    proposals = self._task_proposals
+                    if proposals is not None:
+                        proposals.speech_started(
+                            proposal_readback[0]
+                            if publication.source == "host_task_proposal" and proposal_readback
+                            else None,
+                        )
                     await self._playback.play(
                         chunk,
                         is_valid=self._validity_probe(publication),
@@ -1485,6 +1513,8 @@ class StreamingSpeechLoop:
                     raise asyncio.CancelledError
                 confirmation = self._ledger.mark_delivered_confirmed(receipt)
                 confirmed_text = self._ledger.confirmed_text(confirmation, admission)
+                if publication.source == "host_task_proposal":
+                    proposal_confirmed_text.append(confirmed_text)
                 self._qualification_owner_context.record_transport_confirmed_chunk(
                     confirmed_text.encode("utf-8")
                 )
@@ -1521,6 +1551,12 @@ class StreamingSpeechLoop:
             await asyncio.shield(prefetch_task)
             await asyncio.shield(producer_result)
             turn_counts = self._ledger.snapshot_turn_counts(turn_id)
+            if proposal_readback and self._task_proposals is not None:
+                self._task_proposals.complete_readback(
+                    proposal_readback[0], "".join(proposal_confirmed_text),
+                    queued_chunks=turn_counts.queued_chunk_count,
+                    confirmed_chunks=turn_counts.transport_confirmed_full_count,
+                )
             terminal_evidence.counts = turn_counts
             try:
                 self._ledger.close_turn(turn_id)
@@ -1572,6 +1608,11 @@ class StreamingSpeechLoop:
                 turn_generation=lifecycle_generation,
             )
         except BaseException as error:
+            if proposal_readback and self._task_proposals is not None:
+                self._task_proposals.speech_started()
+                self._task_proposals.complete_readback(
+                    proposal_readback[0], "", queued_chunks=0, confirmed_chunks=0,
+                )
             interruption_marker_error: BaseException | None = None
             if last_heard_segment is not None:
                 # The turn did not complete normally after some speech was heard:

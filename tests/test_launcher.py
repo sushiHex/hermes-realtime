@@ -958,6 +958,8 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
         [
             "--moonshine-model-tier",
             "small",
+            "--ollama-num-gpu",
+            "0",
             "--evidence-capture",
             "--evidence-retention-hours",
             "48",
@@ -972,6 +974,7 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
         await running
 
     assert captured["moonshine_model_tier"] == "small"
+    assert captured["ollama_num_gpu"] == 0
     assert captured["knowledge_speculation"] is False
     assert captured["knowledge_recovery"] is False
     assert captured["knowledge_budget_seconds"] == 3.5
@@ -1767,9 +1770,11 @@ async def test_full_host_explicit_commands_share_the_composed_work_surface(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_policy", [None, "ordinary-lookup/v1"])
 async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    lookup_policy: str | None,
 ) -> None:
     class TranscriberStub:
         async def push(self, _frame: AudioFrame) -> tuple[()]:
@@ -1799,6 +1804,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         tts_provider="edge",
         allow_unsandboxed_tasks=True,
         hermes_run_record=record,
+        hermes_lookup_policy=lookup_policy,
     )
     try:
         close_owner = next(
@@ -1807,6 +1813,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         task_session = close_owner._owners[3]
         assert type(task_session) is host_launcher_module.HermesApiTaskSession
         assert task_session._run_record_path == record
+        assert task_session._config.lookup_policy == lookup_policy
     finally:
         await launcher.close()
 
@@ -3605,3 +3612,136 @@ async def test_full_host_policy_clamps_result_after_private_handle_redaction() -
     assert type(projected) is str
     assert len(projected) <= 1024
     assert "run_a1b2c3d4" not in projected
+
+
+def test_qualification_no_task_composition_rejects_lookup_policy() -> None:
+    with (
+        host_launcher_module._qualification_no_task_composition(),
+        pytest.raises(ValueError, match="lookup policy"),
+    ):
+        build_local_host_launcher(hermes_api_bearer=None, hermes_lookup_policy="ordinary-lookup/v1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["rebind", "projection_resync"])
+@pytest.mark.parametrize("confirmation", ["card", "typed"])
+async def test_full_host_replacement_worker_rebinds_proposal_authority(
+    monkeypatch,
+    replacement,
+    confirmation,
+):
+    from hermes_realtime.client.runtime import BrowserClientRuntime
+    from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
+    from hermes_realtime.conversation.work_tools import WorkCommandAdmission
+    from hermes_realtime.conversation.worker import (
+        ConversationSessionWorker,
+        ReconnectSafeConversationWorker,
+    )
+    from hermes_realtime.livekit.worker import LiveKitConversationWorker
+
+    harness = _FullHostHarness(monkeypatch)
+    monkeypatch.setattr(
+        host_launcher_module, "ReconnectSafeConversationWorker", ReconnectSafeConversationWorker
+    )
+    monkeypatch.setattr(
+        host_launcher_module, "ConversationSessionWorker", ConversationSessionWorker
+    )
+    monkeypatch.setattr(
+        host_launcher_module, "LiveKitConversationWorker", LiveKitConversationWorker
+    )
+    monkeypatch.setattr(
+        host_launcher_module,
+        "_build_voice_activity_detector",
+        lambda **kwargs: type(
+            "Vad", (), {"required_pre_roll_frames": 1, "process": lambda self, frame: None}
+        )(),
+    )
+    monkeypatch.setattr(
+        host_launcher_module,
+        "SileroSpeechPresenceVerifier",
+        lambda: type("Verifier", (), {"classify": lambda self, frame: None})(),
+    )
+
+    async def no_audio(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host_launcher_module.LiveKitRoomPeer, "receive_participant_audio", no_audio)
+    runtimes = []
+
+    def capture_runtime(**kwargs):
+        runtime = BrowserClientRuntime(**kwargs)
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(host_launcher_module, "BrowserClientRuntime", capture_runtime)
+    launcher = harness.build(natural_work_tools=True)
+    runtime = runtimes[0]
+    sessions = runtime._sessions
+    worker = runtime._worker._runtime
+    calls, events = [], []
+    try:
+        initial = await sessions.start()
+        old_binding = worker._binding
+        proposals = old_binding._task_proposals
+        observe = proposals._observer
+
+        def observe_proposal(kind, data):
+            events.append(dict(data))
+            observe(kind, data)
+
+        proposals._observer = observe_proposal
+
+        async def accepted(*, objective, invocation_id):
+            calls.append((objective, invocation_id))
+            return WorkCommandAdmission.ADMITTED
+
+        monkeypatch.setattr(proposals._surface, "submit_start_command", accepted)
+        old = proposals.offer(HostTaskProposalRequest("Inspect the old synthetic release"))
+        credential = await getattr(sessions, replacement)(
+            participant_identity=initial.participant_identity,
+        )
+        generation = runtime._worker.active_generation
+        assert generation > old.generation
+        assert worker._binding is not old_binding
+        assert worker._binding._task_proposals is proposals
+        assert not proposals.has_pending
+        assert any(
+            event["proposalId"] == old.proposal_id and event["status"] == "retired"
+            for event in events
+        )
+        with pytest.raises(PermissionError, match="current binding"):
+            await sessions.decide_task_proposal(
+                participant_identity=initial.participant_identity,
+                generation=old.generation,
+                proposal_id=old.proposal_id,
+                objective=old.objective,
+                decision="confirm",
+                sequence=1,
+            )
+        assert calls == []
+        fresh = proposals.offer(HostTaskProposalRequest("Inspect the current synthetic release"))
+        assert fresh.participant == credential.participant_identity
+        assert fresh.generation == generation
+        card = events[-1]
+        assert card["proposalId"] == fresh.proposal_id
+        assert card["generation"] == generation and card["status"] == "pending"
+        if confirmation == "card":
+            decision = dict(
+                participant_identity=credential.participant_identity,
+                generation=generation,
+                proposal_id=fresh.proposal_id,
+                objective=fresh.objective,
+                decision="confirm",
+                sequence=1,
+            )
+            await sessions.decide_task_proposal(**decision)
+            await sessions.decide_task_proposal(**decision)
+        else:
+            await sessions.submit_text(
+                participant_identity=credential.participant_identity, sequence=1, text="yes"
+            )
+        assert calls == [(fresh.objective, "confirmed_" + fresh.proposal_id)]
+        assert not proposals.has_pending
+    finally:
+        await runtime.close()
+        await launcher.close()

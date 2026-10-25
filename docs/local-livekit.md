@@ -274,6 +274,25 @@ iPhone's ineffective `HTMLMediaElement.volume`. Local onset never calls the yiel
 transcripts, or gains task authority. The explicit **Stop speaking** control still submits an
 immediate exact `(turn, generation, chunk, stream)` yield claim.
 
+The **Speaker** slider and **Mute** button beside Voice update assistant output gain during playback,
+including spoken task results, through the existing LiveKit track's
+[`setVolume`](https://docs.livekit.io/reference/client-sdk-js/classes/RemoteAudioTrack.html#setVolume)
+path. The slider supports the keyboard's native range controls. Volume (0–100%) and mute
+are saved in this browser's local storage across Disconnect/Connect and page refresh;
+invalid saved preferences use the previous 100% playback level. Unmute restores the selected
+level, and changing the slider while muted keeps output muted. If storage is blocked,
+the controls still work for this page and report **not saved** after a change.
+The selected level multiplies temporary speech attenuation and cannot undo committed
+silence. Muted or zero-level output also disables the existing remote media track before
+attachment, so a newly created SDK gain node cannot bypass the zero setting. Speech's
+existing renderer permission remains independent; unmuting cannot revive stopped speech.
+Microphone capture and task/session controls keep their existing behavior.
+[Preference tests](../web/tests/playback-volume.dom.test.ts) and the
+[mounted playback test](../web/tests/connection-main.dom.test.ts) cover gain setting,
+restoration and output-only wiring; they do not establish human audibility.
+LiveKit smooths gain changes. Track gating does not establish instantaneous acoustic silence
+from audio already buffered downstream; human audibility remains a separate observation.
+
 Pass `projection.publish` as the observer when constructing both `ConversationSessionWorker` and `StreamingSpeechLoop`. This projects admitted user transcripts, delivered assistant transcript segments, first foreground token, and first playable audio without exposing internal turn, delegation, or run handles. Task and approval owners publish `task_state`, `completion_received`, `notification_queued`, and actionable `approval_state` events only after their own authoritative transitions; the browser runtime does not duplicate that authority.
 
 Loopback composition derives an `http://127.0.0.1:<port>` origin. Keep the launch capability in the URL fragment; the client removes it from browser history before its first request. `BrowserClientRuntime.start()` returns that launch URL, and `close()` settles the HTTP server and LiveKit worker. The runtime is one-shot: terminal stop or inactivity cleanup closes that worker rather than attempting to reuse it for another bootstrap.
@@ -449,8 +468,33 @@ when browser storage is unavailable. An unresolved input can retire only its own
 An ordinary media reconnect keeps the admitted typed-input and approval counters;
 only a fresh view or a new session starts those counters again.
 
-With Codex or Ollama and `--natural-work-tools`, ordinary language may request a background
-task through the same authoritative work surface. Model cancellation and approval are unavailable;
+With Codex or Ollama and `--natural-work-tools`, ordinary language may propose a background
+task. The browser shows the complete, immutable objective in a **Proposed background task**
+card with **Confirm task** and **Decline** controls. A proposal is limited to 1024 Unicode
+characters independently of the explicit work-command capacity; oversized objectives are
+refused rather than shortened. Creating or declining a proposal dispatches no work.
+Confirmation sends the exact proposal identity, objective and session generation through a
+separate authenticated, sequenced operation. It does not grant downstream Hermes approval
+or cancellation authority, and the card reports only confirmation submission; the normal
+task status must establish Hermes's accepted dispatch acknowledgment.
+
+The full card supports confirmation even while speaker output is muted. Spoken confirmation
+has its own complete-readback and causal-capture checks; playback delivery does not prove
+that the operator heard it. An early or noisy spoken response leaves the proposal pending.
+If the host says **Use Confirm on this task card**, that proposal requires the visible control.
+Confirmation expires; expired proposals require a new proposal. The visible controls do not
+guarantee that a proposal is still valid: the host checks expiry when an action arrives.
+A changed binding or expired/retired proposal cannot be confirmed. Uncertain browser decisions
+stay disabled and are never retried automatically; reconnect to reconcile authoritative state.
+An authenticated, well-formed in-order decision consumes its sequence even if refused;
+replaying that exact action reproduces its recorded outcome without another dispatch.
+Same-binding token refresh retains the decision sequence; a fresh view or changed binding
+starts its own sequence. Open stale browser tabs must reload after this update: the version-1
+event contract rejects an unknown `task_proposal` kind or a partial proposal shape rather
+than accepting a partial confirmation flow. The packaged asset parity gate binds the normal
+served browser build to its server candidate.
+
+Model cancellation and approval are unavailable;
 use explicit user commands or the task's Cancel control. Without that flag, ordinary speech and typed text remain
 tool-less foreground inference. The launcher requires Hermes's authenticated server-side
 `/v1/runs` capabilities before exposing the one-use browser URL; there is no socket, subprocess,

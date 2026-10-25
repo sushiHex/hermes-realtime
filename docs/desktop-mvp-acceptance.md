@@ -224,6 +224,13 @@ Individual offload counts and one warm overlap sample do not establish spare
 capacity, ordinary-length voice responsiveness or human acceptance. Record
 resource headroom and actual latency observations under #159; do not evict
 unrelated workloads to make the profile fit.
+An explicitly nominated configuration may also use `--ollama-num-gpu` to send a
+GPU-layer override through the normal host factory and adapter. Omission keeps
+the runtime default; 0 requests CPU layers. The accepted range 0–1024 is an
+application input bound, not a model-capability or zero-GPU guarantee. Readiness
+and subsequent inference retain the same setting, including browser-selected
+local models. A CPU candidate still needs its reviewed artifact, loader,
+environment and owned-process closure and separate unchanged qualification.
 
 Qualify the installed Hermes API first, in its own interpreter. Under the
 hidden process ownership rules above, use the frozen candidate script:

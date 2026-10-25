@@ -1,0 +1,124 @@
+"""An assent admitted before an await cannot confirm a later proposal or binding."""
+
+import asyncio
+from types import MethodType
+
+import pytest
+
+from hermes_realtime.conversation.commands import ConversationTaskCommandRouter
+from hermes_realtime.conversation.task_proposals import (
+    ConversationTaskProposals,
+    HostTaskProposalRequest,
+)
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
+from hermes_realtime.conversation.worker import ConversationSessionWorker
+from tests.conversation.test_proposal_capture import CommandSurface
+from tests.conversation.test_worker import (
+    FinalOnPushTranscriber,
+    SilenceVad,
+    action_executor_probe,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["late_offer", "replace", "unchanged"])
+async def test_typed_assent_cannot_gain_proposal_authority_during_foreground_cancel(change):
+    surface, entered, release = CommandSurface(), asyncio.Event(), asyncio.Event()
+    proposals = ConversationTaskProposals(surface=surface, observer=lambda *_: None)
+    proposals.bind("participant", 1)
+    if change != "late_offer":
+        proposals.offer(HostTaskProposalRequest("Previously displayed objective"))
+    actions, _, _ = action_executor_probe()
+    original_cancel = actions.cancel_foreground
+
+    async def cancel_foreground(self):
+        entered.set()
+        await release.wait()
+        await original_cancel()
+
+    actions.cancel_foreground = MethodType(cancel_foreground, actions)
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda *_: None,
+        reserve_observer_capacity=lambda: None,
+        task_proposals=proposals,
+    )
+    worker = ConversationSessionWorker(
+        participant_identity="participant", session_generation=1,
+        vad=SilenceVad(), stt=FinalOnPushTranscriber(),
+        actions=actions, command_router=router, task_proposals=proposals,
+    )
+    worker.start()
+    operation = asyncio.create_task(worker.submit_final_transcript(
+        participant_identity="participant", session_generation=1,
+        typed_sequence=1, text="yes",
+    ))
+    try:
+        await entered.wait()
+        if change == "replace":
+            proposals.retire("intervening_input")
+        if change != "unchanged":
+            proposals.offer(HostTaskProposalRequest("Published after typed assent"))
+        release.set()
+        await operation
+        assert [objective for objective, _ in surface.calls] == (
+            ["Previously displayed objective"] if change == "unchanged" else []
+        )
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await worker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["retire", "rebind", "card_confirm", "card_decline", "replace"])
+async def test_recording_await_cannot_upgrade_stale_assent_or_confirm_replacement(change):
+    surface, entered, release = CommandSurface(), asyncio.Event(), asyncio.Event()
+    proposals = ConversationTaskProposals(surface=surface, observer=lambda *_: None)
+    proposals.bind("participant", 1)
+    first = proposals.offer(HostTaskProposalRequest("First exact objective"))
+    proposals.typed_input_started(participant="participant", generation=1)
+
+    async def record(text):
+        entered.set()
+        await release.wait()
+
+    router = ConversationTaskCommandRouter(
+        surface=surface,
+        observer=lambda *_: None,
+        reserve_observer_capacity=lambda: None,
+        task_proposals=proposals,
+        validate_user_input=lambda _: None,
+        record_user_input=record,
+    )
+    operation = asyncio.create_task(router.route("yes"))
+    await entered.wait()
+    replacement = None
+    if change == "rebind":
+        proposals.bind("participant", 2)
+    elif change in {"card_confirm", "card_decline"}:
+        await proposals.decide(
+            participant="participant",
+            generation=1,
+            proposal_id=first.proposal_id,
+            objective=first.objective,
+            decision="confirm" if change == "card_confirm" else "decline",
+        )
+    else:
+        proposals.retire("intervening_input")
+        if change == "replace":
+            replacement = proposals.offer(HostTaskProposalRequest("New exact objective"))
+            proposals.typed_input_started(participant="participant", generation=1)
+    release.set()
+    assert await operation is True
+    assert len(surface.calls) == (1 if change == "card_confirm" else 0)
+    if replacement is not None:
+        assert proposals.confirmation_target("yes") is replacement
+        assert (
+            await proposals.consume_input(
+                "yes",
+                expected_proposal=replacement,
+            )
+            is WorkCommandAdmission.ADMITTED
+        )
+        assert surface.calls == [(replacement.objective, "confirmed_" + replacement.proposal_id)]

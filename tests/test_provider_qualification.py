@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from hermes_realtime.providers.ollama_models import OllamaModelClient
@@ -68,7 +69,7 @@ async def test_status_request_is_separate_from_model_prose_and_effects(
         corpus=one_case, provider=provider, model="synthetic:latest", effort="low",
         codex_executable=None,
     )
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     status = report["host_status_requests"]
     assert status["count"] == 1 and status["case_ids"] == ["nw-001"]
     assert status["scope"] == "selection_only"
@@ -389,6 +390,7 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
 
     def factory(**options: object) -> Decision:
         assert options["inference_provider"] == "ollama"
+        assert options["ollama_num_gpu"] == 0
         value = Decision()
         instances.append(value)
         return value
@@ -398,9 +400,11 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
         corpus=one_case, provider="ollama", mode="diagnostic_override",
         model="synthetic:latest", effort="low", codex_executable=None,
         ollama_base_url="http://127.0.0.1:11434", ollama_num_ctx=4096,
+        ollama_num_gpu=0,
     )
     assert report["provider"] == "ollama"
     assert report["mode"] == "diagnostic_override"
+    assert report["ollama_gpu_layers"] == 0
     assert report["tool_calls"]["by_tool"]["start_work"] == 1
     assert report["host_status_requests"]["count"] == 0
     assert report["host_status_requests"]["case_ids"] == []
@@ -417,7 +421,7 @@ async def test_evaluator_uses_configured_ollama_adapter_for_decision_without_dis
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("accept", [True, False])
-async def test_real_host_ollama_adapter_observes_effect_free_ack(
+async def test_real_host_ollama_adapter_proposes_without_ack_or_effect(
     monkeypatch: pytest.MonkeyPatch, accept: bool,
 ) -> None:
     requests: list[dict[str, object]] = []
@@ -456,13 +460,12 @@ async def test_real_host_ollama_adapter_observes_effect_free_ack(
         handler.begin_case("nw-001", started_at=time.perf_counter())
         case = evaluator.load_corpus(evaluator._DEFAULT_CORPUS).cases[0]
         snapshot = evaluator._snapshot(case, 1)
-        spoken = [part async for part in inference.stream(snapshot, turn_id="turn_ack")]
-        assert spoken == [
-            "I've started that background task." if accept
-            else "The background task was not accepted."
-        ]
-        observation = handler.finish_case(first_speakable_latency_ms=0.0)
-        assert observation.observed_tools == ("start_work",)
+        output = [part async for part in inference.stream(snapshot, turn_id="turn_proposal")]
+        assert output == [HostTaskProposalRequest("Inspect synthetic release")]
+        # Even a synthetic accepting handler has no model-callable effect authority.
+        observation = handler.finish_case(first_speakable_latency_ms=None)
+        assert observation.observed_tools == ()
+        assert observation.first_speakable_latency_ms is None
         assert len(requests) == 2
         assert "format" not in requests[0] and "format" in requests[1]
     finally:
@@ -709,6 +712,33 @@ def test_missing_source_binding_refuses_before_provider(
     )
     assert evaluator.main(["--provider", "ollama"]) == 2
     assert '"status":"error"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure,code", [
+    (evaluator.SourceBindingFailure("source"), "source_binding_failed"),
+    (evaluator.OwnedLaunchFailure({"receipt_status": "missing_or_malformed"}),
+     "owned_launch_failed"),
+    (evaluator.OwnedResultFailure("result"), "owned_result_failed"),
+    (evaluator.EvaluationFailure("provider_readiness_failed"), "provider_readiness_failed"),
+    (RuntimeError("synthetic failure"), "evaluation_failed"),
+], ids=["source", "owned_launch", "owned_result", "provider", "unexpected"])
+def test_gpu_profile_cli_errors_use_the_new_report_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    failure: Exception, code: str,
+) -> None:
+    async def failed(**_options: object) -> dict[str, object]:
+        raise failure
+
+    monkeypatch.setattr(evaluator, "_verify_source_binding", lambda *_args: None)
+    monkeypatch.setattr(evaluator, "run_evaluation", failed)
+    assert evaluator.main([
+        "--provider", "ollama", "--mode", "diagnostic_override", "--ollama-num-gpu", "0",
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+    ]) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 6
+    assert report["status"] == "error" and report["pass"] is False
+    assert report["error"]["code"] == code
 
 
 @pytest.mark.parametrize("observed", [

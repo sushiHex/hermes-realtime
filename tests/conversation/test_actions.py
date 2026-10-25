@@ -423,7 +423,7 @@ def _active_replay_evidence(
 
 
 @pytest.mark.asyncio
-async def test_cancel_without_speech_preserves_active_work_and_authoritative_prompt_notes() -> None:
+async def test_cancel_without_speech_preserves_host_tasks_and_completed_result_notes() -> None:
     from hermes_realtime.providers import OllamaStreamingInference
 
     context = ConversationContextStore()
@@ -457,10 +457,6 @@ async def test_cancel_without_speech_preserves_active_work_and_authoritative_pro
     _, separator, references = systems[0]["content"].partition("\n\nReference data:\n")
     assert separator == "\n\nReference data:\n"
     assert json.loads(references) == {
-        "work_state": "active",
-        "active_work": [{
-            "task_id": "task_active_fixture", "objective": "Synthetic active work",
-        }],
         "updates": [{
             "sequence": 1, "task_id": "task_completed_fixture", "status": "completed",
             "text": "The requested report is ready.",

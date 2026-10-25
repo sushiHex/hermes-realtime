@@ -62,6 +62,12 @@
             <span>Voice</span>
             <select id="voice" disabled><option value="">Unavailable</option></select>
           </label>
+          <div class="speaker-controls" role="group" aria-label="Speaker output">
+            <label for="speaker-volume">Speaker</label>
+            <input id="speaker-volume" type="range" min="0" max="100" step="1" value="100" aria-describedby="speaker-volume-status" />
+            <button id="speaker-mute" class="button secondary" type="button" aria-label="Mute speaker" aria-pressed="false">Mute</button>
+            <output id="speaker-volume-status" for="speaker-volume" role="status">100%</output>
+          </div>
         </div>
         <output id="connection-recovery" class="connection-recovery" role="status" aria-live="polite" hidden></output>
       </section>

@@ -10,12 +10,13 @@ import math
 import re
 import secrets
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 import aiohttp
@@ -34,9 +35,12 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkTerminalStatus,
 )
+from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
 
 logger = logging.getLogger(__name__)
 
+_LOOKUP_POLICY = "ordinary-lookup/v1"
+_LOOKUP_GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _RUN_ID_EXACT = re.compile(r"run_[a-fA-F0-9]{16,64}\Z")
 _RUN_ID_DISCLOSURE = re.compile(r"run_[A-Za-z0-9][A-Za-z0-9_-]{15,127}")
 _PRIVATE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}\Z")
@@ -71,6 +75,17 @@ _DISPATCH_RECOVERY_PREFIX = "[hermes-dispatch-recovery] "
 _RESTART_SETTLEMENT_PREFIX = "[hermes-restart-settlement] "
 _RUN_RECORD_LOCK_PREFIX = "[hermes-run-record-lock] "
 _MAX_RUN_RECORD_BYTES = run_record.max_run_record_bytes(_MAX_ACTIVE_RUNS, _MAX_HTTP_BODY_BYTES)
+_RESULT_REFUSAL_PREFIX = "[hermes-result-refusal] "
+_UNUSABLE_RESULT_SUMMARY = "The task finished, but its result could not be used."
+_BACKGROUND_RESULT = re.compile(
+    r"<voice>(?P<voice>[\s\S]*?)</voice><detail>(?P<detail>[\s\S]*?)</detail>"
+)
+_BACKGROUND_VOICE_MARKUP = re.compile(
+    r"[<>`]|~~"
+    r"|\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
+    r"|\A(?:#{1,6}|[-+*]|\d+[.)])\s"
+)
+_BACKGROUND_DETAIL_PROTOCOL_TAG = re.compile(r"</?(?:voice|detail)\b", re.IGNORECASE)
 # Path() constructs the platform's concrete class, which is the only accepted record path type.
 _CONCRETE_PATH = type(Path())
 _BACKGROUND_INSTRUCTIONS = (
@@ -78,10 +93,13 @@ _BACKGROUND_INSTRUCTIONS = (
     "Stay exactly within the requested scope; do not add a topic, domain, category, "
     "constraint, source, or entity the user did not request. Ask for approval normally "
     "when Hermes policy requires it. For a simple external current-information lookup, make "
-    "exactly one parallel batch of no more than five web_search calls, then answer immediately "
-    "from those results. For that lookup path, do not call skill_view, web_extract, browser "
-    "tools, terminal, or perform follow-up searches unless the objective explicitly requires "
-    "page-level validation that search results cannot provide. Local, runtime, file, process, "
+    "exactly one parallel batch of no more than five web_search calls. Answer from those "
+    "results when they contain the facts needed for the objective. Otherwise, make at most "
+    "one web_extract call for no more than three distinct URLs returned by that search batch, "
+    "then answer. Use only inline extraction output; do not call read_file or page through "
+    "stored page content. Do not retry lookup tools, perform follow-up searches or additional "
+    "extraction calls, or use skill_view, browser tools, or terminal for this lookup path. "
+    "Local, runtime, file, process, "
     "build, and verification objectives are operational work, not external current-information "
     "lookups; use the tools needed to inspect them directly. Never interpret an unavailable "
     "tool, failed command, or empty output as a negative finding; state the failure or "
@@ -97,9 +115,32 @@ _BACKGROUND_INSTRUCTIONS = (
 )
 
 
+def _has_result_text(text: str) -> bool:
+    """Require content beyond whitespace and Unicode format characters."""
+    return any(
+        not character.isspace() and unicodedata.category(character) != "Cf" for character in text
+    )
+
+
+def _has_result_controls(text: str, *, detail: bool = False) -> bool:
+    """Reject non-text controls and surrogates; retain normal detail whitespace."""
+    for character in text:
+        if detail and character in "\t\n\r":
+            continue
+        codepoint = ord(character)
+        if codepoint < 32 or 127 <= codepoint <= 159 or 0xD800 <= codepoint <= 0xDFFF:
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class HermesApiConfig:
-    """Explicit secret-bearing configuration for one loopback Hermes API."""
+    """Explicit secret-bearing configuration for one loopback Hermes API.
+
+    ``lookup_policy`` designates every dispatch through this adapter for a dedicated
+    ordinary-lookup deployment. None keeps native runs unchanged. Selection is a
+    trusted host decision, never a classifier or a model-supplied field.
+    """
 
     base_url: str
     bearer: str = field(repr=False)
@@ -110,6 +151,7 @@ class HermesApiConfig:
     run_model: str | None = None
     run_reasoning_effort: str | None = None
     run_service_tier: str | None = None
+    lookup_policy: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.base_url) is not str:
@@ -173,6 +215,10 @@ class HermesApiConfig:
             "ultra",
         }:
             raise ValueError("run_reasoning_effort is unsupported")
+        if self.lookup_policy is not None and (
+            type(self.lookup_policy) is not str or self.lookup_policy != _LOOKUP_POLICY
+        ):
+            raise ValueError("lookup_policy is unsupported")
         if self.run_service_tier not in {None, "auto", "default", "priority"}:
             raise ValueError("run_service_tier is unsupported")
 
@@ -185,7 +231,7 @@ class HermesApiConfig:
             f"settlement_poll_seconds={self.settlement_poll_seconds!r}, "
             f"run_provider={self.run_provider!r}, run_model={self.run_model!r}, "
             f"run_reasoning_effort={self.run_reasoning_effort!r}, "
-            f"run_service_tier={self.run_service_tier!r})"
+            f"run_service_tier={self.run_service_tier!r}, lookup_policy={self.lookup_policy!r})"
         )
 
     __str__ = __repr__
@@ -224,6 +270,7 @@ class _RunAuthority:
     protocol_run_id: str
     event_task: asyncio.Task[None] | None = None
     terminal: bool = False
+    lookup_generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,7 +537,11 @@ class HermesApiTaskSession:
             return "unknown"
         try:
             status, payload = await self._request_json(
-                "POST", "/v1/runs", body=entry.body, headers={"Idempotency-Key": entry.key}
+                "POST",
+                "/v1/runs",
+                body=entry.body,
+                headers={"Idempotency-Key": entry.key}
+                | ({"X-Lookup-Policy": entry.lookup_policy} if entry.lookup_policy else {}),
             )
         except RuntimeError:
             return "unknown"
@@ -573,7 +624,9 @@ class HermesApiTaskSession:
         # Only durable idempotency makes a key answerable after a lost attempt or a restart.
         key = secrets.token_hex(16) if self._resend_window is not None else None
         # Wall-clock time also counts a suspended host, which the retention window does.
-        return PendingRun(key=key, minted_at=time.time(), body=body)
+        return PendingRun(
+            key=key, minted_at=time.time(), body=body, lookup_policy=self._config.lookup_policy
+        )
 
     async def _dispatch_admitted(
         self,
@@ -582,6 +635,13 @@ class HermesApiTaskSession:
         *,
         abandoned: asyncio.Event,
     ) -> WorkDispatchAcknowledgedEvent:
+        generation = None
+        if pending.lookup_policy is not None:
+            try:
+                generation = await self._lookup_readiness()
+            except BaseException:
+                await self._forget_pending(pending)
+                raise
         try:
             # Write-ahead: a crash after the POST must find the dispatch in the record.
             await self._persist_record()
@@ -590,7 +650,8 @@ class HermesApiTaskSession:
                 if pending in self._record_pending:
                     self._record_pending.remove(pending)
             raise
-        status, payload = await self._submit_run(pending)
+        response_headers: dict[str, str] = {}
+        status, payload = await self._submit_run(pending, response_headers=response_headers)
         if status != 202:
             await self._forget_pending(pending)
             logger.warning("Hermes API rejected background dispatch with HTTP %d", status)
@@ -648,6 +709,14 @@ class HermesApiTaskSession:
         assert isinstance(api_run_id, str)
         if not claimed:
             raise RuntimeError("Hermes API reused a run authority")
+        if generation is not None and not self._lookup_binding(
+            response_headers, generation, api_run_id=api_run_id
+        ):
+            try:
+                await self._settle_unpublished(api_run_id)
+            finally:
+                self._lookup_refusal("acknowledgment")
+            raise RuntimeError("Hermes lookup policy acknowledgment is not authoritative")
         private_token = self._private_id_factory()
         if type(private_token) is not str or _PRIVATE_TOKEN.fullmatch(private_token) is None:
             await self._settle_unpublished(api_run_id)
@@ -664,6 +733,7 @@ class HermesApiTaskSession:
             task_id=trusted.task_id,
             api_run_id=api_run_id,
             protocol_run_id=protocol_run_id,
+            lookup_generation=generation,
         )
         publication_error: RuntimeError | None = None
         async with self._state_lock:
@@ -690,7 +760,9 @@ class HermesApiTaskSession:
             run_id=protocol_run_id,
         )
 
-    async def _submit_run(self, pending: PendingRun) -> tuple[int, dict[str, Any]]:
+    async def _submit_run(
+        self, pending: PendingRun, *, response_headers: dict[str, str]
+    ) -> tuple[int, dict[str, Any]]:
         """POST one run, resending it once unchanged if the first attempt got no complete response.
 
         Both attempts carry the dispatch's recorded idempotency key, so Hermes admits the run at
@@ -703,12 +775,21 @@ class HermesApiTaskSession:
         """
         body = pending.body
         window = self._resend_window
+        options: dict[str, Any] = {}
+        headers = {}
+        if pending.lookup_policy is not None:
+            headers["X-Lookup-Policy"] = pending.lookup_policy
+            options["response_headers"] = response_headers
         if window is None or pending.key is None:
-            return await self._request_json("POST", "/v1/runs", body=body)
-        headers = {"Idempotency-Key": pending.key}
+            if headers:
+                options["headers"] = headers
+            return await self._request_json("POST", "/v1/runs", body=body, **options)
+        headers["Idempotency-Key"] = pending.key
         minted_at = pending.minted_at
         with contextlib.suppress(_NoResponse):
-            return await self._request_json("POST", "/v1/runs", body=body, headers=headers)
+            return await self._request_json(
+                "POST", "/v1/runs", body=body, headers=headers, **options
+            )
         cause: str | None = "error"
         status: int | None = None
         try:
@@ -718,7 +799,7 @@ class HermesApiTaskSession:
                 raise RuntimeError("Hermes API dispatch outcome is unknown")
             try:
                 status, payload = await self._request_json(
-                    "POST", "/v1/runs", body=body, headers=headers
+                    "POST", "/v1/runs", body=body, headers=headers, **options
                 )
             except _NoResponse as error:
                 cause = "no_response"
@@ -1099,8 +1180,11 @@ class HermesApiTaskSession:
             return
         if event not in {"run.completed", "run.failed", "run.cancelled"}:
             return
+        if event == "run.completed" and authority.lookup_generation is not None:
+            payload = await self._lookup_completion(authority)
+            event = payload["event"]
         if event == "run.completed":
-            output = self._bounded_terminal_text(payload.get("output"), "summary")
+            output = self._completed_result_text(payload.get("output"))
             status = WorkTerminalStatus.COMPLETED
             terminal_payload = WorkCompletedPayload(status=status, summary=output)
         elif event == "run.failed":
@@ -1222,6 +1306,73 @@ class HermesApiTaskSession:
         with contextlib.suppress(asyncio.QueueFull):
             self._updates.put_nowait(error)
 
+    @staticmethod
+    def _lookup_refusal(category: str) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                "[hermes-lookup-policy] "
+                + json.dumps(
+                    {"category": category, "version": 1}, separators=(",", ":"), sort_keys=True
+                ),
+                flush=True,
+            )
+
+    async def _lookup_readiness(self) -> str:
+        status, body = await self._request_json("GET", "/lookup-policy/ready")
+        generation = body.get("generation")
+        if (
+            status != 200
+            or set(body) != {"ready", "policy", "generation"}
+            or body.get("ready") is not True
+            or body.get("policy") != _LOOKUP_POLICY
+            or type(generation) is not str
+            or _LOOKUP_GENERATION.fullmatch(generation) is None
+        ):
+            try:
+                raise RuntimeError("Hermes lookup policy readiness is not authoritative")
+            finally:
+                self._lookup_refusal("readiness")
+        return generation
+
+    @staticmethod
+    def _lookup_binding(
+        headers: dict[str, str], generation: str, *, api_run_id: str | None = None
+    ) -> bool:
+        return (
+            headers.get("x-lookup-policy") == _LOOKUP_POLICY
+            and headers.get("x-lookup-generation") == generation
+            and "x-lookup-policy-outcome" not in headers
+            and (api_run_id is None or headers.get("x-lookup-run") == api_run_id)
+        )
+
+    async def _lookup_completion(self, authority: _RunAuthority) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        status, body = await self._request_json(
+            "GET",
+            f"/v1/runs/{quote(authority.api_run_id, safe='')}",
+            response_headers=headers,
+        )
+        if status != 200 or body.get("run_id") != authority.api_run_id:
+            raise RuntimeError("Hermes lookup policy status lacks native authority")
+        terminal = self._terminal_from_status(authority.api_run_id, body)
+        if terminal is None:
+            raise RuntimeError("Hermes lookup policy completion lacks terminal authority")
+        if terminal["event"] != "run.completed":
+            return terminal
+        assert authority.lookup_generation is not None
+        if not self._lookup_binding(headers, authority.lookup_generation) or (
+            headers.get("x-lookup-policy-refused") != "false"
+        ):
+            try:
+                return {
+                    "event": "run.failed",
+                    "run_id": authority.api_run_id,
+                    "error": "Hermes lookup policy completion is refused or unproven",
+                }
+            finally:
+                self._lookup_refusal("completion")
+        return terminal
+
     async def _request_json(
         self,
         method: str,
@@ -1229,6 +1380,7 @@ class HermesApiTaskSession:
         *,
         body: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
+        response_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         client = self._client
         if client is None:
@@ -1249,6 +1401,12 @@ class HermesApiTaskSession:
                 payload = self._strict_json(raw)
                 if type(payload) is not dict:
                     raise RuntimeError("Hermes API response must be an object")
+                if response_headers is not None:
+                    response_headers.clear()
+                    for name in response.headers:
+                        if name.lower().startswith("x-lookup-"):
+                            values = response.headers.getall(name)
+                            response_headers[name.lower()] = values[0] if len(values) == 1 else ""
                 return response.status, payload
         except asyncio.CancelledError:
             raise
@@ -1440,6 +1598,57 @@ class HermesApiTaskSession:
         if trusted.payload.scope is not CancelScope.TASK:
             raise ValueError("Hermes API session only accepts task cancellation")
         return trusted
+
+    @staticmethod
+    def _completed_result_text(value: object) -> str:
+        """Accept the requested API envelope or a fixed host notice, never repair model text."""
+        category: str | None = "terminal_text"
+        try:
+            try:
+                HermesApiTaskSession._bounded_terminal_text(value, "summary")
+            except RuntimeError:
+                return _UNUSABLE_RESULT_SUMMARY
+            text = cast(str, value)
+            category = "envelope"
+            envelope = _BACKGROUND_RESULT.fullmatch(text)
+            if envelope is None:
+                return _UNUSABLE_RESULT_SUMMARY
+            voice, detail = envelope.group("voice", "detail")
+            category = "voice"
+            if (
+                not _has_result_text(voice)
+                or len(voice) > 220
+                or _has_result_controls(voice)
+                or voice.splitlines() != [voice]
+                or strip_markdown_emphasis_for_speech(voice) != voice
+                or _BACKGROUND_VOICE_MARKUP.search(voice.lstrip()) is not None
+            ):
+                return _UNUSABLE_RESULT_SUMMARY
+            category = "detail"
+            if (
+                not _has_result_text(detail)
+                or len(detail) > 1800
+                or _has_result_controls(detail, detail=True)
+                or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
+            ):
+                return _UNUSABLE_RESULT_SUMMARY
+            category = None
+            return text
+        finally:
+            if category is not None:
+                evidence = {
+                    "category": category,
+                    "characters": min(len(value), _MAX_TERMINAL_TEXT_CHARS + 1)
+                    if type(value) is str else 0,
+                    "version": 1,
+                }
+                # Refusal reporting must not turn completed work into settlement/cancellation.
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        _RESULT_REFUSAL_PREFIX
+                        + json.dumps(evidence, separators=(",", ":"), sort_keys=True),
+                        flush=True,
+                    )
 
     @staticmethod
     def _bounded_terminal_text(value: object, field_name: str) -> str:

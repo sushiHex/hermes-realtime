@@ -30,7 +30,7 @@ def test_empty_cleanup_is_a_healthy_control(tmp_path, monkeypatch, capsys):
         ("running_or_terminating", False, {"private-image.exe": 1}),
         ("unknown", False, {"<unknown>": 1}),
         ("identity_changed", False, {}),
-        ("exited", True, {"<unknown>": 1}),
+        ("exited", True, {}),
     ],
 )
 def test_job_only_cleanup_is_classified_at_refusal(
@@ -42,8 +42,7 @@ def test_job_only_cleanup_is_classified_at_refusal(
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: state)
     assert owner.survivors(SimpleNamespace(_job=66, members=lambda: {os.getpid(), 101})) == expected
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
-    observed = "unknown" if missing else state
-    assert record["current"]["job_only"][observed] == 1
+    assert record["current"]["job_only"][state] == 1
     assert record["current"]["tracked"] == dict.fromkeys(
         ("exited", "running_or_terminating", "identity_changed", "unknown"), 0
     )
@@ -78,8 +77,8 @@ async def test_close_and_emitted_summary_keep_first_cleanup_refusal(tmp_path, mo
     monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: next(states))
     containment = SimpleNamespace(_job=66, members=lambda: set())
     stops = []
-    monkeypatch.setattr(owner, "stop_all", lambda *args: stops.append(args))
-    monkeypatch.setattr(rehearsal, "listeners", lambda port: [])
+    monkeypatch.setattr(owner, "stop_all", lambda *args: stops.append(args) or 10.0)
+    monkeypatch.setattr(rehearsal, "listeners", lambda port, **kwargs: [])
     assert owner.survivors(None)
     first = owner.first_cleanup_refusal
     run = object.__new__(rehearsal.Rehearsal)
@@ -120,7 +119,7 @@ async def test_public_summary_refuses_stop_error_even_after_healthy_query(
 
     monkeypatch.setattr(rehearsal, "process_table", healthy_query)
     ports = []
-    monkeypatch.setattr(rehearsal, "listeners", lambda port: ports.append(port) or [])
+    monkeypatch.setattr(rehearsal, "listeners", lambda port, **kwargs: ports.append(port) or [])
 
     def stop_error(*args):
         raise OSError("private path, process ID and exception detail")
@@ -206,6 +205,8 @@ def test_reused_tracked_pid_still_has_independent_job_authority(tmp_path, monkey
 @pytest.mark.parametrize("broken", ["snapshot", "bound"])
 def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, broken):
     owner = rehearsal.Processes(tmp_path)
+    # Fix the controller identity so the synthetic member range cannot depend on the runner PID.
+    monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
     if broken == "snapshot":
 
         def snapshot():
@@ -215,11 +216,77 @@ def test_cleanup_refuses_incomplete_observation(tmp_path, monkeypatch, capsys, b
         containment = None
     else:
         monkeypatch.setattr(rehearsal, "process_table", lambda: {})
-        containment = SimpleNamespace(members=lambda: set(range(10000, 14097)))
+        controller = os.getpid()
+        containment = SimpleNamespace(
+            _job=66, members=lambda: set(range(controller + 1, controller + 4098))
+        )
     assert owner.survivors(containment) == {"<unknown>": 1}
     record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
     assert record["current"]["observation_failed"] == 1
     assert "private" not in json.dumps(record)
+
+
+def test_cleanup_allows_exact_non_controller_observation_bound(tmp_path, monkeypatch, capsys):
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal.os, "getpid", lambda: 10000)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", lambda *args: "unknown")
+    # The controller is removed before applying the bound to the other 4096 members.
+    containment = SimpleNamespace(_job=66, members=lambda: set(range(10000, 14097)))
+    assert owner.survivors(containment) == {"<unknown>": 4096}
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    assert record["current"]["observation_failed"] == 0
+    assert record["current"]["job_only"]["unknown"] == 4096
+
+
+@pytest.mark.parametrize(
+    "state", ["exited", "identity_changed", "unknown", "running_or_terminating"],
+)
+def test_missing_table_job_candidate_uses_native_handle_at_refusal(
+    tmp_path, monkeypatch, capsys, state,
+):
+    """Mutation: gate the authoritative native handle query on an earlier snapshot row."""
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    calls = []
+
+    def native(pid, expected_start, job):
+        calls.append((pid, expected_start, job))
+        return state
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", native)
+    containment = SimpleNamespace(_job=66, members=lambda: {101})
+    assert owner.survivors(containment) == (
+        {"<unknown>": 1} if state in {"unknown", "running_or_terminating"} else {}
+    )
+    assert calls == [(101, None, 66)]
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup] "))
+    assert record["current"]["job_only"][state] == 1
+
+
+@pytest.mark.parametrize(
+    "state", ["exited", "identity_changed", "unknown", "running_or_terminating"],
+)
+def test_missing_table_job_candidate_uses_native_handle_at_settlement(
+    tmp_path, monkeypatch, capsys, state,
+):
+    """Mutation: omit the bounded native wait for a member missing from the prior snapshot."""
+    owner = rehearsal.Processes(tmp_path)
+    monkeypatch.setattr(rehearsal, "process_table", lambda: {})
+    calls = []
+
+    def native(pid, expected_start, job, wait_ms):
+        assert 0 <= wait_ms <= 5000
+        calls.append((pid, expected_start, job))
+        return state
+
+    monkeypatch.setattr(rehearsal, "_cleanup_process_state", native)
+    owner.stop_all(SimpleNamespace(_job=66, members=lambda: {101}))
+    assert calls == [(101, None, 66)]
+    record = json.loads(capsys.readouterr().out.removeprefix("[desktop-mvp-cleanup-settlement] "))
+    assert record[state] == 1
+    assert record["candidates"] == 1
+    assert record["wait_budget_ms"] == 5000
 
 
 class _Kernel:
@@ -448,5 +515,75 @@ def test_normal_hidden_owned_child_cleanup_with_populated_seen_is_clean(tmp_path
         timeout=60,
         check=False,
     )
-    assert completed.returncode == 0, completed.stderr
+    if completed.returncode != 0:
+        raise AssertionError({
+            "returncode": completed.returncode,
+            "cleanup": _cleanup_probe_diagnostics(completed.stdout),
+        })
     assert json.loads(completed.stdout.splitlines()[-1]) == {"clean": True, "seenPopulated": True}
+
+
+def _cleanup_probe_diagnostics(stdout):
+    """Keep bounded categorical counts, never child stdout/stderr or native identities."""
+    keys = {
+        "current", "first_refusal", "tracked", "job_only", "observation_failed", "stop_failed",
+        "wait_budget_ms", "candidates", "exited", "running_or_terminating", "identity_changed",
+        "unknown",
+    }
+
+    def counts(value):
+        if type(value) is dict:
+            return {key: counts(item) for key, item in value.items() if key in keys}
+        return value if type(value) is int and 0 <= value <= 5000 else None
+
+    records = []
+    for line in stdout[-16384:].splitlines():
+        prefix, _, payload = line.partition(" ")
+        if prefix not in {"[desktop-mvp-cleanup]", "[desktop-mvp-cleanup-settlement]"}:
+            continue
+        try:
+            records.append({"marker": prefix, "counts": counts(json.loads(payload))})
+        except (ValueError, RecursionError):
+            continue
+    return records[-4:]
+
+
+def test_native_cleanup_failure_retains_only_bounded_counts(tmp_path, monkeypatch):
+    """Mutations: lose stdout diagnostics, pass raw output, or retain private fields/values."""
+    settlement = '[desktop-mvp-cleanup-settlement] {"wait_budget_ms":5000,"unknown":1}'
+    cleanup = '[desktop-mvp-cleanup] {"current":{"job_only":{"unknown":1}}}'
+    stdout = '\n'.join([
+        'private path C:/secret/image.exe',
+        '[untrusted-marker] {"unknown":42}',
+        '[desktop-mvp-cleanup] not-json',
+        '[desktop-mvp-cleanup] {"private":"secret","unknown":"private.exe"}',
+        settlement, cleanup,
+    ])
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0, raising=False)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        returncode=1, stdout=stdout, stderr="private stderr C:/secret/image.exe",
+    ))
+    with pytest.raises(AssertionError) as caught:
+        test_normal_hidden_owned_child_cleanup_with_populated_seen_is_clean(tmp_path)
+    assert caught.value.args == ({"returncode": 1, "cleanup": [
+        {"marker": "[desktop-mvp-cleanup]", "counts": {"unknown": None}},
+        {"marker": "[desktop-mvp-cleanup-settlement]",
+         "counts": {"wait_budget_ms": 5000, "unknown": 1}},
+        {"marker": "[desktop-mvp-cleanup]", "counts": {"current": {"job_only": {"unknown": 1}}}},
+    ]},)
+
+
+def test_cleanup_probe_diagnostics_bounds_records_and_counts():
+    """Mutations: remove record/tail bounds or admit invalid numeric counts."""
+    line = '[desktop-mvp-cleanup] {"unknown":%s}'
+    assert _cleanup_probe_diagnostics('\n'.join(line % i for i in range(8))) == [
+        {"marker": "[desktop-mvp-cleanup]", "counts": {"unknown": i}} for i in range(4, 8)
+    ]
+    assert _cleanup_probe_diagnostics((line % 1) + '\n' + 'x' * 16384) == []
+    assert _cleanup_probe_diagnostics(
+        '[desktop-mvp-cleanup] ' + '{"current":' * 1100 + '0' + '}' * 1100
+    ) == []
+    for invalid in ['true', '-1', '5001']:
+        assert _cleanup_probe_diagnostics(line % invalid) == [
+            {"marker": "[desktop-mvp-cleanup]", "counts": {"unknown": None}},
+        ]

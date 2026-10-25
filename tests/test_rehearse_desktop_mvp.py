@@ -182,7 +182,7 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
     )
     messages = OllamaStreamingInference._messages(request, output_style="learning")
     observed = rehearsal.prompt_observation(messages, "hoopoe")
-    assert observed["reference_kinds"] == ["memory", "active_work", "updates"]
+    assert observed["reference_kinds"] == ["memory", "updates"]
     assert observed["output_style"] == "learning"
     assert "Synthetic" not in json.dumps(observed)
     sections = json.loads(messages[0]["content"].split("\n\nReference data:\n", 1)[1])
@@ -190,7 +190,7 @@ def test_rehearsal_records_actual_reference_kinds_without_prompt_text() -> None:
     header = messages[0]["content"].split("\n\nReference data:\n", 1)[0]
     messages[0]["content"] = header + "\n\nReference data:\n" + json.dumps(sections)
     assert rehearsal.prompt_observation(messages, "hoopoe")["reference_kinds"] == [
-        "memory", "active_work",
+        "memory",
     ]
     marker = "[rehearsal-prompt] " + json.dumps(observed, separators=(",", ":"), sort_keys=True)
     assert rehearsal.markers([marker]) == ([marker], 0)
@@ -311,6 +311,56 @@ def test_the_host_child_observes_exactly_the_prompt_the_adapter_sends(
         rehearsal.prompt_observation(bodies[0]["messages"], "hoopoe")  # type: ignore[arg-type]
     ]
     assert observed[0]["fact_rows"] == 1
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_prompt_observer_preserves_renderer_options(
+    available, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutation: drop or override capability/style while observing the renderer."""
+    from hermes_realtime.conversation.context import ConversationMessage
+    from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    snapshot = ConversationInferenceRequest(
+        revision=1, active_tasks=(),
+        messages=(ConversationMessage("user", "My favorite bird is the hoopoe."),),
+    )
+    options = {"output_style": "learning", "task_status_available": available}
+    expected = OllamaStreamingInference._messages(snapshot, **options)
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    monkeypatch.setenv("HERMES_REHEARSAL_RECALL_TRIALS", "0")
+    rehearsal._observe_prompts()
+
+    assert OllamaStreamingInference._messages(snapshot, **options) == expected
+    observed = [json.loads(line.removeprefix("[rehearsal-prompt] "))
+                for line in capsys.readouterr().out.splitlines()
+                if line.startswith("[rehearsal-prompt] ")]
+    assert observed == [rehearsal.prompt_observation(expected, "hoopoe")]
+
+
+def test_prompt_observer_preserves_renderer_argument_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutation: coerce a non-boolean capability instead of forwarding it unchanged."""
+    from hermes_realtime.conversation.context import ConversationContextSnapshot
+    from hermes_realtime.providers.ollama import OllamaStreamingInference
+
+    monkeypatch.setattr(OllamaStreamingInference, "_messages", OllamaStreamingInference._messages)
+    monkeypatch.setattr(OllamaStreamingInference, "stream", OllamaStreamingInference.stream)
+    monkeypatch.setenv("HERMES_REHEARSAL_PHRASE", "hoopoe")
+    rehearsal._observe_prompts()
+
+    with pytest.raises(TypeError, match="exact boolean"):
+        OllamaStreamingInference._messages(
+            ConversationContextSnapshot(revision=1, messages=(), active_tasks=()),
+            task_status_available=1,
+        )
+    assert capsys.readouterr().out == (
+        '[status-policy-refusal] {"count":1,"category":"invalid_availability"}\n'
+    )
 
 
 def test_recall_trials_resend_only_the_questions_exact_prompt_after_its_reply(
@@ -739,8 +789,8 @@ def test_every_verdict_is_applied_where_it_is_observed() -> None:
     }
     gateway = inspect.getsource(rehearsal.Rehearsal._start_gateway)
     assert gateway.count("listener_verdict(") == 2
-    assert '"api", listeners(self.api_port)' in gateway
-    assert '"companion", listeners(self.companion_port)' in gateway
+    assert '"api", listeners(self.api_port, deadline=deadline)' in gateway
+    assert '"companion", listeners(self.companion_port, deadline=deadline)' in gateway
     assert 'listener_verdict("livekit_signaling"' in source["_start_livekit"]
     assert "step.apply(exposed)" in gateway
     assert "step.apply(exposed)" in source["_start_livekit"]

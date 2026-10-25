@@ -16,6 +16,7 @@ from types import MethodType
 from typing import TYPE_CHECKING, cast
 
 from hermes_realtime.conversation.output_style import require_output_style
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.evidence.models import (
     BindingCloseReason,
     CaptureState,
@@ -36,6 +37,7 @@ from hermes_realtime.search_egress import (
 
 from .bootstrap import BrowserJoinCredential, BrowserTokenIssuer, OneTimeBootstrapCapability
 from .projection import BrowserEventProjection, BrowserPublicEvent, PublicValue
+from .task_proposal_control import TaskProposalDecision
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -338,6 +340,9 @@ class BrowserSessionDirector:
         stop: Callable[[str, int], Awaitable[None]],
         approval: Callable[[str, int, int, str, str], Awaitable[None]],
         projection: BrowserEventProjection,
+        task_proposal_decision: (
+            Callable[[str, int, str, str, str], Awaitable[WorkCommandAdmission]] | None
+        ) = None,
         speech_runtime: BrowserSpeechRuntime | None = None,
         model_configuration: BrowserModelConfiguration | None = None,
         local_model_configuration: Callable[[], BrowserModelConfiguration] | None = None,
@@ -385,6 +390,8 @@ class BrowserSessionDirector:
             raise TypeError("stop must be callable")
         if not callable(approval):
             raise TypeError("approval must be callable")
+        if task_proposal_decision is not None and not callable(task_proposal_decision):
+            raise TypeError("task_proposal_decision must be callable or None")
         if type(projection) is not BrowserEventProjection:
             raise TypeError("projection must be an exact BrowserEventProjection")
         if speech_runtime is not None and type(speech_runtime) is not BrowserSpeechRuntime:
@@ -463,6 +470,10 @@ class BrowserSessionDirector:
         self._delete_voice_conversation = delete_voice_conversation
         self._voice_delete_status = voice_delete_status
         self._approval = approval
+        self._task_proposal_decision = task_proposal_decision
+        self._proposal_decision_binding: tuple[str, int] | None = None
+        self._last_proposal_decision: TaskProposalDecision | None = None
+        self._last_proposal_failure: Exception | None = None
         self._projection = projection
         self._speech_runtime = speech_runtime or BrowserSpeechRuntime(
             stt_provider="unavailable",
@@ -1046,6 +1057,9 @@ class BrowserSessionDirector:
             self._previous_rebind_request = None
             self._previous_rebind_credential = None
             self._last_input_sequence = 0
+            self._proposal_decision_binding = None
+            self._last_proposal_decision = None
+            self._last_proposal_failure = None
             self._last_approval_sequence = 0
             self._last_evidence_control_sequence = 0
             self._projection_resync_consumed = False
@@ -1289,6 +1303,9 @@ class BrowserSessionDirector:
         self._last_input_request = None
         self._last_approval_sequence = 0
         self._last_approval_request = None
+        self._proposal_decision_binding = None
+        self._last_proposal_decision = None
+        self._last_proposal_failure = None
 
     async def _rebind_after_model_operations(
         self,
@@ -1638,6 +1655,67 @@ class BrowserSessionDirector:
             self._last_approval_sequence = sequence
             self._last_approval_request = request
             self._touch_activity()
+
+    async def decide_task_proposal(
+        self, *, participant_identity: str, proposal_id: str, objective: str,
+        generation: int, decision: str, sequence: int,
+    ) -> None:
+        """Settle one exact, sequenced proposal action; never assert a task started."""
+        category = "invalid"
+        try:
+            request = TaskProposalDecision(proposal_id, objective, generation, decision, sequence)
+            async with self._start_lock:
+                identity, current_generation = self._active_identity, self._active_generation
+                category = "binding_refused"
+                if identity is None or current_generation is None:
+                    raise NoBrowserSession("no browser session is active")
+                if (type(participant_identity) is not str or participant_identity != identity
+                        or generation != current_generation):
+                    raise PermissionError("proposal decision does not own the current binding")
+                binding = (identity, current_generation)
+                previous = (
+                    self._last_proposal_decision
+                    if self._proposal_decision_binding == binding else None
+                )
+                if request == previous:
+                    self._touch_activity()
+                    category = "replayed"
+                    if self._last_proposal_failure is not None:
+                        raise self._last_proposal_failure.with_traceback(None)
+                    return
+                category = "sequence_refused"
+                if sequence != (previous.sequence + 1 if previous is not None else 1):
+                    raise RuntimeError("proposal decision sequence is not the next expected value")
+                # Authenticated, well-formed in-order actions consume their sequence even
+                # when proposal authority refuses. Reserve before awaiting any side effect.
+                self._proposal_decision_binding = binding
+                self._last_proposal_decision = request
+                self._last_proposal_failure = PermissionError("proposal outcome is uncertain")
+                try:
+                    decide = self._task_proposal_decision
+                    category = "unavailable"
+                    if decide is None:
+                        raise RuntimeError("proposal confirmation is unavailable")
+                    category = "projection_capacity"
+                    self._projection.ensure_capacity()
+                    category = "authority_refused"
+                    result = await decide(identity, generation, proposal_id, objective, decision)
+                    expected = (
+                        WorkCommandAdmission.ADMITTED if decision == "confirm"
+                        else WorkCommandAdmission.REFUSED
+                    )
+                    if result is not expected:
+                        category = "admission_refused"
+                        raise PermissionError("proposal decision was not admitted")
+                except Exception as error:
+                    self._last_proposal_failure = error.with_traceback(None)
+                    raise
+                self._last_proposal_failure = None
+                self._touch_activity()
+                category = "settled"
+        finally:
+            print("[task-proposal-control] " + json.dumps(
+                {"category": category, "count": 1}, separators=(",", ":")), flush=True)
 
     async def public_events_after(
         self,
@@ -2048,6 +2126,9 @@ class BrowserSessionDirector:
         self._last_input_request = None
         self._last_approval_sequence = 0
         self._last_approval_request = None
+        self._proposal_decision_binding = None
+        self._last_proposal_decision = None
+        self._last_proposal_failure = None
         self._audio_diagnostics.clear()
         self._last_activity = None
 

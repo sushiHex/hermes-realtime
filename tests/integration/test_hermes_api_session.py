@@ -43,6 +43,11 @@ class _RunState(TypedDict):
     stop_calls: int
 
 
+def _completed_output(text: str) -> str:
+    """A synthetic backend success that honors the API task's requested envelope."""
+    return f"<voice>{text}</voice><detail>{text}</detail>"
+
+
 def _dispatch_request(
     *, sequence: int = 1, task_id: str = "task_release_check"
 ) -> WorkDispatchRequestedEvent:
@@ -338,6 +343,22 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         assert isinstance(instructions, str)
         assert "one parallel batch" in instructions
         assert "no more than five web_search calls" in instructions
+        assert (
+            "Answer from those results when they contain the facts needed for the objective. "
+            "Otherwise, make at most one web_extract call for no more than three distinct URLs "
+            "returned by that search batch, then answer."
+            in instructions
+        )
+        assert (
+            "Do not retry lookup tools, perform follow-up searches or additional extraction "
+            "calls, or use skill_view, browser tools, or terminal for this lookup path."
+            in instructions
+        )
+        assert (
+            "Use only inline extraction output; do not call read_file or page through "
+            "stored page content."
+            in instructions
+        )
         assert "Local, runtime, file, process, build, and verification objectives" in instructions
         assert (
             "Never interpret an unavailable tool, failed command, or empty output"
@@ -379,7 +400,7 @@ async def test_api_session_runs_two_tasks_concurrently_and_settles_independently
         payload = {
             "event": "run.completed",
             "run_id": run_id,
-            "output": "Completed independently.",
+            "output": _completed_output("Completed independently."),
         }
         await response.write(f"data: {json.dumps(payload)}\n\n".encode())
         await response.write_eof()
@@ -918,7 +939,7 @@ async def test_api_session_rejects_private_protocol_id_collision_and_settles_new
             payload = {
                 "event": "run.completed",
                 "run_id": run_id,
-                "output": "First run remained authoritative.",
+                "output": _completed_output("First run remained authoritative."),
             }
             await response.write(f"data: {json.dumps(payload)}\n\n".encode())
         await response.write_eof()
@@ -1328,7 +1349,7 @@ async def test_api_session_routes_authoritative_dispatch_approval_and_completion
             "event": "run.completed",
             "run_id": "run_0123456789abcdef",
             "timestamp": 2.0,
-            "output": "Release evidence is internally consistent.",
+            "output": _completed_output("Release evidence is internally consistent."),
             "usage": {"total_tokens": 12},
         }
         await response.write(f"data: {json.dumps(completed)}\n\n".encode())
@@ -1412,7 +1433,9 @@ async def test_api_session_routes_authoritative_dispatch_approval_and_completion
         assert completion.task_id == "task_release_check"
         assert completion.run_id == "deleg_api_private_1"
         assert completion.payload.status is WorkTerminalStatus.COMPLETED
-        assert completion.payload.summary == "Release evidence is internally consistent."
+        assert completion.payload.summary == _completed_output(
+            "Release evidence is internally consistent."
+        )
         assert requests[0][0] == "dispatch"
         dispatch_body = requests[0][1]
         assert isinstance(dispatch_body, dict)
@@ -1443,11 +1466,10 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
         await response.prepare(request)
         events_connected.set()
         await release_terminal.wait()
-        terminal = (
-            'data: {"event":"run.completed",'
-            f'"run_id":"{api_run_id}",'
-            '"output":"Exact delayed result."}\n\n'
-        ).encode()
+        terminal = b"data: " + json.dumps({
+            "event": "run.completed", "run_id": api_run_id,
+            "output": _completed_output("Exact delayed result."),
+        }).encode() + b"\n\n"
         try:
             await response.write(terminal)
             await response.write_eof()
@@ -1461,7 +1483,7 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
             "status": state["status"],
         }
         if state["status"] == "completed":
-            payload["output"] = "Exact delayed result."
+            payload["output"] = _completed_output("Exact delayed result.")
         return web.json_response(payload)
 
     async def stop(_request: web.Request) -> web.Response:
@@ -1508,7 +1530,7 @@ async def test_event_stream_outlives_request_timeout_until_exact_terminal_eviden
         assert terminal.task_id == "task_release_check"
         assert terminal.run_id == "deleg_delayed_sse_private"
         assert terminal.payload.status is WorkTerminalStatus.COMPLETED
-        assert terminal.payload.summary == "Exact delayed result."
+        assert terminal.payload.summary == _completed_output("Exact delayed result.")
         assert state["stop_calls"] == 0
     finally:
         release_terminal.set()
@@ -1610,8 +1632,6 @@ async def test_api_session_signals_exact_active_run_and_rejects_duplicate_stop()
         "eof",
         "approval_observer",
         "duplicate_approval",
-        "disclosive_terminal",
-        "disclosive_nonhex_terminal",
     ],
 )
 @pytest.mark.asyncio
@@ -1637,18 +1657,6 @@ async def test_event_stream_failure_stops_and_confirms_terminal_authority(
             await response.write(approval)
             if failure_mode == "duplicate_approval":
                 await response.write(approval)
-        elif failure_mode in {"disclosive_terminal", "disclosive_nonhex_terminal"}:
-            token = (
-                "Xrun_0123456789abcdefY"
-                if failure_mode == "disclosive_terminal"
-                else "Xrun_0123456789abcdegY"
-            )
-            await response.write(
-                (
-                    'data: {"event":"run.completed",'
-                    f'"run_id":"{api_run_id}","output":"{token}"}}\n\n'
-                ).encode()
-            )
         await response.write_eof()
         return response
 
@@ -1753,9 +1761,9 @@ async def test_failed_close_retains_run_authority_for_retry() -> None:
     ("terminal_body", "expected_status", "expected_summary", "expected_reason"),
     [
         (
-            {"status": "completed", "output": "Finished before the stop."},
+            {"status": "completed", "output": _completed_output("Finished before the stop.")},
             WorkTerminalStatus.COMPLETED,
-            "Finished before the stop.",
+            _completed_output("Finished before the stop."),
             None,
         ),
         (
@@ -2106,7 +2114,10 @@ class _IdempotentHermes:
         await response.prepare(request)
         if self.release_events is not None:
             await self.release_events.wait()
-        terminal = {"event": "run.completed", "run_id": self.run_id, "output": "Recovered."}
+        terminal = {
+            "event": "run.completed", "run_id": self.run_id,
+            "output": _completed_output("Recovered."),
+        }
         await response.write(b"data: " + json.dumps(terminal).encode() + b"\n\n")
         return response
 
@@ -2179,7 +2190,7 @@ async def test_a_lost_dispatch_response_recovers_the_same_run(
 
         assert acknowledgment.payload.accepted is True
         assert terminal.payload.status is WorkTerminalStatus.COMPLETED
-        assert terminal.payload.summary == "Recovered."
+        assert terminal.payload.summary == _completed_output("Recovered.")
         assert hermes.runs_created == 1
         assert hermes.stop_calls == 0
         (first_key, first_body), (second_key, second_body) = hermes.attempts
@@ -3080,7 +3091,7 @@ def _record_text(**fields: object) -> str:
     [
         pytest.param("not json", id="not-json"),
         pytest.param("[]", id="not-an-object"),
-        pytest.param(_record_text(version=2), id="unknown-version"),
+        pytest.param(_record_text(version=3), id="unknown-version"),
         pytest.param(_record_text(version=True), id="version-not-int"),
         pytest.param(_record_text(extra=1), id="extra-field"),
         pytest.param(json.dumps({"admitted": [], "version": 1}), id="missing-field"),
@@ -3438,3 +3449,384 @@ async def test_a_second_host_leaves_the_owners_temporaries_alone(tmp_path: Path)
         await first.close()
         await second.close()
         await runner.cleanup()
+
+
+class _LookupHermes:
+    def __init__(self, fault: str):
+        self.fault = fault
+        self.generation = "a" * 32
+        self.run_id = "run_0123456789abcdef"
+        self.posts: list[dict[str, str]] = []
+        self.ready_calls = 0
+        self.stops = 0
+        self.status = "running" if fault.startswith("ack-") else "completed"
+
+    async def ready(self, request):
+        self.ready_calls += 1
+        body = {"ready": True, "policy": "ordinary-lookup/v1", "generation": self.generation}
+        if self.fault.startswith("ready-"):
+            field = self.fault.removeprefix("ready-")
+            body[field] = {"ready": 1, "policy": "unknown", "generation": "bad"}[field]
+        return web.json_response(body)
+
+    async def submit(self, request):
+        self.posts.append(dict(request.headers))
+        headers = {
+            "X-Lookup-Policy": "ordinary-lookup/v1",
+            "X-Lookup-Generation": self.generation,
+            "X-Lookup-Run": self.run_id,
+        }
+        if self.fault.startswith("ack-"):
+            name = "X-Lookup-" + self.fault.removeprefix("ack-")
+            headers[name] = "wrong"
+        if self.fault == "ack-missing":
+            headers.clear()
+        response = web.json_response(
+            {"run_id": self.run_id, "status": "started"}, status=202, headers=headers
+        )
+        if self.fault == "ack-duplicate":
+            response.headers.add("X-Lookup-Generation", self.generation)
+        return response
+
+    async def state(self, request):
+        headers = {
+            "X-Lookup-Policy": "ordinary-lookup/v1",
+            "X-Lookup-Generation": self.generation,
+            "X-Lookup-Policy-Refused": "false",
+        }
+        if self.fault.startswith("status-"):
+            name = "X-Lookup-" + self.fault.removeprefix("status-")
+            headers[name] = "wrong"
+        if self.fault == "status-missing":
+            headers.clear()
+        if self.fault == "refused":
+            headers["X-Lookup-Policy-Refused"] = "true"
+        if self.fault == "unavailable":
+            headers["X-Lookup-Policy-Outcome"] = "unavailable"
+        response = web.json_response(
+            {
+                "run_id": self.run_id,
+                "status": self.status,
+                "output": _completed_output("Authoritative result"),
+            },
+            headers=headers,
+        )
+        if self.fault == "status-duplicate":
+            response.headers.add("X-Lookup-Generation", self.generation)
+        return response
+
+    async def events(self, request):
+        return web.Response(
+            text="data: "
+            + json.dumps(
+                {
+                    "event": "run.cancelled" if self.fault == "cancelled" else "run.completed",
+                    "run_id": self.run_id,
+                    "output": _completed_output("Unverified stream result"),
+                }
+            )
+            + "\n\n",
+            content_type="text/event-stream",
+        )
+
+    async def stop(self, request):
+        self.stops += 1
+        self.status = "cancelled"
+        return web.json_response({"run_id": self.run_id, "status": "stopping"})
+
+    async def start(self):
+        app = web.Application()
+        app.router.add_get("/v1/capabilities", _capabilities_response)
+        app.router.add_get("/lookup-policy/ready", self.ready)
+        app.router.add_post("/v1/runs", self.submit)
+        app.router.add_get("/v1/runs/{run_id}", self.state)
+        app.router.add_get("/v1/runs/{run_id}/events", self.events)
+        app.router.add_post("/v1/runs/{run_id}/stop", self.stop)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        port = _available_port()
+        await web.TCPSite(self.runner, "127.0.0.1", port).start()
+        return port
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "healthy",
+        "ordinary",
+        "cancelled",
+        "ack-duplicate",
+        "status-duplicate",
+        "ready-ready",
+        "ready-policy",
+        "ready-generation",
+        "ack-Policy",
+        "ack-Generation",
+        "ack-Run",
+        "ack-missing",
+        "status-Policy",
+        "status-Generation",
+        "status-Policy-Refused",
+        "status-missing",
+        "refused",
+        "unavailable",
+    ],
+)
+async def test_explicit_lookup_policy_binding(fault, capsys):
+    hermes = _LookupHermes(fault)
+    port = await hermes.start()
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url=f"http://127.0.0.1:{port}",
+            bearer="synthetic-lookup-test-bearer-32-characters",
+            lookup_policy=None if fault == "ordinary" else "ordinary-lookup/v1",
+        ),
+        session_id="session_api_1",
+    )
+    try:
+        await session.start()
+        if fault.startswith(("ready-", "ack-")):
+            with pytest.raises(RuntimeError, match="lookup policy"):
+                await session.dispatch(_dispatch_request())
+            assert not session._runs_by_task
+            assert not session._unpublished_api_run_ids
+            assert len(hermes.posts) == (0 if fault.startswith("ready-") else 1)
+            assert hermes.stops == (0 if fault.startswith("ready-") else 1)
+        else:
+            ack = await session.dispatch(_dispatch_request())
+            assert ack.payload.accepted
+            update = await asyncio.wait_for(session.next_update(), 2)
+            if fault in {"healthy", "ordinary"}:
+                assert update.payload.status is WorkTerminalStatus.COMPLETED
+                assert update.payload.summary == _completed_output(
+                    "Unverified stream result" if fault == "ordinary" else "Authoritative result"
+                )
+            elif fault == "cancelled":
+                assert update.payload.status is WorkTerminalStatus.INTERRUPTED
+            else:
+                assert update.payload.status is WorkTerminalStatus.FAILED
+                assert update.payload.summary is None
+        markers = [
+            json.loads(line.removeprefix("[hermes-lookup-policy] "))
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("[hermes-lookup-policy] ")
+        ]
+        category = (
+            "readiness"
+            if fault.startswith("ready-")
+            else "acknowledgment"
+            if fault.startswith("ack-")
+            else "completion"
+        )
+        assert markers == (
+            []
+            if fault in {"healthy", "ordinary", "cancelled"}
+            else [{"category": category, "version": 1}]
+        )
+        assert hermes.ready_calls == (0 if fault == "ordinary" else 1)
+        if hermes.posts:
+            assert hermes.posts[0].get("X-Lookup-Policy") == (
+                None if fault == "ordinary" else "ordinary-lookup/v1"
+            )
+    finally:
+        await session.close()
+        await hermes.runner.cleanup()
+
+
+@pytest.mark.parametrize("policy", ["unknown", True, "", 1])
+def test_lookup_policy_config_rejects_unknown_selection(policy):
+    with pytest.raises(ValueError, match="lookup_policy"):
+        HermesApiConfig(
+            base_url="http://127.0.0.1:8642",
+            bearer="synthetic-lookup-test-bearer-32-characters",
+            lookup_policy=policy,
+        )
+
+
+@pytest.mark.parametrize("policies", [[None], ["ordinary-lookup/v1"], [None, "ordinary-lookup/v1"]])
+def test_lookup_pending_record_preserves_exact_selection(policies):
+    entries = [
+        run_record_module.PendingRun(
+            key=f"{index:032x}",
+            minted_at=1.0,
+            body={"input": "synthetic", "instructions": "synthetic"},
+            lookup_policy=policy,
+        )
+        for index, policy in enumerate(policies)
+    ]
+    raw = run_record_module.run_record_bytes(entries, [])
+    parsed = run_record_module.parse_run_record(
+        raw, max_entries=8, max_request_bytes=65536, run_id=api_module._RUN_ID_EXACT
+    )
+    assert parsed is not None
+    assert [entry.lookup_policy for entry in parsed[0]] == policies
+    assert json.loads(raw)["version"] == (2 if any(p is not None for p in policies) else 1)
+
+
+@pytest.mark.parametrize("policy", ["unknown", "", False, 1])
+def test_lookup_pending_record_cannot_omit_invalid_runtime_policy(policy):
+    entry = run_record_module.PendingRun(
+        key=None,
+        minted_at=1.0,
+        body={"input": "synthetic", "instructions": "synthetic"},
+        lookup_policy=policy,
+    )
+    with pytest.raises(ValueError, match="policy"):
+        run_record_module.run_record_bytes([entry], [])
+
+
+@pytest.mark.parametrize(
+    "version,selection",
+    [(1, "ordinary-lookup/v1"), (2, "missing"), (2, "unknown"), (2, False), (3, None)],
+)
+def test_lookup_pending_record_rejects_ambiguous_selection(version, selection):
+    entry = dict(_VALID_PENDING)
+    if selection != "missing":
+        entry["lookup_policy"] = selection
+    raw = _record_text(version=version, pending=[entry]).encode()
+    assert (
+        run_record_module.parse_run_record(
+            raw, max_entries=8, max_request_bytes=65536, run_id=api_module._RUN_ID_EXACT
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection,current", [(None, "ordinary-lookup/v1"), ("ordinary-lookup/v1", None)]
+)
+async def test_lookup_restart_replays_persisted_selection_only(selection, current):
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8642",
+            bearer="synthetic-lookup-test-bearer-32-characters",
+            lookup_policy=current,
+        ),
+        session_id="session_api_1",
+    )
+    observed = []
+
+    async def request(method, path, *, body=None, headers=None):
+        observed.append((method, path, headers))
+        if method == "POST":
+            return 202, {"run_id": "run_0123456789abcdef"}
+        return 200, {"run_id": "run_0123456789abcdef", "status": "cancelled"}
+
+    session._request_json = request
+    entry = run_record_module.PendingRun(
+        key="a" * 32, minted_at=time.time(), body=dict(_RECORD_REQUEST), lookup_policy=selection
+    )
+    assert await session._settle_recorded_dispatch(entry, 3600) == "stopped"
+    assert observed[0][2] == {"Idempotency-Key": entry.key} | (
+        {"X-Lookup-Policy": selection} if selection else {}
+    )
+    assert len(observed) == 2
+
+
+@pytest.mark.asyncio
+async def test_lookup_lost_ack_resend_retains_selection_and_body():
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8642", bearer="synthetic-lookup-test-bearer-32-characters"
+        ),
+        session_id="session_api_1",
+    )
+    session._resend_window = 3600
+    observed = []
+
+    async def request(method, path, *, body=None, headers=None, response_headers=None):
+        observed.append((body, dict(headers)))
+        if len(observed) == 1:
+            raise api_module._NoResponse("synthetic")
+        response_headers.update({"x-lookup-policy": "ordinary-lookup/v1"})
+        return 202, {"run_id": "run_0123456789abcdef", "status": "running", "replayed": True}
+
+    session._request_json = request
+    entry = run_record_module.PendingRun(
+        key="a" * 32,
+        minted_at=time.time(),
+        body=dict(_RECORD_REQUEST),
+        lookup_policy="ordinary-lookup/v1",
+    )
+    headers = {}
+    assert (await session._submit_run(entry, response_headers=headers))[0] == 202
+    assert (
+        observed
+        == [(entry.body, {"Idempotency-Key": entry.key, "X-Lookup-Policy": entry.lookup_policy})]
+        * 2
+    )
+    assert headers == {"x-lookup-policy": "ordinary-lookup/v1"}
+
+
+@pytest.mark.asyncio
+async def test_lookup_ack_refusal_retains_unsettled_run_record(tmp_path, monkeypatch):
+    hermes = _LookupHermes("ack-Policy")
+    port = await hermes.start()
+    record = tmp_path / "runs.json"
+    session = HermesApiTaskSession(config=HermesApiConfig(
+        base_url=f"http://127.0.0.1:{port}", bearer="synthetic-lookup-test-bearer-32-characters",
+        lookup_policy="ordinary-lookup/v1"), session_id="session_api_1", run_record_path=record)
+    async def refuse_settlement(run_id):
+        raise RuntimeError("synthetic unsettled run")
+    try:
+        await session.start()
+        with monkeypatch.context() as mutation:
+            mutation.setattr(session, "_stop_and_wait", refuse_settlement)
+            with pytest.raises(RuntimeError, match="synthetic unsettled run"):
+                await session.dispatch(_dispatch_request())
+        assert not session._runs_by_task
+        assert session._unpublished_api_run_ids == {hermes.run_id}
+        assert _read_record(record) == {"version": 1, "pending": [], "admitted": [hermes.run_id]}
+        await session.close()
+        assert hermes.stops == 1
+        assert _read_record(record) == _empty_record()
+    finally:
+        await session.close()
+        await hermes.runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [
+    (503, {"ready": True, "policy": "ordinary-lookup/v1", "generation": "a" * 32}),
+    (200, {"ready": True, "policy": "ordinary-lookup/v1", "generation": "a" * 32, "extra": 1}),
+    (200, {"ready": True, "policy": "ordinary-lookup/v1", "generation": 123}),
+])
+async def test_lookup_readiness_requires_exact_schema_and_http_authority(status, body):
+    session = HermesApiTaskSession(config=HermesApiConfig(base_url="http://127.0.0.1:8642",
+        bearer="synthetic-lookup-test-bearer-32-characters"), session_id="session_api_1")
+    async def request(*args, **kwargs):
+        return status, body
+    session._request_json = request
+    with pytest.raises(RuntimeError, match="lookup policy readiness"):
+        await session._lookup_readiness()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,run_id,native_status", [(503, "run_0123456789abcdef", "completed"),
+    (200, "run_ffffffffffffffff", "completed"), (200, "run_0123456789abcdef", "running")])
+async def test_lookup_completion_requires_native_terminal_authority(status, run_id, native_status):
+    session = HermesApiTaskSession(config=HermesApiConfig(base_url="http://127.0.0.1:8642",
+        bearer="synthetic-lookup-test-bearer-32-characters"), session_id="session_api_1")
+    async def request(*args, **kwargs):
+        kwargs["response_headers"].update({"x-lookup-policy": "ordinary-lookup/v1",
+            "x-lookup-generation": "a" * 32, "x-lookup-policy-refused": "false"})
+        return status, {"run_id": run_id, "status": native_status, "output": "synthetic"}
+    session._request_json = request
+    authority = _RunAuthority(task_id="task_release_check", api_run_id="run_0123456789abcdef",
+                              protocol_run_id="deleg_synthetic", lookup_generation="a" * 32)
+    with pytest.raises(RuntimeError, match="lookup policy.*authority"):
+        await session._lookup_completion(authority)
+    assert not authority.terminal
+
+
+def test_lookup_refusal_reporting_cannot_replace_primary_error(monkeypatch):
+    def unavailable_output(*args, **kwargs):
+        raise OSError("synthetic unavailable output")
+    monkeypatch.setattr("builtins.print", unavailable_output)
+    with pytest.raises(RuntimeError, match="primary refusal"):
+        try:
+            raise RuntimeError("primary refusal")
+        finally:
+            HermesApiTaskSession._lookup_refusal("acknowledgment")
