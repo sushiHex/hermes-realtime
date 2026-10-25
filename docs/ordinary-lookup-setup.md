@@ -4,11 +4,14 @@ This is the explicit, disabled-by-default backend configuration delivered by
 [#301](https://github.com/sushiHex/hermes-realtime/pull/301), not a foreground
 model nomination or natural-routing activation. It extends the isolation and
 install-binding rules in [desktop acceptance](desktop-mvp-acceptance.md).
-[#295](https://github.com/sushiHex/hermes-realtime/issues/295) still owns a clean
-contributor walkthrough. Configuration and staging below are public; the owned
-real-provider launch and complete wheel-to-install walkthrough are not yet a
-published command. Do not substitute an unpublished operator helper or report
-that walkthrough as passed.
+[#295](https://github.com/sushiHex/hermes-realtime/issues/295) still owns the full
+selected-profile contributor walkthrough. The
+[public backend command](lookup-backend-command.md) now composes these settings,
+scoped realtime wheel/target equality, owned hidden launch, one production-adapter
+task and cleanup. Use that command rather than an unpublished operator helper.
+Its backend-only execution and source/semantic evidence must be recorded before
+claiming a walkthrough passed; it does not qualify the foreground profile or a
+fresh model download.
 
 ## Freeze the source and artifacts
 
@@ -23,7 +26,8 @@ installed files with the frozen wheel. The
 [installed API gate](hermes-bridge.md) observes that setup.
 A version string, copied RECORD or gateway digest alone is insufficient.
 
-The one successful backend task used these identities:
+The historical successful task and the separate public reproduction input have
+these bindings:
 
 | Component | Binding |
 | --- | --- |
@@ -31,7 +35,17 @@ The one successful backend task used these identities:
 | Source tree for that task | `fff5b8fa50e58d7264d2e0073297ed1d624e1c33` |
 | Background and presentation model | `devstral-small-2:24b` |
 | Installed model manifest SHA-256 | `24277f07f62db8f9cb68e9dfc679ea1818a7fbac47a50eff0a701d3f645b63c8` |
-| Ollama Windows AMD64 archive | v0.40.4, `7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf` |
+| Historical retained Ollama runtime closure | `d1cb1fb752fa1181fb2ad4e4c6fa01dd55457ca8340da3b3bc5f4d3d4435d36d` |
+| Public reproduction archive pin | v0.40.4, `7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf` |
+
+The historical task verified the retained runtime closure, not its equality to
+that ZIP. A later comparison of the retained directory with a freshly verified
+official archive refused `runtime-content`: the retained directory contained
+extra files not in that archive, while the selected executable digest matched.
+Changed bytes in the shared files have not been established; the historical
+directory was preserved. No causal claim follows from this inventory difference.
+The public command used a fresh extraction instead. Neither the archive pin nor
+the historical useful task is relabelled as proof of the new command's outcome.
 
 The model name is a mutable tag. Before loading, require the exact manifest,
 config and complete referenced layer closure by SHA-256 and byte size, then
@@ -165,8 +179,8 @@ config = HermesApiConfig(
 
 Supply it to `HermesApiTaskSession(config=config, ...)` through the existing
 conversation controller. Alternatively `build_local_host_launcher` exposes
-`hermes_lookup_policy="ordinary-lookup/v1"` for its API adapter; the CLI does
-not expose this experimental selection. Every run through that configured
+`hermes_lookup_policy="ordinary-lookup/v1"` for its API adapter; the voice-host CLI
+does not expose this selection. The separate backend setup command does. Every run through that configured
 adapter is designated; use a dedicated deployment. `None` preserves ordinary
 native runs. Keep native `run_provider`, `run_model` and `run_reasoning_effort`
 unset for this profile so Hermes uses the configured route/default reasoning.
@@ -202,16 +216,20 @@ server. Record final process/listener absence and unchanged unrelated services.
 No process-name kill, personal profile update, shared listener replacement or
 prewarming is part of this procedure.
 
-The public rehearsal is synthetic; it does not currently compose this exact
-real-provider profile, install comparator and owner into a single walkthrough.
-That is the concrete remaining #295 deliverable. Until it is implemented and
-followed from a clean contributor environment, mark that walkthrough `not_run`.
-The API gate is an observer, not a new supervisor or alternate dispatcher.
-The recorded qualification also used private transport guards: bounded Exa
-search/extraction POSTs and responses, redirects disabled, and a separate exact
-same-model-origin metadata GET lane. Those wire bounds are additional harness
-evidence, not native tool-policy guarantees. The config above does not install
-them; their public composition remains part of the missing walkthrough.
+The desktop rehearsal remains synthetic. The separate
+[public backend command](lookup-backend-command.md) now composes this real-provider
+profile, the scoped supplied-target comparator and the existing owner. It also
+migrates the qualification's bounded Exa search/extraction transport guards and
+the separate exact same-model-origin metadata GET lane. These are additional
+harness bounds, not native tool-policy guarantees; the config above alone does
+not install them. The API gate remains an observer, not a new supervisor or
+alternate dispatcher.
+
+The prepared Hermes interpreter/dependencies remain trusted inputs, and the
+command's successful structural completion still requires separate answer/source
+review. Record any actual public-command walkthrough against its exact candidate;
+do not reuse the historical task as that observation. Fresh full-profile setup,
+foreground and human acceptance remain under #295/#159.
 
 The [recorded backend task](https://github.com/sushiHex/hermes-realtime/issues/337#issuecomment-6392752249)
 completed in 34.297 seconds, with one search, one permitted extraction, genuine
