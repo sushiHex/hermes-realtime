@@ -115,11 +115,26 @@ subprocess.run(
 ```
 
 Read-only archive/model preflight has a separate 600-second bound. Actual owned
-execution has a 360-second watchdog covering model metadata startup (60 seconds),
+execution has a 360-second watchdog covering model startup (60 seconds),
 gateway startup, one task and settlement. The task retains its original
 120-second admission authority; preflight/startup/cleanup time does not extend
 that authority. A watchdog/outer timeout is a failed observation with cleanup
 unproven, never permission to retry automatically.
+
+Within that same 60-second startup deadline, execution now makes one native
+`/api/chat` request with empty messages, `stream=false`, `num_ctx=64000` and
+five-minute keep-alive. It requires a positive empty `done_reason=load` acknowledgment,
+then one owned `/api/ps` readback matching the selected model identity, digest and
+64,000 configured context. No prompt or tool is supplied and no task text is generated.
+Metadata reads retain their eight-second per-request cap; the load request uses
+only the remaining startup budget, with no retries or deadline reset. A refusal
+stops before gateway startup or task admission.
+
+The process readback reports configured per-sequence context, not independently
+measured KV capacity or a no-truncation guarantee. Live qualification of this gate
+is pending; later runner continuity/reuse and useful completion require retained
+observations from the one task. The task's 120-second authority is unchanged. This
+readiness decision does not establish the cause of the earlier startup stall.
 
 The command authenticates the gateway only after OS listener ownership is known,
 rejects readiness redirects, checks native policy readiness and requires the real

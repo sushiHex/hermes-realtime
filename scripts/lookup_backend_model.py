@@ -1,11 +1,12 @@
-"""Verify selected local artifacts and start metadata-only Ollama under an existing owner.
+"""Verify artifacts and admit an owned, loaded Ollama before any gateway task.
 
-This preflight binds bytes at verification time; it is not a file-seal or model-load
-qualification. The caller retains the owner through all consumers and settles it in
+This preflight binds bytes at verification time; it is not a file-seal, capacity or
+useful-task qualification. The caller retains the owner through all consumers and settles it in
 finally. Only the owned child receives the qualified 64000/q8_0 settings.
 """
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import hashlib
 import json
@@ -37,6 +38,8 @@ _REFUSALS = frozenset({
     "metadata-status", "metadata-bound", "metadata-shape", "model-port", "model-already-attempted",
     "owner-containment", "port-occupied", "model-exited", "metadata-version", "metadata-model",
     "metadata-template", "metadata-capabilities", "artifact-proof",
+    "load-ack", "loaded-model", "loaded-context", "readiness-status", "readiness-bound",
+    "readiness-shape", "readiness-json", "model-readiness-loop",
 })
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
@@ -287,10 +290,88 @@ def _read(kind: str, manifest: Mapping[str, Any], process: Any,
     return value
 
 
+async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: float,
+                          state: dict[str, Any]) -> None:
+    """One empty load and one configured-context readback, under one remaining budget.
+
+    Pinned Ollama's native chat handler awaits runner readiness before returning
+    done_reason=load for empty messages. /api/ps reports configured per-sequence
+    context, not independently measured KV capacity or future truncation behavior.
+    """
+    import httpx
+
+    runtime, port = Path(manifest["ollama_runtime"]), manifest["model_port"]
+
+    async def read(path: str, body: dict[str, Any] | None, phase: str) -> dict[str, Any]:
+        _owned(process, runtime, port, deadline)
+        state["stage"] = "model-" + phase
+        if phase == "load":
+            state["load_request_count"] += 1
+        else:
+            state["metadata_requests"].append("ps")
+        state[phase + "_begin_ns"] = time.monotonic_ns()
+        raw = bytearray()
+        try:
+            async with client.stream("POST" if body is not None else "GET",
+                    f"http://127.0.0.1:{port}/api/{path}", json=body,
+                    timeout=_remaining(deadline) if phase == "load"
+                    else min(8.0, _remaining(deadline))) as response:
+                state[phase + "_headers_ns"] = time.monotonic_ns()
+                if response.status_code != 200:
+                    raise ValueError("readiness-status")
+                async for chunk in response.aiter_bytes():
+                    if len(raw) + len(chunk) > _JSON_LIMIT:
+                        state[phase + "_response_overflow"] = True
+                        raise ValueError("readiness-bound")
+                    raw.extend(chunk)
+        finally:
+            state[phase + "_response_bytes"] = len(raw)
+            state[phase + "_settled_ns"] = time.monotonic_ns()
+        _owned(process, runtime, port, deadline)
+        _remaining(deadline)
+        try:
+            value = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise ValueError("readiness-json") from None
+        if type(value) is not dict:
+            raise ValueError("readiness-shape")
+        return value
+
+    # Cleanup is outside this timeout: one cancellation closes the scoped HTTP
+    # response/client before the synchronous owner receives a refusal.
+    async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0),
+            follow_redirects=False, trust_env=False) as client:
+        async with asyncio.timeout(_remaining(deadline)):
+            load = await read("chat", {"model": manifest["model"], "messages": [],
+                "stream": False, "options": {"num_ctx": 64000}, "keep_alive": "5m"}, "load")
+            state["stage"] = "model-load-ack"
+            message = load.get("message")
+            if (load.get("done") is not True or load.get("done_reason") != "load"
+                    or load.get("model") != manifest["model"] or type(message) is not dict
+                    or message.get("role") != "assistant" or message.get("content") != ""
+                    or message.get("thinking", "") != "" or message.get("tool_calls", []) != []):
+                raise ValueError("load-ack")
+            state["load_acknowledged"] = True
+            snapshot = await read("ps", None, "readback")
+            state["stage"] = "model-readback-identity"
+            models = snapshot.get("models")
+            if type(models) is not list or len(models) != 1 or type(models[0]) is not dict:
+                raise ValueError("loaded-model")
+            row = models[0]
+            if (row.get("digest") != manifest["model_manifest_sha256"]
+                    or row.get("name") != manifest["model"]
+                    or row.get("model") != manifest["model"]):
+                raise ValueError("loaded-model")
+            state["stage"] = "model-readback-context"
+            if type(row.get("context_length")) is not int or row["context_length"] != 64000:
+                raise ValueError("loaded-context")
+            state["configured_context_tokens"] = row["context_length"]
+
+
 def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 evidence_dir: Path, deadline: float, *,
                 verified: VerifiedArtifacts | None = None) -> dict[str, Any]:
-    """Keep the owned server alive for the caller; never load, pull or infer a model."""
+    """Keep the ready owned server for the caller; never pull or generate task text."""
     selected = dict(manifest)
     port = selected["model_port"]
     if type(port) is not int or not 1 <= port <= 65535:
@@ -300,12 +381,20 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
     path = evidence_dir / "model-metadata.private.json"
     state: dict[str, Any] = {"version": 1, "category": "setup", "metadata_requests": [],
         "inference_request_count": 0, "context_default_tokens": 64000,
-        "allocation_observed": False, "port": port, "stage": "ownership"}
+        "allocation_observed": False, "port": port, "stage": "ownership",
+        "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
+        "configured_context_basis": "configured-per-sequence"}
     with path.open("x", encoding="utf-8") as stream:
         json.dump(state, stream)
     process = None
     try:
         _remaining(deadline)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise ValueError("model-readiness-loop")
         if MODEL_PROCESS_NAME in processes.roots:
             raise RuntimeError("model-already-attempted")
         if os.getpid() not in containment.members():
@@ -362,7 +451,10 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 or not {"completion", "tools"}.issubset(show["capabilities"])
                 or any(show.get(field, "") != "" for field in ("remote_host", "remote_model"))):
             raise ValueError("metadata-capabilities")
-        state.update(category="metadata_ready", stage="complete", runtime_version=SUPPORTED_VERSION)
+        asyncio.run(_load_readiness(selected, process, deadline, state))
+        _remaining(deadline)
+        state.update(category="metadata_ready", stage="complete", runtime_version=SUPPORTED_VERSION,
+                     model_ready=True)
         return state
     except BaseException as error:
         state["failure_category"] = (error.args[0] if type(error) in {
@@ -383,5 +475,6 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         public = {key: state[key] for key in (
             "category", "stage", "inference_request_count", "metadata_request_count",
             "runtime_version", "context_default_tokens", "allocation_observed",
+            "load_request_count", "load_acknowledged", "model_ready", "configured_context_tokens",
             "failure_kind", "failure_category") if key in state}
         print("[lookup-model] " + json.dumps(public, sort_keys=True), flush=True)
