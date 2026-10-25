@@ -1,6 +1,7 @@
-"""Offline binding and owned metadata checks; never launch Ollama or contact HTTP."""
+"""Offline binding and owned readiness checks; never launch Ollama or contact HTTP."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from scripts import lookup_backend_model as model
@@ -228,21 +230,61 @@ def owned(selected, monkeypatch):
             return Response(json.dumps(replies[len(calls) - 1]).encode())
 
     monkeypatch.setattr(model.urllib.request, "build_opener", lambda *args: Opener())
+    ready_calls = []
+    ready = {"load": {"model": selected["model"], "done": True, "done_reason": "load",
+                      "message": {"role": "assistant", "content": ""}},
+             "ps": {"models": [{"model": selected["model"], "name": selected["model"],
+                 "digest": selected["model_manifest_sha256"], "context_length": 64000}]}}
+
+    class Dribble(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"{"
+            await asyncio.sleep(2)
+            yield b"}"
+
+        async def aclose(self):
+            ready["stream_closed"] = True
+
+    class Transport(httpx.MockTransport):
+        async def aclose(self):
+            ready["client_closed"] = True
+            await super().aclose()
+
+    async def ready_reply(request):
+        ready_calls.append(request)
+        kind = "load" if request.url.path == "/api/chat" else "ps"
+        if kind == "load" and ready.get("after_load"):
+            ready["after_load"]()
+        if kind == "ps" and ready.get("after_ps"):
+            ready["after_ps"]()
+        if ready.get("dribble"):
+            return httpx.Response(200, stream=Dribble())
+        if ready.get("oversize"):
+            return httpx.Response(200, content=b"x" * (1024 * 1024 + 1))
+        if ready.get("redirect"):
+            return httpx.Response(302, headers={"location": "http://example.invalid/api/chat"})
+        return httpx.Response(200, json=ready[kind])
+
+    def transport(**kwargs):
+        assert kwargs == {"retries": 0}
+        return Transport(ready_reply)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
     containment = SimpleNamespace(members=lambda: {os.getpid()})
-    return owner, containment, calls, replies
+    return owner, containment, calls, replies, ready_calls, ready
 
 
 def start(selected, owned, tmp_path):
-    owner, containment, _, _ = owned
+    owner, containment = owned[:2]
     return model.start_model(selected, owner, containment, tmp_path / "evidence",
                              model.time.monotonic() + 10)
 
 
-def test_owned_metadata_only_and_closed_options(selected, owned, tmp_path, monkeypatch):
+def test_owned_startup_and_closed_options(selected, owned, tmp_path, monkeypatch):
     monkeypatch.setenv("OLLAMA_GO_TEMPLATE", "1")
     monkeypatch.setenv("LLAMA_ARG_GPU_LAYERS", "0")
     result = start(selected, owned, tmp_path)
-    owner, _, calls, _ = owned
+    owner, _, calls, _ = owned[:4]
     assert result["category"] == "metadata_ready"
     assert result["inference_request_count"] == 0
     assert [request.full_url for request in calls] == [
@@ -382,3 +424,117 @@ def test_expired_launch_does_not_start(selected, owned, tmp_path):
 def test_metadata_redirect_is_refused():
     with pytest.raises(ValueError, match="metadata-redirect"):
         model.NoRedirect().redirect_request(None, None, 302, "", {}, "http://example.invalid")
+
+
+def test_load_and_readback_precede_ready(selected, owned, tmp_path):
+    result = start(selected, owned, tmp_path)
+    assert result["model_ready"] is True
+    assert result["load_request_count"] == 1 and result["inference_request_count"] == 0
+    assert result["metadata_request_count"] == 4
+    assert result["configured_context_tokens"] == 64000
+    assert result["allocation_observed"] is False
+    calls = owned[4]
+    assert [(r.method, r.url.path) for r in calls] == [("POST", "/api/chat"), ("GET", "/api/ps")]
+    assert json.loads(calls[0].content) == {
+        "model": selected["model"], "messages": [], "stream": False,
+        "options": {"num_ctx": 64000}, "keep_alive": "5m"}
+
+
+@pytest.mark.parametrize("change", [
+    {"done": False}, {"done_reason": "stop"}, {"model": "other:tag"},
+    {"message": None}, {"message": {"role": "assistant", "content": "generated"}},
+    {"message": {"role": "assistant", "content": "", "tool_calls": [{}]}},
+    {"message": {"role": "assistant", "content": "", "thinking": "reasoning"}},
+    {"message": {"role": "system", "content": ""}},
+], ids=["done", "reason", "model", "missing", "content", "tools", "thinking", "role"])
+def test_load_ack_must_be_positive_and_empty(selected, owned, tmp_path, change):
+    owned[5]["load"].update(change)
+    with pytest.raises(ValueError, match="load-ack"):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 1 and owned[0].killed == [model.MODEL_PROCESS_NAME]
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["model_ready"] is False and state["load_request_count"] == 1
+
+
+def test_missing_load_ack_refuses(selected, owned, tmp_path):
+    owned[5]["load"] = {}
+    with pytest.raises(ValueError, match="load-ack"):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 1
+
+
+@pytest.mark.parametrize("change", [
+    {"digest": "0" * 64}, {"name": "other:tag"}, {"model": "other:tag"},
+], ids=["digest", "name", "model"])
+def test_loaded_identity_must_equal_selection(selected, owned, tmp_path, change):
+    owned[5]["ps"]["models"][0].update(change)
+    with pytest.raises(ValueError, match="loaded-model"):
+        start(selected, owned, tmp_path)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+@pytest.mark.parametrize("context", [4096, 64000.0, None], ids=["wrong", "float", "missing"])
+def test_loaded_context_must_be_exact_integer(selected, owned, tmp_path, context):
+    owned[5]["ps"]["models"][0]["context_length"] = context
+    with pytest.raises(ValueError, match="loaded-context"):
+        start(selected, owned, tmp_path)
+
+
+def test_readback_cannot_add_another_model(selected, owned, tmp_path):
+    owned[5]["ps"]["models"].append(dict(owned[5]["ps"]["models"][0]))
+    with pytest.raises(ValueError, match="loaded-model"):
+        start(selected, owned, tmp_path)
+
+
+def test_load_ownership_cannot_change(selected, owned, tmp_path, monkeypatch):
+    owned[5]["after_load"] = lambda: monkeypatch.setattr(
+        model, "_image", lambda pid: tmp_path / "foreign.exe")
+    with pytest.raises(RuntimeError, match="listener-owner"):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 1 and owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_readback_ownership_cannot_change(selected, owned, tmp_path, monkeypatch):
+    owned[5]["after_ps"] = lambda: monkeypatch.setattr(
+        model, "_image", lambda pid: tmp_path / "foreign.exe")
+    with pytest.raises(RuntimeError, match="listener-owner"):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 2 and owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_load_dribble_cannot_extend_shared_deadline(selected, owned, tmp_path):
+    proof = model.verify_artifacts(selected, model.time.monotonic() + 10)
+    owned[5]["dribble"] = True
+    started = model.time.monotonic()
+    with pytest.raises(TimeoutError):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+                          started + 0.2, verified=proof)
+    assert model.time.monotonic() - started < 1.0
+    assert len(owned[4]) == 1 and owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert owned[5]["stream_closed"] is True and owned[5]["client_closed"] is True
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["category"] == "refused" and state["model_ready"] is False
+    assert state["load_request_count"] == 1
+
+
+def test_load_response_is_bounded(selected, owned, tmp_path):
+    owned[5]["oversize"] = True
+    with pytest.raises(ValueError, match="readiness-bound"):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 1
+
+
+def test_load_cannot_follow_redirect(selected, owned, tmp_path):
+    owned[5]["redirect"] = True
+    with pytest.raises((ValueError, httpx.TooManyRedirects)):
+        start(selected, owned, tmp_path)
+    assert len(owned[4]) == 1
+
+
+def test_load_uses_remaining_budget_but_metadata_keeps_eight_seconds(selected, owned, tmp_path):
+    proof = model.verify_artifacts(selected, model.time.monotonic() + 10)
+    model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+                      model.time.monotonic() + 60, verified=proof)
+    load, readback = owned[4]
+    assert 8 < load.extensions["timeout"]["read"] <= 60
+    assert 0 < readback.extensions["timeout"]["read"] <= 8
