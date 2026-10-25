@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "candidate": "0000000000000000000000000000000000000000",
+  "tree": "0000000000000000000000000000000000000000",
+  "hermes_source": "C:/contributor-lookup/hermes-agent",
+  "hermes_python": "C:/contributor-lookup/hermes-agent/venv/Scripts/python.exe",
+  "runtime_target": "C:/contributor-lookup/runtime",
+  "wheel": "C:/contributor-lookup/dist/hermes_realtime-0.0.3-py3-none-any.whl",
+  "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "ollama_runtime": "C:/contributor-lookup/ollama",
+  "ollama_archive": "C:/contributor-lookup/ollama-windows-amd64.zip",
+  "ollama_archive_sha256": "7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf",
+  "model_store": "C:/contributor-lookup/models",
+  "model": "devstral-small-2:24b",
+  "model_manifest_sha256": "24277f07f62db8f9cb68e9dfc679ea1818a7fbac47a50eff0a701d3f645b63c8",
+  "model_port": 11440,
+  "api_port": 28660,
+  "companion_port": 28785,
+  "objective": "Why does the sky look blue? Use a NASA source and include the source URL.",
+  "presentation_key_env": "HERMES_LOOKUP_PRESENTATION_API_KEY"
+}
