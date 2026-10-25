@@ -250,7 +250,13 @@ def test_resources_survive_until_all_consumers_settle(
             events.append("release")
             live[0] = False
             if fault == "release":
-                raise OSError("synthetic resource cleanup")
+                invalid = OSError("PRIVATE_SENTINEL")
+                invalid.winerror = 65536
+                failure = OSError("PRIVATE_SENTINEL")
+                failure.winerror = 32
+                raise BaseExceptionGroup(
+                    "PRIVATE_SENTINEL", [invalid, BaseExceptionGroup("PRIVATE_SENTINEL", [failure])]
+                )
 
         stack.callback(release)
         if fault == "partial":
@@ -374,6 +380,14 @@ def test_resources_survive_until_all_consumers_settle(
                 )
             else:
                 assert events[-1] == "release" and not live[0]
+            if fault == "release":
+                assert evidence == {
+                    "cleanup_verified": False,
+                    "failure_phase": "resource_release",
+                    "failure_category": "cleanup_failed",
+                    "resource_release_winerror": 32,
+                }
+                assert "PRIVATE_SENTINEL" not in json.dumps(evidence)
     finally:
         # Synthetic consumers are now stopped. Avoid leaking test-only callbacks.
         for stack in launch._UNSETTLED_RESOURCES:

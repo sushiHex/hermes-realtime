@@ -531,7 +531,11 @@ def test_load_cannot_follow_redirect(selected, owned, tmp_path):
     assert len(owned[4]) == 1
 
 
-def test_load_uses_remaining_budget_but_metadata_keeps_eight_seconds(selected, owned, tmp_path):
+def test_load_uses_remaining_budget_but_metadata_keeps_eight_seconds(
+        selected, owned, tmp_path, monkeypatch):
+    # Keep model deadline arithmetic exact without changing asyncio's own clock.
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: 1000.0, monotonic_ns=model.time.monotonic_ns))
     proof = model.verify_artifacts(selected, model.time.monotonic() + 10)
     model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
                       model.time.monotonic() + 60, verified=proof)

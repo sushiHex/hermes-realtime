@@ -306,6 +306,21 @@ def completion_status(value: Any, *, cleanup_verified: bool) -> str:
     )
 
 
+def _resource_release_winerror(error: BaseException) -> int | None:
+    """Sample at most sixteen exception objects; never retain messages or paths."""
+    pending = [error]
+    for _ in range(16):
+        if not pending:
+            break
+        current = pending.pop(0)
+        code = getattr(current, "winerror", None)
+        if type(code) is int and 0 <= code <= 65535:
+            return code
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions[: 16 - len(pending)])
+    return None
+
+
 # No tooling package is imported into the external controller namespace.
 _CONTROLLER = """
 import ctypes,hashlib,json,msvcrt,os,sys
@@ -462,6 +477,11 @@ def _owned_controller(
             try:
                 resources.close()
             except BaseException as error:
+                evidence.update(
+                    failure_phase="resource_release",
+                    failure_category="cleanup_failed",
+                    resource_release_winerror=_resource_release_winerror(error),
+                )
                 failures.append(error)
         evidence["cleanup_verified"] = cleanup and not failures
         if primary is not None:

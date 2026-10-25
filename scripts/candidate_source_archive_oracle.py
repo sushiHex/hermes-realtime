@@ -41,7 +41,8 @@ if TYPE_CHECKING:
     from scripts.qualification_tool_environment import ImmutableToolEnvironmentV1
 
 
-_MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
+# The source envelope leaves finite room for tar headers/padding beyond payloads.
+_MAX_ARCHIVE_BYTES = 40 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
 _MAX_MEMBER_COUNT = 4096
@@ -51,8 +52,8 @@ _MAX_TREE_BYTES = 4 * 1024 * 1024
 _MAX_TREE_ENTRIES = 8192
 _MAX_VISIBLE_MEMBERS = 4096
 _MAX_BLOB_BYTES = 4 * 1024 * 1024
-_MAX_AGGREGATE_BLOB_BYTES = 16 * 1024 * 1024
-_MAX_CANDIDATE_TREE_BYTES = 16 * 1024 * 1024
+_MAX_CANDIDATE_TREE_BYTES = 32 * 1024 * 1024
+_MAX_AGGREGATE_BLOB_BYTES = _MAX_CANDIDATE_TREE_BYTES
 _PREFIX = "hermes-realtime-0.0.3"
 _OID = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
