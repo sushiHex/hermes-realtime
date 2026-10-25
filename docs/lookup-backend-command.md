@@ -131,9 +131,9 @@ only the remaining startup budget, with no retries or deadline reset. A refusal
 stops before gateway startup or task admission.
 
 The process readback reports configured per-sequence context, not independently
-measured KV capacity or a no-truncation guarantee. Live qualification of this gate
-is pending; later runner continuity/reuse and useful completion require retained
-observations from the one task. The task's 120-second authority is unchanged. This
+measured KV capacity or a no-truncation guarantee. The acknowledgment alone does
+not establish later runner continuity/reuse or useful completion; those require
+retained observations from the one task. The task's 120-second authority is unchanged. This
 readiness decision does not establish the cause of the earlier startup stall.
 
 The command authenticates the gateway only after OS listener ownership is known,
