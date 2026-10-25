@@ -1,0 +1,244 @@
+"""Project committed blobs for the opt-in proof's source import boundary.
+
+The caller verifies repository origin and pin and supplies a fresh owned directory.
+The interpreter and prepared third-party dependencies remain a separate trust boundary.
+Git must support --no-lazy-fetch; missing local objects and older Git refuse.
+No worktree overlay is imported. The one pinned attribution-metadata subtree is
+explicitly omitted; receipts describe a committed-source projection, not a full export.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+class SourceExportError(RuntimeError):
+    """Content-free failure of the disposable committed-source export."""
+
+    @property
+    def category(self) -> str:
+        approved = {
+            "source_export_git_failed",
+            "source_export_path_invalid",
+            "source_export_path_collision",
+            "source_export_revision_invalid",
+            "source_export_destination_not_fresh",
+            "source_export_revision_mismatch",
+            "source_export_tree_invalid",
+            "source_export_entry_invalid",
+            "source_export_blob_invalid",
+            "source_export_metadata_projection_changed",
+        }
+        return str(self) if str(self) in approved else "source_export_refused"
+
+
+def _git(source: Path, *arguments: str, payload: bytes | None = None) -> bytes:
+    # Export precedes the worker audit hook. Git must use only local objects, not
+    # spawn a demand fetch or inherit caller-selected object/config/helper paths.
+    environment = {
+        key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_SYSTEM=os.devnull,
+        GIT_ALLOW_PROTOCOL="",
+    )
+    try:
+        return subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "--no-lazy-fetch",
+                "-C",
+                str(source),
+                *arguments,
+            ],
+            env=environment,
+            input=payload,
+            stdin=subprocess.DEVNULL if payload is None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SourceExportError("source_export_git_failed") from error
+
+
+def _paths(entries: list[tuple[str, str, str]]) -> None:
+    aliases: dict[str, str] = {}
+    files = {path for path, _, _ in entries}
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+    }
+    for path, _, _ in entries:
+        parts = path.split("/")
+        if any(
+            not part
+            or part in {".", ".."}
+            or part.casefold() == ".git"
+            or part[-1:] in {".", " "}
+            or part.split(".")[0].upper() in reserved
+            or any(ord(char) < 32 or char in '\\:<>"|?*' for char in part)
+            for part in parts
+        ):
+            raise SourceExportError("source_export_path_invalid")
+        for size in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:size])
+            alias = prefix.casefold()
+            if (alias in aliases and aliases[alias] != prefix) or (
+                size < len(parts) and prefix in files
+            ):
+                raise SourceExportError("source_export_path_collision")
+            aliases[alias] = prefix
+
+
+def _materialize_blob(payload):
+    destination, path, mode, content = payload
+    target = destination.joinpath(*path.split("/"))
+    filesystem_started = time.monotonic()
+    with target.open("xb") as stream:
+        stream.write(content)
+    if os.name != "nt":
+        target.chmod(0o755 if mode == "100755" else 0o644)
+    filesystem_seconds = time.monotonic() - filesystem_started
+    manifest_started = time.monotonic()
+    entry = [path, mode, hashlib.sha256(content).hexdigest()]
+    return entry, filesystem_seconds, time.monotonic() - manifest_started
+
+
+def export_tree(source: Path, revision: str, destination: Path) -> dict[str, str | int | float]:
+    """Materialize a declared projection of regular Git blobs, never overlays.
+
+    Git archive export-ignore attributes cannot omit tracked files because this reads
+    the tree/blob objects directly. Symlinks and submodules refuse rather than escape
+    the owned tree. A failed partial export stays in the caller's owned temp directory.
+    """
+    started = time.monotonic()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise SourceExportError("source_export_revision_invalid")
+    if destination.exists() or destination.is_symlink():
+        raise SourceExportError("source_export_destination_not_fresh")
+    commit = _git(source, "rev-parse", f"{revision}^{{commit}}").strip()
+    if commit != revision.encode("ascii"):
+        raise SourceExportError("source_export_revision_mismatch")
+    tree = _git(source, "rev-parse", f"{revision}^{{tree}}").strip()
+    if not re.fullmatch(rb"[0-9a-f]{40}", tree):
+        raise SourceExportError("source_export_tree_invalid")
+    listing = _git(source, "ls-tree", "-rz", "--full-tree", revision)
+    entries = []
+    try:
+        for row in listing.split(b"\0")[:-1]:
+            metadata, name = row.split(b"\t", 1)
+            mode, kind, oid = metadata.decode("ascii").split(" ")
+            if (
+                mode not in {"100644", "100755"}
+                or kind != "blob"
+                or not re.fullmatch(r"[0-9a-f]{40}", oid)
+            ):
+                raise SourceExportError("source_export_entry_invalid")
+            entries.append((name.decode("utf-8"), mode, oid))
+    except (ValueError, UnicodeError) as error:
+        raise SourceExportError("source_export_entry_invalid") from error
+    if (
+        not listing.endswith(b"\0")
+        or not entries
+        or len({p for p, _, _ in entries}) != len(entries)
+    ):
+        raise SourceExportError("source_export_entry_invalid")
+    full_tree_files = len(entries)
+    metadata_prefix = "contributors/emails/"
+    expected_metadata_tree = b"04e3b76fdc46dc1c6b36fd6f4b94701bf975f51d"
+    excluded = [entry for entry in entries if entry[0].startswith(metadata_prefix)]
+    excluded_tree = b""
+    if excluded:
+        excluded_tree = _git(source, "rev-parse", f"{revision}:contributors/emails").strip()
+        if excluded_tree != expected_metadata_tree or len(excluded) != 935:
+            raise SourceExportError("source_export_metadata_projection_changed")
+        entries = [entry for entry in entries if not entry[0].startswith(metadata_prefix)]
+    _paths(entries)
+    requests = "".join(f"{oid}\n" for _, _, oid in entries).encode("ascii")
+    metadata_seconds = time.monotonic() - started
+    blob_read_started = time.monotonic()
+    batch = _git(source, "cat-file", "--batch", payload=requests)
+    blob_read_seconds = time.monotonic() - blob_read_started
+    validation_started = time.monotonic()
+    offset = 0
+    blobs = []
+    try:
+        for path, mode, oid in entries:
+            end = batch.index(b"\n", offset)
+            actual_oid, kind, size_text = batch[offset:end].decode("ascii").split(" ")
+            size = int(size_text)
+            offset = end + 1
+            content = batch[offset : offset + size]
+            if (
+                size < 0
+                or actual_oid != oid
+                or kind != "blob"
+                or len(content) != size
+                or (batch[offset + size : offset + size + 1] != b"\n")
+            ):
+                raise SourceExportError("source_export_blob_invalid")
+            blob_oid = hashlib.sha1(
+                b"blob " + str(size).encode("ascii") + b"\0" + content
+            ).hexdigest()
+            if blob_oid != oid:
+                raise SourceExportError("source_export_blob_invalid")
+            blobs.append((path, mode, content))
+            offset += size + 1
+    except (ValueError, UnicodeError) as error:
+        raise SourceExportError("source_export_blob_invalid") from error
+    if offset != len(batch):
+        raise SourceExportError("source_export_blob_invalid")
+    validation_seconds = time.monotonic() - validation_started
+    materialization_started = time.monotonic()
+    filesystem_started = time.monotonic()
+    destination.mkdir()
+    created_parents = {destination}
+    for path, _, _ in blobs:
+        target = destination.joinpath(*path.split("/"))
+        if target.parent not in created_parents:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created_parents.add(target.parent)
+    filesystem_seconds = time.monotonic() - filesystem_started
+    jobs = [(destination, path, mode, content) for path, mode, content in blobs]
+    # The finite validated input is at most the already materialized Git listing.
+    # Ordered map preserves the manifest; context exit settles workers on failure.
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        materialized = list(workers.map(_materialize_blob, jobs))
+    materialization_wall_seconds = time.monotonic() - materialization_started
+    manifest = [entry for entry, _, _ in materialized]
+    filesystem_seconds += sum(seconds for _, seconds, _ in materialized)
+    manifest_seconds = sum(seconds for _, _, seconds in materialized)
+    manifest_started = time.monotonic()
+    digest = hashlib.sha256(json.dumps(manifest, separators=(",", ":")).encode("utf-8")).hexdigest()
+    manifest_seconds += time.monotonic() - manifest_started
+    return {
+        "source_export_tree": tree.decode("ascii"),
+        "source_export_full_tree_files": full_tree_files,
+        "source_export_excluded_metadata_tree": excluded_tree.decode("ascii"),
+        "source_export_excluded_metadata_files": len(excluded),
+        "source_export_projection": (
+            "committed_without_pinned_attribution_metadata" if excluded else "committed_no_omission"
+        ),
+        "source_export_manifest_sha256": digest,
+        "source_export_files": len(blobs),
+        "source_export_bytes": sum(len(content) for _, _, content in blobs),
+        "source_export_metadata_seconds": round(metadata_seconds, 3),
+        "source_export_blob_read_seconds": round(blob_read_seconds, 3),
+        "source_export_validation_seconds": round(validation_seconds, 3),
+        "source_export_filesystem_work_seconds": round(filesystem_seconds, 3),
+        "source_export_manifest_work_seconds": round(manifest_seconds, 3),
+        "source_export_materialization_wall_seconds": round(materialization_wall_seconds, 3),
+        "source_export_total_seconds": round(time.monotonic() - started, 3),
+        "source_export_timing_semantics": "overlapping_work_and_wall_v1",
+    }

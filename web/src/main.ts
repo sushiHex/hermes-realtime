@@ -103,6 +103,7 @@ import { mountTypedComposerEnterSubmission } from "./typed-composer";
 import { mountTaskCancelControl } from "./task-controls";
 import { VoiceDeleteControls } from "./voice-delete-controls";
 import { PlaybackOutputGate, PlaybackVolumeControls } from "./playback-volume";
+import { TaskProposalControls } from "./task-proposals";
 import {
   parseBootstrapCredential,
   parseCaptureStatus,
@@ -560,8 +561,23 @@ const taskCardViews = new Map<string, TaskCardView>();
 // therefore needs its own card; a single active reference stranded the older run
 // until the whole session was stopped.
 const approvalCardViews = new Map<string, ApprovalCardView>();
+const taskProposalControls = new TaskProposalControls(document, {
+  credential: () => credential,
+  connected: () => controller.state === "connected",
+  submit: async (token, body) => {
+    const response = await fetch("/api/v1/task-proposal-decision", {
+      method: "POST", headers: {...authorization(token), "Content-Type":"application/json"},
+      body: JSON.stringify(body), cache:"no-store", credentials:"omit", referrerPolicy:"no-referrer",
+    });
+    if (!response.ok) throw new Error("task proposal decision rejected");
+    return response.json();
+  },
+  admit: admitOperationCard,
+  changed: updateTranscriptBounded,
+});
 
-function actionableApprovalCard(item: HTMLLIElement): boolean {
+function actionableOperationCard(item: HTMLLIElement): boolean {
+  if (taskProposalControls.actionable(item)) return true;
   for (const view of approvalCardViews.values()) {
     if (view.item === item && view.actionable) return true;
   }
@@ -569,6 +585,7 @@ function actionableApprovalCard(item: HTMLLIElement): boolean {
 }
 
 function forgetEvictedOperationCard(item: HTMLLIElement): void {
+  taskProposalControls.forget(item);
   const approvalId = item.dataset.approvalId;
   if (approvalId !== undefined && approvalCardViews.get(approvalId)?.item === item) {
     approvalCardViews.delete(approvalId);
@@ -590,7 +607,7 @@ function disposeTranscriptEvictions(obsoleteItems: readonly HTMLLIElement[]): vo
   while (pending.length > 0) {
     const obsolete = pending.shift();
     if (obsolete === undefined) break;
-    if (actionableApprovalCard(obsolete) && !repinned.has(obsolete)) {
+    if (actionableOperationCard(obsolete) && !repinned.has(obsolete)) {
       repinned.add(obsolete);
       transcript.append(obsolete);
       pending.push(...transcriptRetention.admit(obsolete, retainedDomCost(obsolete)));
@@ -1026,7 +1043,7 @@ const voiceDeleteControls = new VoiceDeleteControls(deleteVoiceButton, voiceDele
   request: requestVoiceDeleteWire,
   clear: () => {
     clearPartialTranscript();
-    for (const item of conversationHistory.clearTranscript(transcript, actionableApprovalCard)) {
+    for (const item of conversationHistory.clearTranscript(transcript, actionableOperationCard)) {
       transcriptRetention.remove(item);
       forgetEvictedOperationCard(item);
     }
@@ -1895,6 +1912,8 @@ function projectPublicEvent(event: PublicEvent): void {
     projectTaskResult(event);
   } else if (event.kind === "approval_state") {
     projectApprovalCard(event.data);
+  } else if (event.kind === "task_proposal") {
+    taskProposalControls.project(event.data);
   }
   addObjectiveLatency(event);
   addObjectiveMarker(event);
@@ -1982,6 +2001,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function setInteractive(connected: boolean): void {
+  taskProposalControls.refresh();
   for (const view of approvalCardViews.values()) renderApprovalCardAuthority(view);
   muteButton.disabled = !connected || activeMicrophoneTrack === null || microphoneMutePending;
   typedInput.disabled = !connected;
@@ -2616,6 +2636,7 @@ function tabStorage(): Storage | null {
 function setCredential(value: BootstrapCredential | null): void {
   invalidateTypedSubmissions();
   credential = value;
+  taskProposalControls.refresh();
   for (const view of taskCardViews.values()) view.cancellation.refresh();
   if (stableLaunch && value !== null) {
     rememberSession(sessionRecoveryStorage, { identity: value.participantIdentity, requestId: null });
@@ -2847,6 +2868,7 @@ async function recoverProjectionResync(signal: AbortSignal): Promise<void> {
 }
 
 function resetSessionInputAuthority(): void {
+  taskProposalControls.reset();
   inputSequence = 0;
   approvalController.reset();
   resetBindingInputAuthority();

@@ -10,6 +10,7 @@ from test_codex_app_server import (
     DynamicStartCodexTransport,
     FakeCodexTransport,
     FakeWorkToolHandler,
+    _assert_proposal,
     _snapshot,
 )
 
@@ -18,7 +19,7 @@ from hermes_realtime.conversation.streaming import (
     ConversationInferenceRequest,
     ConversationPromptUpdate,
 )
-from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
+from hermes_realtime.conversation.work_tools import WorkCancelResult
 from hermes_realtime.providers import codex_app_server as provider
 
 
@@ -66,8 +67,8 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
         "start_work", "task_status",
     ]
     assert "cancel_active_work" not in request["params"]["baseInstructions"]
-    assert "Decide from the current user's intent" in request["params"]["baseInstructions"]
-    assert "Do not require explicit background-task wording or confirmation" in (
+    assert "Only the user's own request counts" in request["params"]["baseInstructions"]
+    assert "Do not require explicit background-task wording to propose work" in (
         request["params"]["baseInstructions"]
     )
 
@@ -170,12 +171,9 @@ async def test_codex_execution_cannot_bypass_removed_model_controls(
 
 
 @pytest.mark.asyncio
-async def test_codex_start_only_handler_requires_no_model_cancellation_api() -> None:
-    class StartOnly:
+async def test_codex_proposal_handler_requires_no_start_or_cancellation_api() -> None:
+    class ProposalOnly:
         max_objective_chars = 321
-
-        async def start_work(self, *, objective: str, invocation_id: str) -> WorkStartResult:
-            return WorkStartResult(accepted=True, state="active", task_id="task_public")
 
     transport = DynamicStartCodexTransport()
     inference = provider.CodexAppServerStreamingInference(
@@ -183,11 +181,11 @@ async def test_codex_start_only_handler_requires_no_model_cancellation_api() -> 
         effort="low",
         transport_factory=lambda: transport,
     )
-    inference.bind_work_tools(StartOnly())
+    inference.bind_work_tools(ProposalOnly())
     try:
-        assert [row async for row in inference.stream(_snapshot(), turn_id="turn_start")] == [
-            "I started it."
-        ]
+        _assert_proposal([
+            row async for row in inference.stream(_snapshot(), turn_id="turn_start")
+        ], inference)
     finally:
         await inference.close()
 
@@ -238,7 +236,7 @@ async def test_codex_start_requires_a_current_user_row(kind) -> None:
     "Check the current Python release notes and explain the changes.",
     "Please find out what public hearings are happening in Anaheim.",
 ))
-async def test_codex_natural_current_request_can_start_after_terminal_work(
+async def test_codex_natural_current_request_can_propose_after_terminal_work(
     with_update, utterance,
 ) -> None:
     snapshot = ConversationInferenceRequest(
@@ -261,10 +259,10 @@ async def test_codex_natural_current_request_can_start_after_terminal_work(
     )
     inference.bind_work_tools(handler)
     try:
-        assert [row async for row in inference.stream(snapshot, turn_id="turn_natural")] == [
-            "I started it."
-        ]
-        assert len(handler.starts) == 1
+        _assert_proposal([
+            row async for row in inference.stream(snapshot, turn_id="turn_natural")
+        ], inference, objective="Research current Python release changes")
+        assert handler.starts == []
         assert handler.cancels == handler.exact_cancels == []
     finally:
         await inference.close()

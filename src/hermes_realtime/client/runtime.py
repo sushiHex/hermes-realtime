@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.evidence.models import (
     BindingCloseReason,
     CaptureStatusV1,
@@ -65,6 +66,9 @@ class BrowserClientRuntime:
         worker: LiveKitConversationWorker,
         approval: Callable[[str, int, int, str, str], Awaitable[None]],
         static_root: Path,
+        task_proposal_decision: (
+            Callable[[str, int, str, str, str], Awaitable[WorkCommandAdmission]] | None
+        ) = None,
         host: str = "127.0.0.1",
         port: int = 8765,
         lan_mode: bool = False,
@@ -216,6 +220,7 @@ class BrowserClientRuntime:
             submit=submit,
             stop=stop,
             approval=approval,
+            task_proposal_decision=task_proposal_decision,
             projection=projection,
             speech_runtime=speech_runtime,
             model_configuration=model_configuration,

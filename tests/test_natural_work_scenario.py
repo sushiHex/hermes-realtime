@@ -201,9 +201,14 @@ async def test_actual_factory_preflight_surface_and_pending_manual_reviews(
         for wire in wires
     )
     report = scenario.build_report(value, rows, model="test:model")
-    assert report["routing"]["routing_pass"] is True
+    # Provider proposal selection is not historical start acknowledgment or dispatch.
+    assert report["routing"]["routing_pass"] is False
     assert report["routing"]["pass"] is False
-    assert report["controls"]["structural_pass"] is True
+    assert report["controls"]["structural_pass"] is False
+    assert sum(bool(row["proposals"]) for row in rows) == 22
+    assert report["host_proposals"]["count"] == 22
+    assert report["host_proposals"]["scope"] == "selection_only"
+    assert all(row["objectives"] == row["shadow_dispatches"] == [] for row in rows)
     assert report["controls"]["manual_review"] == "pending"
     assert report["pass"] is False
     assert report["routing"]["codex_version"] == "not_executed"
@@ -731,6 +736,89 @@ async def test_development_marker_is_exact_terminal_selection(
         await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1",
                                  observations=rows)
     assert len(rows) == 1 and rows[0]["usable_decision"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    "valid", "subclass", "later", "prior_speech", "after_status", "prior_start_request",
+])
+async def test_development_proposal_is_exact_terminal_selection_without_start_credit(
+    monkeypatch: pytest.MonkeyPatch, development_factory, bad: str,
+) -> None:
+    import dataclasses
+
+    from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
+    from hermes_realtime.conversation.task_status import HostSpeechRequest
+
+    value = scenario.load_development(DEVELOPMENT)
+    value = dataclasses.replace(value, cases=value.cases[-1:])
+    original_factory = scenario.factory
+    if bad == "prior_start_request":
+        original_recorder = scenario.Recorder
+
+        class MixedRecorder(original_recorder):
+            def __init__(self):
+                super().__init__()
+                self.requests.append("Synthetic legacy request")
+
+        monkeypatch.setattr(scenario, "Recorder", MixedRecorder)
+
+    def factory(**options):
+        inference = original_factory(**options)
+        original_stream = inference.stream
+
+        async def stream(snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                async for part in original_stream(snapshot, turn_id=turn_id):
+                    yield part
+                return
+            if bad == "prior_speech":
+                yield "Untrusted model prose."
+            if bad == "after_status":
+                yield HostSpeechRequest()
+            if bad == "subclass":
+                class Forged(HostTaskProposalRequest):
+                    pass
+                yield Forged("Synthetic bounded work")
+            else:
+                yield HostTaskProposalRequest("Synthetic bounded work")
+            if bad == "later":
+                yield "Late model prose."
+
+        inference.stream = stream
+        return inference
+
+    monkeypatch.setattr(scenario, "factory", factory)
+    rows = []
+    if bad == "valid":
+        await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1",
+                                 observations=rows)
+        assert rows[0]["proposals"] == ["Synthetic bounded work"]
+        assert rows[0]["proposal_latency_ms"] is not None
+        assert rows[0]["speech"] == [] and rows[0]["first_speakable_ms"] is None
+        report = scenario.build_development_report(value, rows, model="test:model")
+        assert report["cases"][0]["observed"] == "proposal"
+        assert report["cases"][0]["matched"] is False
+        assert report["host_proposals"]["count"] == 1
+        assert report["host_proposals"]["latency_ms"]["count"] == 1
+        assert report["pass"] is False
+    else:
+        expected_error = {
+            "subclass": "unsupported_inference_output",
+            "later": "host_selection_not_terminal",
+            "after_status": "host_selection_not_terminal",
+            "prior_speech": "host_selection_mixed_output",
+            "prior_start_request": "host_selection_mixed_output",
+        }[bad]
+        with pytest.raises(RuntimeError, match="^" + expected_error + "$"):
+            await scenario.run_cases(value, model="test:model", base_url="http://127.0.0.1:1",
+                                     observations=rows)
+        assert rows[0]["usable_decision"] is False
+    assert len(rows) == 1
+    assert rows[0]["shadow_dispatches"] == []
+    assert rows[0]["objectives"] == (
+        ["Synthetic legacy request"] if bad == "prior_start_request" else []
+    )
 
 
 def test_development_cli_reserves_receipt_before_calls(

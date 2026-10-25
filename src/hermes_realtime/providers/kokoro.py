@@ -346,6 +346,10 @@ class KokoroSynthesizer:
             raise ValueError("projected speech text exceeds supported bounds")
         return projected
 
+    def project_spoken_text(self, text: str) -> str:
+        """Expose the same canonical text sent to the local or worker synthesizer."""
+        return self._project_spoken_text(text)
+
     async def cancel(self, turn_id: str) -> None:
         self._validate_turn_id(turn_id)
         async with self._lock:

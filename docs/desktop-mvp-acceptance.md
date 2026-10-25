@@ -1,10 +1,16 @@
 # Desktop MVP acceptance
 
-Use this procedure for the integrated operator result owned by
-[#159](https://github.com/sushiHex/hermes-realtime/issues/159). The
-[diagnostic guide](desktop-mvp-diagnostic.md) remains the setup, marker and
-step reference. An automated rehearsal or a green CI run cannot establish
-physical audibility, microphone behavior or the operator's experience.
+This procedure preserves the historical explicit-command desktop diagnostic,
+including its Phi4096 profile. Active natural-request acceptance belongs to
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159) under
+[#284's exact-objective confirmation decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
+and the [shared acceptance contract](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6336110969).
+The steps below supply isolation, provenance and lifecycle observations; they do
+not nominate a candidate or control, qualify natural confirmation, or authorize
+execution. The [experimental backend setup reference](ordinary-lookup-setup.md)
+records the separate source-backed lookup configuration and its remaining setup
+limits. An automated rehearsal or green CI cannot establish physical audibility,
+microphone behavior or the operator's experience.
 
 ## Freeze before observing
 
@@ -82,6 +88,148 @@ environment. Do not change a preexisting Ollama service. These are the
 source-backed launch preconditions for this Phi artifact's Go-template path,
 not a universal model-metadata context guard.
 
+### Historical Phi/Qwen background preparation reference
+
+The historical two-model profile uses **Phi only for the Realtime foreground** and
+**Qwen3.5 9B for Hermes background work**. They run in separate, session-owned
+Ollama processes. A foreground context of 4096 is not a suitable replacement for
+Hermes's resolved background context of 64000. The pinned Hermes
+[minimum-context policy](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/model_metadata.py#L410-L413)
+and [route resolution](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L2414-L2439)
+remain authoritative. [#292](https://github.com/sushiHex/hermes-realtime/issues/292)
+tracks a general server-authoritative preflight; these settings describe one
+explicit local route and do not replace that resolver.
+
+Use the official [Ollama v0.40.4 Windows AMD64 archive](https://github.com/ollama/ollama/releases/tag/v0.40.4),
+`ollama-windows-amd64.zip`, not an installer that replaces an existing service.
+Its published archive SHA-256 is
+`7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf`.
+Download and verify it before extracting to a new, otherwise empty directory:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github.com/ollama/ollama/releases/download/v0.40.4/ollama-windows-amd64.zip" `
+  -OutFile "<test-downloads>\ollama-windows-amd64.zip"
+$actual = (Get-FileHash "<test-downloads>\ollama-windows-amd64.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne "7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf") {
+  throw "Ollama archive identity differs"
+}
+Expand-Archive -LiteralPath "<test-downloads>\ollama-windows-amd64.zip" `
+  -DestinationPath "<test-ollama-runtime>"
+```
+
+Keep the extracted runtime closure intact and record its actual file hashes;
+do not copy just `ollama.exe` or substitute a different runner directory.
+The reviewed runtime source is
+[`45e6011815c74acde6a346512856b69dd79dd22b`](https://github.com/ollama/ollama/tree/45e6011815c74acde6a346512856b69dd79dd22b).
+
+Model tags are mutable. Require these **manifest** identities, not just matching
+model names, file sizes or declared tool support:
+
+| Role | Model name in the frozen install | Manifest SHA-256 |
+| --- | --- | --- |
+| Foreground | `phi4-mini:latest` | `78fad5d182a7c33065e153a5f8ba210754207ba9d91973f57dffa7f487363753` |
+| Background | `qwen3.5:9b` | `6488c96fa5faab64bb65cbd30d4289e20e6130ef535a93ef9a49f42eda893ea7` |
+
+For an available installation, hash the actual manifest, its config blob and
+every referenced layer blob; require each descriptor's exact hash and byte size.
+Compare the owned server's `/api/tags` digest and `/api/show` metadata with those
+files. The frozen Qwen config has native renderer/parser `qwen3.5` and no template
+layer. Its `/api/show` fallback template is metadata, not an artifact template.
+A changed tag, a split projector/template artifact or cloud-backed weights is
+a different candidate. Do not silently repull, create an alias or rewrite a
+manifest to make it match. Fresh retrieval of the frozen Qwen manifest through
+a supported public install command remains a setup prerequisite, not a promise
+that `ollama pull qwen3.5:9b` obtains the table's artifact.
+
+The 2026-10-19 metadata-only registry check found a different current tag:
+`56671c2ab9385f9cfcb404638e32cd62d88e3501d44822208363c010179a3c90`.
+Its config and weights changed, and it adds projector/template layers. The
+frozen manifest's digest endpoint returned 404, while HEAD requests for its old
+config and weights returned 200 with the expected sizes. This establishes
+neither complete artifact loss nor a verified installation route. Keep this
+retrieval gap explicit; the frozen local install is a diagnostic candidate,
+not evidence that a fresh contributor can reproduce it from the current tag.
+
+Reserve separate free literal-loopback ports for the two Ollama servers, API,
+companion and host. Use a dedicated test model store; do not pull into, prune or
+replace the personal service's store. Build each server's child environment
+separately: remove inherited `OLLAMA_*` and `LLAMA_ARG_*` overrides first, then
+apply the settings for that role. Do not set these in the user's environment.
+The background column records the installed API gate's server settings; the
+foreground column describes the prepared voice candidate, not human acceptance.
+
+| Child setting | Phi foreground server | Qwen background server |
+| --- | --- | --- |
+| `OLLAMA_HOST` | `127.0.0.1:<foreground-ollama-port>` | `127.0.0.1:<background-ollama-port>` |
+| `OLLAMA_MODELS` | `<test-model-store>` | `<test-model-store>` |
+| `OLLAMA_NUM_PARALLEL` / `OLLAMA_MAX_LOADED_MODELS` | `1` / `1` | `1` / `1` |
+| `OLLAMA_NO_CLOUD` | `1` | `1` |
+| `OLLAMA_NOPRUNE` / `OLLAMA_DEBUG_LOG_REQUESTS` | `1` / `0` | `1` / `0` |
+| `OLLAMA_CONTEXT_LENGTH` | Unset; the host sends `num_ctx=4096` | `64000` |
+| `OLLAMA_GO_TEMPLATE` | `1` | Unset; the artifact selects its native renderer |
+| `OLLAMA_KV_CACHE_TYPE` | Unset (`f16`) | `q8_0` |
+| `OLLAMA_FLASH_ATTENTION` | No additional foreground requirement | `1` |
+| `LLAMA_ARG_CONTEXT_SHIFT` | Unset | Unset |
+
+These switches are defined by the pinned
+[Ollama environment configuration](https://github.com/ollama/ollama/blob/45e6011815c74acde6a346512856b69dd79dd22b/envconfig/config.go).
+Leave speculative-decoding settings unchanged. The profile does not qualify
+every draft/cache configuration or transfer the foreground no-truncation
+contract to Hermes's background API.
+
+In the fresh isolated Hermes home's `config.yaml`, use this model section with
+the background server's actual port. Keep its other setup sections and explicit
+manual-approval policy. Do not carry over a named custom-provider route or an
+environment override pointing elsewhere:
+
+```yaml
+model:
+  provider: custom
+  default: qwen3.5:9b
+  base_url: "http://127.0.0.1:<background-ollama-port>/v1"
+  context_length: 64000
+```
+
+The frozen candidate omitted the `memory` section. An absent `memory.provider`
+leaves the
+[external provider inactive](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/agent/agent_init.py#L1905-L1907);
+omitted `memory_enabled` and `user_profile_enabled` use the
+[pinned enabled defaults](https://github.com/NousResearch/hermes-agent/blob/29112bef099274229cadff79cdff7bf7b99c4b77/tools/memory_tool.py#L1198-L1204).
+Record a config-only inspection as such. It does not establish a running
+gateway's effective memory state or prove that no data left the machine.
+The diagnostic guide's `hermes memory off` / `status` commands belong to
+intentional isolated-home setup: CLI startup can perform recovery and provider
+discovery, so do not describe an unexecuted status command as a read-only runtime
+readback. Do not print provider configuration, memory contents or credentials.
+
+### Public walkthrough boundary
+
+[#295](https://github.com/sushiHex/hermes-realtime/issues/295) owns the exact-profile
+walkthrough. The preparation reference above does not supply a complete public
+supervisor or claim that walkthrough passed. The existing
+[`Processes` / `Containment` utilities](../scripts/rehearse_desktop_mvp.py)
+provide hidden, stdin-disconnected Job ownership and bounded forced settlement;
+they do not provide this two-model setup as a command. The full rehearsal uses a
+stand-in Hermes model and cannot substitute for this real-model procedure.
+
+Before treating this as a contributor-reproducible acceptance setup, the public
+path must also provide and verify: retrieval of the exact frozen models; actual
+wheel-to-install file equality from the opening steps; owned hidden launch of
+both servers, gateway and installed host; graceful host/gateway stop before
+forced fallback; and fresh final process/listener verification. A private helper
+is not that public path. If any step lacks a published, reviewed mechanism,
+record the walkthrough `not_run` with that precise gap instead of improvising
+process-name kills or claiming setup completion.
+
+Readiness metadata is not allocation proof: advertised model context and
+`/api/ps` options alone do not show the backend's actual per-sequence context or
+K/V allocation. Record bounded numeric backend witnesses for the selected run;
+raw Ollama output can contain prompts and must not become public evidence.
+Individual offload counts and one warm overlap sample do not establish spare
+capacity, ordinary-length voice responsiveness or human acceptance. Record
+resource headroom and actual latency observations under #159; do not evict
+unrelated workloads to make the profile fit.
 An explicitly nominated configuration may also use `--ollama-num-gpu` to send a
 GPU-layer override through the normal host factory and adapter. Omission keeps
 the runtime default; 0 requests CPU layers. The accepted range 0–1024 is an
@@ -149,21 +297,21 @@ Record refusals as well as passes; do not describe a different installed Hermes
 revision as the pinned baseline. If a prerequisite fails, keep later results
 diagnostic and leave acceptance pending.
 
-Use the diagnostic guide's initial profile: Windows Chrome, literal loopback,
+For this historical explicit-command diagnostic, use Windows Chrome, literal loopback,
 built-in memory, evidence capture and public search off, and explicit task
-commands with natural work tools disabled. The current [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
-keeps natural routing off and starts work only through deterministic explicit
+commands with natural work tools disabled. The historical [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
+kept natural routing off and started work only through deterministic explicit
 commands. The model default remains unchanged unless and until this owner
 acceptance passes and a separate default-change is made.
 
 [ADR 0004](adr/0004-model-action-authority.md) remains the design record for
-model-proposed work. If natural routing is considered again, the [#284 owner
+model-proposed work. For the active natural-request scope, the [#284 owner
 decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
 requires explicit user confirmation of the proposed objective before dispatch.
-That future flow is outside this MVP acceptance procedure and needs its own
-implementation and qualification; it grants no model cancellation or approval
-authority. Current acceptance covers explicit task commands, task-card Cancel,
-and interruption independence only.
+That flow is outside this historical diagnostic; its acceptance remains under
+the shared #159 contract linked above. It grants no model cancellation or approval
+authority. The steps here cover explicit task commands, task-card Cancel, and
+interruption independence only.
 
 Before starting, declare the observations: final transcript to first token,
 first token to audio, task acknowledgment/completion/cancellation, and reconnect

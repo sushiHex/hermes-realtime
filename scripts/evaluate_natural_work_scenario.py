@@ -21,6 +21,7 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
 from hermes_realtime.conversation.context import ConversationContextStore, ConversationMessage
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.tasks import TaskDispatchOutcome
 from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
@@ -404,6 +405,8 @@ async def run_cases(
             "error": None,
             "speech": [],
             "objectives": recorder.requests,
+            "proposals": [],
+            "proposal_latency_ms": None,
             "shadow_dispatches": recorder.objectives,
             "first_speakable_ms": None,
             "host_status_request_ms": None,
@@ -433,8 +436,16 @@ async def run_cases(
                 inference=inference, request=request, revision=revision, row=row, recorder=recorder
             ):
                 async for segment in inference.stream(request, turn_id=f"turn_scenario_{revision}"):
-                    if row["host_status_request_ms"] is not None:
+                    if row["host_status_request_ms"] is not None or row["proposals"]:
                         raise RuntimeError("host_selection_not_terminal")
+                    if type(segment) is HostTaskProposalRequest:
+                        if recorder.requests or row["speech"]:
+                            raise RuntimeError("host_selection_mixed_output")
+                        row["proposals"].append(segment.objective)
+                        row["proposal_latency_ms"] = (
+                            time.monotonic() - recorder.started) * 1000
+                        recorder.events.append("host_proposal_selected")
+                        continue
                     if type(segment) is HostSpeechRequest:
                         if recorder.requests or row["speech"]:
                             raise RuntimeError("host_selection_mixed_output")
@@ -519,9 +530,10 @@ def build_development_report(
     for case, row in zip(value.cases, rows, strict=True):
         expected = value.expected_decision(case)
         observed = ("task_status" if row["host_status_request_ms"] is not None else (
+            "proposal" if row.get("proposals") else (
             "start_work" if row["objectives"] else (
                 "reply" if any(legacy._is_speakable(text) for text in row["speech"])
-                else "invalid")))
+                else "invalid"))))
         observations.append({"id": case.case_id, "expected": expected, "observed": observed,
                              "matched": row["usable_decision"] and observed == expected})
         if row["host_status_request_ms"] is not None:
@@ -534,6 +546,7 @@ def build_development_report(
         "clarification_review": "pending", "pass": False,
         "host_status_requests": {"scope": "selection_only", "count": len(selections),
                                  "latency_ms": legacy.latency_distribution(selections)},
+        "host_proposals": proposal_summary(rows),
         "first_speakable_ms": legacy.latency_distribution([
             row["first_speakable_ms"] for row in rows if row["first_speakable_ms"] is not None]),
         "start_proposal_ms": legacy.latency_distribution([
@@ -574,6 +587,7 @@ def build_report(value: Scenario, rows: list[dict[str, Any]], *, model: str) -> 
         "scenario_id": value.scenario_id,
         "input_sha256": list(value.bindings.values()),
         "routing": routing,
+        "host_proposals": proposal_summary(rows),
         "framing_pass": all(row["usable_decision"] for row in rows),
         "controls": {
             "total": len(value.controls),
@@ -589,6 +603,13 @@ def build_report(value: Scenario, rows: list[dict[str, Any]], *, model: str) -> 
         "runtime_ownership": "external",
         "speech_preflight": "synthetic_pcm_not_voice_acceptance",
     }
+
+
+def proposal_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Observe proposal selection separately; historical start gates remain unchanged."""
+    latencies = [row["proposal_latency_ms"] for row in rows if row.get("proposals")]
+    return {"scope": "selection_only", "count": len(latencies),
+            "latency_ms": legacy.latency_distribution(latencies)}
 
 
 def source_binding() -> dict[str, Any]:

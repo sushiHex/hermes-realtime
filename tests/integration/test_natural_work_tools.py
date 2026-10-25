@@ -18,9 +18,14 @@ from hermes_realtime.conversation import (
     ConversationTaskController,
     ConversationUpdateExecutor,
     ConversationWorkControlSurface,
-    WorkCancelResult,
     WorkStartResult,
 )
+from hermes_realtime.conversation.task_proposals import (
+    ConversationTaskProposals,
+    HostTaskProposalRequest,
+    TaskProposal,
+)
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.conversation.worker import ConversationSessionWorker
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
 from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
@@ -406,7 +411,9 @@ class ToolCallingCodexTransport:
         response: dict[str, object],
     ) -> None:
         payload = _tool_payload(response)
-        if payload["state"] == "cancelling":
+        if payload == {"proposed": True, "requires_confirmation": True}:
+            delta = "Please confirm the proposed task."
+        elif payload["state"] == "cancelling":
             delta = "I requested cancellation."
         elif payload["accepted"] is True:
             delta = "I started it."
@@ -472,12 +479,38 @@ class NaturalWorkRuntime:
     context: ConversationContextStore
     controller: ConversationTaskController
     surface: ConversationWorkControlSurface
+    proposals: ConversationTaskProposals
     browser_events: list[tuple[str, dict[str, str | int | bool | None]]]
     cancel_attempts: list[tuple[str, str | None]]
     runtime_name: str
     work_tool_timeout_seconds: float = 0.75
     inferences: list[CodexAppServerStreamingInference] = field(default_factory=list)
     _transport_counter: Any = field(default_factory=lambda: count(1))
+    offered: list[TaskProposal] = field(default_factory=list)
+    proposal_offered: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def collect(self, stream: AsyncIterator[Any]) -> list[Any]:
+        segments = []
+        async for segment in stream:
+            if type(segment) is HostTaskProposalRequest:
+                self.offered.append(self.proposals.offer(segment))
+                self.proposal_offered.set()
+            segments.append(segment)
+        return segments
+
+    async def confirm(self, proposal: TaskProposal | None = None) -> WorkCommandAdmission:
+        target = self.offered[-1] if proposal is None else proposal
+        return await self.proposals.decide(
+            participant="browser_user", generation=1, proposal_id=target.proposal_id,
+            objective=target.objective, decision="confirm",
+        )
+
+    async def settle(self, proposal: TaskProposal | None = None) -> WorkStartResult:
+        target = self.offered[-1] if proposal is None else proposal
+        # Observe the real operation created by host admission; never submit another start.
+        binding = self.surface._bindings["confirmed_" + target.proposal_id]
+        return await asyncio.wait_for(asyncio.shield(binding.operation), timeout=1)
+
 
     def new_inference(
         self,
@@ -487,7 +520,6 @@ class NaturalWorkRuntime:
         duplicate_request: bool = False,
         second_model_call: bool = False,
         hold_for_interrupt: bool = False,
-        handler: Any = None,
         evidence_identity: tuple[str, str, str] | None = None,
         allow_unadvertised_tool: bool = False,
     ) -> tuple[CodexAppServerStreamingInference, ToolCallingCodexTransport]:
@@ -513,7 +545,7 @@ class NaturalWorkRuntime:
             request_timeout_seconds=1,
             work_tool_timeout_seconds=self.work_tool_timeout_seconds,
         )
-        inference.bind_work_tools(self.surface if handler is None else handler)
+        inference.bind_work_tools(self.proposals)
         self.inferences.append(inference)
         return inference, transport
 
@@ -527,7 +559,7 @@ class NaturalWorkRuntime:
         second_model_call: bool = False,
         evidence_identity: tuple[str, str, str] | None = None,
         allow_unadvertised_tool: bool = False,
-    ) -> tuple[list[str], ToolCallingCodexTransport]:
+    ) -> tuple[list[Any], ToolCallingCodexTransport]:
         self.context.record_user_transcript(Transcript(text=text, final=True))
         inference, transport = self.new_inference(
             tool=tool,
@@ -537,13 +569,9 @@ class NaturalWorkRuntime:
             evidence_identity=evidence_identity,
             allow_unadvertised_tool=allow_unadvertised_tool,
         )
-        segments = [
-            segment
-            async for segment in inference.stream(
-                self.context.snapshot(),
-                turn_id=f"foreground_{len(self.inferences)}",
-            )
-        ]
+        segments = await self.collect(inference.stream(
+            self.context.snapshot(), turn_id=f"foreground_{len(self.inferences)}",
+        ))
         _assert_model_visible_values_are_private_token_free(
             segments,
             transport.sent,
@@ -556,9 +584,9 @@ class NaturalWorkRuntime:
     async def invoke_typed(
         self,
         text: str,
-    ) -> tuple[list[str], ToolCallingCodexTransport]:
+    ) -> tuple[list[Any], ToolCallingCodexTransport]:
         inference, transport = self.new_inference()
-        segments: list[str] = []
+        segments: list[Any] = []
         executor = object.__new__(ConversationUpdateExecutor)
         response_reservation = object()
 
@@ -577,15 +605,9 @@ class NaturalWorkRuntime:
             assert authority is None
             assert reservation is response_reservation
             self.context.record_user_transcript(transcript)
-            segments.extend(
-                [
-                    segment
-                    async for segment in inference.stream(
-                        self.context.snapshot(),
-                        turn_id=turn_id,
-                    )
-                ]
-            )
+            segments.extend(await self.collect(inference.stream(
+                self.context.snapshot(), turn_id=turn_id,
+            )))
 
         async def cancel_foreground(
             actions: ConversationUpdateExecutor,
@@ -655,6 +677,10 @@ class NaturalWorkRuntime:
         return segments, transport
 
     async def close(self) -> None:
+        self.proposals.close_binding()
+        # Release owned stub requests even if an assertion failed before acknowledgment.
+        self.stub.create_gate.set()
+        self.stub.complete(status="cancelled")
         failures: list[BaseException] = []
         if self.context.snapshot().active_tasks:
             self.stub.complete(status="cancelled")
@@ -764,12 +790,17 @@ async def _runtime(
         utterance_id_factory=lambda: "cross_layer_utterance",
         start_projection_gate=start_projection_gate,
     )
+    proposals = ConversationTaskProposals(
+        surface=surface, observer=lambda kind, data: browser_events.append((kind, dict(data))),
+    )
+    proposals.bind("browser_user", 1)
     return NaturalWorkRuntime(
         stub=stub,
         runner=runner,
         context=context,
         controller=controller,
         surface=surface,
+        proposals=proposals,
         browser_events=browser_events,
         cancel_attempts=cancel_attempts,
         runtime_name=runtime_name,
@@ -802,47 +833,78 @@ def _assert_model_visible_values_are_private_token_free(*values: object) -> None
             pending.extend(getattr(value, name) for name in value.__dataclass_fields__)
 
 
-_EXPECTED_ACCEPTED_START_SPEECH = ["I started it."]
+_PROPOSAL_RECEIPT = {"proposed": True, "requires_confirmation": True}
+_UNCERTAIN_REASON = (
+    "Task command acknowledgment is uncertain. Check task status before trying again."
+)
+
+
+def _assert_proposal_only(parts: list[Any], transport: ToolCallingCodexTransport) -> None:
+    assert len(parts) == 1
+    assert type(parts[0]) is HostTaskProposalRequest
+    assert _tool_payload(transport.tool_responses[0]) == _PROPOSAL_RECEIPT
 
 
 @pytest.mark.asyncio
 async def test_typed_natural_start_crosses_codex_and_202_authority_once() -> None:
     runtime = await _runtime()
     try:
-        spoken, transport = await runtime.invoke_typed(
-            "Please inspect the release evidence and report back."
+        parts, transport = await runtime.invoke_typed(
+            "Please inspect the release evidence and report back.",
         )
+        _assert_proposal_only(parts, transport)
+        assert parts[0].objective == "Inspect the release evidence"
+        assert runtime.stub.posts == []
+        assert runtime.context.snapshot().active_tasks == ()
+        assert [data["status"] for kind, data in runtime.browser_events] == ["pending"]
 
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        result = await runtime.settle()
+        assert result.accepted and result.state == "active" and result.task_id == "task_cross1"
         assert len(runtime.stub.posts) == 1
         dispatch_body = runtime.stub.posts[0]
-        assert dispatch_body["input"] == "Inspect the release evidence"
+        assert dispatch_body["input"] == parts[0].objective
         instructions = dispatch_body["instructions"]
         assert isinstance(instructions, str)
         assert "one parallel batch" in instructions
         assert "at most 1800 characters" in instructions
-        assert spoken == _EXPECTED_ACCEPTED_START_SPEECH
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": True,
-            "state": "active",
-            "task_id": "task_cross1",
-        }
-        assert runtime.context.snapshot().active_tasks == (
-            runtime.context.snapshot().active_tasks[0],
-        )
-        assert runtime.context.snapshot().active_tasks[0].task_id == "task_cross1"
-        assert runtime.browser_events == [
-            (
-                "task_state",
-                {"status": "active", "taskId": "task_cross1"},
-            )
+        assert [task.task_id for task in runtime.context.snapshot().active_tasks] == ["task_cross1"]
+        assert [kind for kind, _ in runtime.browser_events] == [
+            "task_proposal", "task_proposal", "task_state",
+        ]
+        assert [data["status"] for _, data in runtime.browser_events] == [
+            "pending", "confirmed", "active",
+        ]
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "active", "taskId": "task_cross1"},
         ]
         _assert_model_visible_values_are_private_token_free(
-            spoken,
-            transport.sent,
-            transport.tool_responses,
-            runtime.context.snapshot(),
-            runtime.browser_events,
+            parts, transport.sent, transport.tool_responses,
+            runtime.context.snapshot(), runtime.browser_events,
         )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decline", [False, True])
+async def test_unconfirmed_or_declined_proposal_never_submits_a_hermes_run(decline: bool) -> None:
+    runtime = await _runtime()
+    try:
+        parts, transport = await runtime.invoke("Inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        proposal = runtime.offered[-1]
+        if decline:
+            assert await runtime.proposals.decide(
+                participant="browser_user", generation=1, proposal_id=proposal.proposal_id,
+                objective=proposal.objective, decision="decline",
+            ) is WorkCommandAdmission.REFUSED
+        # Join all actual work operations, so a wrongly queued start cannot hide behind scheduling.
+        await runtime.surface.close()
+        assert runtime.stub.posts == []
+        assert runtime.context.snapshot().active_tasks == ()
+        assert all(kind != "task_state" for kind, _ in runtime.browser_events)
+        assert all("started" not in part.lower() for part in parts if type(part) is str)
     finally:
         await runtime.close()
 
@@ -851,24 +913,22 @@ async def test_typed_natural_start_crosses_codex_and_202_authority_once() -> Non
 async def test_hermes_rejection_cannot_produce_active_state_or_started_claim() -> None:
     runtime = await _runtime(mode="rejected")
     try:
-        spoken, transport = await runtime.invoke("Please inspect the release.")
-
-        payload = _tool_payload(transport.tool_responses[0])
-        assert payload == {
-            "accepted": False,
-            "state": "rejected",
-            "task_id": "task_cross1",
-            "reason": "Hermes API rejected dispatch",
-        }
-        assert spoken == ["I couldn't start that work."]
+        parts, transport = await runtime.invoke("Please inspect the release.")
+        _assert_proposal_only(parts, transport)
+        assert runtime.stub.posts == []
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        result = await runtime.settle()
+        assert result.accepted is False and result.state == "rejected"
+        assert result.task_id == "task_cross1" and result.reason == "Hermes API rejected dispatch"
+        assert len(runtime.stub.posts) == 1
         assert runtime.context.snapshot().active_tasks == ()
-        assert "started" not in " ".join(spoken).lower()
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": "task_cross1",
+             "reason": "Hermes API rejected dispatch"},
+        ]
+        assert all(type(part) is HostTaskProposalRequest for part in parts)
         _assert_model_visible_values_are_private_token_free(
-            payload,
-            spoken,
-            transport.sent,
-            runtime.browser_events,
-            runtime.context.snapshot(),
+            parts, transport.sent, runtime.browser_events, runtime.context.snapshot(),
         )
     finally:
         await runtime.close()
@@ -876,7 +936,7 @@ async def test_hermes_rejection_cannot_produce_active_state_or_started_claim() -
 
 def test_private_namespace_scanner_does_not_reserve_ordinary_run_words() -> None:
     _assert_model_visible_values_are_private_token_free(
-        "Please run_report and summarize the brunch_run_notes."
+        "Please run_report and summarize the brunch_run_notes.",
     )
 
 
@@ -887,30 +947,21 @@ async def test_model_forged_delegation_objective_is_rejected_before_dispatch() -
         arguments={"objective": "Inspect deleg_forged_model_authority"},
     )
     runtime.context.record_user_transcript(
-        Transcript(text="Inspect the release evidence.", final=True)
+        Transcript(text="Inspect the release evidence.", final=True),
     )
     try:
         with pytest.raises(RuntimeError, match="Codex app-server reader failed"):
-            await _collect(
-                inference.stream(
-                    runtime.context.snapshot(),
-                    turn_id="forged_private_objective",
-                )
-            )
-
+            await _collect(inference.stream(runtime.context.snapshot(), turn_id="forged_private"))
         assert runtime.stub.posts == []
         assert runtime.cancel_attempts == []
         assert runtime.context.snapshot().active_tasks == ()
+        assert runtime.offered == []
         assert len(transport.tool_responses) == 1
         assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work request rejected",
+            "accepted": False, "state": "rejected", "reason": "work request rejected",
         }
         _assert_model_visible_values_are_private_token_free(
-            transport.sent,
-            transport.tool_responses,
-            runtime.browser_events,
+            transport.sent, transport.tool_responses, runtime.browser_events,
             runtime.context.snapshot(),
         )
     finally:
@@ -919,26 +970,20 @@ async def test_model_forged_delegation_objective_is_rejected_before_dispatch() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["timeout", "disconnect"])
-async def test_uncertain_http_failure_blocks_later_work_admission(
-    mode: str,
-) -> None:
+async def test_uncertain_http_failure_blocks_later_work_admission(mode: str) -> None:
     runtime = await _runtime(mode=mode, request_timeout_seconds=0.05)
     try:
-        first_spoken, first_transport = await runtime.invoke("Please inspect the release.")
-        second_spoken, second_transport = await runtime.invoke("Try another background inspection.")
-
-        assert first_spoken == ["I couldn't start that work."]
-        assert second_spoken == ["I couldn't start that work."]
-        assert _tool_payload(first_transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work control is unavailable",
-        }
-        assert _tool_payload(second_transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work control unavailable; restart required",
-        }
+        first, first_transport = await runtime.invoke("Please inspect the release.")
+        _assert_proposal_only(first, first_transport)
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        with pytest.raises(RuntimeError, match="Hermes API request failed"):
+            await runtime.settle()
+        second, second_transport = await runtime.invoke("Try another background inspection.")
+        _assert_proposal_only(second, second_transport)
+        assert await runtime.confirm() is WorkCommandAdmission.UNAVAILABLE
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
         assert runtime.surface.health == "uncertain"
         assert len(runtime.stub.posts) == 1
         assert runtime.context.snapshot().active_tasks == ()
@@ -952,39 +997,32 @@ async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> No
     runtime = await _runtime()
     try:
         await runtime.invoke("Please inspect the release evidence.")
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        await runtime.settle()
         await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
-
         result = await runtime.surface.cancel_active_work(invocation_id="direct_cancel")
-        assert result.accepted is True
-        assert result.state == "cancelling"
-        assert result.task_id == "task_cross1"
+        assert result.accepted and result.state == "cancelling" and result.task_id == "task_cross1"
         assert runtime.stub.stop_calls == 1
         assert len(runtime.context.snapshot().active_tasks) == 1
-
         runtime.stub.complete(status="cancelled")
-        terminal = await asyncio.wait_for(
-            runtime.controller.next_completion(),
-            timeout=1,
-        )
-        assert terminal.task_id == "task_cross1"
-        assert terminal.status == "interrupted"
+        terminal = await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
+        assert terminal.task_id == "task_cross1" and terminal.status == "interrupted"
         assert runtime.context.snapshot().active_tasks == ()
         assert runtime.stub.stop_calls == 1
-
-        # The first run's terminal event must not terminate the independent new run.
         runtime.stub.terminal_ready.clear()
-        _, transport = await runtime.invoke(
+        parts, transport = await runtime.invoke(
             "What changed in the current release?",
             arguments={"objective": "Research current release changes."},
         )
-        assert len(runtime.stub.posts) == 2
-        assert runtime.stub.stop_calls == 1
-        assert len(runtime.context.snapshot().active_tasks) == 1
-        new_task_id = runtime.context.snapshot().active_tasks[0].task_id
-        assert new_task_id != terminal.task_id
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": True, "state": "active", "task_id": new_task_id,
-        }
+        _assert_proposal_only(parts, transport)
+        assert len(runtime.stub.posts) == 1
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        accepted = await runtime.settle()
+        assert accepted.accepted and accepted.task_id != terminal.task_id
+        assert len(runtime.stub.posts) == 2 and runtime.stub.stop_calls == 1
+        assert [task.task_id for task in runtime.context.snapshot().active_tasks] == [
+            accepted.task_id,
+        ]
     finally:
         await runtime.close()
 
@@ -992,23 +1030,23 @@ async def test_direct_cancel_stops_exact_run_once_and_waits_for_terminal() -> No
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mode", "expected_stop_calls", "expected_start_state"),
-    [
-        ("accepted", 1, "cancelling"),
-        ("rejected", 0, "rejected"),
-    ],
+    [("accepted", 1, "cancelling"), ("rejected", 0, "rejected")],
 )
 async def test_cancel_while_dispatch_pending_settles_after_late_ack(
-    mode: str,
-    expected_stop_calls: int,
-    expected_start_state: str,
+    mode: str, expected_stop_calls: int, expected_start_state: str,
 ) -> None:
     runtime = await _runtime(mode=mode)
     runtime.stub.create_gate.clear()
     try:
-        start_task = asyncio.create_task(runtime.invoke("Please inspect the release evidence."))
+        parts, transport = await runtime.invoke("Please inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        assert runtime.stub.posts == []
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
         await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=1)
+        assert runtime.context.snapshot().active_tasks == ()
+        assert not any(kind == "task_state" for kind, _ in runtime.browser_events)
         cancel_task = asyncio.create_task(
-            runtime.surface.cancel_active_work(invocation_id="direct_pending_cancel")
+            runtime.surface.cancel_active_work(invocation_id="direct_pending_cancel"),
         )
 
         async def wait_for_pending_cancel() -> None:
@@ -1020,28 +1058,18 @@ async def test_cancel_while_dispatch_pending_settles_after_late_ack(
 
         await asyncio.wait_for(wait_for_pending_cancel(), timeout=1)
         assert runtime.stub.stop_calls == 0
-
         runtime.stub.create_gate.set()
-        (start_spoken, start_transport), cancel_result = await asyncio.gather(
-            start_task, cancel_task,
-        )
-
-        start_payload = _tool_payload(start_transport.tool_responses[0])
-        cancel_payload = {"state": cancel_result.state, "accepted": cancel_result.accepted}
-        assert start_payload["state"] == expected_start_state
-        assert cancel_payload["state"] == expected_start_state
+        started, cancelled = await asyncio.gather(runtime.settle(), cancel_task)
+        assert started.state == cancelled.state == expected_start_state
+        assert started.accepted is cancelled.accepted is (mode == "accepted")
         assert runtime.stub.stop_calls == expected_stop_calls
-        assert "started" not in " ".join(start_spoken).lower()
         if mode == "accepted":
-            assert start_payload["accepted"] is True
-            assert cancel_payload["accepted"] is True
             runtime.stub.complete(status="cancelled")
             await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
         else:
-            assert start_payload["accepted"] is False
-            assert cancel_payload["accepted"] is False
             assert runtime.context.snapshot().active_tasks == ()
     finally:
+        runtime.stub.create_gate.set()
         await runtime.close()
 
 
@@ -1049,23 +1077,21 @@ async def test_cancel_while_dispatch_pending_settles_after_late_ack(
 async def test_duplicate_model_call_and_jsonrpc_replay_issue_one_hermes_post() -> None:
     runtime = await _runtime()
     try:
-        spoken, transport = await runtime.invoke(
-            "Inspect the release evidence.",
-            duplicate_request=True,
-            second_model_call=True,
+        parts, transport = await runtime.invoke(
+            "Inspect the release evidence.", duplicate_request=True, second_model_call=True,
         )
-
-        assert spoken == _EXPECTED_ACCEPTED_START_SPEECH
-        assert len(transport.tool_responses) == 3
-        assert transport.tool_responses[0]["id"] == 91
-        assert transport.tool_responses[1]["id"] == 92
-        assert transport.tool_responses[2]["id"] == 93
+        _assert_proposal_only(parts, transport)
+        assert len(runtime.offered) == 1 and runtime.stub.posts == []
+        assert [response["id"] for response in transport.tool_responses] == [91, 92, 93]
         assert transport.tool_responses[0]["result"] == transport.tool_responses[1]["result"]
         assert _tool_payload(transport.tool_responses[2]) == {
-            "accepted": False,
-            "state": "rejected",
+            "accepted": False, "state": "rejected",
             "reason": "one knowledge search or work start is allowed per turn",
         }
+        proposal = runtime.offered[-1]
+        assert await runtime.confirm(proposal) is WorkCommandAdmission.ADMITTED
+        assert await runtime.confirm(proposal) is WorkCommandAdmission.REFUSED
+        assert (await runtime.settle(proposal)).accepted
         assert len(runtime.stub.posts) == 1
         assert len(runtime.context.snapshot().active_tasks) == 1
     finally:
@@ -1077,21 +1103,21 @@ async def test_exact_cancel_of_second_task_preserves_first_task_authority() -> N
     runtime = await _runtime()
     try:
         await runtime.invoke("Inspect the release evidence.")
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        first = await runtime.settle()
         await runtime.invoke(
             "Audit the dependency licenses too.",
-            arguments={"objective": "Audit the dependency licenses."},
+            arguments={"objective": "Audit dependency licenses."},
         )
-
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        second = await runtime.settle()
         result = await runtime.surface.cancel_work(
-            task_id="task_cross3", invocation_id="direct_exact_cancel",
+            task_id=second.task_id, invocation_id="direct_exact_cancel",
         )
-        assert result.accepted is True
-        assert result.state == "cancelling"
-        assert result.task_id == "task_cross3"
+        assert result.accepted and result.state == "cancelling" and result.task_id == second.task_id
         assert runtime.stub.stopped_run_ids == [_SECOND_API_RUN_ID]
         assert {task.task_id for task in runtime.context.snapshot().active_tasks} == {
-            "task_cross1",
-            "task_cross3",
+            first.task_id, second.task_id,
         }
     finally:
         await runtime.close()
@@ -1102,110 +1128,104 @@ async def test_second_distinct_natural_start_is_accepted_while_one_task_is_activ
     runtime = await _runtime()
     try:
         await runtime.invoke("Inspect the release evidence.")
-        spoken, transport = await runtime.invoke(
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        first = await runtime.settle()
+        parts, transport = await runtime.invoke(
             "Audit the dependency licenses too.",
-            arguments={"objective": "Audit the dependency licenses."},
+            arguments={"objective": "Audit dependency licenses."},
         )
-
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": True,
-            "state": "active",
-            "task_id": "task_cross3",
-        }
-        assert spoken == _EXPECTED_ACCEPTED_START_SPEECH
+        _assert_proposal_only(parts, transport)
+        assert len(runtime.stub.posts) == 1
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        second = await runtime.settle()
+        assert second.accepted and second.task_id != first.task_id
         assert len(runtime.stub.posts) == 2
         assert {task.task_id for task in runtime.context.snapshot().active_tasks} == {
-            "task_cross1",
-            "task_cross3",
+            first.task_id, second.task_id,
         }
     finally:
         await runtime.close()
 
 
-class _CompletionBeforeResponse:
-    def __init__(
-        self,
-        surface: ConversationWorkControlSurface,
-        controller: ConversationTaskController,
-        stub: HermesApiStub,
-    ) -> None:
-        self._surface = surface
-        self._controller = controller
-        self._stub = stub
-        self.terminal: Any = None
-
-    @property
-    def max_objective_chars(self) -> int:
-        return self._surface.max_objective_chars
-
-    @property
-    def can_cancel_work(self) -> bool:
-        return self._surface.can_cancel_work
-
-    async def start_work(
-        self,
-        *,
-        objective: str,
-        invocation_id: str,
-    ) -> WorkStartResult:
-        result = await self._surface.start_work(
-            objective=objective,
-            invocation_id=invocation_id,
+@pytest.mark.asyncio
+async def test_confirmed_dispatch_completion_has_one_terminal_and_no_stale_task() -> None:
+    runtime = await _runtime()
+    try:
+        parts, transport = await runtime.invoke("Inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        started = await runtime.settle()
+        assert started.accepted
+        runtime.stub.complete(status="completed")
+        terminal = await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
+        assert terminal.task_id == started.task_id and terminal.status == "completed"
+        assert runtime.context.snapshot().active_tasks == ()
+        _assert_model_visible_values_are_private_token_free(
+            parts, transport.sent, transport.tool_responses, terminal,
+            runtime.context.snapshot(), runtime.browser_events,
         )
-        self._stub.complete(status="completed")
-        self.terminal = await self._controller.next_completion()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(runtime.controller.next_completion(), timeout=0.02)
+    finally:
+        await runtime.close()
+
+
+class _DispatchReturnGate:
+    """Hold the actual acknowledged controller result before host command settlement."""
+
+    def __init__(self, controller: ConversationTaskController) -> None:
+        self._dispatch = controller.dispatch
+        self.acknowledged = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def dispatch(self, *, objective: str, utterance_id: str) -> Any:
+        result = await self._dispatch(objective=objective, utterance_id=utterance_id)
+        self.acknowledged.set()
+        await self.release.wait()
         return result
-
-    async def cancel_active_work(
-        self,
-        *,
-        invocation_id: str,
-    ) -> WorkCancelResult:
-        return await self._surface.cancel_active_work(invocation_id=invocation_id)
-
-    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
-        return await self._surface.cancel_work(task_id=task_id, invocation_id=invocation_id)
 
 
 @pytest.mark.asyncio
-async def test_completion_race_yields_one_terminal_and_no_stale_context_task() -> None:
+async def test_terminal_arrives_while_confirmed_dispatch_operation_is_unsettled() -> None:
     runtime = await _runtime()
-    handler = _CompletionBeforeResponse(
-        runtime.surface,
-        runtime.controller,
-        runtime.stub,
-    )
-    inference, transport = runtime.new_inference(handler=handler)
-    runtime.context.record_user_transcript(
-        Transcript(text="Inspect the release evidence.", final=True)
-    )
+    gate = _DispatchReturnGate(runtime.controller)
+    runtime.controller.dispatch = gate.dispatch  # type: ignore[method-assign]
     try:
-        spoken = await _collect(
-            inference.stream(
-                runtime.context.snapshot(),
-                turn_id="completion_before_tool_response",
-            )
-        )
-
-        assert spoken == _EXPECTED_ACCEPTED_START_SPEECH
-        assert _tool_payload(transport.tool_responses[0])["accepted"] is True
-        assert handler.terminal.task_id == "task_cross1"
-        assert handler.terminal.status == "completed"
+        parts, transport = await runtime.invoke("Inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        assert runtime.stub.posts == []
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+        await asyncio.wait_for(gate.acknowledged.wait(), timeout=1)
+        await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
+        proposal = runtime.offered[-1]
+        operation = runtime.surface._bindings["confirmed_" + proposal.proposal_id].operation
+        # A real 202 has arrived, but the admitted host operation cannot settle yet.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(operation), timeout=0.02)
+        assert [task.task_id for task in runtime.context.snapshot().active_tasks] == ["task_cross1"]
+        assert all(kind != "task_state" for kind, _ in runtime.browser_events)
+        runtime.stub.complete(status="completed")
+        terminal = await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
+        assert terminal.task_id == "task_cross1" and terminal.status == "completed"
+        assert not operation.done()
         assert runtime.context.snapshot().active_tasks == ()
+        gate.release.set()
+        with pytest.raises(RuntimeError, match="terminal state before active projection"):
+            await runtime.settle(proposal)
+        assert operation.done()
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
+        assert runtime.context.snapshot().active_tasks == ()
+        assert len(runtime.stub.posts) == 1 and runtime.stub.stop_calls == 0
         _assert_model_visible_values_are_private_token_free(
-            spoken,
-            transport.sent,
-            transport.tool_responses,
-            handler.terminal,
-            runtime.context.snapshot(),
-            runtime.browser_events,
+            parts, transport.sent, transport.tool_responses, terminal,
+            runtime.context.snapshot(), runtime.browser_events,
         )
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(
-                runtime.controller.next_completion(),
-                timeout=0.02,
-            )
+            await asyncio.wait_for(runtime.controller.next_completion(), timeout=0.02)
     finally:
+        gate.release.set()
         await runtime.close()
 
 
@@ -1223,88 +1243,48 @@ class _StartProjectionGate:
 @pytest.mark.asyncio
 async def test_completion_before_projection_rolls_back_without_stale_active_state() -> None:
     gate = _StartProjectionGate()
-    # The gate, not the work-tool deadline, orders this test: the deadline outlasts the three
-    # one-second waits bounding the gated phase, so it cannot settle the call first.
-    runtime = await _runtime(start_projection_gate=gate, work_tool_timeout_seconds=5)
-    invocation = asyncio.create_task(runtime.invoke("Inspect the release evidence."))
+    runtime = await _runtime(start_projection_gate=gate)
     try:
+        parts, transport = await runtime.invoke("Inspect the release evidence.")
+        _assert_proposal_only(parts, transport)
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
         await asyncio.wait_for(gate.entered.wait(), timeout=1)
         await asyncio.wait_for(runtime.stub.events_connected.wait(), timeout=1)
-
         runtime.stub.complete(status="completed")
         terminal = await asyncio.wait_for(runtime.controller.next_completion(), timeout=1)
-        assert terminal.task_id == "task_cross1"
-        assert terminal.status == "completed"
+        assert terminal.task_id == "task_cross1" and terminal.status == "completed"
         assert runtime.context.snapshot().active_tasks == ()
-
         gate.release.set()
-        spoken, transport = await asyncio.wait_for(invocation, timeout=1)
-
-        assert spoken == ["I couldn't start that work."]
-        assert _tool_payload(transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work control is unavailable",
-        }
+        with pytest.raises(RuntimeError, match="terminal state before active projection"):
+            await runtime.settle()
         assert runtime.cancel_attempts == [("task_cross1", "task state projection failed")]
         assert runtime.stub.stop_calls == 0
-        assert runtime.browser_events == []
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+        ]
         assert runtime.context.snapshot().active_tasks == ()
-        assert runtime.surface.health == "open"
+        assert runtime.surface.health == "uncertain"
         _assert_model_visible_values_are_private_token_free(
-            spoken,
-            transport.sent,
-            transport.tool_responses,
-            terminal,
-            runtime.browser_events,
-            runtime.context.snapshot(),
+            parts, transport.sent, transport.tool_responses, terminal,
+            runtime.context.snapshot(), runtime.browser_events,
         )
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(runtime.controller.next_completion(), timeout=0.02)
     finally:
         gate.release.set()
-        if not invocation.done():
-            invocation.cancel()
-        await asyncio.gather(invocation, return_exceptions=True)
         await runtime.close()
 
 
 class _StartGate:
-    def __init__(self, surface: ConversationWorkControlSurface) -> None:
-        self._surface = surface
+    def __init__(self, controller: ConversationTaskController) -> None:
+        self._dispatch = controller.dispatch
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    @property
-    def max_objective_chars(self) -> int:
-        return self._surface.max_objective_chars
-
-    @property
-    def can_cancel_work(self) -> bool:
-        return self._surface.can_cancel_work
-
-    async def start_work(
-        self,
-        *,
-        objective: str,
-        invocation_id: str,
-    ) -> WorkStartResult:
+    async def dispatch(self, *, objective: str, utterance_id: str) -> Any:
         self.started.set()
         await self.release.wait()
-        return await self._surface.start_work(
-            objective=objective,
-            invocation_id=invocation_id,
-        )
-
-    async def cancel_active_work(
-        self,
-        *,
-        invocation_id: str,
-    ) -> WorkCancelResult:
-        return await self._surface.cancel_active_work(invocation_id=invocation_id)
-
-    async def cancel_work(self, *, task_id: str, invocation_id: str) -> WorkCancelResult:
-        return await self._surface.cancel_work(task_id=task_id, invocation_id=invocation_id)
+        return await self._dispatch(objective=objective, utterance_id=utterance_id)
 
 
 @pytest.mark.asyncio
@@ -1312,63 +1292,57 @@ class _StartGate:
 async def test_foreground_barge_in_never_stops_background_run(phase: str) -> None:
     runtime = await _runtime()
     runtime.stub.create_gate.clear()
-    gate = _StartGate(runtime.surface)
-    inference, transport = runtime.new_inference(
-        hold_for_interrupt=True,
-        handler=gate,
-    )
+    gate = _StartGate(runtime.controller)
+    runtime.controller.dispatch = gate.dispatch  # type: ignore[method-assign]
+    inference, transport = runtime.new_inference(hold_for_interrupt=True)
     runtime.context.record_user_transcript(
-        Transcript(text="Inspect the release evidence.", final=True)
+        Transcript(text="Inspect the release evidence.", final=True),
     )
-    stream_task = asyncio.create_task(
-        _collect(
-            inference.stream(
-                runtime.context.snapshot(),
-                turn_id=f"barge_{phase}",
-            )
-        )
-    )
+    stream_task = asyncio.create_task(runtime.collect(inference.stream(
+        runtime.context.snapshot(), turn_id=f"barge_{phase}",
+    )))
     try:
+        await asyncio.wait_for(runtime.proposal_offered.wait(), timeout=1)
+        assert runtime.stub.posts == []
+        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
         await asyncio.wait_for(gate.started.wait(), timeout=1)
+        # This is a host/controller dispatch gate, independent of the foreground stream.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=0.02)
+        assert runtime.stub.posts == []
         if phase == "before_dispatch":
-            cancellation = asyncio.create_task(inference.cancel(f"barge_{phase}"))
-            await asyncio.wait_for(transport.tool_responded.wait(), timeout=1)
+            await asyncio.wait_for(inference.cancel(f"barge_{phase}"), timeout=1)
             gate.release.set()
             await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=1)
             runtime.stub.create_gate.set()
         elif phase == "during_ack":
             gate.release.set()
             await asyncio.wait_for(runtime.stub.create_entered.wait(), timeout=1)
-            cancellation = asyncio.create_task(inference.cancel(f"barge_{phase}"))
+            await asyncio.wait_for(inference.cancel(f"barge_{phase}"), timeout=1)
             runtime.stub.create_gate.set()
         else:
             gate.release.set()
             runtime.stub.create_gate.set()
-            await asyncio.wait_for(transport.tool_responded.wait(), timeout=1)
-            cancellation = asyncio.create_task(inference.cancel(f"barge_{phase}"))
-
-        await asyncio.wait_for(cancellation, timeout=1)
-        assert await asyncio.wait_for(stream_task, timeout=1) == []
-        for _ in range(100):
-            if runtime.context.snapshot().active_tasks:
-                break
-            await asyncio.sleep(0)
-        assert len(runtime.stub.posts) == 1
-        assert len(runtime.context.snapshot().active_tasks) == 1
+            assert (await runtime.settle()).accepted
+            await asyncio.wait_for(inference.cancel(f"barge_{phase}"), timeout=1)
+        parts = await asyncio.wait_for(stream_task, timeout=1)
+        _assert_proposal_only(parts, transport)
+        assert (await runtime.settle()).accepted
+        assert len(runtime.stub.posts) == 1 and len(runtime.context.snapshot().active_tasks) == 1
         assert runtime.stub.stop_calls == 0
         _assert_model_visible_values_are_private_token_free(
-            transport.sent,
-            transport.tool_responses,
-            runtime.context.snapshot(),
-            runtime.browser_events,
+            transport.sent, transport.tool_responses,
+            runtime.context.snapshot(), runtime.browser_events,
         )
     finally:
         gate.release.set()
         runtime.stub.create_gate.set()
+        await asyncio.wait_for(inference.cancel(f"barge_{phase}"), timeout=1)
+        await asyncio.wait_for(asyncio.gather(stream_task, return_exceptions=True), timeout=1)
         await runtime.close()
 
 
-async def _collect(stream: AsyncIterator[str]) -> list[str]:
+async def _collect(stream: AsyncIterator[Any]) -> list[Any]:
     return [segment async for segment in stream]
 
 
@@ -1377,65 +1351,37 @@ async def test_stale_codex_evidence_cannot_route_through_replacement_runtime() -
     old = await _runtime(runtime_name="old")
     fresh: NaturalWorkRuntime | None = None
     try:
-        _old_start_spoken, old_start_transport = await old.invoke("Start the old runtime work.")
+        _, old_transport = await old.invoke("Start the old runtime work.")
+        assert await old.confirm() is WorkCommandAdmission.ADMITTED
+        await old.settle()
         old_cancel = await old.surface.cancel_active_work(invocation_id="old_direct_cancel")
         assert old_cancel.accepted
-        old_cancel_transport = old_start_transport
         old.stub.complete(status="cancelled")
-        old_terminal = await asyncio.wait_for(old.controller.next_completion(), timeout=1)
-        assert old_terminal.status == "interrupted"
-        old_start_evidence = (
-            old_start_transport.thread_id,
-            old_start_transport.turn_id,
-            old_start_transport.call_id,
-        )
-        old_cancel_evidence = (
-            old_cancel_transport.thread_id,
-            old_cancel_transport.turn_id,
-            old_cancel_transport.call_id,
-        )
+        terminal = await asyncio.wait_for(old.controller.next_completion(), timeout=1)
+        assert terminal.status == "interrupted"
+        old_evidence = old_transport.thread_id, old_transport.turn_id, old_transport.call_id
         await old.close()
-
         fresh = await _runtime(runtime_name="replacement")
-        stale_start_spoken, stale_start_transport = await fresh.invoke(
-            "Offer stale start evidence.",
-            evidence_identity=old_start_evidence,
+        stale_start, start_transport = await fresh.invoke(
+            "Offer stale start evidence.", evidence_identity=old_evidence,
         )
-        stale_cancel_spoken, stale_cancel_transport = await fresh.invoke(
-            "Offer stale cancel evidence.",
-            tool="cancel_active_work",
-            arguments={},
-            evidence_identity=old_cancel_evidence,
-            allow_unadvertised_tool=True,
+        stale_cancel, cancel_transport = await fresh.invoke(
+            "Offer stale cancel evidence.", tool="cancel_active_work", arguments={},
+            evidence_identity=old_evidence, allow_unadvertised_tool=True,
         )
-
-        assert stale_start_spoken == ["I couldn't start that work."]
-        assert _tool_payload(stale_start_transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work request rejected",
-        }
-        assert stale_cancel_spoken == ["I couldn't start that work."]
-        assert _tool_payload(stale_cancel_transport.tool_responses[0]) == {
-            "accepted": False,
-            "state": "rejected",
-            "reason": "work request rejected",
-        }
-        assert fresh.stub.posts == []
-        assert fresh.stub.stop_calls == 0
-        assert fresh.cancel_attempts == []
-        assert fresh.context.snapshot().active_tasks == ()
-        assert fresh.browser_events == []
+        assert stale_start == stale_cancel == ["I couldn't start that work."]
+        for transport in (start_transport, cancel_transport):
+            assert _tool_payload(transport.tool_responses[0]) == {
+                "accepted": False, "state": "rejected", "reason": "work request rejected",
+            }
+        assert fresh.stub.posts == [] and fresh.stub.stop_calls == 0
+        assert fresh.cancel_attempts == [] and fresh.offered == []
+        assert fresh.context.snapshot().active_tasks == () and fresh.browser_events == []
         assert fresh.surface.health == "open"
         _assert_model_visible_values_are_private_token_free(
-            stale_start_spoken,
-            stale_start_transport.sent,
-            stale_start_transport.tool_responses,
-            stale_cancel_spoken,
-            stale_cancel_transport.sent,
-            stale_cancel_transport.tool_responses,
-            fresh.context.snapshot(),
-            fresh.browser_events,
+            stale_start, start_transport.sent, start_transport.tool_responses,
+            stale_cancel, cancel_transport.sent, cancel_transport.tool_responses,
+            fresh.context.snapshot(), fresh.browser_events,
         )
     finally:
         if fresh is not None:

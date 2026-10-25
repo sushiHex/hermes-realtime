@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import threading
 import time
@@ -20,10 +19,12 @@ from hermes_realtime.conversation.context import (
     ConversationMessage,
 )
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from hermes_realtime.speech import Transcript
 from tests.support.ollama_metadata import supported_ollama_metadata
+from tests.support.work_routing_policy import assert_aligned_work_routing
 
 pytestmark = pytest.mark.usefixtures("deny_uninjected_ollama_metadata")
 
@@ -82,6 +83,12 @@ def decision_frame(value: dict[str, object], **completion: object) -> dict[str, 
 
 def start_frame(**completion: object) -> dict[str, object]:
     return decision_frame({"kind": "start_work", "objective": "Inspect release"}, **completion)
+
+
+def expected_proposal(objective="Inspect release"):
+    return HostTaskProposalRequest(
+        objective,
+    )
 
 
 def reply_schema() -> dict[str, object]:
@@ -150,7 +157,8 @@ async def test_ollama_request_carries_lifecycle_framing_without_granting_authori
     assert framing == (
         "Task cancellation is controlled only by explicit user commands or trusted task controls. "
         "Never cancel tasks or grant approvals yourself. For a request to stop background work, "
-        "direct the user to the task's Cancel control. Do not claim work stopped, was cancelled, "
+        "direct the user to the task's Cancel control; for an approval request, direct the user "
+        "to the existing approval controls. Do not claim work stopped, was cancelled, "
         "was approved, or completed merely because the user requested it; report lifecycle "
         "changes only from trusted acknowledged task state."
     )
@@ -173,6 +181,30 @@ async def test_ollama_outbound_work_request_carries_objective_context_contract()
     assert instructions.count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
     assert handler.calls == []
     assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
+
+
+@pytest.mark.asyncio
+async def test_ollama_outbound_request_assembles_shared_semantic_routes() -> None:
+    """Inspect the real request; the canned reply proves no semantic model behavior."""
+    inference, handler, sent, _ = adapter([
+        decision_frame({"kind": "reply", "text": "Synthetic reply."}),
+    ])
+    snapshot = ConversationInferenceRequest(
+        revision=1, messages=(ConversationMessage("user", "What is the weather in Oslo now?"),),
+        active_tasks=(),
+    )
+    try:
+        assert await collect(inference, snapshot) == ["Synthetic reply."]
+    finally:
+        await inference.close()
+    assert_aligned_work_routing(
+        sent[0]["messages"][0]["content"],
+        task_status_available=status_schema() in sent[0]["format"]["oneOf"],
+    )
+    assert sent[0]["messages"][-1] == {"role": "user", "content": snapshot.messages[-1].text}
+    assert sent[0]["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
+    assert "tools" not in sent[0]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -240,24 +272,18 @@ async def test_transport_timeout_preserves_authority_scope(bound, phase, capsys)
 
 
 @pytest.mark.asyncio
-async def test_constrained_start_advertises_exact_union_and_waits_for_acceptance() -> None:
+async def test_constrained_proposal_advertises_exact_union_without_admission() -> None:
     decision = json.dumps({"kind": "start_work", "objective": "Inspect release"})
     inference, handler, sent, response = adapter([
         {"message": {"content": decision[:18]}, "done": False},
         {"message": {"content": decision[18:]}, "done": True, "done_reason": "stop"},
     ])
     handler.release.clear()
-    result = asyncio.create_task(collect(inference))
-    await asyncio.wait_for(handler.entered.wait(), 1)
-    assert not result.done()
-    handler.release.set()
-    assert await result == ["I've started that background task."]
-    assert handler.calls == [("Inspect release", "ollama_work_" +
-                             hashlib.sha256(b"turn_test").hexdigest())]
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == [] and not handler.entered.is_set()
     assert response.closed
     body = sent[0]
-    assert body["shift"] is False
-    assert body["truncate"] is False
+    assert body["shift"] is False and body["truncate"] is False
     assert body["options"] == {"num_ctx": 16384, "num_predict": 1024, "temperature": 0}
     assert "tools" not in body
     assert body["format"] == {"oneOf": [reply_schema(), start_schema(), status_schema()]}
@@ -294,8 +320,8 @@ async def test_constrained_start_preserves_selected_context_delivery_and_complet
                   ConversationMessage("user", "Please inspect the release.")),
         active_tasks=(),
     )
-    assert await collect(inference, snapshot) == ["I've started that background task."]
-    assert len(handler.calls) == 1
+    assert await collect(inference, snapshot) == [expected_proposal()]
+    assert handler.calls == []
     body = sent[0]
     assert body["options"] == {"num_ctx": 4096, "num_predict": 1024, "temperature": 0}
     assert body["shift"] is False and body["truncate"] is False
@@ -345,11 +371,13 @@ async def test_constrained_work_refuses_unverified_runtime_before_any_opening() 
      "The background task was not accepted."),
     (WorkStartResult(accepted=True, state="cancelling", task_id="task_test"),
      "That background task was accepted and is now being cancelled.")])
-async def test_rejected_and_pending_cancel_results_do_not_claim_active_work(result, spoken) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
+async def test_task_results_cannot_turn_provider_selection_into_admission(result, spoken) -> None:
+    inference, handler, _, _ = adapter([start_frame()])
     handler.result = result
-    assert await collect(inference) == [spoken]
+    # Task acknowledgments are outside the provider's authority, whatever a
+    # formerly injectable handler would have returned.
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -357,19 +385,15 @@ async def test_rejected_and_pending_cancel_results_do_not_claim_active_work(resu
     "capacity exhausted", "matching work is already active",
     "work control unavailable; restart required",
 ])
-async def test_rejected_ack_reports_one_bounded_marker_before_refusal_speech(
+async def test_proposal_terminal_selection_never_consumes_rejected_ack(
     reason, capsys,
 ) -> None:
     inference, handler, _, response = adapter([start_frame()])
     handler.result = WorkStartResult(accepted=False, state="rejected", reason=reason)
     stream = inference.stream(request(), turn_id="turn_test")
     try:
-        assert await anext(stream) == "The background task was not accepted."
-        markers = [json.loads(line.removeprefix("[ollama-work] "))
-                   for line in capsys.readouterr().out.splitlines()
-                   if line.startswith("[ollama-work] ")]
-        assert markers == [{"category": "ack_rejected", "kind": "start", "attempts": 1}]
-        assert len(handler.calls) == 1
+        assert await anext(stream) == expected_proposal()
+        assert handler.calls == []
         with pytest.raises(StopAsyncIteration):
             await anext(stream)
         assert response.closed
@@ -381,11 +405,11 @@ async def test_rejected_ack_reports_one_bounded_marker_before_refusal_speech(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["active", "cancelling"])
-async def test_accepted_ack_has_no_rejection_marker(state, capsys) -> None:
+async def test_proposal_terminal_selection_never_consumes_accepted_ack(state, capsys) -> None:
     inference, handler, _, _ = adapter([start_frame()])
     handler.result = WorkStartResult(accepted=True, state=state, task_id="task_test")
-    assert await collect(inference)
-    assert len(handler.calls) == 1
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
     assert not any(line.startswith("[ollama-work] ")
                    for line in capsys.readouterr().out.splitlines())
 
@@ -610,8 +634,8 @@ async def test_envelope_only_prefix_does_not_consume_decision_budget() -> None:
               "message": {"content": "", "thinking": "Synthetic reasoning."}, "done": False}
     inference, handler, _, response = adapter([prefix] * 500 + [start_frame()])
     assert sum(len(line) for line in response.lines) > 65536
-    assert await collect(inference) == ["I've started that background task."]
-    assert len(handler.calls) == 1
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
     assert response.closed
 
 
@@ -724,8 +748,8 @@ async def test_valid_unicode_decisions_preserve_exact_string(kind) -> None:
     if kind == "reply":
         assert output == [text] and handler.calls == []
     else:
-        assert output == ["I've started that background task."]
-        assert handler.calls == [(text, "ollama_work_" + hashlib.sha256(b"turn_test").hexdigest())]
+        assert output == [expected_proposal(text)]
+        assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -753,33 +777,25 @@ async def test_decision_buffer_has_independent_byte_and_chunk_bounds(bound, monk
 
 
 @pytest.mark.asyncio
-async def test_ack_timeout_is_unknown_and_never_claims_started(capsys) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()], request_timeout_seconds=0.05)
+async def test_provider_does_not_wait_for_or_invoke_task_admission(capsys) -> None:
+    inference, handler, _, _ = adapter([start_frame()], request_timeout_seconds=0.05)
     handler.release.clear()
     started = time.monotonic()
-    assert await collect(inference) == ["I couldn't confirm that background work started."]
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == [] and not handler.entered.is_set()
     assert time.monotonic() - started < 0.12
-    assert '[ollama-work] {"category":"ack_timeout","kind":"start","attempts":1}' in (
-        capsys.readouterr().out)
-    handler.release.set()
-    await asyncio.sleep(0)
+    assert not any(line.startswith("[ollama-work] ")
+                   for line in capsys.readouterr().out.splitlines())
 
 
 @pytest.mark.asyncio
-async def test_foreground_cancel_during_ack_does_not_cancel_background_work(capsys) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
-    handler.release.clear()
-    result = asyncio.create_task(collect(inference))
-    await asyncio.wait_for(handler.entered.wait(), 1)
+async def test_foreground_cancel_after_selection_has_no_task_effect(capsys) -> None:
+    inference, handler, _, _ = adapter([start_frame()])
+    stream = inference.stream(request(), turn_id="turn_test")
+    assert await anext(stream) == expected_proposal()
     await inference.cancel("turn_test")
-    handler.release.set()
-    with pytest.raises(RuntimeError, match="ownership|cancelled"):
-        await result
-    assert len(handler.calls) == 1
-    assert '"category":"ownership_after_admission","kind":"start","attempts":1' in (
-        capsys.readouterr().out)
+    await stream.aclose()
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -894,7 +910,7 @@ async def test_preflight_after_user_turn_does_not_reopen_work_binding(capsys) ->
     "start_work": lambda _: None, "max_objective_chars": True})(),
     type("Bad", (), {"start_work": lambda _: None, "max_objective_chars": 0})(),
     type("Bad", (), {"start_work": lambda _: None, "max_objective_chars": 65537})()])
-def test_binding_requires_start_method_and_exact_supported_bound(handler) -> None:
+def test_binding_requires_exact_supported_proposal_bound(handler) -> None:
     inference = ollama.OllamaStreamingInference(base_url="http://127.0.0.1:11434", model="test")
     with pytest.raises((TypeError, ValueError)):
         inference.bind_work_tools(handler)
@@ -928,27 +944,25 @@ async def test_binding_requires_idle_open_and_unbound_adapter(state, capsys) -> 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("result", [object(), WorkStartResult(
     accepted=True, state="active", task_id="task_test")], ids=["wrong_type", "forged_state"])
-async def test_untrusted_handler_result_is_reconstructively_validated(result) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
+async def test_provider_cannot_consume_untrusted_handler_result(result) -> None:
+    inference, handler, _, _ = adapter([start_frame()])
     if type(result) is WorkStartResult:
         object.__setattr__(result, "state", "rejected")
     handler.result = result
-    with pytest.raises(ValueError, match="result_type|result_schema"):
-        await collect(inference)
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
-async def test_handler_failure_is_unknown_and_never_speaks_model_start_claim(capsys) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
+async def test_provider_cannot_enter_failing_task_handler(capsys) -> None:
+    inference, handler, _, _ = adapter([start_frame()])
 
     async def fail(**kwargs):
-        raise OSError("Synthetic unavailable transport")
+        raise AssertionError("proposal provider cannot invoke task authority")
 
     handler.start_work = fail
-    assert await collect(inference) == ["I couldn't confirm that background work started."]
-    assert '"category":"ack_unavailable","kind":"start","attempts":1' in capsys.readouterr().out
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -1064,37 +1078,21 @@ async def test_reply_playback_drain_does_not_reopen_decision_deadline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_after_local_enqueue_before_shared_handler_entry_preserves_owned_start(
+async def test_proposal_selection_never_enqueues_a_background_start(
     monkeypatch
 ) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
-    release_entry = asyncio.Event()
-    enqueued = asyncio.Event()
-    start = handler.start_work
-
-    async def held_start(**kwargs):
-        await release_entry.wait()
-        return await start(**kwargs)
-
-    handler.start_work = held_start
+    inference, handler, _, _ = adapter([start_frame()])
+    enqueued = []
     create_task = asyncio.create_task
 
     def observe_enqueue(coroutine, *, name=None, context=None):
-        operation = create_task(coroutine, name=name, context=context)
-        if name == "ollama-start-work":
-            enqueued.set()
-        return operation
+        enqueued.append(name)
+        return create_task(coroutine, name=name, context=context)
 
     monkeypatch.setattr(asyncio, "create_task", observe_enqueue)
-    result = asyncio.create_task(collect(inference))
-    await asyncio.wait_for(enqueued.wait(), 1)
-    assert not handler.calls
-    await inference.cancel("turn_test")
-    release_entry.set()
-    with pytest.raises(RuntimeError, match="ownership|cancelled"):
-        await result
-    assert len(handler.calls) == 1
+    assert await collect(inference) == [expected_proposal()]
+    assert "ollama-start-work" not in enqueued
+    assert handler.calls == []
 
 
 @pytest.mark.asyncio
@@ -1125,23 +1123,19 @@ async def test_each_before_admission_ownership_guard_blocks_dispatch_independent
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["closed", "cancelled"])
-async def test_each_after_admission_cancellation_guard_suppresses_speech_independently(
+async def test_injectable_task_authority_has_no_lifecycle_control(
     state
 ) -> None:
-    inference, handler, _, _ = adapter([
-        start_frame()])
-    start = handler.start_work
+    inference, handler, _, _ = adapter([start_frame()])
 
-    async def retire_after_start(**kwargs):
-        result = await start(**kwargs)
+    async def forbidden_start(**kwargs):
         if state == "closed":
             inference._closed = True
         else:
             inference._cancelled_turns.add("turn_test")
-        return result
+        raise AssertionError("task authority must not be entered")
 
-    handler.start_work = retire_after_start
-    with pytest.raises(RuntimeError, match="after_admission"):
-        await collect(inference)
-    assert len(handler.calls) == 1
+    handler.start_work = forbidden_start
+    assert await collect(inference) == [expected_proposal()]
+    assert handler.calls == []
 

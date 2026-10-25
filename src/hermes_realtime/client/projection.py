@@ -13,6 +13,8 @@ from typing import cast
 
 from hermes_realtime.evidence.models import ProjectionReservation
 
+from .task_proposal_control import validate_proposal_event
+
 _EVENT_KINDS = frozenset(
     {
         "approval_state",
@@ -42,6 +44,7 @@ _EVENT_KINDS = frozenset(
         "speech_ended",
         "task_state",
         "task_result",
+        "task_proposal",
         "transcript_final",
         "transcript_partial",
         "typed_input_admitted",
@@ -107,7 +110,7 @@ class BrowserEventProjection:
 
         pending = self._replay_after_reset(initial_slots)
         # State precedes results even after a partially published replay is retried.
-        priority = {"task_state": 0, "task_result": 1, "approval_state": 2}
+        priority = {"task_state": 0, "task_result": 1, "approval_state": 2, "task_proposal": 3}
         self._pending_replay = dict(sorted(pending.items(), key=lambda item: priority[item[0][0]]))
         self._events.clear()
         self._sequence = 0
@@ -175,6 +178,8 @@ class BrowserEventProjection:
         kind: str,
         data: Mapping[str, PublicValue],
     ) -> tuple[str, str] | None:
+        if kind == "task_proposal" and data.get("status") != "pending":
+            return kind, cast(str, data["proposalId"])
         if (
             kind in {"task_state", "task_result"}
             and data.get("status")
@@ -198,6 +203,8 @@ class BrowserEventProjection:
     def _open_key(kind: str, data: dict[str, PublicValue]) -> tuple[str, str] | None:
         """The retained lifecycle entry touched by an event, if any."""
 
+        if kind == "task_proposal":
+            return kind, cast(str, data["proposalId"])
         if (
             kind == "task_state"
             and data.get("status") != "rejected"
@@ -210,6 +217,8 @@ class BrowserEventProjection:
 
     @staticmethod
     def _is_open(kind: str, data: Mapping[str, PublicValue]) -> bool:
+        if kind == "task_proposal":
+            return data.get("status") == "pending"
         if kind == "task_state":
             return data.get("status") in {"active", "cancelling"}
         return data.get("actionable") is True
@@ -354,6 +363,14 @@ class BrowserEventProjection:
         *,
         reserved: bool,
     ) -> BrowserPublicEvent:
+        if kind == "task_proposal":
+            try:
+                validate_proposal_event(dict(data))
+            except (ValueError, TypeError):
+                try:
+                    raise
+                finally:
+                    print('[task-proposal-projection] {"category":"invalid","count":1}', flush=True)
         if kind == "voice_conversation_cleared" and data:
             raise ValueError("voice delete event carries no data")
         if kind == "session_ready":
