@@ -535,6 +535,71 @@ def test_native_git_child_owner_preserves_primary_and_cleanup_failure() -> None:
     assert {str(item) for item in error.value.exceptions} >= {"primary", "cleanup"}
 
 
+@pytest.mark.parametrize("payload_count", (4, 6))
+def test_candidate_archive_admits_source_above_the_former_16_mib_budget(
+    tmp_path: Path, payload_count: int
+) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, _ = _repository(tmp_path)
+    payload_bytes = 4 * 1024 * 1024 - 4
+    expected_payloads = {
+        f"payload-{index}.txt": bytes([ord("a") + index]) * payload_bytes
+        for index in range(payload_count)
+    }
+    for name, payload in expected_payloads.items():
+        (repository / name).write_bytes(payload)
+    (repository / "visible.txt").write_bytes(b"visible\n")
+    (repository / "ignored" / "hidden.txt").write_bytes(b"hidden\n")
+    _git("add", ".", cwd=repository)
+    _git("commit", "-qm", "candidate near the aggregate blob ceiling", cwd=repository)
+    head = _git("rev-parse", "HEAD", cwd=repository).strip().decode("ascii")
+    identity = _identity(repository, head)
+    tree_bytes = len(_git("cat-file", "tree", "HEAD^{tree}", cwd=repository)) + len(
+        _git("cat-file", "tree", "HEAD:ignored", cwd=repository)
+    )
+    blob_bytes = sum(map(len, expected_payloads.values())) + len(b"visible\n") + len(b"hidden\n")
+    assert 16 * 1024 * 1024 < blob_bytes + tree_bytes <= 32 * 1024 * 1024
+    if payload_count == 4:
+        assert blob_bytes < 16 * 1024 * 1024
+    else:
+        assert blob_bytes > 20 * 1024 * 1024
+
+    token = oracle.capture_candidate_source_archive(repository, identity, _pin())
+    archive = oracle._archive_bytes_for_consumer(token, identity)
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as captured:
+        actual_payloads = {}
+        for member in captured.getmembers():
+            if member.isfile():
+                content = captured.extractfile(member)
+                assert content is not None
+                actual_payloads[member.name.removeprefix(oracle._PREFIX + "/")] = content.read()
+    assert actual_payloads == {
+        ".gitattributes": b"",
+        "ignored/hidden.txt": b"hidden\n",
+        "visible.txt": b"visible\n",
+        **expected_payloads,
+    }
+
+
+def test_default_git_output_over_40_mib_is_refused(tmp_path: Path) -> None:
+    from scripts import candidate_source_archive_oracle as oracle
+
+    repository, _ = _repository(tmp_path)
+    oversized = repository / "oversized.txt"
+    with oversized.open("wb") as output:
+        for _ in range(40):
+            output.write(b"x" * 1024 * 1024)
+        output.write(b"x")
+    oid = _git("hash-object", "-w", str(oversized), cwd=repository).strip().decode("ascii")
+    retained = oracle._RetainedGitExecutableV1(_pin())
+    try:
+        with pytest.raises(oracle.CandidateSourceArchiveError, match="bounded output limit"):
+            oracle._GitExecutor(retained, repository).run("cat-file", "blob", oid)
+    finally:
+        retained.close()
+
+
 def test_a_candidate_tree_over_its_byte_budget_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
