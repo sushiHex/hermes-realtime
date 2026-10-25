@@ -426,7 +426,7 @@ def main(argv: Any = None) -> Any:
         # Preserve only the model helper's existing fixed, source-owned enum.
         # Arbitrary native ValueError text must never become public output.
         model_module = sys.modules.get("scripts.lookup_backend_model")
-        allowed = getattr(model_module, "_REFUSALS", frozenset())
+        allowed: frozenset[str] = getattr(model_module, "_REFUSALS", frozenset())
         if (
             type(error) in {ValueError, RuntimeError, TimeoutError}
             and len(error.args) == 1
