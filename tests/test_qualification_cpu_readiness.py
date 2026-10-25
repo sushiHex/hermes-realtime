@@ -337,6 +337,103 @@ async def test_controller_reuses_one_existing_preflight_and_leaves_tree_settleme
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault,category,cleanup_failures",
+    [
+        ("deadline_and_cleanup", "deadline", 1),
+        ("refusal_and_cleanup", "refused", 1),
+        ("deadline_only", "deadline", 0),
+        ("deadline_cleanup_root_stop", "deadline", 2),
+        ("unrelated_group", "refused", 0),
+        ("wrong_shape", "refused", 0),
+        ("startup_group", "refused", 0),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+async def test_controller_preserves_actual_preflight_failure_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    category: str,
+    cleanup_failures: int,
+) -> None:
+    events = []
+    group_message = "qualification preflight and adapter cleanup failed"
+    primary = (
+        TimeoutError("PRIVATE_TIMEOUT")
+        if fault.startswith("deadline")
+        else ValueError("PRIVATE_REFUSAL")
+    )
+    monkeypatch.setenv(recipe.launch.EXECUTION_ROOT_ENV, str(tmp_path / "snapshot"))
+    monkeypatch.setattr(recipe.evaluator, "_verify_source_binding", lambda *a: None)
+    monkeypatch.setattr(recipe, "_verify_recipe_imports", lambda: None)
+    monkeypatch.setattr(recipe.launch, "_outside_jobs", lambda: False)
+    monkeypatch.setattr(recipe, "_unused_port", lambda: 12345)
+    monkeypatch.setattr(recipe, "_runtime_environment", lambda *a: {})
+    monkeypatch.setattr(recipe, "OllamaModelClient", lambda **kwargs: object())
+
+    class Process:
+        pid = 42
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout):
+            events.append("wait")
+            if fault == "deadline_cleanup_root_stop":
+                raise subprocess.TimeoutExpired("PRIVATE_ROOT", timeout)
+
+    async def wait_server(*args):
+        if fault == "startup_group":
+            raise BaseExceptionGroup(group_message, [TimeoutError(), RuntimeError()])
+
+    class Inference:
+        async def configure_context(self, tokens):
+            assert tokens == 4096
+
+        async def stream(self, request, *, turn_id):
+            events.append("preflight")
+            yield ""
+            raise primary
+
+        async def close(self):
+            events.append("adapter_close")
+            if "cleanup" in fault:
+                raise RuntimeError("PRIVATE_CLEANUP")
+
+        def bind_work_tools(self, handler):
+            pytest.fail("failed preflight admitted work tools")
+
+    def factory(**kwargs):
+        events.append("factory")
+        if fault == "unrelated_group":
+            raise BaseExceptionGroup("unrelated", [TimeoutError(), RuntimeError()])
+        if fault == "wrong_shape":
+            raise BaseExceptionGroup(group_message, [TimeoutError()])
+        return Inference()
+
+    monkeypatch.setattr(recipe.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(recipe, "_wait_server", wait_server)
+    monkeypatch.setattr(recipe.evaluator, "_build_streaming_inference", factory)
+    report = await recipe._controller(tmp_path / "models", tmp_path / "work", "a" * 40, "b" * 40)
+
+    assert report["outcome"] == "unavailable" and report["readiness_completed"] is False
+    assert report["context"] is None
+    assert report["category"] == category
+    assert report["cleanup_failures"] == cleanup_failures
+    assert report["runtime_root_stopped"] is (fault != "deadline_cleanup_root_stop")
+    assert report["stage"] == ("startup" if fault == "startup_group" else "readiness")
+    expected_closes = 0 if fault in {"startup_group", "unrelated_group", "wrong_shape"} else 1
+    assert events.count("adapter_close") == expected_closes
+    assert events[-2:] == ["terminate", "wait"]
+    assert recipe._controller_report(json.dumps(report).encode()) == report
+    assert "PRIVATE" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["listener", "root_exited"])
 async def test_metadata_is_never_contacted_without_the_retained_root_listener(
     monkeypatch: pytest.MonkeyPatch,

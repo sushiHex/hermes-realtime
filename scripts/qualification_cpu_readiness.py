@@ -215,20 +215,32 @@ async def _controller(models: Path, work: Path, head: str, tree: str) -> dict[st
         stage = "readiness"
         started = loop.time()
         try:
-            inference = cast(
-                OllamaStreamingInference,
-                await evaluator._open_qualified_inference(
-                    provider="ollama",
-                    model=_MODEL,
-                    effort="",
-                    codex_executable=None,
-                    ollama_base_url=f"http://127.0.0.1:{port}",
-                    ollama_num_ctx=4096,
-                    ollama_num_gpu=0,
-                    handler=evaluator.ShadowWorkHandler(can_cancel_work=False, accept_start=False),
-                    deadline=deadline,
-                ),
-            )
+            try:
+                inference = cast(
+                    OllamaStreamingInference,
+                    await evaluator._open_qualified_inference(
+                        provider="ollama",
+                        model=_MODEL,
+                        effort="",
+                        codex_executable=None,
+                        ollama_base_url=f"http://127.0.0.1:{port}",
+                        ollama_num_ctx=4096,
+                        ollama_num_gpu=0,
+                        handler=evaluator.ShadowWorkHandler(
+                            can_cancel_work=False, accept_start=False
+                        ),
+                        deadline=deadline,
+                    ),
+                )
+            except BaseExceptionGroup as error:
+                # This helper alone groups its primary failure then failed close.
+                if (
+                    error.message != "qualification preflight and adapter cleanup failed"
+                    or len(error.exceptions) != 2
+                ):
+                    raise
+                report["cleanup_failures"] += 1
+                raise error.exceptions[0] from None
             if process.poll() is not None:
                 raise RuntimeError("cpu_readiness_server_exited")
             _require_owned_listener(port, process.pid)
