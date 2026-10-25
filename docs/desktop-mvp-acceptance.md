@@ -1,10 +1,16 @@
 # Desktop MVP acceptance
 
-Use this procedure for the integrated operator result owned by
-[#159](https://github.com/sushiHex/hermes-realtime/issues/159). The
-[diagnostic guide](desktop-mvp-diagnostic.md) remains the setup, marker and
-step reference. An automated rehearsal or a green CI run cannot establish
-physical audibility, microphone behavior or the operator's experience.
+This procedure preserves the historical explicit-command desktop diagnostic,
+including its Phi4096 profile. Active natural-request acceptance belongs to
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159) under
+[#284's exact-objective confirmation decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
+and the [shared acceptance contract](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6336110969).
+The steps below supply isolation, provenance and lifecycle observations; they do
+not nominate a candidate or control, qualify natural confirmation, or authorize
+execution. The [experimental backend setup reference](ordinary-lookup-setup.md)
+records the separate source-backed lookup configuration and its remaining setup
+limits. An automated rehearsal or green CI cannot establish physical audibility,
+microphone behavior or the operator's experience.
 
 ## Freeze before observing
 
@@ -82,9 +88,9 @@ environment. Do not change a preexisting Ollama service. These are the
 source-backed launch preconditions for this Phi artifact's Go-template path,
 not a universal model-metadata context guard.
 
-### Prepare the separate background model
+### Historical Phi/Qwen background preparation reference
 
-The selected two-model profile uses **Phi only for the Realtime foreground** and
+The historical two-model profile uses **Phi only for the Realtime foreground** and
 **Qwen3.5 9B for Hermes background work**. They run in separate, session-owned
 Ollama processes. A foreground context of 4096 is not a suitable replacement for
 Hermes's resolved background context of 64000. The pinned Hermes
@@ -291,21 +297,21 @@ Record refusals as well as passes; do not describe a different installed Hermes
 revision as the pinned baseline. If a prerequisite fails, keep later results
 diagnostic and leave acceptance pending.
 
-Use the diagnostic guide's initial profile: Windows Chrome, literal loopback,
+For this historical explicit-command diagnostic, use Windows Chrome, literal loopback,
 built-in memory, evidence capture and public search off, and explicit task
-commands with natural work tools disabled. The current [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
-keeps natural routing off and starts work only through deterministic explicit
+commands with natural work tools disabled. The historical [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
+kept natural routing off and started work only through deterministic explicit
 commands. The model default remains unchanged unless and until this owner
 acceptance passes and a separate default-change is made.
 
 [ADR 0004](adr/0004-model-action-authority.md) remains the design record for
-model-proposed work. If natural routing is considered again, the [#284 owner
+model-proposed work. For the active natural-request scope, the [#284 owner
 decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
 requires explicit user confirmation of the proposed objective before dispatch.
-That future flow is outside this MVP acceptance procedure and needs its own
-implementation and qualification; it grants no model cancellation or approval
-authority. Current acceptance covers explicit task commands, task-card Cancel,
-and interruption independence only.
+That flow is outside this historical diagnostic; its acceptance remains under
+the shared #159 contract linked above. It grants no model cancellation or approval
+authority. The steps here cover explicit task commands, task-card Cancel, and
+interruption independence only.
 
 Before starting, declare the observations: final transcript to first token,
 first token to audio, task acknowledgment/completion/cancellation, and reconnect
