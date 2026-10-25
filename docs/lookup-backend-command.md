@@ -137,6 +137,38 @@ and evidence are preserved for review, including refusals. Public stdout carries
 only fixed categories, counts, timings and hashes. Raw source/answer snapshots,
 credentials, launch paths and process identifiers must not be posted.
 
+## Recorded public-command outcome
+
+The first full public-command observation at
+`663280ed3507d6145b54c445e6ef038661e02960` (tree
+`1c102e6f97845f40754ad64ff2353cff722d65ad`) **failed the task deadline**.
+It passed archive/extracted-runtime, retained model-store and realtime
+wheel/target preflight, prepared a protected fresh profile, started its owned
+services, and obtained one real accepted acknowledgment for one POST. One Exa
+search HTTP response was 200 with 22,281 bytes; no extraction was observed and
+the transport guard recorded no refusal. These transport facts alone do not
+establish an answered, source-grounded task.
+
+The driver retained its timeout snapshot and refused with `TimeoutError`: zero
+SSE completion events and one settlement fallback entry. No delivered completion
+or semantic pass is claimed. Both owned process trees and listeners settled,
+cleanup reported no failures, and the personal-service listener was unchanged.
+No retry, model substitution or deadline increase followed this task.
+
+Two earlier setup refusals were preserved: a retained runtime directory differed
+from the authenticated ZIP, then an isolated parent lacked the reused owner's
+sibling-import path. Neither reached an owned model process or inference. Fresh
+archive extraction repaired the first input; the second has a fresh-process
+`-I` regression that preserves verified-runtime precedence. The older 34.297-second
+useful task remains separate evidence, not a pass for this public walkthrough.
+
+Private evidence SHA-256s (contents remain private): owner receipt
+`9c57542fe5563753350ce50d8429c990d8a356fcc36be3c01e8f3d8a412a119e`;
+timeout snapshot
+`80dc7bc28d09dec87ac09b247c3005dbb8813a868cc4c50ad3b60b22d7583d27`.
+The command now supplies the public preparation/dispatch/refusal/cleanup path;
+timely useful backend completion and the full #295 profile remain unqualified.
+
 This does not claim graceful remote inference cancellation, physical audibility,
 natural routing, model reliability, or resource qualification. Do not silently
 repair retained text; punctuation fidelity remains

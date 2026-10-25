@@ -26,7 +26,8 @@ installed files with the frozen wheel. The
 [installed API gate](hermes-bridge.md) observes that setup.
 A version string, copied RECORD or gateway digest alone is insufficient.
 
-The one successful backend task used these identities:
+The historical successful task and the separate public reproduction input have
+these bindings:
 
 | Component | Binding |
 | --- | --- |
@@ -34,7 +35,16 @@ The one successful backend task used these identities:
 | Source tree for that task | `fff5b8fa50e58d7264d2e0073297ed1d624e1c33` |
 | Background and presentation model | `devstral-small-2:24b` |
 | Installed model manifest SHA-256 | `24277f07f62db8f9cb68e9dfc679ea1818a7fbac47a50eff0a701d3f645b63c8` |
-| Ollama Windows AMD64 archive | v0.40.4, `7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf` |
+| Historical retained Ollama runtime closure | `d1cb1fb752fa1181fb2ad4e4c6fa01dd55457ca8340da3b3bc5f4d3d4435d36d` |
+| Public reproduction archive pin | v0.40.4, `7485a1172f8527db4342a63521b9342fc466185ff0855da378cc864ecf6354cf` |
+
+The historical task verified the retained runtime closure, not its equality to
+that ZIP. A later comparison of the retained directory with a freshly verified
+official archive refused `runtime-content`: the executable digest matched, but
+some other bytes differed despite matching names and sizes. The cause and timing
+of that difference are not established; the historical directory was preserved.
+The public command used a fresh extraction instead. Neither the archive pin nor
+the historical useful task is relabelled as proof of the new command's outcome.
 
 The model name is a mutable tag. Before loading, require the exact manifest,
 config and complete referenced layer closure by SHA-256 and byte size, then
