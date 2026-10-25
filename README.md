@@ -123,6 +123,12 @@ The `--allow-unsandboxed-hermes-tasks` flag is intentionally explicit. Hermes co
 
 The optional context file is a strict version-1 JSON object. `identity` is required; `persona`, `user_preferences`, and `location` are optional bounded strings. It is sent to the configured inference provider. Do not include secrets, filesystem paths, complete memories, or sensitive personal data.
 
+With `--inference-provider ollama`, use `--ollama-think` or `--no-ollama-think` to send
+the native thinking choice for both readiness and conversation requests, including
+browser-selected models. Omitting both preserves the runtime/model default. Model and runtime
+support determine the behavior; runtime errors fail the request without provider fallback.
+These flags do not establish model qualification.
+
 ## Conversation profiles
 
 - `legacy` is the default and best-tested profile.

@@ -35,6 +35,7 @@ from hermes_realtime.providers.ollama_models import (
     OllamaContextObservation,
     OllamaModelClient,
     require_num_gpu,
+    require_think,
 )
 
 _MAX_MODEL_CHARS = 256
@@ -126,6 +127,7 @@ class OllamaStreamingInference:
         max_active_streams: int = 4,
         num_ctx: int = DEFAULT_OLLAMA_NUM_CTX,
         num_gpu: int | None = None,
+        think: bool | None = None,
         output_style: Callable[[], str] | None = None,
         metadata_client: OllamaModelClient | None = None,
     ) -> None:
@@ -168,6 +170,7 @@ class OllamaStreamingInference:
         if not _MIN_NUM_CTX <= num_ctx <= _MAX_NUM_CTX:
             raise ValueError("num_ctx must be between 2048 and 262144")
         require_num_gpu(num_gpu)
+        require_think(think)
         if open_request is not None and not callable(open_request):
             raise TypeError("open_request must be callable")
 
@@ -185,6 +188,7 @@ class OllamaStreamingInference:
         self._max_active_streams = max_active_streams
         self._num_ctx = num_ctx
         self._num_gpu = num_gpu
+        self._think = think
         self._context_configuration: OllamaContextConfiguration | None = None
         self._model_client = metadata_client
         self._context_contract_verified = False
@@ -405,6 +409,8 @@ class OllamaStreamingInference:
                 )
             if self._num_gpu is not None:
                 cast(dict[str, object], body["options"])["num_gpu"] = self._num_gpu
+            if self._think is not None:
+                body["think"] = self._think
             request = Request(
                 self._endpoint,
                 data=json.dumps(

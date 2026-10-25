@@ -126,6 +126,17 @@ def require_num_gpu(value: object) -> int | None:
                   flush=True)
 
 
+def require_think(value: object) -> bool | None:
+    """Select a native request option without claiming model support."""
+    if value is None or type(value) is bool:
+        return value
+    try:
+        raise TypeError("think must be an exact boolean or None")
+    finally:
+        print('[ollama-profile] {"category":"thinking_refused","count":1,"version":1}',
+              flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class OllamaModelMetadata:
     model: str

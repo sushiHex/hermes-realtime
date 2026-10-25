@@ -201,6 +201,18 @@ preserves the runtime default. Both tool-less readiness and structured decisions
 carry the same explicit override, and the report records requested layers rather
 than claiming actual placement. Other providers refuse this option. These flags
 do not establish a CPU artifact/loader closure or authorize a runtime launch.
+
+CPU resource admission follows the [accepted #315 scope](https://github.com/sushiHex/hermes-realtime/issues/315#issuecomment-6402529916):
+bind the audited artifacts, runtime, environment and CPU-layer requests;
+exclude bundled GPU backends; and retain the sealed namespace through owned
+process settlement and complete cleanup. Disclose compiled-loader/trusted-OS
+assumptions, without claiming static-backend attestation, zero OS/driver GPU
+bytes or a whole-run peak. GPU candidates retain the full numerical 4 GiB
+witness; it is not a CPU admission prerequisite. `/api/ps` `context_length` is
+configured-context bookkeeping, not actual backend per-sequence/K/V evidence.
+All quality, latency, authority and [human-acceptance](desktop-mvp-acceptance.md)
+requirements remain in force.
+
 The legacy direct-work evaluator does not qualify the current confirmed-proposal
 admission path; that path still needs its own configured-provider evidence.
 The entrypoint refuses a missing or

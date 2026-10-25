@@ -127,6 +127,7 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
 
     async def stream(self, request: object, *, turn_id: str):  # type: ignore[no-untyped-def]
         assert self._model == metadata.model
+        assert self._think is False
         if turn_id == "turn_preflight":
             assert self._work_tool_handler is None
         events.append("inference:" + turn_id)
@@ -187,6 +188,7 @@ async def test_host_selection_owns_actual_speech_readiness_and_shutdown(
         hermes_api_bearer="x" * 32, allow_unsandboxed_tasks=True,
         local_model_selection=True,
         natural_work_tools=natural_tools,
+        ollama_think=False,
     )
     owner = captured["local_model_selection"]
     assert type(owner) is host.OllamaSessionSelection
