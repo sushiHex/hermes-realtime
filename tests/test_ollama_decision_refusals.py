@@ -13,6 +13,10 @@ from scripts import evaluate_natural_work_scenario as scenario
 from tests.support.ollama_metadata import supported_ollama_metadata
 
 
+class ForeignDecisionRefusal(ollama.OllamaDecisionRefused):
+    """A caller-owned exception cannot assert the adapter's refusal provenance."""
+
+
 @pytest.fixture
 def offline_cases(monkeypatch):
     instances = []
@@ -124,7 +128,9 @@ async def test_resource_limits_remain_operational(offline_cases, monkeypatch, li
     TimeoutError("synthetic deadline"),
     RuntimeError("Ollama work unavailable: ownership_before_admission"),
     asyncio.CancelledError(),
-], ids=["spoof_claim", "spoof_schema", "unknown", "transport", "deadline", "ownership", "cancel"])
+    ForeignDecisionRefusal("unverified_claim"),
+], ids=["spoof_claim", "spoof_schema", "unknown", "transport", "deadline", "ownership", "cancel",
+        "foreign_subclass"])
 async def test_operational_errors_stop_after_first_case(offline_cases, failure):
     install, value, instances = offline_cases
     install(failure=failure)

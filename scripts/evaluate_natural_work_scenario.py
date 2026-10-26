@@ -464,6 +464,8 @@ async def run_cases(
             try:
                 await asyncio.wait_for(collect(), 60)
             except OllamaDecisionRefused as error:
+                if type(error) is not OllamaDecisionRefused:
+                    raise
                 row["error"] = "decision_refused"
                 row["refusal_category"] = error.category
             if recorder.requests and (
