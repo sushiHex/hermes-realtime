@@ -88,9 +88,9 @@ class OllamaDecisionRefused(ValueError):
     """A model decision was refused, rather than inference failing operationally.
 
     ``category`` is supplied by the adapter's decision guards, never model prose.
-    Callers must catch this type rather than interpret ValueError messages or
-    copy category lists. Deadlines, resource limits and ownership failures are
-    operational errors and must retain their stopping semantics.
+    Callers must require this exact type rather than accept foreign subclasses,
+    interpret ValueError messages or copy category lists. Deadlines, resource
+    limits and ownership failures retain their operational stopping semantics.
     """
 
     def __init__(self, category: str) -> None:
