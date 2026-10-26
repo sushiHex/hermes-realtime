@@ -301,6 +301,29 @@ def test_native_tools_profile_binds_environment_load_and_readback(
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
 
 
+def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
+    profile = model.StartupProfile.NATIVE_TOOLS_4K
+    with pytest.raises(AttributeError):
+        profile.context_tokens = 64000
+    with pytest.raises(AttributeError):
+        profile.go_template = None
+    with pytest.raises(AttributeError):
+        profile.profile_id = "LOOKUP_64K"
+    with pytest.raises(AttributeError):
+        profile.value = (64000, None)
+    original_value, original_name = profile._value_, profile._name_
+    try:
+        profile._value_ = (64000, None)
+        profile._name_ = "LOOKUP_64K"
+        owned[5]["ps"]["models"][0]["context_length"] = 4096
+        result = start(selected, owned, tmp_path, startup_profile=profile)
+    finally:
+        profile._value_, profile._name_ = original_value, original_name
+    assert result["configured_context_tokens"] == 4096
+    assert result["startup_profile"] == "NATIVE_TOOLS_4K"
+    assert owned[0].calls[0][2]["env"]["OLLAMA_GO_TEMPLATE"] == "1"
+
+
 @pytest.mark.parametrize("invalid", [None, "NATIVE_TOOLS_4K", 4096, object()])
 def test_invalid_startup_profile_refused_before_spawn(selected, owned, tmp_path, invalid):
     with pytest.raises(ValueError, match="startup-profile"):

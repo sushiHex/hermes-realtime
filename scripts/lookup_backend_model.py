@@ -33,12 +33,20 @@ SUPPORTED_VERSION = "0.40.4"
 class StartupProfile(Enum):
     """The two admitted Ollama startup settings; callers cannot supply raw values."""
 
-    LOOKUP_64K = (64000, None)
-    NATIVE_TOOLS_4K = (4096, "1")
+    LOOKUP_64K = 1
+    NATIVE_TOOLS_4K = 2
 
-    def __init__(self, context_tokens: int, go_template: str | None) -> None:
-        self.context_tokens = context_tokens
-        self.go_template = go_template
+    @property
+    def context_tokens(self) -> int:
+        return 64000 if self is StartupProfile.LOOKUP_64K else 4096
+
+    @property
+    def go_template(self) -> str | None:
+        return None if self is StartupProfile.LOOKUP_64K else "1"
+
+    @property
+    def profile_id(self) -> str:
+        return "LOOKUP_64K" if self is StartupProfile.LOOKUP_64K else "NATIVE_TOOLS_4K"
 
 
 _JSON_LIMIT = 1024 * 1024
@@ -401,7 +409,7 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
     state: dict[str, Any] = {"version": 1, "category": "setup", "metadata_requests": [],
         "inference_request_count": 0,
         "context_default_tokens": startup_profile.context_tokens if profile_valid else None,
-        "startup_profile": startup_profile.name if profile_valid else "invalid",
+        "startup_profile": startup_profile.profile_id if profile_valid else "invalid",
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}
