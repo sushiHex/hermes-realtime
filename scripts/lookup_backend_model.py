@@ -226,11 +226,12 @@ def _model(manifest: Mapping[str, Any], deadline: float) -> dict[str, Any]:
     weights = [row for row in selected["layers"]
                if row.get("mediaType") == "application/vnd.ollama.image.model"]
     if (len(templates) != 1 or templates[0]["mediaType"] != "application/vnd.ollama.image.template"
-            or len(params) != 1 or not weights or templates[0]["size"] > _JSON_LIMIT):
+            or len(params) > 1 or not weights or templates[0]["size"] > _JSON_LIMIT):
         raise ValueError("model-layer-layout")
-    options = _json_file(store / "blobs" / params[0]["digest"].replace(":", "-"))
-    if "num_ctx" in options:
-        raise ValueError("artifact-context-override")
+    if params:
+        options = _json_file(store / "blobs" / params[0]["digest"].replace(":", "-"))
+        if "num_ctx" in options:
+            raise ValueError("artifact-context-override")
     return {"model_manifest_sha256": identity,
         "model_config_sha256": selected["config"]["digest"][7:],
         "model_blob_count": len(descriptors), "model_family": family,

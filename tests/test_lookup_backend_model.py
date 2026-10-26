@@ -172,6 +172,36 @@ def rewrite_blob(selected, change, *, params=False):
     selected["model_manifest_sha256"] = digest(path.read_bytes())
 
 
+def rewrite_params_layers(selected, count):
+    store = Path(selected["model_store"])
+    path = store / "manifests/registry.ollama.ai/library/local-model/tag"
+    manifest = json.loads(path.read_bytes())
+    params = [row for row in manifest["layers"]
+              if row["mediaType"] == "application/vnd.ollama.image.params"]
+    manifest["layers"] = [row for row in manifest["layers"]
+                          if row["mediaType"] != "application/vnd.ollama.image.params"]
+    manifest["layers"].extend(params * count)
+    config_path = store / "blobs" / manifest["config"]["digest"].replace(":", "-")
+    config = json.loads(config_path.read_bytes())
+    config["rootfs"]["diff_ids"] = [row["digest"] for row in manifest["layers"]]
+    raw = json.dumps(config).encode()
+    manifest["config"].update(digest="sha256:" + digest(raw), size=len(raw))
+    (store / "blobs" / manifest["config"]["digest"].replace(":", "-")).write_bytes(raw)
+    path.write_text(json.dumps(manifest))
+    selected["model_manifest_sha256"] = digest(path.read_bytes())
+
+
+def test_stock_shape_without_params_is_admitted(selected):
+    rewrite_params_layers(selected, 0)
+    assert verify(selected)["model_blob_count"] == 3
+
+
+def test_duplicate_params_layers_are_refused(selected):
+    rewrite_params_layers(selected, 2)
+    with pytest.raises(ValueError, match="model-layer-layout"):
+        verify(selected)
+
+
 def test_model_configuration_refused(selected):
     rewrite_blob(selected, {"renderer": "other-route"})
     with pytest.raises(ValueError, match="model-config"):
