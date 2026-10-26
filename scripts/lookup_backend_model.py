@@ -48,6 +48,10 @@ class StartupProfile(Enum):
     def profile_id(self) -> str:
         return "LOOKUP_64K" if self is StartupProfile.LOOKUP_64K else "NATIVE_TOOLS_4K"
 
+    @property
+    def startup_seconds(self) -> int:
+        return 60 if self is StartupProfile.LOOKUP_64K else 120
+
 
 _JSON_LIMIT = 1024 * 1024
 _REFUSALS = frozenset({
@@ -401,16 +405,19 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
     """Keep the ready owned server for the caller; never pull or generate task text."""
     selected = dict(manifest)
     profile_valid = type(startup_profile) is StartupProfile
+    startup_seconds = startup_profile.startup_seconds if profile_valid else None
     port = selected["model_port"]
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("model-port")
-    deadline = min(deadline, time.monotonic() + 60)
+    if startup_seconds is not None:
+        deadline = min(deadline, time.monotonic() + startup_seconds)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     path = evidence_dir / "model-metadata.private.json"
     state: dict[str, Any] = {"version": 1, "category": "setup", "metadata_requests": [],
         "inference_request_count": 0,
         "context_default_tokens": startup_profile.context_tokens if profile_valid else None,
         "startup_profile": startup_profile.profile_id if profile_valid else "invalid",
+        "startup_budget_ceiling_seconds": startup_seconds,
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}

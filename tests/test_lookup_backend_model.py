@@ -331,6 +331,81 @@ def test_native_tools_profile_binds_environment_load_and_readback(
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
 
 
+def test_native_startup_admits_load_after_sixty_before_120(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1065.0)
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        1200.0, verified=proof, startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert result["model_ready"] is True
+    assert result["startup_budget_ceiling_seconds"] == 120
+    assert len(owned[4]) == 2
+
+
+def test_native_startup_parent_deadline_wins(selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1031.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1030.0, verified=proof,
+            startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())[
+        "startup_budget_ceiling_seconds"] == 120
+
+
+def test_native_startup_budget_is_shared_after_metadata(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    original_read = model._read
+
+    def metadata_read(*args):
+        result = original_read(*args)
+        if args[0] == "show":
+            now[0] = 1030.0
+        return result
+
+    monkeypatch.setattr(model, "_read", metadata_read)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1121.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1200.0, verified=proof,
+            startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_default_lookup_startup_stays_sixty_seconds(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1061.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1200.0, verified=proof)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["startup_budget_ceiling_seconds"] == 60
+    assert state["context_default_tokens"] == 64000
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
 def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
     profile = model.StartupProfile.NATIVE_TOOLS_4K
     with pytest.raises(AttributeError):
@@ -339,6 +414,8 @@ def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
         profile.go_template = None
     with pytest.raises(AttributeError):
         profile.profile_id = "LOOKUP_64K"
+    with pytest.raises(AttributeError):
+        profile.startup_seconds = 60
     with pytest.raises(AttributeError):
         profile.value = (64000, None)
     original_value, original_name = profile._value_, profile._name_
@@ -351,6 +428,7 @@ def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
         profile._value_, profile._name_ = original_value, original_name
     assert result["configured_context_tokens"] == 4096
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
+    assert result["startup_budget_ceiling_seconds"] == 120
     assert owned[0].calls[0][2]["env"]["OLLAMA_GO_TEMPLATE"] == "1"
 
 
