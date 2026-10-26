@@ -426,6 +426,25 @@ async def test_structured_reply_retains_segmentation_without_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "Could you send the error log? Share it here, and I'll inspect it once it arrives.",
+    "I will research the timeout.",
+], ids=["clarification_and_offer", "unconditional_offer"])
+async def test_future_offer_is_ordinary_reply_without_proposal_or_dispatch(text) -> None:
+    inference, handler, _, response = adapter([
+        decision_frame({"kind": "reply", "text": text}),
+    ])
+    try:
+        parts = await collect(inference)
+        assert all(type(part) is str for part in parts)
+        assert " ".join(parts) == text
+        assert handler.calls == []
+        assert response.closed
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chunks", [
     ["I've started that background task."],
     ["An ordinary sentence. I've sta", "rted that background task."],

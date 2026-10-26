@@ -2671,8 +2671,35 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
 
 
 @pytest.mark.asyncio
-async def test_codex_rejects_a_background_promise_without_accepted_start() -> None:
-    transport = FakeCodexTransport(assistant_delta="I'll look into the delay and report back.")
+@pytest.mark.parametrize("text", [
+    "Could you send the error log? Share it here, and I'll inspect it once it arrives.",
+    "I will research the timeout.",
+], ids=["clarification_and_offer", "unconditional_offer"])
+async def test_codex_future_offer_is_ordinary_speech_without_proposal_or_dispatch(text) -> None:
+    transport = FakeCodexTransport(assistant_delta=text)
+    handler = FakeWorkToolHandler()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(handler)
+    try:
+        parts = await _collect_stream(inference, "turn_future_offer")
+        assert all(type(part) is str for part in parts)
+        assert " ".join(parts) == text
+        assert handler.starts == []
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "I've started the investigation.",
+    "I launched a background task.",
+])
+async def test_codex_rejects_an_actual_start_claim_without_accepted_start(text) -> None:
+    transport = FakeCodexTransport(assistant_delta=text)
     handler = FakeWorkToolHandler()
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
@@ -2682,7 +2709,7 @@ async def test_codex_rejects_a_background_promise_without_accepted_start() -> No
     inference.bind_work_tools(handler)
 
     with pytest.raises(RuntimeError, match="unverified background-work claim"):
-        await _collect_stream(inference, "turn_false_background_promise")
+        await _collect_stream(inference, "turn_false_background_start")
 
     assert handler.starts == []
     await inference.close()

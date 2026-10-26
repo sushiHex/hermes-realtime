@@ -221,6 +221,21 @@ shared routing rule (`WORK_ROUTING_POLICY`, #280, aligned for the confirmed prop
 These rules are instructions, not a validator, and they do not guarantee model
 obedience.
 
+The owner approved allowing future offers as ordinary speech on 2026-10-25
+([#346](https://github.com/sushiHex/hermes-realtime/issues/346)). Future intent
+alone does not report accepted or active work, including an unconditional offer
+or a clarification asking for required input followed by an offer of help.
+Speech creates no proposal, confirms no objective and dispatches nothing. Requests
+that need delegation still require faithful objectives through the existing
+proposal and exact-objective confirmation path; an offer cannot substitute for it.
+
+The shared provider reporting guard retains its finite started/launched phrase
+families and excludes future offers. It does not establish the truth of arbitrary
+English acceptance, current-work or completion claims. Unsupported lifecycle
+claims and misleading promises still fail manual truthfulness and quality review.
+This reporting distinction adds no condition parser, intent classifier or model
+exception, changes no default, and waives no routing or activation gate.
+
 ## Host-authored task status
 
 The owner approved the bounded status path in #270 on 2026-10-15. An admitted
