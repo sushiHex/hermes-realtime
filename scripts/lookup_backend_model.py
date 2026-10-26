@@ -2,7 +2,7 @@
 
 This preflight binds bytes at verification time; it is not a file-seal, capacity or
 useful-task qualification. The caller retains the owner through all consumers and settles it in
-finally. Only the owned child receives the qualified 64000/q8_0 settings.
+finally. Only the owned child receives the selected closed startup settings.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import urllib.request
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import IO, Any, NoReturn
@@ -27,6 +28,31 @@ from scripts.qualification_file_seals import _relative_windows_member
 
 MODEL_PROCESS_NAME = "lookup-model"
 SUPPORTED_VERSION = "0.40.4"
+
+
+class StartupProfile(Enum):
+    """The two admitted Ollama startup settings; callers cannot supply raw values."""
+
+    LOOKUP_64K = 1
+    NATIVE_TOOLS_4K = 2
+
+    @property
+    def context_tokens(self) -> int:
+        return 64000 if self is StartupProfile.LOOKUP_64K else 4096
+
+    @property
+    def go_template(self) -> str | None:
+        return None if self is StartupProfile.LOOKUP_64K else "1"
+
+    @property
+    def profile_id(self) -> str:
+        return "LOOKUP_64K" if self is StartupProfile.LOOKUP_64K else "NATIVE_TOOLS_4K"
+
+    @property
+    def startup_seconds(self) -> int:
+        return 60 if self is StartupProfile.LOOKUP_64K else 120
+
+
 _JSON_LIMIT = 1024 * 1024
 _REFUSALS = frozenset({
     "model-deadline", "artifact-file-kind", "artifact-json-bound", "artifact-json-shape",
@@ -38,7 +64,8 @@ _REFUSALS = frozenset({
     "metadata-status", "metadata-bound", "metadata-shape", "model-port", "model-already-attempted",
     "owner-containment", "port-occupied", "model-exited", "metadata-version", "metadata-model",
     "metadata-template", "metadata-capabilities", "artifact-proof",
-    "load-ack", "loaded-model", "loaded-context", "readiness-status", "readiness-bound",
+    "load-ack", "loaded-model", "loaded-context", "startup-profile", "readiness-status",
+    "readiness-bound",
     "readiness-shape", "readiness-json", "model-readiness-loop",
 })
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
@@ -203,11 +230,12 @@ def _model(manifest: Mapping[str, Any], deadline: float) -> dict[str, Any]:
     weights = [row for row in selected["layers"]
                if row.get("mediaType") == "application/vnd.ollama.image.model"]
     if (len(templates) != 1 or templates[0]["mediaType"] != "application/vnd.ollama.image.template"
-            or len(params) != 1 or not weights or templates[0]["size"] > _JSON_LIMIT):
+            or len(params) > 1 or not weights or templates[0]["size"] > _JSON_LIMIT):
         raise ValueError("model-layer-layout")
-    options = _json_file(store / "blobs" / params[0]["digest"].replace(":", "-"))
-    if "num_ctx" in options:
-        raise ValueError("artifact-context-override")
+    if params:
+        options = _json_file(store / "blobs" / params[0]["digest"].replace(":", "-"))
+        if "num_ctx" in options:
+            raise ValueError("artifact-context-override")
     return {"model_manifest_sha256": identity,
         "model_config_sha256": selected["config"]["digest"][7:],
         "model_blob_count": len(descriptors), "model_family": family,
@@ -291,7 +319,7 @@ def _read(kind: str, manifest: Mapping[str, Any], process: Any,
 
 
 async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: float,
-                          state: dict[str, Any]) -> None:
+                          state: dict[str, Any], startup_profile: StartupProfile) -> None:
     """One empty load and one configured-context readback, under one remaining budget.
 
     Pinned Ollama's native chat handler awaits runner readiness before returning
@@ -343,7 +371,8 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
             follow_redirects=False, trust_env=False) as client:
         async with asyncio.timeout(_remaining(deadline)):
             load = await read("chat", {"model": manifest["model"], "messages": [],
-                "stream": False, "options": {"num_ctx": 64000}, "keep_alive": "5m"}, "load")
+                "stream": False, "options": {"num_ctx": startup_profile.context_tokens},
+                "keep_alive": "5m"}, "load")
             state["stage"] = "model-load-ack"
             message = load.get("message")
             if (load.get("done") is not True or load.get("done_reason") != "load"
@@ -363,24 +392,32 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
                     or row.get("model") != manifest["model"]):
                 raise ValueError("loaded-model")
             state["stage"] = "model-readback-context"
-            if type(row.get("context_length")) is not int or row["context_length"] != 64000:
+            if (type(row.get("context_length")) is not int
+                    or row["context_length"] != startup_profile.context_tokens):
                 raise ValueError("loaded-context")
             state["configured_context_tokens"] = row["context_length"]
 
 
 def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 evidence_dir: Path, deadline: float, *,
-                verified: VerifiedArtifacts | None = None) -> dict[str, Any]:
+                verified: VerifiedArtifacts | None = None,
+                startup_profile: StartupProfile = StartupProfile.LOOKUP_64K) -> dict[str, Any]:
     """Keep the ready owned server for the caller; never pull or generate task text."""
     selected = dict(manifest)
+    profile_valid = type(startup_profile) is StartupProfile
+    startup_seconds = startup_profile.startup_seconds if profile_valid else None
     port = selected["model_port"]
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("model-port")
-    deadline = min(deadline, time.monotonic() + 60)
+    if startup_seconds is not None:
+        deadline = min(deadline, time.monotonic() + startup_seconds)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     path = evidence_dir / "model-metadata.private.json"
     state: dict[str, Any] = {"version": 1, "category": "setup", "metadata_requests": [],
-        "inference_request_count": 0, "context_default_tokens": 64000,
+        "inference_request_count": 0,
+        "context_default_tokens": startup_profile.context_tokens if profile_valid else None,
+        "startup_profile": startup_profile.profile_id if profile_valid else "invalid",
+        "startup_budget_ceiling_seconds": startup_seconds,
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}
@@ -388,6 +425,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         json.dump(state, stream)
     process = None
     try:
+        if not profile_valid:
+            raise ValueError("startup-profile")
         _remaining(deadline)
         try:
             asyncio.get_running_loop()
@@ -413,10 +452,13 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                if not key.upper().startswith(("OLLAMA_", "LLAMA_ARG_"))}
         env.update({"OLLAMA_HOST": f"127.0.0.1:{port}",
             "OLLAMA_MODELS": str(selected["model_store"]),
-            "OLLAMA_CONTEXT_LENGTH": "64000", "OLLAMA_KV_CACHE_TYPE": "q8_0",
+            "OLLAMA_CONTEXT_LENGTH": str(startup_profile.context_tokens),
+            "OLLAMA_KV_CACHE_TYPE": "q8_0",
             "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_NUM_PARALLEL": "1",
             "OLLAMA_MAX_LOADED_MODELS": "1", "OLLAMA_NOPRUNE": "1", "OLLAMA_NO_CLOUD": "1",
             "OLLAMA_DEBUG_LOG_REQUESTS": "0"})
+        if startup_profile.go_template is not None:
+            env["OLLAMA_GO_TEMPLATE"] = startup_profile.go_template
         if _listeners(port, deadline):
             raise RuntimeError("port-occupied")
         _remaining(deadline)
@@ -451,7 +493,7 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 or not {"completion", "tools"}.issubset(show["capabilities"])
                 or any(show.get(field, "") != "" for field in ("remote_host", "remote_model"))):
             raise ValueError("metadata-capabilities")
-        asyncio.run(_load_readiness(selected, process, deadline, state))
+        asyncio.run(_load_readiness(selected, process, deadline, state, startup_profile))
         _remaining(deadline)
         state.update(category="metadata_ready", stage="complete", runtime_version=SUPPORTED_VERSION,
                      model_ready=True)

@@ -172,6 +172,36 @@ def rewrite_blob(selected, change, *, params=False):
     selected["model_manifest_sha256"] = digest(path.read_bytes())
 
 
+def rewrite_params_layers(selected, count):
+    store = Path(selected["model_store"])
+    path = store / "manifests/registry.ollama.ai/library/local-model/tag"
+    manifest = json.loads(path.read_bytes())
+    params = [row for row in manifest["layers"]
+              if row["mediaType"] == "application/vnd.ollama.image.params"]
+    manifest["layers"] = [row for row in manifest["layers"]
+                          if row["mediaType"] != "application/vnd.ollama.image.params"]
+    manifest["layers"].extend(params * count)
+    config_path = store / "blobs" / manifest["config"]["digest"].replace(":", "-")
+    config = json.loads(config_path.read_bytes())
+    config["rootfs"]["diff_ids"] = [row["digest"] for row in manifest["layers"]]
+    raw = json.dumps(config).encode()
+    manifest["config"].update(digest="sha256:" + digest(raw), size=len(raw))
+    (store / "blobs" / manifest["config"]["digest"].replace(":", "-")).write_bytes(raw)
+    path.write_text(json.dumps(manifest))
+    selected["model_manifest_sha256"] = digest(path.read_bytes())
+
+
+def test_stock_shape_without_params_is_admitted(selected):
+    rewrite_params_layers(selected, 0)
+    assert verify(selected)["model_blob_count"] == 3
+
+
+def test_duplicate_params_layers_are_refused(selected):
+    rewrite_params_layers(selected, 2)
+    with pytest.raises(ValueError, match="model-layer-layout"):
+        verify(selected)
+
+
 def test_model_configuration_refused(selected):
     rewrite_blob(selected, {"renderer": "other-route"})
     with pytest.raises(ValueError, match="model-config"):
@@ -274,10 +304,152 @@ def owned(selected, monkeypatch):
     return owner, containment, calls, replies, ready_calls, ready
 
 
-def start(selected, owned, tmp_path):
+_DEFAULT_PROFILE = object()
+
+
+def start(selected, owned, tmp_path, *, startup_profile=_DEFAULT_PROFILE):
     owner, containment = owned[:2]
+    kwargs = {} if startup_profile is _DEFAULT_PROFILE else {"startup_profile": startup_profile}
     return model.start_model(selected, owner, containment, tmp_path / "evidence",
-                             model.time.monotonic() + 10)
+                             model.time.monotonic() + 10, **kwargs)
+
+
+def test_native_tools_profile_binds_environment_load_and_readback(
+        selected, owned, tmp_path, monkeypatch):
+    monkeypatch.setenv("OLLAMA_GO_TEMPLATE", "0")
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "9000")
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    result = start(selected, owned, tmp_path,
+                   startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    env = owned[0].calls[0][2]["env"]
+    assert env["OLLAMA_CONTEXT_LENGTH"] == "4096"
+    assert env["OLLAMA_GO_TEMPLATE"] == "1"
+    assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
+    assert env["OLLAMA_FLASH_ATTENTION"] == "1"
+    assert json.loads(owned[4][0].content)["options"] == {"num_ctx": 4096}
+    assert result["context_default_tokens"] == result["configured_context_tokens"] == 4096
+    assert result["startup_profile"] == "NATIVE_TOOLS_4K"
+
+
+def test_native_startup_admits_load_after_sixty_before_120(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1065.0)
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        1200.0, verified=proof, startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert result["model_ready"] is True
+    assert result["startup_budget_ceiling_seconds"] == 120
+    assert len(owned[4]) == 2
+
+
+def test_native_startup_parent_deadline_wins(selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1031.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1030.0, verified=proof,
+            startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())[
+        "startup_budget_ceiling_seconds"] == 120
+
+
+def test_native_startup_budget_is_shared_after_metadata(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    original_read = model._read
+
+    def metadata_read(*args):
+        result = original_read(*args)
+        if args[0] == "show":
+            now[0] = 1030.0
+        return result
+
+    monkeypatch.setattr(model, "_read", metadata_read)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1121.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1200.0, verified=proof,
+            startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_default_lookup_startup_stays_sixty_seconds(
+        selected, owned, tmp_path, monkeypatch):
+    now = [1000.0]
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns))
+    proof = model.verify_artifacts(selected, 1200.0)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1061.0)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1200.0, verified=proof)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["startup_budget_ceiling_seconds"] == 60
+    assert state["context_default_tokens"] == 64000
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
+    profile = model.StartupProfile.NATIVE_TOOLS_4K
+    with pytest.raises(AttributeError):
+        profile.context_tokens = 64000
+    with pytest.raises(AttributeError):
+        profile.go_template = None
+    with pytest.raises(AttributeError):
+        profile.profile_id = "LOOKUP_64K"
+    with pytest.raises(AttributeError):
+        profile.startup_seconds = 60
+    with pytest.raises(AttributeError):
+        profile.value = (64000, None)
+    original_value, original_name = profile._value_, profile._name_
+    try:
+        profile._value_ = (64000, None)
+        profile._name_ = "LOOKUP_64K"
+        owned[5]["ps"]["models"][0]["context_length"] = 4096
+        result = start(selected, owned, tmp_path, startup_profile=profile)
+    finally:
+        profile._value_, profile._name_ = original_value, original_name
+    assert result["configured_context_tokens"] == 4096
+    assert result["startup_profile"] == "NATIVE_TOOLS_4K"
+    assert result["startup_budget_ceiling_seconds"] == 120
+    assert owned[0].calls[0][2]["env"]["OLLAMA_GO_TEMPLATE"] == "1"
+
+
+@pytest.mark.parametrize("invalid", [None, "NATIVE_TOOLS_4K", 4096, object()])
+def test_invalid_startup_profile_refused_before_spawn(selected, owned, tmp_path, invalid):
+    with pytest.raises(ValueError, match="startup-profile"):
+        start(selected, owned, tmp_path, startup_profile=invalid)
+    assert not owned[0].calls
+    receipt = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert receipt["category"] == "refused"
+    assert receipt["failure_category"] == "startup-profile"
+    assert receipt["startup_profile"] == "invalid"
+
+
+@pytest.mark.parametrize("context", [64000, 4096.0, None])
+def test_native_tools_profile_requires_exact_readback(selected, owned, tmp_path, context):
+    owned[5]["ps"]["models"][0]["context_length"] = context
+    with pytest.raises(ValueError, match="loaded-context"):
+        start(selected, owned, tmp_path,
+              startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
 
 
 def test_owned_startup_and_closed_options(selected, owned, tmp_path, monkeypatch):
