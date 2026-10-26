@@ -160,6 +160,42 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
 
 
+def test_observation_time_contract_reaches_both_background_and_presentation_requests(setup):
+    from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
+    from tests.integration.test_hermes_api_session import _dispatch_request
+
+    session = HermesApiTaskSession(
+        config=HermesApiConfig(
+            base_url="http://127.0.0.1:8642",
+            bearer="presentation-test-bearer-value-32-characters",
+        ),
+        session_id="session_api_1",
+    )
+    background = session._mint_pending_run(_dispatch_request()).body["instructions"]
+    assert isinstance(background, str)
+
+    answer = (
+        "The monitor counted 12 active sessions at 07:53 UTC. The result was "
+        "retrieved at 09:30 UTC, 97 minutes after observation."
+    )
+    setup.original.choices[0].message.content = answer
+    setup.run()
+    presentation = setup.captured["requests"][0]
+    assert json.loads(presentation["messages"][1]["content"])["answer"] == answer
+    formatter = presentation["messages"][0]["content"]
+
+    for instructions in (background, formatter):
+        assert (
+            "observation time or age in both independently usable voice and detail"
+            in instructions
+        )
+        assert "distinguish observation time from retrieval time" in instructions
+        assert (
+            "do not present an earlier observation as an instantaneous present condition"
+            in instructions
+        )
+
+
 @pytest.mark.parametrize("setup", [None], indirect=True)
 def test_initial_lookup_is_a_host_request_without_provider_call(setup):
     s = setup
