@@ -84,6 +84,20 @@ class _DuplicateDecisionKeys(ValueError):
     """A structured decision contains conflicting JSON object entries."""
 
 
+class OllamaDecisionRefused(ValueError):
+    """A model decision was refused, rather than inference failing operationally.
+
+    ``category`` is supplied by the adapter's decision guards, never model prose.
+    Callers must catch this type rather than interpret ValueError messages or
+    copy category lists. Deadlines, resource limits and ownership failures are
+    operational errors and must retain their stopping semantics.
+    """
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__("Ollama work refused: " + category)
+
+
 class _WorkToolHandler(Protocol):
     @property
     def max_objective_chars(self) -> int: ...
@@ -485,9 +499,9 @@ class OllamaStreamingInference:
                     response_bytes += len(raw_line)
                     response_chunks += 1
                     if response_bytes > _MAX_WORK_RESPONSE_BYTES:
-                        self._refuse_work("response_bytes")
+                        self._work_limit("response_bytes")
                     if response_chunks > _MAX_WORK_RESPONSE_CHUNKS:
-                        self._refuse_work("response_chunks")
+                        self._work_limit("response_chunks")
                 payload = self._payload(raw_line)
                 content, done = self._content(payload)
                 message = cast(dict[str, object], payload["message"])
@@ -507,7 +521,7 @@ class OllamaStreamingInference:
                         except UnicodeEncodeError:
                             self._refuse_work("decision_unicode")
                         if decision_bytes > _MAX_WORK_DECISION_BYTES:
-                            self._refuse_work("decision_bytes")
+                            self._work_limit("decision_bytes")
                     buffer += content
                     if handler is None:
                         segments, buffer = self._extract_segments(buffer, final=False)
@@ -535,7 +549,7 @@ class OllamaStreamingInference:
                             turn_id, response, phase="before_status", work=True,
                         )
                         if asyncio.get_running_loop().time() >= deadline:
-                            self._refuse_work("deadline")
+                            self._work_limit("deadline")
                     yield decision
                     return
                 objective, buffer = cast(tuple[str | None, str], decision)
@@ -544,7 +558,7 @@ class OllamaStreamingInference:
                         turn_id, response, phase="before_admission", work=True,
                     )
                     if asyncio.get_running_loop().time() >= deadline:
-                        self._refuse_work("deadline")
+                        self._work_limit("deadline")
                 if objective is not None:
                     # Selection has no dispatch authority. The current host lease
                     # presents this exact objective and owns later confirmation.
@@ -567,7 +581,7 @@ class OllamaStreamingInference:
                 raise AssertionError("final segmentation retained text")
         except TimeoutError:
             if handler is not None:
-                self._refuse_work("deadline")
+                self._work_limit("deadline")
             raise
         finally:
             response_cleanup: asyncio.Task[None] | None = None
@@ -629,6 +643,13 @@ class OllamaStreamingInference:
 
     @classmethod
     def _refuse_work(cls, category: str, *, attempts: int = 0) -> None:
+        try:
+            raise OllamaDecisionRefused(category)
+        finally:
+            cls._work_evidence(category, attempts=attempts)
+
+    @classmethod
+    def _work_limit(cls, category: str, *, attempts: int = 0) -> None:
         try:
             raise ValueError("Ollama work refused: " + category)
         finally:

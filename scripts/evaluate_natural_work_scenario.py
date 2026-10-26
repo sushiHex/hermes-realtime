@@ -31,7 +31,7 @@ from hermes_realtime.host_launcher import (
 from hermes_realtime.host_launcher import (
     _run_full_host_preflight as preflight,
 )
-from hermes_realtime.providers.ollama import OllamaStreamingInference
+from hermes_realtime.providers.ollama import OllamaDecisionRefused, OllamaStreamingInference
 from hermes_realtime.speech import AudioFrame, SpeechChunk, Transcript
 from scripts import evaluate_natural_work_routing as legacy
 
@@ -463,33 +463,9 @@ async def run_cases(
             row["decision_attempted"] = True
             try:
                 await asyncio.wait_for(collect(), 60)
-            except ValueError as error:
-                if str(error) not in {
-                    "Ollama work refused: " + category
-                    for category in (
-                        "completion_reason",
-                        "incomplete",
-                        "calls_type",
-                        "unexpected_native_calls",
-                        "decision_unicode",
-                        "unverified_claim",
-                        "duplicate_keys",
-                        "decision_json",
-                        "decision_schema",
-                        "unadvertised",
-                        "objective_type",
-                        "objective_blank",
-                        "objective_length",
-                        "objective_unicode",
-                        "text_type",
-                        "text_blank",
-                        "text_length",
-                        "text_unicode",
-                        "private_authority",
-                    )
-                }:
-                    raise
+            except OllamaDecisionRefused as error:
                 row["error"] = "decision_refused"
+                row["refusal_category"] = error.category
             if recorder.requests and (
                 row["speech"] != ["The background task was not accepted."]
                 or recorder.events != ["ack_rejected", "speech"]
