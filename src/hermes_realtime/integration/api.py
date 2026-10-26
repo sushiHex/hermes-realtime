@@ -110,7 +110,12 @@ _BACKGROUND_INSTRUCTIONS = (
     "detail, at most 1800 characters. Preserve every material finding, its useful context, "
     "uncertainty, and source attribution; do not collapse a multi-item result into a terse "
     "headline list</detail>. Voice and detail must be semantically consistent; detail may "
-    "expand voice but must not replace its important findings. Do not put line breaks or "
+    "expand voice but must not replace its important findings. For time-dependent observed "
+    "facts, include the observation time or age in both independently usable voice and detail "
+    "when evidence supports it; distinguish observation time from retrieval time; do not "
+    "present an earlier observation as an instantaneous present condition merely because "
+    "retrieval was recent. If observation time is unavailable, state timing uncertainty "
+    "instead of inventing a time. Do not put line breaks or "
     "markup inside voice, or text outside these elements."
 )
 
