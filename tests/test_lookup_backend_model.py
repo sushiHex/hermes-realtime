@@ -274,10 +274,51 @@ def owned(selected, monkeypatch):
     return owner, containment, calls, replies, ready_calls, ready
 
 
-def start(selected, owned, tmp_path):
+_DEFAULT_PROFILE = object()
+
+
+def start(selected, owned, tmp_path, *, startup_profile=_DEFAULT_PROFILE):
     owner, containment = owned[:2]
+    kwargs = {} if startup_profile is _DEFAULT_PROFILE else {"startup_profile": startup_profile}
     return model.start_model(selected, owner, containment, tmp_path / "evidence",
-                             model.time.monotonic() + 10)
+                             model.time.monotonic() + 10, **kwargs)
+
+
+def test_native_tools_profile_binds_environment_load_and_readback(
+        selected, owned, tmp_path, monkeypatch):
+    monkeypatch.setenv("OLLAMA_GO_TEMPLATE", "0")
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "9000")
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    result = start(selected, owned, tmp_path,
+                   startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    env = owned[0].calls[0][2]["env"]
+    assert env["OLLAMA_CONTEXT_LENGTH"] == "4096"
+    assert env["OLLAMA_GO_TEMPLATE"] == "1"
+    assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
+    assert env["OLLAMA_FLASH_ATTENTION"] == "1"
+    assert json.loads(owned[4][0].content)["options"] == {"num_ctx": 4096}
+    assert result["context_default_tokens"] == result["configured_context_tokens"] == 4096
+    assert result["startup_profile"] == "NATIVE_TOOLS_4K"
+
+
+@pytest.mark.parametrize("invalid", [None, "NATIVE_TOOLS_4K", 4096, object()])
+def test_invalid_startup_profile_refused_before_spawn(selected, owned, tmp_path, invalid):
+    with pytest.raises(ValueError, match="startup-profile"):
+        start(selected, owned, tmp_path, startup_profile=invalid)
+    assert not owned[0].calls
+    receipt = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert receipt["category"] == "refused"
+    assert receipt["failure_category"] == "startup-profile"
+    assert receipt["startup_profile"] == "invalid"
+
+
+@pytest.mark.parametrize("context", [64000, 4096.0, None])
+def test_native_tools_profile_requires_exact_readback(selected, owned, tmp_path, context):
+    owned[5]["ps"]["models"][0]["context_length"] = context
+    with pytest.raises(ValueError, match="loaded-context"):
+        start(selected, owned, tmp_path,
+              startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
 
 
 def test_owned_startup_and_closed_options(selected, owned, tmp_path, monkeypatch):
