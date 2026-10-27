@@ -31,7 +31,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from hermes_realtime._qualification import (
@@ -1936,6 +1936,7 @@ def build_local_host_launcher(
     hermes_api_bearer: str | None,
     hermes_api_url: str = DEFAULT_HERMES_API_URL,
     hermes_lookup_policy: str | None = None,
+    hermes_model_source: Literal["foreground", "gateway"] = "foreground",
     livekit_url: str = "ws://127.0.0.1:7880",
     livekit_api_key: str = "devkey",
     livekit_api_secret: str = "local" + "-" + ("x" * 32),
@@ -1992,11 +1993,21 @@ def build_local_host_launcher(
     ``hermes_lookup_policy`` explicitly designates all background runs through this
     host's API adapter. None preserves ordinary native runs; this does not install
     or qualify the experimental policy plugin.
+    ``hermes_model_source="gateway"`` delegates background model selection to the
+    gateway configuration; the default retains the foreground Codex overrides.
     ``voice_tail`` names the durable heard-context file; None disables it.
     ``voice_companion`` names the Hermes companion that archives the tail's outbox;
     None archives nothing. Archiving needs the tail, whose outbox it drains.
     """
 
+    if type(hermes_model_source) is not str or hermes_model_source not in ("foreground", "gateway"):
+        try:
+            raise ValueError("hermes_model_source must be exactly 'foreground' or 'gateway'")
+        finally:
+            print(
+                '[hermes-model-source] {"category":"configuration_refused","count":1,"version":1}',
+                flush=True,
+            )
     qualification_dependencies = _current_qualification_full_host_dependencies()
     qualification_no_hermes_tasks = (
         _QUALIFICATION_NO_TASK_COMPOSITION.get() or qualification_dependencies is not None
@@ -2121,16 +2132,17 @@ def build_local_host_launcher(
         raise ValueError("browser launch authorizers are mutually exclusive")
     if tts_provider is None:
         tts_provider = _default_tts_provider()
+    foreground_model = inference_provider == "codex" and hermes_model_source == "foreground"
     api_config = (
         None
         if qualification_no_hermes_tasks
         else HermesApiConfig(
             base_url=hermes_api_url,
             bearer=cast(str, hermes_api_bearer),
-            run_provider="openai-codex" if inference_provider == "codex" else None,
-            run_model=codex_model if inference_provider == "codex" else None,
-            run_reasoning_effort=codex_effort if inference_provider == "codex" else None,
-            run_service_tier="priority" if inference_provider == "codex" else None,
+            run_provider="openai-codex" if foreground_model else None,
+            run_model=codex_model if foreground_model else None,
+            run_reasoning_effort=codex_effort if foreground_model else None,
+            run_service_tier="priority" if foreground_model else None,
             lookup_policy=hermes_lookup_policy,
         )
     )

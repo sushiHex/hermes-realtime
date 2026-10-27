@@ -179,10 +179,15 @@ config = HermesApiConfig(
 
 Supply it to `HermesApiTaskSession(config=config, ...)` through the existing
 conversation controller. Alternatively `build_local_host_launcher` exposes
-`hermes_lookup_policy="ordinary-lookup/v1"` for its API adapter; the voice-host CLI
-does not expose this selection. The separate backend setup command does. Every run through that configured
+`hermes_lookup_policy="ordinary-lookup/v1"` for its API adapter. Also select
+`hermes_model_source="gateway"` in that Python composition so background runs
+use the gateway's configured model route, reasoning and service tier, independently
+of the foreground model. This delegates selection; it does not attest the model's
+identity. The default `"foreground"` preserves the existing Codex overrides.
+The voice-host CLI exposes neither selection. The separate backend setup command
+selects its own gateway route. Every run through that configured
 adapter is designated; use a dedicated deployment. `None` preserves ordinary
-native runs. Keep native `run_provider`, `run_model` and `run_reasoning_effort`
+native runs. Keep native `run_provider`, `run_model`, `run_reasoning_effort` and `run_service_tier`
 unset for this profile so Hermes uses the configured route/default reasoning.
 The separate presentation call sends `reasoning_effort="none"`, no tools,
 nonstreaming strict JSON and a 1024-token cap. Unsupported controls refuse;

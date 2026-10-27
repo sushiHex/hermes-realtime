@@ -1631,6 +1631,72 @@ def test_full_host_requires_explicit_unsandboxed_task_opt_in() -> None:
         )
 
 
+@pytest.mark.parametrize("inference_provider", ["codex", "ollama"])
+@pytest.mark.parametrize("model_source", [None, "foreground", "gateway"])
+def test_full_host_selects_hermes_model_source_without_changing_foreground(
+    monkeypatch: pytest.MonkeyPatch,
+    inference_provider: str,
+    model_source: str | None,
+) -> None:
+    captured: list[host_launcher_module.HermesApiConfig] = []
+
+    def capture_session(**kwargs: Any) -> None:
+        captured.append(kwargs["config"])
+        raise RuntimeError("captured task configuration")
+
+    monkeypatch.setattr(host_launcher_module, "HermesApiTaskSession", capture_session)
+    options = {} if model_source is None else {"hermes_model_source": model_source}
+    with pytest.raises(RuntimeError, match="captured task configuration"):
+        build_local_host_launcher(
+            hermes_api_bearer="host-test-bearer-value-32-characters",
+            inference_provider=inference_provider,
+            codex_model="foreground-model",
+            codex_effort="medium",
+            allow_unsandboxed_tasks=True,
+            **options,  # type: ignore[arg-type]
+        )
+    assert len(captured) == 1
+    config = captured[0]
+    assert type(config) is host_launcher_module.HermesApiConfig
+    overrides = (
+        config.run_provider, config.run_model,
+        config.run_reasoning_effort, config.run_service_tier,
+    )
+    assert overrides == (
+        ("openai-codex", "foreground-model", "medium", "priority")
+        if inference_provider == "codex" and model_source != "gateway"
+        else (None, None, None, None)
+    )
+
+
+class _ModelSourceString(str):
+    pass
+
+
+@pytest.mark.parametrize("model_source", [
+    "unknown", "", None, True, b"gateway",
+    pytest.param(_ModelSourceString("gateway"), id="string-subclass"),
+])
+def test_full_host_rejects_invalid_hermes_model_source_before_provider_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model_source: object,
+) -> None:
+    def forbidden_provider(**_kwargs: object) -> None:
+        raise AssertionError("invalid model source reached provider loading")
+
+    monkeypatch.setattr(host_launcher_module, "_build_streaming_inference", forbidden_provider)
+    with pytest.raises(ValueError, match="hermes_model_source"):
+        build_local_host_launcher(
+            hermes_api_bearer="host-test-bearer-value-32-characters",
+            hermes_model_source=model_source,  # type: ignore[arg-type]
+            allow_unsandboxed_tasks=True,
+        )
+    assert capsys.readouterr().out.splitlines() == [
+        '[hermes-model-source] {"category":"configuration_refused","count":1,"version":1}'
+    ]
+
+
 @pytest.mark.asyncio
 async def test_qualification_no_task_composition_routes_through_real_command_router(
     monkeypatch: pytest.MonkeyPatch,
