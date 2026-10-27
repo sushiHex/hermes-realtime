@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 
@@ -5,6 +6,173 @@ import pytest
 
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from scripts import probe_confirmed_natural_work as probe
+
+
+def codex_arguments(tmp_path):
+    executable = tmp_path / "synthetic-codex.exe"
+    executable.write_bytes(b"synthetic executable; never launched")
+    return [
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--inference-provider", "codex", "--model", "gpt-5.6-terra",
+        "--codex-effort", "low", "--codex-executable", str(executable),
+        "--codex-executable-sha256", probe.harness.digest(executable),
+        "--private-receipt", str(tmp_path / "receipt"),
+    ]
+
+
+def bind_synthetic_source(monkeypatch):
+    monkeypatch.setattr(probe.harness, "verify_imports", lambda: None)
+    monkeypatch.setattr(probe.harness, "source_binding", lambda: {
+        "head": "a" * 40, "tree": "b" * 40, "dirty": False,
+    })
+
+
+def test_explicit_codex_preparation_binds_executable_without_launch(monkeypatch, tmp_path, capsys):
+    bind_synthetic_source(monkeypatch)
+    monkeypatch.setattr(probe, "factory", lambda **kwargs: pytest.fail("preparation launched"))
+    arguments = codex_arguments(tmp_path)
+    assert probe.main(arguments) == 0
+    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    assert report["status"] == "prepared_only"
+    assert report["inference_provider"] == "codex"
+    assert report["model"] == "gpt-5.6-terra"
+    assert report["model_digest"] is None
+    assert report["codex_effort"] == "low"
+    assert report["source_binding"]["codex_executable_sha256"] == arguments[-3]
+    assert str(tmp_path) not in json.dumps(report)
+    assert not (tmp_path / "receipt").exists()
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_model", "missing_effort", "missing_executable", "missing_pin", "wrong_pin",
+    "ollama_digest", "ollama_endpoint", "unknown_provider", "private_model", "effort",
+])
+def test_codex_configuration_refused_before_dispatch_or_receipt(
+    monkeypatch, tmp_path, capsys, fault,
+):
+    bind_synthetic_source(monkeypatch)
+    arguments = codex_arguments(tmp_path)
+    missing = {"missing_model": "--model", "missing_effort": "--codex-effort",
+               "missing_executable": "--codex-executable",
+               "missing_pin": "--codex-executable-sha256"}
+    if fault in missing:
+        index = arguments.index(missing[fault])
+        del arguments[index:index + 2]
+    elif fault == "wrong_pin":
+        arguments[arguments.index("--codex-executable-sha256") + 1] = "0" * 64
+    elif fault == "ollama_digest":
+        arguments.extend(["--model-digest", "c" * 64])
+    elif fault == "ollama_endpoint":
+        arguments.extend(["--base-url", "http://127.0.0.1:1"])
+    elif fault == "unknown_provider":
+        arguments[arguments.index("--inference-provider") + 1] = "SYNTHETIC_PRIVATE_provider"
+    elif fault == "private_model":
+        arguments[arguments.index("--model") + 1] = "SYNTHETIC_PRIVATE/model\\path"
+    else:
+        arguments[arguments.index("--codex-effort") + 1] = "SYNTHETIC_PRIVATE_effort"
+    monkeypatch.setattr(probe, "run_cases", lambda **kwargs: pytest.fail("refusal dispatched"))
+    assert probe.main(arguments + ["--live"]) == 1
+    output = capsys.readouterr()
+    assert "SYNTHETIC_PRIVATE" not in output.out + output.err
+    assert not (tmp_path / "receipt").exists()
+
+
+def test_codex_executable_drift_refused_after_preparation(monkeypatch, tmp_path, capsys):
+    bind_synthetic_source(monkeypatch)
+    arguments = codex_arguments(tmp_path)
+    calls = 0
+
+    def binding():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (tmp_path / "synthetic-codex.exe").write_bytes(b"changed bytes")
+        return {"head": "a" * 40, "tree": "b" * 40, "dirty": False}
+
+    monkeypatch.setattr(probe.harness, "source_binding", binding)
+    assert probe.main(arguments) == 1
+    assert '"status": "attempt_failed"' in capsys.readouterr().out
+
+
+def test_namespaced_ollama_model_remains_an_explicit_configuration(monkeypatch, tmp_path, capsys):
+    bind_synthetic_source(monkeypatch)
+    assert probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--inference-provider", "ollama", "--model", "library/phi4-mini:latest",
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(tmp_path / "receipt"),
+    ]) == 0
+    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    assert report["model"] == "library/phi4-mini:latest"
+    assert report["model_digest"] == "c" * 64
+    assert report["inference_provider"] == "ollama"
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--codex-effort", "low"), ("--codex-executable", "synthetic.exe"),
+    ("--codex-executable-sha256", "d" * 64),
+])
+def test_ollama_refuses_mixed_codex_configuration(monkeypatch, tmp_path, capsys, flag, value):
+    bind_synthetic_source(monkeypatch)
+    monkeypatch.setattr(probe, "run_cases", lambda **kwargs: pytest.fail("mixed dispatch"))
+    assert probe.main([
+        "--source-head", "a" * 40, "--source-tree", "b" * 40,
+        "--model-digest", "c" * 64, "--base-url", "http://127.0.0.1:1",
+        "--private-receipt", str(tmp_path / "receipt"), flag, value, "--live",
+    ]) == 1
+    assert '"status": "attempt_failed"' in capsys.readouterr().out
+    assert not (tmp_path / "receipt").exists()
+
+
+def test_codex_failed_attempt_cannot_overwrite_its_original_receipt(monkeypatch, tmp_path, capsys):
+    bind_synthetic_source(monkeypatch)
+    arguments = codex_arguments(tmp_path) + ["--live"]
+
+    async def failed(**kwargs):
+        row = {"id": "research", "expected": "proposal", "status": "attempted",
+               "error": "attempt_failed", "selection": None, "dispatches": 0, "timings": []}
+        kwargs["observations"].append(row)
+        probe.harness.write_private_row(kwargs["private_sink"], row)
+        raise RuntimeError("SYNTHETIC_PRIVATE_failure")
+
+    monkeypatch.setattr(probe, "run_cases", failed)
+    assert probe.main(arguments) == 1
+    original = (tmp_path / "receipt").read_bytes()
+    rows = [json.loads(line) for line in original.splitlines()]
+    assert [row["status"] for row in rows] == ["attempted"] + ["not_run"] * 7
+    monkeypatch.setattr(probe, "run_cases", lambda **kwargs: pytest.fail("attempt replayed"))
+    assert probe.main(arguments) == 1
+    assert (tmp_path / "receipt").read_bytes() == original
+    assert "SYNTHETIC_PRIVATE" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_first_usable_reply_precedes_generator_and_cleanup_with_injected_clock():
+    clock = [10.0]
+
+    class Inference:
+        async def stream(self, request, turn_id):
+            clock[0] += 0.1
+            yield " "
+            clock[0] += 0.2
+            yield "Synthetic reply."
+            clock[0] += 0.5
+            yield "Another sentence."
+            clock[0] += 0.4
+
+    row = {}
+    await probe.collect_decision(Inference(), None, "synthetic", row, clock=lambda: clock[0])
+    assert row["first_speakable_ms"] == pytest.approx(300)
+    assert row["first_usable_decision_ms"] == pytest.approx(300)
+    assert row["generator_elapsed_ms"] == pytest.approx(1200)
+    assert row["decision_elapsed_ms"] == row["generator_elapsed_ms"]
+    report = probe.build_report([
+        {**row, "id": "research", "expected": "proposal", "status": "attempted",
+         "error": None, "dispatches": 0, "timings": [], "cleanup_elapsed_ms": 50},
+    ])
+    assert report["stage_timings"][0]["first_usable_decision_ms"] == pytest.approx(300)
+    assert report["stage_timings"][0]["generator_elapsed_ms"] == pytest.approx(1200)
+    assert report["stage_timings"][0]["cleanup_elapsed_ms"] == 50
 
 
 def test_v2_is_hash_bound_exposed_comparison_with_exact_v1_cases():
@@ -181,7 +349,9 @@ async def test_mixed_proposal_and_speech_is_not_a_usable_selection(order):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outputs,error", [([], "selection_empty"), ([123], "selection_type")])
+@pytest.mark.parametrize("outputs,error", [
+    ([], "selection_empty"), ([" "], "selection_empty"), ([123], "selection_type"),
+])
 async def test_missing_or_untyped_selection_refused(outputs, error):
     class Inference:
         async def stream(self, request, turn_id):
@@ -401,8 +571,9 @@ async def test_operational_diagnostics_are_typed_staged_and_private(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operational_failure", [False, True])
+@pytest.mark.parametrize("owner_cancels", [False, True])
 async def test_cleanup_diagnostics_preserve_both_owners_and_primary_failure(
-    monkeypatch, operational_failure,
+    monkeypatch, operational_failure, owner_cancels,
 ):
     clock = [0.0]
     closed = []
@@ -420,6 +591,8 @@ async def test_cleanup_diagnostics_preserve_both_owners_and_primary_failure(
         async def close(self):
             closed.append("inference")
             clock[0] += 0.025
+            if owner_cancels:
+                raise asyncio.CancelledError("PRIVATE_cleanup_inference")
             raise TimeoutError("PRIVATE_cleanup_inference")
 
     async def close_surface(self):
@@ -446,7 +619,8 @@ async def test_cleanup_diagnostics_preserve_both_owners_and_primary_failure(
     assert closed == ["inference", "surface"]
     assert outcome["error"] == "cleanup_failed"
     assert outcome["cleanup_failures"] == [
-        {"stage": "cleanup", "category": "timeout", "elapsed_ms": 25.0},
+        {"stage": "cleanup", "category": "cancelled" if owner_cancels else "timeout",
+         "elapsed_ms": 25.0},
         {"stage": "cleanup", "category": "other", "elapsed_ms": 50.0},
     ]
     assert outcome["operational_failure"] == (
@@ -482,3 +656,72 @@ async def test_untyped_readiness_refusal_remains_other_without_text_inference(mo
     assert outcome["operational_failure"]["category"] == "other"
     assert outcome["operational_failure"]["stage"] == "readiness"
     assert outcome["operational_failure"]["elapsed_ms"] >= 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["decision", "cleanup"])
+async def test_cancelled_attempt_is_failed_and_settles_both_cleanup_owners(monkeypatch, stage):
+    reached = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    closed = []
+
+    class Inference:
+        async def configure_context(self, size):
+            pass
+
+        def context_public_data(self):
+            return {"modelDigest": "a" * 64}
+
+        async def stream(self, request, turn_id):
+            if stage == "decision":
+                reached.set()
+                await asyncio.Event().wait()
+            yield "Synthetic reply."
+
+        async def close(self):
+            if stage == "cleanup":
+                reached.set()
+                await release_cleanup.wait()
+            closed.append("inference")
+
+    async def close_surface(self):
+        closed.append("surface")
+
+    async def preflight(**kwargs):
+        pass
+
+    monkeypatch.setattr(probe, "factory", lambda **kwargs: Inference())
+    monkeypatch.setattr(probe, "OllamaStreamingInference", Inference)
+    monkeypatch.setattr(probe, "preflight", preflight)
+    monkeypatch.setattr(probe.ConversationWorkControlSurface, "close", close_surface)
+    rows = []
+    receipt = io.BytesIO()
+    task = asyncio.create_task(probe.run_cases(
+        model="phi4-mini:latest", base_url="http://127.0.0.1:1", model_digest="a" * 64,
+        private_sink=receipt, observations=rows,
+    ))
+    try:
+        await asyncio.wait_for(reached.wait(), 1)
+        task.cancel()
+        if stage == "cleanup":
+            await asyncio.sleep(0)
+            assert not task.done()
+            task.cancel()  # Repeated cancellation cannot abandon owned cleanup either.
+            await asyncio.sleep(0)
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert closed == ["inference", "surface"]
+        assert len(rows) == 1
+        assert rows[0]["error"] == "attempt_failed"
+        assert rows[0]["operational_failure"]["category"] == "cancelled"
+        assert rows[0]["operational_failure"]["stage"] == stage
+        probe.record_unrun(rows, receipt)
+        report = probe.build_report(rows)
+        assert (report["attempts"], report["errors"], report["unrun"]) == (1, 1, 7)
+        assert report["selections"] == {}
+        assert [r["status"] for r in rows] == ["attempted"] + ["not_run"] * 7
+    finally:
+        release_cleanup.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
