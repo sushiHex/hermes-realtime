@@ -1,7 +1,9 @@
-"""One frozen Phi proposal diagnostic; run only inside an externally owned controller.
+"""One foreground proposal diagnostic; run only inside an externally owned controller.
 
 Metadata/endpoint ownership must be attested by the caller before --live. This
 probe never starts an Ollama server, changes its store, or confirms a proposal.
+Ollama retains its existing defaults; Codex requires an explicit model, effort,
+and byte-bound executable. Neither selection authorizes a live invocation.
 """
 # ruff: noqa: E402 -- bind candidate imports before production modules.
 
@@ -13,9 +15,11 @@ import contextlib
 import hashlib
 import io
 import json
+import re
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
@@ -30,6 +34,10 @@ from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.work_tools import ConversationWorkControlSurface
 from hermes_realtime.host_launcher import _build_streaming_inference as factory
 from hermes_realtime.host_launcher import _run_full_host_preflight as preflight
+from hermes_realtime.providers.codex_app_server import (
+    _REASONING_EFFORTS,
+    CodexAppServerStreamingInference,
+)
 from hermes_realtime.providers.ollama import OllamaStreamingInference
 from scripts import evaluate_natural_work_routing as legacy
 from scripts import evaluate_natural_work_scenario as harness
@@ -123,13 +131,15 @@ def codex_error_diagnostic(message: object) -> dict[str, object] | None:
     return result
 
 
-def failure_diagnostic(error: Exception, *, stage: str, started: float) -> dict[str, Any]:
+def failure_diagnostic(error: BaseException, *, stage: str, started: float) -> dict[str, Any]:
     """Classify exposed exception types only; never inspect text or chained causes.
 
     Preflight currently exposes readiness refusals as generic RuntimeError, so
     they remain `other` at stage `readiness`, rather than inferring a cause.
     """
-    if isinstance(error, TimeoutError):
+    if isinstance(error, asyncio.CancelledError):
+        category = "cancelled"
+    elif isinstance(error, TimeoutError):
         category = "timeout"
     elif isinstance(error, (HTTPError, aiohttp.ClientResponseError)):
         category = "http"
@@ -139,6 +149,50 @@ def failure_diagnostic(error: Exception, *, stage: str, started: float) -> dict[
         category = "other"
     return {"stage": stage, "category": category,
             "elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
+
+
+def verify_provider_configuration(
+    *, inference_provider: str, model: str | None, base_url: str | None,
+    model_digest: str | None, codex_effort: str | None, codex_executable: str | None,
+    codex_executable_sha256: str | None,
+) -> None:
+    """Refuse mixed selections and bind Codex bytes without running its executable."""
+    category: str | None = "model_identifier_refused"
+    try:
+        if (type(model) is not str or len(model) > 256
+                or re.fullmatch(
+                    r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*"
+                    r"(?::[A-Za-z0-9][A-Za-z0-9._-]*)?", model,
+                ) is None):
+            raise ValueError("model_identifier_refused")
+        category = "provider_configuration_refused"
+        if inference_provider == "ollama":
+            if (not base_url or model_digest is None
+                    or harness.SHA256.fullmatch(model_digest) is None
+                    or any(value is not None for value in (
+                        codex_effort, codex_executable, codex_executable_sha256,
+                    ))):
+                raise ValueError("provider_configuration_refused")
+        elif inference_provider == "codex":
+            if (base_url is not None or model_digest is not None
+                    or codex_effort not in _REASONING_EFFORTS
+                    or not codex_executable or codex_executable_sha256 is None
+                    or harness.SHA256.fullmatch(codex_executable_sha256) is None):
+                raise ValueError("provider_configuration_refused")
+            category = "codex_executable_unreadable"
+            actual_digest = harness.digest(Path(codex_executable))
+            category = "codex_executable_binding_refused"
+            if actual_digest != codex_executable_sha256:
+                raise ValueError("codex_executable_binding_refused")
+        else:
+            category = "provider_refused"
+            raise ValueError("provider_refused")
+        category = None
+    finally:
+        if category is not None:
+            print("[confirmed-provider-configuration] " + json.dumps(
+                {"category": category, "count": 1}, sort_keys=True,
+            ))
 
 
 class PromptTimingSink(io.TextIOBase):
@@ -166,39 +220,83 @@ class PromptTimingSink(io.TextIOBase):
 
 
 async def collect_decision(inference: Any, request: Any, turn_id: str,
-                           row: dict[str, Any]) -> None:
-    started = time.monotonic()
+                           row: dict[str, Any], *,
+                           clock: Callable[[], float] | None = None) -> None:
+    """Consume production outputs through finalization, retaining first usable selection.
+
+    ``decision_elapsed_ms`` remains the legacy generator-wide timing alias. Use
+    ``first_usable_decision_ms`` for reply/proposal/status availability. A yielded
+    decision never suppresses a subsequent provider/finalization failure.
+    """
+    now = clock or time.monotonic
+    started = now()
     terminal = False
-    row.update(selection=None, speech=[], proposed_objective=None, first_speakable_ms=None)
-    async for output in inference.stream(request, turn_id=turn_id):
-        if terminal:
-            raise ValueError("selection_terminal")
-        if type(output) is HostTaskProposalRequest:
-            if row["speech"]:
+    row.update(selection=None, speech=[], proposed_objective=None, first_speakable_ms=None,
+               first_usable_decision_ms=None, generator_elapsed_ms=None, decision_elapsed_ms=None)
+    try:
+        async for output in inference.stream(request, turn_id=turn_id):
+            if terminal:
                 raise ValueError("selection_terminal")
-            row.update(selection="proposal", proposed_objective=output.objective)
-            terminal = True
-        elif type(output) is HostSpeechRequest:
-            if row["speech"]:
-                raise ValueError("selection_terminal")
-            row["selection"] = "task_status"
-            terminal = True
-        elif type(output) is str:
-            row["speech"].append(output)
-            if row["first_speakable_ms"] is None and legacy._is_speakable(output):
-                row["first_speakable_ms"] = (time.monotonic() - started) * 1000
-            row["selection"] = "reply"
-        else:
-            raise ValueError("selection_type")
-    if row["selection"] is None:
-        raise ValueError("selection_empty")
-    row["decision_elapsed_ms"] = (time.monotonic() - started) * 1000
+            if type(output) is HostTaskProposalRequest:
+                if row["speech"]:
+                    raise ValueError("selection_terminal")
+                row.update(selection="proposal", proposed_objective=output.objective)
+                terminal = True
+            elif type(output) is HostSpeechRequest:
+                if row["speech"]:
+                    raise ValueError("selection_terminal")
+                row["selection"] = "task_status"
+                terminal = True
+            elif type(output) is str:
+                row["speech"].append(output)
+                if row["first_speakable_ms"] is None and legacy._is_speakable(output):
+                    row["first_speakable_ms"] = (now() - started) * 1000
+                    row["first_usable_decision_ms"] = row["first_speakable_ms"]
+                row["selection"] = "reply"
+            else:
+                raise ValueError("selection_type")
+            if terminal:
+                row["first_usable_decision_ms"] = (now() - started) * 1000
+        if row["first_usable_decision_ms"] is None:
+            raise ValueError("selection_empty")
+    finally:
+        row["generator_elapsed_ms"] = row["decision_elapsed_ms"] = (now() - started) * 1000
 
 
-async def run_cases(*, model: str, base_url: str, private_sink: Any,
-                    model_digest: str, observations: list[dict[str, Any]] | None = None,
+async def _close_owners(inference: Any, surface: ConversationWorkControlSurface,
+                        timing: PromptTimingSink, row: dict[str, Any]) -> None:
+    with contextlib.redirect_stdout(timing), contextlib.redirect_stderr(timing):
+        failures = []
+        for owner in (inference, surface):
+            cleanup_started = time.monotonic()
+            try:
+                await asyncio.wait_for(owner.close(), 10)
+            except (Exception, asyncio.CancelledError) as error:
+                failures.append(RuntimeError("owner cleanup cancelled")
+                                if isinstance(error, asyncio.CancelledError) else error)
+                row["cleanup_failures"].append(failure_diagnostic(
+                    error, stage="cleanup", started=cleanup_started,
+                ))
+        if failures:
+            row["error"] = "cleanup_failed"
+            raise ExceptionGroup("probe cleanup failed", failures)
+
+
+async def run_cases(*, model: str, private_sink: Any, base_url: str | None = None,
+                    model_digest: str | None = None,
+                    inference_provider: str = "ollama", codex_effort: str | None = None,
+                    codex_executable: str | None = None,
+                    codex_executable_sha256: str | None = None,
+                    observations: list[dict[str, Any]] | None = None,
                     fixture_version: str = "v1",
+                    clock: Callable[[], float] | None = None,
                     ) -> list[dict[str, Any]]:
+    verify_provider_configuration(
+        inference_provider=inference_provider, model=model, base_url=base_url,
+        model_digest=model_digest, codex_effort=codex_effort, codex_executable=codex_executable,
+        codex_executable_sha256=codex_executable_sha256,
+    )
+    now = clock or time.monotonic
     fixture = load_fixture(fixture_version)
     rows = observations if observations is not None else []
     for revision, case in enumerate(fixture["model_cases"], 1):
@@ -212,8 +310,10 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
             reserve_observer_capacity=lambda: None,
         )
         inference = factory(
-            inference_provider="ollama", ollama_base_url=base_url, ollama_model=model,
-            codex_model="", codex_effort="", codex_executable=None,
+            inference_provider=inference_provider, ollama_base_url=base_url or "",
+            ollama_model=model if inference_provider == "ollama" else "",
+            codex_model=model if inference_provider == "codex" else "",
+            codex_effort=codex_effort or "", codex_executable=codex_executable,
         )
         row = {"id": case["id"], "expected": case["expected"], "error": None,
                "status": "attempted",
@@ -225,11 +325,14 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
         started = time.monotonic()
         try:
             with contextlib.redirect_stdout(timing), contextlib.redirect_stderr(timing):
-                if type(inference) is not OllamaStreamingInference:
+                expected_type = (OllamaStreamingInference if inference_provider == "ollama"
+                                 else CodexAppServerStreamingInference)
+                if type(inference) is not expected_type:
                     raise ValueError("provider_refused")
-                await inference.configure_context(4096)
-                if inference.context_public_data()["modelDigest"] != model_digest:
-                    raise ValueError("model_digest_refused")
+                if inference_provider == "ollama":
+                    await inference.configure_context(4096)
+                    if inference.context_public_data()["modelDigest"] != model_digest:
+                        raise ValueError("model_digest_refused")
                 stage = "readiness"
                 started = time.monotonic()
                 row["readiness_attempted"] = True
@@ -242,29 +345,39 @@ async def run_cases(*, model: str, base_url: str, private_sink: Any,
                 timing.stage = "decision"
                 row["decision_attempted"] = True
                 await asyncio.wait_for(collect_decision(
-                    inference, request, f"confirmed_probe_{revision}", row,
+                    inference, request, f"confirmed_probe_{revision}", row, clock=now,
                 ), 60)
-        except Exception as error:
+        except (Exception, asyncio.CancelledError) as error:
             row["error"] = "attempt_failed"
             row["operational_failure"] = failure_diagnostic(error, stage=stage, started=started)
             raise
         finally:
+            cleanup_started_all = now()
+            cleanup_stage_started = time.monotonic()
+            cleanup = asyncio.create_task(_close_owners(inference, surface, timing, row))
+            cancelled = None
             try:
-                with contextlib.redirect_stdout(timing), contextlib.redirect_stderr(timing):
-                    failures = []
-                    for owner in (inference, surface):
-                        cleanup_started = time.monotonic()
-                        try:
-                            await asyncio.wait_for(owner.close(), 10)
-                        except Exception as error:
-                            failures.append(error)
-                            row["cleanup_failures"].append(failure_diagnostic(
-                                error, stage="cleanup", started=cleanup_started,
-                            ))
-                    if failures:
-                        row["error"] = "cleanup_failed"
-                        raise ExceptionGroup("probe cleanup failed", failures)
+                # The owner operations retain their individual ten-second bounds.
+                # Caller cancellation must wait for both to settle before returning.
+                while True:
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError as error:
+                        cancelled = error
+                        row["error"] = row["error"] or "attempt_failed"
+                        if row["operational_failure"] is None:
+                            row["operational_failure"] = failure_diagnostic(
+                                error, stage="cleanup", started=cleanup_stage_started,
+                            )
+                        continue
+                    except Exception:
+                        if cancelled is None:
+                            raise
+                    break
+                if cancelled is not None:
+                    raise cancelled
             finally:
+                row["cleanup_elapsed_ms"] = (now() - cleanup_started_all) * 1000
                 row["dispatches"] = len(recorder.objectives)
                 row["timings"] = timing.rows
                 rows.append(row)
@@ -305,6 +418,9 @@ def build_report(rows: list[dict[str, Any]], *, fixture_version: str = "v1") -> 
         "dispatch_mode": "rejecting_shadow", "real_effects": 0,
         "stage_timings": [{"id": row["id"], "timings": row["timings"],
                            "decision_elapsed_ms": row.get("decision_elapsed_ms"),
+                           "first_usable_decision_ms": row.get("first_usable_decision_ms"),
+                           "generator_elapsed_ms": row.get("generator_elapsed_ms"),
+                           "cleanup_elapsed_ms": row.get("cleanup_elapsed_ms"),
                            "first_speakable_ms": row.get("first_speakable_ms")} for row in rows],
         "objective_fidelity": "pending", "clarification_review": "pending",
         "lifecycle_claims": "pending", "actual_source_proof": "not_run",
@@ -316,9 +432,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-head", required=True)
     parser.add_argument("--source-tree", required=True)
-    parser.add_argument("--model", choices=("phi4-mini:latest",), default="phi4-mini:latest")
-    parser.add_argument("--model-digest", required=True)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--inference-provider", default="ollama")
+    parser.add_argument("--model")
+    parser.add_argument("--model-digest")
+    parser.add_argument("--base-url")
+    parser.add_argument("--codex-effort")
+    parser.add_argument("--codex-executable")
+    parser.add_argument("--codex-executable-sha256")
     parser.add_argument("--private-receipt", type=Path, required=True)
     parser.add_argument("--fixture-version", choices=("v1", "v2"), default="v1")
     parser.add_argument("--live", action="store_true")
@@ -326,13 +446,26 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict[str, Any]] = []
     before = None
     report: dict[str, Any] = {"status": "refused", "natural_routing_qualified": False}
+    configuration: dict[str, Any] = {}
     try:
+        model = args.model
+        if model is None and args.inference_provider == "ollama":
+            model = "phi4-mini:latest"
+        verify_provider_configuration(
+            inference_provider=args.inference_provider, model=model, base_url=args.base_url,
+            model_digest=args.model_digest, codex_effort=args.codex_effort,
+            codex_executable=args.codex_executable,
+            codex_executable_sha256=args.codex_executable_sha256,
+        )
+        configuration = {"inference_provider": args.inference_provider, "model": model,
+                         "model_digest": args.model_digest, "codex_effort": args.codex_effort}
         harness.verify_imports()
         before = harness.source_binding()
         before["probe_sha256"] = harness.digest(Path(__file__))
+        if args.inference_provider == "codex":
+            before["codex_executable_sha256"] = args.codex_executable_sha256
         harness.verify_execution_binding(before, args.source_head, args.live)
-        if (before["tree"] != args.source_tree
-                or harness.SHA256.fullmatch(args.model_digest) is None):
+        if before["tree"] != args.source_tree:
             raise ValueError("execution_binding_refused")
         load_fixture(args.fixture_version)
         report = {"status": "prepared_only", **fixture_metadata(args.fixture_version)}
@@ -340,7 +473,10 @@ def main(argv: list[str] | None = None) -> int:
             with args.private_receipt.open("xb", buffering=0) as receipt:
                 try:
                     asyncio.run(asyncio.wait_for(run_cases(
-                        model=args.model, base_url=args.base_url, model_digest=args.model_digest,
+                        model=model, base_url=args.base_url, model_digest=args.model_digest,
+                        inference_provider=args.inference_provider, codex_effort=args.codex_effort,
+                        codex_executable=args.codex_executable,
+                        codex_executable_sha256=args.codex_executable_sha256,
                         private_sink=receipt, observations=rows,
                         fixture_version=args.fixture_version,
                     ), 1000))
@@ -353,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         after = harness.source_binding()
         after["probe_sha256"] = harness.digest(Path(__file__))
+        if args.inference_provider == "codex":
+            after["codex_executable_sha256"] = harness.digest(Path(args.codex_executable))
         load_fixture(args.fixture_version)
         if after != before:
             raise ValueError("execution_input_drift")
@@ -361,7 +499,8 @@ def main(argv: list[str] | None = None) -> int:
             "status": "attempt_failed",
         }
     finally:
-        report.update(source_binding=before, model=args.model, model_digest=args.model_digest,
+        report.update(configuration)
+        report.update(source_binding=before,
                       natural_routing_qualified=False)
         print("[confirmed-natural-probe] " + json.dumps(report, sort_keys=True))
     return 0 if report.get("status") in {"prepared_only", "completed"} else 1
