@@ -123,12 +123,26 @@ unproven, never permission to retry automatically.
 
 Within that same 60-second startup deadline, execution now makes one native
 `/api/chat` request with empty messages, `stream=false`, `num_ctx=64000` and
-five-minute keep-alive. It requires a positive empty `done_reason=load` acknowledgment,
+`keep_alive=-1`. This retains the selected model across idle periods for this
+dedicated owned server's lifetime. The existing Job, watchdog and final settlement
+bound that lifetime; no request is sent to the personal server. This follows
+[Ollama's retention contract](https://github.com/ollama/ollama/blob/v0.40.4/docs/faq.mdx#how-do-i-keep-a-model-loaded-in-memory-or-make-it-unload-immediately).
+It requires a positive empty `done_reason=load` acknowledgment,
 then one owned `/api/ps` readback matching the selected model identity, digest and
 64,000 configured context. No prompt or tool is supplied and no task text is generated.
 Metadata reads retain their eight-second per-request cap; the load request uses
 only the remaining startup budget, with no retries or deadline reset. A refusal
 stops before gateway startup or task admission.
+
+The public command keeps its 60-second startup default and 360-second watchdog.
+Python compositions calling `start_model` may explicitly set
+`startup_timeout_seconds` to an exact integer from 1 through 600; `None` retains
+the selected profile's default (60 seconds for lookup, 120 for native tools).
+The smaller of that ceiling and the caller's remaining absolute budget governs
+the entire startup, including metadata and load/readback. Receipts report the
+requested override, selected ceiling and effective initial budget separately.
+This option grants no task time and extends no caller watchdog. A composition
+must retain its process owner and bounded cleanup until its last consumer closes.
 
 The process readback reports configured per-sequence context, not independently
 measured KV capacity or a no-truncation guarantee. The acknowledgment alone does

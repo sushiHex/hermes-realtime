@@ -327,6 +327,7 @@ def test_native_tools_profile_binds_environment_load_and_readback(
     assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
     assert env["OLLAMA_FLASH_ATTENTION"] == "1"
     assert json.loads(owned[4][0].content)["options"] == {"num_ctx": 4096}
+    assert json.loads(owned[4][0].content)["keep_alive"] == -1
     assert result["context_default_tokens"] == result["configured_context_tokens"] == 4096
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
 
@@ -344,6 +345,8 @@ def test_native_startup_admits_load_after_sixty_before_120(
         1200.0, verified=proof, startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
     assert result["model_ready"] is True
     assert result["startup_budget_ceiling_seconds"] == 120
+    assert result["startup_timeout_requested_seconds"] is None
+    assert result["startup_effective_budget_seconds"] == 120
     assert len(owned[4]) == 2
 
 
@@ -402,8 +405,70 @@ def test_default_lookup_startup_stays_sixty_seconds(
             1200.0, verified=proof)
     state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
     assert state["startup_budget_ceiling_seconds"] == 60
+    assert state["startup_timeout_requested_seconds"] is None
+    assert state["startup_effective_budget_seconds"] == 60
     assert state["context_default_tokens"] == 64000
     assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+@pytest.mark.parametrize("seconds", [1, 300, 600])
+def test_explicit_startup_timeout_and_receipt(selected, owned, tmp_path, monkeypatch, seconds):
+    now = [1000.0]
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=model.time.monotonic_ns))
+    proof = model.verify_artifacts(selected, 1700.0)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1000.0 + seconds - 0.5)
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        1700.0, verified=proof, startup_timeout_seconds=seconds)
+    assert result["model_ready"] is True
+    assert result["startup_timeout_requested_seconds"] == seconds
+    assert result["startup_budget_ceiling_seconds"] == seconds
+    assert result["startup_effective_budget_seconds"] == seconds
+    assert result["context_default_tokens"] == 64000
+    assert len(owned[4]) == 2
+
+
+@pytest.mark.parametrize("caller_budget, load_elapsed, effective", [(30, 31, 30), (500, 301, 300)])
+def test_explicit_startup_timeout_and_caller_bound_are_shared(
+        selected, owned, tmp_path, monkeypatch, caller_budget, load_elapsed, effective):
+    now = [1000.0]
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=model.time.monotonic_ns))
+    proof = model.verify_artifacts(selected, 1700.0)
+    owned[5]["after_load"] = lambda: now.__setitem__(0, 1000.0 + load_elapsed)
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            1000.0 + caller_budget, verified=proof, startup_timeout_seconds=300)
+    receipt = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert receipt["startup_timeout_requested_seconds"] == 300
+    assert receipt["startup_budget_ceiling_seconds"] == 300
+    assert receipt["startup_effective_budget_seconds"] == effective
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+class _StartupSeconds(int):
+    pass
+
+
+@pytest.mark.parametrize("seconds", [
+    pytest.param(True, id="bool"), pytest.param(300.0, id="float"),
+    pytest.param(float("inf"), id="infinity"), pytest.param(float("nan"), id="nan"),
+    pytest.param(_StartupSeconds(300), id="subclass"), pytest.param(0, id="zero"),
+    pytest.param(601, id="over-cap"), pytest.param(object(), id="object"),
+])
+def test_invalid_startup_timeout_refuses_without_serializing_input(
+        selected, owned, tmp_path, capsys, seconds):
+    with pytest.raises(ValueError, match="startup-timeout"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 700, startup_timeout_seconds=seconds)
+    receipt = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert receipt["failure_category"] == "startup-timeout"
+    assert receipt["startup_timeout_requested_seconds"] is None
+    assert receipt["startup_effective_budget_seconds"] is None
+    assert receipt["keep_alive_configured"] == -1 and receipt["load_request_count"] == 0
+    assert not owned[0].calls and not owned[4]
+    assert json.loads(capsys.readouterr().out.removeprefix("[lookup-model] "))[
+        "failure_category"] == "startup-timeout"
 
 
 def test_startup_profile_settings_cannot_drift(selected, owned, tmp_path):
@@ -605,11 +670,12 @@ def test_load_and_readback_precede_ready(selected, owned, tmp_path):
     assert result["metadata_request_count"] == 4
     assert result["configured_context_tokens"] == 64000
     assert result["allocation_observed"] is False
+    assert result["keep_alive_configured"] == -1
     calls = owned[4]
     assert [(r.method, r.url.path) for r in calls] == [("POST", "/api/chat"), ("GET", "/api/ps")]
     assert json.loads(calls[0].content) == {
         "model": selected["model"], "messages": [], "stream": False,
-        "options": {"num_ctx": 64000}, "keep_alive": "5m"}
+        "options": {"num_ctx": 64000}, "keep_alive": -1}
 
 
 @pytest.mark.parametrize("change", [
