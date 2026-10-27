@@ -66,7 +66,7 @@ _REFUSALS = frozenset({
     "metadata-template", "metadata-capabilities", "artifact-proof",
     "load-ack", "loaded-model", "loaded-context", "startup-profile", "readiness-status",
     "readiness-bound",
-    "readiness-shape", "readiness-json", "model-readiness-loop",
+    "readiness-shape", "readiness-json", "model-readiness-loop", "startup-timeout",
 })
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
@@ -371,8 +371,7 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
             follow_redirects=False, trust_env=False) as client:
         async with asyncio.timeout(_remaining(deadline)):
             load = await read("chat", {"model": manifest["model"], "messages": [],
-                "stream": False, "options": {"num_ctx": startup_profile.context_tokens},
-                "keep_alive": "5m"}, "load")
+                "stream": False, "options": {"num_ctx": startup_profile.context_tokens}}, "load")
             state["stage"] = "model-load-ack"
             message = load.get("message")
             if (load.get("done") is not True or load.get("done_reason") != "load"
@@ -401,23 +400,38 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
 def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 evidence_dir: Path, deadline: float, *,
                 verified: VerifiedArtifacts | None = None,
-                startup_profile: StartupProfile = StartupProfile.LOOKUP_64K) -> dict[str, Any]:
-    """Keep the ready owned server for the caller; never pull or generate task text."""
+                startup_profile: StartupProfile = StartupProfile.LOOKUP_64K,
+                startup_timeout_seconds: int | None = None) -> dict[str, Any]:
+    """Retain the model for the caller's bounded owned process lifetime.
+
+    An explicit startup timeout (1..600 seconds) overrides the profile's default,
+    still capped by the caller's absolute deadline. It never extends task authority.
+    The caller must keep its Job/watchdog/finally settlement through every consumer.
+    """
     selected = dict(manifest)
     profile_valid = type(startup_profile) is StartupProfile
+    timeout_valid = startup_timeout_seconds is None or (
+        type(startup_timeout_seconds) is int and 1 <= startup_timeout_seconds <= 600)
     startup_seconds = startup_profile.startup_seconds if profile_valid else None
+    if startup_timeout_seconds is not None:
+        startup_seconds = startup_timeout_seconds if timeout_valid else None
     port = selected["model_port"]
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("model-port")
+    started = time.monotonic()
     if startup_seconds is not None:
-        deadline = min(deadline, time.monotonic() + startup_seconds)
+        deadline = min(deadline, started + startup_seconds)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     path = evidence_dir / "model-metadata.private.json"
     state: dict[str, Any] = {"version": 1, "category": "setup", "metadata_requests": [],
         "inference_request_count": 0,
         "context_default_tokens": startup_profile.context_tokens if profile_valid else None,
         "startup_profile": startup_profile.profile_id if profile_valid else "invalid",
+        "startup_timeout_requested_seconds": startup_timeout_seconds if timeout_valid else None,
         "startup_budget_ceiling_seconds": startup_seconds,
+        "startup_effective_budget_seconds": max(0.0, deadline - started)
+            if startup_seconds is not None else None,
+        "keep_alive_configured": -1,
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}
@@ -427,6 +441,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
     try:
         if not profile_valid:
             raise ValueError("startup-profile")
+        if not timeout_valid:
+            raise ValueError("startup-timeout")
         _remaining(deadline)
         try:
             asyncio.get_running_loop()
@@ -456,6 +472,7 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             "OLLAMA_KV_CACHE_TYPE": "q8_0",
             "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_NUM_PARALLEL": "1",
             "OLLAMA_MAX_LOADED_MODELS": "1", "OLLAMA_NOPRUNE": "1", "OLLAMA_NO_CLOUD": "1",
+            "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_DEBUG_LOG_REQUESTS": "0"})
         if startup_profile.go_template is not None:
             env["OLLAMA_GO_TEMPLATE"] = startup_profile.go_template
@@ -517,6 +534,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         public = {key: state[key] for key in (
             "category", "stage", "inference_request_count", "metadata_request_count",
             "runtime_version", "context_default_tokens", "allocation_observed",
+            "startup_timeout_requested_seconds", "startup_budget_ceiling_seconds",
+            "startup_effective_budget_seconds",
             "load_request_count", "load_acknowledged", "model_ready", "configured_context_tokens",
             "failure_kind", "failure_category") if key in state}
         print("[lookup-model] " + json.dumps(public, sort_keys=True), flush=True)

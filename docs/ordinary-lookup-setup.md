@@ -221,6 +221,29 @@ server. Record final process/listener absence and unchanged unrelated services.
 No process-name kill, personal profile update, shared listener replacement or
 prewarming is part of this procedure.
 
+The startup helper sets `OLLAMA_KEEP_ALIVE=-1` only in its spawned owned server's
+environment, retaining the model through idle periods until that server stops.
+The empty HTTP load sends no retention override. Later requests
+without a retention override preserve that lease in the
+[pinned scheduler](https://github.com/ollama/ollama/blob/45e6011815c74acde6a346512856b69dd79dd22b/server/sched.go).
+The caller must retain its Job, watchdog and final settlement for the entire
+consumer session. This prevents idle expiration; it does not prove future runner
+survival or replace process/listener cleanup.
+
+Startup timing remains separate from the model/context profile and the task's
+120-second authority. `start_model(..., startup_timeout_seconds=300)` explicitly
+selects a bounded cold-start allowance in an existing Python composition; accepted
+values are exact integers from 1 through 600. `None` preserves the 60/120-second
+profile defaults, and the caller's earlier absolute deadline always wins.
+Requested and effective startup budgets appear in the receipt. The separate
+public backend command keeps its existing 60-second startup and 360-second watchdog.
+
+For an interactive session, prove background startup and task readiness before
+inviting the operator. Reserve an owner window for cold startup, operator use and
+cleanup; publish the ready URL with an explicit usable end time, then hand control
+to the operator promptly. A URL published after scheduled shutdown is unavailable.
+An earlier load acknowledgment alone does not establish later consumer reuse.
+
 The desktop rehearsal remains synthetic. The separate
 [public backend command](lookup-backend-command.md) now composes this real-provider
 profile, the scoped supplied-target comparator and the existing owner. It also
