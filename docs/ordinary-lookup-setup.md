@@ -221,10 +221,11 @@ server. Record final process/listener absence and unchanged unrelated services.
 No process-name kill, personal profile update, shared listener replacement or
 prewarming is part of this procedure.
 
-The startup helper's empty load selects `keep_alive=-1`, retaining the model
-through idle periods until the dedicated owned server stops. Later requests
+The startup helper sets `OLLAMA_KEEP_ALIVE=-1` only in its spawned owned server's
+environment, retaining the model through idle periods until that server stops.
+The empty HTTP load sends no retention override. Later requests
 without a retention override preserve that lease in the
-[pinned scheduler](https://github.com/ollama/ollama/blob/v0.40.4/server/sched.go#L495-L505).
+[pinned scheduler](https://github.com/ollama/ollama/blob/45e6011815c74acde6a346512856b69dd79dd22b/server/sched.go).
 The caller must retain its Job, watchdog and final settlement for the entire
 consumer session. This prevents idle expiration; it does not prove future runner
 survival or replace process/listener cleanup.

@@ -327,7 +327,8 @@ def test_native_tools_profile_binds_environment_load_and_readback(
     assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
     assert env["OLLAMA_FLASH_ATTENTION"] == "1"
     assert json.loads(owned[4][0].content)["options"] == {"num_ctx": 4096}
-    assert json.loads(owned[4][0].content)["keep_alive"] == -1
+    assert env["OLLAMA_KEEP_ALIVE"] == "-1"
+    assert "keep_alive" not in json.loads(owned[4][0].content)
     assert result["context_default_tokens"] == result["configured_context_tokens"] == 4096
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
 
@@ -519,6 +520,7 @@ def test_native_tools_profile_requires_exact_readback(selected, owned, tmp_path,
 
 def test_owned_startup_and_closed_options(selected, owned, tmp_path, monkeypatch):
     monkeypatch.setenv("OLLAMA_GO_TEMPLATE", "1")
+    monkeypatch.setenv("OLLAMA_KEEP_ALIVE", "5m")
     monkeypatch.setenv("LLAMA_ARG_GPU_LAYERS", "0")
     result = start(selected, owned, tmp_path)
     owner, _, calls, _ = owned[:4]
@@ -535,6 +537,7 @@ def test_owned_startup_and_closed_options(selected, owned, tmp_path, monkeypatch
     assert env["OLLAMA_CONTEXT_LENGTH"] == "64000"
     assert env["OLLAMA_KV_CACHE_TYPE"] == "q8_0"
     assert env["OLLAMA_NUM_PARALLEL"] == "1"
+    assert env["OLLAMA_KEEP_ALIVE"] == "-1"
 
 
 def test_foreign_containment_refused_before_start(selected, owned, tmp_path):
@@ -542,6 +545,7 @@ def test_foreign_containment_refused_before_start(selected, owned, tmp_path):
     with pytest.raises(RuntimeError, match="owner-containment"):
         start(selected, owned, tmp_path)
     assert not owned[0].calls
+    assert not owned[4]
 
 
 def test_occupied_port_never_adopted(selected, owned, tmp_path, monkeypatch):
@@ -549,6 +553,7 @@ def test_occupied_port_never_adopted(selected, owned, tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="port-occupied"):
         start(selected, owned, tmp_path)
     assert not owned[0].calls
+    assert not owned[4]
 
 
 @pytest.mark.parametrize("listener", [("0.0.0.0:11440", 4321), ("127.0.0.1:11440", 999)])
@@ -558,6 +563,7 @@ def test_listener_must_match_owned_process(selected, owned, tmp_path, monkeypatc
         start(selected, owned, tmp_path)
     assert owned[0].killed == [model.MODEL_PROCESS_NAME]
     assert not owned[2]
+    assert not owned[4]
 
 
 def test_process_image_must_match_runtime(selected, owned, tmp_path, monkeypatch):
@@ -565,6 +571,7 @@ def test_process_image_must_match_runtime(selected, owned, tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="listener-owner"):
         start(selected, owned, tmp_path)
     assert not owned[2]
+    assert not owned[4]
 
 
 def test_show_template_bound_to_artifact(selected, owned, tmp_path):
@@ -671,11 +678,12 @@ def test_load_and_readback_precede_ready(selected, owned, tmp_path):
     assert result["configured_context_tokens"] == 64000
     assert result["allocation_observed"] is False
     assert result["keep_alive_configured"] == -1
+    assert owned[0].calls[0][2]["env"]["OLLAMA_KEEP_ALIVE"] == "-1"
     calls = owned[4]
     assert [(r.method, r.url.path) for r in calls] == [("POST", "/api/chat"), ("GET", "/api/ps")]
     assert json.loads(calls[0].content) == {
         "model": selected["model"], "messages": [], "stream": False,
-        "options": {"num_ctx": 64000}, "keep_alive": -1}
+        "options": {"num_ctx": 64000}}
 
 
 @pytest.mark.parametrize("change", [

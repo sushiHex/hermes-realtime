@@ -122,10 +122,11 @@ that authority. A watchdog/outer timeout is a failed observation with cleanup
 unproven, never permission to retry automatically.
 
 Within that same 60-second startup deadline, execution now makes one native
-`/api/chat` request with empty messages, `stream=false`, `num_ctx=64000` and
-`keep_alive=-1`. This retains the selected model across idle periods for this
-dedicated owned server's lifetime. The existing Job, watchdog and final settlement
-bound that lifetime; no request is sent to the personal server. This follows
+`/api/chat` request with empty messages, `stream=false` and `num_ctx=64000`.
+The spawned owned server alone receives `OLLAMA_KEEP_ALIVE=-1`; the HTTP request
+carries no retention override. The child default retains the selected model
+across idle periods for that dedicated owned server's lifetime. The existing Job,
+watchdog and final settlement bound that lifetime. This follows
 [Ollama's retention contract](https://github.com/ollama/ollama/blob/v0.40.4/docs/faq.mdx#how-do-i-keep-a-model-loaded-in-memory-or-make-it-unload-immediately).
 It requires a positive empty `done_reason=load` acknowledgment,
 then one owned `/api/ps` readback matching the selected model identity, digest and

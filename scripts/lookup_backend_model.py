@@ -371,8 +371,7 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
             follow_redirects=False, trust_env=False) as client:
         async with asyncio.timeout(_remaining(deadline)):
             load = await read("chat", {"model": manifest["model"], "messages": [],
-                "stream": False, "options": {"num_ctx": startup_profile.context_tokens},
-                "keep_alive": -1}, "load")
+                "stream": False, "options": {"num_ctx": startup_profile.context_tokens}}, "load")
             state["stage"] = "model-load-ack"
             message = load.get("message")
             if (load.get("done") is not True or load.get("done_reason") != "load"
@@ -473,6 +472,7 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             "OLLAMA_KV_CACHE_TYPE": "q8_0",
             "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_NUM_PARALLEL": "1",
             "OLLAMA_MAX_LOADED_MODELS": "1", "OLLAMA_NOPRUNE": "1", "OLLAMA_NO_CLOUD": "1",
+            "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_DEBUG_LOG_REQUESTS": "0"})
         if startup_profile.go_template is not None:
             env["OLLAMA_GO_TEMPLATE"] = startup_profile.go_template

@@ -47,6 +47,7 @@ def test_exact_manifest_accepted(tmp_path):
         {"objective": "x" * 1025},
         {"api_port": True},
         {"api_port": 11440},
+        {"model_port": 11434},
         {"model": ""},
         {"presentation_key_env": "PATH"},
         {"runtime_target": "relative-target"},
