@@ -32,7 +32,9 @@ def test_explicit_codex_preparation_binds_executable_without_launch(monkeypatch,
     monkeypatch.setattr(probe, "factory", lambda **kwargs: pytest.fail("preparation launched"))
     arguments = codex_arguments(tmp_path)
     assert probe.main(arguments) == 0
-    report = json.loads(capsys.readouterr().out.split("[confirmed-natural-probe] ")[1])
+    output = capsys.readouterr().out
+    assert "[confirmed-provider-configuration]" not in output
+    report = json.loads(output.split("[confirmed-natural-probe] ")[1])
     assert report["status"] == "prepared_only"
     assert report["inference_provider"] == "codex"
     assert report["model"] == "gpt-5.6-terra"
@@ -74,6 +76,44 @@ def test_codex_configuration_refused_before_dispatch_or_receipt(
     assert probe.main(arguments + ["--live"]) == 1
     output = capsys.readouterr()
     assert "SYNTHETIC_PRIVATE" not in output.out + output.err
+    assert not (tmp_path / "receipt").exists()
+
+
+@pytest.mark.parametrize("fault,category", [
+    ("unknown_provider", "provider_refused"),
+    ("missing_configuration", "provider_configuration_refused"),
+    ("executable_mismatch", "codex_executable_binding_refused"),
+    ("executable_unreadable", "codex_executable_unreadable"),
+    ("private_model", "model_identifier_refused"),
+])
+def test_provider_refusal_evidence_survives_main_without_private_values(
+    monkeypatch, tmp_path, capsys, fault, category,
+):
+    bind_synthetic_source(monkeypatch)
+    arguments = codex_arguments(tmp_path)
+    if fault == "unknown_provider":
+        arguments[arguments.index("--inference-provider") + 1] = "SYNTHETIC_PRIVATE_provider"
+    elif fault == "missing_configuration":
+        index = arguments.index("--codex-effort")
+        del arguments[index:index + 2]
+    elif fault == "executable_mismatch":
+        arguments[arguments.index("--codex-executable-sha256") + 1] = "0" * 64
+    elif fault == "executable_unreadable":
+        arguments[arguments.index("--codex-executable") + 1] = str(
+            tmp_path / "SYNTHETIC_PRIVATE_missing.exe"
+        )
+    else:
+        arguments[arguments.index("--model") + 1] = "SYNTHETIC_PRIVATE/model\\path"
+    monkeypatch.setattr(probe, "run_cases", lambda **kwargs: pytest.fail("refusal dispatched"))
+    assert probe.main(arguments + ["--live"]) == 1
+    output = capsys.readouterr()
+    markers = [line for line in output.out.splitlines()
+               if line.startswith("[confirmed-provider-configuration] ")]
+    assert len(markers) == 1
+    assert len(markers[0]) < 160
+    assert json.loads(markers[0].split("] ", 1)[1]) == {"category": category, "count": 1}
+    assert "SYNTHETIC_PRIVATE" not in output.out + output.err
+    assert str(tmp_path) not in output.out + output.err
     assert not (tmp_path / "receipt").exists()
 
 

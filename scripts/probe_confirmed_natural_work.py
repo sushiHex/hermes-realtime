@@ -157,29 +157,42 @@ def verify_provider_configuration(
     codex_executable_sha256: str | None,
 ) -> None:
     """Refuse mixed selections and bind Codex bytes without running its executable."""
-    if (type(model) is not str or len(model) > 256
-            or re.fullmatch(
-                r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*"
-                r"(?::[A-Za-z0-9][A-Za-z0-9._-]*)?", model,
-            ) is None):
-        raise ValueError("model_identifier_refused")
-    if inference_provider == "ollama":
-        if (not base_url or model_digest is None
-                or harness.SHA256.fullmatch(model_digest) is None
-                or any(value is not None for value in (
-                    codex_effort, codex_executable, codex_executable_sha256,
-                ))):
-            raise ValueError("provider_configuration_refused")
-    elif inference_provider == "codex":
-        if (base_url is not None or model_digest is not None
-                or codex_effort not in _REASONING_EFFORTS
-                or not codex_executable or codex_executable_sha256 is None
-                or harness.SHA256.fullmatch(codex_executable_sha256) is None):
-            raise ValueError("provider_configuration_refused")
-        if harness.digest(Path(codex_executable)) != codex_executable_sha256:
-            raise ValueError("codex_executable_binding_refused")
-    else:
-        raise ValueError("provider_refused")
+    category: str | None = "model_identifier_refused"
+    try:
+        if (type(model) is not str or len(model) > 256
+                or re.fullmatch(
+                    r"(?:[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*"
+                    r"(?::[A-Za-z0-9][A-Za-z0-9._-]*)?", model,
+                ) is None):
+            raise ValueError("model_identifier_refused")
+        category = "provider_configuration_refused"
+        if inference_provider == "ollama":
+            if (not base_url or model_digest is None
+                    or harness.SHA256.fullmatch(model_digest) is None
+                    or any(value is not None for value in (
+                        codex_effort, codex_executable, codex_executable_sha256,
+                    ))):
+                raise ValueError("provider_configuration_refused")
+        elif inference_provider == "codex":
+            if (base_url is not None or model_digest is not None
+                    or codex_effort not in _REASONING_EFFORTS
+                    or not codex_executable or codex_executable_sha256 is None
+                    or harness.SHA256.fullmatch(codex_executable_sha256) is None):
+                raise ValueError("provider_configuration_refused")
+            category = "codex_executable_unreadable"
+            actual_digest = harness.digest(Path(codex_executable))
+            category = "codex_executable_binding_refused"
+            if actual_digest != codex_executable_sha256:
+                raise ValueError("codex_executable_binding_refused")
+        else:
+            category = "provider_refused"
+            raise ValueError("provider_refused")
+        category = None
+    finally:
+        if category is not None:
+            print("[confirmed-provider-configuration] " + json.dumps(
+                {"category": category, "count": 1}, sort_keys=True,
+            ))
 
 
 class PromptTimingSink(io.TextIOBase):
