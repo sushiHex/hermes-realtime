@@ -145,6 +145,14 @@ requested override, selected ceiling and effective initial budget separately.
 This option grants no task time and extends no caller watchdog. A composition
 must retain its process owner and bounded cleanup until its last consumer closes.
 
+This standalone command retains native HTTP loading for human operation. Agent
+sessions must use the existing Python composition's
+[`mcp_loader` callback](ordinary-lookup-setup.md#execution-and-remaining-walkthrough-boundary)
+so the actual load goes through vram-mcp. A prior status check or claim followed
+by this command's native load is not compliant. The callback shares the startup
+deadline and cannot fall back to native loading; independent identity/context
+readback remains mandatory. No public CLI option or MCP dependency is added here.
+
 The process readback reports configured per-sequence context, not independently
 measured KV capacity or a no-truncation guarantee. The acknowledgment alone does
 not establish later runner continuity/reuse or useful completion; those require
