@@ -357,6 +357,9 @@ textarea::placeholder { color: var(--faint); }
   .task-card-status { flex-basis: calc(100% - 116px); }
   .task-card-controls { margin-left: auto; }
 }
+@media (max-width: 640px) {
+  .task-card-controls .button { min-height: 44px; }
+}
 .diagnostics { margin-top: auto; padding: 0; overflow: hidden; }
 .diagnostics summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; list-style: none; color: var(--text-secondary); font-size: 12px; }
 .diagnostics summary::-webkit-details-marker { display: none; }

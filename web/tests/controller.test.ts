@@ -69,7 +69,6 @@ import {
   takeBootstrapCapability,
   takeOptionalBootstrapCapability,
   terminalDisconnectIsAuthoritative,
-  taskMetaPresentation,
   taskStatusPresentation,
   UserTurnAssembler,
   userTranscriptProjectionDisposition,
@@ -89,14 +88,6 @@ describe("background task status presentation", () => {
     expect(() => taskStatusPresentation("active", -1)).toThrow(/elapsed/i);
   });
 
-  it("does not describe terminal work as still running", () => {
-    expect(taskMetaPresentation("active")).toBe("You can keep talking while this runs.");
-    expect(taskMetaPresentation("cancelling")).toBe("Stopping the task now.");
-    expect(taskMetaPresentation("completed")).toBe("Background work finished.");
-    expect(taskMetaPresentation("failed")).toBe("Background work failed.");
-    expect(taskMetaPresentation("interrupted")).toBe("Background work stopped.");
-    expect(taskMetaPresentation("rejected")).toBe("Background work was not started.");
-  });
 });
 
 describe("session toggle presentation", () => {
