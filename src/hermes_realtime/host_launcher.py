@@ -1695,8 +1695,9 @@ def _load_hermes_context(context_file: Path | None) -> HermesRepresentativeConte
         raise RuntimeError("Hermes context contains an invalid descriptive field") from error
 
 
-_COMPLETION_URL = re.compile(r"https?://[^\s<>()]+")
-_COMPLETION_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\(https?://[^\s)]+\)")
+_COMPLETION_REFERENCE = re.compile(
+    r"(?:\[([^\]]+)\]\()?(https?://[^\s<>]+)", re.IGNORECASE,
+)
 _COMPLETION_MACHINE_TOKEN = re.compile(r"\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+")
 _PRIVATE_RESULT_HANDLE = re.compile(r"(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,})")
 _TAGGED_COMPLETION = re.compile(
@@ -1731,9 +1732,29 @@ def _completion_projections(detail: str) -> tuple[str, str]:
     return detail, detail
 
 
+def _completion_source_label(match: re.Match[str]) -> str:
+    """Render a supplied URL's hostname, without navigating or verifying its source."""
+    label, raw = match.groups()
+    url = raw.rstrip(".,;:!?")
+    punctuation = raw[len(url):]
+    if label is not None:
+        return _completion_reference_text(label) + punctuation
+    try:
+        hostname = urlsplit(url).hostname
+    except ValueError:
+        hostname = None
+    return (hostname or "link") + punctuation
+
+
+def _completion_reference_text(detail: str) -> str:
+    """Keep labels/hostnames while URLs remain only in the local task result."""
+    # Consume the complete URL token before rendering its optional Markdown label;
+    # stopping at a path parenthesis would forward the remainder of that URL.
+    return _COMPLETION_REFERENCE.sub(_completion_source_label, detail)
+
+
 def _voice_friendly_completion_text(status: str, detail: str) -> str:
-    detail = _COMPLETION_MARKDOWN_LINK.sub(r"\1", detail)
-    detail = _COMPLETION_URL.sub("the source link", detail)
+    detail = _completion_reference_text(detail)
     detail = _COMPLETION_MACHINE_TOKEN.sub("the reference", detail)
     detail = " ".join(detail.replace("•", " ").split()).strip()
     if detail:
@@ -1766,11 +1787,10 @@ def _voice_friendly_completion_text(status: str, detail: str) -> str:
 
 
 def _conversation_completion_text(status: str, voice_detail: str, visual_detail: str) -> str:
-    """Give inference a natural handoff plus the result substance it must explain."""
+    """Give inference bounded findings/time with source labels, excluding full URLs."""
 
     handoff = _voice_friendly_completion_text(status, voice_detail)
-    full_result = _COMPLETION_MARKDOWN_LINK.sub(r"\1", visual_detail)
-    full_result = _COMPLETION_URL.sub("the source link", full_result)
+    full_result = _completion_reference_text(visual_detail)
     full_result = _COMPLETION_MACHINE_TOKEN.sub("the reference", full_result)
     full_result = " ".join(full_result.replace("•", " ").split()).strip()
     if len(full_result) > _MAX_CONVERSATION_COMPLETION_DETAIL_CHARS:
@@ -1857,10 +1877,10 @@ class ProactiveCompletionUpdatePolicy:
                 raise TypeError("floor_available must return an exact boolean")
         return UpdateDirective(
             kind="interrupt" if floor_available else "mention_next",
-            text=_conversation_completion_text(
-                completion.status,
-                voice_detail,
-                visual_detail,
+            text=(
+                _voice_friendly_completion_text(completion.status, voice_detail)
+                if floor_available else
+                _conversation_completion_text(completion.status, voice_detail, visual_detail)
             ),
         )
 

@@ -3346,7 +3346,7 @@ def test_full_host_contains_no_delayed_progress_advisory_surface() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_host_policy_keeps_machine_text_visual_and_voice_friendly() -> None:
+async def test_full_host_policy_preserves_source_text_for_deferred_context() -> None:
     projection = BrowserEventProjection()
     policy = ProactiveCompletionUpdatePolicy(projection=projection)
     summary = (
@@ -3369,8 +3369,9 @@ async def test_full_host_policy_keeps_machine_text_visual_and_voice_friendly() -
 
     assert directive.text is not None
     assert "task_087a306b24da49c788d2d2cf825c31fd" not in directive.text
+    assert "github.com" in directive.text
     assert "https://" not in directive.text
-    assert "the source link" in directive.text
+    assert "the source link" not in directive.text
     assert "background result" not in directive.text.casefold()
     assert directive.text.count("A substantial stabilization detail follows.") > 10
     task_result = projection.events_after(0)[-1]
