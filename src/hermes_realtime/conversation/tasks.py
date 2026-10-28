@@ -28,6 +28,7 @@ from hermes_realtime.protocol import (
 )
 
 from .context import ConversationContextStore, PrivateRunDisclosureError, TaskAdmission
+from .result_projection import completed_result_reference
 from .task_status import TaskStatusSnapshot
 
 _TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
@@ -701,9 +702,14 @@ class ConversationTaskController:
             raise RuntimeError("terminal update does not match active task authority")
         if self._terminal_updates.full():
             raise RuntimeError("terminal outcome capacity exhausted")
+        outcome = evidence.outcome
+        detail = outcome.summary if outcome.status == "completed" else outcome.reason
+        assert detail is not None
         self._context.record_task_completed(
             task_id=evidence.task_id,
             run_id=evidence.run_id,
+            result_status=outcome.status,
+            result_text=completed_result_reference(detail),
         )
         self._terminal_sequences[evidence.task_id] = evidence.event_sequence
         del self._active_run_ids[evidence.task_id]

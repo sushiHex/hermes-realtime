@@ -27,6 +27,8 @@ _DEFAULT_WINDOW_ITEMS = 22
 _MAX_TASK_INCARNATIONS_LIMIT = 4096
 _MAX_PENDING_ASSISTANT_ADMISSIONS_LIMIT = 256
 _MAX_REVISION_LIMIT = 2**63 - 1
+_MAX_RECENT_TASK_RESULTS = 8
+_MAX_RECENT_TASK_RESULT_CHARS = 1024
 _TASK_ID_PATTERN = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _RUN_ID_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _PRIVATE_RUN_TOKEN_PATTERN = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
@@ -133,6 +135,32 @@ class ActiveTaskSummary:
         _validate_model_visible_value(self.objective)
 
 
+@dataclass(frozen=True, slots=True)
+class RecentTaskResult:
+    """Ephemeral host-observed task data, never a heard speech row."""
+
+    task_id: str
+    objective: str
+    status: str
+    text: str
+
+    def __post_init__(self) -> None:
+        ActiveTaskSummary(self.task_id, self.objective)
+        if type(self.status) is not str or self.status not in {
+            "completed",
+            "failed",
+            "interrupted",
+        }:
+            raise ValueError("task result status is invalid")
+        if (
+            type(self.text) is not str
+            or not self.text.strip()
+            or len(self.text) > _MAX_RECENT_TASK_RESULT_CHARS
+        ):
+            raise ValueError("task result text is invalid")
+        _validate_model_visible_value(self.text)
+
+
 AssistantTextAdmission = SpeechDeliveryAdmission
 
 
@@ -162,6 +190,7 @@ class ConversationContextSnapshot:
     active_tasks: tuple[ActiveTaskSummary, ...]
     terminal_task_count: int = 0
     memory: BuiltinMemorySnapshot | None = None
+    recent_task_results: tuple[RecentTaskResult, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.revision) is not int:
@@ -174,6 +203,12 @@ class ConversationContextSnapshot:
             raise TypeError("snapshot messages must be an exact tuple")
         if type(self.active_tasks) is not tuple:
             raise TypeError("snapshot active_tasks must be an exact tuple")
+        if (
+            type(self.recent_task_results) is not tuple
+            or len(self.recent_task_results) > _MAX_RECENT_TASK_RESULTS
+            or any(type(item) is not RecentTaskResult for item in self.recent_task_results)
+        ):
+            raise TypeError("snapshot task results must be a bounded exact tuple")
         if type(self.terminal_task_count) is not int:
             raise TypeError("snapshot terminal_task_count must be an exact integer")
         if not 0 <= self.terminal_task_count <= _MAX_TASK_INCARNATIONS_LIMIT:
@@ -203,6 +238,14 @@ class ConversationContextSnapshot:
         )
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "active_tasks", active_tasks)
+        object.__setattr__(
+            self,
+            "recent_task_results",
+            tuple(
+                RecentTaskResult(item.task_id, item.objective, item.status, item.text)
+                for item in self.recent_task_results
+            ),
+        )
         if self.memory is not None:
             object.__setattr__(
                 self,
@@ -318,6 +361,7 @@ class ConversationContextStore:
         self._seen_task_ids: set[str] = set()
         self._seen_run_ids: set[str] = set()
         self._terminal_task_count = 0
+        self._recent_task_results: deque[RecentTaskResult] = deque(maxlen=_MAX_RECENT_TASK_RESULTS)
         self._memory: BuiltinMemorySnapshot | None = None
         self._pending_task_admissions_by_object_id: dict[
             int,
@@ -566,6 +610,7 @@ class ConversationContextStore:
         """Start a new heard conversation without changing live task authority."""
 
         self._messages.clear()
+        self._recent_task_results.clear()
         self._window_chars = 0
         self._evicted = 0
         self._open_assistant_segment = None
@@ -707,7 +752,14 @@ class ConversationContextStore:
         ):
             raise ActiveTaskIdentityError("cancellation does not match active authority")
 
-    def record_task_completed(self, *, task_id: str, run_id: str) -> None:
+    def record_task_completed(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        result_status: str | None = None,
+        result_text: str | None = None,
+    ) -> None:
         self._validate_task_identifier(task_id)
         self._validate_run_identifier(run_id)
         active = self._active_tasks.get(task_id)
@@ -717,14 +769,35 @@ class ConversationContextStore:
             or self._task_ids_by_run_id.get(run_id) != task_id
         ):
             raise ActiveTaskIdentityError("task completion does not match active authority")
+        result = None
+        if result_status is not None or result_text is not None:
+            if type(result_status) is not str or type(result_text) is not str:
+                raise TypeError("task result status and text must both be strings")
+            result = RecentTaskResult(task_id, active.objective, result_status, result_text)
         prior_work = self._has_prior_work()
         del self._active_tasks[task_id]
         del self._task_ids_by_run_id[run_id]
+        if result is not None:
+            self._recent_task_results.append(result)
         self._terminal_task_count += 1
         self._revision += 1
         self._notify_if_prior_work_changed(prior_work)
 
     def snapshot(self) -> ConversationContextSnapshot:
+        """Fit recent result references and heard text within the configured character window.
+
+        Eviction here affects only this snapshot; the heard and durable histories remain intact.
+        """
+        messages = list(self._messages)
+        results = list(self._recent_task_results)
+        size = sum(len(message.text) for message in messages) + sum(
+            len(result.objective) + len(result.text) for result in results
+        )
+        while size > self._max_window_chars and len(messages) > 1:
+            size -= len(messages.pop(0).text)
+        while size > self._max_window_chars and results:
+            dropped = results.pop(0)
+            size -= len(dropped.objective) + len(dropped.text)
         return ConversationContextSnapshot(
             revision=self._revision,
             messages=tuple(
@@ -734,7 +807,7 @@ class ConversationContextStore:
                     interrupted=message.interrupted,
                     source=message.source,
                 )
-                for message in self._messages
+                for message in messages
             ),
             active_tasks=tuple(
                 ActiveTaskSummary(task_id=task.task_id, objective=task.objective)
@@ -742,6 +815,7 @@ class ConversationContextStore:
             ),
             terminal_task_count=self._terminal_task_count,
             memory=self._memory,
+            recent_task_results=tuple(results),
         )
 
     def set_memory(self, memory: BuiltinMemorySnapshot | None) -> None:
