@@ -91,6 +91,7 @@ def _trusted_snapshot(snapshot: ConversationContextSnapshot) -> ConversationCont
         ),
         terminal_task_count=snapshot.terminal_task_count,
         memory=snapshot.memory,
+        recent_task_results=snapshot.recent_task_results,
     )
 
 

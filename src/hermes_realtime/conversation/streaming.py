@@ -105,6 +105,7 @@ def _committed_conversation_context_snapshot_bytes(
     updates: tuple[tuple[int, str, str, str], ...] = (),
     memory: BuiltinMemorySnapshot | None = None,
     host_speech_message_indices: tuple[int, ...] = (),
+    recent_task_results: tuple[tuple[str, str, str, str], ...] = (),
 ) -> bytes:
     """Encode the internal snapshot supplied to an adapter for content-free observation.
 
@@ -119,6 +120,8 @@ def _committed_conversation_context_snapshot_bytes(
         "terminalTaskCount": terminal_task_count,
         "updates": updates,
     }
+    if recent_task_results:
+        payload["recentTaskResults"] = recent_task_results
     if host_speech_message_indices:
         payload["hostSpeechMessageIndices"] = host_speech_message_indices
     if memory is not None:
@@ -263,6 +266,7 @@ class ConversationInferenceRequest(ConversationContextSnapshot):
             active_tasks=self.active_tasks,
             terminal_task_count=self.terminal_task_count,
             memory=self.memory,
+            recent_task_results=self.recent_task_results,
         )
 
 
@@ -903,6 +907,7 @@ class StreamingSpeechLoop:
                         active_tasks=source_snapshot.active_tasks,
                         terminal_task_count=source_snapshot.terminal_task_count,
                         memory=source_snapshot.memory,
+                        recent_task_results=source_snapshot.recent_task_results,
                         updates=updates,
                     )
                     committed_conversation_context_snapshot = (
@@ -924,6 +929,10 @@ class StreamingSpeechLoop:
                                 for task in snapshot.active_tasks
                             ),
                             terminal_task_count=snapshot.terminal_task_count,
+                            recent_task_results=tuple(
+                                (result.task_id, result.objective, result.status, result.text)
+                                for result in snapshot.recent_task_results
+                            ),
                             updates=tuple(
                                 (update.sequence, update.task_id, update.status, update.text)
                                 for update in snapshot.updates
@@ -1027,6 +1036,7 @@ class StreamingSpeechLoop:
                                 active_tasks=accepted_tasks,
                                 terminal_task_count=current.terminal_task_count,
                                 memory=current.memory, task_id=accepted.task_id,
+                                recent_task_results=current.recent_task_results,
                             )
                             continuation = self._inference.stream(acknowledged, turn_id=turn_id)
                             continuation_error: BaseException | None = None
