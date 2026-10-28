@@ -295,3 +295,27 @@ SSE completion, source review and clean owned shutdown. This is one stable task,
 not reliability, broad model compatibility, natural routing, voice acceptance or
 [#315 resource qualification](https://github.com/sushiHex/hermes-realtime/issues/315).
 Readable punctuation remains a separate [#338 follow-up](https://github.com/sushiHex/hermes-realtime/issues/338).
+
+## Task result presentation
+
+When the foreground is idle, completion speech uses the supplied voice projection;
+it does not read the detail's source footer aloud or make another model call.
+Markdown citation labels remain readable, and bare HTTP(S) references are spoken
+as their hostname, without paths, queries or user information. This is text
+presentation, not source verification or permission to navigate a URL.
+
+The local task card retains the supplied visual detail and URLs. Deferred
+conversation context retains source labels/hostnames and non-URL factual/time
+wording instead of replacing every URL with the same generic phrase. Full URLs,
+including their user information, paths, queries and fragments, are not forwarded
+by this context projection. Existing private-handle filters and all text
+bounds remain unchanged. Legacy untagged speech still has the existing short
+spoken limit and screen handoff; this does not guarantee that every long legacy
+result's temporal qualification is spoken.
+
+The renderer cannot establish freshness or supply an observation time omitted
+from the voice projection. Semantic compliance and the real formatter witness
+remain separate under [#349](https://github.com/sushiHex/hermes-realtime/pull/349).
+The API's 1,800-character detail allowance and downstream 1,024-character handoff
+bounds are tracked separately in [#367](https://github.com/sushiHex/hermes-realtime/issues/367);
+this presentation change does not widen them.
