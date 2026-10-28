@@ -320,6 +320,21 @@ The API's 1,800-character detail allowance and downstream 1,024-character handof
 bounds are tracked separately in [#367](https://github.com/sushiHex/hermes-realtime/issues/367);
 this presentation change does not widen them.
 
+## Follow-up context
+
+Recent terminal task results are available as untrusted reference data to later
+foreground turns, independently of whether their spoken announcement was heard.
+They retain the matching task objective and terminal status; they do not establish
+a fresh foreground lookup, grant tools, or replay speech. A snapshot taken before
+completion remains a point-in-time view without that result.
+
+This live context keeps at most eight references, each with at most 1,024 characters
+of source-safe result text. Objectives, results, and heard rows share the existing
+configured character window; older rows and references can be omitted to fit it.
+This is a character bound, not a model-token-fit guarantee. The heard ledger and
+durable voice history are unchanged. Voice-history deletion clears these ephemeral
+references; they are not a new durable result store or a guarantee across restart.
+
 ## Refusal diagnostics
 
 The owned gateway retains emitted `[lookup-presentation]` metadata in the existing
