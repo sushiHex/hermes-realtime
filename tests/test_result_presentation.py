@@ -94,3 +94,25 @@ async def test_deferred_context_excludes_url_credentials_paths_queries_and_fragm
     ), context=ConversationContextStore().snapshot()))
     assert directive.text == "Observed 12 sessions at 07:53 UTC. Source: monitor.example.invalid."
     assert projection.events_after(0)[-1].data["text"] == detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference, expected", [
+    ("https://synthetic:fixture@monitor.example.invalid/a(b)?key=synthetic#fragment",
+     "monitor.example.invalid"),
+    ("[Monitor](https://synthetic:fixture@monitor.example.invalid/a(b)?key=synthetic#fragment)",
+     "Monitor"),
+    ("[https://synthetic:fixture@label.example.invalid/path?key=synthetic]"
+     "(https://monitor.example.invalid/a(b)?key=synthetic#fragment)", "label.example.invalid"),
+])
+async def test_parenthesized_url_paths_stay_local_in_deferred_context(reference, expected):
+    detail = f"Observed 12 sessions at 07:53 UTC. Source: {reference}."
+    projection = BrowserEventProjection()
+    directive = await ProactiveCompletionUpdatePolicy(projection=projection).decide(
+        UpdatePolicyInput(sequence=1, completion=TaskTerminalOutcome(
+            task_id="task_parenthesized_source", status="completed",
+            summary=f"<voice>The monitor counted 12 sessions.</voice><detail>{detail}</detail>",
+        ), context=ConversationContextStore().snapshot()),
+    )
+    assert directive.text == f"Observed 12 sessions at 07:53 UTC. Source: {expected}."
+    assert projection.events_after(0)[-1].data["text"] == detail
