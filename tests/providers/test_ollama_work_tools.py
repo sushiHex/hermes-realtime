@@ -151,6 +151,8 @@ async def test_accepted_start_continuation_omits_work_schema_and_tools():
         assert await collect(inference, snapshot) == ["I've started the work."]
         assert "format" not in sent[0] and "tools" not in sent[0]
         assert "host has accepted" in sent[0]["messages"][0]["content"]
+        reference = sent[0]["messages"][0]["content"].split("\n\nReference data:\n", 1)[1]
+        assert json.loads(reference)["accepted_background_objective"] == "Inspect release."
         assert handler.calls == []
     finally:
         await inference.close()
