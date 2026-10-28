@@ -696,7 +696,7 @@ function projectTaskStateCard(event: PublicEvent): void {
           notice.setAttribute("role", "status");
           typedForm.prepend(notice);
         }
-        notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
+        notice.textContent = "Some active tasks could not be displayed. Reload the page to refresh task state.";
         return;
       } finally {
         console.info(`[history-capacity] ${JSON.stringify({ activeCount, limit: 256, category: "active_task_capacity" })}`);

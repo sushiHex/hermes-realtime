@@ -153,7 +153,9 @@ describe("mounted task controls", () => {
     const form = dom.window.document.querySelector<HTMLFormElement>("#typed-form")!;
     const notice = form.querySelector<HTMLElement>(".history-capacity-notice");
     expect(notice?.getAttribute("role")).toBe("status");
-    expect(notice?.textContent).toContain("Active task display capacity reached");
+    expect(notice?.textContent).toBe(
+      "Some active tasks could not be displayed. Reload the page to refresh task state.",
+    );
     expect(dom.window.document.querySelectorAll('[data-operation="task"]')).toHaveLength(256);
     expect(notice!.compareDocumentPosition(form.querySelector(".composer")!) &
       dom.window.Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
