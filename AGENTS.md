@@ -83,6 +83,13 @@ or an in-progress run; never imply that PR checks establish main's result.
 
 Windows is the primary target and several hazards are specific to it.
 
+- Every operation that loads anything into VRAM must go through `vram-mcp`,
+  including inference that may implicitly load a model. A status check, reservation,
+  or claim followed by a direct API, script, or native-launcher load is not sufficient.
+  If `vram-mcp` cannot perform the required load with the intended configuration
+  and isolation, stop and report the capability gap; never bypass it. This rule
+  applies to all sessions and delegated agents. Preserve desktop usability and
+  existing personal workloads; available VRAM alone does not establish suitability.
 - A local checkout may not be this repository. Confirm `git remote get-url origin` before
   trusting any local file; `git show origin/main:<path>` fails silently against the wrong
   lineage. Prefer `gh api .../contents/<path>?ref=<sha>`.
