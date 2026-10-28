@@ -340,9 +340,9 @@ class _ProbeTransport:
             self.tool_proposed = (
                 result.get("success") is True
                 and type(payload) is dict
-                and set(payload) == {"proposed", "requires_confirmation"}
+                and set(payload) == {"proposed", "host_applies_start_policy"}
                 and payload["proposed"] is True
-                and payload["requires_confirmation"] is True
+                and payload["host_applies_start_policy"] is True
             )
             await self.incoming.put({"method": "turn/completed", "params": {
                 "threadId": "thread_m4",

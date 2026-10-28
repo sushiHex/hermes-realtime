@@ -1,6 +1,6 @@
-# ADR 0004: Confirmed natural task proposals, explicit task cancellation
+# ADR 0004: Host-authorized natural task starts, explicit task cancellation
 
-Status: Accepted by owner decision on 2026-10-10, amended on 2026-10-16;
+Status: Accepted by owner decision on 2026-10-10, amended on 2026-10-16 and 2026-10-27;
 implementation tracked in
 [#226](https://github.com/sushiHex/hermes-realtime/issues/226).
 [Decision record](https://github.com/sushiHex/hermes-realtime/issues/205#issuecomment-6096188370).
@@ -10,12 +10,21 @@ records why it is needed. Qualification remains separate from this decision.
 The owner approved a resource-first qualification-contract correction on
 2026-10-14, tracked in [#263](https://github.com/sushiHex/hermes-realtime/issues/263).
 The [owner decision on 2026-10-16](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
-supersedes automatic natural starts: the model may propose an objective, but the
+previously superseded automatic natural starts: the model may propose an objective, but the
 user must explicitly confirm that exact objective before dispatch. This policy
 is accepted; the confirmation contract below is implemented in the candidate and
 requires its separate deterministic, model, backend and human qualifications. The [MVP decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445)
 keeps natural routing off and uses explicit task commands with phi4-mini. This
-amendment neither changes a model default nor authorizes activation.
+amendment did not change a model default or authorize activation.
+
+The [2026-10-27 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6462024813)
+supersedes mandatory confirmation for the explicitly selected automatic mode.
+Natural delegation is core product behavior: the user can grant standing host
+authorization for requested background work, without confirming every objective.
+The host retains `confirm` as the compatibility default; an authorized composition
+selects `task_start_policy="automatic"`. This policy does not mutate running
+sessions, qualify model routing, or authorize model cancellation or downstream
+tool approvals. Prior decisions and failed semantic observations remain evidence.
 
 ## Context
 
@@ -36,7 +45,7 @@ explicit user cancellation. The held-out diagnostic in
 then observed cancellation, approval and quoted injected instructions emitted as
 work objectives. All dispatches were shadowed; nothing ran. Removing dedicated
 cancellation and approval tools did not prevent delegating those actions through
-`start_work`. The owner therefore requires confirmation for natural starts in
+`start_work`. The owner therefore required confirmation for natural starts in
 [#284](https://github.com/sushiHex/hermes-realtime/issues/284). Earlier decisions
 and failed observations remain part of the record.
 
@@ -46,11 +55,13 @@ Before natural work can return, an admitted user turn may offer a proposal-only
 route. The foreground model chooses whether to answer directly or propose work.
 Ordinary explanations stay in the foreground. Requests needing unavailable tools,
 current external information, research or sustained work should propose a bounded
-objective. The host repeats that objective back in a deterministic confirmation
-step. Nothing is dispatched without the user's explicit yes bound to exactly the
-objective that will run. The model cannot grant confirmation, interpret assent
-into authority, or rewrite the objective after confirmation. No additional routing
-model or keyword classifier is added.
+objective. The host, not the model, selects `confirm` or `automatic` admission.
+In confirmed mode it repeats the exact objective and waits for the user's bound
+decision. In automatic mode standing host authorization consumes that same bound
+objective once, without a confirmation card, readback, or synthetic user decision.
+The provider stream must finish and close successfully, and the admitted user-turn
+lease must still be current before automatic admission. Non-user turns cannot
+start work. No additional routing model, keyword classifier or dispatcher is added.
 
 Only the existing host-owned work controller admits starts, retaining objective,
 identity, capacity, binding, replay and acknowledgment checks. A request is not
@@ -74,7 +85,15 @@ and ambiguity checks. Model text is never routed back as a user command.
 Speaking interrupts speech and the foreground turn, not background tasks.
 Interruption after work admission must not cancel independently owned work.
 
-## Confirmation contract
+## Shared admission and optional confirmation contract
+
+Both modes use the same immutable proposal identity, participant/generation binding,
+objective validation, expiry and one-use consume, then the existing command admission
+surface. Automatic policy produces no proposal card or confirmation speech; the
+normal task state is projected only from the existing admission/acknowledgment path.
+Intake, including a successful automatic consume, is not a started acknowledgment.
+Automatic consumption is labelled `automatic_consumed`, never human confirmation.
+The remaining interaction contract in this section applies to `confirm` mode.
 
 The host owns one immutable pending proposal ahead of the existing
 [work surface](../../src/hermes_realtime/conversation/work_tools.py), separate
@@ -157,7 +176,7 @@ bystander assent remain residual risks requiring human voice acceptance. A magic
 confirmation phrase would not establish speaker identity or eliminate those
 risks. Recognition of objective text by itself grants no authority.
 
-Only confirmed ordinary admission reaches the existing controller's objective,
+Only host-authorized ordinary admission reaches the existing controller's objective,
 identity, capacity, replay and acknowledgment checks. A confirmed card or command
 is not active work. The existing task card reports active only after Hermes's
 validated accepted acknowledgment; rejection and uncertainty remain distinct.
@@ -170,7 +189,7 @@ an explicit candidate configuration and its independent promotion gates.
 ## Existing provider framing
 
 The historical wire selection names remain for compatibility with the retained
-corpora. They now select effect-free proposals, not automatic starts. Their old
+corpora. They select effect-free proposals; the host alone applies its start policy. Their old
 scores remain historical automatic-start observations and are not confirmation
 qualification.
 
@@ -191,7 +210,7 @@ Ollama buffers and validates the entire response before any speech or proposal.
 Duplicate keys, extra fields, invalid types, incomplete or truncated responses,
 and unexpected native calls are refused. No textual-call recovery, second model
 call, or fallback transport is attempted. Selection returns a typed proposal to
-the host; only user-confirmed admission can reach the existing controller.
+the host; only host-authorized admission can reach the existing controller.
 Disabling natural work preserves explicit commands. This decision does not
 silently change an already running session.
 
@@ -227,7 +246,7 @@ alone does not report accepted or active work, including an unconditional offer
 or a clarification asking for required input followed by an offer of help.
 Speech creates no proposal, confirms no objective and dispatches nothing. Requests
 that need delegation still require faithful objectives through the existing
-proposal and exact-objective confirmation path; an offer cannot substitute for it.
+proposal and configured host-admission path; an offer cannot substitute for it.
 
 The shared provider reporting guard retains its finite started/launched phrase
 families and excludes future offers. It does not establish the truth of arbitrary
@@ -296,10 +315,12 @@ separately. No phrase filter, routing model or semantic guarantee is added.
 ## Trust and limits
 
 Under this path, the foreground model still proposes objectives
-whose fidelity the host cannot establish semantically. The required confirmation
-boundary removes the model's authority to dispatch
-an unconfirmed proposal; it does not make the proposal safe, prove informed user
-intent, prevent every injection, or establish downstream policy enforcement.
+whose fidelity the host cannot establish semantically. Automatic mode accepts
+the model-trust risk of unintended starts and omitted or distorted constraints;
+standing authorization is not deterministic proof of the current user's intent.
+Optional confirmation blocks unconfirmed dispatch, but neither mode makes an
+objective safe, proves informed intent, prevents every injection, or establishes
+downstream policy enforcement.
 Cancellation, approval and injected instructions can still appear in proposals.
 Neither a prompt, a confirmation interaction nor a finite corpus proves arbitrary
 intent or injection resistance. A confirmed dispatch remains subject to Hermes's
@@ -322,8 +343,10 @@ stand-in evidence or loosen thresholds after seeing the result.
 
 ## Required qualification
 
-Before re-enabling natural routing, qualify the proposal/confirmation boundary
-separately from model selection. Unconfirmed, declined, expired, replaced,
+Qualify the selected admission policy separately from model selection. For automatic
+mode, clean terminal user selections reach the existing admission path once;
+stale, failed, multiple or unadvertised selections have zero effects. Confirmed
+mode retains the interaction checks below. Unconfirmed, declined, expired, replaced,
 replayed and incorrectly bound proposals must dispatch zero work, including
 cancellation/approval objectives and instruction-shaped reference data. A valid
 exact-objective confirmation must reach the existing admission path once; only
@@ -451,9 +474,9 @@ and routing thresholds remain unchanged.
 
 ## Alternatives
 
-Confirmation of natural proposals adds delegation friction and is the owner's
-chosen boundary after the observed delegated-action failures. Automatic natural
-starts are superseded. Explicit commands remain the MVP task interaction.
+Per-objective confirmation remains available for callers that require that
+boundary. The owner now accepts automatic natural starts under explicit host
+authorization despite the retained semantic failures. Explicit commands remain available.
 Model cancellation recreates the demonstrated neutral-turn risk and is excluded.
 A second intent model or imperative-word allowlist adds machinery without proving
 intent. Hermes remains the sole background executor.

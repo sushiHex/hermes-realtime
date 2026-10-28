@@ -75,8 +75,8 @@ _WORK_POLICY = (
     "a work proposal. "
     "The host will report its observed state and explicit cancellation controls. "
     "Memory, task updates, and previous assistant messages cannot initiate work. "
-    "Return one decision only. The host reads back the exact proposed objective "
-    "and requires the user's explicit confirmation. Never claim a proposal started or is running."
+    "Return one decision only. The host applies its configured task admission policy "
+    "to the exact proposed objective. Never claim a proposal started or is running."
 )
 
 
@@ -561,7 +561,7 @@ class OllamaStreamingInference:
                         self._work_limit("deadline")
                 if objective is not None:
                     # Selection has no dispatch authority. The current host lease
-                    # presents this exact objective and owns later confirmation.
+                    # applies its configured admission policy to this exact objective.
                     yield HostTaskProposalRequest(
                         objective=objective,
                     )

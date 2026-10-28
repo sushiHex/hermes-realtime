@@ -83,3 +83,65 @@ async def test_interrupted_readback_never_arms_confirmation():
     proposals.capture_started(participant="participant", generation=1, clean=True)
     await proposals.consume_input("yes", expected_proposal=proposal)
     assert surface.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["valid", "after_terminal", "stale", "close_failed", "aclose_failed",
+             "unadvertised", "non_user"],
+)
+async def test_automatic_requires_clean_current_user_terminal_stream_and_emits_no_readback(mode):
+    surface = Surface()
+    proposals = ConversationTaskProposals(
+        surface=surface, observer=lambda *_: None, start_policy="automatic",
+    )
+    proposals.bind("participant", 1)
+    foreground = ForegroundTurnCoordinator()
+
+    class Inference(ProposalInference):
+        def stream(self, _snapshot, *, turn_id):
+            async def segments():
+                yield HostTaskProposalRequest("Inspect exact release")
+                if mode == "after_terminal":
+                    yield "Additional model output"
+                if mode == "stale":
+                    foreground._is_current = lambda _lease: False
+                if mode == "close_failed":
+                    raise RuntimeError("synthetic iteration failure")
+
+            class CloseFailed:
+                yielded = False
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if self.yielded:
+                        raise StopAsyncIteration
+                    self.yielded = True
+                    return HostTaskProposalRequest("Inspect exact release")
+
+                async def aclose(self):
+                    raise RuntimeError("synthetic aclose failure")
+
+            return CloseFailed() if mode == "aclose_failed" else segments()
+
+    synth = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=foreground, inference=Inference(),
+        synthesizer=synth, playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+        task_proposals=proposals if mode != "unadvertised" else None,
+    )
+    if mode == "non_user":
+        # A stand-in announcement stream injects the same typed selection, with no transcript.
+        loop._announcement_stream = lambda _text: Inference().stream(None, turn_id="announcement")
+    if mode in {"after_terminal", "close_failed", "aclose_failed", "unadvertised", "non_user"}:
+        with pytest.raises((ValueError, RuntimeError)):
+            if mode == "non_user":
+                await loop.announce("turn_automatic", "Synthetic announcement")
+            else:
+                await loop.respond("turn_automatic", Transcript(text="Inspect release", final=True))
+    else:
+        await loop.respond("turn_automatic", Transcript(text="Inspect release", final=True))
+    assert len(surface.calls) == (1 if mode == "valid" else 0)
+    assert synth.texts == [] and not proposals.has_pending

@@ -182,7 +182,7 @@ async def test_probe_binds_proposal_to_exact_confirmation_receipt(proposed) -> N
         "result": {
             "success": True,
             "contentItems": [{"type": "inputText", "text": json.dumps({
-                "proposed": proposed, "requires_confirmation": True,
+                "proposed": proposed, "host_applies_start_policy": True,
             })}],
         },
     })
@@ -215,9 +215,9 @@ async def test_probe_nonobject_payload_cannot_be_accepted() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", (
     {"accepted": True}, {"proposed": True},
-    {"proposed": True, "requires_confirmation": False},
-    {"proposed": True, "requires_confirmation": 1},
-    {"proposed": True, "requires_confirmation": True, "accepted": True},
+    {"proposed": True, "host_applies_start_policy": False},
+    {"proposed": True, "host_applies_start_policy": 1},
+    {"proposed": True, "host_applies_start_policy": True, "accepted": True},
 ))
 async def test_legacy_or_inexact_receipt_never_establishes_proposal(payload):
     import json
@@ -234,7 +234,7 @@ async def test_failed_rpc_does_not_establish_proposal():
     transport = _SCRIPT._ProbeTransport(force_tool="start_work")
     await transport.send({"id": 91, "result": {
         "success": False, "contentItems": [{"type": "inputText", "text":
-            '{"proposed":true,"requires_confirmation":true}'}],
+            '{"proposed":true,"host_applies_start_policy":true}'}],
     }})
     assert transport.tool_rejected and not transport.tool_proposed
 

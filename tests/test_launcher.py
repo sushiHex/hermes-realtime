@@ -3690,6 +3690,37 @@ def test_qualification_no_task_composition_rejects_lookup_policy() -> None:
         build_local_host_launcher(hermes_api_bearer=None, hermes_lookup_policy="ordinary-lookup/v1")
 
 
+@pytest.mark.parametrize("policy", [None, True, "auto", ""])
+def test_task_start_policy_refuses_before_composition_dependencies(monkeypatch, policy):
+    def unexpected():
+        raise AssertionError("composition dependencies were reached")
+
+    monkeypatch.setattr(
+        host_launcher_module, "_current_qualification_full_host_dependencies", unexpected,
+    )
+    with pytest.raises(ValueError, match="task start policy"):
+        build_local_host_launcher(hermes_api_bearer=None, task_start_policy=policy)
+
+
+@pytest.mark.asyncio
+async def test_full_host_passes_automatic_start_policy_to_proposal_owner(monkeypatch):
+    from hermes_realtime.conversation.task_proposals import ConversationTaskProposals
+
+    harness = _FullHostHarness(monkeypatch)
+    captured = []
+
+    def proposals(**kwargs):
+        captured.append(kwargs["start_policy"])
+        return ConversationTaskProposals(**kwargs)
+
+    monkeypatch.setattr(host_launcher_module, "ConversationTaskProposals", proposals)
+    launcher = harness.build(natural_work_tools=True, task_start_policy="automatic")
+    try:
+        assert captured == ["automatic"]
+    finally:
+        await launcher.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", ["rebind", "projection_resync"])
 @pytest.mark.parametrize("confirmation", ["card", "typed"])

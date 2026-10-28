@@ -1,7 +1,7 @@
 """One bounded, host-owned proposal ahead of the existing work admission surface.
 
-The provider's selection is data. Only an exact confirmation by the current
-participant/session binding can consume it and call ordinary command admission.
+The provider's selection is data. The host's configured start policy owns its
+admission; confirmation and standing authorization share the same bound consume.
 """
 
 from __future__ import annotations
@@ -11,13 +11,20 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .work_tools import WorkCommandAdmission, _validate_exact_text
 
 _AFFIRMATIVES = frozenset({"yes", "yeah", "yep", "sure", "okay", "go ahead", "do it", "please do"})
 _PublicValue = str | int | bool | None
 MAX_TASK_PROPOSAL_OBJECTIVE_CHARS = 1024
+TaskStartPolicy = Literal["confirm", "automatic"]
+
+
+def validate_task_start_policy(value: TaskStartPolicy) -> None:
+    if type(value) is not str or value not in ("confirm", "automatic"):
+        print('[task-start-policy] {"category":"configuration_refused","count":1}', flush=True)
+        raise ValueError("task start policy must be exactly 'confirm' or 'automatic'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +73,10 @@ class ConversationTaskProposals:
         observer: Callable[[str, dict[str, _PublicValue]], None],
         clock: Callable[[], float] = time.monotonic,
         speech_projection: Callable[[str], str | None] | None = None,
+        start_policy: TaskStartPolicy = "confirm",
     ) -> None:
+        validate_task_start_policy(start_policy)
+        self._start_policy = start_policy
         self._surface = surface
         self._observer = observer
         self._clock = clock
@@ -75,6 +85,7 @@ class ConversationTaskProposals:
         self._speech_projection = speech_projection
         self._binding: tuple[str, int] | None = None
         self._pending: TaskProposal | None = None
+        self._pending_visible = False
         self._readback_complete: TaskProposal | None = None
         self._capture_binding: TaskProposal | None = None
         self._deadline: float | None = None
@@ -212,7 +223,31 @@ class ConversationTaskProposals:
     def has_pending(self) -> bool:
         return self._pending is not None
 
+    @property
+    def automatic_start(self) -> bool:
+        return self._start_policy == "automatic"
+
+    async def submit(self, request: HostTaskProposalRequest) -> TaskProposal | None:
+        """Apply host authorization to a clean, current user-turn selection."""
+        if not self.automatic_start:
+            return self.offer(request)
+        proposal = self._offer(request, visible=False)
+        admission = await self._consume(proposal, decision=None)
+        if admission is WorkCommandAdmission.UNAVAILABLE:
+            try:
+                self._observer("task_state", {
+                    "status": "rejected", "taskId": None,
+                    "reason": "Task control is unavailable. "
+                    "Restart the session before trying again.",
+                })
+            finally:
+                self._evidence("automatic_unavailable")
+        return None
+
     def offer(self, request: HostTaskProposalRequest) -> TaskProposal:
+        return self._offer(request, visible=True)
+
+    def _offer(self, request: HostTaskProposalRequest, *, visible: bool) -> TaskProposal:
         category = "invalid_proposal"
         try:
             if type(request) is not HostTaskProposalRequest:
@@ -232,12 +267,14 @@ class ConversationTaskProposals:
             proposal = TaskProposal(
                 proposal_id, request.objective, *self._binding, self._clock() + 60.0
             )
-            # The card must be projected successfully before becoming actionable.
-            self._publish(proposal, "pending")
+            # Confirmed mode requires successful card projection before it is actionable.
+            if visible:
+                self._publish(proposal, "pending")
             self._pending = proposal
+            self._pending_visible = visible
             self._deadline = proposal.expires_at
             self._readback_settled = False
-            category = "offered"
+            category = "offered" if visible else "automatic_selected"
             return proposal
         finally:
             self._evidence(category)
@@ -251,7 +288,7 @@ class ConversationTaskProposals:
         objective: str,
         decision: str,
     ) -> WorkCommandAdmission:
-        category = "binding_refused"
+        category: str | None = "binding_refused"
         try:
             if type(decision) is not str or decision not in {"confirm", "decline"}:
                 raise ValueError("proposal decision must be confirm or decline")
@@ -267,34 +304,49 @@ class ConversationTaskProposals:
                 or proposal.objective != objective
             ):
                 return WorkCommandAdmission.REFUSED
+            category = None
+            return await self._consume(proposal, decision=decision)
+        finally:
+            if category is not None:
+                self._evidence(category)
+
+    async def _consume(
+        self, proposal: TaskProposal, *, decision: str | None,
+    ) -> WorkCommandAdmission:
+        category = "expired"
+        try:
+            # Both callers synchronously validated/created this exact pending binding.
             if self._deadline is None or self._clock() >= self._deadline:
-                category = "expired"
                 self.retire("expired")
                 return WorkCommandAdmission.REFUSED
-            # Consume synchronously before projection or admission can suspend/fail.
+            # The same one-use consume precedes all projections and admission awaits.
             self._pending = None
+            self._pending_visible = False
             self._readback_complete = None
             self._capture_binding = None
             self._deadline = None
-            self._publish(proposal, "confirmed" if decision == "confirm" else "declined")
-            category = "consumed" if decision == "confirm" else "declined"
+            if decision is not None:
+                self._publish(proposal, "confirmed" if decision == "confirm" else "declined")
+            category = "automatic_consumed" if decision is None else (
+                "consumed" if decision == "confirm" else "declined")
             if decision == "decline":
                 return WorkCommandAdmission.REFUSED
-            # Admission owns dispatch and validated acknowledgment exactly as for
-            # explicit commands. This return value never reports a task started.
+            # Intake is never a started claim; existing admission owns the accepted ack.
             return await self._surface.submit_start_command(
                 objective=proposal.objective,
-                invocation_id="confirmed_" + proposal.proposal_id,
+                invocation_id=("automatic_" if decision is None else "confirmed_")
+                + proposal.proposal_id,
             )
         finally:
             self._evidence(category)
 
     def retire(self, category: str) -> None:
         proposal, self._pending = self._pending, None
+        visible, self._pending_visible = self._pending_visible, False
         self._readback_complete = None
         self._capture_binding = None
         self._deadline = None
-        if proposal is not None:
+        if proposal is not None and visible:
             try:
                 self._publish(proposal, "retired")
             finally:

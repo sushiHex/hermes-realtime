@@ -1158,8 +1158,8 @@ class CodexAppServerStreamingInference:
                 else:
                     work_policy = (
                         "Use start_work to propose the complete objective. "
-                        "The host displays and reads it back, then requires explicit "
-                        "user confirmation before admission. Do not ask the user to confirm in "
+                        "The host applies its configured task admission policy to that exact "
+                        "objective. Do not ask the user to confirm in "
                         "model prose or claim acceptance, progress, or that work has started. "
                     )
                 work_policy += (
@@ -1494,7 +1494,7 @@ class CodexAppServerStreamingInference:
                     "type": "function",
                     "name": "start_work",
                     "description": (
-                        "Propose work for host readback and explicit user confirmation: "
+                        "Propose work for the host's configured task admission policy: "
                         "research, tools, "
                         "inspection, commands, builds, changes, or verification. "
                         "Never use for conversation, indirect requests, "
@@ -2781,7 +2781,8 @@ class CodexAppServerStreamingInference:
                                     raise TypeError("Codex proposal selection has invalid result")
                                 routing.proposal = result
                                 call.response = self._tool_response(
-                                    {"proposed": True, "requires_confirmation": True}, success=True,
+                                    {"proposed": True, "host_applies_start_policy": True},
+                                    success=True,
                                 )
                         call.response_ready.set()
                     else:
