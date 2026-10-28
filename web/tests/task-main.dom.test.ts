@@ -101,6 +101,17 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   const task = (taskId: string | null, status: string, reason?: string) => event("task_state", { taskId, status, ...(reason === undefined ? {} : { reason }) });
+  const taskBatch = async (ids: string[]) => {
+    await vi.waitFor(() => expect(emit).not.toBeNull());
+    const dispatch = emit!;
+    emit = null;
+    dispatch(ids.map(taskId => {
+      sequence += 1;
+      return { sequence, kind: "task_state", monotonicMs: sequence * 1000,
+        data: { taskId, status: "active" } };
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+  };
   const approval = async (approvalId: string) => {
     await event("approval_state", { approvalId, state: "pending", actionable: true, taskId: "task_fixture", command: "synthetic command", description: "Synthetic approval" });
     dom.window.document.querySelector<HTMLButtonElement>('[data-operation="approval"]:last-child .approve')!.click();
@@ -125,7 +136,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
       dispatch([{}]);
     }
   };
-  return { requests, approvals, approval, task, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
+  return { requests, approvals, approval, task, taskBatch, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -135,6 +146,21 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it("keeps the active-task display capacity warning visible above the composer", async () => {
+    const { task, taskBatch } = await mount();
+    await taskBatch(Array.from({ length: 256 }, (_, index) => `task_capacity_${index}`));
+    await task("task_capacity_256", "active");
+    const form = dom.window.document.querySelector<HTMLFormElement>("#typed-form")!;
+    const notice = form.querySelector<HTMLElement>(".history-capacity-notice");
+    expect(notice?.getAttribute("role")).toBe("status");
+    expect(notice?.textContent).toBe(
+      "Some active tasks could not be displayed. Reload the page to refresh task state.",
+    );
+    expect(dom.window.document.querySelectorAll('[data-operation="task"]')).toHaveLength(256);
+    expect(notice!.compareDocumentPosition(form.querySelector(".composer")!) &
+      dom.window.Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
   it("forgets in-memory recovery after confirmed stop without browser storage", async () => {
     const { toggle } = await mount(undefined, false, "getter");
     toggle.click();

@@ -552,9 +552,9 @@ def test_active_capacity_refuses_overflow_visibly_without_evicting_work(page) ->
     assert page.locator('[data-operation="task"]').count() == 256
     assert page.locator('[data-task-id="task_capacity_0"]').count() == 1
     assert page.locator('[data-task-id="task_capacity_256"]').count() == 0
-    assert page.locator(".history-capacity-notice").inner_text() == (
-        "Active task display capacity reached. Reconnect to refresh task state."
-    )
+    notice = page.locator('.history-capacity-notice[role="status"]')
+    assert notice.is_visible()
+    assert notice.inner_text().strip()
 
 
 def test_live_card_admission_preserves_exact_bounded_conversation_history(page) -> None:

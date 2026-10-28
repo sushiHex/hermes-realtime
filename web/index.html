@@ -51,17 +51,23 @@
         <div class="connection-actions">
           <button id="session-toggle" class="button primary" type="button" aria-describedby="connection-recovery">Connect</button>
           <button id="stop-speaking" class="button secondary" type="button" disabled hidden>Stop speaking</button>
-          <output id="speech-renderer-state" class="status" aria-live="polite" hidden>Speech idle</output>
         </div>
         <div class="device-controls">
           <label class="device-control" for="microphone">
             <span>Microphone</span>
             <select id="microphone"><option value="">System default</option></select>
           </label>
-          <label class="device-control" for="voice">
+          <label class="device-control" for="voice" hidden>
             <span>Voice</span>
             <select id="voice" disabled><option value="">Unavailable</option></select>
           </label>
+          <div class="output-style-control">
+            <label class="device-control" for="output-style">
+              <span>Output style</span>
+              <select id="output-style" aria-describedby="output-style-status"></select>
+            </label>
+            <output id="output-style-status" class="control-feedback" aria-live="polite"></output>
+          </div>
           <div class="speaker-controls" role="group" aria-label="Speaker output">
             <label for="speaker-volume">Speaker</label>
             <input id="speaker-volume" type="range" min="0" max="100" step="1" value="100" aria-describedby="speaker-volume-status" />
@@ -74,17 +80,6 @@
 
       <section class="workspace">
         <article id="conversation-panel" class="panel conversation-panel">
-          <div class="panel-header">
-            <div>
-              <p class="section-kicker">Voice session</p>
-              <h2>Conversation</h2>
-            </div>
-            <span class="feature-badge">
-              <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-              Live transcription
-            </span>
-          </div>
-
           <div class="conversation-scroll">
             <div id="transcript-empty" class="empty-state">
               <span class="empty-orb" aria-hidden="true">
@@ -107,7 +102,7 @@
                 maxlength="4096"
                 rows="2"
                 disabled
-                placeholder="Type a message if voice is unavailable…"
+                placeholder="Type a message…"
               ></textarea>
               <button id="send" class="send-button" type="submit" disabled aria-label="Send message">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -116,18 +111,10 @@
                 </svg>
               </button>
             </div>
-            <p class="composer-hint">Voice remains the primary input. Typed messages use the same conversation context. Say “start task …” to delegate. Say “cancel task” when one task is active, or use its Cancel button.</p>
           </form>
         </article>
 
         <aside class="inspector" aria-label="Session details">
-          <section class="panel inspector-card" aria-labelledby="output-style-title">
-            <h2 id="output-style-title">Output style</h2>
-            <label for="output-style">Response preference</label>
-            <select id="output-style" aria-describedby="output-style-status"></select>
-            <output id="output-style-status" aria-live="polite"></output>
-            <p>Saved in this browser. Applies to the next response; model, effort and voice are separate.</p>
-          </section>
           <section class="panel inspector-card model-card" aria-labelledby="model-card-title">
             <div class="card-heading">
               <span class="card-icon model-icon" aria-hidden="true">
@@ -160,7 +147,7 @@
               <button id="local-model-retry" class="button secondary" type="button" hidden>Retry local model discovery</button>
               <button id="local-model-change" class="button secondary" type="button" hidden>Change model or context</button>
             </div>
-            <div class="model-controls" aria-label="Next turn model configuration">
+            <div class="model-controls" aria-label="Next turn model configuration" hidden>
               <label for="model-select">
                 <span>Model</span>
                 <select id="model-select" disabled><option value="">Unavailable</option></select>
@@ -169,10 +156,10 @@
                 <span>Reasoning / mode</span>
                 <select id="effort-select" disabled><option value="">Unavailable</option></select>
               </label>
-              <p id="model-selection-state" class="model-selection-state" aria-live="polite">
-                Connect to select the next-turn model.
-              </p>
             </div>
+              <p id="model-selection-state" class="model-selection-state" aria-live="polite">
+                Model options load on connection.
+              </p>
             <dl class="model-stats">
               <div class="model-stat"><dt>Provider</dt><dd id="model-provider">Awaiting session</dd></div>
               <div class="model-stat"><dt>Model</dt><dd id="model-name">—</dd></div>
@@ -188,6 +175,7 @@
               </div>
               <div class="model-stat"><dt>Usage feed</dt><dd id="model-usage-reporting">Awaiting session</dd></div>
               <div class="model-stat model-stat-section"><dt>Speech runtime</dt><dd></dd></div>
+              <div class="model-stat speech-renderer-stat"><dt>Speech renderer</dt><dd><output id="speech-renderer-state" aria-live="polite" hidden>Speech idle</output></dd></div>
               <div class="model-stat"><dt>STT provider</dt><dd id="stt-provider">Awaiting session</dd></div>
               <div class="model-stat"><dt>STT model</dt><dd id="stt-model">—</dd></div>
               <div class="model-stat"><dt>TTS provider</dt><dd id="tts-provider">Awaiting session</dd></div>
@@ -206,9 +194,10 @@
             </dl>
           </section>
 
-          <section id="evidence-disclosure" class="panel inspector-card evidence-disclosure" aria-labelledby="evidence-disclosure-title">
-            <p class="section-kicker">Optional local capture</p>
-            <h2 id="evidence-disclosure-title">Evidence capture disclosure</h2>
+          <details id="evidence-disclosure" class="panel inspector-card evidence-disclosure disclosure-card" aria-labelledby="evidence-disclosure-title">
+            <summary>
+              <h2 id="evidence-disclosure-title"><span class="disclosure-label">Evidence capture</span><output id="evidence-capture-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Evidence capture is unavailable for this session.</output></h2>
+            </summary>
             <div class="evidence-disclosure-copy">
               <p>Evidence capture is optional and off until you consent.</p>
               <p>If you consent, Hermes Realtime stores the selected final microphone transcript text, selected final typed input text, generated assistant segment text, transport-confirmed assistant text, and content-free routing, delivery, lifecycle, and settlement metadata. These records can contain sensitive personal information. They are stored locally without encryption at rest.</p>
@@ -217,29 +206,31 @@
             </div>
             <div class="evidence-controls" aria-labelledby="evidence-controls-title">
               <h3 id="evidence-controls-title">Capture controls</h3>
-              <output id="evidence-capture-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Evidence capture is unavailable for this session.</output>
+
               <div class="evidence-control-actions">
                 <button id="evidence-consent" class="button" type="button" aria-describedby="evidence-capture-status" disabled>Enable local capture</button>
                 <button id="evidence-revoke" class="button button-danger" type="button" aria-describedby="evidence-capture-status" disabled>Revoke consent and erase</button>
               </div>
             </div>
-          </section>
+          </details>
 
-          <section class="panel inspector-card evidence-disclosure" aria-labelledby="voice-delete-title">
-            <p class="section-kicker">Conversation control</p>
-            <h2 id="voice-delete-title">Delete voice conversation</h2>
+          <details id="voice-delete-panel" class="panel inspector-card evidence-disclosure disclosure-card" aria-labelledby="voice-delete-title">
+            <summary>
+              <h2 id="voice-delete-title"><span class="disclosure-label">Conversation deletion</span><output id="voice-delete-status" class="evidence-capture-status" role="status" aria-live="polite">Connect to delete this voice conversation.</output></h2>
+            </summary>
             <p id="voice-delete-limit" class="evidence-disclosure-copy">What Hermes learned from it (memories and skills) stays and may still shape replies. There is no unlearning in the MVP. Delegated tasks remain in Hermes and are managed with Hermes's own session controls. A copy made with Hermes /branch is a separate conversation: deletion stays pending until you delete that copy in Hermes.</p>
             <div class="evidence-controls">
-              <output id="voice-delete-status" class="evidence-capture-status" role="status" aria-live="polite">Connect to delete this voice conversation.</output>
+
               <div class="evidence-control-actions">
                 <button id="delete-voice-conversation" class="button danger" type="button" aria-describedby="voice-delete-limit voice-delete-status" disabled>Delete this voice conversation</button>
               </div>
             </div>
-          </section>
+          </details>
 
-          <section id="search-egress-disclosure" class="panel inspector-card evidence-disclosure" aria-labelledby="search-egress-disclosure-title">
-            <p class="section-kicker">Optional external search</p>
-            <h2 id="search-egress-disclosure-title">Public search disclosure</h2>
+          <details id="search-egress-disclosure" class="panel inspector-card evidence-disclosure disclosure-card" aria-labelledby="search-egress-disclosure-title">
+            <summary>
+              <h2 id="search-egress-disclosure-title"><span class="disclosure-label">Public search</span><output id="search-egress-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Public search is unavailable for this session.</output></h2>
+            </summary>
             <div id="search-egress-disclosure-copy" class="evidence-disclosure-copy">
               <p>Public search is optional. It is unavailable unless the host operator enables it, and it remains off for each browser session until you consent here.</p>
               <p>If you consent, Hermes Realtime may use a search query derived from stable partial or final speech transcript text, or final typed input text, and send that query over HTTPS to Bing Search RSS and, for outcome-shaped queries, Google News RSS. Raw microphone audio is not sent to those services by this feature.</p>
@@ -248,13 +239,13 @@
             </div>
             <div class="evidence-controls" aria-labelledby="search-egress-controls-title">
               <h3 id="search-egress-controls-title">Search controls</h3>
-              <output id="search-egress-status" class="evidence-capture-status" role="status" aria-live="polite" aria-busy="false">Public search is unavailable for this session.</output>
+
               <div class="evidence-control-actions">
                 <button id="search-egress-consent" class="button" type="button" aria-describedby="search-egress-status" disabled>Allow public search</button>
                 <button id="search-egress-revoke" class="button button-danger" type="button" aria-describedby="search-egress-status" disabled>Revoke public search</button>
               </div>
             </div>
-          </section>
+          </details>
 
 
           <details class="panel inspector-card diagnostics">

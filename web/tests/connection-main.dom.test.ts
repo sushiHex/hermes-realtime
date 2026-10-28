@@ -422,9 +422,27 @@ describe("mounted connection recovery", () => {
     expect(fetch.mock.calls.some(([path]) => path === "/api/v1/stable-bootstrap")).toBe(false);
   });
 
-  it("preserves existing next-turn model controls when local selection is explicitly disabled", async () => {
-    await mount(normalRequest);
-    expect(dom.window.document.querySelector<HTMLElement>(".model-controls")?.hidden).toBe(false);
+  it.each([false, true])("only offers selectors after a supported live catalog (supported: %s)", async supported => {
+    const { toggle } = await mount(path => path === "/api/v1/models" && supported
+      ? Response.json({
+        version: 1, selectedModel: "synthetic-current", selectedEffort: "high",
+        models: [{ model: "synthetic-current", displayName: "Synthetic model",
+          description: "Synthetic catalog", defaultEffort: "high", supportedEfforts: ["high"] }],
+      }) : normalRequest(path));
+    const controls = dom.window.document.querySelector<HTMLElement>(".model-controls")!;
+    expect(controls.hidden).toBe(true);
+    toggle.click();
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+    expect(controls.hidden).toBe(!supported);
+    expect(dom.window.document.querySelector<HTMLSelectElement>("#model-select")!.disabled).toBe(!supported);
+    // The local picker renders repeatedly; it must not resurrect an unsupported selector.
+    dom.window.document.querySelector<HTMLInputElement>("#local-model-context-input")!
+      .dispatchEvent(new dom.window.Event("input"));
+    expect(controls.hidden).toBe(!supported);
+    const status = dom.window.document.querySelector<HTMLElement>("#model-selection-state")!;
+    expect(controls.contains(status)).toBe(false);
+    expect(status.textContent).toContain(supported ? "Codex options" : "unavailable");
+    expect(dom.window.document.querySelector<HTMLSelectElement>("#voice")!.closest("label")!.hidden).toBe(true);
   });
 
   it("ignores an older discovery response after a newer host-status result", async () => {

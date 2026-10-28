@@ -47,7 +47,7 @@ export class OutputStyleControls {
         void this.apply(this.submit, this.current, previous);
       } else {
         this.persist();
-        this.render("Connect to apply this preference.");
+        this.render("Connect to apply.");
       }
     });
   }
@@ -67,7 +67,7 @@ export class OutputStyleControls {
     this.submit = null;
     this.current = null;
     this.select.disabled = false;
-    this.render("Connect to apply this preference.");
+    this.render("Connect to apply.");
   }
 
   async sync(submit: Submit, current: () => boolean): Promise<void> {
@@ -80,13 +80,13 @@ export class OutputStyleControls {
     const operation = ++this.revision;
     const requested = this.selected;
     this.select.disabled = true;
-    this.render("Applying preference…");
+    this.render("Applying…");
     try {
       const reply = await submit(requested);
       if (operation !== this.revision || !current()) return;
       if (!acceptedStyle(reply, requested)) throw new Error("style acknowledgment rejected");
       this.persist();
-      this.render("Accepted. Applies to the next response.");
+      this.render("Applied.");
     } catch {
       if (operation !== this.revision || !current()) return;
       if (previous !== null) {

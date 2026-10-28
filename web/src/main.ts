@@ -159,6 +159,7 @@ const outputStyleControls = new OutputStyleControls(
   () => window.localStorage,
 );
 const voiceSelect = element<HTMLSelectElement>("voice");
+const voiceControl = voiceSelect.closest<HTMLLabelElement>("label");
 const modelSelect = element<HTMLSelectElement>("model-select");
 const effortSelect = element<HTMLSelectElement>("effort-select");
 const modelSelectionState = element<HTMLParagraphElement>("model-selection-state");
@@ -693,9 +694,9 @@ function projectTaskStateCard(event: PublicEvent): void {
           notice = document.createElement("span");
           notice.className = "history-capacity-notice";
           notice.setAttribute("role", "status");
-          transcript.closest(".conversation-panel")?.querySelector(".panel-header")?.append(notice);
+          typedForm.prepend(notice);
         }
-        notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
+        notice.textContent = "Some active tasks could not be displayed. Reload the page to refresh task state.";
         return;
       } finally {
         console.info(`[history-capacity] ${JSON.stringify({ activeCount, limit: 256, category: "active_task_capacity" })}`);
@@ -2009,6 +2010,7 @@ function setInteractive(connected: boolean): void {
   evidenceControls.setInteractive(connected);
   searchEgressControls.setInteractive(connected);
   voiceSelect.disabled = !connected || selectedVoice === null;
+  if (voiceControl !== null) voiceControl.hidden = selectedVoice === null;
   const modelInteractive = connected && selectableModels !== null && !modelSelectionPending;
   modelSelect.disabled = !modelInteractive;
   effortSelect.disabled = !modelInteractive;
@@ -2206,7 +2208,7 @@ async function loadVoiceConfiguration(
   }
   selectedVoice = configuration.selectedVoice;
   if (selectedVoice !== null) voiceSelect.value = selectedVoice;
-  voiceSelect.disabled = selectedVoice === null || controller.state !== "connected";
+  setInteractive(controller.state === "connected");
   addMarker(`voice_catalog_loaded_${configuration.voices.length}`);
   return true;
 }
@@ -2389,7 +2391,8 @@ function renderLocalModelPicker(): void {
   const frozen = catalog?.state === "prepared" && catalog.selection !== null;
   const unavailable = localModelDiscoveryState === "disabled";
   if (existingModelControls !== null) {
-    existingModelControls.hidden = localModelDiscoveryState === "ready" && catalog !== null;
+    existingModelControls.hidden = selectableModels === null ||
+      (localModelDiscoveryState === "ready" && catalog !== null);
   }
   const lifecycleLocked = localModelLifecycleIsLocked();
   const controlsDisabled = catalog === null || catalog.state !== "configuring" ||
