@@ -75,7 +75,6 @@ import {
   sessionTogglePresentation,
   takeOptionalBootstrapCapability,
   terminalDisconnectIsAuthoritative,
-  taskMetaPresentation,
   taskStatusPresentation,
   UserTurnAssembler,
   userTranscriptProjectionDisposition,
@@ -534,7 +533,7 @@ function projectTaskResult(event: PublicEvent): void {
 interface TaskCardView {
   readonly item: HTMLLIElement;
   readonly status: HTMLParagraphElement;
-  readonly meta: HTMLSpanElement;
+  readonly controls: HTMLDivElement;
   readonly feedback: HTMLParagraphElement;
   readonly cancellation: ReturnType<typeof mountTaskCancelControl>;
   participantIdentity: string | null;
@@ -709,19 +708,16 @@ function projectTaskStateCard(event: PublicEvent): void {
     item.dataset.role = "operation";
     item.dataset.operation = "task";
     item.dataset.taskId = taskId;
+    const row = document.createElement("div");
+    row.className = "task-card-row";
     const label = document.createElement("strong");
-    label.textContent = "Execution";
-    const title = document.createElement("span");
-    title.className = "operation-title";
-    title.textContent = "Background task";
+    label.className = "task-card-label";
+    label.textContent = "Background task";
     const state = document.createElement("p");
-    state.className = "operation-detail";
+    state.className = "task-card-status";
     state.setAttribute("role", "timer");
-    const meta = document.createElement("span");
-    meta.className = "operation-meta";
-    meta.textContent = "You can keep talking while this runs.";
     const controls = document.createElement("div");
-    controls.className = "operation-controls";
+    controls.className = "task-card-controls";
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "button danger";
@@ -730,7 +726,8 @@ function projectTaskStateCard(event: PublicEvent): void {
     feedback.className = "operation-detail";
     feedback.setAttribute("role", "status");
     controls.append(cancel);
-    item.append(label, title, state, meta, controls, feedback);
+    row.append(label, state, controls);
+    item.append(row, feedback);
     const cancellation = mountTaskCancelControl(cancel, {
       taskId,
       canCancel: () => controller.state === "connected" &&
@@ -745,7 +742,7 @@ function projectTaskStateCard(event: PublicEvent): void {
     view = {
       item,
       status: state,
-      meta,
+      controls,
       feedback,
       cancellation,
       participantIdentity: credential?.participantIdentity ?? null,
@@ -768,6 +765,7 @@ function projectTaskStateCard(event: PublicEvent): void {
   view.item.dataset.status = status;
   view.currentStatus = status;
   view.participantIdentity = credential?.participantIdentity ?? null;
+  view.controls.hidden = status !== "active";
   view.feedback.textContent = "";
   view.cancellation.refresh();
   const render = (): void => {
@@ -776,7 +774,6 @@ function projectTaskStateCard(event: PublicEvent): void {
         ? performance.now() - view!.startedBrowserMs
         : Math.max(0, event.monotonicMs - view!.startedServerMs);
     view!.status.textContent = taskStatusPresentation(view!.currentStatus, elapsedMs);
-    view!.meta.textContent = taskMetaPresentation(view!.currentStatus);
   };
   render();
   if (status === "active" || status === "cancelling") {
