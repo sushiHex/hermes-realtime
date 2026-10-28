@@ -32,7 +32,7 @@ describe("output style preference", () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(view.select.value).toBe("concise");
     expect(view.status.textContent).toContain("not saved");
-    expect(view.status.textContent).toContain("next response");
+    expect(view.status.textContent).toContain("Applied.");
   });
 
   it("reapplies the saved choice across reconnect and server restart", async () => {
@@ -43,7 +43,7 @@ describe("output style preference", () => {
     view.control.reset();
     await view.control.sync(submit, () => true);
     expect(sent).toEqual(["explanatory", "explanatory"]);
-    expect(view.status.textContent).toContain("next response");
+    expect(view.status.textContent).toContain("Applied.");
   });
 
   it("ignores stale acknowledgments and rolls back rejected connected changes", async () => {
@@ -85,7 +85,7 @@ describe("output style preference", () => {
     current = false;
     finish({version:1, selectedStyle:"learning"});
     await pending;
-    expect(view.status.textContent).not.toContain("Accepted");
+    expect(view.status.textContent).not.toContain("Applied");
   });
 
   it("keeps a newer selection pending when an older operation settles", async () => {

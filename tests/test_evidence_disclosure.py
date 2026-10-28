@@ -19,7 +19,7 @@ def _visible_text(markup: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
 
 
-def test_canonical_disclosure_is_visible_accessible_and_hash_bound_to_packaged_assets() -> None:
+def test_canonical_disclosure_is_accessible_before_consent_and_bound_to_assets() -> None:
     disclosure = DISCLOSURE.read_bytes()
     document = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
@@ -42,16 +42,23 @@ def test_canonical_disclosure_is_visible_accessible_and_hash_bound_to_packaged_a
 
     index = (STATIC / "index.html").read_text(encoding="utf-8")
     assert re.search(
-        r'<section id="evidence-disclosure"[^>]*aria-labelledby="evidence-disclosure-title">',
+        r'<details id="evidence-disclosure"[^>]*aria-labelledby="evidence-disclosure-title">',
         index,
     )
-    assert '<h2 id="evidence-disclosure-title">Evidence capture disclosure</h2>' in index
+    assert '<span class="disclosure-label">Evidence capture</span>' in index
     section = re.search(
-        r'<section id="evidence-disclosure"[^>]*>(.*?)</section>', index, re.DOTALL
+        r'<details id="evidence-disclosure"[^>]*>(.*?)</details>', index, re.DOTALL
     )
     assert section is not None
     assert "hidden" not in section.group(0)
     assert "aria-hidden" not in section.group(0)
+    summary = re.search(r"<summary>(.*?)</summary>", section.group(1), re.DOTALL)
+    assert summary is not None
+    assert 'id="evidence-capture-status"' in summary.group(1)
+    assert 'id="evidence-consent"' not in summary.group(1)
+    assert section.group(1).index('class="evidence-disclosure-copy"') < section.group(1).index(
+        'id="evidence-consent"'
+    )
     visible = _visible_text(section.group(1))
     for paragraph in disclosure.decode("utf-8").split("\n\n"):
         assert re.sub(r"\s+", " ", paragraph).strip() in visible
