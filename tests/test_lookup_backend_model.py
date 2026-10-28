@@ -678,12 +678,142 @@ def test_load_and_readback_precede_ready(selected, owned, tmp_path):
     assert result["configured_context_tokens"] == 64000
     assert result["allocation_observed"] is False
     assert result["keep_alive_configured"] == -1
+    assert result["load_mechanism_configured"] == "native-http"
+    assert result["mcp_callback_invocation_count"] == 0
+    assert result["mcp_callback_acknowledged"] is False
     assert owned[0].calls[0][2]["env"]["OLLAMA_KEEP_ALIVE"] == "-1"
     calls = owned[4]
     assert [(r.method, r.url.path) for r in calls] == [("POST", "/api/chat"), ("GET", "/api/ps")]
     assert json.loads(calls[0].content) == {
         "model": selected["model"], "messages": [], "stream": False,
         "options": {"num_ctx": 64000}}
+
+
+@pytest.mark.parametrize("profile", list(model.StartupProfile), ids=["lookup", "native"])
+def test_mcp_loader_replaces_native_load_and_shares_readback(selected, owned, tmp_path, profile):
+    calls = []
+    owned[5]["ps"]["models"][0]["context_length"] = profile.context_tokens
+
+    class Loader:
+        def __bool__(self):
+            return False  # Selection is by None, never callback truthiness.
+
+        async def __call__(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    deadline = model.time.monotonic() + 10
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        deadline, startup_profile=profile, mcp_loader=Loader())
+    assert calls == [{"base_url": "http://127.0.0.1:11440", "model": selected["model"],
+                      "startup_profile": profile, "deadline": deadline}]
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
+    assert result["load_mechanism_configured"] == "mcp-callback"
+    assert result["mcp_callback_invocation_count"] == 1
+    assert result["mcp_callback_acknowledged"] is True
+    assert result["load_request_count"] == 0 and result["load_acknowledged"] is False
+    assert result["model_ready"] is True
+
+
+@pytest.mark.parametrize("answer", [False, None, 1, "accepted"])
+def test_mcp_loader_requires_exact_ack_without_native_fallback(selected, owned, tmp_path, answer):
+    async def loader(**_kwargs):
+        return answer
+
+    with pytest.raises(ValueError, match="mcp-load-ack"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["mcp_callback_invocation_count"] == 1
+    assert state["load_request_count"] == 0 and state["model_ready"] is False
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_mcp_loader_exception_has_no_fallback_or_private_detail(selected, owned, tmp_path, capsys):
+    async def loader(**_kwargs):
+        raise RuntimeError("private-loader-detail")
+
+    with pytest.raises(RuntimeError):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert "private-loader-detail" not in json.dumps(state) + capsys.readouterr().out
+
+
+def test_mcp_loader_timeout_cancels_callback_without_native_fallback(selected, owned, tmp_path):
+    observed = {"cancelled": False, "completed": False}
+
+    async def loader(**_kwargs):
+        try:
+            await asyncio.sleep(1)
+            observed["completed"] = True
+            return True
+        except asyncio.CancelledError:
+            observed["cancelled"] = True
+            raise
+
+    with pytest.raises(TimeoutError):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 0.2, mcp_loader=loader)
+    assert observed == {"cancelled": True, "completed": False}
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+@pytest.mark.parametrize("field,value,category", [
+    ("digest", "0" * 64, "loaded-model"), ("context_length", 4096, "loaded-context"),
+], ids=["digest", "context"])
+def test_mcp_loader_ack_cannot_replace_readback(selected, owned, tmp_path, field, value, category):
+    owned[5]["ps"]["models"][0][field] = value
+
+    async def loader(**_kwargs):
+        return True
+
+    with pytest.raises(ValueError, match=category):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_mcp_loader_checks_ownership_before_invocation(selected, owned, tmp_path, monkeypatch):
+    calls = []
+    original = model._read
+
+    def read(kind, *args):
+        reply = original(kind, *args)
+        if kind == "show":
+            monkeypatch.setattr(model, "_image", lambda _pid: tmp_path / "foreign.exe")
+        return reply
+
+    async def loader(**_kwargs):
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr(model, "_read", read)
+    with pytest.raises(RuntimeError, match="listener-owner"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    assert not calls and not owned[4]
+
+
+def test_invalid_mcp_loader_refuses_before_start(selected, owned, tmp_path):
+    with pytest.raises(ValueError, match="mcp-loader"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=object())
+    assert not owned[0].calls and not owned[4]
+
+
+def test_mcp_loader_cannot_change_owned_process_before_readback(
+        selected, owned, tmp_path, monkeypatch):
+    async def loader(**_kwargs):
+        monkeypatch.setattr(model, "_image", lambda _pid: tmp_path / "foreign.exe")
+        return True
+
+    with pytest.raises(RuntimeError, match="listener-owner"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
 
 
 @pytest.mark.parametrize("change", [

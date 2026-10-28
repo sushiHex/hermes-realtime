@@ -238,6 +238,26 @@ profile defaults, and the caller's earlier absolute deadline always wins.
 Requested and effective startup budgets appear in the receipt. The separate
 public backend command keeps its existing 60-second startup and 360-second watchdog.
 
+Agents must select the trusted `start_model(..., mcp_loader=callback)` seam rather
+than its native HTTP default. The asynchronous callback receives only the owned
+`base_url`, exact `model`, immutable `startup_profile` and shared absolute `deadline`.
+It must perform the actual load through a scoped vram-mcp instance and return the
+exact boolean `True` only for a successful MCP result. Unknown/refused results,
+exceptions and timeouts stop startup without a direct-load fallback. The existing
+independent owned `/api/ps` check still requires the selected digest, name and context.
+The callback owns its external SDK transport's bounded cancellation and cleanup;
+it must preserve the shared coordination ledger and the owned retention policy.
+
+No MCP package is required in the Hermes interpreter. A trusted composition can
+invoke the already installed SDK from a separate interpreter under the existing
+process owner. Receipts distinguish configured `mcp-callback` from `native-http`,
+count callback invocations separately, and retain the callback acknowledgment
+separately from the native empty-load acknowledgment. Invocation is not proof of
+a dispatched MCP tool; the trusted callback must retain that tool's own evidence.
+Neither acknowledgment alone substitutes for independent readback. The native
+default remains available for human-operated command compatibility; canonical
+agent sessions must never use it to bypass MCP admission.
+
 For an interactive session, prove background startup and task readiness before
 inviting the operator. Reserve an owner window for cold startup, operator use and
 cleanup; publish the ready URL with an explicit usable end time, then hand control

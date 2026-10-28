@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, NoReturn
+from typing import IO, Any, NoReturn, Protocol
 
 from scripts.qualification_file_seals import _relative_windows_member
 
@@ -53,6 +53,13 @@ class StartupProfile(Enum):
         return 60 if self is StartupProfile.LOOKUP_64K else 120
 
 
+class McpModelLoader(Protocol):
+    """Trusted operator callback; True acknowledges its actual MCP load operation."""
+
+    async def __call__(self, *, base_url: str, model: str, deadline: float,
+                       startup_profile: StartupProfile) -> bool: ...
+
+
 _JSON_LIMIT = 1024 * 1024
 _REFUSALS = frozenset({
     "model-deadline", "artifact-file-kind", "artifact-json-bound", "artifact-json-shape",
@@ -67,6 +74,7 @@ _REFUSALS = frozenset({
     "load-ack", "loaded-model", "loaded-context", "startup-profile", "readiness-status",
     "readiness-bound",
     "readiness-shape", "readiness-json", "model-readiness-loop", "startup-timeout",
+    "mcp-loader", "mcp-load-ack",
 })
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
@@ -319,8 +327,9 @@ def _read(kind: str, manifest: Mapping[str, Any], process: Any,
 
 
 async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: float,
-                          state: dict[str, Any], startup_profile: StartupProfile) -> None:
-    """One empty load and one configured-context readback, under one remaining budget.
+                          state: dict[str, Any], startup_profile: StartupProfile,
+                          mcp_loader: McpModelLoader | None = None) -> None:
+    """One selected load and one configured-context readback, under one remaining budget.
 
     Pinned Ollama's native chat handler awaits runner readiness before returning
     done_reason=load for empty messages. /api/ps reports configured per-sequence
@@ -370,16 +379,32 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
     async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0),
             follow_redirects=False, trust_env=False) as client:
         async with asyncio.timeout(_remaining(deadline)):
-            load = await read("chat", {"model": manifest["model"], "messages": [],
-                "stream": False, "options": {"num_ctx": startup_profile.context_tokens}}, "load")
-            state["stage"] = "model-load-ack"
-            message = load.get("message")
-            if (load.get("done") is not True or load.get("done_reason") != "load"
-                    or load.get("model") != manifest["model"] or type(message) is not dict
-                    or message.get("role") != "assistant" or message.get("content") != ""
-                    or message.get("thinking", "") != "" or message.get("tool_calls", []) != []):
-                raise ValueError("load-ack")
-            state["load_acknowledged"] = True
+            if mcp_loader is None:
+                load = await read("chat", {"model": manifest["model"], "messages": [],
+                    "stream": False, "options": {"num_ctx": startup_profile.context_tokens}},
+                    "load")
+                state["stage"] = "model-load-ack"
+                message = load.get("message")
+                if (load.get("done") is not True or load.get("done_reason") != "load"
+                        or load.get("model") != manifest["model"] or type(message) is not dict
+                        or message.get("role") != "assistant" or message.get("content") != ""
+                        or message.get("thinking", "") != ""
+                        or message.get("tool_calls", []) != []):
+                    raise ValueError("load-ack")
+                state["load_acknowledged"] = True
+            else:
+                _owned(process, runtime, port, deadline)
+                state["stage"] = "model-mcp-load"
+                state["mcp_callback_invocation_count"] += 1
+                state["mcp_callback_begin_ns"] = time.monotonic_ns()
+                try:
+                    accepted = await mcp_loader(base_url=f"http://127.0.0.1:{port}",
+                        model=manifest["model"], deadline=deadline, startup_profile=startup_profile)
+                finally:
+                    state["mcp_callback_settled_ns"] = time.monotonic_ns()
+                if accepted is not True:
+                    raise ValueError("mcp-load-ack")
+                state["mcp_callback_acknowledged"] = True
             snapshot = await read("ps", None, "readback")
             state["stage"] = "model-readback-identity"
             models = snapshot.get("models")
@@ -401,12 +426,16 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 evidence_dir: Path, deadline: float, *,
                 verified: VerifiedArtifacts | None = None,
                 startup_profile: StartupProfile = StartupProfile.LOOKUP_64K,
-                startup_timeout_seconds: int | None = None) -> dict[str, Any]:
+                startup_timeout_seconds: int | None = None,
+                mcp_loader: McpModelLoader | None = None) -> dict[str, Any]:
     """Retain the model for the caller's bounded owned process lifetime.
 
     An explicit startup timeout (1..600 seconds) overrides the profile's default,
     still capped by the caller's absolute deadline. It never extends task authority.
     The caller must keep its Job/watchdog/finally settlement through every consumer.
+    Agents must supply ``mcp_loader`` performing the actual load through MCP. It
+    receives no mutable manifest or receipt. Refusal/timeout never selects native
+    loading; both paths require the same independent owned identity/context readback.
     """
     selected = dict(manifest)
     profile_valid = type(startup_profile) is StartupProfile
@@ -432,6 +461,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         "startup_effective_budget_seconds": max(0.0, deadline - started)
             if startup_seconds is not None else None,
         "keep_alive_configured": -1,
+        "load_mechanism_configured": "native-http" if mcp_loader is None else "mcp-callback",
+        "mcp_callback_invocation_count": 0, "mcp_callback_acknowledged": False,
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}
@@ -443,6 +474,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             raise ValueError("startup-profile")
         if not timeout_valid:
             raise ValueError("startup-timeout")
+        if mcp_loader is not None and not callable(mcp_loader):
+            raise ValueError("mcp-loader")
         _remaining(deadline)
         try:
             asyncio.get_running_loop()
@@ -510,7 +543,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
                 or not {"completion", "tools"}.issubset(show["capabilities"])
                 or any(show.get(field, "") != "" for field in ("remote_host", "remote_model"))):
             raise ValueError("metadata-capabilities")
-        asyncio.run(_load_readiness(selected, process, deadline, state, startup_profile))
+        asyncio.run(_load_readiness(
+            selected, process, deadline, state, startup_profile, mcp_loader))
         _remaining(deadline)
         state.update(category="metadata_ready", stage="complete", runtime_version=SUPPORTED_VERSION,
                      model_ready=True)
@@ -536,6 +570,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             "runtime_version", "context_default_tokens", "allocation_observed",
             "startup_timeout_requested_seconds", "startup_budget_ceiling_seconds",
             "startup_effective_budget_seconds",
+            "load_mechanism_configured", "mcp_callback_invocation_count",
+            "mcp_callback_acknowledged",
             "load_request_count", "load_acknowledged", "model_ready", "configured_context_tokens",
             "failure_kind", "failure_category") if key in state}
         print("[lookup-model] " + json.dumps(public, sort_keys=True), flush=True)
