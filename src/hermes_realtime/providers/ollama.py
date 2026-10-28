@@ -17,7 +17,10 @@ import aiohttp
 
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
-from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.streaming import (
+    AcceptedStartInferenceRequest,
+    ConversationInferenceRequest,
+)
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
     HostTaskProposalRequest,
@@ -371,6 +374,23 @@ class OllamaStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
+        accepted_ack = type(snapshot) is AcceptedStartInferenceRequest
+        accepted_objective: str | None = None
+        if accepted_ack:
+            snapshot = AcceptedStartInferenceRequest(
+                revision=snapshot.revision, messages=snapshot.messages,
+                active_tasks=snapshot.active_tasks,
+                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
+                task_id=cast(AcceptedStartInferenceRequest, snapshot).task_id,
+            )
+            accepted_objective = next(
+                task.objective for task in snapshot.active_tasks if task.task_id == snapshot.task_id
+            )
+            snapshot = ConversationContextSnapshot(
+                revision=snapshot.revision, messages=snapshot.messages,
+                active_tasks=snapshot.active_tasks,
+                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
+            )
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
         if turn_id != "turn_preflight":
@@ -386,7 +406,7 @@ class OllamaStreamingInference:
             if len(self._openings) + len(self._responses) >= self._max_active_streams:
                 raise RuntimeError("Ollama stream capacity exhausted")
             await self._ensure_context_contract_locked()
-            handler = self._work_tool_handler
+            handler = None if accepted_ack else self._work_tool_handler
             can_start = (
                 handler is not None
                 and type(snapshot) is ConversationInferenceRequest
@@ -396,6 +416,19 @@ class OllamaStreamingInference:
             messages = self._messages(
                 snapshot, output_style=style, task_status_available=can_start,
             )
+            if accepted_ack:
+                prefix, separator, reference = messages[0]["content"].partition(
+                    "\n\nReference data:\n"
+                )
+                if not separator:
+                    raise RuntimeError("accepted acknowledgment prompt has no reference boundary")
+                facts = json.loads(reference)
+                facts["accepted_background_objective"] = accepted_objective
+                messages[0]["content"] = (
+                    prefix + " The host has accepted the requested background task. "
+                    "Briefly acknowledge this naturally; do not claim progress or results."
+                    + separator + json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
+                )
             body: dict[str, object] = {
                 "model": self._model,
                 "messages": messages,
@@ -446,7 +479,9 @@ class OllamaStreamingInference:
             )
             self._openings[turn_id] = opening
         try:
-            async with asyncio.timeout_at(deadline if handler is not None else None):
+            async with asyncio.timeout_at(
+                deadline if handler is not None or accepted_ack else None
+            ):
                 opened_response = await asyncio.shield(opening)
             async with self._state_lock:
                 if self._closed or turn_id in self._opening_cleanups:
@@ -485,7 +520,9 @@ class OllamaStreamingInference:
                     )
                     self._reads[turn_id] = read_operation
                 try:
-                    async with asyncio.timeout_at(deadline if handler is not None else None):
+                    async with asyncio.timeout_at(
+                        deadline if handler is not None or accepted_ack else None
+                    ):
                         raw_line = await asyncio.shield(read_operation)
                 finally:
                     if read_operation.done():

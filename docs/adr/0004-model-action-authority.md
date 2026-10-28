@@ -95,6 +95,14 @@ Intake, including a successful automatic consume, is not a started acknowledgmen
 Automatic consumption is labelled `automatic_consumed`, never human confirmation.
 The remaining interaction contract in this section applies to `confirm` mode.
 
+After an automatic start receives a validated accepted acknowledgment and remains
+active, the current foreground turn may ask the model for a brief natural
+acknowledgment. That continuation receives a typed accepted-task fact alongside
+conversation context and no tools; it cannot start or cancel work. A rejected or uncertain dispatch grants no
+such continuation. A newer user turn interrupts the response without cancelling
+the independently owned task. The model's wording remains a semantic limitation;
+the typed fact establishes acceptance, not later progress or result accuracy.
+
 The host owns one immutable pending proposal ahead of the existing
 [work surface](../../src/hermes_realtime/conversation/work_tools.py), separate
 from dispatched tasks and its acknowledgment-waiting `_PendingStart`. The

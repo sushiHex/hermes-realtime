@@ -8,7 +8,7 @@ from hermes_realtime.conversation.task_proposals import (
     ConversationTaskProposals,
     HostTaskProposalRequest,
 )
-from hermes_realtime.conversation.work_tools import WorkCommandAdmission
+from hermes_realtime.conversation.work_tools import WorkCommandAdmission, WorkStartResult
 
 
 class TextSubclass(str):
@@ -24,6 +24,10 @@ class Surface:
     async def submit_start_command(self, *, objective: str, invocation_id: str):
         self.calls.append((objective, invocation_id))
         return WorkCommandAdmission.ADMITTED
+
+    async def start_work(self, *, objective: str, invocation_id: str):
+        self.calls.append((objective, invocation_id))
+        return WorkStartResult(accepted=False, state="rejected", reason="synthetic refusal")
 
 
 def owner():

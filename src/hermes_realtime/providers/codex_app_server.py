@@ -25,7 +25,10 @@ from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 from hermes_realtime import __version__
 from hermes_realtime.conversation.context import ConversationContextSnapshot
 from hermes_realtime.conversation.output_style import communication_policy, require_output_style
-from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.streaming import (
+    AcceptedStartInferenceRequest,
+    ConversationInferenceRequest,
+)
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
     HostTaskProposalRequest,
@@ -985,6 +988,19 @@ class CodexAppServerStreamingInference:
         turn_id: str,
     ) -> AsyncIterator[str | HostSpeechRequest | HostTaskProposalRequest]:
         style = require_output_style(self._output_style())
+        accepted_ack = type(snapshot) is AcceptedStartInferenceRequest
+        accepted_objective: str | None = None
+        if accepted_ack:
+            validated_ack = AcceptedStartInferenceRequest(
+                revision=snapshot.revision, messages=snapshot.messages,
+                active_tasks=snapshot.active_tasks,
+                terminal_task_count=snapshot.terminal_task_count, memory=snapshot.memory,
+                task_id=cast(AcceptedStartInferenceRequest, snapshot).task_id,
+            )
+            accepted_objective = next(
+                task.objective for task in validated_ack.active_tasks
+                if task.task_id == validated_ack.task_id
+            )
         admitted_user_turn = type(snapshot) is ConversationInferenceRequest
         snapshot = self._trusted_snapshot(snapshot)
         self._validate_turn_id(turn_id)
@@ -994,6 +1010,8 @@ class CodexAppServerStreamingInference:
                 (message.text for message in reversed(snapshot.messages) if message.role == "user"),
                 None,
             )
+            if accepted_ack:
+                latest_user = None
             freshness_context: str | None = None
             bounded_lookup_failed = False
             lookup_attempted = False
@@ -1113,8 +1131,11 @@ class CodexAppServerStreamingInference:
                 handler is not None and admitted_user_turn
                 and current_user_turn and not private_turn
             )
-            if not current_user_turn or private_turn or lookup_attempted:
+            if accepted_ack or not current_user_turn or private_turn or lookup_attempted:
                 tool_handler = None
+            if accepted_ack:
+                search_available = False
+                status_available = False
             if bounded_lookup_failed:
                 knowledge_policy += (
                     "The bounded lookup reached its limit. Do not escalate this factual lookup "
@@ -1131,6 +1152,11 @@ class CodexAppServerStreamingInference:
                     + "Respond only to the supplied conversation snapshot."
                 )
                 dynamic_tools: list[dict[str, object]] = []
+                if accepted_ack:
+                    base_instructions += (
+                        " The host has accepted the requested background task. "
+                        "Briefly acknowledge this naturally; do not claim progress or results."
+                    )
             else:
                 if not search_available:
                     tool_policy = "Use only the supplied work-management tools. "
@@ -1240,7 +1266,8 @@ class CodexAppServerStreamingInference:
                             "input": [
                                 {
                                     "type": "text",
-                                    "text": self._prompt(snapshot, local_now=local_now),
+                                    "text": self._prompt(snapshot, local_now=local_now,
+                                                         accepted_objective=accepted_objective),
                                 }
                             ],
                             "effort": self._effort,
@@ -1307,6 +1334,7 @@ class CodexAppServerStreamingInference:
                                 segment,
                                 thread_id=server_thread_id,
                                 turn_id=server_turn_id,
+                                accepted_ack=accepted_ack,
                             )
                             self._require_verified_lookup_claim(
                                 segment,
@@ -1351,6 +1379,7 @@ class CodexAppServerStreamingInference:
                         segment,
                         thread_id=server_thread_id,
                         turn_id=server_turn_id,
+                        accepted_ack=accepted_ack,
                     )
                     self._require_verified_lookup_claim(
                         segment,
@@ -1432,9 +1461,11 @@ class CodexAppServerStreamingInference:
         *,
         thread_id: str,
         turn_id: str,
+        accepted_ack: bool = False,
     ) -> None:
         if (
             self._work_tool_handler is None
+            or accepted_ack
             or not has_background_work_claim(segment)
         ):
             return
@@ -3098,6 +3129,7 @@ class CodexAppServerStreamingInference:
         snapshot: ConversationInferenceRequest,
         *,
         local_now: datetime | None = None,
+        accepted_objective: str | None = None,
     ) -> str:
         payload: dict[str, object] = {
             "revision": snapshot.revision,
@@ -3119,6 +3151,8 @@ class CodexAppServerStreamingInference:
                 for update in snapshot.updates
             ],
         }
+        if accepted_objective is not None:
+            payload["accepted_background_objective"] = accepted_objective
         host_indices = [index for index, message in enumerate(snapshot.messages)
                         if message.source in {"host_task_status", "host_task_proposal"}]
         if host_indices:

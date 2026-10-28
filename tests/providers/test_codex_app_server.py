@@ -28,6 +28,7 @@ from hermes_realtime.conversation.output_style import (
     communication_policy,
 )
 from hermes_realtime.conversation.streaming import (
+    AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ConversationPromptUpdate,
 )
@@ -62,6 +63,52 @@ _CONTEXT_CASES = json.loads(
     (Path(__file__).parents[1] / "fixtures" / "natural_work_context_contract_cases.json")
     .read_text(encoding="utf-8")
 )["cases"]
+
+
+@pytest.mark.asyncio
+async def test_accepted_start_continuation_is_tool_free_and_claim_is_scoped():
+    transport = FakeCodexTransport(assistant_delta="I've started the investigation.")
+    handler = FakeWorkToolHandler()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(handler)
+    snapshot = AcceptedStartInferenceRequest(
+        revision=1, messages=(ConversationMessage("user", "Inspect the release."),),
+        active_tasks=(ActiveTaskSummary("task_public", "Inspect the release."),),
+        task_id="task_public",
+    )
+    try:
+        parts = [part async for part in inference.stream(snapshot, turn_id="turn_ack")]
+        assert " ".join(parts) == "I've started the investigation."
+        thread = next(row for row in transport.sent if row.get("method") == "thread/start")
+        assert thread["params"]["dynamicTools"] == []
+        assert "host has accepted" in thread["params"]["baseInstructions"]
+        assert handler.starts == []
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_accepted_start_subclass_does_not_authorize_started_claim():
+    class ForgedAcknowledgment(AcceptedStartInferenceRequest):
+        pass
+
+    transport = FakeCodexTransport(assistant_delta="I've started the investigation.")
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    snapshot = ForgedAcknowledgment(
+        revision=1, messages=(ConversationMessage("user", "Inspect the release."),),
+        active_tasks=(ActiveTaskSummary("task_public", "Inspect the release."),),
+        task_id="task_public",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unverified background-work claim"):
+            [part async for part in inference.stream(snapshot, turn_id="turn_forged_ack")]
+    finally:
+        await inference.close()
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)

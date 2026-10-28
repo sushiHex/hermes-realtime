@@ -58,6 +58,7 @@ from .task_proposals import ConversationTaskProposals, HostTaskProposalRequest, 
 from .task_status import HostSpeechRequest, TaskStatusSnapshot
 from .tasks import TaskTerminalOutcome
 from .updates import UpdateDecision, UpdateDecisionKind
+from .work_tools import _validate_task_id
 
 _MAX_SEGMENT_CHARS_LIMIT = 65_536
 _MAX_SEGMENTS_LIMIT = 4096
@@ -263,6 +264,21 @@ class ConversationInferenceRequest(ConversationContextSnapshot):
             terminal_task_count=self.terminal_task_count,
             memory=self.memory,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedStartInferenceRequest(ConversationContextSnapshot):
+    """A dedicated tool-free response for an already accepted active task."""
+
+    task_id: str = ""
+
+    def __post_init__(self) -> None:
+        ConversationContextSnapshot.__post_init__(self)
+        _validate_task_id(self.task_id)
+        if sum(
+            task.task_id == self.task_id for task in self.active_tasks
+        ) != 1:
+            raise ValueError("accepted start must match one active task")
 
 
 @runtime_checkable
@@ -997,7 +1013,49 @@ class StreamingSpeechLoop:
                 )
                 if automatic_proposal is not None and lease.is_current:
                     assert self._task_proposals is not None
-                    await self._task_proposals.submit(automatic_proposal)
+                    accepted = await self._task_proposals.submit_for_ack(automatic_proposal)
+                    if (accepted is not None and accepted.accepted and accepted.state == "active"
+                            and accepted.task_id is not None and lease.is_current):
+                        current = self._context.snapshot()
+                        accepted_tasks = tuple(
+                            task for task in current.active_tasks
+                            if task.task_id == accepted.task_id
+                        )
+                        if len(accepted_tasks) == 1:
+                            acknowledged = AcceptedStartInferenceRequest(
+                                revision=current.revision, messages=current.messages,
+                                active_tasks=accepted_tasks,
+                                terminal_task_count=current.terminal_task_count,
+                                memory=current.memory, task_id=accepted.task_id,
+                            )
+                            continuation = self._inference.stream(acknowledged, turn_id=turn_id)
+                            continuation_error: BaseException | None = None
+                            continuation_close_error: BaseException | None = None
+                            try:
+                                async for segment in continuation:
+                                    if not any(
+                                        task.task_id == accepted.task_id
+                                        for task in self._context.snapshot().active_tasks
+                                    ):
+                                        break
+                                    if type(segment) is not str or not segment.strip():
+                                        raise TypeError("acknowledgment must be nonblank text")
+                                    segment_count += 1
+                                    if (segment_count > self._max_segments
+                                            or len(segment) > self._max_segment_chars):
+                                        raise ValueError("acknowledgment capacity exceeded")
+                                    if not await lease.publish(segment, on_admit=admit_generated):
+                                        break
+                            except BaseException as error:
+                                if not isinstance(error, asyncio.CancelledError):
+                                    lease.invalidate_publications()
+                                continuation_error = error
+                            finally:
+                                continuation_close_error = await self._close_stream(continuation)
+                            self._raise_iteration_or_close_error(
+                                "acknowledgment iteration and close failed",
+                                continuation_error, continuation_close_error,
+                            )
             except asyncio.CancelledError:
                 producer_result.cancel()
                 raise

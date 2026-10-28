@@ -13,7 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .work_tools import WorkCommandAdmission, _validate_exact_text
+from .work_tools import (
+    _UNAVAILABLE_REASON,
+    WorkCommandAdmission,
+    WorkStartResult,
+    _validate_exact_text,
+)
 
 _AFFIRMATIVES = frozenset({"yes", "yeah", "yep", "sure", "okay", "go ahead", "do it", "please do"})
 _PublicValue = str | int | bool | None
@@ -61,6 +66,8 @@ class _Surface(Protocol):
         objective: str,
         invocation_id: str,
     ) -> WorkCommandAdmission: ...
+
+    async def start_work(self, *, objective: str, invocation_id: str) -> WorkStartResult: ...
 
 
 class ConversationTaskProposals:
@@ -233,6 +240,7 @@ class ConversationTaskProposals:
             return self.offer(request)
         proposal = self._offer(request, visible=False)
         admission = await self._consume(proposal, decision=None)
+        assert isinstance(admission, WorkCommandAdmission)
         if admission is WorkCommandAdmission.UNAVAILABLE:
             try:
                 self._observer("task_state", {
@@ -243,6 +251,23 @@ class ConversationTaskProposals:
             finally:
                 self._evidence("automatic_unavailable")
         return None
+
+    async def submit_for_ack(self, request: HostTaskProposalRequest) -> WorkStartResult | None:
+        """Wait for the independently owned dispatch, not merely command intake."""
+        if not self.automatic_start:
+            raise RuntimeError("automatic start policy required")
+        proposal = self._offer(request, visible=False)
+        result = await self._consume(proposal, decision=None, wait_for_ack=True)
+        if isinstance(result, WorkCommandAdmission):
+            return None
+        if not result.accepted and result.task_id is None and result.reason == _UNAVAILABLE_REASON:
+            try:
+                self._observer("task_state", {"status": "rejected", "taskId": None,
+                    "reason": "Task control is unavailable. "
+                    "Restart the session before trying again."})
+            finally:
+                self._evidence("automatic_unavailable")
+        return result
 
     def offer(self, request: HostTaskProposalRequest) -> TaskProposal:
         return self._offer(request, visible=True)
@@ -305,14 +330,16 @@ class ConversationTaskProposals:
             ):
                 return WorkCommandAdmission.REFUSED
             category = None
-            return await self._consume(proposal, decision=decision)
+            result = await self._consume(proposal, decision=decision)
+            assert isinstance(result, WorkCommandAdmission)
+            return result
         finally:
             if category is not None:
                 self._evidence(category)
 
     async def _consume(
-        self, proposal: TaskProposal, *, decision: str | None,
-    ) -> WorkCommandAdmission:
+        self, proposal: TaskProposal, *, decision: str | None, wait_for_ack: bool = False,
+    ) -> WorkCommandAdmission | WorkStartResult:
         category = "expired"
         try:
             # Both callers synchronously validated/created this exact pending binding.
@@ -332,6 +359,15 @@ class ConversationTaskProposals:
             if decision == "decline":
                 return WorkCommandAdmission.REFUSED
             # Intake is never a started claim; existing admission owns the accepted ack.
+            if wait_for_ack:
+                if decision is not None:
+                    raise ValueError("acknowledgment applies only to automatic starts")
+                result = await self._surface.start_work(
+                    objective=proposal.objective, invocation_id="automatic_" + proposal.proposal_id,
+                )
+                if type(result) is not WorkStartResult:
+                    raise TypeError("work start result must be exact")
+                return result
             return await self._surface.submit_start_command(
                 objective=proposal.objective,
                 invocation_id=("automatic_" if decision is None else "confirmed_")
