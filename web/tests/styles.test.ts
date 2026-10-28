@@ -74,6 +74,7 @@ describe("desktop viewport containment", () => {
 
     const shell = declarations(".app-shell");
     expect(shell).toContain("display: grid");
+    expect(shell).toContain("grid-template-columns: minmax(0, 1fr)");
     expect(shell).toContain("height: 100dvh");
     expect(shell).toContain("grid-template-rows: auto auto minmax(0, 1fr)");
 

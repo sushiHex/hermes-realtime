@@ -694,7 +694,7 @@ function projectTaskStateCard(event: PublicEvent): void {
           notice = document.createElement("span");
           notice.className = "history-capacity-notice";
           notice.setAttribute("role", "status");
-          transcript.closest(".conversation-panel")?.querySelector(".panel-header")?.append(notice);
+          typedForm.prepend(notice);
         }
         notice.textContent = "Active task display capacity reached. Reconnect to refresh task state.";
         return;
