@@ -29,13 +29,15 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
 )
 # Offered whenever the provider advertises a work proposal tool.
 WORK_ROUTING_POLICY = (
+    "Start or retry work only when the latest user turn requests it. "
+    "A social acknowledgment, status question, or prior failure alone does not request a retry. "
     "Only the user's own request counts. Never propose work for reported, hypothetical, "
     "quoted, or negated requests. For unresolved references (our, the pinned, that one), "
     "ask a clarifying question in an ordinary reply before proposing work; objectives never "
     "hold questions. "
-    "For cancellation or approval requests, give an ordinary truthful reply directing the user "
-    "to the existing explicit controls; do not select task_status or propose new work for those "
-    "requests. If supplied evidence or an available foreground lookup can answer the question, "
+    "For cancellation or approval, direct the user to the controls; "
+    "do not select task_status or propose work. "
+    "If supplied evidence or an available foreground lookup can answer the question, "
     "use it and reply. Otherwise, propose work when the current request needs current external "
     "information, background research, tools, inspection, commands, builds, changes, audits, "
     "verification, or a multi-step briefing. Do not require explicit background-task wording "

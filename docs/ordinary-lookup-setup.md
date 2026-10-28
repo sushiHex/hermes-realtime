@@ -10,6 +10,11 @@ not a provider-controlled choice or evidence of objective fidelity. See
 [ADR 0004](adr/0004-model-action-authority.md).
 The equivalent host CLI flags are `--natural-work-tools --task-start-policy automatic`.
 
+Routing guidance requires a new work request or explicit retry in the latest user
+turn. A social acknowledgment, status question, or earlier failure alone does not
+authorize another task. This is model-directed intent selection, not a deterministic
+semantic guarantee; the host's existing admission and cancellation boundaries remain.
+
 This is the explicit, disabled-by-default backend configuration delivered by
 [#301](https://github.com/sushiHex/hermes-realtime/pull/301), not a foreground
 model nomination or natural-routing activation. It extends the isolation and

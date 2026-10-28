@@ -101,6 +101,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   const task = (taskId: string | null, status: string, reason?: string) => event("task_state", { taskId, status, ...(reason === undefined ? {} : { reason }) });
+  const taskResult = (taskId: string, text: string) => event("task_result", { status: "completed", taskId, text });
   const taskBatch = async (ids: string[]) => {
     await vi.waitFor(() => expect(emit).not.toBeNull());
     const dispatch = emit!;
@@ -136,7 +137,7 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
       dispatch([{}]);
     }
   };
-  return { requests, approvals, approval, task, taskBatch, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
+  return { requests, approvals, approval, task, taskResult, taskBatch, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -146,6 +147,25 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it("renders a compact task row and removes cancellation controls after settlement", async () => {
+    const { task, taskResult, card } = await mount();
+    await task("task_fixture", "active");
+    const running = card();
+    expect(running.querySelector("strong")?.textContent).toBe("Background task");
+    expect(running.querySelector(".operation-title")).toBeNull();
+    expect(running.querySelector(".operation-meta")).toBeNull();
+    expect(running.querySelectorAll(".operation-detail")).toHaveLength(1);
+    expect(running.querySelector("button")?.hidden).toBe(false);
+
+    await task("task_fixture", "completed");
+    await taskResult("task_fixture", "Synthetic retained result");
+    const settled = card();
+    expect(settled.querySelector<HTMLElement>(".task-card-controls")?.hidden).toBe(true);
+    expect(settled.textContent).toContain("Completed in 0:02");
+    expect(settled.querySelector<HTMLDetailsElement>("details.task-result")?.open).toBe(false);
+    expect(settled.querySelector(".task-result summary")?.textContent).toBe("Task result");
+  });
+
   it("keeps the active-task display capacity warning visible above the composer", async () => {
     const { task, taskBatch } = await mount();
     await taskBatch(Array.from({ length: 256 }, (_, index) => `task_capacity_${index}`));
@@ -400,11 +420,11 @@ describe("mounted task controls", () => {
     await vi.waitFor(() => expect(cancel().disabled).toBe(false));
   });
 
-  it.each(["cancelling", "completed", "interrupted", "failed"])("disables cancellation for %s work", async (status) => {
-    const { requests, task, cancel } = await mount();
+  it.each(["cancelling", "completed", "interrupted", "failed"])("hides cancellation for %s work", async (status) => {
+    const { requests, task, cancel, card } = await mount();
     await task("task_fixture", "active");
     await task("task_fixture", status);
-    expect(cancel().disabled).toBe(true);
+    expect(card().querySelector(".task-card-controls")?.hasAttribute("hidden")).toBe(true);
     cancel().click();
     expect(requests).toEqual([]);
   });
@@ -570,6 +590,6 @@ describe("mounted task controls", () => {
     await task("task_fixture", status);
     await task("task_fixture", "rejected", "task is not active");
     expect(card().dataset.status).toBe(status);
-    expect(cancel().disabled).toBe(true);
+    expect(card().querySelector(".task-card-controls")?.hasAttribute("hidden")).toBe(true);
   });
 });

@@ -83,16 +83,6 @@ export function taskStatusPresentation(status: string, elapsedMs: number): strin
   throw new TypeError("task status is unsupported");
 }
 
-export function taskMetaPresentation(status: string): string {
-  if (status === "active") return "You can keep talking while this runs.";
-  if (status === "cancelling") return "Stopping the task now.";
-  if (status === "completed") return "Background work finished.";
-  if (status === "failed") return "Background work failed.";
-  if (status === "interrupted") return "Background work stopped.";
-  if (status === "rejected") return "Background work was not started.";
-  throw new TypeError("task status is unsupported");
-}
-
 export type SessionModelPresentationRow = readonly [label: string, value: string];
 
 export interface MarkdownEmphasisRun {

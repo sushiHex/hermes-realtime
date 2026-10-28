@@ -13,10 +13,12 @@ def assert_aligned_work_routing(instructions: str, *, task_status_available: boo
     assert instructions.count(selected) == 1
     assert absent not in instructions
     for clause in (
+        "Start or retry work only when the latest user turn requests it",
+        "A social acknowledgment, status question, or prior failure alone does not request a retry",
         "Only the user's own request counts",
         "reported, hypothetical, quoted, or negated requests",
-        "For cancellation or approval requests, give an ordinary truthful reply",
-        "do not select task_status or propose new work for those requests",
+        "For cancellation or approval, direct the user to the controls",
+        "do not select task_status or propose work",
         "supplied evidence or an available foreground lookup can answer",
         "Otherwise, propose work when the current request needs current external information",
         "ask a clarifying question in an ordinary reply before proposing work",
