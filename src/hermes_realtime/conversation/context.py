@@ -68,9 +68,7 @@ def validate_speech_source(source: str, *, role: str = "assistant") -> None:
     """Validate internal provenance before publication or confirmation consumption."""
     category = None
     if type(source) is not str or source not in (
-        "conversation",
-        "host_task_status",
-        "host_task_proposal",
+        "conversation", "host_task_status", "host_task_proposal",
     ):
         category = "unsupported_source"
     elif source != "conversation" and role != "assistant":
@@ -79,10 +77,8 @@ def validate_speech_source(source: str, *, role: str = "assistant") -> None:
         try:
             raise ValueError("conversation source is invalid")
         finally:
-            print(
-                "[speech-source] " + json.dumps({"category": category}, separators=(",", ":")),
-                flush=True,
-            )
+            print("[speech-source] " + json.dumps({"category": category},
+                  separators=(",", ":")), flush=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +372,9 @@ class ConversationContextStore:
             tuple[AssistantTextAdmission, str, AssistantSegmentKey, str | None],
         ] = {}
         # The only heard row that a later chunk of the same segment may replace.
-        self._open_assistant_segment: tuple[AssistantSegmentKey, ConversationMessage] | None = None
+        self._open_assistant_segment: tuple[AssistantSegmentKey, ConversationMessage] | None = (
+            None
+        )
         # Rows evicted from the front: the number of the oldest retained row.
         self._evicted = 0
         self._revision = 0
@@ -487,9 +485,7 @@ class ConversationContextStore:
         del self._assistant_admissions_by_object_id[id(admission)]
         if heard_text is not None:
             message = ConversationMessage(
-                role=ConversationRole.ASSISTANT.value,
-                text=heard_text,
-                source=source,
+                role=ConversationRole.ASSISTANT.value, text=heard_text, source=source,
             )
             if replaces_open_row:
                 self._window_chars += len(message.text) - len(self._messages[-1].text)
@@ -854,7 +850,8 @@ class ConversationContextStore:
     def _evict_to_budget(self) -> None:
         # The newest row alone always fits: it holds at most half the window.
         while (
-            len(self._messages) > self._max_messages or self._window_chars > self._max_window_chars
+            len(self._messages) > self._max_messages
+            or self._window_chars > self._max_window_chars
         ):
             self._window_chars -= len(self._messages.popleft().text)
             self._evicted += 1
