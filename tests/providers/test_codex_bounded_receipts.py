@@ -435,7 +435,7 @@ async def test_failed_receipt_preserves_exact_proposal_without_start_authority(
         assert routing.proposal == proposal
         assert call.response is not None
         assert json.loads(call.response["contentItems"][0]["text"]) == {  # type: ignore[index]
-            "proposed": True, "requires_confirmation": True,
+            "proposed": True, "host_applies_start_policy": True,
         }
         assert len([row for row in transport.sent if row.get("id") == _RESULT_ID]) == 1
         markers = [

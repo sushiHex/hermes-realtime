@@ -411,7 +411,7 @@ class ToolCallingCodexTransport:
         response: dict[str, object],
     ) -> None:
         payload = _tool_payload(response)
-        if payload == {"proposed": True, "requires_confirmation": True}:
+        if payload == {"proposed": True, "host_applies_start_policy": True}:
             delta = "Please confirm the proposed task."
         elif payload["state"] == "cancelling":
             delta = "I requested cancellation."
@@ -833,7 +833,7 @@ def _assert_model_visible_values_are_private_token_free(*values: object) -> None
             pending.extend(getattr(value, name) for name in value.__dataclass_fields__)
 
 
-_PROPOSAL_RECEIPT = {"proposed": True, "requires_confirmation": True}
+_PROPOSAL_RECEIPT = {"proposed": True, "host_applies_start_policy": True}
 _UNCERTAIN_REASON = (
     "Task command acknowledgment is uncertain. Check task status before trying again."
 )

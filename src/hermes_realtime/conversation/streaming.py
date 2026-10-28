@@ -923,6 +923,7 @@ class StreamingSpeechLoop:
                     )
                 segment_count = 0
                 host_item_seen = False
+                automatic_proposal: HostTaskProposalRequest | None = None
                 iteration_error: BaseException | None = None
                 try:
                     async for segment in inference:
@@ -937,6 +938,9 @@ class StreamingSpeechLoop:
                             host_item_seen = True
                             source = "host_task_proposal"
                             assert self._task_proposals is not None
+                            if self._task_proposals.automatic_start:
+                                automatic_proposal = segment
+                                continue
                             proposal = self._task_proposals.offer(segment)
                             proposal_readback.append(proposal)
                             segment = proposal.readback
@@ -991,6 +995,9 @@ class StreamingSpeechLoop:
                     iteration_error,
                     close_error,
                 )
+                if automatic_proposal is not None and lease.is_current:
+                    assert self._task_proposals is not None
+                    await self._task_proposals.submit(automatic_proposal)
             except asyncio.CancelledError:
                 producer_result.cancel()
                 raise

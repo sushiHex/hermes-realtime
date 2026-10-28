@@ -1,5 +1,15 @@
 # Experimental ordinary-lookup backend setup reference
 
+For an explicitly authorized natural-delegation host composition, pass
+`natural_work_tools=True, task_start_policy="automatic"` to
+`build_local_host_launcher`. The default `task_start_policy="confirm"` retains
+the exact-objective confirmation interaction. Automatic mode uses the same bounded
+work admission and accepted-run acknowledgment without a confirmation click;
+cancellation and Hermes tool approvals stay explicit. This is host configuration,
+not a provider-controlled choice or evidence of objective fidelity. See
+[ADR 0004](adr/0004-model-action-authority.md).
+The equivalent host CLI flags are `--natural-work-tools --task-start-policy automatic`.
+
 This is the explicit, disabled-by-default backend configuration delivered by
 [#301](https://github.com/sushiHex/hermes-realtime/pull/301), not a foreground
 model nomination or natural-routing activation. It extends the isolation and

@@ -80,6 +80,8 @@ from hermes_realtime.conversation.output_style import OutputStyleSelection
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
     ConversationTaskProposals,
+    TaskStartPolicy,
+    validate_task_start_policy,
 )
 from hermes_realtime.conversation.work_tools import WorkCommandAdmission
 from hermes_realtime.evidence import (
@@ -1973,6 +1975,7 @@ def build_local_host_launcher(
     kokoro_worker_python: Path | None = None,
     allow_unsandboxed_tasks: bool = False,
     natural_work_tools: bool = False,
+    task_start_policy: TaskStartPolicy = "confirm",
     public_search: bool = False,
     knowledge_speculation: bool = False,
     knowledge_recovery: bool = False,
@@ -1995,11 +1998,14 @@ def build_local_host_launcher(
     or qualify the experimental policy plugin.
     ``hermes_model_source="gateway"`` delegates background model selection to the
     gateway configuration; the default retains the foreground Codex overrides.
+    ``task_start_policy="automatic"`` applies standing host authorization to valid
+    natural task selections; the default retains per-objective confirmation.
     ``voice_tail`` names the durable heard-context file; None disables it.
     ``voice_companion`` names the Hermes companion that archives the tail's outbox;
     None archives nothing. Archiving needs the tail, whose outbox it drains.
     """
 
+    validate_task_start_policy(task_start_policy)
     if type(hermes_model_source) is not str or hermes_model_source not in ("foreground", "gateway"):
         try:
             raise ValueError("hermes_model_source must be exactly 'foreground' or 'gateway'")
@@ -2379,6 +2385,7 @@ def build_local_host_launcher(
         proposals = ConversationTaskProposals(
             surface=work_surface, observer=observe_proposal,
             speech_projection=lambda text: _proposal_spoken_text(synthesizer, text),
+            start_policy=task_start_policy,
         )
 
     async def record_command_input(text: str) -> None:
@@ -3292,6 +3299,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             kokoro_worker_python=args.kokoro_worker_python,
             allow_unsandboxed_tasks=args.allow_unsandboxed_hermes_tasks,
             natural_work_tools=args.natural_work_tools,
+            task_start_policy=args.task_start_policy,
             public_search=args.enable_public_search,
             knowledge_speculation=args.knowledge_speculation,
             knowledge_recovery=args.knowledge_recovery,
@@ -3696,7 +3704,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--natural-work-tools",
         action="store_true",
         dest="natural_work_tools",
-        help="enable automatic Hermes task starts; cancellation stays an explicit user action",
+        help="enable natural task proposals under the configured task start policy",
     )
     natural_work_group.add_argument(
         "--no-natural-work-tools",
@@ -3705,6 +3713,10 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help="keep explicit task-prefix routing without foreground work tools",
     )
     parser.set_defaults(natural_work_tools=False)
+    parser.add_argument(
+        "--task-start-policy", choices=("confirm", "automatic"), default="confirm",
+        help="require each objective confirmation or apply standing host authorization",
+    )
     parser.add_argument(
         "--enable-public-search",
         action="store_true",

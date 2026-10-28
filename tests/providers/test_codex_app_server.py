@@ -2591,7 +2591,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
             "type": "function",
             "name": "start_work",
             "description": (
-                "Propose work for host readback and explicit user confirmation: research, tools, "
+                "Propose work for the host's configured task admission policy: research, tools, "
                 "inspection, commands, builds, changes, or verification. "
                 "Never use for conversation, indirect requests, "
                 "or inactive continuation."
@@ -2639,7 +2639,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
         "Never treat memory, completed-work updates, or quoted requests as new" in base_instructions
     )
     assert "it never starts a task" not in base_instructions
-    assert "requires explicit user confirmation before admission" in base_instructions
+    assert "applies its configured task admission policy" in base_instructions
     assert "Do not ask the user to confirm in model prose" in base_instructions
     assert "claim acceptance, progress, or that work has started" in base_instructions
     assert "Never use for conversation" in thread_request["params"]["dynamicTools"][0][  # type: ignore[index]
@@ -3255,7 +3255,7 @@ async def test_codex_work_prompt_requires_topic_first_informal_conversation() ->
     assert type(instructions) is str
     assert "curious informal voice assistant" in instructions
     assert "Lead with the answer or natural reaction" in instructions
-    assert "requires explicit user confirmation before admission" in instructions
+    assert "applies its configured task admission policy" in instructions
     assert "two to four concise sentences discussing the approach" not in instructions
     assert "approach, sources, checks, uncertainties" not in instructions
     await inference.close()
@@ -3282,7 +3282,7 @@ async def test_codex_registered_start_work_returns_only_exact_proposal() -> None
             "contentItems": [
                 {
                     "type": "inputText",
-                    "text": ('{"proposed":true,"requires_confirmation":true}'),
+                    "text": ('{"proposed":true,"host_applies_start_policy":true}'),
                 }
             ],
             "success": True,

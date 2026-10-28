@@ -517,6 +517,8 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
             "a" * 64,
             "--ollama-base-url",
             "http://127.0.0.1:11437",
+            "--task-start-policy",
+            "automatic",
         ]
     )
     captured: dict[str, object] = {}
@@ -568,6 +570,7 @@ async def test_qualification_child_never_reads_hermes_credentials_before_no_task
     assert captured["private_no_tasks"] is True
     assert captured["closed"] is True
     assert captured["ollama_base_url"] == "http://127.0.0.1:11437"
+    assert captured["task_start_policy"] == "automatic"
 
 
 def test_evidence_database_path_uses_only_custom_or_localappdata_root() -> None:
@@ -1028,6 +1031,14 @@ def test_host_cli_natural_work_tools_are_explicit_and_reversibly_disabled() -> N
     assert parser.parse_args(["--no-natural-work-tools"]).natural_work_tools is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--natural-work-tools", "--no-natural-work-tools"])
+
+
+def test_host_cli_task_start_policy_is_explicit_and_rejects_unknown():
+    parser = _build_argument_parser()
+    assert parser.parse_args([]).task_start_policy == "confirm"
+    assert parser.parse_args(["--task-start-policy", "automatic"]).task_start_policy == "automatic"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--task-start-policy", "auto"])
 
 
 def test_host_cli_natural_duplex_profile_preserves_provider_sentence_units() -> None:
