@@ -18,7 +18,10 @@ from hermes_realtime.conversation.context import (
     ConversationContextStore,
     ConversationMessage,
 )
-from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.streaming import (
+    AcceptedStartInferenceRequest,
+    ConversationInferenceRequest,
+)
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
@@ -133,6 +136,26 @@ def adapter(lines: list[dict[str, object]], **options: object
 async def collect(inference: ollama.OllamaStreamingInference,
                   snapshot: ConversationContextSnapshot | None = None) -> list[str]:
     return [part async for part in inference.stream(snapshot or request(), turn_id="turn_test")]
+
+
+@pytest.mark.asyncio
+async def test_accepted_start_continuation_omits_work_schema_and_tools():
+    inference, handler, sent, _ = adapter([
+        {"message": {"content": "I've started the work."}, "done": True},
+    ])
+    snapshot = AcceptedStartInferenceRequest(
+        revision=1, messages=(ConversationMessage("user", "Inspect release."),),
+        active_tasks=(ActiveTaskSummary("task_test", "Inspect release."),), task_id="task_test",
+    )
+    try:
+        assert await collect(inference, snapshot) == ["I've started the work."]
+        assert "format" not in sent[0] and "tools" not in sent[0]
+        assert "host has accepted" in sent[0]["messages"][0]["content"]
+        reference = sent[0]["messages"][0]["content"].split("\n\nReference data:\n", 1)[1]
+        assert json.loads(reference)["accepted_background_objective"] == "Inspect release."
+        assert handler.calls == []
+    finally:
+        await inference.close()
 
 
 @pytest.mark.asyncio

@@ -10,12 +10,158 @@ import os
 import subprocess
 import sys
 import threading
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).parent
 INSTALL: Path = ROOT
+
+_DIAGNOSTIC_ENUMS = {
+    "category": {"refused", "presented"},
+    "stage": {
+        "native-response", "source", "retrieval", "catalog", "route", "worker-loop",
+        "provider", "response-envelope", "json", "fields", "content", "source-selection",
+        "source-id-type", "source-id-range", "source-id-unique", "inline-links",
+        "terminal-contract", "publication", "catalog-publication", "complete",
+    },
+    "rejection": {
+        "native-policy-error", "generation-unavailable", "budget-unavailable", "budget-replaced",
+        "batch-envelope", "call-envelope", "search-arguments", "url-membership", "batch-budget",
+        "call-json", "retrieval-required", "other",
+    },
+    "failure_kind": {
+        "ValueError", "RuntimeError", "JSONDecodeError", "TimeoutError", "CancelledError",
+        "APIConnectionError", "APITimeoutError", "APIStatusError", "BadRequestError",
+        "AuthenticationError", "PermissionDeniedError", "RateLimitError", "InternalServerError",
+        "other",
+    },
+}
+_DIAGNOSTIC_COUNTS = {
+    "calls", "wire_requests", "catalog_count", "selected_source_count", "rendered_detail_length",
+}
+_DIAGNOSTIC_FLAGS = {"local_http_settled"}
+for _prefix in ("source", "response"):
+    for _name in ("kind", "reasoning_content_kind", "reasoning_kind"):
+        _DIAGNOSTIC_ENUMS[f"{_prefix}_{_name}"] = {"string", "none", "other"}
+    _DIAGNOSTIC_ENUMS[f"{_prefix}_finish_reason"] = {
+        "stop", "length", "tool_calls", "content_filter", "function_call", "missing", "other",
+    }
+    _DIAGNOSTIC_COUNTS.update(f"{_prefix}_{name}" for name in (
+        "choices_count", "length", "reasoning_content_length", "reasoning_length",
+    ))
+    _DIAGNOSTIC_FLAGS.update(f"{_prefix}_{name}" for name in (
+        "tool_calls", "refusal", "parsed_present",
+    ))
+
+
+def _policy_diagnostic(value: Any) -> Any:
+    """Project fixed scalar facts, never arbitrary native output or exception text."""
+    if type(value) is not dict or not {"category", "stage"} <= value.keys():
+        raise ValueError("diagnostic_schema")
+    result = {}
+    for key, allowed in _DIAGNOSTIC_ENUMS.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if type(item) is not str:
+            raise ValueError("diagnostic_schema")
+        if item not in allowed:
+            if key not in {"failure_kind", "rejection"}:
+                raise ValueError("diagnostic_schema")
+            item = "other"
+        result[key] = item
+    for key in _DIAGNOSTIC_COUNTS & value.keys():
+        item = value[key]
+        if type(item) is not int or not 0 <= item <= 1000000000:
+            raise ValueError("diagnostic_schema")
+        result[key] = item
+    for key in _DIAGNOSTIC_FLAGS & value.keys():
+        if type(value[key]) is not bool:
+            raise ValueError("diagnostic_schema")
+        result[key] = value[key]
+    return result
+
+
+def _diagnostic_pairs(items: Any) -> Any:
+    value = dict(items)
+    if len(value) != len(items):
+        raise ValueError("diagnostic_duplicate_key")
+    return value
+
+
+class PolicyDiagnosticTee:
+    """Retain at most sixteen scalar native markers; delegate ordinary stream behavior."""
+
+    def __init__(self, delegate: Any, witness: Any, save: Any) -> None:
+        self._delegate, self._save = delegate, save
+        self._lock = threading.RLock()
+        self._lines = threading.local()
+        self._facts = {"version": 1, "events": [], "observed": 0, "invalid": 0,
+                       "oversized": 0, "truncated": 0, "saveFailures": 0}
+        witness["policyDiagnostics"] = self._facts
+
+    def __getattr__(self, name: Any) -> Any:
+        return getattr(self._delegate, name)
+
+    def _increment(self, key: str) -> None:
+        self._facts[key] = min(1000000, self._facts[key] + 1)
+
+    def _persist(self) -> None:
+        try:
+            self._save()
+        except Exception:
+            self._increment("saveFailures")
+
+    def _line(self, line: str) -> None:
+        prefix = "[lookup-presentation] "
+        if not line.startswith(prefix):
+            return
+        try:
+            event = _policy_diagnostic(json.loads(
+                line[len(prefix):], object_pairs_hook=_diagnostic_pairs,
+            ))
+        except (ValueError, TypeError, RecursionError):
+            self._increment("invalid")
+        else:
+            self._increment("observed")
+            if len(self._facts["events"]) < 16:
+                self._facts["events"].append(event)
+            else:
+                self._increment("truncated")
+        self._persist()
+
+    def write(self, text: str) -> Any:
+        with self._lock:
+            result = self._delegate.write(text)
+            if type(result) is not int or not 0 <= result <= len(text):
+                return result
+            pending = getattr(self._lines, "pending", "")
+            dropping = getattr(self._lines, "dropping", False)
+            start = 0
+            while start < result:
+                end = text.find("\n", start, result)
+                newline = end != -1
+                if not newline:
+                    end = result
+                if not dropping:
+                    if len(pending) + end - start > 8192:
+                        pending, dropping = "", True
+                        self._increment("oversized")
+                        self._persist()
+                    else:
+                        pending += text[start:end]
+                if newline:
+                    if not dropping:
+                        self._line(pending)
+                    pending, dropping = "", False
+                start = end + 1
+            self._lines.pending, self._lines.dropping = pending, dropping
+            return result
+
+    def flush(self) -> Any:
+        with self._lock:
+            return self._delegate.flush()
 
 
 def read_bounded_decoded_response(response: Any) -> Any:
@@ -381,8 +527,10 @@ def main() -> Any:
         ).hexdigest(),
         globalPopenUnchanged=subprocess.Popen is original,
     )
+    diagnostics = PolicyDiagnosticTee(sys.stdout, witness, save)
     save()
-    gateway_main()
+    with redirect_stdout(diagnostics):
+        gateway_main()
 
 
 if __name__ == "__main__":

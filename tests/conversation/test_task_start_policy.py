@@ -72,6 +72,7 @@ async def test_automatic_stream_reports_only_real_ack_after_one_silent_submissio
         ForegroundTurnCoordinator,
         StreamingSpeechLoop,
     )
+    from hermes_realtime.conversation.streaming import AcceptedStartInferenceRequest
     from hermes_realtime.speech import DeliveredSpeechLedger, Transcript
     from tests.conversation.test_proposal_speech import ProposalInference
     from tests.conversation.test_streaming import RecordingPlayback, SegmentSynthesizer
@@ -84,16 +85,25 @@ async def test_automatic_stream_reports_only_real_ack_after_one_silent_submissio
         start_policy="automatic")
     proposals.bind("participant", 1)
     synth = SegmentSynthesizer()
+    class Inference(ProposalInference):
+        async def stream(self, snapshot, *, turn_id):
+            if type(snapshot) is AcceptedStartInferenceRequest:
+                yield "The work is underway."
+            else:
+                yield HostTaskProposalRequest("Inspect **the exact** release")
     loop = StreamingSpeechLoop(context=context, foreground=ForegroundTurnCoordinator(),
-        inference=ProposalInference(), synthesizer=synth, playback=RecordingPlayback(),
+        inference=Inference(), synthesizer=synth, playback=RecordingPlayback(),
         ledger=DeliveredSpeechLedger(), task_proposals=proposals)
+    response = asyncio.create_task(
+        loop.respond("turn_auto", Transcript(text="Inspect release", final=True))
+    )
     try:
-        await loop.respond("turn_auto", Transcript(text="Inspect release", final=True))
         await controller.dispatch_started.wait()
         assert synth.texts == [] and events == [] and len(controller.dispatches) == 1
         assert context.snapshot().active_tasks == ()
     finally:
         gate.set()
+        await response
         await surface.close()
     expected = {"status": "active" if accepted else "rejected", "taskId": "task_release_check"}
     if not accepted:
@@ -123,3 +133,21 @@ async def test_automatic_unavailable_surface_projects_refusal_without_dispatch(h
             "reason": "Task control is unavailable. Restart the session before trying again."})]
     finally:
         await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_automatic_ack_wait_reports_unavailable_without_dispatch():
+    from tests.conversation.test_work_tools import _surface
+
+    surface, controller, events = _surface()
+    await surface.close()
+    proposals = ConversationTaskProposals(
+        surface=surface, observer=lambda kind, data: events.append((kind, data)),
+        start_policy="automatic",
+    )
+    proposals.bind("participant", 1)
+    result = await proposals.submit_for_ack(HostTaskProposalRequest("Inspect release"))
+    assert result is not None and result.accepted is False
+    assert controller.dispatches == []
+    assert events == [("task_state", {"status": "rejected", "taskId": None,
+        "reason": "Task control is unavailable. Restart the session before trying again."})]

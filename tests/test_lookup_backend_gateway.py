@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -143,3 +146,103 @@ def test_overflow_refusal_has_fixed_marker_and_preserves_private_cap(capsys):
     observed = marker(capsys.readouterr().out)
     assert observed["category"] == "denial_overflow" and observed["denialCount"] == 9
     assert len(state["transportDenials"]) == 8 and state["transportDenialsTruncated"]
+
+
+def test_policy_diagnostic_retains_only_closed_scalars_and_preserves_stdout():
+    module, state, delegate, saved = gateway(), witness(), io.StringIO(), []
+    tee = module.PolicyDiagnosticTee(delegate, state, lambda: saved.append(json.dumps(state)))
+    event = {"category": "refused", "stage": "response-envelope", "calls": 1,
+             "wire_requests": 1, "failure_kind": "ValueError", "response_kind": "none",
+             "response_length": 0, "response_finish_reason": "length",
+             "body": "synthetic-private-value", "source_sha256": "synthetic-private-value"}
+    raw = "synthetic-private-value\n[lookup-presentation] " + json.dumps(event) + "\n"
+    assert tee.write(raw) == len(raw)
+    tee.flush()
+    assert delegate.getvalue() == raw
+    diagnostic = state["policyDiagnostics"]
+    assert diagnostic["events"] == [{key: value for key, value in event.items()
+                                     if key not in {"body", "source_sha256"}}]
+    assert saved and all("synthetic-private-value" not in value for value in saved)
+
+
+@pytest.mark.parametrize("changes", [
+    {"stage": "synthetic-private-value"}, {"calls": True}, {"calls": 1.5},
+    {"calls": -1}, {"calls": 1000000001}, {"response_refusal": "synthetic-private-value"},
+])
+def test_policy_diagnostic_rejects_non_schema_values(changes):
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    event = {"category": "refused", "stage": "source", **changes}
+    tee.write("[lookup-presentation] " + json.dumps(event) + "\n")
+    assert state["policyDiagnostics"]["events"] == []
+    assert state["policyDiagnostics"]["invalid"] == 1
+    assert "synthetic-private-value" not in json.dumps(state)
+
+
+def test_policy_diagnostic_bounds_line_before_buffering_and_resynchronizes():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    tee.write("[lookup-presentation] " + "x" * 8192)
+    assert len(tee._lines.pending) <= 8192
+    tee.write("synthetic-private-value\n")
+    tee.write('[lookup-presentation] {"category":"refused","stage":"source"}\n')
+    diagnostic = state["policyDiagnostics"]
+    assert diagnostic["oversized"] == 1 and diagnostic["invalid"] == 0
+    assert diagnostic["events"] == [{"category": "refused", "stage": "source"}]
+
+
+def test_policy_diagnostic_bounds_events_and_reports_truncation_thread_safely():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    line = '[lookup-presentation] {"category":"refused","stage":"source"}\n'
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(tee.write, [line] * 20))
+    diagnostic = state["policyDiagnostics"]
+    assert len(diagnostic["events"]) == 16
+    assert diagnostic["observed"] == 20 and diagnostic["truncated"] == 4
+
+
+def test_policy_diagnostic_save_failure_cannot_replace_stream_behavior():
+    module, state, delegate = gateway(), witness(), io.StringIO()
+    def save():
+        raise OSError("synthetic-private-value")
+    tee = module.PolicyDiagnosticTee(delegate, state, save)
+    line = '[lookup-presentation] {"category":"refused","stage":"source"}\n'
+    assert tee.write(line) == len(line)
+    tee.flush()
+    assert delegate.getvalue() == line
+    assert state["policyDiagnostics"]["saveFailures"] == 1
+    assert "synthetic-private-value" not in json.dumps(state)
+
+
+def test_policy_diagnostic_keeps_separate_threads_fragmented_marker_lines():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    barrier = threading.Barrier(2)
+    def emit(stage):
+        tee.write('[lookup-presentation] ' + json.dumps({"category": "refused", "stage": stage}))
+        barrier.wait(timeout=5)
+        tee.write("\n")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(emit, ["source", "catalog"]))
+    diagnostic = state["policyDiagnostics"]
+    assert diagnostic["invalid"] == 0
+    assert {event["stage"] for event in diagnostic["events"]} == {"source", "catalog"}
+
+
+def test_policy_diagnostic_rejects_duplicate_json_keys():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    tee.write('[lookup-presentation] {"category":"refused","category":"presented",'
+              '"stage":"source"}\n')
+    assert state["policyDiagnostics"]["events"] == []
+    assert state["policyDiagnostics"]["invalid"] == 1
+
+
+def test_policy_diagnostic_saturates_counters():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    state["policyDiagnostics"]["observed"] = 1000000
+    tee.write('[lookup-presentation] {"category":"refused","stage":"source"}\n')
+    assert state["policyDiagnostics"]["observed"] == 1000000
+    assert len(state["policyDiagnostics"]["events"]) == 1

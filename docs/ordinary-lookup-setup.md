@@ -319,3 +319,25 @@ remain separate under [#349](https://github.com/sushiHex/hermes-realtime/pull/34
 The API's 1,800-character detail allowance and downstream 1,024-character handoff
 bounds are tracked separately in [#367](https://github.com/sushiHex/hermes-realtime/issues/367);
 this presentation change does not widen them.
+
+## Refusal diagnostics
+
+The owned gateway retains emitted `[lookup-presentation]` metadata in the existing
+private gateway witness's `policyDiagnostics` field. Its versioned projection keeps
+only fixed stages, categories, exception kinds, response kinds and bounded counts.
+It excludes model/tool text, URLs, paths, credentials, hashes and arbitrary fields;
+it does not write raw stdout to a diagnostic file. Ordinary stdout writes and
+flushes still delegate to the process owner's selected stream.
+
+Each native writer's line is limited to 8,192 characters before further buffering;
+an oversized line is discarded through its next newline. The first 16 valid events
+are retained, with explicit observed, invalid, oversized, truncated and save-failure
+counts (each saturating at 1,000,000). A nonzero truncation count means the retained
+events are incomplete. Native workers' fragmented writes are tracked separately.
+Existing transport-refusal counters remain separate.
+
+This metadata does not authorize completion or change the native policy. Some
+native refusal branches emit no presentation marker; their un-emitted reason
+remains unavailable. Absence of a retained event cannot establish that a formatter
+call occurred or identify the refusal's cause. A gateway configured with stdout
+discarded cannot recover markers from an earlier run.
