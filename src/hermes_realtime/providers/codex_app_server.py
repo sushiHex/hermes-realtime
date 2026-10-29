@@ -1549,7 +1549,7 @@ class CodexAppServerStreamingInference:
         if include_status:
             tools.append({"type": "function", "name": "task_status",
                 "description": (
-                    "Report host-owned background task status and explicit Cancel controls."),
+                    "Pending, active, or cancellation state only; no findings."),
                 "inputSchema": {"type": "object", "additionalProperties": False,
                                 "required": [], "properties": {}}})
         return tools

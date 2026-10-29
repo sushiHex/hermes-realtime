@@ -215,7 +215,7 @@ def test_status_schema_does_not_require_proposal_bounds():
     # Mutation: restore the early return that hides status when proposals are suppressed.
     tools = CodexAppServerStreamingInference._dynamic_tools(None, include_status=True)
     assert tools == [{"type": "function", "name": "task_status", "description": (
-        "Report host-owned background task status and explicit Cancel controls."
+        "Pending, active, or cancellation state only; no findings."
     ), "inputSchema": {"type": "object", "additionalProperties": False,
                        "required": [], "properties": {}}}]
 

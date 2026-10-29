@@ -2657,7 +2657,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
             },
         },
         {"type": "function", "name": "task_status",
-         "description": "Report host-owned background task status and explicit Cancel controls.",
+         "description": "Pending, active, or cancellation state only; no findings.",
          "inputSchema": {"type": "object", "additionalProperties": False,
                          "required": [], "properties": {}}},
     ]

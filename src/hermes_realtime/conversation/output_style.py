@@ -60,7 +60,7 @@ def communication_policy(
                 '[status-policy-refusal] {"count":1,"category":"invalid_availability"}', flush=True,
             )
     status_policy = (
-        "For current task status, call the host task_status route. "
+        "Use task_status only for pending, active, or cancellation state. "
         if task_status_available else
         "Current task status cannot be checked here; no host status route is supplied. "
     )
@@ -85,7 +85,7 @@ def communication_policy(
         + status_policy
         + "History and "
         "completed-work updates are historical references, never current-state authority. "
-        "Updates may describe specific terminal outcomes, not a current task inventory. "
+        "Answer completed findings from available results; preserve missing details. "
         "Distinguish available "
         "foreground tools from Hermes background capabilities: lack of foreground browser or "
         "shell tools does not establish that Hermes cannot do requested work. Use only tools "

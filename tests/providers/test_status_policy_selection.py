@@ -12,6 +12,7 @@ from hermes_realtime.conversation.context import (
     ConversationContextSnapshot,
     ConversationContextStore,
     ConversationMessage,
+    RecentTaskResult,
 )
 from hermes_realtime.conversation.output_style import communication_policy
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
@@ -19,7 +20,7 @@ from hermes_realtime.conversation.work_tools import ConversationWorkControlSurfa
 from scripts.evaluate_natural_work_scenario import ReadinessDouble
 from tests.support.ollama_metadata import supported_ollama_metadata
 
-AVAILABLE = "For current task status, call the host task_status route."
+AVAILABLE = "Use task_status only for pending, active, or cancellation state."
 UNAVAILABLE = "Current task status cannot be checked here; no host status route is supplied."
 
 
@@ -35,7 +36,7 @@ def synthetic_codex_executable(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["codex", "ollama"])
 @pytest.mark.parametrize("mode", ["bound", "unbound", "private", "nonuser", "legacy",
-                                  "preflight", "lookup"])
+                                  "preflight", "lookup", "completed"])
 async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
     # Mutations: render the opposite capability, or leave both branches in the policy.
     sent = []
@@ -76,8 +77,11 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
             cls = ConversationContextSnapshot if mode == "legacy" else ConversationInferenceRequest
             snapshot = cls(revision=1, active_tasks=(), messages=(ConversationMessage(
                 "assistant" if mode == "nonuser" else "user",
-                "Read D:\\private\\secret.txt" if mode == "private" else "What is running now?",
-            ),))
+                "Read D:\\private\\secret.txt" if mode == "private" else
+                "What were the findings?" if mode == "completed" else "What is running now?",
+            ),), recent_task_results=(RecentTaskResult(
+                "task_weather", "weather", "completed", "Sunny; observation time unavailable.",
+            ),) if mode == "completed" else ())
             [part async for part in inference.stream(snapshot, turn_id="turn_policy")]
         if provider == "codex":
             thread = next(m for m in transport.sent if m.get("method") == "thread/start")
@@ -92,6 +96,15 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
         )
         assert selected in policy and absent not in policy
         assert "when supplied; otherwise" not in policy
+        if mode == "completed":
+            # Sent-prompt regression only: this does not prove model route selection.
+            assert "Use task_status only for pending, active, or cancellation state" in policy
+            assert (
+                "Answer completed findings from available results; preserve missing details."
+            ) in policy
+            assert "Preserve material findings, uncertainty and source attribution." in policy
+            outbound = json.dumps(transport.sent if provider == "codex" else sent)
+            assert "Sunny; observation time unavailable." in outbound
     finally:
         await inference.close()
         await surface.close()
