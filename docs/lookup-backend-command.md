@@ -175,6 +175,31 @@ and evidence are preserved for review, including refusals. Public stdout carries
 only fixed categories, counts, timings and hashes. Raw source/answer snapshots,
 credentials, launch paths and process identifiers must not be posted.
 
+## Optional owned model-response capture
+
+The Python `run_owned` entry point accepts `model_response_capture="off"` (the default),
+`"metadata"`, or `"controlled-public"`. The runner passes that choice explicitly to its
+gateway; environment variables never enable capture. Enabled capture requires the prepared
+native and presentation model routes to match the owned literal-loopback model port;
+the personal port 11434 is excluded. It does not change the manifest schema or model call.
+
+`metadata` retains assistant-content UTF-8 hashes/lengths, fixed finish reasons and whether
+the request specified a response format. Only `controlled-public` also retains the bounded
+assistant string: use that mode solely for an explicitly approved public-source case, never
+for private conversation. Prompts, headers and tool arguments are not captured. The private
+`model-response-capture.private.json` artifact inherits the protected owned directory.
+At most eight response events, 16 KiB per raw assistant string and 150,000 artifact bytes are
+retained. Responses over 64 KiB, unread/streaming responses, redirects and observation/write
+failures mark capture unavailable. No response body is read or consumed by the observer.
+
+Capture observes synchronous and asynchronous HTTPX sends to that exact chat-completions
+endpoint, then returns the original response unchanged. Event indexes reflect observed
+response completion order, not provider request IDs. This can distinguish a native answer
+from a separate schema-formatted presentation call, but does not verify the content's truth.
+Check the owner/witness capture summary and bounded `[lookup-model-capture]` diagnostics as
+well as the artifact: a failed atomic replacement can leave an older file. Unavailable or
+dropped capture is never evidence of no output or a complete before/after observation.
+
 ## Recorded public-command outcome
 
 The first full public-command observation at
