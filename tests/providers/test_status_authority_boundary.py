@@ -184,7 +184,11 @@ async def test_actual_status_route_reads_host_at_consumption(provider, status, e
     try:
         await loop.respond("turn_status", Transcript(text="What is running now?", final=True))
         heard = context.snapshot().messages[-1]
-        suffix = " To cancel work, use the task's Cancel control." if status.available else ""
+        suffix = (
+            " To cancel work, use the task's Cancel control."
+            if status.pending or status.active or status.cancel_pending or status.cancelling
+            else ""
+        )
         assert (heard.source, heard.text) == ("host_task_status", expected + suffix)
         assert reads == [1]
         if provider == "ollama":
