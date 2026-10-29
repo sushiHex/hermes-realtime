@@ -254,7 +254,9 @@ def require_owned_listeners(rows: Any, members: Any) -> None:
     )
 
 
-def run_owned(m: Any) -> Any:
+def run_owned(m: Any, *, mcp_loader_factory: Any = None,
+              startup_timeout_seconds: Any = None) -> Any:
+    """Own one task; a supplied loader factory must return an actual loader."""
     require(os.name == "nt", "windows_required")
     require(
         Path(sys.executable).resolve() == Path(m["hermes_python"]).resolve(),
@@ -281,13 +283,22 @@ def run_owned(m: Any) -> Any:
     watchdog.start()
     result: dict[str, Any] = {"category": "refused"}
     try:
+        mcp_loader = (
+            mcp_loader_factory(processes, output / "mcp-load")
+            if mcp_loader_factory is not None else None
+        )
+        require(mcp_loader_factory is None or callable(mcp_loader), "mcp_loader_required")
         start_model(
             m,
             processes,
             containment,
             output,
-            time.monotonic() + 60,
+            time.monotonic() + (
+                60 if startup_timeout_seconds is None else startup_timeout_seconds
+            ),
             verified=m["_verified_artifacts"],
+            startup_timeout_seconds=startup_timeout_seconds,
+            mcp_loader=mcp_loader,
         )
         env = owner._isolated(Path(m["profile"]))
         env.update(
@@ -352,7 +363,11 @@ def run_owned(m: Any) -> Any:
         result["category"] = "refused"
         result["failure_kind"] = type(error).__name__
         if type(error) is ValueError:
-            result["failure_category"] = "validation_refused"
+            result["failure_category"] = (
+                "mcp_loader_required"
+                if len(error.args) == 1 and type(error.args[0]) is str
+                and error.args[0] == "mcp_loader_required" else "validation_refused"
+            )
     finally:
         result["cleanup_begin_ns"] = time.monotonic_ns()
         cleanup_errors = []
@@ -381,7 +396,28 @@ def run_owned(m: Any) -> Any:
         ):
             result["category"] = "cleanup_refused"
         watchdog.cancel()
-        (output / "owner-receipt.private.json").write_text(json.dumps(result), encoding="utf-8")
+        receipt_saved = False
+        try:
+            (output / "owner-receipt.private.json").write_text(json.dumps(result), encoding="utf-8")
+            receipt_saved = True
+        finally:
+            category = result.get("category")
+            failure = result.get(
+                "failure_category", "unclassified_failure" if "failure_kind" in result else "none",
+            )
+            print("[lookup-owned] " + json.dumps({
+                "category": category if category in {
+                    "completed", "refused", "cleanup_refused",
+                } else "refused",
+                "failure_category": failure if failure in {
+                    "none", "mcp_loader_required", "validation_refused",
+                } else "unclassified_failure",
+                "cleanup_failures": len(cleanup_errors),
+                "owned_listeners_gone": result.get("owned_listeners_gone") is True,
+                "owned_processes_settled": result.get("owned_processes_settled") is True,
+                "user_listener_unchanged": result.get("user_listener_unchanged") is True,
+                "receipt_saved": receipt_saved,
+            }, separators=(",", ":")), flush=True)
     # Private bounded evidence includes source/answer. stdout receives scalars only.
     return {
         name: result[name]
