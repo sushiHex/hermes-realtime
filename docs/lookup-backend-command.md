@@ -189,13 +189,18 @@ assistant string: use that mode solely for an explicitly approved public-source 
 for private conversation. Prompts, headers and tool arguments are not captured. The private
 `model-response-capture.private.json` artifact inherits the protected owned directory.
 At most eight response events, 16 KiB per raw assistant string and 150,000 artifact bytes are
-retained. Responses over 64 KiB, unread/streaming responses, redirects and observation/write
-failures mark capture unavailable. No response body is read or consumed by the observer.
+retained. Presentation HTTP responses over 64 KiB, unread/streaming responses, redirects
+and observation/write failures mark capture unavailable. No response body is read or
+consumed by the observer.
 
-Capture observes synchronous and asynchronous HTTPX sends to that exact chat-completions
-endpoint, then returns the original response unchanged. Event indexes reflect observed
-response completion order, not provider request IDs. This can distinguish a native answer
-from a separate schema-formatted presentation call, but does not verify the content's truth.
+Native capture observes the assembled response returned by the terminal callback inside
+Hermes LLM execution middleware, before presentation can replace its assistant content.
+The provider, model and base URL context must match the prepared owned route. A middleware
+short circuit that does not call the provider produces no native event. The provider may
+stream normally; its assembled response is returned unchanged. Presentation capture observes
+only asynchronous HTTPX sends to the exact chat-completions endpoint. Synchronous HTTPX
+sends are untouched. Events identify `native` or `presentation` stage; indexes reflect
+observation order, not provider request IDs. This does not verify the content's truth.
 Check the owner/witness capture summary and bounded `[lookup-model-capture]` diagnostics as
 well as the artifact: a failed atomic replacement can leave an older file. Unavailable or
 dropped capture is never evidence of no output or a complete before/after observation.

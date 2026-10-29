@@ -1,4 +1,4 @@
-"""Offline observation at the owned HTTPX response boundary; no network/model calls."""
+"""Offline observation at the owned terminal and formatter boundaries; no network/model calls."""
 
 import asyncio
 import hashlib
@@ -7,6 +7,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -161,7 +162,7 @@ def test_redirected_response_is_not_captured(tmp_path):
     assert data["unavailable_reason"] == "redirected_response"
 
 
-def test_sync_and_async_wrappers_preserve_responses_arguments_and_restore(tmp_path, monkeypatch):
+def test_async_wrapper_preserves_arguments_and_leaves_sync_unmodified(tmp_path, monkeypatch):
     observer = recorder(tmp_path, "controlled-public")
     seen = []
     request = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
@@ -176,14 +177,15 @@ def test_sync_and_async_wrappers_preserve_responses_arguments_and_restore(tmp_pa
 
     monkeypatch.setattr(httpx.Client, "send", sync)
     monkeypatch.setattr(httpx.AsyncClient, "send", asynchronous)
-    with observer.installed():
+    with observer.installed(SimpleNamespace(run_llm_execution_middleware=None)):
         client = object()
         assert httpx.Client.send(client, request, "positional", follow_redirects=False) is returned
         assert asyncio.run(httpx.AsyncClient.send(
             client, request, "positional", follow_redirects=False)) is returned
     assert seen == [(client, request, ("positional",), {"follow_redirects": False})] * 2
     assert httpx.Client.send is sync and httpx.AsyncClient.send is asynchronous
-    assert len(read(tmp_path)["events"]) == 2
+    assert len(read(tmp_path)["events"]) == 1
+    assert read(tmp_path)["events"][0]["stage"] == "presentation"
 
 
 def test_observation_failure_does_not_change_send_result(tmp_path, monkeypatch, capsys):
@@ -191,9 +193,12 @@ def test_observation_failure_does_not_change_send_result(tmp_path, monkeypatch, 
     request = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
     returned = response(request)
     monkeypatch.setattr(observer, "_write", lambda: (_ for _ in ()).throw(OSError("PRIVATE_ERROR")))
-    monkeypatch.setattr(httpx.Client, "send", lambda *a, **k: returned)
-    with observer.installed():
-        assert httpx.Client.send(object(), request) is returned
+    async def send(*a, **k):
+        return returned
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    with observer.installed(SimpleNamespace(run_llm_execution_middleware=None)):
+        assert asyncio.run(httpx.AsyncClient.send(object(), request)) is returned
     assert observer.status["available"] is False
     assert observer.status["unavailable_reason"] == "write_failed"
     marker = capsys.readouterr().out
@@ -219,12 +224,13 @@ def test_original_send_exception_is_preserved(tmp_path, monkeypatch):
     observer = recorder(tmp_path)
     error = RuntimeError("synthetic transport exception")
 
-    def fail(*args, **kwargs):
+    async def fail(*args, **kwargs):
         raise error
 
-    monkeypatch.setattr(httpx.Client, "send", fail)
-    with observer.installed(), pytest.raises(RuntimeError) as caught:
-        httpx.Client.send(object(), object())
+    monkeypatch.setattr(httpx.AsyncClient, "send", fail)
+    with (observer.installed(SimpleNamespace(run_llm_execution_middleware=None)),
+          pytest.raises(RuntimeError) as caught):
+        asyncio.run(httpx.AsyncClient.send(object(), object()))
     assert caught.value is error
 
 
@@ -254,3 +260,94 @@ def test_gateway_rejects_invalid_mode_before_reading_manifest():
     ], capture_output=True, text=True, timeout=15)
     assert completed.returncode == 2 and "invalid choice" in completed.stderr
     assert "FileNotFoundError" not in completed.stderr
+
+
+
+def native_context():
+    return {"provider": "custom", "model": "fixture",
+            "base_url": "http://127.0.0.1:11441/v1", "api_mode": "chat_completions"}
+
+
+def test_native_terminal_captured_before_presenter_mutates_and_called_once(tmp_path):
+    observer = recorder(tmp_path, "controlled-public")
+    original_text = "Synthetic native preimage"
+    result = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=original_text), finish_reason="stop")])
+    seen = []
+    request = {"response_format": {"type": "json_schema"}}
+
+    def terminal(payload):
+        seen.append(payload)
+        return result
+
+    def middleware(payload, next_call, **context):
+        assert context == native_context()
+        returned = next_call(payload)
+        assert returned is result
+        assert read(tmp_path)["events"][0]["content"] == original_text
+        returned.choices[0].message.content = "Synthetic formatted result"
+        return returned
+
+    module = SimpleNamespace(run_llm_execution_middleware=middleware)
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware(
+            request, terminal, **native_context()) is result
+    assert module.run_llm_execution_middleware is middleware
+    assert seen == [request]
+    event = read(tmp_path)["events"][0]
+    assert event["stage"] == "native" and event["response_format"] is True
+    assert event["content_sha256"] == hashlib.sha256(original_text.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("changed", [{"provider": "other"}, {"model": "other"},
+                                    {"base_url": "http://127.0.0.1:11434/v1"}])
+def test_native_context_scope_excludes_mismatch(tmp_path, changed):
+    observer = recorder(tmp_path, "controlled-public")
+    result = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="UNRELATED_PRIVATE"), finish_reason="stop")])
+    module = SimpleNamespace(run_llm_execution_middleware=lambda req, call, **ctx: call(req))
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware(
+            {}, lambda req: result, **(native_context() | changed)) is result
+    assert read(tmp_path)["observed"] == 0
+    assert "UNRELATED_PRIVATE" not in json.dumps(read(tmp_path))
+
+
+def test_native_shortcircuit_and_terminal_exception_preserve_outcome(tmp_path):
+    observer = recorder(tmp_path)
+    sentinel = object()
+    module = SimpleNamespace(run_llm_execution_middleware=lambda *a, **k: sentinel)
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware(
+            {}, lambda req: pytest.fail("terminal called"), **native_context()) is sentinel
+    assert read(tmp_path)["observed"] == 0
+    error = RuntimeError("synthetic native failure")
+
+    def fail(req):
+        raise error
+
+    module.run_llm_execution_middleware = lambda req, call, **ctx: call(req)
+    with observer.installed(module), pytest.raises(RuntimeError) as caught:
+        module.run_llm_execution_middleware({}, fail, **native_context())
+    assert caught.value is error and read(tmp_path)["observed"] == 0
+
+
+
+def test_native_observation_failure_and_bounds_preserve_result(tmp_path, monkeypatch):
+    observer = recorder(tmp_path, "controlled-public")
+    result = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="x" * (capture.MAX_CONTENT_BYTES + 1)),
+        finish_reason="stop")])
+    module = SimpleNamespace(run_llm_execution_middleware=lambda req, call, **ctx: call(req))
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware({}, lambda req: result,
+                                                   **native_context()) is result
+    data = read(tmp_path)
+    assert data["unavailable_reason"] == "content_bound"
+    assert "content" not in data["events"][0]
+    monkeypatch.setattr(observer, "observe_native",
+                        lambda *a: (_ for _ in ()).throw(ValueError("PRIVATE_ERROR")))
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware({}, lambda req: result,
+                                                   **native_context()) is result
+    assert read(tmp_path)["unavailable_reason"] == "observation_failed"

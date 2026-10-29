@@ -76,6 +76,9 @@ class ModelResponseCapture:
                  on_update: Any = None) -> None:
         self.mode = validate_mode(mode)
         self.endpoint = capture_endpoint(mode, manifest, config)
+        self._native_scope = ({key: config["model"][field] for key, field in (
+            ("provider", "provider"), ("model", "default"), ("base_url", "base_url"),
+        )} if self.endpoint is not None else {})
         self.path = directory / "model-response-capture.private.json"
         self._lock = threading.RLock()
         self._on_update = on_update
@@ -173,41 +176,74 @@ class ModelResponseCapture:
                     choice = choices[0]
                     content = choice["message"]["content"]
                     finish = choice.get("finish_reason")
-                    event = {"index": len(self.status["events"]) + 1,
-                             "response_format": "response_format" in payload,
-                             "finish_reason": finish if finish in _FINISH else "other",
-                             "content_kind": "string" if type(content) is str
-                             else "none" if content is None else "other"}
-                    if type(content) is str:
-                        raw = content.encode("utf-8")
-                        event.update(content_chars=len(content), content_bytes=len(raw),
-                                     content_sha256=hashlib.sha256(raw).hexdigest())
-                        if self.mode == "controlled-public":
-                            if len(raw) <= MAX_CONTENT_BYTES:
-                                event["content"] = content
-                            else:
-                                self._fail("content_bound")
-                    self.status["events"].append(event)
+                    self._record_content(content, finish, "response_format" in payload,
+                                         "presentation")
+            except Exception:
+                self._fail("observation_failed")
+            self._publish()
+
+    def _record_content(self, content: Any, finish: Any, response_format: bool,
+                        stage: str) -> None:
+        event = {"index": len(self.status["events"]) + 1, "stage": stage,
+                 "response_format": response_format,
+                 "finish_reason": finish if finish in _FINISH else "other",
+                 "content_kind": "string" if type(content) is str
+                 else "none" if content is None else "other"}
+        if type(content) is str:
+            raw = content.encode("utf-8")
+            event.update(content_chars=len(content), content_bytes=len(raw),
+                         content_sha256=hashlib.sha256(raw).hexdigest())
+            if self.mode == "controlled-public":
+                if len(raw) <= MAX_CONTENT_BYTES:
+                    event["content"] = content
+                else:
+                    self._fail("content_bound")
+        self.status["events"].append(event)
+
+    def observe_native(self, request: Any, response: Any, context: Any) -> None:
+        if self.mode == "off" or any(
+            context.get(key) != value for key, value in self._native_scope.items()
+        ):
+            return
+        with self._lock:
+            try:
+                self.status["observed"] = min(1000000, self.status["observed"] + 1)
+                if len(self.status["events"]) >= MAX_EVENTS:
+                    self._fail("event_bound")
+                    self.status["truncated"] = True
+                else:
+                    choices = response.choices
+                    if len(choices) != 1 or type(request) is not dict:
+                        raise ValueError("response_shape")
+                    choice = choices[0]
+                    self._record_content(choice.message.content, choice.finish_reason,
+                                         "response_format" in request, "native")
             except Exception:
                 self._fail("observation_failed")
             self._publish()
 
     @contextlib.contextmanager
-    def installed(self) -> Any:
+    def installed(self, middleware: Any = None) -> Any:
         if self.mode == "off":
             yield
             return
         import httpx
+        if middleware is None:
+            import hermes_cli.middleware as middleware
 
-        original, original_async = httpx.Client.send, httpx.AsyncClient.send
+        original_async = httpx.AsyncClient.send
+        original_middleware = middleware.run_llm_execution_middleware
 
-        def send(client: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-            response = original(client, request, *args, **kwargs)
-            try:
-                self.observe(request, response, streaming=kwargs.get("stream", False))
-            except Exception:
-                self.unavailable("observation_failed")
-            return response
+        def run_middleware(request: Any, next_call: Any, **context: Any) -> Any:
+            def terminal(payload: Any) -> Any:
+                response = next_call(payload)
+                try:
+                    self.observe_native(payload, response, context)
+                except Exception:
+                    self.unavailable("observation_failed")
+                return response
+
+            return original_middleware(request, terminal, **context)
 
         async def async_send(client: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
             response = await original_async(client, request, *args, **kwargs)
@@ -217,12 +253,13 @@ class ModelResponseCapture:
                 self.unavailable("observation_failed")
             return response
 
-        httpx.Client.send, httpx.AsyncClient.send = send, async_send
+        middleware.run_llm_execution_middleware = run_middleware
+        httpx.AsyncClient.send = async_send
         try:
             yield
         finally:
-            if httpx.Client.send is send:
-                httpx.Client.send = original
+            if middleware.run_llm_execution_middleware is run_middleware:
+                middleware.run_llm_execution_middleware = original_middleware
             else:
                 self.unavailable("wrapper_replaced")
             if httpx.AsyncClient.send is async_send:
