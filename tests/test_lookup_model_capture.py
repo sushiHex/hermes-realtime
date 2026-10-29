@@ -276,14 +276,23 @@ def test_native_terminal_captured_before_presenter_mutates_and_called_once(tmp_p
     seen = []
     request = {"response_format": {"type": "json_schema"}}
 
+    chunks = iter(["Synthetic ", "native ", "preimage"])
+
     def terminal(payload):
         seen.append(payload)
+        # Model the provider terminal assembling its stream before returning.
+        result.choices[0].message.content = "".join(chunks)
         return result
 
+    presentation_source_sha = None
+
     def middleware(payload, next_call, **context):
+        nonlocal presentation_source_sha
         assert context == native_context()
         returned = next_call(payload)
         assert returned is result
+        presentation_source_sha = hashlib.sha256(
+            returned.choices[0].message.content.encode("utf-8")).hexdigest()
         assert read(tmp_path)["events"][0]["content"] == original_text
         returned.choices[0].message.content = "Synthetic formatted result"
         return returned
@@ -296,7 +305,9 @@ def test_native_terminal_captured_before_presenter_mutates_and_called_once(tmp_p
     assert seen == [request]
     event = read(tmp_path)["events"][0]
     assert event["stage"] == "native" and event["response_format"] is True
-    assert event["content_sha256"] == hashlib.sha256(original_text.encode()).hexdigest()
+    assert event["content_sha256"] == presentation_source_sha
+    assert presentation_source_sha == hashlib.sha256(original_text.encode()).hexdigest()
+    assert list(chunks) == []
 
 
 @pytest.mark.parametrize("changed", [{"provider": "other"}, {"model": "other"},
