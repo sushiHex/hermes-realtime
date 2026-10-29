@@ -4,13 +4,15 @@ Native plugin lifecycle owns tool policy. Harness binds Exa native search/extrac
 requests, independent transport counts, returned sources and response bounds.
 """
 
+import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import threading
-from contextlib import redirect_stdout, suppress
+from contextlib import nullcontext, redirect_stdout, suppress
 from pathlib import Path
 from typing import Any
 
@@ -406,9 +408,26 @@ def bounded_exa_send(
     return send
 
 
+def _model_capture_module() -> Any:
+    """Load the adjacent verified helper even under the gateway's -I launch."""
+    spec = importlib.util.spec_from_file_location(
+        "owned_model_capture", ROOT / "lookup_model_capture.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("capture_helper_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> Any:
     global INSTALL
-    manifest_path = Path(sys.argv[1]).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("manifest")
+    parser.add_argument("--model-response-capture", default="off",
+                        choices=("off", "metadata", "controlled-public"))
+    args = parser.parse_args()
+    manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
     INSTALL = Path(manifest["hermes_source"]).resolve()
     output = manifest_path.parent
@@ -472,7 +491,20 @@ def main() -> Any:
         config_raw = stream.read(65537)
     if len(config_raw) > 65536:
         raise RuntimeError("metadata_config_bound")
-    metadata_urls = metadata_urls_from_config(yaml.safe_load(config_raw))
+    config = yaml.safe_load(config_raw)
+    metadata_urls = metadata_urls_from_config(config)
+    capture_context: Any = nullcontext()
+    if args.model_response_capture != "off":
+        capture_module = _model_capture_module()
+
+        def capture_updated(summary: Any) -> None:
+            witness["modelResponseCapture"] = summary
+            save()
+
+        recorder = capture_module.ModelResponseCapture(
+            output, args.model_response_capture, manifest, config, on_update=capture_updated,
+        )
+        capture_context = recorder.installed()
     returned_urls: set[str] = set()
     allowed_urls: set[str] = set()
     projection_lock = threading.Lock()
@@ -529,7 +561,7 @@ def main() -> Any:
     )
     diagnostics = PolicyDiagnosticTee(sys.stdout, witness, save)
     save()
-    with redirect_stdout(diagnostics):
+    with redirect_stdout(diagnostics), capture_context:
         gateway_main()
 
 

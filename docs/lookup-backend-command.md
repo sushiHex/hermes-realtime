@@ -175,6 +175,42 @@ and evidence are preserved for review, including refusals. Public stdout carries
 only fixed categories, counts, timings and hashes. Raw source/answer snapshots,
 credentials, launch paths and process identifiers must not be posted.
 
+## Optional owned model-response capture
+
+The Python `run_owned` entry point accepts `model_response_capture="off"` (the default),
+`"metadata"`, or `"controlled-public"`. The runner passes that choice explicitly to its
+gateway; environment variables never enable capture. Enabled capture requires the prepared
+native and presentation model routes to match the owned literal-loopback model port;
+the personal port 11434 is excluded. It does not change the manifest schema or model call.
+
+`metadata` retains assistant-content UTF-8 hashes/lengths, fixed finish reasons and whether
+the request specified a response format. Only `controlled-public` also retains the bounded
+assistant string: use that mode solely for an explicitly approved public-source case, never
+for private conversation. Prompts, headers and tool arguments are not captured. The private
+`model-response-capture.private.json` artifact inherits the protected owned directory.
+At most eight response events, 16 KiB per raw assistant string and 150,000 artifact bytes are
+retained. Presentation HTTP responses over 64 KiB, unread/streaming responses, redirects
+and observation/write failures mark capture unavailable. No response body is read or
+consumed by the observer.
+
+Native capture observes the assembled response returned by the terminal callback inside
+Hermes LLM execution middleware, before presentation can replace its assistant content.
+The provider, model and base URL context must match the prepared owned route. A middleware
+short circuit that does not call the provider produces no native event. The provider may
+stream normally; its assembled response is returned unchanged. Presentation capture observes
+only asynchronous HTTPX sends to the exact chat-completions endpoint. Synchronous HTTPX
+sends are untouched. Events identify `native` or `presentation` stage; indexes reflect
+observation order, not provider request IDs. Native strings are capped at 64 KiB before
+hashing; a character-count guard bounds UTF-8 allocation before the byte-count check.
+Multiple native events can include tool calls or retries; scope-skipped calls are not
+retained. `available: true` alone does not prove a complete pair. Select the completed
+native answer by finish reason and equality with the actual presentation source SHA,
+then independently match the formatter output; do not select by event index. Capture
+does not verify the content's truth.
+Check the owner/witness capture summary and bounded `[lookup-model-capture]` diagnostics as
+well as the artifact: a failed atomic replacement can leave an older file. Unavailable or
+dropped capture is never evidence of no output or a complete before/after observation.
+
 ## Recorded public-command outcome
 
 The first full public-command observation at

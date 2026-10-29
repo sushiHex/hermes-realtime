@@ -255,8 +255,10 @@ def require_owned_listeners(rows: Any, members: Any) -> None:
 
 
 def run_owned(m: Any, *, mcp_loader_factory: Any = None,
-              startup_timeout_seconds: Any = None) -> Any:
+              startup_timeout_seconds: Any = None, model_response_capture: Any = "off") -> Any:
     """Own one task; a supplied loader factory must return an actual loader."""
+    from scripts.lookup_model_capture import capture_endpoint, validate_mode
+
     require(os.name == "nt", "windows_required")
     require(
         Path(sys.executable).resolve() == Path(m["hermes_python"]).resolve(),
@@ -282,7 +284,16 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     watchdog.daemon = True
     watchdog.start()
     result: dict[str, Any] = {"category": "refused"}
+    capture_mode = "off"
     try:
+        capture_mode = validate_mode(model_response_capture)
+        if capture_mode != "off":
+            from scripts.setup_lookup_backend import protect_directory
+
+            capture_endpoint(capture_mode, m, read_json(Path(m["profile"]) / "config.yaml"))
+            protect_directory(output)
+            require(not (output / "model-response-capture.private.json").exists(),
+                    "capture_artifact_exists")
         mcp_loader = (
             mcp_loader_factory(processes, output / "mcp-load")
             if mcp_loader_factory is not None else None
@@ -315,6 +326,8 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
                 "-B",
                 str(ROOT / "scripts/lookup_backend_gateway.py"),
                 str(output / "prepared.json"),
+                "--model-response-capture",
+                capture_mode,
             ],
             env=env,
             cwd=Path(m["hermes_source"]),
@@ -376,6 +389,15 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
         except BaseException as error:
             cleanup_errors.append(type(error).__name__)
         result["logs"] = processes.finish()
+        if capture_mode != "off":
+            try:
+                captured_witness = read_json(output / "gateway-witness.private.json")
+                result["model_response_capture"] = captured_witness["modelResponseCapture"]
+            except (OSError, ValueError, KeyError):
+                result["model_response_capture"] = {
+                    "mode": capture_mode, "available": False,
+                    "unavailable_reason": "witness_unavailable",
+                }
         result["cleanup_settled_ns"] = time.monotonic_ns()
         try:
             result["owned_listeners_gone"] = all(
@@ -433,6 +455,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
             "owned_processes_settled",
             "failure_kind",
             "failure_category",
+            "model_response_capture",
         )
         if name in result
     }

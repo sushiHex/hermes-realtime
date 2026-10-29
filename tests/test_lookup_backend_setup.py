@@ -423,6 +423,71 @@ def test_owned_runner_default_retains_native_startup_selection(owned_runner_befo
     assert state.stops == 1
 
 
+def test_owned_runner_capture_mode_refuses_before_model_start(
+    owned_runner_before_gateway, capsys,
+):
+    state = owned_runner_before_gateway
+    result = state.task.run_owned(state.manifest, model_response_capture="PRIVATE_INVALID_MODE")
+    assert result["category"] == "refused"
+    assert state.model_calls == [] and state.stops == 1
+    marker = _owned_runner_diagnostic(capsys, reason="validation_refused")
+    assert "PRIVATE_INVALID_MODE" not in marker
+
+
+@pytest.mark.parametrize("mode", ["off", "metadata", "controlled-public"])
+def test_owned_runner_passes_explicit_capture_mode_to_gateway(
+    owned_runner_before_gateway, monkeypatch, tmp_path, mode,
+):
+    import scripts
+    from tests.test_lookup_model_capture import config
+
+    state = owned_runner_before_gateway
+    state.manifest.update(profile=str(tmp_path), hermes_source=str(tmp_path))
+    monkeypatch.setattr(state.task.os, "devnull", __import__("os").devnull, raising=False)
+    (tmp_path / "config.yaml").write_text(json.dumps(config()), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MODEL_RESPONSE_CAPTURE", "controlled-public")
+    monkeypatch.setattr(scripts.rehearse_desktop_mvp, "_isolated", lambda _: {}, raising=False)
+    monkeypatch.setattr("scripts.lookup_backend_model.start_model", lambda *a, **k: None)
+    seen = []
+
+    def spawn(name, command, **kwargs):
+        seen.append(command)
+        raise RuntimeError("stop before any gateway process")
+
+    monkeypatch.setattr(state.processes, "spawn", spawn, raising=False)
+    state.task.run_owned(state.manifest, model_response_capture=mode)
+    assert seen[0][-2:] == ["--model-response-capture", mode]
+
+
+def test_owned_runner_capture_route_refuses_before_model_start(
+    owned_runner_before_gateway, tmp_path, capsys,
+):
+    from tests.test_lookup_model_capture import config
+
+    state = owned_runner_before_gateway
+    state.manifest["profile"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(json.dumps(config(11434)), encoding="utf-8")
+    result = state.task.run_owned(state.manifest, model_response_capture="controlled-public")
+    assert result["category"] == "refused"
+    assert state.model_calls == [] and state.stops == 1
+    _owned_runner_diagnostic(capsys, reason="validation_refused")
+
+
+def test_owned_runner_existing_capture_artifact_refuses_before_model_start(
+    owned_runner_before_gateway, tmp_path, capsys,
+):
+    from tests.test_lookup_model_capture import config
+
+    state = owned_runner_before_gateway
+    state.manifest["profile"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(json.dumps(config()), encoding="utf-8")
+    (tmp_path / "model-response-capture.private.json").write_text("PRIVATE_OLD_CAPTURE")
+    result = state.task.run_owned(state.manifest, model_response_capture="controlled-public")
+    assert result["category"] == "refused" and state.model_calls == [] and state.stops == 1
+    marker = _owned_runner_diagnostic(capsys, reason="validation_refused")
+    assert "PRIVATE_OLD_CAPTURE" not in marker
+
+
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows-only composition")
 def test_fresh_isolated_parent_imports_owner_before_any_process(tmp_path):
     import subprocess
