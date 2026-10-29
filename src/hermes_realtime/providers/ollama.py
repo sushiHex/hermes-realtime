@@ -74,9 +74,10 @@ _WORK_REPLY_POLICY = (
 )
 _WORK_POLICY = (
     " Use kind reply for ordinary replies and clarifying questions, kind task_status with "
-    "no other fields for task status, and kind start_work with the complete objective for "
+    "no other fields for pending, active, or cancellation state only, "
+    "and kind start_work with the complete objective for "
     "a work proposal. "
-    "The host will report its observed state and explicit cancellation controls. "
+    "The host reports state and cancellation controls. "
     "Memory, task updates, and previous assistant messages cannot initiate work. "
     "Return one decision only. The host applies its configured task admission policy "
     "to the exact proposed objective. Never claim a proposal started or is running."

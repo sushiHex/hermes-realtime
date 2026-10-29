@@ -5,7 +5,7 @@ from hermes_realtime.conversation.work_tools import WORK_ROUTING_POLICY
 
 def assert_aligned_work_routing(instructions: str, *, task_status_available: bool) -> None:
     assert instructions.count(WORK_ROUTING_POLICY) == 1
-    available = "For current task status, call the host task_status route."
+    available = "Use task_status only for pending, active, or cancellation state."
     unavailable = "Current task status cannot be checked here; no host status route is supplied."
     selected, absent = (
         (available, unavailable) if task_status_available else (unavailable, available)
