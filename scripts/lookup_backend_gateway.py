@@ -360,6 +360,7 @@ def bounded_exa_send(
                         "exa_response_bound",
                         "exa_http_refused",
                         "metadata_request_refused",
+                        "frozen_web_transport_refused",
                         "metadata_retry_refused",
                         "metadata_response_bound",
                         "metadata_redirect_refused",
