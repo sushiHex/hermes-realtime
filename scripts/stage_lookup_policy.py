@@ -13,12 +13,12 @@ import hashlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "0754a6d93b80525a3a921f0838ceeedd0ab9cd14"
+REVIEWED_REVISION = "5bf8ce7988dc9538e50d008a52ef8fa00d6435a3"
 REVIEWED_SOURCES = {
     "entrypoint.py": "f0a37e115d6ec602afb15c7820eb55b54434571c3a335e6987973a9fe434bbdd",
-    "policy.py": "b70a14e2971a5c48e14ceb12b7cbbf2a95ba5f8b99d7c65765986ffbb336b66f",
+    "policy.py": "da9ab08afaa10d0af5f046528091c54d1858e25f81503e6b129ef4f41b6d75ec",
 }
-REVIEWED_SIZES = {"entrypoint.py": 2534, "policy.py": 38813}
+REVIEWED_SIZES = {"entrypoint.py": 2534, "policy.py": 45522}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
