@@ -41,6 +41,54 @@ async def test_result_preserves_visual_sources_and_observation_time_in_each_proj
         )
 
 
+def test_source_catalog_keeps_distinct_hosts_and_subdomains_in_first_seen_order():
+    assert _voice_friendly_completion_text("completed", (
+        "Findings.\n\nSources:\n"
+        "https://blog.example.invalid/a\n"
+        "https://www.example.invalid/a\n"
+        "https://docs.example.invalid/b\n"
+        "https://archive.example.invalid/a\n"
+        "https://BLOG.example.invalid/b"
+    )) == (
+        "Findings. Sources: blog.example.invalid www.example.invalid docs.example.invalid "
+        "archive.example.invalid."
+    )
+
+
+def test_named_references_are_not_deduplicated_by_label():
+    assert _voice_friendly_completion_text("completed", (
+        "Findings.\n\nSources:\n"
+        "[Source](https://one.example.invalid/a)\n"
+        "[Source](https://two.example.invalid/a)\n"
+        "[Documentation](https://two.example.invalid/b)"
+    )) == "Findings. Sources: Source Source Documentation."
+
+
+def test_repeated_inline_source_references_are_not_deduplicated():
+    assert _voice_friendly_completion_text("completed", (
+        "Version one: https://docs.example.invalid/one. "
+        "Version two: https://docs.example.invalid/two."
+    )) == "Version one: docs.example.invalid. Version two: docs.example.invalid."
+
+
+@pytest.mark.parametrize("catalog", [
+    "https://www.example.invalid/one\nNot a source entry.\nhttps://www.example.invalid/two",
+    "https://www.example.invalid/one https://www.example.invalid/two",
+])
+def test_non_catalog_source_text_is_not_deduplicated(catalog):
+    spoken = _voice_friendly_completion_text("completed", "Findings.\n\nSources:\n" + catalog)
+    assert spoken.count("www.example.invalid") == 2
+
+
+def test_source_catalog_still_excludes_url_credentials_and_paths():
+    spoken = _voice_friendly_completion_text("completed", (
+        "Findings.\n\nSources:\n"
+        "https://synthetic:fixture@docs.example.invalid/private?key=synthetic\n"
+        "https://synthetic:fixture@docs.example.invalid/another#synthetic"
+    ))
+    assert spoken == "Findings. Sources: docs.example.invalid."
+
+
 @pytest.mark.asyncio
 async def test_short_legacy_source_hostname_survives_deferred_context_handoff():
     detail = "Observed 12 sessions at 07:53 UTC. Source: https://monitor.example.invalid/status"
@@ -116,3 +164,28 @@ async def test_parenthesized_url_paths_stay_local_in_deferred_context(reference,
     )
     assert directive.text == f"Observed 12 sessions at 07:53 UTC. Source: {expected}."
     assert projection.events_after(0)[-1].data["text"] == detail
+
+
+@pytest.mark.asyncio
+async def test_deferred_source_catalog_speaks_each_label_once_without_losing_links():
+    detail = (
+        "The release adds two capabilities.\n\nSources:\n"
+        "https://blog.example.invalid/release\n"
+        "https://www.example.invalid/one\n"
+        "https://www.example.invalid/two\n"
+        "https://www.example.invalid/three"
+    )
+    projection = BrowserEventProjection()
+    directive = await ProactiveCompletionUpdatePolicy(projection=projection).decide(
+        UpdatePolicyInput(sequence=1, completion=TaskTerminalOutcome(
+            task_id="task_source_catalog", status="completed",
+            summary=f"<voice>The release adds two capabilities.</voice><detail>{detail}</detail>",
+        ), context=ConversationContextStore().snapshot()),
+    )
+    assert directive.text == (
+        "The release adds two capabilities. Sources: blog.example.invalid www.example.invalid"
+    )
+    result_event = projection.events_after(0)[-1]
+    assert result_event.kind == "task_result"
+    assert result_event.data["taskId"] == "task_source_catalog"
+    assert result_event.data["text"] == detail

@@ -58,6 +58,24 @@ def _completion_source_label(match: re.Match[str]) -> str:
 
 def _completion_reference_text(detail: str) -> str:
     """Keep labels/hostnames while URLs remain only in the local task result."""
+    body, marker, catalog = detail.rpartition("\n\nSources:\n")
+    if marker and catalog:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for line in catalog.splitlines():
+            reference = _COMPLETION_REFERENCE.fullmatch(line.strip())
+            # Only the emitted raw-URL catalog is a list of interchangeable host labels.
+            if reference is None or reference.group(1) is not None:
+                break
+            label = _completion_source_label(reference)
+            if label.casefold() not in seen:
+                labels.append(label)
+                seen.add(label.casefold())
+        else:
+            return (
+                _COMPLETION_REFERENCE.sub(_completion_source_label, body)
+                + marker + "\n".join(labels)
+            )
     # Consume the complete URL token before rendering its optional Markdown label;
     # stopping at a path parenthesis would forward the remainder of that URL.
     return _COMPLETION_REFERENCE.sub(_completion_source_label, detail)
