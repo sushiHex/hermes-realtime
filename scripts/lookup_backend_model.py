@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Mapping
@@ -326,6 +327,19 @@ def _read(kind: str, manifest: Mapping[str, Any], process: Any,
     return value
 
 
+def _version_transient(error: BaseException) -> str | None:
+    """Only transport not-ready errors, never an HTTP or validation refusal."""
+    if (isinstance(error, urllib.error.HTTPError)
+            or type(error) is TimeoutError and error.args == ("model-deadline",)):
+        return None
+    cause = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(cause, TimeoutError):
+        return "timeout"
+    if isinstance(cause, ConnectionRefusedError):
+        return "connection_refused"
+    return None
+
+
 async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: float,
                           state: dict[str, Any], startup_profile: StartupProfile,
                           mcp_loader: McpModelLoader | None = None) -> None:
@@ -463,6 +477,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         "keep_alive_configured": -1,
         "load_mechanism_configured": "native-http" if mcp_loader is None else "mcp-callback",
         "mcp_callback_invocation_count": 0, "mcp_callback_acknowledged": False,
+        "version_probe_attempts": 0, "version_probe_transient_failures": 0,
+        "version_probe_last_transient": "none",
         "allocation_observed": False, "port": port, "stage": "ownership",
         "load_request_count": 0, "load_acknowledged": False, "model_ready": False,
         "configured_context_basis": "configured-per-sequence"}
@@ -526,7 +542,22 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             state["metadata_requests"].append(kind)
             return _read(kind, selected, process, deadline)
 
-        if read("version") != {"version": SUPPORTED_VERSION}:
+        while True:
+            _remaining(deadline)
+            state["version_probe_attempts"] += 1
+            try:
+                version = read("version")
+            except (TimeoutError, ConnectionRefusedError, urllib.error.URLError) as error:
+                transient = _version_transient(error)
+                if transient is None:
+                    raise
+                state["version_probe_transient_failures"] += 1
+                state["version_probe_last_transient"] = transient
+                _remaining(deadline)
+                time.sleep(min(0.1, _remaining(deadline)))
+                continue
+            break
+        if version != {"version": SUPPORTED_VERSION}:
             raise ValueError("metadata-version")
         rows = [row for row in read("tags")["models"]
                 if row.get("name") == selected["model"] or row.get("model") == selected["model"]]
@@ -567,6 +598,8 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         public = {key: state[key] for key in (
             "category", "stage", "inference_request_count", "metadata_request_count",
+            "version_probe_attempts", "version_probe_transient_failures",
+            "version_probe_last_transient",
             "runtime_version", "context_default_tokens", "allocation_observed",
             "startup_timeout_requested_seconds", "startup_budget_ceiling_seconds",
             "startup_effective_budget_seconds",
