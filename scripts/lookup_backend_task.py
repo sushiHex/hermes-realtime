@@ -254,7 +254,9 @@ def require_owned_listeners(rows: Any, members: Any) -> None:
     )
 
 
-def run_owned(m: Any) -> Any:
+def run_owned(m: Any, *, mcp_loader_factory: Any = None,
+              startup_timeout_seconds: Any = None) -> Any:
+    """Own one task; a supplied loader factory must return an actual loader."""
     require(os.name == "nt", "windows_required")
     require(
         Path(sys.executable).resolve() == Path(m["hermes_python"]).resolve(),
@@ -281,13 +283,22 @@ def run_owned(m: Any) -> Any:
     watchdog.start()
     result: dict[str, Any] = {"category": "refused"}
     try:
+        mcp_loader = (
+            mcp_loader_factory(processes, output / "mcp-load")
+            if mcp_loader_factory is not None else None
+        )
+        require(mcp_loader_factory is None or callable(mcp_loader), "mcp_loader_required")
         start_model(
             m,
             processes,
             containment,
             output,
-            time.monotonic() + 60,
+            time.monotonic() + (
+                60 if startup_timeout_seconds is None else startup_timeout_seconds
+            ),
             verified=m["_verified_artifacts"],
+            startup_timeout_seconds=startup_timeout_seconds,
+            mcp_loader=mcp_loader,
         )
         env = owner._isolated(Path(m["profile"]))
         env.update(

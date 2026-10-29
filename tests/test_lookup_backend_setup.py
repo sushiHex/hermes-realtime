@@ -262,6 +262,116 @@ def test_private_directory_grants_inherit_to_gateway_descendants(monkeypatch, tm
     assert applied == ["D:P(A;OICI;FA;;;owner)"]
 
 
+@pytest.fixture
+def owned_runner_before_gateway(monkeypatch, tmp_path):
+    """Exercise the real runner through startup without processes or model calls."""
+    import sys
+
+    import scripts
+    from scripts import lookup_backend_logs, lookup_backend_model
+    from scripts import lookup_backend_task as task
+
+    state = SimpleNamespace(model_calls=[], stops=0)
+
+    class Processes:
+        first_cleanup_refusal = False
+
+        def stop_all(self, containment):
+            state.stops += 1
+
+        def survivors(self, containment):
+            return {}
+
+        def finish(self):
+            return {}
+
+    state.processes = Processes()
+    owner = SimpleNamespace(Containment=object, Processes=lambda _: state.processes)
+    monkeypatch.setattr(scripts, "rehearse_desktop_mvp", owner, raising=False)
+    monkeypatch.setattr(lookup_backend_logs, "CappedProcesses", lambda process, _: process)
+    monkeypatch.setattr(task, "os", SimpleNamespace(name="nt", _exit=lambda _: None))
+    monkeypatch.setattr(
+        task, "sys", SimpleNamespace(executable=sys.executable, path=list(sys.path)),
+    )
+    monkeypatch.setattr(task, "select_runtime", lambda _: None)
+    monkeypatch.setattr(task, "listener_rows", lambda _: [])
+    monkeypatch.setattr(
+        task, "time", SimpleNamespace(monotonic=lambda: 1000, monotonic_ns=lambda: 1),
+    )
+    monkeypatch.setattr(task, "threading", SimpleNamespace(
+        Timer=lambda *_args, **_kwargs: SimpleNamespace(start=lambda: None, cancel=lambda: None),
+    ))
+
+    def start_model(*args, **kwargs):
+        state.model_calls.append((args, kwargs))
+        raise ValueError("test_stopping_before_gateway")
+
+    monkeypatch.setattr(lookup_backend_model, "start_model", start_model)
+    state.manifest = {
+        "hermes_python": sys.executable, "output": str(tmp_path), "candidate": "a" * 40,
+        "api_port": 28660, "companion_port": 28785, "model_port": 11441,
+        "_verified_artifacts": object(),
+    }
+    state.task = task
+    return state
+
+
+@pytest.mark.parametrize("timeout,seconds", [(None, 60), (180, 180)])
+def test_owned_runner_forwards_loader_from_its_process_owner(
+    owned_runner_before_gateway, timeout, seconds,
+):
+    state = owned_runner_before_gateway
+    supplied = []
+
+    async def loader(**_):
+        return True
+
+    def factory(processes, directory):
+        supplied.append((processes, directory))
+        return loader
+
+    result = state.task.run_owned(
+        state.manifest, mcp_loader_factory=factory, startup_timeout_seconds=timeout,
+    )
+    assert supplied == [(state.processes, Path(state.manifest["output"]) / "mcp-load")]
+    args, kwargs = state.model_calls[0]
+    assert args[1] is state.processes and args[4] == 1000 + seconds
+    assert kwargs["mcp_loader"] is loader
+    assert kwargs["startup_timeout_seconds"] is timeout
+    assert kwargs["verified"] is state.manifest["_verified_artifacts"]
+    assert result["category"] == "refused" and state.stops == 1
+
+
+@pytest.mark.parametrize("loader", [None, object()])
+def test_owned_runner_rejects_missing_factory_loader_before_native_fallback(
+    owned_runner_before_gateway, loader,
+):
+    state = owned_runner_before_gateway
+    result = state.task.run_owned(state.manifest, mcp_loader_factory=lambda *_: loader)
+    assert state.model_calls == []
+    assert result["category"] == "refused" and state.stops == 1
+
+
+def test_owned_runner_factory_failure_uses_existing_cleanup(owned_runner_before_gateway):
+    state = owned_runner_before_gateway
+
+    def factory(*_):
+        raise RuntimeError("test_factory_failure")
+
+    result = state.task.run_owned(state.manifest, mcp_loader_factory=factory)
+    assert state.model_calls == []
+    assert result["category"] == "refused" and state.stops == 1
+
+
+def test_owned_runner_default_retains_native_startup_selection(owned_runner_before_gateway):
+    state = owned_runner_before_gateway
+    state.task.run_owned(state.manifest)
+    args, kwargs = state.model_calls[0]
+    assert args[4] == 1060
+    assert kwargs["mcp_loader"] is None and kwargs["startup_timeout_seconds"] is None
+    assert state.stops == 1
+
+
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows-only composition")
 def test_fresh_isolated_parent_imports_owner_before_any_process(tmp_path):
     import subprocess
