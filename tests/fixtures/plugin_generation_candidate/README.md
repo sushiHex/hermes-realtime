@@ -69,15 +69,26 @@ flag. Its presence records admitted search-result metadata, not page extraction,
 answer correctness, citation fidelity, source authority or freshness. Those remain
 separate acceptance checks.
 Presentation freezes the complete admitted URL catalog in deterministic order and
-supplies it alongside the native answer. The whole JSON input must fit 16 KiB in
-UTF-8; an oversized catalog refuses without truncation or a formatter call. The
+supplies it alongside the exact objective, fallible native draft and immutable
+same-run search/extraction text snapshots. Extraction text must match both the
+admitted request and catalog URL. The formatter is instructed to synthesize from
+these untrusted passages and correct or omit unsupported draft claims, rather
+than repeat them as verified facts. This is a presentation mitigation, not evidence
+that the native generator improved.
+The whole JSON input must fit 16 KiB in UTF-8; an oversized catalog refuses without
+truncation or a formatter call. Evidence packing uses one shared prefix allowance,
+measuring the actual serialized byte size. Every prefix records its original byte
+length and truncation flag, and sources without passage text are explicit. Packing
+does not establish that omitted context is immaterial. The
 formatter selects unique, exact integer catalog IDs. Its schema permits an empty
 selection when no source supports the answer; publication refuses that outcome.
 Only selected IDs are resolved to the exact frozen URLs, rendered as a source list
 in detail. The existing 1800-character detail limit and reserved-markup validation
 apply after rendering, including all links. Catalog drift before publication
-refuses. No URL rewriting, extra source, repair call or new semantic verifier is
-added. URL metadata establishes reference eligibility, not claim support.
+refuses, as does replacement of the frozen passage snapshot during presentation.
+No URL rewriting, extra source, second repair call or lexical truth guard is added.
+Reference eligibility and evidence availability do not prove claim support; the
+actual output remains subject to the content rubric.
 Model-written voice/detail containing case-insensitive `http://`, `https://` or
 `www.` is refused rather than repaired. Web links are rendered only by the host
 from selected catalog IDs. This is a narrow web-link syntax rule: domain names,

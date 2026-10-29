@@ -28,6 +28,26 @@ Its backend-only execution and source/semantic evidence must be recorded before
 claiming a walkthrough passed; it does not qualify the foreground profile or a
 fresh model download.
 
+## Evidence-aware presentation
+
+The selected plugin retains immutable text snapshots from admitted, successful
+search and extraction results. Extraction text must name a URL from that exact
+admitted extraction request and the same run's source catalog. The formatter gets
+the original objective, the fallible native draft, stable source IDs and URL mapping,
+and these untrusted passages. Its instructions require evidence-aware synthesis,
+including supplied dates, qualifications and explicit gaps, rather than faithful
+repetition of unsupported draft claims.
+
+The complete serialized presentation input remains capped at 16,384 UTF-8 bytes.
+Packing shares one character-prefix allowance across passages and measures the
+actual serialized byte size. Every excerpt carries its original byte count and an
+explicit truncation flag; sources with no text are identified separately. Prefix
+packing does not establish that omitted context is immaterial. Voice remains capped
+at 220 characters and rendered detail, including selected citation URLs, at 1,800.
+These checks prove source binding, bounds and valid references, not factual truth
+or faithful inference. Actual answer quality and voice acceptance remain separately
+observed outcomes under [the grounding investigation](https://github.com/sushiHex/hermes-realtime/issues/386).
+
 ## Freeze the source and artifacts
 
 Use a clean public checkout. The delivered main commit is

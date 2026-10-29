@@ -146,8 +146,12 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert body["reasoning_effort"] == "none"
     assert body["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(body["messages"][-1]["content"])
-    assert payload == {"answer": s.original.choices[0].message.content, "sources": [
-        {"id": 0, "url": "https://example.invalid/source"}]}
+    assert payload["answer"] == s.original.choices[0].message.content
+    assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
+    assert payload["objective"] == "synthetic lookup"
+    assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "",
+                                    "original_bytes": 0, "truncated": False}]
+    assert payload["missing_source_ids"] == [0]
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
     assert s.captured["sdk"][0]["max_retries"] == 0
@@ -296,6 +300,177 @@ def test_successful_admitted_search_without_extraction_reaches_presentation(setu
     assert setup.row["phase"] == "search" and setup.row["settled"] == 1
     assert setup.row["spent"] == setup.row["admitted"] and len(setup.row["spent"]) == 1
     assert setup.run() is not setup.refused and len(setup.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/b", "title": "Published date", "description":
+     "Published October 21. Deployment in early 2027, once utilities are ready."},
+    {"url": "https://example.invalid/a", "description": "Bolt with Lucid."}]}}], indirect=True)
+def test_search_passages_are_immutable_and_bound_to_sorted_source_ids(setup):
+    s = setup
+    snapshots = s.row["passages"]
+    with pytest.raises(TypeError):
+        snapshots["https://example.invalid/a"] = ()
+    assert s.run() is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["objective"] == s.row["objective"]
+    assert payload["missing_source_ids"] == []
+    assert payload["evidence"][0] == {
+        "source_id": 0, "kind": "search", "text": "Bolt with Lucid.",
+        "original_bytes": len(b"Bolt with Lucid."), "truncated": False}
+    assert payload["evidence"][1]["source_id"] == 1
+    assert "Published October 21" in payload["evidence"][1]["text"]
+    assert "once utilities are ready" in payload["evidence"][1]["text"]
+    assert s.row["passages"] is snapshots
+
+
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/a", "description": "dated context. " + "界" * 20000},
+    {"url": "https://example.invalid/b", "description": "qualified context. " + "b" * 20000}]}}],
+    indirect=True)
+def test_evidence_pack_bounds_serialized_bytes_and_exposes_exact_prefix_omissions(setup):
+    s = setup
+    assert s.run() is not s.refused
+    packed = s.captured["requests"][0]["messages"][-1]["content"]
+    assert len(packed.encode("utf-8")) <= 16384
+    payload = json.loads(packed)
+    assert len(payload["evidence"]) == 2
+    for item in payload["evidence"]:
+        original = s.row["passages"][payload["sources"][item["source_id"]]["url"]][0][1]
+        assert original.startswith(item["text"]) and item["text"]
+        assert item["truncated"] is True
+        assert item["original_bytes"] == len(original.encode("utf-8"))
+
+
+def test_passage_map_replacement_during_presentation_is_refused(setup):
+    s = setup
+    async def replace():
+        s.row["passages"] = MappingProxyType(dict(s.row["passages"]))
+    s.captured["callback"] = replace
+    assert s.run() is s.refused
+    assert s.row["presentation_evidence"]["stage"] == "catalog-publication"
+
+
+def test_passage_catalog_mismatch_is_refused_before_formatter(setup):
+    setup.row["passages"] = MappingProxyType(dict(setup.row["passages"]) | {
+        "https://example.invalid/other": (("search", "Stale source text"),)})
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+
+
+def test_mutable_passage_snapshot_is_refused_before_formatter(setup):
+    setup.row["passages"] = dict(setup.row["passages"])
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_invalid_passage_shape_refuses_without_retaining_private_values(setup, capsys):
+    retrieve(setup.g, {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/a", "description": 7}]}})
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+    assert "[lookup-evidence]" in capsys.readouterr().out
+
+
+async def extract_passage(s, payload, before_result=None, urls=None):
+    args = {"urls": ["https://example.invalid/source"] if urls is None else urls}
+    s.row["request"] = "extract-request"
+    s.row["spent"].add("extract-call")
+    token = s.g.ticket.set(("selected", "extract-request", "extract-call", "web_extract",
+                            s.module.frozen(args)))
+    async def original(_):
+        if before_result:
+            before_result()
+        return payload
+    try:
+        return await s.g.wrap_extract(original)(args)
+    finally:
+        s.g.ticket.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_admitted_extraction_retains_same_url_content_as_immutable_snapshot(setup):
+    s = setup
+    before = s.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source",
+        "title": "Observation", "content": "Published October 21; available early 2027."}]})
+    assert await extract_passage(s, result) == result
+    assert s.row["passages"] is not before
+    assert before["https://example.invalid/source"] == (("search", ""),)
+    assert await asyncio.to_thread(s.run) is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["missing_source_ids"] == []
+    assert payload["evidence"][1]["kind"] == "extract"
+    assert payload["evidence"][1]["text"] == (
+        "Observation\nPublished October 21; available early 2027.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["request", "catalog"])
+async def test_extraction_cannot_attach_another_admitted_catalog_sources_text(
+    setup, capsys, binding,
+):
+    s = setup
+    # Catalog membership alone is insufficient: only this extraction's request may bind text.
+    if binding == "request":
+        s.row["urls"].add("https://example.invalid/other")
+    before = s.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/other",
+                                     "content": "SYNTHETIC_PRIVATE_TEXT"}]})
+    urls = ["https://example.invalid/other"] if binding == "catalog" else None
+    assert await extract_passage(s, result, urls=urls) == s.module.REFUSAL
+    assert s.row["passages"] is before and s.row["closed"]
+    output = capsys.readouterr().out
+    assert '"category":"membership"' in output and "SYNTHETIC_PRIVATE_TEXT" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["closed", "replaced"])
+async def test_late_extraction_never_updates_retained_passages(setup, kind):
+    s = setup
+    before = s.row["passages"]
+    def late():
+        if kind == "closed":
+            s.row["closed"] = s.row["cancelled"] = True
+        else:
+            replacement = dict(s.row)
+            s.g.budgets["selected"] = replacement
+            s.g.members = MappingProxyType({
+                "selected": (s.module.VERSION, "identity", replacement)})
+            s.g._membership_authority = s.g.members
+    result = json.dumps({"results": [{"url": "https://example.invalid/source", "content": "Late"}]})
+    assert await extract_passage(s, result, late) == s.module.REFUSAL
+    assert s.row["passages"] is before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["x" * 262145, "界" * 100000], ids=["characters", "utf8"])
+async def test_extraction_snapshot_ingress_is_bounded_before_retention(
+    setup, capsys, monkeypatch, text,
+):
+    before = setup.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source", "content": text}]},
+                        ensure_ascii=False)
+    parsed = []
+    original_loads = setup.module.json.loads
+    def loads(value, *args, **kwargs):
+        parsed.append(True)
+        return original_loads(value, *args, **kwargs)
+    monkeypatch.setattr(setup.module.json, "loads", loads)
+    assert await extract_passage(setup, result) == setup.module.REFUSAL
+    assert setup.row["passages"] is before
+    assert parsed == []
+    assert '"category":"bound"' in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/source", "description": "s" * 180000}]}}], indirect=True)
+async def test_combined_snapshot_bytes_are_bounded_atomically(setup, capsys):
+    before = setup.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source",
+                                     "content": "e" * 100000}]})
+    assert await extract_passage(setup, result) == setup.module.REFUSAL
+    assert setup.row["passages"] is before
+    assert '"category":"bound"' in capsys.readouterr().out
 
 
 def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
