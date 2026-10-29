@@ -135,7 +135,7 @@ def test_oversize_refuses_an_otherwise_valid_fixture(tmp_path):
         helper().load_frozen_search(path, hashlib.sha256(raw).hexdigest(), "question")
 
 
-def test_frozen_transport_never_forwards_web_even_outside_provider_scope():
+def test_frozen_transport_never_forwards_web_even_outside_provider_scope(capsys):
     spec = importlib.util.spec_from_file_location(
         "frozen_gateway", ROOT / "scripts/lookup_backend_gateway.py",
     )
@@ -153,3 +153,4 @@ def test_frozen_transport_never_forwards_web_even_outside_provider_scope():
     with pytest.raises(RuntimeError):
         send(None, request, timeout=30)
     assert witness["transportRefused"] is True
+    assert '"category":"frozen_web_transport_refused"' in capsys.readouterr().out
