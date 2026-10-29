@@ -58,5 +58,6 @@ class TaskStatusSnapshot:
             parts.append(
                 f"{self.cancelling} tasks with cancellation acknowledged, awaiting completion"
             )
-        status = "; ".join(parts) + "." if parts else "No confirmed active background tasks."
-        return status + " To cancel work, use the task's Cancel control."
+        if not parts:
+            return "No confirmed active background tasks."
+        return "; ".join(parts) + ". To cancel work, use the task's Cancel control."

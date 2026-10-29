@@ -27,6 +27,10 @@ def test_status_empty_and_unavailable_are_distinct():
     assert "unavailable" in owner.task_status().render()
 
 
+def test_empty_status_does_not_offer_cancellation():
+    assert TaskStatusSnapshot().render() == "No confirmed active background tasks."
+
+
 def test_status_source_is_exact_and_preserved_by_snapshot():
     row = ConversationMessage(
         "assistant", "No confirmed active background tasks.", source="host_task_status"
@@ -308,7 +312,7 @@ async def test_interrupted_host_speech_records_heard_prefix_and_replays_source()
         synthesizer=SentenceSliceSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
-        task_status=lambda: TaskStatusSnapshot(),
+        task_status=lambda: TaskStatusSnapshot(active=1),
     )
     response = asyncio.create_task(loop.respond("turn_001", Transcript(text="Status?", final=True)))
     await playback.blocked.wait()
@@ -317,7 +321,7 @@ async def test_interrupted_host_speech_records_heard_prefix_and_replays_source()
     heard = context.snapshot().messages[-1]
     assert (heard.source, heard.text, heard.interrupted) == (
         "host_task_status",
-        "No confirmed active background tasks.",
+        "1 confirmed active background tasks.",
         True,
     )
     assert await loop.resume_interrupted()
