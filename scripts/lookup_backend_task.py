@@ -255,8 +255,10 @@ def require_owned_listeners(rows: Any, members: Any) -> None:
 
 
 def run_owned(m: Any, *, mcp_loader_factory: Any = None,
-              startup_timeout_seconds: Any = None, model_response_capture: Any = "off") -> Any:
+              startup_timeout_seconds: Any = None, model_response_capture: Any = "off",
+              frozen_search_fixture: Any = None, frozen_search_sha256: Any = None) -> Any:
     """Own one task; a supplied loader factory must return an actual loader."""
+    from scripts.lookup_frozen_search import load_frozen_search
     from scripts.lookup_model_capture import capture_endpoint, validate_mode
 
     require(os.name == "nt", "windows_required")
@@ -292,6 +294,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     result: dict[str, Any] = {"category": "refused"}
     capture_mode = "off"
     try:
+        replay = load_frozen_search(frozen_search_fixture, frozen_search_sha256, m.get("objective"))
         capture_mode = validate_mode(model_response_capture)
         if capture_mode != "off":
             from scripts.setup_lookup_backend import protect_directory
@@ -324,6 +327,10 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
             API_SERVER_PORT=str(m["api_port"]),
             PYTHONDONTWRITEBYTECODE="1",
         )
+        replay_arguments = ([] if replay is None else [
+            "--frozen-search-fixture", str(frozen_search_fixture),
+            "--frozen-search-sha256", frozen_search_sha256,
+        ])
         gateway = processes.spawn(
             "gateway",
             [
@@ -334,7 +341,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
                 str(output / "prepared.json"),
                 "--model-response-capture",
                 capture_mode,
-            ],
+            ] + replay_arguments,
             env=env,
             cwd=Path(m["hermes_source"]),
             log=Path(os.devnull),
@@ -378,14 +385,26 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
         result = asyncio.run(execute(m, output / "result"))
         witness = read_json(output / "gateway-witness.private.json")
         require(witness.get("transportRefused") is False, "transport_refused")
+        if replay is not None:
+            frozen = witness.get("frozenSearchReplay", {})
+            result["frozen_search_replay"] = frozen
+            require(not frozen.get("extraction_refused"), "frozen_extract_unavailable")
+            require(
+                frozen == {"mode": "frozen", "sha256": frozen_search_sha256, "searches": 1,
+                           "extraction_refused": False, "refused": False},
+                "frozen_replay_refused",
+            )
+            require(witness.get("searchRequests") == witness.get("extractRequests") == 0,
+                    "frozen_live_web_refused")
     except Exception as error:
         result["category"] = "refused"
         result["failure_kind"] = type(error).__name__
         if type(error) is ValueError:
             result["failure_category"] = (
-                "mcp_loader_required"
+                error.args[0]
                 if len(error.args) == 1 and type(error.args[0]) is str
-                and error.args[0] == "mcp_loader_required" else "validation_refused"
+                and error.args[0] in {"mcp_loader_required", "frozen_extract_unavailable"}
+                else "validation_refused"
             )
     finally:
         result["cleanup_begin_ns"] = time.monotonic_ns()
@@ -439,6 +458,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
                 } else "refused",
                 "failure_category": failure if failure in {
                     "none", "mcp_loader_required", "validation_refused",
+                    "frozen_extract_unavailable",
                 } else "unclassified_failure",
                 "cleanup_failures": len(cleanup_errors),
                 "owned_listeners_gone": result.get("owned_listeners_gone") is True,

@@ -240,6 +240,7 @@ def bounded_exa_send(
     save: Any,
     state: Any,
     metadata_urls: Any = frozenset(),
+    frozen_replay: bool = False,
 ) -> Any:
     lock = threading.RLock()
 
@@ -249,6 +250,8 @@ def bounded_exa_send(
         phase = "request_decode"
         refusal: dict[str, Any] | None = None
         try:
+            if frozen_replay and request.url not in metadata_urls:
+                raise RuntimeError("frozen_web_transport_refused")
             # Unknown traffic still refuses. This separate read-only lane is never active
             # within a provider invocation and never accepts the Exa endpoint itself.
             if (
@@ -420,15 +423,31 @@ def _model_capture_module() -> Any:
     return module
 
 
+def _frozen_search_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "owned_frozen_search", ROOT / "lookup_frozen_search.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("frozen_search_helper_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> Any:
     global INSTALL
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest")
     parser.add_argument("--model-response-capture", default="off",
                         choices=("off", "metadata", "controlled-public"))
+    parser.add_argument("--frozen-search-fixture")
+    parser.add_argument("--frozen-search-sha256")
     args = parser.parse_args()
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
+    replay = _frozen_search_module().load_frozen_search(
+        args.frozen_search_fixture, args.frozen_search_sha256, manifest["objective"],
+    )
     INSTALL = Path(manifest["hermes_source"]).resolve()
     output = manifest_path.parent
     package = Path(manifest["packageRoot"]).resolve()
@@ -457,6 +476,8 @@ def main() -> Any:
         "transportRefused": False,
         "globalPopenUnchanged": True,
     }
+    if replay is not None:
+        witness["frozenSearchReplay"] = replay.summary()
     target = output / "gateway-witness.private.json"
     save_lock = threading.Lock()
     original = subprocess.Popen
@@ -514,9 +535,13 @@ def main() -> Any:
     def observe_search(query: Any, limit: Any = 5) -> Any:
         wire_state.search = {"query": query, "limit": max(1, int(limit)), "spent": False}
         try:
-            result = original_search(query, limit)
+            result = (replay.search(query, limit) if replay is not None
+                      else original_search(query, limit))
         finally:
             wire_state.search = None
+            if replay is not None:
+                witness["frozenSearchReplay"] = replay.summary()
+                save()
         if type(result) is dict and result.get("success") is True:
             data = result.get("data")
             rows = data.get("web") if type(data) is dict else None
@@ -530,6 +555,12 @@ def main() -> Any:
         return result
 
     def observe_extract(urls: Any, **kwargs: Any) -> Any:
+        if replay is not None:
+            try:
+                return replay.extract()
+            finally:
+                witness["frozenSearchReplay"] = replay.summary()
+                save()
         if type(urls) is list:
             with projection_lock:
                 allowed_urls.update(
@@ -545,7 +576,8 @@ def main() -> Any:
     import requests  # type: ignore[import-untyped]
 
     requests.sessions.Session.send = bounded_exa_send(
-        requests.sessions.Session.send, witness, allowed_urls, save, wire_state, metadata_urls
+        requests.sessions.Session.send, witness, allowed_urls, save, wire_state, metadata_urls,
+        frozen_replay=replay is not None,
     )
     witness.update(
         searchProviderReady=True,

@@ -504,6 +504,45 @@ def test_owned_runner_existing_capture_artifact_refuses_before_model_start(
     assert "PRIVATE_OLD_CAPTURE" not in marker
 
 
+def test_owned_runner_frozen_fixture_refuses_before_loader(owned_runner_before_gateway, capsys):
+    state = owned_runner_before_gateway
+    called = []
+    result = state.task.run_owned(
+        state.manifest, frozen_search_fixture="PRIVATE_BAD_PATH", frozen_search_sha256="bad",
+        mcp_loader_factory=lambda *_: called.append(True),
+    )
+    assert result["category"] == "refused" and state.model_calls == [] and called == []
+    output = capsys.readouterr().out
+    assert "PRIVATE_BAD_PATH" not in output
+    assert '"category":"frozen_search_config"' in output
+
+
+def test_owned_runner_forwards_frozen_fixture_pair(
+    owned_runner_before_gateway, monkeypatch, tmp_path,
+):
+    import hashlib
+
+    import scripts
+    from tests.test_lookup_frozen_search import snapshot
+
+    state = owned_runner_before_gateway
+    path, digest, _ = snapshot(tmp_path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    state.manifest.update(objective="question", profile=str(tmp_path), hermes_source=str(tmp_path))
+    monkeypatch.setattr(state.task.os, "devnull", __import__("os").devnull, raising=False)
+    monkeypatch.setattr(scripts.rehearse_desktop_mvp, "_isolated", lambda _: {}, raising=False)
+    monkeypatch.setattr("scripts.lookup_backend_model.start_model", lambda *a, **k: None)
+    seen = []
+
+    def spawn(_name, command, **_kwargs):
+        seen.append(command)
+        raise RuntimeError("stop before gateway")
+
+    monkeypatch.setattr(state.processes, "spawn", spawn, raising=False)
+    state.task.run_owned(state.manifest, frozen_search_fixture=path, frozen_search_sha256=digest)
+    assert seen[0][-4:] == ["--frozen-search-fixture", str(path), "--frozen-search-sha256", digest]
+
+
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows-only composition")
 def test_fresh_isolated_parent_imports_owner_before_any_process(tmp_path):
     import subprocess
