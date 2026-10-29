@@ -362,3 +362,19 @@ def test_native_observation_failure_and_bounds_preserve_result(tmp_path, monkeyp
         assert module.run_llm_execution_middleware({}, lambda req: result,
                                                    **native_context()) is result
     assert read(tmp_path)["unavailable_reason"] == "observation_failed"
+
+
+
+@pytest.mark.parametrize("text", ["x" * (capture.MAX_RESPONSE_BYTES + 1),
+                                 chr(0x1F600) * (capture.MAX_RESPONSE_BYTES // 4 + 1)],
+                         ids=["characters", "utf8-bytes"])
+def test_native_response_bound_precedes_hash_and_retention(tmp_path, monkeypatch, text):
+    observer = recorder(tmp_path, "controlled-public")
+    result = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=text), finish_reason="stop")])
+    monkeypatch.setattr(capture.hashlib, "sha256",
+                        lambda *a: pytest.fail("oversized response reached hashing"))
+    observer.observe_native({}, result, native_context())
+    data = read(tmp_path)
+    assert data["available"] is False and data["unavailable_reason"] == "response_bound"
+    assert data["events"] == [] and data["observed"] == 1

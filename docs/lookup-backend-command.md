@@ -200,7 +200,13 @@ short circuit that does not call the provider produces no native event. The prov
 stream normally; its assembled response is returned unchanged. Presentation capture observes
 only asynchronous HTTPX sends to the exact chat-completions endpoint. Synchronous HTTPX
 sends are untouched. Events identify `native` or `presentation` stage; indexes reflect
-observation order, not provider request IDs. This does not verify the content's truth.
+observation order, not provider request IDs. Native strings are capped at 64 KiB before
+hashing; a character-count guard bounds UTF-8 allocation before the byte-count check.
+Multiple native events can include tool calls or retries; scope-skipped calls are not
+retained. `available: true` alone does not prove a complete pair. Select the completed
+native answer by finish reason and equality with the actual presentation source SHA,
+then independently match the formatter output; do not select by event index. Capture
+does not verify the content's truth.
 Check the owner/witness capture summary and bounded `[lookup-model-capture]` diagnostics as
 well as the artifact: a failed atomic replacement can leave an older file. Unavailable or
 dropped capture is never evidence of no output or a complete before/after observation.

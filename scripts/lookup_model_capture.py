@@ -190,7 +190,13 @@ class ModelResponseCapture:
                  "content_kind": "string" if type(content) is str
                  else "none" if content is None else "other"}
         if type(content) is str:
+            if len(content) > MAX_RESPONSE_BYTES:
+                self._fail("response_bound")
+                return
             raw = content.encode("utf-8")
+            if len(raw) > MAX_RESPONSE_BYTES:
+                self._fail("response_bound")
+                return
             event.update(content_chars=len(content), content_bytes=len(raw),
                          content_sha256=hashlib.sha256(raw).hexdigest())
             if self.mode == "controlled-public":
