@@ -1,5 +1,6 @@
 """Consequential selection controls for the explicit disposable setup command."""
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,15 +345,64 @@ def test_owned_runner_forwards_loader_from_its_process_owner(
 
 @pytest.mark.parametrize("loader", [None, object()])
 def test_owned_runner_rejects_missing_factory_loader_before_native_fallback(
-    owned_runner_before_gateway, loader,
+    owned_runner_before_gateway, loader, capsys,
 ):
     state = owned_runner_before_gateway
+    state.manifest["objective"] = "SYNTHETIC_PRIVATE_OBJECTIVE"
+    state.manifest["bearer"] = "SYNTHETIC_PRIVATE_TOKEN"
     result = state.task.run_owned(state.manifest, mcp_loader_factory=lambda *_: loader)
     assert state.model_calls == []
     assert result["category"] == "refused" and state.stops == 1
+    assert result["failure_category"] == "mcp_loader_required"
+    output = _owned_runner_diagnostic(capsys, reason="mcp_loader_required")
+    assert state.manifest["output"] not in output and "SYNTHETIC_PRIVATE" not in output
 
 
-def test_owned_runner_factory_failure_uses_existing_cleanup(owned_runner_before_gateway):
+def _owned_runner_diagnostic(capsys, *, reason, receipt_saved=True):
+    output = capsys.readouterr().out
+    prefix = "[lookup-owned] "
+    lines = [line for line in output.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1 and output == lines[0] + "\n"
+    assert len(lines[0].encode()) <= 512
+    assert json.loads(lines[0][len(prefix):]) == {
+        "category": "refused", "failure_category": reason, "cleanup_failures": 0,
+        "owned_listeners_gone": True, "owned_processes_settled": True,
+        "user_listener_unchanged": True, "receipt_saved": receipt_saved,
+    }
+    return output
+
+
+def test_owned_runner_diagnostic_survives_private_receipt_write_failure(
+    owned_runner_before_gateway, monkeypatch, capsys,
+):
+    state = owned_runner_before_gateway
+    original = Path.write_text
+
+    def write_text(path, *args, **kwargs):
+        if path.name == "owner-receipt.private.json":
+            raise OSError("SYNTHETIC_PRIVATE_RECEIPT_ERROR")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    with pytest.raises(OSError, match="SYNTHETIC_PRIVATE_RECEIPT_ERROR"):
+        state.task.run_owned(state.manifest, mcp_loader_factory=lambda *_: None)
+    assert state.model_calls == [] and state.stops == 1
+    _owned_runner_diagnostic(capsys, reason="mcp_loader_required", receipt_saved=False)
+
+
+def test_owned_runner_diagnostic_does_not_disclose_other_value_error(
+    owned_runner_before_gateway, capsys,
+):
+    state = owned_runner_before_gateway
+
+    def factory(*_):
+        raise ValueError("SYNTHETIC_PRIVATE_ERROR https://private.invalid/token")
+
+    state.task.run_owned(state.manifest, mcp_loader_factory=factory)
+    _owned_runner_diagnostic(capsys, reason="validation_refused")
+
+
+def test_owned_runner_factory_failure_uses_existing_cleanup(owned_runner_before_gateway, capsys):
     state = owned_runner_before_gateway
 
     def factory(*_):
@@ -361,6 +411,7 @@ def test_owned_runner_factory_failure_uses_existing_cleanup(owned_runner_before_
     result = state.task.run_owned(state.manifest, mcp_loader_factory=factory)
     assert state.model_calls == []
     assert result["category"] == "refused" and state.stops == 1
+    _owned_runner_diagnostic(capsys, reason="unclassified_failure")
 
 
 def test_owned_runner_default_retains_native_startup_selection(owned_runner_before_gateway):
