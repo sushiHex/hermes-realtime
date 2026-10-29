@@ -918,3 +918,141 @@ def test_load_uses_remaining_budget_but_metadata_keeps_eight_seconds(
     load, readback = owned[4]
     assert 8 < load.extensions["timeout"]["read"] <= 60
     assert 0 < readback.extensions["timeout"]["read"] <= 8
+
+
+def delayed_version_opener(monkeypatch, owned, errors):
+    """Actual urllib-probe boundary; no socket or process is involved."""
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+
+    class Opener:
+        def open(self, request, timeout):
+            assert 0 < timeout <= 8
+            calls.append(request)
+            kind = request.full_url.rsplit("/", 1)[-1]
+            if kind == "version" and errors:
+                error = errors.pop(0)
+                raise error
+            reply = owned[3][{"version": 0, "tags": 1, "show": 2}[kind]]
+            return Response(json.dumps(reply).encode())
+
+    monkeypatch.setattr(model.urllib.request, "build_opener", lambda *_args: Opener())
+    return calls
+
+
+def test_version_http_readiness_retries_transients_before_one_load(
+    selected, owned, tmp_path, monkeypatch,
+):
+    from urllib.error import URLError
+
+    calls = delayed_version_opener(
+        monkeypatch, owned, [TimeoutError("private timeout"), URLError(ConnectionRefusedError())],
+    )
+    monkeypatch.setattr(model.time, "sleep", lambda _seconds: None)
+    result = start(selected, owned, tmp_path)
+    assert result["model_ready"] is True
+    assert [request.full_url.rsplit("/", 1)[-1] for request in calls] == [
+        "version", "version", "version", "tags", "show"]
+    assert result["version_probe_attempts"] == 3
+    assert result["version_probe_transient_failures"] == 2
+    assert result["version_probe_last_transient"] == "connection_refused"
+    assert result["metadata_request_count"] == 6
+    assert result["load_request_count"] == 1 and len(owned[4]) == 2
+
+
+@pytest.mark.parametrize("kind", ["http", "redirect", "schema", "other-urlerror"])
+def test_version_readiness_does_not_retry_permanent_failures(
+    selected, owned, tmp_path, monkeypatch, kind,
+):
+    from urllib.error import HTTPError, URLError
+
+    errors = {"http": HTTPError("http://private.invalid", 401, "private auth", {}, None),
+              "redirect": ValueError("metadata-redirect"),
+              "schema": ValueError("metadata-shape"),
+              "other-urlerror": URLError(PermissionError("private denied"))}
+    calls = delayed_version_opener(monkeypatch, owned, [errors[kind]])
+    with pytest.raises(type(errors[kind])):
+        start(selected, owned, tmp_path)
+    assert len(calls) == 1 and owned[4] == []
+
+
+def test_version_readiness_never_renews_startup_deadline(
+    selected, owned, tmp_path, monkeypatch,
+):
+    now = [1000.0]
+    calls = []
+    monotonic_ns = model.time.monotonic_ns
+    monkeypatch.setattr(model, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=monotonic_ns,
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)))
+
+    class Opener:
+        def open(self, request, timeout):
+            assert timeout <= 1001.0 - now[0]
+            calls.append(request)
+            assert len(calls) <= 3, "deadline was renewed"
+            now[0] += 0.4
+            raise TimeoutError("private startup timeout")
+
+    monkeypatch.setattr(model.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(TimeoutError, match="model-deadline"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence", 1001.0)
+    assert len(calls) == 2 and owned[4] == []
+    receipt = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert receipt["startup_effective_budget_seconds"] == 1
+    assert receipt["version_probe_attempts"] == 2
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+@pytest.mark.parametrize("loss", ["listener", "process"])
+def test_version_retry_rechecks_ownership_before_any_new_request(
+    selected, owned, tmp_path, monkeypatch, loss,
+):
+    calls = []
+    lost = [False]
+    original_listeners = model._listeners
+    monkeypatch.setattr(model, "_listeners", lambda port, deadline: (
+        [(f"127.0.0.1:{port}", 999)] if lost[0] and loss == "listener"
+        else original_listeners(port, deadline)))
+    monkeypatch.setattr(model.time, "sleep", lambda _seconds: None)
+
+    class Response(io.BytesIO):
+        status = 200
+
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request)
+            if len(calls) == 1:
+                lost[0] = True
+                if loss == "process":
+                    owned[0].roots[model.MODEL_PROCESS_NAME].poll = lambda: 4
+                raise TimeoutError("startup timeout")
+            return Response(b'{"version":"0.40.4"}')
+
+    monkeypatch.setattr(model.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(RuntimeError, match="listener-owner"):
+        start(selected, owned, tmp_path)
+    assert len(calls) == 1 and owned[4] == []
+
+
+def test_retry_is_limited_to_initial_version_readiness(
+    selected, owned, tmp_path, monkeypatch,
+):
+    calls = []
+
+    class Response(io.BytesIO):
+        status = 200
+
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request)
+            if request.full_url.endswith("/api/tags"):
+                raise TimeoutError("later metadata failure")
+            return Response(b'{"version":"0.40.4"}')
+
+    monkeypatch.setattr(model.urllib.request, "build_opener", lambda *_args: Opener())
+    with pytest.raises(TimeoutError, match="later metadata failure"):
+        start(selected, owned, tmp_path)
+    assert len(calls) == 2 and owned[4] == []
