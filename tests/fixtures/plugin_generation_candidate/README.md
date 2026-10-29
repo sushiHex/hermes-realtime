@@ -71,8 +71,10 @@ separate acceptance checks.
 Presentation freezes the complete admitted URL catalog in deterministic order and
 supplies it alongside the exact objective, fallible native draft and immutable
 same-run search/extraction text snapshots. Extraction text must match both the
-admitted request and catalog URL. The formatter is instructed to synthesize from
-these untrusted passages and correct or omit unsupported draft claims, rather
+admitted request and catalog URL. An unbound extraction echo leaves the tool result unchanged
+and records explicit `extract-unavailable` context for the requested catalog
+sources, rather than attaching unproven text or refusing the run. The formatter
+is instructed to synthesize from these untrusted passages and correct or omit unsupported draft claims, rather
 than repeat them as verified facts. This is a presentation mitigation, not evidence
 that the native generator improved.
 The whole JSON input must fit 16 KiB in UTF-8; an oversized catalog refuses without

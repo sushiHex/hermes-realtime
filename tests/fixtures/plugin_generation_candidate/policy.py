@@ -47,6 +47,8 @@ PRESENTATION_INSTRUCTIONS = (
     "provided. Evidence marked truncated is an exact prefix, not a complete source; "
     "missing_source_ids have no passage. State requested information as unavailable when "
     "the supplied evidence is insufficient; never infer absent context. "
+    "An extract-unavailable entry means returned extraction identity could not be bound "
+    "to that requested source; its text was omitted, not verified as empty. "
     "Return JSON with exactly voice, detail and source_ids. Select only catalog IDs that "
     "support the answer; choose an empty source_ids array if none supports it. Never invent "
     "sources. Use unique IDs. Do not write URLs in voice or detail; the host renders the "
@@ -82,7 +84,7 @@ def presentation_input(answer, objective, catalog, passages):
         if not values or not any(text for _, text in values):
             missing.append(source_id)
         for kind, text in values:
-            if kind not in {"search", "extract"} or type(text) is not str:
+            if kind not in {"search", "extract", "extract-unavailable"} or type(text) is not str:
                 raise ValueError("presentation-evidence-shape")
             rows.append((source_id, kind, text, len(text.encode("utf-8"))))
 
@@ -879,6 +881,7 @@ class Generation:
     def capture_passages(self, row, items, kind, admitted):
         """Retain only admitted same-run text, replacing the immutable snapshot atomically."""
         category = "shape"
+        unbound = 0
         try:
             if type(items) is not list or len(items) > 256:
                 raise ValueError("evidence-shape")
@@ -890,11 +893,19 @@ class Generation:
                 if type(item) is not dict:
                     raise ValueError("evidence-shape")
                 url = item["url"]
-                if not url.strip():
+                if not url.strip() and kind == "search":
                     continue
                 category = "membership"
                 if url not in admitted or url not in row["urls"]:
-                    raise ValueError("evidence-membership")
+                    if kind != "extract":
+                        raise ValueError("evidence-membership")
+                    unbound += 1
+                    for requested in admitted & row["urls"]:
+                        values = updated.get(requested, ())
+                        gap = ("extract-unavailable", "")
+                        if gap not in values:
+                            updated[requested] = values + (gap,)
+                    continue
                 category = "shape"
                 updated.setdefault(url, ())
                 if item.get("error") or item.get("blocked_by_policy"):
@@ -915,3 +926,6 @@ class Generation:
             if category is not None:
                 print("[lookup-evidence] " + frozen({"category": category, "kind": kind}),
                       flush=True)
+            elif unbound:
+                print("[lookup-evidence] " + frozen({
+                    "category": "unbound", "kind": kind, "count": unbound}), flush=True)

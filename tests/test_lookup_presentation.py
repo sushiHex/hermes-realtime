@@ -416,10 +416,35 @@ async def test_extraction_cannot_attach_another_admitted_catalog_sources_text(
     result = json.dumps({"results": [{"url": "https://example.invalid/other",
                                      "content": "SYNTHETIC_PRIVATE_TEXT"}]})
     urls = ["https://example.invalid/other"] if binding == "catalog" else None
-    assert await extract_passage(s, result, urls=urls) == s.module.REFUSAL
-    assert s.row["passages"] is before and s.row["closed"]
+    assert await extract_passage(s, result, urls=urls) == result
+    assert not s.row["closed"]
+    assert set(s.row["passages"]) == set(before)
+    assert all("SYNTHETIC_PRIVATE_TEXT" not in text
+               for values in s.row["passages"].values() for _, text in values)
+    if binding == "request":
+        assert ("extract-unavailable", "") in s.row["passages"]["https://example.invalid/source"]
     output = capsys.readouterr().out
-    assert '"category":"membership"' in output and "SYNTHETIC_PRIVATE_TEXT" not in output
+    assert '"category":"unbound"' in output and "SYNTHETIC_PRIVATE_TEXT" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/caf\u00e9", "description": "Dated search context."}]}}],
+    indirect=True)
+async def test_canonicalized_extraction_echo_is_an_explicit_gap_without_refusing_run(setup):
+    s = setup
+    requested = "https://example.invalid/caf\u00e9"
+    echoed = "https://example.invalid/caf%C3%A9"
+    result = json.dumps({"results": [{"url": echoed, "content": "Unbound extraction text"}]})
+    assert await extract_passage(s, result, urls=[requested]) == result
+    assert not s.row["closed"] and s.row["urls"] == {requested}
+    assert s.row["passages"][requested] == (
+        ("search", "Dated search context."), ("extract-unavailable", ""))
+    assert await asyncio.to_thread(s.run) is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["evidence"][1]["kind"] == "extract-unavailable"
+    assert payload["evidence"][1]["text"] == ""
+    assert "Unbound extraction text" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio

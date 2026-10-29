@@ -33,7 +33,10 @@ fresh model download.
 The selected plugin retains immutable text snapshots from admitted, successful
 search and extraction results. Extraction text must name a URL from that exact
 admitted extraction request and the same run's source catalog. The formatter gets
-the original objective, the fallible native draft, stable source IDs and URL mapping,
+no text from an unbound extraction echo: the tool result and run are preserved,
+with an explicit `extract-unavailable` passage for the requested catalog sources.
+This includes canonicalized echoes whose equivalence has not been established.
+The formatter gets the original objective, the fallible native draft, stable source IDs and URL mapping,
 and these untrusted passages. Its instructions require evidence-aware synthesis,
 including supplied dates, qualifications and explicit gaps, rather than faithful
 repetition of unsupported draft claims.
