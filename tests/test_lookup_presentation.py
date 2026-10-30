@@ -1234,6 +1234,40 @@ def test_native_rejection_category_is_fixed_and_does_not_emit_arguments(
     assert "SYNTHETIC_PRIVATE" not in output and "Out of range float values" not in output
 
 
+@pytest.mark.parametrize(
+    ("args", "kind", "count", "cause", "nonstring", "duplicate", "unadmitted"), [
+    ({}, "missing", 0, "not_list", 0, 0, 0),
+    ({"urls": "SYNTHETIC_PRIVATE_WRONG_TYPE"}, "string", 0, "not_list", 0, 0, 0),
+    ({"urls": []}, "list", 0, "count", 0, 0, 0),
+    ({"urls": ["a", "b", "c", "SYNTHETIC_PRIVATE_EXTRA", "e"]},
+     "list", 4, "count", 0, 0, 0),
+    ({"urls": [None, "SYNTHETIC_PRIVATE_NONSTRING"]}, "list", 2, "non_string", 1, 0, 0),
+    ({"urls": ["https://example.invalid/source"] * 2}, "list", 2, "duplicate", 0, 1, 0),
+    ({"urls": ["https://example.invalid/SYNTHETIC_PRIVATE_UNADMITTED"]},
+     "list", 1, "not_admitted", 0, 0, 1),
+], ids=["missing", "wrong-type", "empty", "too-many", "non-string",
+        "duplicate", "unadmitted"])
+def test_extract_url_rejection_emits_only_bounded_cause_counts(
+    setup, capsys, args, kind, count, cause, nonstring, duplicate, unadmitted,
+):
+    s = setup
+    call = SimpleNamespace(id="synthetic-extract-call", function=SimpleNamespace(
+        name="web_extract", arguments=json.dumps(args)))
+    s.run.original = completion(None, reason="tool_calls", calls=[call])
+    assert s.run() is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["rejection"] == "url-membership"
+    assert evidence["extract_urls_kind"] == kind
+    assert evidence["extract_urls_count"] == count
+    assert evidence["extract_urls_rejection_cause"] == cause
+    assert evidence["extract_urls_non_string_count"] == nonstring
+    assert evidence["extract_urls_duplicate_count"] == duplicate
+    assert evidence["extract_urls_unadmitted_count"] == unadmitted
+    output = capsys.readouterr().out
+    assert "SYNTHETIC_PRIVATE" not in output
+    assert "https://example.invalid" not in output
+
+
 def test_unknown_native_guard_exception_does_not_emit_its_secret_message(setup, capsys):
     s = setup
 

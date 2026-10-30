@@ -385,6 +385,64 @@ def response_facts(response, prefix, api_mode="chat_completions"):
     return {prefix + "_" + key: value for key, value in facts.items()}
 
 
+def _extract_url_diagnostics(args, admitted_urls):
+    """Return bounded counts describing a failed URL membership guard."""
+    present = "urls" in args
+    urls = args.get("urls")
+    if not present:
+        kind = "missing"
+    elif type(urls) is list:
+        kind = "list"
+    elif urls is None:
+        kind = "null"
+    elif type(urls) is str:
+        kind = "string"
+    elif type(urls) is dict:
+        kind = "mapping"
+    elif type(urls) is bool:
+        kind = "boolean"
+    elif type(urls) in (int, float):
+        kind = "number"
+    else:
+        kind = "other"
+
+    count = min(len(urls), EXTRACT_LIMIT + 1) if type(urls) is list else 0
+    overflow = type(urls) is list and len(urls) > EXTRACT_LIMIT + 1
+    facts = {
+        "extract_urls_kind": kind,
+        "extract_urls_count": count,
+        "extract_urls_count_overflow": overflow,
+        "extract_urls_rejection_cause": "not_list" if type(urls) is not list else "count",
+        "extract_urls_non_string_count": 0,
+        "extract_urls_duplicate_count": 0,
+        "extract_urls_unadmitted_count": 0,
+    }
+    if type(urls) is not list or not 1 <= len(urls) <= EXTRACT_LIMIT:
+        return facts
+
+    non_strings = sum(type(url) is not str for url in urls)
+    facts["extract_urls_non_string_count"] = non_strings
+    if non_strings:
+        facts["extract_urls_rejection_cause"] = "non_string"
+        return facts
+
+    seen = set()
+    duplicates = 0
+    for url in urls:
+        if url in seen:
+            duplicates += 1
+        else:
+            seen.add(url)
+    facts["extract_urls_duplicate_count"] = duplicates
+    if duplicates:
+        facts["extract_urls_rejection_cause"] = "duplicate"
+        return facts
+
+    facts["extract_urls_unadmitted_count"] = sum(url not in admitted_urls for url in urls)
+    facts["extract_urls_rejection_cause"] = "not_admitted"
+    return facts
+
+
 class Presentation:
     """One explicit same-route SDK call, independent of native tool dispatch."""
 
@@ -848,6 +906,7 @@ class Generation:
     def model_gate(self, **kw):
         run_id = ""
         response = None
+        native_diagnostics = {}
         api_mode = kw.get("api_mode", "")
         try:
             with self.lock:
@@ -940,7 +999,8 @@ class Generation:
                     and len(calls) == 1
                     and row["settled"] == row["reserved"]
                 ):
-                    urls = json.loads(next(iter(plan.values()))[1]).get("urls")
+                    extract_args = json.loads(next(iter(plan.values()))[1])
+                    urls = extract_args.get("urls")
                     if (
                         type(urls) is not list
                         or not 1 <= len(urls) <= EXTRACT_LIMIT
@@ -948,6 +1008,7 @@ class Generation:
                         or len(set(urls)) != len(urls)
                         or any(url not in row["urls"] for url in urls)
                     ):
+                        native_diagnostics = _extract_url_diagnostics(extract_args, row["urls"])
                         raise ValueError("url-membership")
                     row["phase"] = "extract"
                 else:
@@ -979,7 +1040,7 @@ class Generation:
                 evidence = {"category": "refused", "stage": "native-response", "calls": 0,
                             "wire_requests": 0, "failure_kind": type(error).__name__,
                             "rejection": rejection,
-                            **native_facts}
+                            **native_facts, **native_diagnostics}
                 row["presentation_evidence"] = evidence
                 with contextlib.suppress(OSError, ValueError):
                     print("[lookup-presentation] " + frozen(evidence), flush=True)
