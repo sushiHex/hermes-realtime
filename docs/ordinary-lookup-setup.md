@@ -72,6 +72,14 @@ resolved route before dispatch. This explicit-token configuration does not
 qualify OAuth discovery or refresh. A direct endpoint request alone does not
 prove the native Runs path.
 
+For a selected lookup, the advertised tools reflect the existing execution policy:
+after search settles, the model may answer or make one extraction request using
+unique URLs from that run's admitted catalog, within the existing extraction
+limit. After extraction, no further tools are advertised. The request is copied;
+shared native schemas and handlers remain unchanged. Runtime admission still
+checks every proposal independently; schema guidance does not authorize a call,
+repair its arguments, or guarantee that a model will comply.
+
 ## Freeze the source and artifacts
 
 Use a clean public checkout. The delivered main commit is
