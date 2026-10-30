@@ -58,7 +58,12 @@ streaming, `store: false` and low reasoning. The bounded stream must terminate i
 one completed response; unknown events or output, refusal, incomplete/null
 terminal state, or missing final answer refuse publication. Deltas are not used to
 reconstruct a response. A successful result retains its raw Responses envelope
-and rewrites only the final-answer text. This route uses an explicitly supplied
+and rewrites only the final-answer text. The observed subscription-provider
+`response.metadata` extension is ignored without inspecting its payload; it
+still counts toward the stream bound and is rejected after the terminal event.
+It cannot supply answer content or authorize work. Other unknown events remain
+refused. This is observed provider compatibility, not a claim that the extension
+is part of the documented Responses event set. This route uses an explicitly supplied
 token through the SDK Codex headers helper, without OAuth lookup or refresh, and
 does not establish foreground Codex support or native task qualification.
 
