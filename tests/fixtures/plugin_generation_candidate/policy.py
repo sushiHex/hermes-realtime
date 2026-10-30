@@ -863,7 +863,8 @@ class Generation:
                                 and type(tool.get("function")) is dict
                                 and tool["function"].get("name") == "web_search"
                             ] if type(tools) is list else []
-                        if len(advertised) != 1:
+                        if (len(advertised) != 1
+                                or advertised[0].get("type") != "function"):
                             raise ValueError("lookup-search-unavailable")
                         response = host_search_request(query, api_mode)
                     elif not row["urls"]:

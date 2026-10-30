@@ -399,14 +399,18 @@ def test_codex_stream_close_is_cancellation_boundary(setup):
 @pytest.mark.parametrize("events", [
     [],
     [SimpleNamespace(type="response.incomplete", response=SimpleNamespace(status="incomplete"))],
+    [SimpleNamespace(type="response.unknown_future_event")],
     [SimpleNamespace(type="response.completed", response=None)],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="not-completed", status="incomplete", output=[], usage=None))],
     [SimpleNamespace(type="response.completed", response=SimpleNamespace(
         id="null-output", status="completed", output=None, usage=None))],
     [SimpleNamespace(type="response.completed", response=SimpleNamespace(
         id="refusal", status="completed", output=[SimpleNamespace(
             type="message", role="assistant", status="completed", phase="final_answer",
             content=[SimpleNamespace(type="refusal", refusal="denied")])], usage=None))],
-], ids=["missing-terminal", "incomplete", "terminal-null", "output-null", "refusal"])
+], ids=["missing-terminal", "incomplete-event", "unknown-event", "terminal-null",
+        "native-not-completed", "output-null", "refusal"])
 def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup, events):
     s = setup
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
