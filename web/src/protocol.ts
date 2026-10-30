@@ -407,14 +407,7 @@ export function parseSearchEgressStatus(value: unknown): SearchEgressStatus {
 }
 
 export function parseBootstrapCredential(value: unknown): BootstrapCredential {
-  if (!isPlainRecord(value)) {
-    throw new Error("Invalid bootstrap credential shape");
-  }
-  const keys = Object.keys(value).sort();
-  if (
-    keys.length !== BOOTSTRAP_KEYS.length ||
-    keys.some((key, index) => key !== BOOTSTRAP_KEYS[index])
-  ) {
+  if (!isPlainRecord(value) || !hasExactKeys(value, BOOTSTRAP_KEYS)) {
     throw new Error("Invalid bootstrap credential shape");
   }
 
