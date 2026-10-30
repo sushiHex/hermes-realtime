@@ -160,20 +160,7 @@ class SearchEgressAuthority:
             raise TypeError("binding must be an exact SearchEgressBindingV1")
         if type(request) is not SearchEgressConsentRequestV1:
             raise TypeError("request must be an exact SearchEgressConsentRequestV1")
-        with self._lock:
-            if not self._operator_enabled:
-                raise RuntimeError("public search egress is disabled by the operator")
-            if binding != self._binding:
-                raise PermissionError("participant does not own the active search egress binding")
-            control = ("consent", request)
-            if request.sequence == self._last_sequence and control == self._last_control:
-                return self._status_locked()
-            if request.sequence != self._last_sequence + 1:
-                raise RuntimeError("search egress control sequence conflicts with current binding")
-            self._consented = True
-            self._last_sequence = request.sequence
-            self._last_control = control
-            return self._status_locked()
+        return self._apply_control(binding, ("consent", request), consented=True)
 
     def revoke(
         self,
@@ -184,18 +171,27 @@ class SearchEgressAuthority:
             raise TypeError("binding must be an exact SearchEgressBindingV1")
         if type(request) is not SearchEgressRevokeRequestV1:
             raise TypeError("request must be an exact SearchEgressRevokeRequestV1")
+        return self._apply_control(binding, ("revoke", request), consented=False)
+
+    def _apply_control(
+        self,
+        binding: SearchEgressBindingV1,
+        control: tuple[str, SearchEgressConsentRequestV1 | SearchEgressRevokeRequestV1],
+        *,
+        consented: bool,
+    ) -> SearchEgressStatusV1:
+        sequence = control[1].sequence
         with self._lock:
             if not self._operator_enabled:
                 raise RuntimeError("public search egress is disabled by the operator")
             if binding != self._binding:
                 raise PermissionError("participant does not own the active search egress binding")
-            control = ("revoke", request)
-            if request.sequence == self._last_sequence and control == self._last_control:
+            if sequence == self._last_sequence and control == self._last_control:
                 return self._status_locked()
-            if request.sequence != self._last_sequence + 1:
+            if sequence != self._last_sequence + 1:
                 raise RuntimeError("search egress control sequence conflicts with current binding")
-            self._consented = False
-            self._last_sequence = request.sequence
+            self._consented = consented
+            self._last_sequence = sequence
             self._last_control = control
             return self._status_locked()
 

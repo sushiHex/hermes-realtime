@@ -200,24 +200,17 @@ class ProductionObservationViewV1:
 class _ProductionObservationRecorderV1:
     """Owner-only recorder capability, never returned from browser composition."""
 
-    __slots__ = ("_append", "_append_close", "_matches")
+    __slots__ = ("_append", "_matches")
 
     def __init__(
         self,
         append: Callable[[ProductionObservationV1], None],
-        append_close: Callable[[CloseStageObservationV1], None],
         matches: Callable[[object], bool],
         token: object,
     ) -> None:
-        if (
-            token is not _CHANNEL_TOKEN
-            or not callable(append)
-            or not callable(append_close)
-            or not callable(matches)
-        ):
+        if token is not _CHANNEL_TOKEN or not callable(append) or not callable(matches):
             raise TypeError("production observation recorders are owner-created")
         self._append = append
-        self._append_close = append_close
         self._matches = matches
 
     def record_context_committed(self) -> None:
@@ -239,7 +232,10 @@ class _ProductionObservationRecorderV1:
         )
 
     def record_close_stage(self, *, stage: CloseStageV1, result: CloseResultV1) -> None:
-        self._append_close(CloseStageObservationV1(stage=stage, result=result))
+        # Close results are immutable attempt facts.  A later retry may derive a
+        # current final state, but must never rewrite the failed attempt that
+        # preceded it; Task 11 compares this exact ordering.
+        self._append(CloseStageObservationV1(stage=stage, result=result))
 
     def record_rollover(self, *, stage: RolloverStageV1, result: RolloverResultV1) -> None:
         self._append(RolloverObservationV1(stage=stage, result=result))
@@ -317,24 +313,8 @@ def _new_observation_channel(*, max_records: int = _MAX_RECORDS) -> tuple[
     append, records, status = _new_bounded_callbacks(state)
     identity = object()
 
-    def append_close(record: CloseStageObservationV1) -> None:
-        if not state.lock.acquire(blocking=False):
-            state.incomplete.set()
-            return
-        try:
-            if len(state.records) >= state.max_records:
-                state.incomplete.set()
-                return
-            # Close results are immutable attempt facts.  A later retry may
-            # derive a current final state, but must never rewrite the failed
-            # attempt that preceded it; Task 11 compares this exact ordering.
-            state.records = (*state.records, record)
-        finally:
-            state.lock.release()
-
     recorder = _ProductionObservationRecorderV1(
         append=append,
-        append_close=append_close,
         matches=lambda candidate: candidate is identity,
         token=_CHANNEL_TOKEN,
     )

@@ -280,22 +280,11 @@ class LocalBrowserLauncher:
             else:
                 self._provider_closed[index] = True
         self._started = False
-        if len(errors) == 1:
-            self._production_observation_recorder.record_close_stage(
-                stage=CloseStageV1.LAUNCHER,
-                result=CloseResultV1.FAILED,
-            )
-            raise errors[0]
-        if errors:
-            self._production_observation_recorder.record_close_stage(
-                stage=CloseStageV1.LAUNCHER,
-                result=CloseResultV1.FAILED,
-            )
-            raise BaseExceptionGroup("local browser launcher cleanup failed", errors)
         self._production_observation_recorder.record_close_stage(
             stage=CloseStageV1.LAUNCHER,
-            result=CloseResultV1.SUCCEEDED,
+            result=CloseResultV1.FAILED if errors else CloseResultV1.SUCCEEDED,
         )
+        self._raise_close_errors(errors)
         self._closed = True
 
     @staticmethod

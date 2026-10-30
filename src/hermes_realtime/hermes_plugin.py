@@ -127,10 +127,7 @@ def _close_companion() -> None:
 def get_dispatcher() -> HermesPluginDispatcher:
     """Return the adapter initialized by Hermes's plugin loader."""
 
-    with _lock:
-        if _runtime is None:
-            raise RuntimeError("hermes-realtime plugin has not been registered")
-        return _runtime.dispatcher
+    return get_runtime().dispatcher
 
 
 def get_runtime() -> HermesPluginRuntime:
