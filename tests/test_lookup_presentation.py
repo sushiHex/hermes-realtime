@@ -1268,6 +1268,171 @@ def test_extract_url_rejection_emits_only_bounded_cause_counts(
     assert "https://example.invalid" not in output
 
 
+def _request_with_lookup_tools(api_mode):
+    parameters = {
+        "type": "object", "title": "Native web_extract parameters",
+        "properties": {
+            "urls": {
+                "type": "array", "description": "Native URL field",
+                "minItems": 0, "maxItems": 100, "uniqueItems": False,
+                "items": {"type": "string", "description": "Native URL item"},
+            },
+            "char_limit": {
+                "type": "integer", "description": "Native file-recovery advice",
+                "minimum": 2000,
+            },
+        },
+        "required": ["urls"],
+        "additionalProperties": False,
+    }
+    names = ("web_search", "web_extract", "read_file")
+    if api_mode == "chat_completions":
+        tools = [{"type": "function", "function": {
+            "name": name, "description": "Native description " + name,
+            "parameters": json.loads(json.dumps(parameters)),
+        }} for name in names]
+    else:
+        tools = [{"type": "function", "name": name,
+                  "description": "Native description " + name,
+                  "parameters": json.loads(json.dumps(parameters))} for name in names]
+    return {
+        "model": "test-model", "tools": tools,
+        "tool_choice": {"type": "function", "name": "web_search"},
+        "parallel_tool_calls": True,
+        "functions": [{"name": "read_file"}], "function_call": "auto",
+        "metadata": {"preserve": "this"},
+    }
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_settled_search_projects_exact_optional_extract_tool(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+        s.run.original = s.codex_response([SimpleNamespace(
+            type="function_call", id="extract-item", call_id="extract-call",
+            name="web_extract",
+            arguments=json.dumps({"urls": ["https://example.invalid/source"]}),
+            status=None,
+        )])
+    else:
+        tool_call = SimpleNamespace(
+            id="extract-call", type="function",
+            function=SimpleNamespace(
+                name="web_extract", arguments='{"urls":["https://example.invalid/source"]}'),
+        )
+        s.run.original = completion(None, reason="tool_calls", calls=[tool_call])
+    s.row["urls"].add("https://example.invalid/second")
+    request = _request_with_lookup_tools(api_mode)
+    original = json.loads(json.dumps(request))
+    forwarded = []
+
+    def native(value):
+        forwarded.append(value)
+        return s.run.original
+
+    result = s.run(api_mode=api_mode, request=request, next_call=native)
+    assert result is s.run.original and s.row["phase"] == "extract"
+    assert len(forwarded) == 1 and forwarded[0] is not request
+    assert request == original
+    projected = forwarded[0]
+    assert [
+        item["function"]["name"] if api_mode == "chat_completions" else item["name"]
+        for item in projected["tools"]
+    ] == ["web_extract"]
+    tool = projected["tools"][0]
+    function = tool["function"] if api_mode == "chat_completions" else tool
+    assert function["description"] == s.module.EXTRACT_TOOL_DESCRIPTION
+    assert function["parameters"] == {
+        "type": "object", "title": "Native web_extract parameters",
+        "properties": {
+            "urls": {
+                "type": "array", "description": s.module.EXTRACT_URLS_DESCRIPTION,
+                "minItems": 1, "maxItems": s.module.EXTRACT_LIMIT, "uniqueItems": True,
+                "items": {"type": "string", "description": "Native URL item",
+                          "enum": sorted(s.row["urls"])},
+            },
+            "char_limit": {
+                "type": "integer", "description": s.module.EXTRACT_CHAR_LIMIT_DESCRIPTION,
+                "minimum": 2000,
+            },
+        },
+        "required": ["urls"], "additionalProperties": False,
+    }
+    assert projected["tool_choice"] == "auto"
+    assert projected["parallel_tool_calls"] is False
+    assert "functions" not in projected and "function_call" not in projected
+    assert projected["metadata"] == {"preserve": "this"}
+    assert "browser" not in function["description"].lower()
+    assert "read_file" not in function["description"].lower()
+    assert "read_file" not in function["parameters"]["properties"]["char_limit"][
+        "description"].lower()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_after_extract_projection_removes_tool_controls(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    args = {"urls": ["https://example.invalid/source"]}
+    if api_mode == "chat_completions":
+        tool_call = SimpleNamespace(
+            id="extract-call", type="function",
+            function=SimpleNamespace(name="web_extract", arguments=json.dumps(args)),
+        )
+        s.run.original = completion(None, reason="tool_calls", calls=[tool_call])
+    else:
+        s.run.original = s.codex_response([SimpleNamespace(
+            type="function_call", id="extract-item", call_id="extract-call",
+            name="web_extract", arguments=json.dumps(args), status=None,
+        )])
+    request = _request_with_lookup_tools(api_mode)
+    original = json.loads(json.dumps(request))
+    first = s.run(api_mode=api_mode, request=request, next_call=lambda _: s.run.original)
+    assert first is s.run.original and s.row["phase"] == "extract"
+    s.g.tool_gate(
+        tool_name="web_extract", tool_call_id="extract-call", api_request_id="task-request",
+        args=args, next_call=lambda _: "extracted",
+    )
+
+    if api_mode == "chat_completions":
+        s.run.original = completion("Grounded source answer.")
+    else:
+        s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    forwarded = []
+    result = s.run(api_mode=api_mode, request=request,
+                   next_call=lambda value: forwarded.append(value) or s.run.original)
+    assert result is not s.refused and len(forwarded) == 1
+    assert request == original
+    assert all(key not in forwarded[0] for key in (
+        "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"))
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_search_projection_waits_until_all_searches_settle(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+        s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.row["reserved"] += 1
+    request = _request_with_lookup_tools(api_mode)
+    forwarded = []
+    result = s.run(api_mode=api_mode, request=request,
+                   next_call=lambda value: forwarded.append(value) or s.run.original)
+    assert result is not s.refused
+    assert forwarded == [request] and forwarded[0] is request
+
+
+def test_unselected_run_receives_the_original_native_request(setup):
+    s = setup
+    s.session["run"] = "unselected"
+    request = _request_with_lookup_tools("chat_completions")
+    forwarded = []
+    result = s.run(next_call=lambda value: forwarded.append(value) or s.original, request=request)
+    assert result is s.original
+    assert forwarded == [request] and forwarded[0] is request
+
+
 def test_unknown_native_guard_exception_does_not_emit_its_secret_message(setup, capsys):
     s = setup
 

@@ -25,6 +25,15 @@ from tools.registry import registry
 VERSION = "ordinary-lookup/v1"
 SEARCH_LIMIT = 5
 EXTRACT_LIMIT = 3
+EXTRACT_TOOL_DESCRIPTION = (
+    "Optionally extract supporting passages from one or more listed URLs once; "
+    "otherwise give the final answer from available search evidence. Choose a suitable "
+    "per-page character budget for the needed inline context."
+)
+EXTRACT_URLS_DESCRIPTION = "Select one to three distinct URLs from the admitted search results."
+EXTRACT_CHAR_LIMIT_DESCRIPTION = (
+    "Optional per-page character budget for the inline content returned by this extraction."
+)
 PRESENTATION_MODES = frozenset({"chat_completions", "codex_responses"})
 MAX_CODEX_STREAM_EVENTS = 4096
 MAX_CODEX_STREAM_TEXT_CHARS = 8192
@@ -441,6 +450,67 @@ def _extract_url_diagnostics(args, admitted_urls):
     facts["extract_urls_unadmitted_count"] = sum(url not in admitted_urls for url in urls)
     facts["extract_urls_rejection_cause"] = "not_admitted"
     return facts
+
+
+def _project_selected_request(request, api_mode, row):
+    """Narrow only the selected run's tool surface for its current evidence phase."""
+    if type(request) is not dict:
+        raise ValueError("lookup-request-shape")
+    phase = row["phase"]
+    if phase == "extract":
+        projected = copy.deepcopy(request)
+        for key in ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"):
+            projected.pop(key, None)
+        return projected
+    if phase != "search" or row["settled"] != row["reserved"]:
+        return request
+
+    projected = copy.deepcopy(request)
+    tools = projected.get("tools")
+    eligible = []
+    if type(tools) is list:
+        for tool in tools:
+            if type(tool) is not dict or tool.get("type") != "function":
+                continue
+            if api_mode == "chat_completions":
+                function = tool.get("function")
+                if type(function) is not dict or function.get("name") != "web_extract":
+                    continue
+            else:
+                function = tool
+                if function.get("name") != "web_extract":
+                    continue
+            parameters = function.get("parameters")
+            properties = parameters.get("properties") if type(parameters) is dict else None
+            urls = properties.get("urls") if type(properties) is dict else None
+            items = urls.get("items") if type(urls) is dict else None
+            if (type(parameters) is not dict or type(properties) is not dict
+                    or type(urls) is not dict or urls.get("type") != "array"
+                    or type(items) is not dict or items.get("type") != "string"):
+                raise ValueError("lookup-extract-schema")
+            function["description"] = EXTRACT_TOOL_DESCRIPTION
+            urls["description"] = EXTRACT_URLS_DESCRIPTION
+            urls["minItems"] = 1
+            urls["maxItems"] = EXTRACT_LIMIT
+            urls["uniqueItems"] = True
+            items["enum"] = sorted(row["urls"])
+            char_limit = properties.get("char_limit")
+            if char_limit is not None:
+                if type(char_limit) is not dict or char_limit.get("type") != "integer":
+                    raise ValueError("lookup-extract-schema")
+                char_limit["description"] = EXTRACT_CHAR_LIMIT_DESCRIPTION
+            eligible.append(tool)
+            break
+    projected["tools"] = eligible
+    projected.pop("functions", None)
+    projected.pop("function_call", None)
+    if eligible:
+        projected["tool_choice"] = "auto"
+        projected["parallel_tool_calls"] = False
+    else:
+        projected.pop("tool_choice", None)
+        projected.pop("parallel_tool_calls", None)
+    return projected
 
 
 class Presentation:
@@ -906,6 +976,7 @@ class Generation:
     def model_gate(self, **kw):
         run_id = ""
         response = None
+        provider_request = kw["request"]
         native_diagnostics = {}
         api_mode = kw.get("api_mode", "")
         try:
@@ -944,12 +1015,15 @@ class Generation:
                             "rejection": "retrieval-required",
                             "calls": 0, "wire_requests": 0}
                         raise ValueError("retrieval-required")
+                    if row["phase"] in {"search", "extract"}:
+                        provider_request = _project_selected_request(
+                            kw["request"], api_mode, row)
         except BaseException:
             with self.lock:
                 self.refuse(run_id)
             return self.refusal_for(api_mode)
         if response is None:
-            response = kw["next_call"](kw["request"])
+            response = kw["next_call"](provider_request)
         if row is None:
             return response
         native_facts = (response_facts(response, "source", api_mode)
