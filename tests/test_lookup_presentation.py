@@ -432,6 +432,7 @@ def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup
 ], ids=["refusal-part", "unknown-content-part"])
 def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_commentary):
     s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     commentary = s.codex_message("untrusted", phase="commentary",
                                  item_id="msg_commentary_invalid")
     commentary.content = invalid_commentary(s)
@@ -457,6 +458,7 @@ def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_c
 ], ids=["reasoning-in-progress", "reasoning-incomplete"])
 def test_codex_refuses_noncompleted_reasoning_items(setup, response):
     s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     s.run.original = response(s)
     result = s.run(api_mode="codex_responses")
     assert result.output[0].content[0].text == s.module.REFUSAL
@@ -476,6 +478,7 @@ def test_codex_refuses_noncompleted_function_call_item_status(setup, status):
 
 def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
     s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     s.run.original = s.codex_response([
         s.codex_message("intermediate", phase="commentary"),
         s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}',
@@ -488,6 +491,7 @@ def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
 
 def test_codex_diagnostic_whitelists_unrecognized_output_types(setup, capsys):
     s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     sentinel = "PRIVATE_SENTINEL_" + "x" * 512
     raw = s.codex_response([SimpleNamespace(type=sentinel)])
     facts = s.module.response_facts(raw, "source", "codex_responses")
