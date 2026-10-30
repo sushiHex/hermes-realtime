@@ -62,6 +62,16 @@ and rewrites only the final-answer text. This route uses an explicitly supplied
 token through the SDK Codex headers helper, without OAuth lookup or refresh, and
 does not establish foreground Codex support or native task qualification.
 
+For the pinned Hermes resolver, a plain `model.provider: custom` configuration
+at the Codex subscription endpoint does **not** preserve `model.api_mode`.
+Declare a named provider entry literally called `custom`, with the same endpoint,
+model, credential environment variable and explicit `api_mode: codex_responses`.
+This resolves to canonical provider `custom` while preserving the Responses mode.
+Keep the model and presentation route bindings equal, and verify the actual
+resolved route before dispatch. This explicit-token configuration does not
+qualify OAuth discovery or refresh. A direct endpoint request alone does not
+prove the native Runs path.
+
 ## Freeze the source and artifacts
 
 Use a clean public checkout. The delivered main commit is
