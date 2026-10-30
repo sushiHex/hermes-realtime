@@ -247,17 +247,12 @@ REQUIRED_PRAGMAS: tuple[tuple[str, object], ...] = (
     ("temp_store", 2),
 )
 
-# Reusable named-check fragments; whitespace is normalized away before hashing.
-_UUID4 = (
-    "GLOB '????????-????-4???-[89ab]???-????????????' AND length({0})=36 "
-    "AND {0} NOT GLOB '*[^0-9a-f-]*'"
-)
-_SHA256 = "length({0})=64 AND {0} NOT GLOB '*[^0-9a-f]*'"
-_UTC = (
-    "length({0})=27 AND {0} GLOB "
-    "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]."
-    "[0-9][0-9][0-9][0-9][0-9][0-9]Z'"
-)
+_ERASURE_SCOPE_BY_REASON: dict[str, str] = {
+    "ttl": "session",
+    "revoked": "consent_epoch",
+    "unclean_epoch": "consent_epoch",
+    "clock_rollback": "store",
+}
 
 SCHEMA_DDL_V1 = """
 CREATE TABLE producer_installation (
@@ -1334,12 +1329,7 @@ class SQLiteEvidenceSpool:
                     raise _store_corrupt("an erasure request has invalid scalar authority")
                 validate_canonical_uuid4(request_id, field_name="erasure_request_id")
                 validate_canonical_utc(requested_at_utc, field_name="requested_at_utc")
-                expected_scope = {
-                    "ttl": "session",
-                    "revoked": "consent_epoch",
-                    "unclean_epoch": "consent_epoch",
-                    "clock_rollback": "store",
-                }.get(reason_code)
+                expected_scope = _ERASURE_SCOPE_BY_REASON.get(reason_code)
                 if scope_kind != expected_scope:
                     raise _store_corrupt("an erasure request has incompatible scope authority")
                 if scope_kind in ("session", "consent_epoch"):
@@ -1528,12 +1518,7 @@ class SQLiteEvidenceSpool:
                     raise _store_corrupt("an erasure tombstone has an invalid scope")
                 if reason_code not in ("ttl", "revoked", "unclean_epoch", "clock_rollback"):
                     raise _store_corrupt("an erasure tombstone has an invalid reason")
-                expected_scope = {
-                    "ttl": "session",
-                    "revoked": "consent_epoch",
-                    "unclean_epoch": "consent_epoch",
-                    "clock_rollback": "store",
-                }[reason_code]
+                expected_scope = _ERASURE_SCOPE_BY_REASON[reason_code]
                 if scope_kind != expected_scope:
                     raise _store_corrupt("an erasure tombstone has incompatible scope authority")
                 if (
@@ -2473,7 +2458,7 @@ class SQLiteEvidenceSpool:
                 self._load_store_state()
                 if not self._resume_recoverable_erasures():
                     return RecoveryDisposition.FAULTED
-                if not self._schedule_recovery_privacy_erasures(cold_start=False):
+                if not self._schedule_recovery_privacy_erasures():
                     return RecoveryDisposition.FAULTED
                 return RecoveryDisposition.RECOVERED
             except _ClockRolledBack:
@@ -2550,7 +2535,7 @@ class SQLiteEvidenceSpool:
             self._load_store_state()
             if not self._resume_recoverable_erasures():
                 return RecoveryDisposition.FAULTED
-            if not self._schedule_recovery_privacy_erasures(cold_start=True):
+            if not self._schedule_recovery_privacy_erasures():
                 return RecoveryDisposition.FAULTED
         except _ClockRolledBack:
             return self._finish_detected_clock_rollback()
@@ -2867,13 +2852,7 @@ class SQLiteEvidenceSpool:
                 if self._sticky_fault is not None
                 else StoreDisposition.REJECTED_STATE
             )
-        result = self._append(item.snapshot)
-        if result in (StoreDisposition.COMMITTED, StoreDisposition.IDEMPOTENT):
-            self._last_admission_ordinal = max(
-                self._last_admission_ordinal,
-                item.admission_ordinal,
-            )
-        return result
+        return self._append_admitted(item.snapshot, item.admission_ordinal)
 
     def append_binding_close(self, command: BindingCloseV1) -> StoreDisposition:
         """Append the single current binding's close record."""
@@ -2884,12 +2863,12 @@ class SQLiteEvidenceSpool:
                 if self._sticky_fault is not None
                 else StoreDisposition.REJECTED_STATE
             )
-        result = self._append(command.snapshot)
+        return self._append_admitted(command.snapshot, command.admission_ordinal)
+
+    def _append_admitted(self, snapshot: object, admission_ordinal: int) -> StoreDisposition:
+        result = self._append(snapshot)
         if result in (StoreDisposition.COMMITTED, StoreDisposition.IDEMPOTENT):
-            self._last_admission_ordinal = max(
-                self._last_admission_ordinal,
-                command.admission_ordinal,
-            )
+            self._last_admission_ordinal = max(self._last_admission_ordinal, admission_ordinal)
         return result
 
     def seal_epoch(self, command: SealEpochV1) -> StoreDisposition:
@@ -3257,10 +3236,12 @@ class SQLiteEvidenceSpool:
             }
         )
 
-    def _schedule_recovery_privacy_erasures(self, *, cold_start: bool) -> bool:
-        """Schedule every missing unclean/TTL authority before recovery availability."""
+    def _schedule_recovery_privacy_erasures(self) -> bool:
+        """Schedule every missing unclean/TTL authority before recovery availability.
 
-        del cold_start  # Public recovery is an explicit privacy boundary on either open path.
+        Public recovery is an explicit privacy boundary on either open path.
+        """
+
         try:
             now = format_canonical_utc(self._sample_now())
             connection = self.connection
@@ -3490,12 +3471,7 @@ class SQLiteEvidenceSpool:
             scope_key = str(scope_key)
             reason_code = str(reason_code)
             state = str(state)
-            expected_scope = {
-                "ttl": "session",
-                "revoked": "consent_epoch",
-                "unclean_epoch": "consent_epoch",
-                "clock_rollback": "store",
-            }.get(reason_code)
+            expected_scope = _ERASURE_SCOPE_BY_REASON.get(reason_code)
             if expected_scope != scope_kind:
                 raise _store_corrupt("an erasure reason does not match its scope")
             if scope_kind == "store":
@@ -4118,6 +4094,23 @@ class SQLiteEvidenceSpool:
             or command.erasure_scope.value != "session"
         ):
             return PurgeDisposition.PURGE_FAILED
+
+        def expected_for(row: tuple[object, ...]) -> tuple[object, ...]:
+            fingerprint = self._maintenance_authority_fingerprint(
+                command,
+                consent_epoch_id=str(row[5]),
+                expires_at_utc=str(row[6]),
+            )
+            return (
+                "session",
+                command.scope_id,
+                "ttl",
+                command.deadline_admission_ordinal,
+                fingerprint,
+                row[5],
+                row[6],
+            )
+
         try:
             connection = self.connection
             connection.execute("BEGIN IMMEDIATE")
@@ -4128,20 +4121,7 @@ class SQLiteEvidenceSpool:
                 (command.erasure_request_id,),
             ).fetchone()
             if existing is not None:
-                fingerprint = self._maintenance_authority_fingerprint(
-                    command,
-                    consent_epoch_id=str(existing[5]),
-                    expires_at_utc=str(existing[6]),
-                )
-                expected = (
-                    "session",
-                    command.scope_id,
-                    "ttl",
-                    command.deadline_admission_ordinal,
-                    fingerprint,
-                    existing[5],
-                    existing[6],
-                )
+                expected = expected_for(existing)
                 connection.commit()
                 if tuple(existing) != expected:
                     return PurgeDisposition.PURGE_FAILED
@@ -4153,20 +4133,7 @@ class SQLiteEvidenceSpool:
                     (command.erasure_request_id,),
                 ).fetchone()
                 if completed is not None:
-                    fingerprint = self._maintenance_authority_fingerprint(
-                        command,
-                        consent_epoch_id=str(completed[5]),
-                        expires_at_utc=str(completed[6]),
-                    )
-                    expected = (
-                        "session",
-                        command.scope_id,
-                        "ttl",
-                        command.deadline_admission_ordinal,
-                        fingerprint,
-                        completed[5],
-                        completed[6],
-                    )
+                    expected = expected_for(completed)
                     connection.commit()
                     return (
                         PurgeDisposition.ALREADY_ABSENT

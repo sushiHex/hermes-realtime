@@ -293,12 +293,14 @@ def test_replay_authority_rejects_source_lineage_from_predecessor_binding() -> N
         consent_epoch_id=_uuid(68),
         logical_session_id=_uuid(69),
     )
-    owner.rollover_binding(
-        successor_logical_session_id=_uuid(70),
-        successor_expires_at_utc="2026-08-12T00:00:00.000000Z",
-        reason=BindingCloseReason.RETENTION_ROLLOVER,
+    owner.commit_prepared_rollover(
+        owner.prepare_rollover(
+            successor_logical_session_id=_uuid(70),
+            successor_expires_at_utc="2026-08-12T00:00:00.000000Z",
+            reason=BindingCloseReason.RETENTION_ROLLOVER,
+        )
     )
-    replay = scheduler.try_reserve(ConversationOperationKind.REPLAY)
+    replay =scheduler.try_reserve(ConversationOperationKind.REPLAY)
     assert replay is not None
 
     with pytest.raises(ReservationError, match="source binding"):
@@ -366,11 +368,13 @@ def test_rollover_atomically_replaces_session_and_invalidates_predecessor_input(
         typed_sequence=1,
     )
 
-    rollover = owner.rollover_binding(
+    preparation = owner.prepare_rollover(
         successor_logical_session_id=_uuid(85),
         successor_expires_at_utc="2026-08-12T00:00:00.000000Z",
         reason=BindingCloseReason.CAPACITY_ROLLOVER,
     )
+    rollover = owner.rollover_authority(preparation)
+    owner.commit_prepared_rollover(preparation)
 
     assert rollover.predecessor_logical_session_id == _uuid(84)
     assert rollover.successor_logical_session_id == _uuid(85)

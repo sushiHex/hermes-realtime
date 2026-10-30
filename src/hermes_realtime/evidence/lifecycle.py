@@ -26,40 +26,36 @@ from .models import (
     ReplayTurnAuthorityV1,
     RolloverAuthorityV1,
     UserTurnAuthorityV1,
+    _OpaqueCapability,
 )
 
 _MAX_UNSIGNED_63 = 2**63 - 1
-_Capability = TypeVar(
-    "_Capability",
-    BindingCloseAuthorityV1,
-    CommandAdmissionAuthorityV1,
-    FinalInputAuthorityV1,
-    LifecycleDrainAuthorityV1,
-    LifecycleSealAuthorityV1,
-    ProactiveTurnAuthorityV1,
-    ReplayTurnAuthorityV1,
-    RolloverAuthorityV1,
-    UserTurnAuthorityV1,
-)
+_Capability = TypeVar("_Capability", bound=_OpaqueCapability)
+_RoutedT = TypeVar("_RoutedT", UserTurnAuthorityV1, CommandAdmissionAuthorityV1)
 
 _MAX_TRACKED_IDENTITIES = 4096
+
+
+def _mint_capability(capability_type: type[_Capability], **fields: object) -> _Capability:
+    capability = object.__new__(capability_type)
+    for name, value in fields.items():
+        object.__setattr__(capability, name, value)
+    capability._validate()
+    return capability
 
 
 class _LifecycleRolloverPreparationV1:
     """Opaque owner-bound lifecycle transaction retained only in-process."""
 
-    __slots__ = ("_owner", "_predecessor", "_authority", "_terminal")
+    __slots__ = ("_predecessor", "_authority")
 
     def __init__(
         self,
-        owner: EvidenceLifecycleOwner,
         predecessor: tuple[str, int, str, str],
         authority: RolloverAuthorityV1,
     ) -> None:
-        self._owner = owner
         self._predecessor = predecessor
         self._authority = authority
-        self._terminal = False
 
     def __repr__(self) -> str:
         return "<_LifecycleRolloverPreparationV1 opaque>"
@@ -75,8 +71,7 @@ class EvidenceLifecycleOwner:
         uuid_factory: Callable[[], str] | None = None,
         operation_scheduler: ConversationOperationScheduler | None = None,
     ) -> None:
-        if type(owner_generation) is not int or not 1 <= owner_generation <= _MAX_UNSIGNED_63:
-            raise ValueError("owner_generation must be an unsigned 63-bit positive integer")
+        self._require_u63(owner_generation, "owner_generation")
         if uuid_factory is not None and not callable(uuid_factory):
             raise TypeError("uuid_factory must be callable or None")
         if (
@@ -137,20 +132,16 @@ class EvidenceLifecycleOwner:
         consent_epoch_id: str,
         logical_session_id: str,
     ) -> None:
-        self._require_uuid4(binding_id, "binding_id")
-        self._require_uuid4(consent_epoch_id, "consent_epoch_id")
-        self._require_uuid4(logical_session_id, "logical_session_id")
-        if type(binding_generation) is not int or not 1 <= binding_generation <= _MAX_UNSIGNED_63:
-            raise ValueError("binding_generation must be an unsigned 63-bit positive integer")
+        lineage = self._validated_lineage(
+            binding_id=binding_id,
+            binding_generation=binding_generation,
+            consent_epoch_id=consent_epoch_id,
+            logical_session_id=logical_session_id,
+        )
         with self._lock:
             if self._rollover_preparation is not None:
                 raise ReservationError("a lifecycle rollover is prepared")
-            self._binding = (
-                binding_id,
-                binding_generation,
-                consent_epoch_id,
-                logical_session_id,
-            )
+            self._binding = lineage
             self._drain_lineage = None
             self._drain_authority = None
             self._live_final_inputs.clear()
@@ -165,16 +156,11 @@ class EvidenceLifecycleOwner:
     ) -> None:
         """Retain the host-reserved create lineage for pre-publication teardown."""
 
-        self._require_uuid4(binding_id, "binding_id")
-        self._require_uuid4(consent_epoch_id, "consent_epoch_id")
-        self._require_uuid4(logical_session_id, "logical_session_id")
-        if type(binding_generation) is not int or not 1 <= binding_generation <= _MAX_UNSIGNED_63:
-            raise ValueError("binding_generation must be an unsigned 63-bit positive integer")
-        lineage = (
-            binding_id,
-            binding_generation,
-            consent_epoch_id,
-            logical_session_id,
+        lineage = self._validated_lineage(
+            binding_id=binding_id,
+            binding_generation=binding_generation,
+            consent_epoch_id=consent_epoch_id,
+            logical_session_id=logical_session_id,
         )
         with self._lock:
             if self._binding is not None:
@@ -205,11 +191,7 @@ class EvidenceLifecycleOwner:
         change.
         """
 
-        if (
-            type(final_admission_ordinal) is not int
-            or not 1 <= final_admission_ordinal <= _MAX_UNSIGNED_63
-        ):
-            raise ValueError("final admission ordinal must be an unsigned 63-bit positive integer")
+        self._require_u63(final_admission_ordinal, "final admission ordinal")
         with self._lock:
             lineage = self._binding or self._drain_lineage
             if lineage is None:
@@ -219,7 +201,7 @@ class EvidenceLifecycleOwner:
                 if authority.final_admission_ordinal != final_admission_ordinal:
                     raise ReservationError("drain watermark changed during owner close")
                 return authority
-            authority = self._mint(
+            authority = _mint_capability(
                 LifecycleDrainAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -242,7 +224,7 @@ class EvidenceLifecycleOwner:
             if binding is None:
                 raise ReservationError("no active evidence binding")
             utterance_id = self._allocate_uuid_locked("utterance_id")
-            authority = self._mint(
+            authority = _mint_capability(
                 FinalInputAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -260,74 +242,52 @@ class EvidenceLifecycleOwner:
             return authority
 
     def decline_to_user(self, authority: FinalInputAuthorityV1) -> UserTurnAuthorityV1:
-        with self._lock:
-            if (
-                type(authority) is not FinalInputAuthorityV1
-                or authority not in self._live_final_inputs
-            ):
-                raise ReservationError("final input authority is stale or consumed")
-            self._live_final_inputs.remove(authority)
-            serial = self._next_routing_serial
-            if serial > _MAX_UNSIGNED_63:
-                raise ReservationError("routing serial exhausted")
-            self._next_routing_serial += 1
-            return self._mint(
-                UserTurnAuthorityV1,
-                protocol_version=authority.protocol_version,
-                owner_generation=authority.owner_generation,
-                binding_id=authority.binding_id,
-                binding_generation=authority.binding_generation,
-                consent_epoch_id=authority.consent_epoch_id,
-                logical_session_id=authority.logical_session_id,
-                utterance_id=authority.utterance_id,
-                source=authority.source,
-                input_incarnation=authority.input_incarnation,
-                media_incarnation=authority.media_incarnation,
-                typed_sequence=authority.typed_sequence,
-                routing_serial=serial,
-                routing_disposition="response",
-            )
+        return self._route_final_input(authority, UserTurnAuthorityV1, "response")
 
     def accept_command(
         self,
         authority: FinalInputAuthorityV1,
     ) -> CommandAdmissionAuthorityV1:
+        return self._route_final_input(authority, CommandAdmissionAuthorityV1, "command")
+
+    def retire_final_input(self, authority: FinalInputAuthorityV1) -> None:
         with self._lock:
-            if (
-                type(authority) is not FinalInputAuthorityV1
-                or authority not in self._live_final_inputs
-            ):
-                raise ReservationError("final input authority is stale or consumed")
-            self._live_final_inputs.remove(authority)
+            self._consume_final_input_locked(authority)
+
+    def _consume_final_input_locked(self, authority: object) -> FinalInputAuthorityV1:
+        if type(authority) is not FinalInputAuthorityV1 or authority not in self._live_final_inputs:
+            raise ReservationError("final input authority is stale or consumed")
+        self._live_final_inputs.remove(authority)
+        return authority
+
+    def _route_final_input(
+        self,
+        authority: object,
+        capability_type: type[_RoutedT],
+        routing_disposition: str,
+    ) -> _RoutedT:
+        with self._lock:
+            final_input = self._consume_final_input_locked(authority)
             serial = self._next_routing_serial
             if serial > _MAX_UNSIGNED_63:
                 raise ReservationError("routing serial exhausted")
             self._next_routing_serial += 1
-            return self._mint(
-                CommandAdmissionAuthorityV1,
-                protocol_version=authority.protocol_version,
-                owner_generation=authority.owner_generation,
-                binding_id=authority.binding_id,
-                binding_generation=authority.binding_generation,
-                consent_epoch_id=authority.consent_epoch_id,
-                logical_session_id=authority.logical_session_id,
-                utterance_id=authority.utterance_id,
-                source=authority.source,
-                input_incarnation=authority.input_incarnation,
-                media_incarnation=authority.media_incarnation,
-                typed_sequence=authority.typed_sequence,
+            return _mint_capability(
+                capability_type,
+                protocol_version=final_input.protocol_version,
+                owner_generation=final_input.owner_generation,
+                binding_id=final_input.binding_id,
+                binding_generation=final_input.binding_generation,
+                consent_epoch_id=final_input.consent_epoch_id,
+                logical_session_id=final_input.logical_session_id,
+                utterance_id=final_input.utterance_id,
+                source=final_input.source,
+                input_incarnation=final_input.input_incarnation,
+                media_incarnation=final_input.media_incarnation,
+                typed_sequence=final_input.typed_sequence,
                 routing_serial=serial,
-                routing_disposition="command",
+                routing_disposition=routing_disposition,
             )
-
-    def retire_final_input(self, authority: FinalInputAuthorityV1) -> None:
-        with self._lock:
-            if (
-                type(authority) is not FinalInputAuthorityV1
-                or authority not in self._live_final_inputs
-            ):
-                raise ReservationError("final input authority is stale or consumed")
-            self._live_final_inputs.remove(authority)
 
     def conversation_authority_is_current(self, authority: object) -> bool:
         """Whether an issued conversation bearer still belongs to the open binding."""
@@ -377,7 +337,7 @@ class EvidenceLifecycleOwner:
             if serial > _MAX_UNSIGNED_63:
                 raise ReservationError("proactive invocation serial exhausted")
             self._next_proactive_invocation_serial += 1
-            return self._mint(
+            return _mint_capability(
                 ProactiveTurnAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -401,15 +361,8 @@ class EvidenceLifecycleOwner:
         self._require_uuid4(replay_of_evidence_turn_id, "replay_of_evidence_turn_id")
         self._require_uuid4(source_binding_id, "source_binding_id")
         self._require_uuid4(source_logical_session_id, "source_logical_session_id")
-        if (
-            type(source_binding_generation) is not int
-            or not 1 <= source_binding_generation <= _MAX_UNSIGNED_63
-        ):
-            raise ValueError(
-                "source_binding_generation must be an unsigned 63-bit positive integer"
-            )
-        if type(replay_generation) is not int or not 1 <= replay_generation <= _MAX_UNSIGNED_63:
-            raise ValueError("replay_generation must be an unsigned 63-bit positive integer")
+        self._require_u63(source_binding_generation, "source_binding_generation")
+        self._require_u63(replay_generation, "replay_generation")
         with self._lock:
             scheduler = self._operation_scheduler
             binding = self._binding
@@ -428,7 +381,7 @@ class EvidenceLifecycleOwner:
                 ConversationOperationKind.REPLAY,
                 require_unconsumed=True,
             )
-            return self._mint(
+            return _mint_capability(
                 ReplayTurnAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -450,7 +403,7 @@ class EvidenceLifecycleOwner:
             binding = self._binding
             if binding is None:
                 raise ReservationError("no active evidence binding")
-            authority = self._mint(
+            authority = _mint_capability(
                 BindingCloseAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -462,40 +415,6 @@ class EvidenceLifecycleOwner:
             )
             self._drain_lineage = binding
             self._binding = None
-            self._live_final_inputs.clear()
-            return authority
-
-    def rollover_binding(
-        self,
-        *,
-        successor_logical_session_id: str,
-        successor_expires_at_utc: str,
-        reason: BindingCloseReason,
-    ) -> RolloverAuthorityV1:
-        with self._lock:
-            if self._rollover_preparation is not None:
-                raise ReservationError("a lifecycle rollover is prepared")
-            binding = self._binding
-            if binding is None:
-                raise ReservationError("no active evidence binding")
-            authority = self._mint(
-                RolloverAuthorityV1,
-                protocol_version=1,
-                owner_generation=self._owner_generation,
-                binding_id=binding[0],
-                binding_generation=binding[1],
-                consent_epoch_id=binding[2],
-                predecessor_logical_session_id=binding[3],
-                successor_logical_session_id=successor_logical_session_id,
-                successor_expires_at_utc=successor_expires_at_utc,
-                reason=reason,
-            )
-            self._binding = (
-                binding[0],
-                binding[1],
-                binding[2],
-                authority.successor_logical_session_id,
-            )
             self._live_final_inputs.clear()
             return authority
 
@@ -514,7 +433,7 @@ class EvidenceLifecycleOwner:
             binding = self._binding
             if binding is None:
                 raise ReservationError("no active evidence binding")
-            authority = self._mint(
+            authority = _mint_capability(
                 RolloverAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -526,7 +445,7 @@ class EvidenceLifecycleOwner:
                 successor_expires_at_utc=successor_expires_at_utc,
                 reason=reason,
             )
-            preparation = _LifecycleRolloverPreparationV1(self, binding, authority)
+            preparation = _LifecycleRolloverPreparationV1(binding, authority)
             self._rollover_preparation = preparation
             return preparation
 
@@ -553,14 +472,12 @@ class EvidenceLifecycleOwner:
             )
             self._live_final_inputs.clear()
             self._rollover_preparation = None
-            preparation._terminal = True
 
     def abort_prepared_rollover(self, preparation: _LifecycleRolloverPreparationV1) -> None:
         with self._lock:
             if self._rollover_preparation is not preparation:
                 raise ReservationError("lifecycle rollover preparation is stale")
             self._rollover_preparation = None
-            preparation._terminal = True
 
     def seal_lifecycle(
         self,
@@ -574,7 +491,7 @@ class EvidenceLifecycleOwner:
             binding = self._binding
             if binding is None:
                 raise ReservationError("no active evidence binding")
-            authority = self._mint(
+            authority = _mint_capability(
                 LifecycleSealAuthorityV1,
                 protocol_version=1,
                 owner_generation=self._owner_generation,
@@ -609,6 +526,25 @@ class EvidenceLifecycleOwner:
             self._used_ids.discard(self._used_id_order.popleft())
         return value
 
+    def _validated_lineage(
+        self,
+        *,
+        binding_id: str,
+        binding_generation: int,
+        consent_epoch_id: str,
+        logical_session_id: str,
+    ) -> tuple[str, int, str, str]:
+        self._require_uuid4(binding_id, "binding_id")
+        self._require_uuid4(consent_epoch_id, "consent_epoch_id")
+        self._require_uuid4(logical_session_id, "logical_session_id")
+        self._require_u63(binding_generation, "binding_generation")
+        return (binding_id, binding_generation, consent_epoch_id, logical_session_id)
+
+    @staticmethod
+    def _require_u63(value: object, field_name: str) -> None:
+        if type(value) is not int or not 1 <= value <= _MAX_UNSIGNED_63:
+            raise ValueError(f"{field_name} must be an unsigned 63-bit positive integer")
+
     @staticmethod
     def _require_uuid4(value: object, field_name: str) -> None:
         if type(value) is not str:
@@ -619,14 +555,6 @@ class EvidenceLifecycleOwner:
             raise ValueError(f"{field_name} must be a canonical UUIDv4") from error
         if parsed.version != 4 or str(parsed) != value:
             raise ValueError(f"{field_name} must be a canonical UUIDv4")
-
-    @staticmethod
-    def _mint(capability_type: type[_Capability], **fields: object) -> _Capability:
-        capability = object.__new__(capability_type)
-        for name, value in fields.items():
-            object.__setattr__(capability, name, value)
-        capability._validate()
-        return capability
 
 
 class EvidenceConversationAuthorityV1:
