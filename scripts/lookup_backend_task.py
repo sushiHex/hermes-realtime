@@ -21,6 +21,30 @@ from urllib.parse import quote
 
 from scripts.setup_lookup_backend import ROOT, digest, read_json, require
 
+_EXECUTION_GUARDS = frozenset(
+    {
+        "single_exact_dispatch",
+        "snapshot_status",
+        "snapshot_bound",
+        "snapshot_session",
+        "snapshot_combined_bound",
+        "accepted_ack",
+        "owned_run_count",
+        "adapter_completion",
+        "sse_completion",
+        "completion_refused",
+    }
+)
+
+
+def _known_execution_guard(error: BaseException) -> str:
+    """Expose only fixed require labels; never retain exception text."""
+    if type(error) is ValueError and len(error.args) == 1:
+        value = error.args[0]
+        if type(value) is str and value in _EXECUTION_GUARDS:
+            return value
+    return "other"
+
 
 def select_runtime(m: Any) -> Any:
     package = Path(m["packageRoot"]).resolve()
@@ -150,16 +174,20 @@ async def execute(m: Any, directory: Any) -> Any:
             return hashlib.sha256(raw).hexdigest()
 
     result: dict[str, Any] = {"category": "refused", "semantic_review": "pending"}
+    execution_stage = "session_start"
     try:
         await session.start()
         started = time.monotonic()
+        execution_stage = "dispatch"
         start = await asyncio.wait_for(
             surface.start_work(objective=m["objective"], invocation_id="explicit_lookup_setup"), 90
         )
+        execution_stage = "accepted_ack"
         require(start.accepted and observed == {"posts": 1, "accepted": 1}, "accepted_ack")
         require(len(session.admitted_run_ids) == 1, "owned_run_count")
         run_id = next(iter(session.admitted_run_ids))
         controller.start()
+        execution_stage = "completion_wait"
         try:
             terminal = await asyncio.wait_for(controller.next_completion(), 120)
         except TimeoutError:
@@ -181,6 +209,7 @@ async def execute(m: Any, directory: Any) -> Any:
             else None
         )
         # Retain terminal evidence before any conformance refusal.
+        execution_stage = "terminal_snapshot"
         try:
             result["evidence_sha256"] = await snapshot(run_id, "terminal-evidence.private.json")
         except Exception as error:
@@ -190,11 +219,15 @@ async def execute(m: Any, directory: Any) -> Any:
             raise
         require(primary is None, primary or "completion_refused")
         result["category"] = "completed"
+        execution_stage = "complete"
     except Exception as error:
         result["failure_kind"] = type(error).__name__
+        result["execution_stage"] = execution_stage
+        result["failure_guard"] = _known_execution_guard(error)
         if type(error) is ValueError:
             result["failure_category"] = "validation_refused"
     finally:
+        execution_stage = "cleanup"
         errors = []
         for close in (surface.close, controller.close, session.close):
             try:
