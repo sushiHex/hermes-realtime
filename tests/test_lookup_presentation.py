@@ -334,7 +334,7 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     original_final = s.codex_message(
         '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
-    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", summary=[])
+    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status="completed", summary=[])
     commentary = s.codex_message("Progress text must not be published.", phase="commentary",
                                  item_id="msg_commentary")
     raw = s.codex_response(
@@ -423,6 +423,67 @@ def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup
     assert result.output[0].content[0].text == s.module.REFUSAL
     assert s.row["presentation_evidence"]["category"] == "refused"
     assert s.captured["stream_closed"] == 1
+
+
+@pytest.mark.parametrize("invalid_commentary", [
+    lambda s: [SimpleNamespace(type="refusal", refusal="do not log this"),
+               SimpleNamespace(type="output_text", text="commentary")],
+    lambda s: [SimpleNamespace(type="future_content_part", text="do not log this")],
+], ids=["refusal-part", "unknown-content-part"])
+def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_commentary):
+    s = setup
+    commentary = s.codex_message("untrusted", phase="commentary",
+                                 item_id="msg_commentary_invalid")
+    commentary.content = invalid_commentary(s)
+    s.run.original = s.codex_response([
+        commentary,
+        s.codex_message(
+            '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ])
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+@pytest.mark.parametrize("response", [
+    lambda s: s.codex_response([
+        SimpleNamespace(type="reasoning", status="in_progress", id="rs_partial"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ]),
+    lambda s: s.codex_response([
+        SimpleNamespace(type="reasoning", status="incomplete", id="rs_partial"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ]),
+], ids=["reasoning-in-progress", "reasoning-incomplete"])
+def test_codex_refuses_noncompleted_reasoning_items(setup, response):
+    s = setup
+    s.run.original = response(s)
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
+    s = setup
+    s.run.original = s.codex_response([
+        s.codex_message("intermediate", phase="commentary"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}',
+                        phase=None),
+    ])
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+def test_codex_diagnostic_whitelists_unrecognized_output_types(setup, capsys):
+    s = setup
+    sentinel = "PRIVATE_SENTINEL_" + "x" * 512
+    raw = s.codex_response([SimpleNamespace(type=sentinel)])
+    facts = s.module.response_facts(raw, "source", "codex_responses")
+    assert facts["source_output_item_types"] == ["other"]
+    s.run.original = raw
+    s.run(api_mode="codex_responses")
+    assert sentinel not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("setup", [None], indirect=True)

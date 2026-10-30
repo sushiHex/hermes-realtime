@@ -157,6 +157,7 @@ def _raw_responses_result(response):
         raise ValueError("responses-empty-output")
     calls = []
     final_items = []
+    final_phases = []
     commentary_seen = False
     for item in output:
         item_type = getattr(item, "type", None)
@@ -175,16 +176,16 @@ def _raw_responses_result(response):
             calls.append({"call_id": call_id, "name": name, "arguments": arguments,
                           "parsed": parsed})
         elif item_type == "reasoning":
+            if getattr(item, "status", None) != "completed":
+                raise ValueError("responses-reasoning-incomplete")
             continue
         elif item_type == "message":
             if (getattr(item, "role", None) != "assistant"
                     or getattr(item, "status", None) != "completed"):
                 raise ValueError("responses-message-shape")
             phase = getattr(item, "phase", None)
-            if phase in {"commentary", "analysis"}:
-                commentary_seen = True
-                continue
-            if phase not in {None, "final_answer", "final"}:
+            if (phase not in {None, "final_answer", "final"}
+                    and phase not in {"commentary", "analysis"}):
                 raise ValueError("responses-message-phase")
             parts = getattr(item, "content", None)
             if type(parts) is not list or not parts:
@@ -199,11 +200,17 @@ def _raw_responses_result(response):
                 text_parts.append(part)
             if len(text_parts) != 1:
                 raise ValueError("responses-message-text-parts")
+            if phase in {"commentary", "analysis"}:
+                commentary_seen = True
+                continue
             final_items.append((item, text_parts[0]))
+            final_phases.append(phase)
         else:
             raise ValueError("responses-output-item")
     if len(final_items) > 1:
         raise ValueError("responses-multiple-final-messages")
+    if commentary_seen and final_items and final_phases[0] is None:
+        raise ValueError("responses-ambiguous-final-phase")
     if not calls and not final_items:
         # Commentary-only output is not a final answer. Never publish it.
         raise ValueError("responses-no-final-answer" if commentary_seen else "responses-no-message")
@@ -331,7 +338,10 @@ def response_facts(response, prefix, api_mode="chat_completions"):
         item_types = [getattr(item, "type", None) for item in output[:64]] if sequence else []
         facts = {
             "output_count": len(output) if sequence else 0,
-            "output_item_types": [kind if type(kind) is str else "other" for kind in item_types],
+            "output_item_types": [
+                kind if type(kind) is str and kind in {"message", "reasoning", "function_call"}
+                else "other" for kind in item_types
+            ],
             "status": (response.status if type(getattr(response, "status", None)) is str
                        and response.status in {"completed", "incomplete", "failed", "cancelled"}
                        else "other" if getattr(response, "status", None) is not None
