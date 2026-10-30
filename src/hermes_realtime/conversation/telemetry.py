@@ -57,13 +57,6 @@ class UtteranceTicket:
             if not 1 <= value <= _MAX_BROWSER_INTEGER:
                 raise ValueError(f"{name} is outside the browser-safe range")
 
-    @property
-    def public_turn_id(self) -> str:
-        return (
-            f"session_{self.session_generation}_media_{self.media_incarnation}"
-            f"_utterance_{self.utterance_sequence}"
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class KnowledgeTurnBudget:

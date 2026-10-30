@@ -12,12 +12,11 @@ from hermes_realtime.conversation.telemetry import (
 
 
 def test_utterance_ticket_rejects_ambiguous_or_unbounded_identity() -> None:
-    ticket = UtteranceTicket(
+    UtteranceTicket(
         session_generation=7,
         media_incarnation=3,
         utterance_sequence=11,
     )
-    assert ticket.public_turn_id == "session_7_media_3_utterance_11"
 
     with pytest.raises(TypeError, match="session_generation"):
         UtteranceTicket(session_generation=True, media_incarnation=3, utterance_sequence=11)

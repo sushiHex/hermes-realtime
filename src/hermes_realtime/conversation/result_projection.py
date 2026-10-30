@@ -87,12 +87,7 @@ def completed_result_reference(detail: str) -> str:
     safe = _COMPLETION_MACHINE_TOKEN.sub("the reference", _completion_reference_text(visual))
     safe = _PRIVATE_RESULT_HANDLE.sub("private reference", safe)
     safe = " ".join(safe.replace("•", " ").split()).strip()
-    if len(safe) > 1024:
-        boundary = safe.rfind(" ", 0, 1021)
-        if boundary < 512:
-            boundary = 1021
-        safe = safe[:boundary].rstrip() + "..."
-    return safe or _NO_DISPLAYABLE_RESULT
+    return _bounded_result(safe) or _NO_DISPLAYABLE_RESULT
 
 
 def _voice_friendly_completion_text(status: str, detail: str) -> str:
@@ -155,10 +150,13 @@ def _conversation_completion_text(status: str, voice_detail: str, visual_detail:
 
 
 def _browser_safe_task_result(detail: str) -> str:
-    projected = _PRIVATE_RESULT_HANDLE.sub("private reference", detail)
-    if len(projected) <= 1024:
-        return projected
-    boundary = projected.rfind(" ", 0, 1021)
+    return _bounded_result(_PRIVATE_RESULT_HANDLE.sub("private reference", detail))
+
+
+def _bounded_result(text: str) -> str:
+    if len(text) <= 1024:
+        return text
+    boundary = text.rfind(" ", 0, 1021)
     if boundary < 512:
         boundary = 1021
-    return projected[:boundary].rstrip() + "..."
+    return text[:boundary].rstrip() + "..."

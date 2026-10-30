@@ -39,6 +39,7 @@ from .ingress import BoundedPcmIngress, IngressRecord
 from .knowledge import KnowledgePrefetchCoordinator
 from .task_proposals import ConversationTaskProposals
 from .telemetry import KnowledgeTurnBudget, UtteranceTicket
+from .updates import _operation_failed
 
 _MAX_IDENTITY_CHARS = 128
 _MAX_SESSION_GENERATION = (1 << 63) - 1
@@ -53,14 +54,6 @@ _LOGGER = logging.getLogger(__name__)
 
 _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
-
-
-def _operation_failed(operation: asyncio.Task[None]) -> bool:
-    if not operation.done():
-        return False
-    if operation.cancelled():
-        return True
-    return operation.exception() is not None
 
 
 class _VoiceActivityDetector(Protocol):
@@ -279,7 +272,6 @@ class ConversationSessionWorker:
         self._echo_promotion_checks = echo_promotion_checks
         self._echo_suppressed = False
         self._echo_recheck_countdown = echo_recheck_frames
-        self._echo_rechecks = 0
         self._echo_non_echo_checks = 0
         self._echo_candidate_frames: deque[AudioFrame] = deque()
         self._echo_candidate_bytes = 0
@@ -309,10 +301,6 @@ class ConversationSessionWorker:
     @property
     def session_generation(self) -> int:
         return self._session_generation
-
-    @property
-    def active_response_count(self) -> int:
-        return len(self._response_operations)
 
     def start(self) -> None:
         if self._closed:
@@ -412,7 +400,6 @@ class ConversationSessionWorker:
                     if echo_dominated or confirmation_required:
                         self._echo_suppressed = True
                         self._echo_recheck_countdown = self._echo_recheck_frames
-                        self._echo_rechecks = 0
                         self._echo_non_echo_checks = 0 if echo_dominated else 1
                         self._set_echo_candidate(start_frames)
                         self._clear_pre_roll()
@@ -441,7 +428,6 @@ class ConversationSessionWorker:
                         self._echo_recheck_countdown -= 1
                         if self._echo_recheck_countdown == 0:
                             self._echo_recheck_countdown = self._echo_recheck_frames
-                            self._echo_rechecks += 1
                             guard = self._echo_guard
                             echo_dominated = guard is not None and guard.is_echo_dominated(
                                 tuple(self._echo_candidate_frames)
@@ -570,7 +556,7 @@ class ConversationSessionWorker:
                         self._observe_final_transcript(transcript)
                         router = self._command_router
                         lifecycle = self._resolve_evidence_lifecycle()
-                        user_authority: UserTurnAuthorityV1 | None = None
+                        authority: FinalInputAuthorityV1 | None = None
                         if router is not None and lifecycle is not None:
                             self._microphone_input_incarnation += 1
                             media_incarnation = self._media_incarnation_provider()
@@ -584,32 +570,11 @@ class ConversationSessionWorker:
                                 media_incarnation=media_incarnation,
                                 typed_sequence=None,
                             )
-                            routing = await router.route(transcript.text, authority)
-                            if type(routing) is not CommandRoutingResultV1:
-                                raise TypeError("command router returned the wrong result")
-                            handled = routing.outcome is not CommandRoutingOutcome.NOT_COMMAND
-                            user_authority = routing.user_turn_authority
-                        else:
-                            legacy_router = cast(Any, router)
-                            handled = router is not None and bool(
-                                await legacy_router.route(transcript.text)
-                            )
-                        self._raise_if_closed()
-                        if handled:
-                            await self._revoke_active_ticket("command_routed")
-                        else:
-                            self._start_response(transcript, user_authority)
+                        await self._route_final(router, transcript, authority)
                     else:
                         await self._observe_partial_transcript(transcript)
             except BaseException as error:
-                current = asyncio.current_task()
-                caller_cancelled = (
-                    isinstance(error, asyncio.CancelledError)
-                    and current is not None
-                    and current.cancelling() > 0
-                )
-                if not self._closed and not caller_cancelled and self._terminal_error is None:
-                    self._terminal_error = error
+                self._latch_terminal_error(error)
                 raise
             finally:
                 if utterance_ended:
@@ -808,7 +773,6 @@ class ConversationSessionWorker:
     def _reset_echo_suppression(self) -> None:
         self._echo_suppressed = False
         self._echo_recheck_countdown = self._echo_recheck_frames
-        self._echo_rechecks = 0
         self._echo_non_echo_checks = 0
         self._clear_echo_candidate()
 
@@ -857,7 +821,7 @@ class ConversationSessionWorker:
                 self._raise_if_closed()
                 router = self._command_router
                 lifecycle = self._resolve_evidence_lifecycle()
-                user_authority: UserTurnAuthorityV1 | None = None
+                authority: FinalInputAuthorityV1 | None = None
                 if router is not None and lifecycle is not None:
                     if typed_sequence <= self._typed_sequence:
                         raise RuntimeError("typed input sequence is stale or duplicated")
@@ -868,31 +832,42 @@ class ConversationSessionWorker:
                         media_incarnation=None,
                         typed_sequence=typed_sequence,
                     )
-                    routing = await router.route(transcript.text, authority)
-                    if type(routing) is not CommandRoutingResultV1:
-                        raise TypeError("command router returned the wrong result")
-                    handled = routing.outcome is not CommandRoutingOutcome.NOT_COMMAND
-                    user_authority = routing.user_turn_authority
-                else:
-                    legacy_router = cast(Any, router)
-                    handled = router is not None and bool(
-                        await legacy_router.route(transcript.text)
-                    )
-                self._raise_if_closed()
-                if handled:
-                    await self._revoke_active_ticket("command_routed")
-                else:
-                    self._start_response(transcript, user_authority)
+                await self._route_final(router, transcript, authority)
             except BaseException as error:
-                current = asyncio.current_task()
-                caller_cancelled = (
-                    isinstance(error, asyncio.CancelledError)
-                    and current is not None
-                    and current.cancelling() > 0
-                )
-                if not self._closed and not caller_cancelled and self._terminal_error is None:
-                    self._terminal_error = error
+                self._latch_terminal_error(error)
                 raise
+
+    async def _route_final(
+        self,
+        router: _TaskCommandRouter | None,
+        transcript: Transcript,
+        authority: FinalInputAuthorityV1 | None,
+    ) -> None:
+        user_authority: UserTurnAuthorityV1 | None = None
+        if router is not None and authority is not None:
+            routing = await router.route(transcript.text, authority)
+            if type(routing) is not CommandRoutingResultV1:
+                raise TypeError("command router returned the wrong result")
+            handled = routing.outcome is not CommandRoutingOutcome.NOT_COMMAND
+            user_authority = routing.user_turn_authority
+        else:
+            legacy_router = cast(Any, router)
+            handled = router is not None and bool(await legacy_router.route(transcript.text))
+        self._raise_if_closed()
+        if handled:
+            await self._revoke_active_ticket("command_routed")
+        else:
+            self._start_response(transcript, user_authority)
+
+    def _latch_terminal_error(self, error: BaseException) -> None:
+        current = asyncio.current_task()
+        caller_cancelled = (
+            isinstance(error, asyncio.CancelledError)
+            and current is not None
+            and current.cancelling() > 0
+        )
+        if not self._closed and not caller_cancelled and self._terminal_error is None:
+            self._terminal_error = error
 
     async def wait_for_responses(self) -> None:
         """Wait until every currently accepted foreground response settles."""
@@ -952,19 +927,14 @@ class ConversationSessionWorker:
             await self._actions.close()
         except BaseException as error:
             errors.append(error)
-        if len(errors) == 1:
-            if recorder is not None:
-                recorder.record_close_stage(
-                    stage=CloseStageV1.SESSION_WORKER,
-                    result=CloseResultV1.FAILED,
-                )
-            raise errors[0]
         if errors:
             if recorder is not None:
                 recorder.record_close_stage(
                     stage=CloseStageV1.SESSION_WORKER,
                     result=CloseResultV1.FAILED,
                 )
+            if len(errors) == 1:
+                raise errors[0]
             raise BaseExceptionGroup("conversation session close failed", errors)
         if recorder is not None:
             recorder.record_close_stage(
@@ -1054,19 +1024,14 @@ class ConversationSessionWorker:
         ) or _operation_failed(stt_cleanup)
         if self._terminal_error is not None:
             errors.append(self._terminal_error)
-        if len(errors) == 1:
-            if recorder is not None:
-                recorder.record_close_stage(
-                    stage=CloseStageV1.BINDING_CLEANUP,
-                    result=CloseResultV1.FAILED,
-                )
-            raise errors[0]
         if errors:
             if recorder is not None:
                 recorder.record_close_stage(
                     stage=CloseStageV1.BINDING_CLEANUP,
                     result=CloseResultV1.FAILED,
                 )
+            if len(errors) == 1:
+                raise errors[0]
             raise BaseExceptionGroup("conversation session worker close failed", errors)
         if recorder is not None:
             recorder.record_close_stage(
@@ -1455,11 +1420,18 @@ class ReconnectSafeConversationWorker:
         """Resume input only for the exact current suppression token."""
 
         async with self._binding_lock:
-            suppression = self._audio_input_suppression
-            if suppression is None or suppression[2] is not token:
-                return False
-            self._audio_input_suppression = None
-            return True
+            return self.release_suppressed_input_after_clear(token)
+
+    def _binding_stale_locked(self, generation: int, binding: ConversationSessionWorker) -> bool:
+        return self._closed or generation != self._generation or self._binding is not binding
+
+    def _input_suppressed_locked(self, generation: int, participant: str) -> bool:
+        suppression = self._audio_input_suppression
+        return (
+            suppression is not None
+            and suppression[0] == generation
+            and suppression[1] == participant
+        )
 
     def release_suppressed_input_after_clear(self, token: object) -> bool:
         """Release a durable clear's exact lease without yielding past new input."""
@@ -1484,12 +1456,7 @@ class ReconnectSafeConversationWorker:
             binding = self._binding
             if binding is None or session_generation != self._generation:
                 raise RuntimeError("audio belongs to a stale session generation")
-            suppression = self._audio_input_suppression
-            if (
-                suppression is not None
-                and suppression[0] == session_generation
-                and suppression[1] == participant_identity
-            ):
+            if self._input_suppressed_locked(session_generation, participant_identity):
                 return
         await binding.receive_audio(
             participant_identity,
@@ -1570,11 +1537,7 @@ class ReconnectSafeConversationWorker:
             while True:
                 ingress.check_health()
                 async with self._binding_lock:
-                    if (
-                        self._closed
-                        or session_generation != self._generation
-                        or self._binding is not binding
-                    ):
+                    if self._binding_stale_locked(session_generation, binding):
                         return
                 receive_operation = asyncio.create_task(
                     source.receive_participant_audio(
@@ -1598,11 +1561,7 @@ class ReconnectSafeConversationWorker:
                     except RuntimeError as error:
                         consumer_error = error
                     async with self._binding_lock:
-                        if (
-                            self._closed
-                            or session_generation != self._generation
-                            or self._binding is not binding
-                        ):
+                        if self._binding_stale_locked(session_generation, binding):
                             return
                     if consumer_error is not None:
                         raise consumer_error
@@ -1619,22 +1578,15 @@ class ReconnectSafeConversationWorker:
                 observed_at = time.monotonic()
                 try:
                     async with self._binding_lock:
-                        if (
-                            self._closed
-                            or session_generation != self._generation
-                            or self._binding is not binding
-                        ):
+                        if self._binding_stale_locked(session_generation, binding):
                             return
                         if (
                             self._require_media_activation
                             and packet.track_name != self._media_track_name
                         ):
                             continue
-                        suppression = self._audio_input_suppression
-                        if (
-                            suppression is not None
-                            and suppression[0] == session_generation
-                            and suppression[1] == packet.participant_identity
+                        if self._input_suppressed_locked(
+                            session_generation, packet.participant_identity
                         ):
                             continue
                         sequence += 1
@@ -1671,22 +1623,15 @@ class ReconnectSafeConversationWorker:
             record = await ingress.receive()
             try:
                 async with self._binding_lock:
-                    if (
-                        self._closed
-                        or record.session_generation != self._generation
-                        or self._binding is not binding
-                    ):
+                    if self._binding_stale_locked(record.session_generation, binding):
                         return
                     if (
                         self._require_media_activation
                         and record.track_name != self._media_track_name
                     ):
                         continue
-                    suppression = self._audio_input_suppression
-                    if (
-                        suppression is not None
-                        and suppression[0] == record.session_generation
-                        and suppression[1] == record.participant_identity
+                    if self._input_suppressed_locked(
+                        record.session_generation, record.participant_identity
                     ):
                         continue
                 await binding.receive_audio(

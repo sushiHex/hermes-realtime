@@ -729,29 +729,6 @@ class ConversationContextStore:
         if task_id not in self._active_tasks:
             raise ActiveTaskIdentityError("task identity is not active")
 
-    def validate_task_cancellation(
-        self,
-        *,
-        task_id: str,
-        signaled_run_ids: tuple[str, ...],
-    ) -> None:
-        """Validate cancellation evidence without changing terminal authority."""
-
-        self._validate_task_identifier(task_id)
-        if type(signaled_run_ids) is not tuple:
-            raise TypeError("signaled_run_ids must be an exact tuple")
-        if len(signaled_run_ids) != 1:
-            raise ActiveTaskIdentityError("cancellation must signal exactly one active run")
-        run_id = signaled_run_ids[0]
-        self._validate_run_identifier(run_id)
-        active = self._active_tasks.get(task_id)
-        if (
-            active is None
-            or active.run_id != run_id
-            or self._task_ids_by_run_id.get(run_id) != task_id
-        ):
-            raise ActiveTaskIdentityError("cancellation does not match active authority")
-
     def record_task_completed(
         self,
         *,
@@ -800,15 +777,7 @@ class ConversationContextStore:
             size -= len(dropped.objective) + len(dropped.text)
         return ConversationContextSnapshot(
             revision=self._revision,
-            messages=tuple(
-                ConversationMessage(
-                    role=message.role,
-                    text=message.text,
-                    interrupted=message.interrupted,
-                    source=message.source,
-                )
-                for message in messages
-            ),
+            messages=tuple(messages),
             active_tasks=tuple(
                 ActiveTaskSummary(task_id=task.task_id, objective=task.objective)
                 for task in self._active_tasks.values()
