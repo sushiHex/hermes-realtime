@@ -75,7 +75,7 @@ _REFUSALS = frozenset({
     "load-ack", "loaded-model", "loaded-context", "startup-profile", "readiness-status",
     "readiness-bound",
     "readiness-shape", "readiness-json", "model-readiness-loop", "startup-timeout",
-    "mcp-loader", "mcp-load-ack",
+    "mcp-loader", "mcp-load-ack", "loaded-gpu-fit",
 })
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
@@ -434,6 +434,14 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
                     or row["context_length"] != startup_profile.context_tokens):
                 raise ValueError("loaded-context")
             state["configured_context_tokens"] = row["context_length"]
+            if mcp_loader is not None:
+                state["stage"] = "model-readback-gpu-fit"
+                size, vram = row.get("size"), row.get("size_vram")
+                if (type(size) is not int or type(vram) is not int
+                        or size <= 0 or vram != size):
+                    raise ValueError("loaded-gpu-fit")
+                # Ollama's residency report, not an OS/driver memory bound.
+                state["full_gpu_residency_reported"] = True
 
 
 def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,

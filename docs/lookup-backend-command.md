@@ -211,6 +211,49 @@ Check the owner/witness capture summary and bounded `[lookup-model-capture]` dia
 well as the artifact: a failed atomic replacement can leave an older file. Unavailable or
 dropped capture is never evidence of no output or a complete before/after observation.
 
+## Owned MCP loading
+
+Agent-operated GPU loads must use the actual VRAM-MCP warm operation. The
+dependency-free `scripts.lookup_backend_mcp.make_strict_mcp_loader` callback
+fits `start_model(..., mcp_loader=...)`; it does not install an SDK or start
+a server. Its trusted async session factory receives `(base_url, deadline)`
+and owns an initialized, source-bound MCP transport and its cleanup.
+
+The operator must stage and verify the MCP source independently. The initial
+supported contract is upstream VRAM-MCP commit
+`1f273fe41f2803df8c3887a86c4afa72f351b93c` (PR #47), in a separate scoped
+process. A package name, revision string or matching tool names alone do not
+prove that source. Do not restart or replace a shared editable installation
+to prepare this isolated instance. Keep the existing process owner and closed
+environment; use hidden Windows processes.
+
+Before its single warm request, the callback checks the exact literal-loopback
+endpoint, tool argument capabilities and an empty, available residency snapshot
+at that endpoint. Personal Ollama port 11434 is refused. Warm uses
+`strict_fit=True`, `force=False`, the selected profile's exact `num_ctx`,
+`num_parallel=1` (matching the owned server), and indefinite keep-alive for
+the owner's bounded lifetime. Configure `VRAM_MCP_FIT_MARGIN_MB=1024` or
+higher; a smaller reported margin is refused. There is no eviction, fallback,
+automatic retry or context reduction.
+
+Cold-start waiting uses the caller's existing absolute deadline. The warm
+transport timeout is the remaining time less a 60-second allowance for MCP
+checks, reconciliation, independent readback and cleanup; insufficient budget
+refuses before warm. The default 60-second startup is consequently insufficient
+for this strict callback: explicitly admit a supported startup budget using
+`startup_timeout_seconds` (at most 600 seconds). The owned runner's watchdog
+retains its five-minute post-startup allowance, with a total cap of 900 seconds.
+Neither deadline renews after a refusal. The factory must apply the same absolute
+deadline to session initialization and transport; the process owner still settles
+children on timeout or cancellation.
+
+Successful MCP acknowledgment is not sufficient for model readiness. The existing
+owned HTTP readback verifies the sole model's artifact identity and exact context,
+and the MCP path additionally requires positive integer `size == size_vram`.
+Missing, malformed or partial GPU residency refuses and invokes owned cleanup.
+This is Ollama's residency report, not a driver-level bound on GPU use or a
+guarantee of desktop responsiveness. Those remain separately observed outcomes.
+
 ## Recorded public-command outcome
 
 The first full public-command observation at

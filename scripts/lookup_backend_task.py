@@ -280,7 +280,13 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     )
     containment = owner.Containment()
     processes = CappedProcesses(owner.Processes(output), output)
-    watchdog = threading.Timer(360, os._exit, args=(124,))
+    # Keep the existing five-minute post-startup allowance when the caller
+    # explicitly admits a longer (at most ten-minute) cold startup. Invalid
+    # values retain the old bound and are refused by start_model as before.
+    watchdog_seconds = 360
+    if type(startup_timeout_seconds) is int and 1 <= startup_timeout_seconds <= 600:
+        watchdog_seconds = max(360, startup_timeout_seconds + 300)
+    watchdog = threading.Timer(watchdog_seconds, os._exit, args=(124,))
     watchdog.daemon = True
     watchdog.start()
     result: dict[str, Any] = {"category": "refused"}
