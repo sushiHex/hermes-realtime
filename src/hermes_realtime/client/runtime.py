@@ -450,16 +450,13 @@ class BrowserClientRuntime:
                 errors.append(error)
             else:
                 self._worker_closed = True
+        self._record_ingress_close_result(
+            CloseResultV1.FAILED if errors else CloseResultV1.SUCCEEDED
+        )
         if len(errors) == 1:
-            self._record_close_result(CloseResultV1.FAILED)
             raise errors[0]
         if errors:
-            self._record_close_result(CloseResultV1.FAILED)
             raise BaseExceptionGroup("browser client runtime close failed", errors)
-        self._record_close_result(CloseResultV1.SUCCEEDED)
-
-    def _record_close_result(self, result: CloseResultV1) -> None:
-        self._record_ingress_close_result(result)
 
     def _record_ingress_close_result(self, result: CloseResultV1) -> None:
         if getattr(self, "_ingress_close_recorded", False):
