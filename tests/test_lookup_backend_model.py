@@ -69,6 +69,8 @@ def test_complete_artifact_binding(selected):
     assert value["model_blob_count"] == 4
     assert value["model_manifest_sha256"] == selected["model_manifest_sha256"]
     assert value["model_bytes"] == len(b"synthetic-gguf")
+    assert value["rendering_kind"] == "go_template"
+    assert value["renderer"] is value["parser"] is None
 
 
 def test_archive_digest_refused(selected):
@@ -191,6 +193,37 @@ def rewrite_params_layers(selected, count):
     selected["model_manifest_sha256"] = digest(path.read_bytes())
 
 
+def rewrite_rendering_layout(selected, renderer="qwen3.5", parser="qwen3.5", *,
+                             keep_template=False, prompt_layer=False):
+    """Make a synthetic, self-consistently hashed builtin-layout artifact."""
+    store = Path(selected["model_store"])
+    path = store / "manifests/registry.ollama.ai/library/local-model/tag"
+    manifest = json.loads(path.read_bytes())
+    config_path = store / "blobs" / manifest["config"]["digest"].replace(":", "-")
+    config = json.loads(config_path.read_bytes())
+    config["renderer"] = renderer
+    config["parser"] = parser
+    if not keep_template:
+        manifest["layers"] = [row for row in manifest["layers"] if
+            row["mediaType"] != "application/vnd.ollama.image.template"]
+    if prompt_layer:
+        raw = b"unrelated-prompt"
+        manifest["layers"].append({"mediaType": "application/vnd.ollama.image.prompt",
+            "digest": "sha256:" + digest(raw), "size": len(raw)})
+        (store / "blobs" / ("sha256-" + digest(raw))).write_bytes(raw)
+    config["rootfs"]["diff_ids"] = [row["digest"] for row in manifest["layers"]]
+    raw = json.dumps(config).encode()
+    manifest["config"].update(digest="sha256:" + digest(raw), size=len(raw))
+    (store / "blobs" / ("sha256-" + digest(raw))).write_bytes(raw)
+    path.write_text(json.dumps(manifest))
+    selected["model_manifest_sha256"] = digest(path.read_bytes())
+
+
+def sync_owned_digest(selected, owned):
+    owned[3][1]["models"][0]["digest"] = selected["model_manifest_sha256"]
+    owned[5]["ps"]["models"][0]["digest"] = selected["model_manifest_sha256"]
+
+
 def test_stock_shape_without_params_is_admitted(selected):
     rewrite_params_layers(selected, 0)
     assert verify(selected)["model_blob_count"] == 3
@@ -205,6 +238,56 @@ def test_duplicate_params_layers_are_refused(selected):
 def test_model_configuration_refused(selected):
     rewrite_blob(selected, {"renderer": "other-route"})
     with pytest.raises(ValueError, match="model-config"):
+        verify(selected)
+
+
+def test_builtin_layout_is_bound_without_invented_template_digest(selected):
+    rewrite_rendering_layout(selected)
+    facts = verify(selected)
+    assert facts["rendering_kind"] == "builtin_renderer_parser"
+    assert facts["renderer"] == facts["parser"] == "qwen3.5"
+    assert facts["model_blob_count"] == 3
+    assert "template_sha256" not in facts and "template_bytes" not in facts
+    assert facts["model_manifest_sha256"] == selected["model_manifest_sha256"]
+
+
+@pytest.mark.parametrize("renderer,parser,keep_template,prompt_layer", [
+    ("qwen3.5", None, False, False),
+    (None, "qwen3.5", False, False),
+    ("other", "qwen3.5", False, False),
+    ("qwen3.5", "other", False, False),
+    ("qwen3.5", "qwen3.5", True, False),
+    ("qwen3.5", "qwen3.5", False, True),
+])
+def test_builtin_layout_refuses_unsupported_or_mixed_config(
+        selected, renderer, parser, keep_template, prompt_layer):
+    rewrite_rendering_layout(selected, renderer, parser,
+        keep_template=keep_template, prompt_layer=prompt_layer)
+    with pytest.raises(ValueError, match="model-config|model-layer-layout"):
+        verify(selected)
+
+
+def test_builtin_params_context_override_still_refuses(selected):
+    rewrite_rendering_layout(selected)
+    rewrite_blob(selected, {"num_ctx": 4096}, params=True)
+    with pytest.raises(ValueError, match="artifact-context-override"):
+        verify(selected)
+
+
+def test_builtin_rootfs_layer_equality_still_refuses(selected):
+    rewrite_rendering_layout(selected)
+    rewrite_blob(selected, {"rootfs": {"diff_ids": []}})
+    with pytest.raises(ValueError, match="model-config"):
+        verify(selected)
+
+
+def test_builtin_weight_blob_hash_still_refuses(selected):
+    rewrite_rendering_layout(selected)
+    blobs = Path(selected["model_store"]) / "blobs"
+    weight = next(path for path in blobs.iterdir()
+        if path.read_bytes() == b"synthetic-gguf")
+    weight.write_bytes(b"synthetic-fake")
+    with pytest.raises(ValueError, match="model-blob-digest"):
         verify(selected)
 
 
@@ -577,6 +660,60 @@ def test_process_image_must_match_runtime(selected, owned, tmp_path, monkeypatch
 def test_show_template_bound_to_artifact(selected, owned, tmp_path):
     owned[3][-1]["template"] = "different-template"
     with pytest.raises(ValueError, match="metadata-template"):
+        start(selected, owned, tmp_path)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
+def test_builtin_metadata_uses_authenticated_config_not_fallback_template(
+        selected, owned, tmp_path):
+    rewrite_rendering_layout(selected)
+    sync_owned_digest(selected, owned)
+    owned[3][-1]["template"] = "default-template-is-not-a-renderer-witness"
+    owned[3][-1]["modelfile"] = "untrusted-prose-is-not-a-renderer-witness"
+    owned[5]["ps"]["models"][0].update(size=4096, size_vram=4096)
+
+    async def loader(**_kwargs):
+        return True
+
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        model.time.monotonic() + 10, mcp_loader=loader)
+    assert result["category"] == "metadata_ready"
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
+    artifact = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())[
+        "artifact"]
+    assert artifact["rendering_kind"] == "builtin_renderer_parser"
+    assert artifact["renderer"] == artifact["parser"] == "qwen3.5"
+    assert "template_sha256" not in artifact
+
+
+def test_builtin_forced_go_template_profile_refuses_before_spawn(selected, owned, tmp_path):
+    rewrite_rendering_layout(selected)
+    sync_owned_digest(selected, owned)
+    owned[5]["ps"]["models"][0]["context_length"] = 4096
+    with pytest.raises(ValueError, match="model-rendering-profile"):
+        start(selected, owned, tmp_path,
+            startup_profile=model.StartupProfile.NATIVE_TOOLS_4K)
+    assert not owned[0].calls
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["failure_category"] == "model-rendering-profile"
+
+
+@pytest.mark.parametrize("field,value,category", [
+    ("digest", "0" * 64, "metadata-model"),
+    ("family", "wrong", "metadata-capabilities"),
+    ("capabilities", ["completion"], "metadata-capabilities"),
+])
+def test_builtin_served_identity_and_tools_remain_bound(
+        selected, owned, tmp_path, field, value, category):
+    rewrite_rendering_layout(selected)
+    sync_owned_digest(selected, owned)
+    if field == "digest":
+        owned[3][1]["models"][0][field] = value
+    elif field == "family":
+        owned[3][-1]["details"][field] = value
+    else:
+        owned[3][-1][field] = value
+    with pytest.raises(ValueError, match=category):
         start(selected, owned, tmp_path)
     assert owned[0].killed == [model.MODEL_PROCESS_NAME]
 
