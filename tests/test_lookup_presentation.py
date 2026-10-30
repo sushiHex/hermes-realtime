@@ -110,6 +110,8 @@ def setup(monkeypatch, request):
                 await hook(SimpleNamespace(content=json.dumps(kw).encode()))
             if captured.get("callback"):
                 await captured["callback"]()
+            if captured.get("responses_error") is not None:
+                raise captured["responses_error"]
             return ResponseStream(captured.get("stream_events", codex_events()))
 
     class ResponseStream:
@@ -423,6 +425,40 @@ def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup
     assert result.output[0].content[0].text == s.module.REFUSAL
     assert s.row["presentation_evidence"]["category"] == "refused"
     assert s.captured["stream_closed"] == 1
+
+
+@pytest.mark.parametrize(("failure", "marker"), [
+    ("wire", "presentation-wire-contract"),
+    ("stream", "responses-event-unknown"),
+], ids=["wire-contract", "unknown-stream-event"])
+def test_codex_provider_rejection_marker_uses_fixed_allowlist(setup, capsys, failure, marker):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    if failure == "wire":
+        s.captured["wire_mutation"] = lambda body: body.update(function_call="auto")
+    else:
+        s.captured["stream_events"] = [SimpleNamespace(type="response.future_private_event")]
+
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider" and evidence["failure_kind"] == "ValueError"
+    assert evidence["provider_rejection"] == marker
+    assert "future_private_event" not in capsys.readouterr().out
+
+
+def test_codex_provider_does_not_publish_unrecognized_value_error_text(setup, capsys):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["responses_error"] = ValueError("SYNTHETIC_PRIVATE_PROVIDER_TEXT")
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider" and evidence["failure_kind"] == "ValueError"
+    assert "provider_rejection" not in evidence
+    assert "SYNTHETIC_PRIVATE_PROVIDER_TEXT" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("invalid_commentary", [

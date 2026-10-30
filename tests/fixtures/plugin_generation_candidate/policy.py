@@ -37,6 +37,14 @@ EXTRACT_CHAR_LIMIT_DESCRIPTION = (
 PRESENTATION_MODES = frozenset({"chat_completions", "codex_responses"})
 MAX_CODEX_STREAM_EVENTS = 4096
 MAX_CODEX_STREAM_TEXT_CHARS = 8192
+CODEX_PROVIDER_REJECTIONS = frozenset({
+    "presentation-wire-input", "presentation-wire-contract",
+    "presentation-deadline", "presentation-ownership",
+    "responses-event-bound", "responses-event-type", "responses-terminal-failure",
+    "responses-event-unknown", "responses-event-after-terminal", "responses-delta-shape",
+    "responses-stream-text-bound", "responses-stream-output-item",
+    "responses-stream-content-part", "responses-terminal-missing", "responses-terminal-count",
+})
 REFUSAL = json.dumps({"error": "policy_refused"})
 PRESENTATION_SCHEMA = {
     "type": "object",
@@ -1263,6 +1271,11 @@ class Generation:
                 return result
         except BaseException as error:
             evidence["failure_kind"] = type(error).__name__
+            if (api_mode == "codex_responses" and evidence.get("stage") == "provider"
+                    and type(error) is ValueError and len(error.args) == 1
+                    and type(error.args[0]) is str
+                    and error.args[0] in CODEX_PROVIDER_REJECTIONS):
+                evidence["provider_rejection"] = error.args[0]
             with self.lock:
                 self.refuse(run_id)
             return self.refusal_for(api_mode)
