@@ -139,41 +139,28 @@ class HermesPluginRuntime:
         raw_summary = child_summary.strip() if isinstance(child_summary, str) else ""
         with self._lock:
             authoritative = delegation_id in self._reserved_run_ids
+        status: str
+        summary: str | None = None
+        reason: str | None = None
         if raw_status in {"completed", "success"}:
             if raw_summary:
-                completion = HermesRunCompletion(
-                    run_id=delegation_id,
-                    status="completed",
-                    summary=raw_summary,
-                    reason=None,
-                    authoritative=authoritative,
-                )
+                status, summary = "completed", raw_summary
             else:
-                completion = HermesRunCompletion(
-                    run_id=delegation_id,
-                    status="failed",
-                    summary=None,
-                    reason="Hermes delegation completed without a summary",
-                    authoritative=authoritative,
-                )
+                status = "failed"
+                reason = "Hermes delegation completed without a summary"
         elif raw_status in {"interrupted", "cancelled", "canceled"}:
-            completion = HermesRunCompletion(
-                run_id=delegation_id,
-                status="interrupted",
-                summary=None,
-                reason=raw_summary or "Hermes delegation was interrupted",
-                authoritative=authoritative,
-            )
+            status = "interrupted"
+            reason = raw_summary or "Hermes delegation was interrupted"
         else:
-            completion = HermesRunCompletion(
-                run_id=delegation_id,
-                status="failed",
-                summary=None,
-                reason=(
-                    raw_summary or f"Hermes delegation ended with status {raw_status or 'unknown'}"
-                ),
-                authoritative=authoritative,
-            )
+            status = "failed"
+            reason = raw_summary or f"Hermes delegation ended with status {raw_status or 'unknown'}"
+        completion = HermesRunCompletion(
+            run_id=delegation_id,
+            status=status,
+            summary=summary,
+            reason=reason,
+            authoritative=authoritative,
+        )
         with self._lock:
             listeners = tuple(self._listeners)
         for listener in listeners:

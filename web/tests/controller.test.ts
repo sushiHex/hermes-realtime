@@ -63,7 +63,6 @@ import {
   settleMicrophoneMuteChoice,
   settleMicrophoneVerification,
   settleReconnectedMicrophone,
-  settleStableDisconnect,
   sameSpeechAuthority,
   sessionTogglePresentation,
   takeBootstrapCapability,
@@ -548,39 +547,6 @@ describe("launch capability", () => {
       ),
     ).toThrow(/fresh bootstrap/i);
     expect(replaceState).toHaveBeenCalledWith(null, "", "/");
-  });
-});
-
-describe("stable disconnect settlement", () => {
-  it("does not release locally after a successful server stop", async () => {
-    const calls: string[] = [];
-    const result = await settleStableDisconnect(
-      async () => {
-        calls.push("stop");
-      },
-      async () => {
-        calls.push("release");
-      },
-    );
-
-    expect(result).toBe("stopped");
-    expect(calls).toEqual(["stop"]);
-  });
-
-  it("always releases locally when the server stop fails", async () => {
-    const calls: string[] = [];
-    const result = await settleStableDisconnect(
-      async () => {
-        calls.push("stop");
-        throw new Error("rejected");
-      },
-      async () => {
-        calls.push("release");
-      },
-    );
-
-    expect(result).toBe("local-release");
-    expect(calls).toEqual(["stop", "release"]);
   });
 });
 

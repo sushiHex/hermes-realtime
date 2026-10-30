@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Literal, Protocol, TypeVar
+from typing import Literal, Protocol
 
+from hermes_realtime.companion.archive import run_to_end
 from hermes_realtime.companion.integrity import ArchiveRefusal, validate_conversation_id
 from hermes_realtime.companion.store import CompanionStore, DeleteTarget, DeletionRecord
 
@@ -24,9 +25,6 @@ class DeletePort(Protocol):
     def capture_copies(self, session_ids: tuple[str, ...]) -> tuple[str, ...]: ...
 
     def copies_absent(self, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool: ...
-
-
-_T = TypeVar("_T")
 
 
 class VoiceForgetReconciler:
@@ -48,20 +46,6 @@ class VoiceForgetReconciler:
         self._on_tombstone = on_tombstone
         self._on_complete = on_complete
         self._fallback_lock = asyncio.Lock()
-
-    async def _call(self, function: Callable[..., _T], *arguments: object) -> _T:
-        """Keep the conversation lock until a native worker ends, even on cancellation."""
-        work = asyncio.create_task(asyncio.to_thread(function, *arguments))
-        cancelled = False
-        while not work.done():
-            try:
-                await asyncio.wait({work})
-            except asyncio.CancelledError:
-                cancelled = True
-        if cancelled:
-            work.exception()
-            raise asyncio.CancelledError
-        return work.result()
 
     @contextlib.asynccontextmanager
     async def _conversation(self, conversation_id: str) -> AsyncIterator[None]:
@@ -131,11 +115,11 @@ class VoiceForgetReconciler:
                     binding.committed is None
                     and binding.pending is not None and binding.pending.fingerprint.count == 0
                 )
-                targets = await self._call(
+                targets = await run_to_end(
                     self._port.capture_delete_targets, binding.session_id, allow_missing_voice,
                 )
                 # Copies are frozen before the chain goes: Hermes's delete orphans them.
-                copies = await self._call(
+                copies = await run_to_end(
                     self._port.capture_copies,
                     tuple(target.session_id for target in targets),
                 )
@@ -144,7 +128,7 @@ class VoiceForgetReconciler:
                 assert deletion is not None and deletion.targets is not None
             stage = "delete"
             for target in deletion.targets:
-                await self._call(self._port.delete_target, target)
+                await run_to_end(self._port.delete_target, target)
             stage = "verify"
             remaining = await self._remaining(deletion)
             if remaining is not None:
@@ -175,9 +159,9 @@ class VoiceForgetReconciler:
         if deletion.targets is None:
             return "present"
         ids = tuple(target.session_id for target in deletion.targets)
-        if not await self._call(self._port.absent, ids):
+        if not await run_to_end(self._port.absent, ids):
             return "present"
-        if not await self._call(self._port.copies_absent, ids, deletion.copies):
+        if not await run_to_end(self._port.copies_absent, ids, deletion.copies):
             return "branch_copies"
         return None
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Literal, Protocol, Self, cast
+from typing import Any, Literal, Protocol, Self, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from pydantic_core import TzInfo
@@ -31,6 +31,8 @@ from .bridge import BridgeProtocolError
 _MAX_IDENTIFIER_CHARS = 128
 _MAX_TEXT_CHARS = 1024
 _MAX_SEQUENCE = (1 << 63) - 1
+
+_Ack = TypeVar("_Ack", WorkDispatchAcknowledgedEvent, ControlCancelAcknowledgedEvent)
 
 
 def _require_exact_string(value: Any, field: str, *, max_chars: int) -> str:
@@ -59,6 +61,42 @@ def _require_safe_timestamp(value: Any) -> datetime:
     if value.utcoffset() is None:
         raise BridgeProtocolError("event timestamp must be timezone-aware")
     return value
+
+
+def _validate_envelope(
+    event: Any,
+    *,
+    expected_type: str,
+    type_message: str,
+    version_message: str,
+) -> tuple[str, str, int, datetime]:
+    event_type = _require_exact_string(event.type, "event type", max_chars=64)
+    if event_type != expected_type:
+        raise BridgeProtocolError(type_message)
+    protocol_version = _require_exact_string(
+        event.protocol_version,
+        "protocol version",
+        max_chars=16,
+    )
+    if protocol_version != "0.1":
+        raise BridgeProtocolError(version_message)
+    event_id = _require_exact_string(
+        event.event_id,
+        "event_id",
+        max_chars=_MAX_IDENTIFIER_CHARS,
+    )
+    session_id = _require_exact_string(
+        event.session_id,
+        "session_id",
+        max_chars=_MAX_IDENTIFIER_CHARS,
+    )
+    if type(event.sequence) is not int:
+        raise TypeError("sequence must be an exact built-in integer")
+    sequence = event.sequence
+    if not 0 <= sequence <= _MAX_SEQUENCE:
+        raise BridgeProtocolError("event sequence must be non-negative and bounded")
+    timestamp = _require_safe_timestamp(event.timestamp)
+    return event_id, session_id, sequence, timestamp
 
 
 class _HermesBridgeClient(Protocol):
@@ -182,26 +220,12 @@ class RealtimeHermesSession:
         """Send work and await the acknowledgment correlated by task_id."""
 
         request = self._validate_dispatch_request(request)
-        self._authorize_session(request.session_id)
-        self.start()
-        loop = asyncio.get_running_loop()
-        async with self._lock:
-            self._raise_if_unavailable()
-            if request.task_id in self._pending_dispatches:
-                raise ValueError("a dispatch with this task_id is already pending")
-            if (
-                len(self._pending_dispatches) + len(self._pending_cancellations)
-                >= self._max_pending_operations
-            ):
-                raise BridgeProtocolError("worker pending operation capacity exhausted")
-            future: asyncio.Future[WorkDispatchAcknowledgedEvent] = loop.create_future()
-            self._pending_dispatches[request.task_id] = future
-        operation = asyncio.create_task(
-            self._settle_dispatch(request, request.task_id, future)
+        return await self._submit(
+            request,
+            self._pending_dispatches,
+            request.task_id,
+            "a dispatch with this task_id is already pending",
         )
-        self._owned_operations.add(operation)
-        operation.add_done_callback(self._consume_operation)
-        return await asyncio.shield(operation)
 
     async def cancel(
         self,
@@ -210,23 +234,35 @@ class RealtimeHermesSession:
         """Send scoped cancellation and await its exact request acknowledgment."""
 
         request = self._validate_cancel_request(request)
+        return await self._submit(
+            request,
+            self._pending_cancellations,
+            request.event_id,
+            "this cancellation event is already pending",
+        )
+
+    async def _submit(
+        self,
+        request: WorkDispatchRequestedEvent | ControlCancelEvent,
+        pending: dict[str, asyncio.Future[_Ack]],
+        key: str,
+        duplicate: str,
+    ) -> _Ack:
         self._authorize_session(request.session_id)
         self.start()
         loop = asyncio.get_running_loop()
         async with self._lock:
             self._raise_if_unavailable()
-            if request.event_id in self._pending_cancellations:
-                raise ValueError("this cancellation event is already pending")
+            if key in pending:
+                raise ValueError(duplicate)
             if (
                 len(self._pending_dispatches) + len(self._pending_cancellations)
                 >= self._max_pending_operations
             ):
                 raise BridgeProtocolError("worker pending operation capacity exhausted")
-            future: asyncio.Future[ControlCancelAcknowledgedEvent] = loop.create_future()
-            self._pending_cancellations[request.event_id] = future
-        operation = asyncio.create_task(
-            self._settle_cancellation(request, request.event_id, future)
-        )
+            future: asyncio.Future[_Ack] = loop.create_future()
+            pending[key] = future
+        operation = asyncio.create_task(self._settle(request, pending, key, future))
         self._owned_operations.add(operation)
         operation.add_done_callback(self._consume_operation)
         return await asyncio.shield(operation)
@@ -250,32 +286,12 @@ class RealtimeHermesSession:
     def _validate_dispatch_request(request: Any) -> WorkDispatchRequestedEvent:
         if type(request) is not WorkDispatchRequestedEvent:
             raise TypeError("dispatch request must use its exact event class")
-        event_type = _require_exact_string(request.type, "event type", max_chars=64)
-        if event_type != "work.dispatch.requested":
-            raise BridgeProtocolError("dispatch request type contradicted its class")
-        protocol_version = _require_exact_string(
-            request.protocol_version,
-            "protocol version",
-            max_chars=16,
+        event_id, session_id, sequence, timestamp = _validate_envelope(
+            request,
+            expected_type="work.dispatch.requested",
+            type_message="dispatch request type contradicted its class",
+            version_message="dispatch protocol version is unsupported",
         )
-        if protocol_version != "0.1":
-            raise BridgeProtocolError("dispatch protocol version is unsupported")
-        event_id = _require_exact_string(
-            request.event_id,
-            "event_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        session_id = _require_exact_string(
-            request.session_id,
-            "session_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        if type(request.sequence) is not int:
-            raise TypeError("sequence must be an exact built-in integer")
-        sequence = request.sequence
-        if not 0 <= sequence <= _MAX_SEQUENCE:
-            raise BridgeProtocolError("event sequence must be non-negative and bounded")
-        timestamp = _require_safe_timestamp(request.timestamp)
         task_id = _require_exact_string(
             request.task_id,
             "task_id",
@@ -341,32 +357,12 @@ class RealtimeHermesSession:
     def _validate_cancel_request(request: Any) -> ControlCancelEvent:
         if type(request) is not ControlCancelEvent:
             raise TypeError("cancellation request must use its exact event class")
-        event_type = _require_exact_string(request.type, "event type", max_chars=64)
-        if event_type != "control.cancel":
-            raise BridgeProtocolError("cancellation request type contradicted its class")
-        protocol_version = _require_exact_string(
-            request.protocol_version,
-            "protocol version",
-            max_chars=16,
+        event_id, session_id, sequence, timestamp = _validate_envelope(
+            request,
+            expected_type="control.cancel",
+            type_message="cancellation request type contradicted its class",
+            version_message="cancellation protocol version is unsupported",
         )
-        if protocol_version != "0.1":
-            raise BridgeProtocolError("cancellation protocol version is unsupported")
-        event_id = _require_exact_string(
-            request.event_id,
-            "event_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        session_id = _require_exact_string(
-            request.session_id,
-            "session_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        if type(request.sequence) is not int:
-            raise TypeError("sequence must be an exact built-in integer")
-        sequence = request.sequence
-        if not 0 <= sequence <= _MAX_SEQUENCE:
-            raise BridgeProtocolError("event sequence must be non-negative and bounded")
-        timestamp = _require_safe_timestamp(request.timestamp)
         if request.task_id is None:
             task_id = None
         else:
@@ -396,12 +392,13 @@ class RealtimeHermesSession:
             payload=ControlCancelPayload(scope=payload.scope, reason=reason),
         )
 
-    async def _settle_dispatch(
+    async def _settle(
         self,
-        request: WorkDispatchRequestedEvent,
-        correlation_task_id: str,
-        future: asyncio.Future[WorkDispatchAcknowledgedEvent],
-    ) -> WorkDispatchAcknowledgedEvent:
+        request: WorkDispatchRequestedEvent | ControlCancelEvent,
+        pending: dict[str, asyncio.Future[_Ack]],
+        key: str,
+        future: asyncio.Future[_Ack],
+    ) -> _Ack:
         try:
             self._raise_if_unavailable()
             await self._client.send(
@@ -411,27 +408,7 @@ class RealtimeHermesSession:
             return await asyncio.shield(future)
         except BaseException:
             async with self._lock:
-                self._pending_dispatches.pop(correlation_task_id, None)
-            if future.done() and not future.cancelled():
-                future.exception()
-            raise
-
-    async def _settle_cancellation(
-        self,
-        request: ControlCancelEvent,
-        correlation_event_id: str,
-        future: asyncio.Future[ControlCancelAcknowledgedEvent],
-    ) -> ControlCancelAcknowledgedEvent:
-        try:
-            self._raise_if_unavailable()
-            await self._client.send(
-                request,
-                admission_guard=self._raise_if_unavailable,
-            )
-            return await asyncio.shield(future)
-        except BaseException:
-            async with self._lock:
-                self._pending_cancellations.pop(correlation_event_id, None)
+                pending.pop(key, None)
             if future.done() and not future.cancelled():
                 future.exception()
             raise
@@ -510,32 +487,12 @@ class RealtimeHermesSession:
             expected_type = "work.completed"
         else:
             raise BridgeProtocolError("worker received an unsupported exact event class")
-        event_type = _require_exact_string(event.type, "event type", max_chars=64)
-        if event_type != expected_type:
-            raise BridgeProtocolError("event type contradicted its exact event class")
-        protocol_version = _require_exact_string(
-            event.protocol_version,
-            "protocol version",
-            max_chars=16,
+        event_id, session_id, sequence, timestamp = _validate_envelope(
+            event,
+            expected_type=expected_type,
+            type_message="event type contradicted its exact event class",
+            version_message="event protocol version is unsupported",
         )
-        if protocol_version != "0.1":
-            raise BridgeProtocolError("event protocol version is unsupported")
-        event_id = _require_exact_string(
-            event.event_id,
-            "event_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        session_id = _require_exact_string(
-            event.session_id,
-            "session_id",
-            max_chars=_MAX_IDENTIFIER_CHARS,
-        )
-        if type(event.sequence) is not int:
-            raise TypeError("sequence must be an exact built-in integer")
-        sequence = event.sequence
-        if not 0 <= sequence <= _MAX_SEQUENCE:
-            raise BridgeProtocolError("event sequence must be non-negative and bounded")
-        timestamp = _require_safe_timestamp(event.timestamp)
 
         if event_class is WorkDispatchAcknowledgedEvent:
             self._validate_dispatch_acknowledgment(event)

@@ -12,7 +12,7 @@ from pathlib import Path
 from queue import Empty
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 from uuid import uuid4
 
 from hermes_realtime._qualification import (
@@ -49,6 +49,7 @@ from .lifecycle import (
     EvidenceConversationAuthorityV1,
     EvidenceLifecycleOwner,
     _LifecycleRolloverPreparationV1,
+    _mint_capability,
 )
 from .models import (
     CONSENT_VERSION,
@@ -208,6 +209,8 @@ _WRITER_TRANSPORT_METHODS = (
     "drain_and_close",
 )
 
+_D = TypeVar("_D", StoreDisposition, PurgeDisposition, RevokeDisposition, DrainDisposition)
+
 _STORE_DISPOSITIONS = frozenset(StoreDisposition)
 _PURGE_DISPOSITIONS = frozenset(PurgeDisposition)
 _REVOKE_REQUEST_DISPOSITIONS = frozenset(
@@ -237,6 +240,14 @@ def _validate_writer_transport_v1(transport: object) -> None:
     for method in _WRITER_TRANSPORT_METHODS:
         if not callable(getattr(transport, method, None)):
             raise TypeError(f"transport must provide {method}()")
+
+
+def _close_failure_result(error: BaseException) -> CloseResultV1:
+    """Map a close-stage exception to its observed result."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return CloseResultV1.CANCELLED
+    return CloseResultV1.FAILED
 
 
 def _checked_binding_is_current(
@@ -293,18 +304,13 @@ class EvidenceWriterDispatcherV1:
             raise TypeError("item must be an exact evidence writer queue item")
         payload = item.payload
         if type(payload) is CreateEpochV1:
-            try:
-                disposition = self._transport.create_epoch(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            disposition = self._call_transport(
                 item,
-                disposition,
+                lambda: self._transport.create_epoch(payload),
                 StoreDisposition,
                 _STORE_DISPOSITIONS,
-            ):
+            )
+            if disposition is None:
                 return
             if disposition in _CREATE_DURABLE_DISPOSITIONS:
                 try:
@@ -325,58 +331,38 @@ class EvidenceWriterDispatcherV1:
             )
             return
         if type(payload) is BindingCloseV1:
-            try:
-                disposition = self._transport.append_binding_close(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            disposition = self._call_transport(
                 item,
-                disposition,
+                lambda: self._transport.append_binding_close(payload),
                 StoreDisposition,
                 _STORE_DISPOSITIONS,
-            ):
+            )
+            if disposition is None:
                 return
             self._admission.complete_ordered_item(
                 item,
-                writer_succeeded=disposition
-                in (StoreDisposition.COMMITTED, StoreDisposition.IDEMPOTENT),
+                writer_succeeded=disposition in _CREATE_DURABLE_DISPOSITIONS,
             )
             return
         if type(payload) is RolloverSessionV1:
-            try:
-                disposition = self._transport.rollover_session(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            disposition = self._call_transport(
                 item,
-                disposition,
+                lambda: self._transport.rollover_session(payload),
                 StoreDisposition,
                 _STORE_DISPOSITIONS,
-            ):
+            )
+            if disposition is None:
                 return
-            completion = getattr(self, "_rollover_completion", None)
-            if completion is None:
-                self._admission.complete_rollover(item, disposition)
-            else:
-                completion(item, disposition)
+            self._complete_rollover(item, disposition)
             return
         if type(payload) is ExpireSessionV1:
-            try:
-                purge_disposition = self._transport.expire_session(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            purge_disposition = self._call_transport(
                 item,
-                purge_disposition,
+                lambda: self._transport.expire_session(payload),
                 PurgeDisposition,
                 _PURGE_DISPOSITIONS,
-            ):
+            )
+            if purge_disposition is None:
                 return
             self._admission.complete_ordered_item(
                 item,
@@ -385,93 +371,101 @@ class EvidenceWriterDispatcherV1:
             )
             return
         if type(payload) is SealEpochV1:
-            try:
-                disposition = self._transport.seal_epoch(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            disposition = self._call_transport(
                 item,
-                disposition,
+                lambda: self._transport.seal_epoch(payload),
                 StoreDisposition,
                 _STORE_DISPOSITIONS,
-            ):
+            )
+            if disposition is None:
                 return
             self._admission.complete_ordered_item(
                 item,
-                writer_succeeded=disposition
-                in (StoreDisposition.COMMITTED, StoreDisposition.IDEMPOTENT),
+                writer_succeeded=disposition in _CREATE_DURABLE_DISPOSITIONS,
             )
             return
         if type(payload) is RevokeRequestV1:
-            try:
-                revoke_disposition = self._transport.commit_revoke_request(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            revoke_disposition = self._call_transport(
                 item,
-                revoke_disposition,
+                lambda: self._transport.commit_revoke_request(payload),
                 RevokeDisposition,
                 _REVOKE_REQUEST_DISPOSITIONS,
-            ):
+            )
+            if revoke_disposition is None:
                 return
             self._admission.complete_revoke_request(item, revoke_disposition)
             return
         if type(payload) is RevokeFinalizeV1:
-            try:
-                revoke_disposition = self._transport.finalize_revoke(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            revoke_disposition = self._call_transport(
                 item,
-                revoke_disposition,
+                lambda: self._transport.finalize_revoke(payload),
                 RevokeDisposition,
                 _REVOKE_FINALIZE_DISPOSITIONS,
-            ):
+            )
+            if revoke_disposition is None:
                 return
             self._admission.complete_revoke_finalize(item, revoke_disposition)
             return
         if type(payload) is DrainAndStopV1:
-            try:
-                drain_disposition = self._transport.drain_and_close(payload)
-            except BaseException as error:
-                self._complete_transport_failure(item)
-                self._reraise_system_transport_exception(error)
-                return
-            if self._complete_disallowed_transport_disposition(
+            drain_disposition = self._call_transport(
                 item,
-                drain_disposition,
+                lambda: self._transport.drain_and_close(payload),
                 DrainDisposition,
                 _DRAIN_DISPOSITIONS,
-            ):
+            )
+            if drain_disposition is None:
                 return
             self._admission.complete_drain(item, drain_disposition)
             return
         if type(payload) is not QueuedEvidenceRecordV1:
             raise TypeError("writer dispatcher does not support this payload type")
-        try:
-            disposition = self._transport.append_record(payload)
-        except BaseException as error:
-            self._complete_transport_failure(item)
-            self._reraise_system_transport_exception(error)
-            return
-        if self._complete_disallowed_transport_disposition(
+        disposition = self._call_transport(
             item,
-            disposition,
+            lambda: self._transport.append_record(payload),
             StoreDisposition,
             _STORE_DISPOSITIONS,
-        ):
+        )
+        if disposition is None:
             return
         self._admission.complete_ordered_item(
             item,
-            writer_succeeded=disposition
-            in (StoreDisposition.COMMITTED, StoreDisposition.IDEMPOTENT),
+            writer_succeeded=disposition in _CREATE_DURABLE_DISPOSITIONS,
         )
+
+    def _call_transport(
+        self,
+        item: EvidenceWriterQueueItemV1,
+        call: Callable[[], object],
+        expected_type: type[_D],
+        allowed_members: frozenset[_D],
+    ) -> _D | None:
+        """Run one transport call; return None once the item is fault-completed."""
+
+        try:
+            result = call()
+        except BaseException as error:
+            self._complete_transport_failure(item)
+            self._reraise_system_transport_exception(error)
+            return None
+        if self._complete_disallowed_transport_disposition(
+            item,
+            result,
+            expected_type,
+            allowed_members,
+        ):
+            return None
+        return cast(_D, result)
+
+    def _complete_rollover(
+        self,
+        item: EvidenceWriterQueueItemV1,
+        disposition: StoreDisposition,
+    ) -> None:
+        completion = getattr(self, "_rollover_completion", None)
+        if completion is None:
+            self._admission.complete_rollover(item, disposition)
+        else:
+            completion(item, disposition)
 
     def _complete_disallowed_transport_disposition(
         self,
@@ -522,11 +516,7 @@ class EvidenceWriterDispatcherV1:
             self._admission.complete_ordered_item(item, writer_succeeded=False)
             return
         if type(payload) is RolloverSessionV1:
-            completion = getattr(self, "_rollover_completion", None)
-            if completion is None:
-                self._admission.complete_rollover(item, StoreDisposition.FAULTED)
-            else:
-                completion(item, StoreDisposition.FAULTED)
+            self._complete_rollover(item, StoreDisposition.FAULTED)
             return
         if type(payload) is RevokeRequestV1:
             self._admission.complete_revoke_request(item, RevokeDisposition.WRITER_FAULT)
@@ -1099,22 +1089,18 @@ class HostEvidenceRuntimeV1:
                     self._active_rollover = None
                 self._record_rollover_terminal(RolloverResultV1.REJECTED)
                 return
-        except ReservationError:
+        except BaseException as error:
             with self._rollover_lock:
                 self._active_rollover = None
             if lifecycle is not None:
                 self._lifecycle_owner.abort_prepared_rollover(lifecycle)
             if preparation.item is None and not preparation.terminal:
                 admission.abort_prepared_rollover(preparation)
-            self._record_rollover_terminal(RolloverResultV1.REJECTED)
-        except BaseException:
-            with self._rollover_lock:
-                self._active_rollover = None
-            if lifecycle is not None:
-                self._lifecycle_owner.abort_prepared_rollover(lifecycle)
-            if preparation.item is None and not preparation.terminal:
-                admission.abort_prepared_rollover(preparation)
-            self._record_rollover_terminal(RolloverResultV1.FAULTED)
+            self._record_rollover_terminal(
+                RolloverResultV1.REJECTED
+                if isinstance(error, ReservationError)
+                else RolloverResultV1.FAULTED
+            )
 
     def _complete_capacity_rollover(
         self, item: EvidenceWriterQueueItemV1, disposition: StoreDisposition
@@ -1267,24 +1253,21 @@ class HostEvidenceRuntimeV1:
         reservation = self.reserve_consent(command)
         if reservation is None:
             raise RuntimeError("consent create capacity is unavailable")
-        authority = object.__new__(ConsentCreateAuthorityV1)
-        values: dict[str, object] = {
-            "protocol_version": command.protocol_version,
-            "binding_id": command.binding_id,
-            "binding_generation": command.binding_generation,
-            "control_sequence": command.control_sequence,
-            "control_fingerprint_hash": command.control_fingerprint_hash,
-            "consent_version": command.consent_version,
-            "disclosure_digest": command.disclosure_digest,
-            "retention_hours": command.retention_hours,
-            "microphone_accepted": command.microphone_accepted,
-            "typed_accepted": command.typed_accepted,
-            "projection_reservation": projection_reservation,
-            "create_epoch_reservation": reservation,
-        }
-        for name, value in values.items():
-            object.__setattr__(authority, name, value)
-        authority._validate()
+        authority = _mint_capability(
+            ConsentCreateAuthorityV1,
+            protocol_version=command.protocol_version,
+            binding_id=command.binding_id,
+            binding_generation=command.binding_generation,
+            control_sequence=command.control_sequence,
+            control_fingerprint_hash=command.control_fingerprint_hash,
+            consent_version=command.consent_version,
+            disclosure_digest=command.disclosure_digest,
+            retention_hours=command.retention_hours,
+            microphone_accepted=command.microphone_accepted,
+            typed_accepted=command.typed_accepted,
+            projection_reservation=projection_reservation,
+            create_epoch_reservation=reservation,
+        )
         validate_authority_composition(authority, command)
         self._pending_consent_authority = authority
         return authority
@@ -1554,20 +1537,17 @@ class HostEvidenceRuntimeV1:
                     sort_keys=True,
                 ).encode("utf-8")
             ).hexdigest()
-            authority = object.__new__(ConsentRevokeAuthorityV1)
-            values = {
-                "protocol_version": 1,
-                "binding_id": command.binding_id,
-                "binding_generation": command.binding_generation,
-                "consent_epoch_id": command.consent_epoch_id,
-                "revoke_gate_generation": self._owner_generation,
-                "control_sequence": request.sequence,
-                "control_fingerprint_hash": fingerprint,
-                "projection_reservation": projection_reservation,
-            }
-            for name, value in values.items():
-                object.__setattr__(authority, name, value)
-            authority._validate()
+            authority = _mint_capability(
+                ConsentRevokeAuthorityV1,
+                protocol_version=1,
+                binding_id=command.binding_id,
+                binding_generation=command.binding_generation,
+                consent_epoch_id=command.consent_epoch_id,
+                revoke_gate_generation=self._owner_generation,
+                control_sequence=request.sequence,
+                control_fingerprint_hash=fingerprint,
+                projection_reservation=projection_reservation,
+            )
             # This is the one synchronous revoke linearization point.  It closes
             # foreground capability issuance before the writer receives its
             # request, while admission retains pre-existing lease settlement.
@@ -1711,32 +1691,6 @@ class HostEvidenceRuntimeV1:
             raise TypeError("authority must be an exact ConsentCreateAuthorityV1")
         if authority is not self._pending_consent_authority:
             raise RuntimeError("consent activation requires the exact pending authority")
-
-    def abandon_reserved_consent(self, authority: ConsentCreateAuthorityV1) -> None:
-        """Atomically abandon a pre-dispatch consent reservation after composition fails.
-
-        The writer factory runs after the browser projection and admission
-        reservations exist but before any writer or consent dispatch is published.
-        A factory failure must therefore return every reservation and leave the
-        runtime equivalent to a clean retry.
-        """
-
-        if type(authority) is not ConsentCreateAuthorityV1:
-            raise TypeError("authority must be an exact ConsentCreateAuthorityV1")
-        if authority is not self._pending_consent_authority:
-            raise RuntimeError("only the exact pending consent may be abandoned")
-        if self._pending_consent_ticket is not None:
-            raise RuntimeError("dispatched consent cannot be abandoned")
-        admission = self._admission
-        if admission is None or self._pending_create is None:
-            raise RuntimeError("pending consent is missing its admission reservation")
-        admission.release_create_epoch_reservation(authority.create_epoch_reservation)
-        self._pending_create = None
-        self._pending_evidence_consent_key_reset()
-        self._queue = None
-        self._admission = None
-        self._admission_view = None
-        self._lifecycle_owner.retire_drain_lineage()
 
     async def activate_consent(
         self,
@@ -2069,18 +2023,16 @@ class HostEvidenceRuntimeV1:
             if not admission.diagnostics().active_lease_count:
                 break
             await self._retention_sleep(0.01)
-        authority = object.__new__(SessionExpiryAuthorityV1)
-        for name, value in {
-            "protocol_version": 1,
-            "owner_generation": self._lifecycle_owner.owner_generation,
-            "consent_epoch_id": command.consent_epoch_id,
-            "logical_session_id": command.logical_session_id,
-            "expires_at_utc": expires_at,
-            "deadline_admission_ordinal": admission.final_admission_ordinal,
-            "mode": ExpiryMode.ERASE_STUCK,
-        }.items():
-            object.__setattr__(authority, name, value)
-        authority._validate()
+        authority = _mint_capability(
+            SessionExpiryAuthorityV1,
+            protocol_version=1,
+            owner_generation=self._lifecycle_owner.owner_generation,
+            consent_epoch_id=command.consent_epoch_id,
+            logical_session_id=command.logical_session_id,
+            expires_at_utc=expires_at,
+            deadline_admission_ordinal=admission.final_admission_ordinal,
+            mode=ExpiryMode.ERASE_STUCK,
+        )
         ticket = admission.begin_expiry(authority)
         disposition = ticket.disposition
         if disposition is not ExpiryDisposition.ERASURE_DURABLY_SCHEDULED:
@@ -2225,11 +2177,7 @@ class HostEvidenceRuntimeV1:
             except BaseException as error:
                 self._observe_close_stage(
                     CloseStageV1.EPOCH_RETIREMENT,
-                    (
-                        CloseResultV1.CANCELLED
-                        if isinstance(error, asyncio.CancelledError)
-                        else CloseResultV1.FAILED
-                    ),
+                    _close_failure_result(error),
                 )
                 errors.append(error)
             else:
@@ -2240,72 +2188,21 @@ class HostEvidenceRuntimeV1:
         retention = self._retention_task
         self._retention_task = None
         if retention is not None and not retention.done():
-            retention.cancel()
-            try:
-                retention_results = await asyncio.gather(retention, return_exceptions=True)
-            except BaseException as error:
-                errors.append(error)
-                self._observe_close_stage(
-                    CloseStageV1.RETENTION_CANCELLATION,
-                    (
-                        CloseResultV1.CANCELLED
-                        if isinstance(error, asyncio.CancelledError)
-                        else CloseResultV1.FAILED
-                    ),
-                )
-            else:
-                retention_failed = any(
-                    isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)
-                    for result in retention_results
-                )
-                if retention_failed:
-                    errors.extend(
-                        result
-                        for result in retention_results
-                        if isinstance(result, BaseException)
-                        and not isinstance(result, asyncio.CancelledError)
-                    )
-                self._observe_close_stage(
-                    CloseStageV1.RETENTION_CANCELLATION,
-                    CloseResultV1.FAILED if retention_failed else CloseResultV1.SUCCEEDED,
-                )
+            await self._cancel_tasks_for_close(
+                (retention,),
+                CloseStageV1.RETENTION_CANCELLATION,
+                errors,
+            )
         # The browser projection reservation for terminal revoke status is owned
         # by this observer.  Cancel and observe it before writer shutdown so a
         # close that wins before purge releases the exact unpublished slot.
         observers = tuple(self._revoke_observers)
         if observers:
-            for observer in observers:
-                observer.cancel()
-            try:
-                observer_results = await asyncio.gather(*observers, return_exceptions=True)
-            except BaseException as error:
-                errors.append(error)
-                self._observe_close_stage(
-                    CloseStageV1.REVOKE_OBSERVER_CANCELLATION,
-                    (
-                        CloseResultV1.CANCELLED
-                        if isinstance(error, asyncio.CancelledError)
-                        else CloseResultV1.FAILED
-                    ),
-                )
-            else:
-                observers_failed = any(
-                    isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)
-                    for result in observer_results
-                )
-                if observers_failed:
-                    errors.extend(
-                        result
-                        for result in observer_results
-                        if isinstance(result, BaseException)
-                        and not isinstance(result, asyncio.CancelledError)
-                    )
-                self._observe_close_stage(
-                    CloseStageV1.REVOKE_OBSERVER_CANCELLATION,
-                    CloseResultV1.FAILED if observers_failed else CloseResultV1.SUCCEEDED,
-                )
+            await self._cancel_tasks_for_close(
+                observers,
+                CloseStageV1.REVOKE_OBSERVER_CANCELLATION,
+                errors,
+            )
         if self._revoke_observer_failures:
             errors.extend(self._revoke_observer_failures)
             self._revoke_observer_failures.clear()
@@ -2317,11 +2214,7 @@ class HostEvidenceRuntimeV1:
                 errors.append(error)
                 self._observe_close_stage(
                     CloseStageV1.WRITER_DRAIN,
-                    (
-                        CloseResultV1.CANCELLED
-                        if isinstance(error, asyncio.CancelledError)
-                        else CloseResultV1.FAILED
-                    ),
+                    _close_failure_result(error),
                 )
             else:
                 self._observe_close_stage(CloseStageV1.WRITER_DRAIN, CloseResultV1.SUCCEEDED)
@@ -2333,11 +2226,7 @@ class HostEvidenceRuntimeV1:
                     errors.append(error)
                     self._observe_close_stage(
                         CloseStageV1.WRITER_STOP,
-                        (
-                            CloseResultV1.CANCELLED
-                            if isinstance(error, asyncio.CancelledError)
-                            else CloseResultV1.FAILED
-                        ),
+                        _close_failure_result(error),
                     )
                 else:
                     if stopped:
@@ -2364,11 +2253,7 @@ class HostEvidenceRuntimeV1:
                     errors.append(error)
                     self._observe_close_stage(
                         CloseStageV1.TRANSPORT_CLOSE,
-                        (
-                            CloseResultV1.CANCELLED
-                            if isinstance(error, asyncio.CancelledError)
-                            else CloseResultV1.FAILED
-                        ),
+                        _close_failure_result(error),
                     )
                 else:
                     if closed is False:
@@ -2420,6 +2305,33 @@ class HostEvidenceRuntimeV1:
             raise errors[0]
         if errors:
             raise BaseExceptionGroup("host evidence runtime close failed", errors)
+
+    async def _cancel_tasks_for_close(
+        self,
+        tasks: tuple[asyncio.Task[Any], ...],
+        stage: CloseStageV1,
+        errors: list[BaseException],
+    ) -> None:
+        """Cancel owned tasks, collect their non-cancellation failures, and observe the stage."""
+
+        for task in tasks:
+            task.cancel()
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException as error:
+            errors.append(error)
+            self._observe_close_stage(stage, _close_failure_result(error))
+            return
+        failures = [
+            result
+            for result in results
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+        ]
+        errors.extend(failures)
+        self._observe_close_stage(
+            stage,
+            CloseResultV1.FAILED if failures else CloseResultV1.SUCCEEDED,
+        )
 
     async def _cancel_and_observe_consent_settlement(
         self,

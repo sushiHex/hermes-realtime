@@ -565,10 +565,8 @@ class KokoroSynthesizer:
     def _verify_asset(path: Path, asset: _PinnedAsset) -> None:
         if path.stat().st_size != asset.size:
             raise ValueError(f"Kokoro asset has unexpected size: {path}")
-        digest = hashlib.sha256()
         with path.open("rb") as source:
-            for block in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(block)
+            digest = hashlib.file_digest(source, "sha256")
         if digest.hexdigest() != asset.sha256:
             raise ValueError(f"Kokoro asset failed integrity verification: {path}")
 

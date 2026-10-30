@@ -10,13 +10,9 @@ export function mountTaskCancelControl(
   options: TaskCancelControlOptions,
 ): { refresh(): void; dispose(): void } {
   const taskId = options.taskId;
-  try {
-    if (!/^task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}$/.test(taskId) || /deleg_/.test(taskId)) {
-      throw new Error("invalid public task identity");
-    }
-  } catch (error) {
+  if (!/^task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}$/.test(taskId) || /deleg_/.test(taskId)) {
     try {
-      throw error;
+      throw new Error("invalid public task identity");
     } finally {
       console.info('[task-control-refusal] {"kind":"cancel","category":"invalid-identity"}');
     }

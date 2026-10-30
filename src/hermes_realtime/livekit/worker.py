@@ -198,13 +198,11 @@ class LiveKitConversationWorker:
                     errors.append(error)
                 else:
                     self._runtime_closed = True
+            self._record_close_result(tuple(errors))
             if len(errors) == 1:
-                self._record_close_result(tuple(errors))
                 raise errors[0]
             if errors:
-                self._record_close_result(tuple(errors))
                 raise BaseExceptionGroup("LiveKit conversation worker close failed", errors)
-            self._record_close_result(())
 
     def _record_close_result(self, errors: tuple[BaseException, ...]) -> None:
         recorder = self._production_observation_recorder

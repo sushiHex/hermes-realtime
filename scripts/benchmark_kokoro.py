@@ -31,11 +31,8 @@ _LONG_TEXT = " ".join([_MEDIUM_TEXT] * 4)
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _percentile(values: list[float], fraction: float) -> float:

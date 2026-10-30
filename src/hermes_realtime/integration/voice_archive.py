@@ -27,6 +27,7 @@ import contextlib
 import json
 import math
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Protocol
 
 from hermes_realtime.integration.bridge import LocalHermesBridgeClient
@@ -92,16 +93,14 @@ def bridge_connector(
 ) -> Callable[[], Awaitable[VoiceArchiveLink]]:
     """Connect to the companion's bridge, asking for ``voice_archive`` only."""
 
-    async def connect() -> VoiceArchiveLink:
-        return await LocalHermesBridgeClient.connect(
-            host=host,
-            port=port,
-            token=token,
-            participant_id=_PARTICIPANT,
-            capabilities=(VOICE_ARCHIVE_CAPABILITY,),
-        )
-
-    return connect
+    return partial(
+        LocalHermesBridgeClient.connect,
+        host=host,
+        port=port,
+        token=token,
+        participant_id=_PARTICIPANT,
+        capabilities=(VOICE_ARCHIVE_CAPABILITY,),
+    )
 
 
 class VoiceArchiveSender:

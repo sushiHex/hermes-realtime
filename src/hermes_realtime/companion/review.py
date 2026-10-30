@@ -14,7 +14,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from hermes_realtime.companion.archive import VoiceArchive
 from hermes_realtime.companion.integrity import (
@@ -29,6 +29,7 @@ from hermes_realtime.companion.store import (
     ConversationRecord,
 )
 
+_K = TypeVar("_K")
 _MARKER = "[voice-review] "
 MAX_REVIEW_ROWS = 24
 MAX_REVIEW_BYTES = 65_536
@@ -62,6 +63,17 @@ class ReviewQuiescenceError(RuntimeError):
 
 def _marker(evidence: dict[str, str | int]) -> None:
     print(_MARKER + json.dumps(evidence, sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _retained(
+    tasks: dict[_K, asyncio.Task[None]], key: _K, function: Callable[..., None], *arguments: object
+) -> asyncio.Task[None]:
+    """The key's worker-thread task, started anew only if it is missing, cancelled or failed."""
+
+    work = tasks.get(key)
+    if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
+        work = tasks[key] = asyncio.create_task(asyncio.to_thread(function, *arguments))
+    return work
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,10 +445,7 @@ class VoiceReviewCoordinator:
         for key, (owner, token) in tuple(self._owned_releases.items()):
             if parent is not None and owner is not parent:
                 continue
-            work = self._release_tasks.get(key)
-            if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
-                work = asyncio.create_task(asyncio.to_thread(self._port.finish, owner, token))
-                self._release_tasks[key] = work
+            work = _retained(self._release_tasks, key, self._port.finish, owner, token)
             try:
                 await asyncio.wait_for(asyncio.shield(work), timeout)
             except asyncio.CancelledError:
@@ -486,12 +495,9 @@ class VoiceReviewCoordinator:
             return True
         running.cancelled = True
         deadline = asyncio.get_running_loop().time() + timeout
-        work = self._cancel_tasks.get(running.review_id)
-        if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
-            work = asyncio.create_task(
-                asyncio.to_thread(self._port.cancel, running.parent, running.token)
-            )
-            self._cancel_tasks[running.review_id] = work
+        work = _retained(
+            self._cancel_tasks, running.review_id, self._port.cancel, running.parent, running.token
+        )
         cancel_error: BaseException | None = None
         try:
             await asyncio.wait_for(
@@ -558,12 +564,7 @@ class VoiceReviewCoordinator:
             raise ReviewQuiescenceError("failed review parent has not closed")
         for parent in self._parents.values():
             key = id(parent)
-            work = self._parent_closes.get(key)
-            if work is None or (work.done() and (work.cancelled() or work.exception() is not None)):
-                work = asyncio.create_task(
-                    asyncio.to_thread(self._port.close_parent, parent)
-                )
-                self._parent_closes[key] = work
+            work = _retained(self._parent_closes, key, self._port.close_parent, parent)
             try:
                 await asyncio.wait_for(asyncio.shield(work), _CLOSE_JOIN_SECONDS)
             except BaseException:

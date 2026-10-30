@@ -3,6 +3,7 @@ import type {
   ModelCatalog,
   SessionModelConfiguration,
   SessionTokenUsage,
+  SpeechAuthority,
 } from "./protocol";
 import { isBrowserIdentity } from "./protocol";
 
@@ -565,20 +566,6 @@ export async function reloadOrBootstrap(options: {
   return options.bootstrap();
 }
 
-
-export async function settleStableDisconnect(
-  stopRemote: () => Promise<void>,
-  releaseLocal: () => Promise<void>,
-): Promise<"stopped" | "local-release"> {
-  try {
-    await stopRemote();
-    return "stopped";
-  } catch {
-    await releaseLocal();
-    return "local-release";
-  }
-}
-
 export type ApprovalDecision = "approve" | "reject";
 
 type ApprovalSender = (
@@ -828,13 +815,6 @@ export function naturalDuplexProfileEnabled(data: Record<string, unknown>): bool
     data.conversationProfile === "natural_v1" &&
     data.mode === "microphone_or_typed"
   );
-}
-
-export interface SpeechAuthority {
-  readonly turnId: string;
-  readonly turnGeneration: number;
-  readonly chunkId: string;
-  readonly streamId: string;
 }
 
 export function sameSpeechAuthority(
@@ -1389,14 +1369,7 @@ export class BoundedRetention<Value> {
     }
     this.entries.push({ value, cost });
     this.totalCost += cost;
-    const evicted: Value[] = [];
-    while (this.entries.length > this.maxItems || this.totalCost > this.maxCost) {
-      const oldest = this.entries.shift();
-      if (oldest === undefined) throw new Error("retention accounting is inconsistent");
-      this.totalCost -= oldest.cost;
-      evicted.push(oldest.value);
-    }
-    return evicted;
+    return this.evictOverflow();
   }
 
   update(value: Value, cost: number): Value[] {
@@ -1414,14 +1387,7 @@ export class BoundedRetention<Value> {
     }
     this.totalCost += cost - entry.cost;
     entry.cost = cost;
-    const evicted: Value[] = [];
-    while (this.entries.length > this.maxItems || this.totalCost > this.maxCost) {
-      const oldest = this.entries.shift();
-      if (oldest === undefined) throw new Error("retention accounting is inconsistent");
-      this.totalCost -= oldest.cost;
-      evicted.push(oldest.value);
-    }
-    return evicted;
+    return this.evictOverflow();
   }
 
   remove(value: Value): boolean {
@@ -1431,6 +1397,17 @@ export class BoundedRetention<Value> {
     if (entry === undefined) throw new Error("retention accounting is inconsistent");
     this.totalCost -= entry.cost;
     return true;
+  }
+
+  private evictOverflow(): Value[] {
+    const evicted: Value[] = [];
+    while (this.entries.length > this.maxItems || this.totalCost > this.maxCost) {
+      const oldest = this.entries.shift();
+      if (oldest === undefined) throw new Error("retention accounting is inconsistent");
+      this.totalCost -= oldest.cost;
+      evicted.push(oldest.value);
+    }
+    return evicted;
   }
 }
 
@@ -1663,7 +1640,10 @@ export class AssistantGenerationAuthority {
       this.highWatermarks.get(turnId),
       candidateGeneration,
     );
-    if (disposition === "create" || disposition === "replace") {
+    if (disposition !== "reject") {
+      // Map insertion order is the LRU key. Refreshing it for "current" too keeps an
+      // actively streaming turn from aging out as the "oldest" entry, after which a
+      // replayed lower generation would read as "create" instead of "reject".
       this.highWatermarks.delete(turnId);
       this.highWatermarks.set(turnId, candidateGeneration);
       while (this.highWatermarks.size > this.maxTurns) {
@@ -1671,12 +1651,6 @@ export class AssistantGenerationAuthority {
         if (oldest === undefined) break;
         this.highWatermarks.delete(oldest);
       }
-    } else if (disposition === "current") {
-      // Map insertion order is the LRU key. Without refreshing it here an
-      // actively streaming turn ages out as the "oldest" entry, after which a
-      // replayed lower generation reads as "create" instead of "reject".
-      this.highWatermarks.delete(turnId);
-      this.highWatermarks.set(turnId, candidateGeneration);
     }
     return disposition;
   }

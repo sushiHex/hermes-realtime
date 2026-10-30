@@ -9,8 +9,8 @@ def _is_punctuation(character: str | None) -> bool:
     return character is not None and unicodedata.category(character).startswith("P")
 
 
-def strip_markdown_emphasis_for_speech(text: str) -> str:
-    """Remove matched emphasis delimiters in one bounded linear scan."""
+def _scan_markdown_emphasis(text: str) -> tuple[bytearray, bool]:
+    """Mark matched emphasis delimiters and report whether any opening stays unmatched."""
 
     removed = bytearray(len(text))
     openings: dict[tuple[str, int], list[tuple[int, int]]] = {}
@@ -59,4 +59,11 @@ def strip_markdown_emphasis_for_speech(text: str) -> str:
         elif can_open:
             openings.setdefault(key, []).append((index, end))
         index = end
+    return removed, any(candidates for candidates in openings.values())
+
+
+def strip_markdown_emphasis_for_speech(text: str) -> str:
+    """Remove matched emphasis delimiters in one bounded linear scan."""
+
+    removed, _ = _scan_markdown_emphasis(text)
     return "".join(character for offset, character in enumerate(text) if not removed[offset])

@@ -556,7 +556,6 @@ class RecordingRootHandle:
 
         self.root = root
         self.closed = 0
-        self.moves: list[tuple[Path, Path]] = []
         self._identity = storage_security.RootIdentityV1(
             volume_serial_number=1,
             file_index=2,
@@ -593,10 +592,6 @@ class RecordingRootHandle:
                 storage_security.WriterFault.PATH_INVALID,
                 "the configured evidence root no longer names the retained object",
             )
-
-    def move_no_replace_write_through(self, source: Path, destination: Path) -> None:
-        self.moves.append((source, destination))
-        os.rename(source, destination)
 
     def activate_exact_temporary(self, temporary, final, retained, expected) -> None:  # type: ignore[no-untyped-def]
         from hermes_realtime.evidence import storage_security

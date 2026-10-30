@@ -1,9 +1,4 @@
-export interface SearchEgressStatus {
-  readonly available: boolean;
-  readonly consentVersion: "realtime-search-egress-consent-v1";
-  readonly disclosureDigest: string;
-  readonly searchEgressState: "unavailable" | "idle" | "active";
-}
+import type { SearchEgressStatus } from "./protocol";
 
 export interface SearchEgressConsentRequest {
   readonly accepted: true;

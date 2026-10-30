@@ -17,7 +17,7 @@ import re
 import struct
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 _MAGIC = b"HRQJ3\x00\r\n"
 _GENESIS_TAG = b"hermes-realtime/run-journal/genesis/1\x00"
@@ -302,18 +302,6 @@ class _JournalHandleFactV1:
     links: int
     directory: bool = False
     inheritable: bool = False
-
-
-class _JournalIoV1(Protocol):
-    def handle_fact(self, handle: int) -> _JournalHandleFactV1: ...
-
-    def final_path(self, handle: int) -> str: ...
-
-    def read(self, handle: int, maximum: int) -> bytes: ...
-
-    def write(self, handle: int, offset: int, raw: bytes) -> int: ...
-
-    def flush(self, handle: int) -> None: ...
 
 
 @dataclass(slots=True)

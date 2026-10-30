@@ -1,16 +1,4 @@
-export interface CaptureStatus {
-  readonly available: boolean;
-  readonly captureState:
-    | "unavailable"
-    | "idle"
-    | "active"
-    | "revoked_purging"
-    | "purge_failed"
-    | "faulted";
-  readonly consentVersion: "realtime-evidence-consent-v1";
-  readonly disclosureDigest: string;
-  readonly retentionHours: number;
-}
+import type { CaptureStatus } from "./protocol";
 
 export interface EvidenceConsentRequest {
   readonly accepted: true;
