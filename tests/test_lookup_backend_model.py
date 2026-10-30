@@ -693,6 +693,7 @@ def test_load_and_readback_precede_ready(selected, owned, tmp_path):
 def test_mcp_loader_replaces_native_load_and_shares_readback(selected, owned, tmp_path, profile):
     calls = []
     owned[5]["ps"]["models"][0]["context_length"] = profile.context_tokens
+    owned[5]["ps"]["models"][0].update(size=4096, size_vram=4096)
 
     class Loader:
         def __bool__(self):
@@ -713,6 +714,23 @@ def test_mcp_loader_replaces_native_load_and_shares_readback(selected, owned, tm
     assert result["mcp_callback_acknowledged"] is True
     assert result["load_request_count"] == 0 and result["load_acknowledged"] is False
     assert result["model_ready"] is True
+
+
+@pytest.mark.parametrize("size,vram", [
+    (4096, 2048), (4096, None), (None, 4096), (0, 0),
+    (4096, 8192), (True, True), (4096.0, 4096.0),
+])
+def test_mcp_ack_requires_independent_full_gpu_readback(selected, owned, tmp_path, size, vram):
+    owned[5]["ps"]["models"][0].update(size=size, size_vram=vram)
+
+    async def loader(**_kwargs):
+        return True
+
+    with pytest.raises(ValueError, match="loaded-gpu-fit"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
 
 
 @pytest.mark.parametrize("answer", [False, None, 1, "accepted"])
@@ -739,6 +757,18 @@ def test_mcp_loader_exception_has_no_fallback_or_private_detail(selected, owned,
     state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
     assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
     assert "private-loader-detail" not in json.dumps(state) + capsys.readouterr().out
+
+
+def test_mcp_refusal_category_survives_owned_model_diagnostic(selected, owned, tmp_path):
+    async def loader(**_kwargs):
+        raise ValueError("mcp-budget")
+
+    with pytest.raises(ValueError, match="mcp-budget"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["failure_category"] == "mcp-budget"
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
 
 
 def test_mcp_loader_timeout_cancels_callback_without_native_fallback(selected, owned, tmp_path):
