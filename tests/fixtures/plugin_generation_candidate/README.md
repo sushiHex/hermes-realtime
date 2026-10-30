@@ -100,11 +100,25 @@ Generic native completion and the budget-only fixture deployment do not promise
 source support and keep their prior completion behavior. Historical bounded-tool
 qualification does not become source-backed publication qualification retroactively.
 
-The presentation request sets `reasoning_effort: none`; native task reasoning
-is unchanged. The configured endpoint must support this request control.
-Unsupported requests fail closed without a fallback. The 1024-token cap, schema
-and admission deadline remain unchanged; wire evidence records the serialized
-control as a boolean without recording request content.
+The legacy presentation request uses `chat_completions`. An explicit optional
+`api_mode: codex_responses` selects the official Codex Responses endpoint for
+presentation and the native Hermes raw-Responses envelope for policy-authored
+search calls. It binds the same provider, base URL and model, sends no tools,
+uses strict `text.format` JSON schema, `store: false`, streaming and low reasoning,
+and accepts only one completed terminal response. Streaming is bounded to 4,096
+events and 8,192 text characters; deltas are never assembled into a result.
+Unknown events/items, refusal or incomplete terminal state, null output and
+unusable final text refuse presentation. Only the final-answer message is
+rewritten, preserving the original response identity, usage and other output
+items. This mode needs an explicit access token in the configured environment
+variable; it does not resolve or refresh Codex OAuth credentials. The caller
+must supply a valid token. Native Hermes task reasoning is unchanged.
+
+`tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
+streaming producer through presentation and publication using synthetic SDK
+transports. It checks native and SDK response metadata and original-response
+preservation. It is an explicit offline proof, not a model or gateway qualification;
+its source, policy, runtime and fresh receipt paths are supplied by the caller.
 
 `tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
 streaming producer through presentation and publication using synthetic SDK

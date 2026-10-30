@@ -19,6 +19,7 @@ CONFIG = {
     "model": "test-model",
     "api_key_env": "LOOKUP_TEST_KEY",
 }
+CODEX_CONFIG = CONFIG | {"api_mode": "codex_responses"}
 
 
 def completion(content, *, reason="stop", calls=None):
@@ -59,14 +60,18 @@ def setup(monkeypatch, request):
         "success": True, "data": {"web": [{"url": "https://example.invalid/source"}]},
     })
     session = {"run": "selected"}
-    for name in ("tools", "tools.approval", "tools.registry"):
+    for name in ("tools", "tools.approval", "tools.registry", "agent", "agent.codex_headers"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     sys.modules["tools.approval"].get_current_session_key = lambda **_: session["run"]
     sys.modules["tools.registry"].registry = SimpleNamespace(get_entry=lambda _: None)
+    sys.modules["agent.codex_headers"].codex_cloudflare_headers = (
+        lambda token, *, base_url: {"X-Codex-Test": "explicit-token-bound"}
+    )
     spec = importlib.util.spec_from_file_location("lookup_presentation_policy", SOURCE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    captured = {"requests": [], "closed": 0, "sdk": [], "http": []}
+    captured = {"requests": [], "responses_requests": [], "closed": 0,
+                "stream_closed": 0, "sdk": [], "http": []}
 
     class Http:
         def __init__(self, **kw):
@@ -84,6 +89,7 @@ def setup(monkeypatch, request):
         def __init__(self, **kw):
             captured["sdk"].append(kw)
             self.chat = SimpleNamespace(completions=self)
+            self.responses = SimpleNamespace(create=self.create_responses)
 
         async def create(self, **kw):
             captured["requests"].append(kw)
@@ -95,6 +101,56 @@ def setup(monkeypatch, request):
                 "response", completion(
                     '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
             )
+
+        async def create_responses(self, **kw):
+            if captured.get("wire_mutation"):
+                captured["wire_mutation"](kw)
+            captured["responses_requests"].append(kw)
+            for hook in captured["http"][-1]["event_hooks"]["request"]:
+                await hook(SimpleNamespace(content=json.dumps(kw).encode()))
+            if captured.get("callback"):
+                await captured["callback"]()
+            return ResponseStream(captured.get("stream_events", codex_events()))
+
+    class ResponseStream:
+        def __init__(self, events):
+            self.events = events
+
+        def __aiter__(self):
+            async def iterate():
+                for event in self.events:
+                    yield event
+            return iterate()
+
+        async def close(self):
+            captured["stream_closed"] += 1
+            if captured.get("stream_close_callback"):
+                await captured["stream_close_callback"]()
+
+    def codex_message(text, *, phase="final_answer", item_id="msg_native"):
+        return SimpleNamespace(
+            type="message", id=item_id, role="assistant", status="completed", phase=phase,
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )
+
+    def codex_response(output, *, status="completed", usage=None,
+                       incomplete_details=None, output_text=None):
+        return SimpleNamespace(
+            id="resp_native", object="response", status=status,
+            output=output, output_text=output_text, usage=usage,
+            incomplete_details=incomplete_details,
+        )
+
+    def codex_events(response=None, *, deltas=None):
+        response = response or codex_response([
+            codex_message(
+                '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7))
+        events = [SimpleNamespace(type="response.created")]
+        events.extend(SimpleNamespace(type="response.output_text.delta", delta=delta)
+                      for delta in (deltas or ['{"voice":"Short."}']))
+        events.append(SimpleNamespace(type="response.completed", response=response))
+        return events
 
     monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(AsyncClient=Http))
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=Client))
@@ -119,12 +175,15 @@ def setup(monkeypatch, request):
     def run(**changes):
         kw = dict(api_mode="chat_completions", api_request_id="task-request",
                   provider=CONFIG["provider"], base_url=CONFIG["base_url"], model=CONFIG["model"],
-                  request=request, next_call=lambda _: original)
+                  request=request, next_call=lambda _: run.original)
         kw.update(changes)
         return g.model_gate(**kw)
+    run.original = original
 
     return SimpleNamespace(module=module, g=g, row=row, original=original, request=request,
-                           run=run, captured=captured, refused=refused, session=session)
+                           run=run, captured=captured, refused=refused, session=session,
+                           codex_response=codex_response, codex_message=codex_message,
+                           codex_events=codex_events)
 
 
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
@@ -162,6 +221,204 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
     assert s.row["presentation_evidence"]["wire_requests"] == 1
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda body: body["input"][0].update(content=body["input"][0]["content"] + " "),
+    lambda body: body.update(tools=[]),
+    lambda body: body["text"]["format"].update(strict=False),
+    lambda body: body.update(store=True),
+    lambda body: body.update(stream=False),
+    lambda body: body["reasoning"].update(effort="high"),
+    lambda body: body.update(model="other-model"),
+    lambda body: body.update(instructions="changed"),
+    lambda body: body.update(extra="unexpected"),
+], ids=["input", "tools", "schema", "store", "stream", "reasoning", "model",
+        "instructions", "extra-field"])
+def test_codex_wire_contract_mutations_refuse_before_accepting_response(setup, mutate):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["wire_mutation"] = mutate
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert s.row["presentation_evidence"]["category"] == "refused"
+    assert s.row["presentation_evidence"]["wire_requests"] == 0
+    assert s.row["presentation_evidence"]["local_http_settled"] is True
+
+
+def test_presentation_route_mode_is_explicit_and_bound(setup):
+    s = setup
+    formatter = s.module.Presentation(CODEX_CONFIG)
+    formatter.validate_route({
+        "provider": CODEX_CONFIG["provider"],
+        "base_url": CODEX_CONFIG["base_url"],
+        "model": CODEX_CONFIG["model"],
+        "api_mode": "codex_responses",
+        "request": {"model": CODEX_CONFIG["model"]},
+    })
+    with pytest.raises(ValueError, match="presentation-route"):
+        formatter.validate_route({
+            "provider": CODEX_CONFIG["provider"],
+            "base_url": CODEX_CONFIG["base_url"],
+            "model": CODEX_CONFIG["model"],
+            "api_mode": "chat_completions",
+            "request": {"model": CODEX_CONFIG["model"]},
+        })
+    with pytest.raises(ValueError, match="presentation-config"):
+        s.module.Presentation(CONFIG | {"api_mode": "codex_app_server"})
+
+
+def test_codex_responses_function_call_uses_call_id_for_ticket_identity(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    source_url = "https://example.invalid/source"
+    s.row.update(phase="search", reserved=1, settled=1, urls={source_url})
+    args = {"urls": [source_url]}
+    raw = SimpleNamespace(
+        id="resp_native",
+        status="completed",
+        output=[SimpleNamespace(
+            type="function_call", id="fc_item_id", call_id="call_ticket_id",
+            name="web_extract", arguments=json.dumps(args), status="completed",
+        )],
+        usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+    )
+    s.run.original = raw
+    request = {
+        "model": CODEX_CONFIG["model"],
+        "tools": [{"type": "function", "name": "web_extract",
+                   "parameters": {"type": "object"}}],
+    }
+    result = s.run(api_mode="codex_responses", request=request)
+    assert result is raw
+    assert s.row["plan"] == {"call_ticket_id": ("web_extract", s.module.frozen(args))}
+    result = s.g.tool_gate(
+        tool_name="web_extract", tool_call_id="call_ticket_id",
+        api_request_id="task-request", args=args, next_call=lambda _: "admitted",
+    )
+    assert result == "admitted"
+    assert s.row["spent"] == {"call_ticket_id"}
+
+
+def test_codex_host_search_returns_native_responses_envelope(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.row.update(phase="new", reserved=0, settled=0, urls=set())
+    request = {"tools": [{
+        "type": "function", "name": "web_search",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }]}
+    result = s.run(api_mode="codex_responses", request=request,
+                   next_call=lambda _: pytest.fail("host retrieval must not call the model"))
+    assert result.status == "completed" and result.id.startswith("host-response-")
+    assert len(result.output) == 1 and result.output[0].type == "function_call"
+    assert result.output[0].name == "web_search"
+    assert result.output[0].call_id.startswith("host-search-")
+    assert json.loads(result.output[0].arguments) == {"query": "synthetic lookup"}
+
+
+def test_codex_mode_refusal_is_a_completed_native_message(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    result = s.run(api_mode="codex_responses", request={"tools": []})
+    assert result.status == "completed"
+    assert result.output[0].status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    original_final = s.codex_message(
+        '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", summary=[])
+    commentary = s.codex_message("Progress text must not be published.", phase="commentary",
+                                 item_id="msg_commentary")
+    raw = s.codex_response(
+        [reasoning, commentary, original_final],
+        usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+    )
+    s.run.original = raw
+    s.captured["stream_events"] = s.codex_events(
+        s.codex_response([
+            s.codex_message("{\"voice\":\"Short.\",\"detail\":\"Full source result.\","
+                            "\"source_ids\":[0]}")
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7)),
+        deltas=['{"voice":', '"Short."}'],
+    )
+    result = s.run(api_mode="codex_responses")
+    assert result is not s.refused and result.id == raw.id
+    assert result.usage is raw.usage and result.output[0] is reasoning
+    assert result.output[1] is commentary
+    final_text = result.output[2].content[0].text
+    assert final_text == (
+        "<voice>Short.</voice><detail>Full source result.\n\nSources:\n"
+        "https://example.invalid/source</detail>"
+    )
+    assert original_final.content[0].text.startswith('{"voice"')
+    assert len(s.captured["responses_requests"]) == 1
+    body = s.captured["responses_requests"][0]
+    assert set(body) == {"model", "instructions", "input", "store", "stream", "text", "reasoning"}
+    assert body["model"] == CODEX_CONFIG["model"]
+    assert body["store"] is False and body["stream"] is True
+    assert body["reasoning"] == {"effort": "low"}
+    assert body["text"]["format"] == {
+        "type": "json_schema", "name": "voice_detail", "strict": True,
+        "schema": s.module.PRESENTATION_SCHEMA,
+    }
+    assert "tools" not in body and "tool_choice" not in body
+    assert s.captured["stream_closed"] == 1
+    assert s.row["presentation_evidence"]["usage"] == {
+        "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+    }
+    assert s.row["presentation_evidence"]["wire"]["tools_absent"] is True
+    assert s.row["presentation_evidence"]["wire"]["input_matches"] is True
+    assert s.row["presentation_evidence"]["wire"]["instructions_match"] is True
+
+
+def test_codex_stream_close_is_cancellation_boundary(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+
+    async def cancel_during_close():
+        s.g.cancel_presentation(s.row)
+        await asyncio.sleep(0)
+
+    s.captured["stream_close_callback"] = cancel_during_close
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert s.captured["stream_closed"] == 1
+    assert s.row["presentation_evidence"]["local_http_settled"] is True
+    assert s.row["presentation_active"] is None
+
+
+@pytest.mark.parametrize("events", [
+    [],
+    [SimpleNamespace(type="response.incomplete", response=SimpleNamespace(status="incomplete"))],
+    [SimpleNamespace(type="response.completed", response=None)],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="null-output", status="completed", output=None, usage=None))],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="refusal", status="completed", output=[SimpleNamespace(
+            type="message", role="assistant", status="completed", phase="final_answer",
+            content=[SimpleNamespace(type="refusal", refusal="denied")])], usage=None))],
+], ids=["missing-terminal", "incomplete", "terminal-null", "output-null", "refusal"])
+def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup, events):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([
+        s.codex_message("Grounded source answer.")
+    ])
+    s.captured["stream_events"] = events
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert s.row["presentation_evidence"]["category"] == "refused"
+    assert s.captured["stream_closed"] == 1
 
 
 @pytest.mark.parametrize("setup", [None], indirect=True)

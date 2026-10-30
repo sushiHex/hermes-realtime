@@ -51,6 +51,17 @@ These checks prove source binding, bounds and valid references, not factual trut
 or faithful inference. Actual answer quality and voice acceptance remain separately
 observed outcomes under [the grounding investigation](https://github.com/sushiHex/hermes-realtime/issues/386).
 
+Presentation keeps `chat_completions` as its default. A plugin configuration may
+explicitly select `api_mode: codex_responses`; this is a same-provider, same-base-
+URL, same-model direct Responses request with no advertised tools, strict schema,
+streaming, `store: false` and low reasoning. The bounded stream must terminate in
+one completed response; unknown events or output, refusal, incomplete/null
+terminal state, or missing final answer refuse publication. Deltas are not used to
+reconstruct a response. A successful result retains its raw Responses envelope
+and rewrites only the final-answer text. This route uses an explicitly supplied
+token through the SDK Codex headers helper, without OAuth lookup or refresh, and
+does not establish foreground Codex support or native task qualification.
+
 ## Freeze the source and artifacts
 
 Use a clean public checkout. The delivered main commit is

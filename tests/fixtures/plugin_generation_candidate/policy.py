@@ -25,6 +25,9 @@ from tools.registry import registry
 VERSION = "ordinary-lookup/v1"
 SEARCH_LIMIT = 5
 EXTRACT_LIMIT = 3
+PRESENTATION_MODES = frozenset({"chat_completions", "codex_responses"})
+MAX_CODEX_STREAM_EVENTS = 4096
+MAX_CODEX_STREAM_TEXT_CHARS = 8192
 REFUSAL = json.dumps({"error": "policy_refused"})
 PRESENTATION_SCHEMA = {
     "type": "object",
@@ -118,8 +121,17 @@ def lookup_query(value):
     return value
 
 
-def host_search_request(query):
+def host_search_request(query, api_mode="chat_completions"):
     """A policy-authored request, never a provider answer or fabricated tool result."""
+    if api_mode == "codex_responses":
+        call_id = "host-search-" + secrets.token_hex(12)
+        return SimpleNamespace(
+            id="host-response-" + secrets.token_hex(12), object="response",
+            status="completed", output=[SimpleNamespace(
+                id="fc_" + secrets.token_hex(12), type="function_call", call_id=call_id,
+                name="web_search", arguments=frozen({"query": query}), status="completed",
+            )], output_text=None, usage=None,
+        )
     call = SimpleNamespace(id="host-search-" + secrets.token_hex(12), type="function",
         function=SimpleNamespace(name="web_search", arguments=frozen({"query": query})))
     return SimpleNamespace(id="host-request-" + secrets.token_hex(12), object="chat.completion",
@@ -129,8 +141,210 @@ def host_search_request(query):
                 tool_calls=[call]))])
 
 
-def response_facts(response, prefix):
+def _raw_output(response):
+    output = getattr(response, "output", None)
+    if type(output) is not list or len(output) > 64:
+        raise ValueError("responses-output-shape")
+    return output
+
+
+def _raw_responses_result(response):
+    """Read only completed native Responses items; never reconstruct from deltas."""
+    if type(getattr(response, "status", None)) is not str or response.status != "completed":
+        raise ValueError("responses-not-completed")
+    output = _raw_output(response)
+    if not output:
+        raise ValueError("responses-empty-output")
+    calls = []
+    final_items = []
+    commentary_seen = False
+    for item in output:
+        item_type = getattr(item, "type", None)
+        if item_type == "function_call":
+            if getattr(item, "status", None) != "completed":
+                raise ValueError("responses-function-call-incomplete")
+            call_id = getattr(item, "call_id", None)
+            name = getattr(item, "name", None)
+            arguments = getattr(item, "arguments", None)
+            if (type(call_id) is not str or not call_id or type(name) is not str or not name
+                    or type(arguments) is not str or len(arguments) > 16_384):
+                raise ValueError("responses-function-call-shape")
+            parsed = json.loads(arguments)
+            if type(parsed) is not dict or any(call_id == call["call_id"] for call in calls):
+                raise ValueError("responses-function-call-arguments")
+            calls.append({"call_id": call_id, "name": name, "arguments": arguments,
+                          "parsed": parsed})
+        elif item_type == "reasoning":
+            continue
+        elif item_type == "message":
+            if (getattr(item, "role", None) != "assistant"
+                    or getattr(item, "status", None) != "completed"):
+                raise ValueError("responses-message-shape")
+            phase = getattr(item, "phase", None)
+            if phase in {"commentary", "analysis"}:
+                commentary_seen = True
+                continue
+            if phase not in {None, "final_answer", "final"}:
+                raise ValueError("responses-message-phase")
+            parts = getattr(item, "content", None)
+            if type(parts) is not list or not parts:
+                raise ValueError("responses-message-content")
+            text_parts = []
+            for part in parts:
+                part_type = getattr(part, "type", None)
+                if part_type == "refusal":
+                    raise ValueError("responses-refusal")
+                if part_type != "output_text" or type(getattr(part, "text", None)) is not str:
+                    raise ValueError("responses-content-part")
+                text_parts.append(part)
+            if len(text_parts) != 1:
+                raise ValueError("responses-message-text-parts")
+            final_items.append((item, text_parts[0]))
+        else:
+            raise ValueError("responses-output-item")
+    if len(final_items) > 1:
+        raise ValueError("responses-multiple-final-messages")
+    if not calls and not final_items:
+        # Commentary-only output is not a final answer. Never publish it.
+        raise ValueError("responses-no-final-answer" if commentary_seen else "responses-no-message")
+    final_text = final_items[0][1].text if final_items else None
+    if final_text is not None and len(final_text) > MAX_CODEX_STREAM_TEXT_CHARS:
+        raise ValueError("responses-text-bound")
+    return calls, final_text, (final_items[0] if final_items else None)
+
+
+def _codex_usage(usage):
+    if usage is None:
+        return {}
+    mapped = {}
+    for source, target in (("input_tokens", "prompt_tokens"),
+                           ("output_tokens", "completion_tokens"),
+                           ("total_tokens", "total_tokens")):
+        value = getattr(usage, source, None)
+        if type(value) is int and 0 <= value <= 1_000_000_000:
+            mapped[target] = value
+    detail = getattr(usage, "output_tokens_details", None)
+    reasoning = getattr(detail, "reasoning_tokens", None)
+    if type(reasoning) is int and 0 <= reasoning <= 1_000_000_000:
+        mapped["reasoning_tokens"] = reasoning
+    return mapped
+
+
+def _replace_codex_final_text(response, content):
+    calls, _text, final = _raw_responses_result(response)
+    if calls or final is None:
+        raise ValueError("responses-publication-target")
+    final_item, final_part = final
+    output = list(_raw_output(response))
+    index = next((index for index, item in enumerate(output) if item is final_item), None)
+    if index is None:
+        raise ValueError("responses-publication-item")
+    item_copy = copy.copy(final_item)
+    content_parts = list(final_item.content)
+    part_index = next((index for index, part in enumerate(content_parts)
+                       if part is final_part), None)
+    if part_index is None:
+        raise ValueError("responses-publication-part")
+    part_copy = copy.copy(final_part)
+    part_copy.text = content
+    content_parts[part_index] = part_copy
+    item_copy.content = content_parts
+    output[index] = item_copy
+    result = copy.copy(response)
+    result.output = output
+    return result
+
+
+def _codex_refusal_response():
+    """A completed refusal that cannot enter a native fallback/retry branch."""
+    refusal_message = SimpleNamespace(
+        type="message", id="msg_" + secrets.token_hex(12), role="assistant",
+        status="completed", phase="final_answer",
+        content=[SimpleNamespace(type="output_text", text=REFUSAL)],
+    )
+    return SimpleNamespace(
+        id="host-refusal-" + secrets.token_hex(12), object="response", status="completed",
+        output=[refusal_message], output_text=REFUSAL, usage=None,
+    )
+
+
+async def _consume_codex_stream(stream):
+    """Return only the completed terminal object, bounded and never delta-reconstructed."""
+    terminal = None
+    terminal_count = 0
+    event_count = 0
+    text_chars = 0
+    allowed = {
+        "response.created", "response.in_progress", "response.queued",
+        "response.output_item.added", "response.output_item.done",
+        "response.content_part.added", "response.content_part.done",
+        "response.output_text.delta", "response.output_text.done",
+        "response.output_text.annotation.added",
+        "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+        "response.completed",
+    }
+    async for event in stream:
+        event_count += 1
+        if event_count > MAX_CODEX_STREAM_EVENTS:
+            raise ValueError("responses-event-bound")
+        event_type = getattr(event, "type", None)
+        if type(event_type) is not str:
+            raise ValueError("responses-event-type")
+        if event_type in {"response.failed", "response.incomplete", "error"}:
+            raise ValueError("responses-terminal-failure")
+        if event_type not in allowed:
+            raise ValueError("responses-event-unknown")
+        if terminal_count:
+            raise ValueError("responses-event-after-terminal")
+        if event_type == "response.output_text.delta":
+            delta = getattr(event, "delta", None)
+            if type(delta) is not str:
+                raise ValueError("responses-delta-shape")
+            text_chars += len(delta)
+            if text_chars > MAX_CODEX_STREAM_TEXT_CHARS:
+                raise ValueError("responses-stream-text-bound")
+        elif event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = getattr(event, "item", None)
+            item_type = getattr(item, "type", None)
+            if item_type not in {"message", "reasoning"}:
+                raise ValueError("responses-stream-output-item")
+        elif event_type in {"response.content_part.added", "response.content_part.done"}:
+            part = getattr(event, "part", None)
+            if getattr(part, "type", None) != "output_text":
+                raise ValueError("responses-stream-content-part")
+        if event_type == "response.completed":
+            terminal_count += 1
+            terminal = getattr(event, "response", None)
+            if terminal is None:
+                raise ValueError("responses-terminal-missing")
+    if terminal_count != 1 or terminal is None:
+        raise ValueError("responses-terminal-count")
+    return terminal
+
+
+def response_facts(response, prefix, api_mode="chat_completions"):
     """Content-free first-choice facts; observation never authorizes a response."""
+    if api_mode == "codex_responses":
+        output = getattr(response, "output", None)
+        sequence = type(output) is list
+        item_types = [getattr(item, "type", None) for item in output[:64]] if sequence else []
+        facts = {
+            "output_count": len(output) if sequence else 0,
+            "output_item_types": [kind if type(kind) is str else "other" for kind in item_types],
+            "status": (response.status if type(getattr(response, "status", None)) is str
+                       and response.status in {"completed", "incomplete", "failed", "cancelled"}
+                       else "other" if getattr(response, "status", None) is not None
+                       else "missing"),
+            "function_call_count": sum(kind == "function_call" for kind in item_types),
+            "message_count": sum(kind == "message" for kind in item_types),
+            "output_text_kind": ("string" if type(getattr(response, "output_text", None)) is str
+                                 else "none" if getattr(response, "output_text", None) is None
+                                 else "other"),
+            "output_text_length": (len(response.output_text)
+                                   if type(getattr(response, "output_text", None)) is str else 0),
+        }
+        return {prefix + "_" + key: value for key, value in facts.items()}
     choices = getattr(response, "choices", None)
     sequence = type(choices) in (list, tuple)
     choice = choices[0] if sequence and choices else None
@@ -163,20 +377,28 @@ class Presentation:
     """One explicit same-route SDK call, independent of native tool dispatch."""
 
     def __init__(self, config):
-        keys = {"provider", "base_url", "model", "api_key_env"}
-        if type(config) is not dict or set(config) != keys or any(
-            type(config[key]) is not str or not 1 <= len(config[key]) <= 2048 for key in keys
-        ):
+        required = {"provider", "base_url", "model", "api_key_env"}
+        if (type(config) is not dict or not required <= set(config)
+                or set(config) - required not in (set(), {"api_mode"})):
             raise ValueError("presentation-config")
-        url = urlsplit(config["base_url"])
+        normalized = dict(config)
+        normalized.setdefault("api_mode", "chat_completions")
+        if any(type(normalized[key]) is not str
+               or not 1 <= len(normalized[key]) <= 2048
+               for key in required | {"api_mode"}):
+            raise ValueError("presentation-config")
+        if normalized["api_mode"] not in PRESENTATION_MODES:
+            raise ValueError("presentation-config")
+        url = urlsplit(normalized["base_url"])
         if (url.scheme not in {"http", "https"} or not url.hostname
                 or url.username or url.password or url.query or url.fragment
-                or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", config["api_key_env"]) is None):
+                or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", normalized["api_key_env"]) is None):
             raise ValueError("presentation-config")
-        self.config = MappingProxyType(dict(config))
+        self.config = MappingProxyType(normalized)
 
     def validate_route(self, kw):
-        if any(kw.get(key) != self.config[key] for key in ("provider", "base_url", "model")):
+        if any(kw.get(key) != self.config[key]
+               for key in ("provider", "base_url", "model", "api_mode")):
             raise ValueError("presentation-route")
         if kw["request"].get("model") != self.config["model"]:
             raise ValueError("presentation-model")
@@ -188,6 +410,9 @@ class Presentation:
         key = os.environ.get(self.config["api_key_env"])
         if not key:
             raise ValueError("presentation-credential")
+        if self.config["api_mode"] == "codex_responses":
+            return await self._complete_codex(generation, row, source_input, evidence, key,
+                                               httpx, AsyncOpenAI)
         body = {
             "model": self.config["model"],
             "messages": [
@@ -266,6 +491,117 @@ class Presentation:
                 if settled and row.get("presentation_active") is active:
                     row["presentation_active"] = None
 
+    async def _complete_codex(self, generation, row, source_input, evidence, key,
+                              httpx, AsyncOpenAI):
+        from agent.codex_headers import codex_cloudflare_headers
+
+        body = {
+            "model": self.config["model"],
+            "instructions": PRESENTATION_INSTRUCTIONS,
+            "input": [{"role": "user", "content": source_input}],
+            "store": False,
+            "stream": True,
+            "text": {"format": {
+                "type": "json_schema", "name": "voice_detail", "strict": True,
+                "schema": PRESENTATION_SCHEMA,
+            }},
+            "reasoning": {"effort": "low"},
+        }
+        expected_text_format = copy.deepcopy(body["text"])
+
+        async def observe(request):
+            raw = request.content
+            serialized = json.loads(raw)
+            input_items = serialized.get("input")
+            if (type(input_items) is not list or len(input_items) != 1
+                    or type(input_items[0]) is not dict
+                    or input_items[0].get("role") != "user"
+                    or type(input_items[0].get("content")) is not str):
+                raise ValueError("presentation-wire-input")
+            actual_input = input_items[0]["content"]
+            payload = json.loads(actual_input)
+            instructions = serialized.get("instructions")
+            text = serialized.get("text")
+            evidence["wire"] = {
+                "body_sha256": hashlib.sha256(raw).hexdigest(),
+                "input_matches": actual_input == source_input,
+                "instructions_match": instructions == PRESENTATION_INSTRUCTIONS,
+                "model_matches": serialized.get("model") == self.config["model"],
+                "tools_absent": not any(name in serialized for name in (
+                    "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call")),
+                "streaming": serialized.get("stream") is True,
+                "store_disabled": serialized.get("store") is False,
+                "reasoning_effort_low": serialized.get("reasoning") == {"effort": "low"},
+                "schema_matches": text == expected_text_format,
+                "source_sha256": hashlib.sha256(payload["answer"].encode()).hexdigest(),
+                "input_sha256": hashlib.sha256(actual_input.encode()).hexdigest(),
+                "catalog_sha256": hashlib.sha256(frozen(payload["sources"]).encode()).hexdigest(),
+                "catalog_count": len(payload["sources"]),
+                "instruction_sha256": (hashlib.sha256(instructions.encode()).hexdigest()
+                                        if type(instructions) is str else ""),
+            }
+            if (set(serialized) != set(body)
+                    or not evidence["wire"]["input_matches"]
+                    or not evidence["wire"]["instructions_match"]
+                    or not evidence["wire"]["model_matches"]
+                    or not evidence["wire"]["tools_absent"]
+                    or not evidence["wire"]["streaming"]
+                    or not evidence["wire"]["store_disabled"]
+                    or not evidence["wire"]["reasoning_effort_low"]
+                    or not evidence["wire"]["schema_matches"]):
+                raise ValueError("presentation-wire-contract")
+            evidence["wire_requests"] += 1
+
+        active = {"loop": asyncio.get_running_loop(), "task": asyncio.current_task(),
+                  "cancel_requested": False, "closing": False}
+        settled = False
+        failure = None
+        stream = None
+        response = None
+        try:
+            remaining = row["deadline"] - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("presentation-deadline")
+            async with httpx.AsyncClient(
+                follow_redirects=False, timeout=remaining, event_hooks={"request": [observe]}
+            ) as http, AsyncOpenAI(
+                base_url=self.config["base_url"], api_key=key, http_client=http,
+                default_headers=codex_cloudflare_headers(
+                    key, base_url=self.config["base_url"]),
+                max_retries=0, timeout=remaining,
+            ) as client:
+                with generation.lock:
+                    _, current = generation.scope()
+                    if current is not row or row["cancelled"] or row.get("presentation_active"):
+                        raise ValueError("presentation-ownership")
+                    remaining = row["deadline"] - time.monotonic()
+                    if remaining <= 0:
+                        raise ValueError("presentation-deadline")
+                    row["presentation_active"] = active
+                try:
+                    async with asyncio.timeout(remaining):
+                        stream = await client.responses.create(**body)
+                        response = await _consume_codex_stream(stream)
+                except BaseException as error:
+                    failure = error
+                finally:
+                    if stream is not None:
+                        with generation.lock:
+                            active["closing"] = True
+                        await stream.close()
+                    else:
+                        with generation.lock:
+                            active["closing"] = True
+            settled = True
+            if failure is not None:
+                raise failure
+            return response
+        finally:
+            evidence["local_http_settled"] = settled
+            with generation.lock:
+                if settled and row.get("presentation_active") is active:
+                    row["presentation_active"] = None
+
 
 class Generation:
     def __init__(self, refusal, presentation=None):
@@ -286,6 +622,11 @@ class Generation:
         self.late_denied = 0
         self.late_results = 0
         self.presentation = presentation
+
+    def refusal_for(self, api_mode):
+        if api_mode == "codex_responses":
+            return _codex_refusal_response()
+        return self.refusal()
 
     def cancel_presentation(self, row):
         active = row.get("presentation_active")
@@ -495,26 +836,36 @@ class Generation:
     def model_gate(self, **kw):
         run_id = ""
         response = None
+        api_mode = kw.get("api_mode", "")
         try:
             with self.lock:
                 run_id, row = self.scope()
                 if row is not None and row["closed"]:
-                    return self.refusal()
-                if row is not None and kw.get("api_mode") != "chat_completions":
+                    return self.refusal_for(api_mode)
+                if row is not None and api_mode not in PRESENTATION_MODES:
                     raise ValueError("unsupported-response-mode")
+                if (row is not None and self.presentation is not None
+                        and self.presentation.config["api_mode"] != api_mode):
+                    raise ValueError("presentation-route-mode")
                 if row is not None and self.presentation is not None:
                     if row["cancelled"] or time.monotonic() >= row["deadline"]:
                         raise ValueError("lookup-closed")
                     if row["phase"] == "new":
                         query = lookup_query(row["objective"])
                         tools = kw["request"].get("tools")
-                        advertised = [tool for tool in tools if type(tool) is dict
-                            and type(tool.get("function")) is dict
-                            and tool["function"].get("name") == "web_search"
-                        ] if type(tools) is list else []
-                        if len(advertised) != 1 or advertised[0].get("type") != "function":
+                        if api_mode == "codex_responses":
+                            advertised = [tool for tool in tools if type(tool) is dict
+                                and tool.get("type") == "function"
+                                and tool.get("name") == "web_search"
+                            ] if type(tools) is list else []
+                        else:
+                            advertised = [tool for tool in tools if type(tool) is dict
+                                and type(tool.get("function")) is dict
+                                and tool["function"].get("name") == "web_search"
+                            ] if type(tools) is list else []
+                        if len(advertised) != 1:
                             raise ValueError("lookup-search-unavailable")
-                        response = host_search_request(query)
+                        response = host_search_request(query, api_mode)
                     elif not row["urls"]:
                         row["presentation_evidence"] = {
                             "category": "refused", "stage": "retrieval",
@@ -524,21 +875,32 @@ class Generation:
         except BaseException:
             with self.lock:
                 self.refuse(run_id)
-            return self.refusal()
+            return self.refusal_for(api_mode)
         if response is None:
             response = kw["next_call"](kw["request"])
         if row is None:
             return response
-        native_facts = response_facts(response, "source") if self.presentation is not None else None
+        native_facts = (response_facts(response, "source", api_mode)
+                        if self.presentation is not None else None)
         try:
             with self.lock:
                 _, current = self.scope()  # Replaced rows are never adopted.
                 if current is not row:
                     raise ValueError("budget-replaced")
                 if row["closed"]:
-                    return self.refusal()
-                calls = response.choices[0].message.tool_calls or []
-                if len(response.choices) != 1 or len(calls) > SEARCH_LIMIT:
+                    return self.refusal_for(api_mode)
+                if api_mode == "codex_responses":
+                    raw_calls, _final_text, _final_item = _raw_responses_result(response)
+                    calls = [SimpleNamespace(
+                        id=call["call_id"], type="function",
+                        function=SimpleNamespace(name=call["name"],
+                                                 arguments=call["arguments"]),
+                    ) for call in raw_calls]
+                else:
+                    calls = response.choices[0].message.tool_calls or []
+                    if len(response.choices) != 1:
+                        raise ValueError("batch-envelope")
+                if len(calls) > SEARCH_LIMIT:
                     raise ValueError("batch-envelope")
                 plan = {}
                 for call in calls:
@@ -608,18 +970,26 @@ class Generation:
                 row["presentation_evidence"] = evidence
                 with contextlib.suppress(OSError, ValueError):
                     print("[lookup-presentation] " + frozen(evidence), flush=True)
-            return self.refusal()
+            return self.refusal_for(api_mode)
 
     def present(self, run_id, row, response, kw):
         evidence = {"category": "refused", "stage": "source", "calls": 0, "wire_requests": 0}
         row["presentation_evidence"] = evidence
+        api_mode = kw.get("api_mode", "chat_completions")
         try:
-            evidence.update(response_facts(response, "source"))
-            message = response.choices[0].message
-            source = message.content
-            if (response.choices[0].finish_reason != "stop" or getattr(message, "refusal", None)
-                    or type(source) is not str or not source.strip() or len(source) > 4096):
-                raise ValueError("presentation-source")
+            evidence.update(response_facts(response, "source", api_mode))
+            if api_mode == "codex_responses":
+                calls, source, _final_source = _raw_responses_result(response)
+                if calls or type(source) is not str or not source.strip() or len(source) > 4096:
+                    raise ValueError("presentation-source")
+                message = None
+            else:
+                message = response.choices[0].message
+                source = message.content
+                if (response.choices[0].finish_reason != "stop"
+                        or getattr(message, "refusal", None)
+                        or type(source) is not str or not source.strip() or len(source) > 4096):
+                    raise ValueError("presentation-source")
             row["original_response"] = response
             evidence["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
             evidence["stage"] = "retrieval"
@@ -649,25 +1019,32 @@ class Generation:
             formatted = asyncio.run(self.presentation.complete(
                 self, run_id, row, source_input, evidence))
             evidence["stage"] = "response-envelope"
-            evidence.update(response_facts(formatted, "response"))
+            evidence.update(response_facts(formatted, "response", api_mode))
             usage = getattr(formatted, "usage", None)
-            evidence["usage"] = {
-                key: number for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                if type(number := getattr(usage, key, None)) is int and 0 <= number <= 1000000000
-            }
-            reasoning_tokens = getattr(
-                getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
-            )
-            if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= 1000000000:
-                evidence["usage"]["reasoning_tokens"] = reasoning_tokens
-            if len(formatted.choices) != 1:
-                raise ValueError("presentation-envelope")
-            choice = formatted.choices[0]
-            content = choice.message.content
-            if (choice.finish_reason != "stop" or choice.message.tool_calls
-                    or getattr(choice.message, "refusal", None)
-                    or type(content) is not str or len(content) > 8192):
-                raise ValueError("presentation-envelope")
+            if api_mode == "codex_responses":
+                evidence["usage"] = _codex_usage(usage)
+                calls, content, _final_formatted = _raw_responses_result(formatted)
+                if calls or type(content) is not str or len(content) > MAX_CODEX_STREAM_TEXT_CHARS:
+                    raise ValueError("presentation-envelope")
+            else:
+                evidence["usage"] = {
+                    key: number for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    if (type(number := getattr(usage, key, None)) is int
+                        and 0 <= number <= 1000000000)
+                }
+                reasoning_tokens = getattr(
+                    getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
+                )
+                if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= 1000000000:
+                    evidence["usage"]["reasoning_tokens"] = reasoning_tokens
+                if len(formatted.choices) != 1:
+                    raise ValueError("presentation-envelope")
+                choice = formatted.choices[0]
+                content = choice.message.content
+                if (choice.finish_reason != "stop" or choice.message.tool_calls
+                        or getattr(choice.message, "refusal", None)
+                        or type(content) is not str or len(content) > 8192):
+                    raise ValueError("presentation-envelope")
 
             def pairs(items):
                 if len(items) != len(dict(items)):
@@ -723,13 +1100,16 @@ class Generation:
                     raise ValueError("presentation-source-catalog-changed")
                 if passages is not row.get("passages"):
                     raise ValueError("presentation-evidence-changed")
-                # Retain native identity/metadata and task usage; presentation usage is separate.
-                result = copy.copy(response)
-                published_choice = copy.copy(response.choices[0])
-                published_message = copy.copy(message)
-                published_message.content = content
-                published_choice.message = published_message
-                result.choices = [published_choice]
+                # Retain native identity, usage and reasoning; replace only final answer text.
+                if api_mode == "codex_responses":
+                    result = _replace_codex_final_text(response, content)
+                else:
+                    result = copy.copy(response)
+                    published_choice = copy.copy(response.choices[0])
+                    published_message = copy.copy(message)
+                    published_message.content = content
+                    published_choice.message = published_message
+                    result.choices = [published_choice]
                 evidence["category"] = "presented"
                 evidence["stage"] = "complete"
                 return result
@@ -737,7 +1117,7 @@ class Generation:
             evidence["failure_kind"] = type(error).__name__
             with self.lock:
                 self.refuse(run_id)
-            return self.refusal()
+            return self.refusal_for(api_mode)
         finally:
             print("[lookup-presentation] " + frozen(evidence), flush=True)
 
