@@ -29,6 +29,11 @@ from scripts.qualification_file_seals import _relative_windows_member
 
 MODEL_PROCESS_NAME = "lookup-model"
 SUPPORTED_VERSION = "0.40.4"
+MCP_CALLBACK_REFUSALS = frozenset({
+    "mcp-result", "mcp-capability", "mcp-scope", "mcp-preflight", "mcp-warm-ack",
+    "mcp-session-factory", "mcp-reused", "mcp-input", "mcp-budget", "mcp-other",
+    "mcp-timeout", "mcp-cancelled",
+})
 
 
 class StartupProfile(Enum):
@@ -76,7 +81,7 @@ _REFUSALS = frozenset({
     "readiness-bound",
     "readiness-shape", "readiness-json", "model-readiness-loop", "startup-timeout",
     "mcp-loader", "mcp-load-ack", "loaded-gpu-fit",
-})
+}) | MCP_CALLBACK_REFUSALS
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
 

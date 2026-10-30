@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from scripts.lookup_backend_model import StartupProfile
+from scripts.lookup_backend_model import MCP_CALLBACK_REFUSALS, StartupProfile
 
 _OVERHEAD_SECONDS = 60.0
 _MAX_WARM_SECONDS = 1800.0
@@ -154,8 +154,8 @@ def make_strict_mcp_loader(session_factory: Callable[..., Any]) -> Callable[...,
         raise ValueError("mcp-session-factory")
     invoked = False
 
-    async def load(*, base_url: str, model: str, deadline: float,
-                   startup_profile: StartupProfile) -> bool:
+    async def perform(*, base_url: str, model: str, deadline: float,
+                      startup_profile: StartupProfile, evidence: dict[str, Any]) -> bool:
         nonlocal invoked
         if invoked:
             raise ValueError("mcp-reused")
@@ -166,11 +166,15 @@ def make_strict_mcp_loader(session_factory: Callable[..., Any]) -> Callable[...,
                 or type(startup_profile) is not StartupProfile):
             raise ValueError("mcp-input")
         invoked = True
+        evidence["phase"] = "budget"
         if deadline - time.monotonic() <= _OVERHEAD_SECONDS:
             raise ValueError("mcp-budget")
         async with asyncio.timeout_at(deadline):
             async with session_factory(base_url, deadline) as session:
+                evidence["phase"] = "capability"
                 _check_tools(await session.list_tools())
+                evidence["phase"] = "preflight"
+                evidence["read_only_tool_calls"] += 1
                 preflight = _payload(await session.call_tool("list_loaded", {}))
                 _check_preflight(preflight, base_url)
                 remaining = deadline - time.monotonic()
@@ -181,9 +185,37 @@ def make_strict_mcp_loader(session_factory: Callable[..., Any]) -> Callable[...,
                     "force": False, "strict_fit": True,
                     "num_ctx": startup_profile.context_tokens,
                     "num_parallel": 1, "timeout_seconds": timeout}
-                result = _payload(await session.call_tool("warm", arguments))
+                evidence["phase"] = "warm"
+                evidence["warm_tool_calls"] += 1
+                reply = await session.call_tool("warm", arguments)
+                evidence["phase"] = "acknowledgment"
+                result = _payload(reply)
                 _check_warm(result, base_url=base_url, model=model,
                     context=startup_profile.context_tokens, timeout=timeout)
                 return True
+
+    async def load(*, base_url: str, model: str, deadline: float,
+                   startup_profile: StartupProfile) -> bool:
+        evidence: dict[str, Any] = {"phase": "input", "accepted": False,
+            "failure_category": "none", "read_only_tool_calls": 0, "warm_tool_calls": 0}
+        try:
+            accepted = await perform(base_url=base_url, model=model, deadline=deadline,
+                                     startup_profile=startup_profile, evidence=evidence)
+            evidence["accepted"] = accepted
+            return accepted
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError):
+                category = "mcp-cancelled"
+            elif isinstance(error, TimeoutError):
+                category = "mcp-timeout"
+            elif (type(error) is ValueError and len(error.args) == 1
+                    and type(error.args[0]) is str and error.args[0] in MCP_CALLBACK_REFUSALS):
+                category = error.args[0]
+            else:
+                category = "mcp-other"
+            evidence["failure_category"] = category
+            raise
+        finally:
+            print("[lookup-mcp] " + json.dumps(evidence, separators=(",", ":")), flush=True)
 
     return load

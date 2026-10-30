@@ -1,6 +1,7 @@
 """Offline contract tests for one scoped MCP warm; no model or service is started."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -225,3 +226,64 @@ async def test_loader_closure_is_one_shot():
     with pytest.raises(ValueError, match="mcp-reused"):
         await load(**kwargs)
     assert [name for name, _ in session.calls] == ["list_loaded", "warm"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_warm", [True, False])
+async def test_refusal_records_closed_category_and_attempt_counts(capsys, before_warm):
+    session = Session(preflight=loaded(scope="foreign") if before_warm else None,
+                      result=warm(outcome="unknown"))
+    with pytest.raises(ValueError):
+        await invoke(session)
+    line = capsys.readouterr().out.strip()
+    record = json.loads(line.removeprefix("[lookup-mcp] "))
+    assert record == {"phase": "preflight" if before_warm else "acknowledgment",
+        "accepted": False, "failure_category": "mcp-scope" if before_warm else "mcp-warm-ack",
+        "read_only_tool_calls": 1, "warm_tool_calls": 0 if before_warm else 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+async def test_deadline_and_cancellation_record_attempt_and_close_session(
+    capsys, monkeypatch, cancel,
+):
+    session = Session()
+    started = asyncio.Event()
+    original = session.call_tool
+
+    async def call_tool(name, arguments):
+        if name == "warm":
+            started.set()
+            await asyncio.sleep(10)
+        return await original(name, arguments)
+
+    session.call_tool = call_tool
+    monkeypatch.setattr(mcp, "_OVERHEAD_SECONDS", 0.001)
+    task = asyncio.create_task(invoke(session, seconds=360 if cancel else .05))
+    await started.wait()
+    if cancel:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+        await task
+    assert session.closed
+    record = json.loads(capsys.readouterr().out.strip().removeprefix("[lookup-mcp] "))
+    assert record["warm_tool_calls"] == 1 and record["read_only_tool_calls"] == 1
+    assert record["phase"] == "warm" and record["accepted"] is False
+    assert record["failure_category"] == ("mcp-cancelled" if cancel else "mcp-timeout")
+
+
+@pytest.mark.asyncio
+async def test_foreign_error_details_are_not_published(capsys):
+    session = Session()
+
+    async def fail():
+        raise ValueError("private-untrusted-detail")
+
+    session.list_tools = fail
+    with pytest.raises(ValueError):
+        await invoke(session)
+    output = capsys.readouterr().out
+    assert "private-untrusted-detail" not in output
+    record = json.loads(output.strip().removeprefix("[lookup-mcp] "))
+    assert record["failure_category"] == "mcp-other"
+    assert record["warm_tool_calls"] == record["read_only_tool_calls"] == 0

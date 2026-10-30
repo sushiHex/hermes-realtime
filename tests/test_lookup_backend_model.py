@@ -759,6 +759,18 @@ def test_mcp_loader_exception_has_no_fallback_or_private_detail(selected, owned,
     assert "private-loader-detail" not in json.dumps(state) + capsys.readouterr().out
 
 
+def test_mcp_refusal_category_survives_owned_model_diagnostic(selected, owned, tmp_path):
+    async def loader(**_kwargs):
+        raise ValueError("mcp-budget")
+
+    with pytest.raises(ValueError, match="mcp-budget"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, mcp_loader=loader)
+    state = json.loads((tmp_path / "evidence/model-metadata.private.json").read_text())
+    assert state["failure_category"] == "mcp-budget"
+    assert not owned[4] and owned[0].killed == [model.MODEL_PROCESS_NAME]
+
+
 def test_mcp_loader_timeout_cancels_callback_without_native_fallback(selected, owned, tmp_path):
     observed = {"cancelled": False, "completed": False}
 
