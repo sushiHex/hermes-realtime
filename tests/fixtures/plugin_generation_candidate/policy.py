@@ -162,7 +162,8 @@ def _raw_responses_result(response):
     for item in output:
         item_type = getattr(item, "type", None)
         if item_type == "function_call":
-            if getattr(item, "status", None) != "completed":
+            status = getattr(item, "status", None)
+            if status not in {None, "completed"}:
                 raise ValueError("responses-function-call-incomplete")
             call_id = getattr(item, "call_id", None)
             name = getattr(item, "name", None)
@@ -176,7 +177,8 @@ def _raw_responses_result(response):
             calls.append({"call_id": call_id, "name": name, "arguments": arguments,
                           "parsed": parsed})
         elif item_type == "reasoning":
-            if getattr(item, "status", None) != "completed":
+            status = getattr(item, "status", None)
+            if status not in {None, "completed"}:
                 raise ValueError("responses-reasoning-incomplete")
             continue
         elif item_type == "message":

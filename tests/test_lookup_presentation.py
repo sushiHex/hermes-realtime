@@ -281,7 +281,7 @@ def test_codex_responses_function_call_uses_call_id_for_ticket_identity(setup):
         status="completed",
         output=[SimpleNamespace(
             type="function_call", id="fc_item_id", call_id="call_ticket_id",
-            name="web_extract", arguments=json.dumps(args), status="completed",
+            name="web_extract", arguments=json.dumps(args), status=None,
         )],
         usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
     )
@@ -334,7 +334,7 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     original_final = s.codex_message(
         '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
-    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status="completed", summary=[])
+    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status=None, summary=[])
     commentary = s.codex_message("Progress text must not be published.", phase="commentary",
                                  item_id="msg_commentary")
     raw = s.codex_response(
@@ -461,6 +461,17 @@ def test_codex_refuses_noncompleted_reasoning_items(setup, response):
     result = s.run(api_mode="codex_responses")
     assert result.output[0].content[0].text == s.module.REFUSAL
     assert not s.captured["responses_requests"]
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "incomplete"])
+def test_codex_refuses_noncompleted_function_call_item_status(setup, status):
+    s = setup
+    raw = s.codex_response([SimpleNamespace(
+        type="function_call", status=status, call_id="call_partial",
+        name="web_extract", arguments='{"urls":[]}',
+    )])
+    with pytest.raises(ValueError, match="responses-function-call-incomplete"):
+        s.module._raw_responses_result(raw)
 
 
 def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
