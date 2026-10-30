@@ -427,25 +427,47 @@ def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup
     assert s.captured["stream_closed"] == 1
 
 
-@pytest.mark.parametrize(("failure", "marker"), [
-    ("wire", "presentation-wire-contract"),
-    ("stream", "responses-event-unknown"),
-], ids=["wire-contract", "unknown-stream-event"])
-def test_codex_provider_rejection_marker_uses_fixed_allowlist(setup, capsys, failure, marker):
+@pytest.mark.parametrize(("failure", "marker", "event_type", "event_kind"), [
+    ("wire", "presentation-wire-contract", None, None),
+    ("stream", "responses-event-unknown", "response.future_private_event", "other"),
+    ("stream", "responses-event-unknown", "response.reasoning_text.delta",
+     "response.reasoning_text.delta"),
+    ("stream", "responses-event-unknown", "response.reasoning_text.done",
+     "response.reasoning_text.done"),
+    ("stream", "responses-event-unknown", "response.reasoning_part.added",
+     "response.reasoning_part.added"),
+    ("stream", "responses-event-unknown", "response.reasoning_part.done",
+     "response.reasoning_part.done"),
+    ("stream", "responses-event-unknown", "response.refusal.delta", "response.refusal.delta"),
+    ("stream", "responses-event-unknown", "response.refusal.done", "response.refusal.done"),
+    ("stream", "responses-event-unknown", "response.function_call_arguments.delta",
+     "response.function_call_arguments.delta"),
+    ("stream", "responses-event-unknown", "response.function_call_arguments.done",
+     "response.function_call_arguments.done"),
+], ids=["wire-contract", "unknown-other", "reasoning-delta", "reasoning-done",
+        "reasoning-part-added", "reasoning-part-done", "refusal-delta", "refusal-done",
+        "function-arguments-delta", "function-arguments-done"])
+def test_codex_provider_rejection_marker_uses_fixed_allowlist(
+    setup, capsys, failure, marker, event_type, event_kind,
+):
     s = setup
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
     if failure == "wire":
         s.captured["wire_mutation"] = lambda body: body.update(function_call="auto")
     else:
-        s.captured["stream_events"] = [SimpleNamespace(type="response.future_private_event")]
+        s.captured["stream_events"] = [SimpleNamespace(type=event_type, delta="SECRET")]
 
     result = s.run(api_mode="codex_responses")
     assert result.status == "completed"
     evidence = s.row["presentation_evidence"]
     assert evidence["stage"] == "provider" and evidence["failure_kind"] == "ValueError"
     assert evidence["provider_rejection"] == marker
-    assert "future_private_event" not in capsys.readouterr().out
+    if event_kind is not None:
+        assert evidence["provider_event_kind"] == event_kind
+    output = capsys.readouterr().out
+    assert "SECRET" not in output
+    assert "future_private_event" not in output
 
 
 def test_codex_provider_does_not_publish_unrecognized_value_error_text(setup, capsys):

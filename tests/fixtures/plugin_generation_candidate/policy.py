@@ -45,6 +45,12 @@ CODEX_PROVIDER_REJECTIONS = frozenset({
     "responses-stream-text-bound", "responses-stream-output-item",
     "responses-stream-content-part", "responses-terminal-missing", "responses-terminal-count",
 })
+CODEX_REJECTED_EVENT_KINDS = frozenset({
+    "response.reasoning_text.delta", "response.reasoning_text.done",
+    "response.reasoning_part.added", "response.reasoning_part.done",
+    "response.refusal.delta", "response.refusal.done",
+    "response.function_call_arguments.delta", "response.function_call_arguments.done",
+})
 REFUSAL = json.dumps({"error": "policy_refused"})
 PRESENTATION_SCHEMA = {
     "type": "object",
@@ -294,7 +300,7 @@ def _codex_refusal_response():
     )
 
 
-async def _consume_codex_stream(stream):
+async def _consume_codex_stream(stream, evidence=None):
     """Return only the completed terminal object, bounded and never delta-reconstructed."""
     terminal = None
     terminal_count = 0
@@ -320,6 +326,10 @@ async def _consume_codex_stream(stream):
         if event_type in {"response.failed", "response.incomplete", "error"}:
             raise ValueError("responses-terminal-failure")
         if event_type not in allowed:
+            if evidence is not None:
+                evidence["provider_event_kind"] = (
+                    event_type if event_type in CODEX_REJECTED_EVENT_KINDS else "other"
+                )
             raise ValueError("responses-event-unknown")
         if terminal_count:
             raise ValueError("responses-event-after-terminal")
@@ -729,7 +739,7 @@ class Presentation:
                 try:
                     async with asyncio.timeout(remaining):
                         stream = await client.responses.create(**body)
-                        response = await _consume_codex_stream(stream)
+                        response = await _consume_codex_stream(stream, evidence)
                 except BaseException as error:
                     failure = error
                 finally:
