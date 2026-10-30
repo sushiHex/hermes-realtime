@@ -427,6 +427,52 @@ def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup
     assert s.captured["stream_closed"] == 1
 
 
+def test_codex_metadata_stream_extension_is_opaque_before_terminal(setup, capsys):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["stream_events"] = [
+        SimpleNamespace(type="response.metadata", metadata={
+            "private": "SYNTHETIC_PRIVATE_METADATA",
+        }),
+        *s.codex_events(),
+    ]
+    result = s.run(api_mode="codex_responses")
+    assert result.id == "resp_native"
+    assert s.row["presentation_evidence"]["category"] == "presented"
+    assert "SYNTHETIC_PRIVATE_METADATA" not in capsys.readouterr().out
+
+
+def test_codex_metadata_only_stream_still_requires_terminal(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["stream_events"] = [SimpleNamespace(
+        type="response.metadata", metadata={"private": "ignored"},
+    )]
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider"
+    assert evidence["provider_rejection"] == "responses-terminal-count"
+
+
+def test_codex_metadata_after_terminal_is_rejected(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    terminal = s.codex_response([s.codex_message("formatter terminal")])
+    s.captured["stream_events"] = [
+        SimpleNamespace(type="response.completed", response=terminal),
+        SimpleNamespace(type="response.metadata", metadata={"private": "ignored"}),
+    ]
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider"
+    assert evidence["provider_rejection"] == "responses-event-after-terminal"
+
+
 @pytest.mark.parametrize(("failure", "marker", "event_type", "event_kind"), [
     ("wire", "presentation-wire-contract", None, None),
     ("stream", "responses-event-unknown", "response.future_private_event", "other"),

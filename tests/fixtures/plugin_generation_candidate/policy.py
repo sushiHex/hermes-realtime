@@ -315,6 +315,8 @@ async def _consume_codex_stream(stream, evidence=None):
         "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
         "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
         "response.completed",
+        # Observed Codex subscription extension. Its body is intentionally opaque.
+        "response.metadata",
     }
     async for event in stream:
         event_count += 1
