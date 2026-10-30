@@ -69,8 +69,11 @@ def metadata_config(base="https://chatgpt.com/backend-api/codex", mode="codex_re
                                  "base_url": base, "api_mode": mode}}}}}}
 
 
-def test_responses_gateway_adds_no_metadata_egress():
-    assert gateway().metadata_urls_from_config(metadata_config()) == frozenset()
+def test_responses_gateway_binds_only_native_metadata_paths():
+    base = "https://chatgpt.com/backend-api/codex"
+    assert gateway().metadata_urls_from_config(metadata_config()) == frozenset({
+        base + "/models", base + "/v1/models",
+    })
 
 
 @pytest.mark.parametrize("field,value", [
@@ -281,3 +284,48 @@ def test_policy_diagnostic_saturates_counters():
     tee.write('[lookup-presentation] {"category":"refused","stage":"source"}\n')
     assert state["policyDiagnostics"]["observed"] == 1000000
     assert len(state["policyDiagnostics"]["events"]) == 1
+
+
+def test_cloud_metadata_lane_preserves_native_fallback_and_two_request_limit(capsys):
+    module, state, calls = gateway(), witness(), []
+    allowed = module.metadata_urls_from_config(metadata_config())
+    response = SimpleNamespace(
+        status_code=404, raw=SimpleNamespace(read=lambda *_a, **_k: b"{}"), close=lambda: None,
+    )
+    session = SimpleNamespace(
+        get_adapter=lambda _: SimpleNamespace(max_retries=SimpleNamespace(total=0)),
+    )
+
+    def forward(_session, request, **kwargs):
+        calls.append(request.url)
+        assert kwargs == {"allow_redirects": False, "stream": True,
+                          "timeout": (5, 10), "proxies": {}}
+        return response
+
+    send = module.bounded_exa_send(
+        forward, state, set(), lambda: None, SimpleNamespace(), allowed,
+    )
+    for url in sorted(allowed):
+        assert send(session, SimpleNamespace(url=url, method="GET", body=None)) is response
+    assert len(calls) == state["metadataRequests"] == 2
+    assert state["transportRefused"] is False
+    assert [row["httpStatus"] for row in state["transportResponses"]] == [404, 404]
+    with pytest.raises(RuntimeError, match="metadata_request_refused"):
+        send(session, SimpleNamespace(url=sorted(allowed)[0], method="GET", body=None))
+    assert len(calls) == 2
+    assert marker(capsys.readouterr().out)["forwarded"] is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://chatgpt.com/backend-api/codex/models?extra=1",
+    "https://chatgpt.com/backend-api/codex/models/other",
+    "https://chatgpt.com.attacker.invalid/backend-api/codex/models",
+])
+def test_cloud_metadata_lane_refuses_neighboring_urls(url):
+    module, state = gateway(), witness()
+    send = module.bounded_exa_send(
+        lambda *_a, **_k: pytest.fail("must not forward"), state, set(), lambda: None,
+        SimpleNamespace(), module.metadata_urls_from_config(metadata_config()),
+    )
+    with pytest.raises(RuntimeError, match="metadata_request_refused"):
+        send(None, SimpleNamespace(url=url, method="GET", body=None))

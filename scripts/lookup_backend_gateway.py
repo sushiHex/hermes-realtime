@@ -219,9 +219,9 @@ def metadata_urls_from_config(config: Any) -> Any:
     ):
         raise RuntimeError("metadata_route_mismatch")
     if mode == "codex_responses" and base == "https://chatgpt.com/backend-api/codex":
-        # This selected cloud route has no local Ollama metadata endpoint.
-        # An empty allowlist adds no requests-based network authority.
-        return frozenset()
+        # Native custom-route pricing discovery probes these two exact paths.
+        # Keep the existing bounded GET lane; no broader cloud traffic is admitted.
+        return frozenset((base + "/models", base + "/v1/models"))
     if mode != "chat_completions":
         raise RuntimeError("metadata_route_refused")
     parsed = urlsplit(base)
