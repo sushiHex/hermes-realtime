@@ -288,11 +288,7 @@ def test_codex_responses_function_call_uses_call_id_for_ticket_identity(setup):
         usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
     )
     s.run.original = raw
-    request = {
-        "model": CODEX_CONFIG["model"],
-        "tools": [{"type": "function", "name": "web_extract",
-                   "parameters": {"type": "object"}}],
-    }
+    request = _request_with_lookup_tools("codex_responses")
     result = s.run(api_mode="codex_responses", request=request)
     assert result is raw
     assert s.row["plan"] == {"call_ticket_id": ("web_extract", s.module.frozen(args))}
@@ -1080,9 +1076,11 @@ def test_budget_only_completion_does_not_claim_or_require_retrieval(setup):
     assert setup.run() is setup.original and not setup.captured["requests"]
 
 
-def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
+def test_formatter_reasoning_control_projects_without_mutating_native_task_request(setup):
     s = setup
     s.request["reasoning_effort"] = "high"
+    s.row.update(phase="search", reserved=1, settled=1)
+    original = json.loads(json.dumps(s.request))
     seen = []
 
     def native(request):
@@ -1090,7 +1088,12 @@ def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
         return s.original
 
     assert s.run(next_call=native) is not s.refused
-    assert seen == [s.request] and s.request["reasoning_effort"] == "high"
+    assert len(seen) == 1 and seen[0] is not s.request
+    assert s.request == original and s.request["reasoning_effort"] == "high"
+    assert seen[0]["reasoning_effort"] == "high"
+    assert seen[0]["tools"] == []
+    assert all(key not in seen[0] for key in (
+        "tool_choice", "parallel_tool_calls", "functions", "function_call"))
     assert s.captured["requests"][0]["reasoning_effort"] == "none"
 
 
