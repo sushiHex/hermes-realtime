@@ -12,9 +12,11 @@ transaction ever spans the two files.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ from hermes_realtime.companion.integrity import (
 _SCHEMA_VERSION = 4
 _CONCRETE_PATH = type(Path())
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_REVIEW_ID = re.compile(r"vr_[0-9a-f]{32}")
 _MAX_HOLDER_CHARS = 256
 # A generous bound on stored conversations: each is one row of fences and progress.
 MAX_BOUND_CONVERSATIONS = 4096
@@ -201,19 +204,33 @@ class CompanionStore:
         """Run ``action(row)`` inside one ``BEGIN IMMEDIATE`` over this conversation's row."""
 
         validate_conversation_id(conversation_id)
-        connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
-        try:
+        with self._transaction() as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM voice_archive WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
-            result = action(row)
+            return action(row)
+
+    @contextlib.contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """One ``BEGIN IMMEDIATE`` transaction, committed, or rolled back on any error."""
+
+        connection = self._connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
             connection.execute("COMMIT")
         except BaseException:
             connection.execute("ROLLBACK")
             raise
-        return result
+
+    def _write_review_ledger(
+        self, conversation_id: str, ledger: dict[str, dict[str, str]]
+    ) -> None:
+        self._connection.execute(
+            "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
+            (json.dumps(ledger, sort_keys=True, separators=(",", ":")), conversation_id),
+        )
 
     @staticmethod
     def _record(row: Any) -> ConversationRecord:
@@ -305,17 +322,11 @@ class CompanionStore:
         A completed row holds no capacity, so keeping it costs one small row, not a cap.
         """
 
-        connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
-        try:
+        with self._transaction() as connection:
             connection.execute(
                 "DELETE FROM voice_archive WHERE conversation_id IN "
                 "(SELECT conversation_id FROM voice_deletion WHERE complete = 1)"
             )
-            connection.execute("COMMIT")
-        except BaseException:
-            connection.execute("ROLLBACK")
-            raise
 
     def tombstone(self, conversation_id: str, generation: int) -> bool:
         """Persist the generation fence before any native delete."""
@@ -441,7 +452,7 @@ class CompanionStore:
                 not valid_key or type(value) is not dict
                 or set(value) != {"id", "outcome"}
                 or type(value["id"]) is not str
-                or not re.fullmatch(r"vr_[0-9a-f]{32}", value["id"])
+                or not _REVIEW_ID.fullmatch(value["id"])
                 or value["id"] in ids
                 or type(value["outcome"]) is not str
                 or value["outcome"] not in _REVIEW_OUTCOMES
@@ -478,7 +489,7 @@ class CompanionStore:
         return self._step(request.conversation_id, action)  # type: ignore[no-any-return]
 
     def reserve_review(self, request: Any, review_id: str) -> None:
-        if type(review_id) is not str or not re.fullmatch(r"vr_[0-9a-f]{32}", review_id):
+        if type(review_id) is not str or not _REVIEW_ID.fullmatch(review_id):
             raise ValueError("review ID is invalid")
         key = self._review_key(request)
 
@@ -490,13 +501,7 @@ class CompanionStore:
             if len(ledger) >= MAX_REVIEW_LEDGER_ENTRIES:
                 raise ArchiveRefusal("capacity")
             ledger[key] = {"id": review_id, "outcome": "reserved"}
-            self._connection.execute(
-                "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
-                (
-                    json.dumps(ledger, sort_keys=True, separators=(",", ":")),
-                    request.conversation_id,
-                ),
-            )
+            self._write_review_ledger(request.conversation_id, ledger)
 
         self._step(request.conversation_id, action)
 
@@ -510,13 +515,7 @@ class CompanionStore:
             if entry != {"id": review_id, "outcome": "reserved"}:
                 raise RuntimeError("review reservation changed")
             entry["outcome"] = "accepted"
-            self._connection.execute(
-                "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
-                (
-                    json.dumps(ledger, sort_keys=True, separators=(",", ":")),
-                    request.conversation_id,
-                ),
-            )
+            self._write_review_ledger(request.conversation_id, ledger)
 
         self._step(request.conversation_id, action)
 
@@ -528,13 +527,7 @@ class CompanionStore:
             for entry in ledger.values():
                 if entry["id"] == review_id:
                     entry["outcome"] = outcome
-                    self._connection.execute(
-                        "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
-                        (
-                            json.dumps(ledger, sort_keys=True, separators=(",", ":")),
-                            conversation_id,
-                        ),
-                    )
+                    self._write_review_ledger(conversation_id, ledger)
                     return
             raise RuntimeError("review identity is absent")
         self._step(conversation_id, action)
@@ -555,10 +548,8 @@ class CompanionStore:
         row never stops an owned start. Returns how many were quarantined.
         """
 
-        connection = self._connection
         quarantined = 0
-        connection.execute("BEGIN IMMEDIATE")
-        try:
+        with self._transaction() as connection:
             rows = connection.execute(
                 "SELECT conversation_id, review_ledger FROM voice_archive"
             ).fetchmany(MAX_BOUND_CONVERSATIONS + 1)
@@ -579,17 +570,7 @@ class CompanionStore:
                     for entry in ledger.values():
                         if entry["outcome"] in {"reserved", "accepted"}:
                             entry["outcome"] = "unknown"
-                    connection.execute(
-                        "UPDATE voice_archive SET review_ledger = ? WHERE conversation_id = ?",
-                        (
-                            json.dumps(ledger, sort_keys=True, separators=(",", ":")),
-                            conversation_id,
-                        ),
-                    )
-            connection.execute("COMMIT")
-        except BaseException:
-            connection.execute("ROLLBACK")
-            raise
+                    self._write_review_ledger(conversation_id, ledger)
         return quarantined
 
     def bind(

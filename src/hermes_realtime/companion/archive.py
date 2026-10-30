@@ -35,7 +35,7 @@ import json
 import math
 import os
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
@@ -163,11 +163,46 @@ def _marker(prefix: str, evidence: dict[str, str | int]) -> None:
     print(prefix + json.dumps(evidence, separators=(",", ":"), sort_keys=True), flush=True)
 
 
+@contextlib.contextmanager
+def _evidence(prefix: str, extra: dict[str, str | int]) -> Iterator[None]:
+    """Print one marker for a refusal or failure, then let it propagate."""
+
+    try:
+        yield
+    except ArchiveRefusal as refusal:
+        _marker(prefix, {"refusal": refusal.category, **extra, "version": 1})
+        raise
+    except BaseException as error:
+        _marker(prefix, {"failure": type(error).__name__, **extra, "version": 1})
+        raise
+
+
 def _checked_id(conversation_id: str) -> str:
     try:
         return validate_conversation_id(conversation_id)
     except (TypeError, ValueError):
         raise ArchiveRefusal("invalid") from None
+
+
+async def run_to_end(function: Callable[..., _T], *arguments: object) -> _T:
+    """Run one Hermes call on a worker thread and wait for it to end, even if cancelled.
+
+    The thread cannot be stopped, so a cancelled caller keeps waiting (and keeps the
+    conversation lock) until Hermes returns; the cancellation is re-raised after.
+    """
+
+    work = asyncio.ensure_future(asyncio.to_thread(function, *arguments))
+    cancelled = False
+    while not work.done():
+        try:
+            await asyncio.wait({work})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not work.cancelled():
+            work.exception()  # Retrieved: the outcome is left for recovery to settle.
+        raise asyncio.CancelledError
+    return work.result()
 
 
 class VoiceArchive:
@@ -257,44 +292,17 @@ class VoiceArchive:
                 del self._locks[conversation_id]
 
     async def _call(self, function: Callable[..., _T], *arguments: object) -> _T:
-        """Run one Hermes call on a worker thread and wait for it to end, even if cancelled.
-
-        The thread cannot be stopped, so a cancelled caller keeps waiting (and keeps the
-        conversation lock) until Hermes returns; the cancellation is re-raised after.
-        """
-
-        work = asyncio.ensure_future(asyncio.to_thread(function, *arguments))
-        cancelled = False
-        while not work.done():
-            try:
-                await asyncio.wait({work})
-            except asyncio.CancelledError:
-                cancelled = True
-        if cancelled:
-            if not work.cancelled():
-                work.exception()  # Retrieved: the outcome is left for recovery to settle.
-            raise asyncio.CancelledError
-        return work.result()
+        return await run_to_end(function, *arguments)
 
     # --- startup ---------------------------------------------------------------------------
 
     async def open(self, conversation_id: str) -> OpenReport:
         """Fences, then compatibility, then the lease, then verification, then readiness."""
 
-        evidence: dict[str, str | int] | None = None
-        try:
+        with _evidence(_OPEN_MARKER, {}):
             conversation_id = _checked_id(conversation_id)
             async with self._guard(conversation_id):
                 return await self._open(conversation_id)
-        except ArchiveRefusal as refusal:
-            evidence = {"refusal": refusal.category, "version": 1}
-            raise
-        except BaseException as error:
-            evidence = {"failure": type(error).__name__, "version": 1}
-            raise
-        finally:
-            if evidence is not None:
-                _marker(_OPEN_MARKER, evidence)
 
     async def _open(self, conversation_id: str) -> OpenReport:
         if self._fenced:
@@ -406,22 +414,12 @@ class VoiceArchive:
 
         rows = batch.rows if type(batch) is VoiceBatch else ()
         count = len(rows) if type(rows) is tuple else 0
-        evidence: dict[str, str | int] | None = None
-        try:
+        with _evidence(_ARCHIVE_MARKER, {"rows": count}):
             conversation_id = _checked_id(conversation_id)
             async with self._guard(conversation_id):
                 result = await self._archive(conversation_id, batch)
                 self._on_state_change()
                 return result
-        except ArchiveRefusal as refusal:
-            evidence = {"refusal": refusal.category, "rows": count, "version": 1}
-            raise
-        except BaseException as error:
-            evidence = {"failure": type(error).__name__, "rows": count, "version": 1}
-            raise
-        finally:
-            if evidence is not None:
-                _marker(_ARCHIVE_MARKER, evidence)
 
     async def _archive(self, conversation_id: str, batch: VoiceBatch) -> ArchiveResult:
         if self._fenced:
