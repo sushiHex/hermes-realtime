@@ -120,6 +120,67 @@ async def test_deadline_reserve_refuses_before_warm():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase,clock,deadline", [
+    ("initial", (200.1,), 200.1 + 60.0),
+    ("after_preflight", (900.0, 1023.9), 1023.9 + 60.0),
+])
+async def test_non_dyadic_exact_reserve_refuses_without_warm(
+        monkeypatch, phase, clock, deadline):
+    readings = list(clock)
+
+    def monotonic():
+        return readings.pop(0) if len(readings) > 1 else readings[0]
+
+    monkeypatch.setattr(mcp, "time", SimpleNamespace(monotonic=monotonic))
+
+    @asynccontextmanager
+    async def no_timer(_deadline):
+        yield
+
+    monkeypatch.setattr(mcp.asyncio, "timeout_at", no_timer)
+    session = Session()
+    entered = []
+
+    @asynccontextmanager
+    async def factory(_base_url, _deadline):
+        entered.append(True)
+        yield session
+
+    load = mcp.make_strict_mcp_loader(factory)
+    with pytest.raises(ValueError, match="mcp-budget"):
+        await load(base_url=BASE, model=MODEL, deadline=deadline,
+                   startup_profile=StartupProfile.LOOKUP_64K)
+    assert [name for name, _ in session.calls] == (
+        [] if phase == "initial" else ["list_loaded"])
+    assert entered == ([] if phase == "initial" else [True])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds,maximum", [(360.0, 300.0), (600.0, 540.0)])
+async def test_non_dyadic_warm_timeout_preserves_reserve(
+        monkeypatch, seconds, maximum):
+    now = 1023.9  # Both deadlines cross a binary exponent boundary.
+    monkeypatch.setattr(mcp, "time", SimpleNamespace(monotonic=lambda: now))
+
+    @asynccontextmanager
+    async def no_timer(_deadline):
+        yield
+
+    monkeypatch.setattr(mcp.asyncio, "timeout_at", no_timer)
+    session = Session()
+
+    @asynccontextmanager
+    async def factory(_base_url, _deadline):
+        yield session
+
+    assert await mcp.make_strict_mcp_loader(factory)(
+        base_url=BASE, model=MODEL, deadline=now + seconds,
+        startup_profile=StartupProfile.LOOKUP_64K) is True
+    assert [name for name, _ in session.calls] == ["list_loaded", "warm"]
+    assert 0 < session.calls[1][1]["timeout_seconds"] <= maximum
+
+
+@pytest.mark.asyncio
 async def test_warm_capability_schema_is_required():
     entry = schema()
     entry.inputSchema["properties"].pop("strict_fit")

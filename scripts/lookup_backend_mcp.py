@@ -33,6 +33,17 @@ _ACTOR = "hermes-realtime"
 _LOOPBACK_URL = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})\Z")
 
 
+def _warm_budget_seconds(deadline: float) -> float:
+    # Compare absolute times first. Subtracting non-dyadic clocks can round an
+    # exact 60-second reserve upward, then admit a warm with no real allowance.
+    # Round the cutoff up and the derived wait down by one float step so neither
+    # operation grants time beyond the caller's absolute deadline.
+    cutoff = math.nextafter(time.monotonic() + _OVERHEAD_SECONDS, math.inf)
+    if deadline <= cutoff:
+        raise ValueError("mcp-budget")
+    return math.nextafter(deadline - cutoff, 0.0)
+
+
 def _field(value: Any, key: str) -> Any:
     return value.get(key) if isinstance(value, dict) else getattr(value, key, None)
 
@@ -167,8 +178,7 @@ def make_strict_mcp_loader(session_factory: Callable[..., Any]) -> Callable[...,
             raise ValueError("mcp-input")
         invoked = True
         evidence["phase"] = "budget"
-        if deadline - time.monotonic() <= _OVERHEAD_SECONDS:
-            raise ValueError("mcp-budget")
+        _warm_budget_seconds(deadline)
         async with asyncio.timeout_at(deadline):
             async with session_factory(base_url, deadline) as session:
                 evidence["phase"] = "capability"
@@ -177,10 +187,7 @@ def make_strict_mcp_loader(session_factory: Callable[..., Any]) -> Callable[...,
                 evidence["read_only_tool_calls"] += 1
                 preflight = _payload(await session.call_tool("list_loaded", {}))
                 _check_preflight(preflight, base_url)
-                remaining = deadline - time.monotonic()
-                if remaining <= _OVERHEAD_SECONDS:
-                    raise ValueError("mcp-budget")
-                timeout = min(_MAX_WARM_SECONDS, remaining - _OVERHEAD_SECONDS)
+                timeout = min(_MAX_WARM_SECONDS, _warm_budget_seconds(deadline))
                 arguments = {"model": model, "keep_alive": "-1", "by": _ACTOR,
                     "force": False, "strict_fit": True,
                     "num_ctx": startup_profile.context_tokens,
