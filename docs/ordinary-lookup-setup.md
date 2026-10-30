@@ -118,6 +118,16 @@ owned loopback endpoint and `OLLAMA_MODELS` to that store. Remove inherited
 personal server. Metadata readiness is not inference readiness or memory proof;
 64,000 is the configured context, not a claim of spare capacity or all-GPU fit.
 
+Trusted Python operators may explicitly select `StartupProfile.LOOKUP_16K` when
+calling `run_owned`. This closed, model-independent profile sets 16,384 context
+tokens for the owned server and strict MCP warm; its independent readback must
+match. The separately prepared Hermes `config.yaml` must set
+`model.context_length` to the same exact integer or the runner refuses before
+model startup, so later inference cannot silently request the 64K default.
+The normal lookup profile remains 64K; admission never shrinks context
+automatically. A 16K fit result is specific to the selected artifact and current
+capacity, and useful answers and freedom from truncation require actual observation.
+
 The isolated `config.yaml` uses matching native and presentation routes. Replace
 the numeric port placeholder in both locations with the same owned model port:
 

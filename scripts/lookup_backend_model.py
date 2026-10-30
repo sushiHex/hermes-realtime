@@ -40,26 +40,35 @@ MCP_CALLBACK_REFUSALS = frozenset({
 
 
 class StartupProfile(Enum):
-    """The two admitted Ollama startup settings; callers cannot supply raw values."""
+    """Closed Ollama startup settings; callers cannot supply raw context values."""
 
     LOOKUP_64K = 1
     NATIVE_TOOLS_4K = 2
+    LOOKUP_16K = 3
 
     @property
     def context_tokens(self) -> int:
-        return 64000 if self is StartupProfile.LOOKUP_64K else 4096
+        if self is StartupProfile.LOOKUP_64K:
+            return 64000
+        if self is StartupProfile.LOOKUP_16K:
+            return 16384
+        return 4096
 
     @property
     def go_template(self) -> str | None:
-        return None if self is StartupProfile.LOOKUP_64K else "1"
+        return "1" if self is StartupProfile.NATIVE_TOOLS_4K else None
 
     @property
     def profile_id(self) -> str:
-        return "LOOKUP_64K" if self is StartupProfile.LOOKUP_64K else "NATIVE_TOOLS_4K"
+        if self is StartupProfile.LOOKUP_64K:
+            return "LOOKUP_64K"
+        if self is StartupProfile.LOOKUP_16K:
+            return "LOOKUP_16K"
+        return "NATIVE_TOOLS_4K"
 
     @property
     def startup_seconds(self) -> int:
-        return 60 if self is StartupProfile.LOOKUP_64K else 120
+        return 120 if self is StartupProfile.NATIVE_TOOLS_4K else 60
 
 
 class McpModelLoader(Protocol):
