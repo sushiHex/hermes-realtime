@@ -39,6 +39,7 @@ _PRIVATE_RUN_TOKEN_PATTERN = re.compile(
 )
 _MAX_TASK_ID_CHARS = 128
 _MAX_OUTCOME_TEXT_CHARS = 1024
+_MAX_COMPLETED_SUMMARY_CHARS = 4096
 _MAX_PROTOCOL_SEQUENCE = (1 << 63) - 1
 _TERMINAL_STATUSES = frozenset(("completed", "failed", "interrupted"))
 
@@ -89,12 +90,17 @@ def _validate_event_envelope(event: Any, expected_type: str) -> None:
         raise ValueError("event timestamp must be timezone-aware")
 
 
-def _validate_outcome_text(value: str | None, field: str) -> None:
+def _validate_outcome_text(
+    value: str | None,
+    field: str,
+    *,
+    max_chars: int = _MAX_OUTCOME_TEXT_CHARS,
+) -> None:
     if value is None:
         return
     if type(value) is not str:
         raise TypeError(f"{field} must be an exact built-in string or None")
-    if not value.strip() or len(value) > _MAX_OUTCOME_TEXT_CHARS:
+    if not value.strip() or len(value) > max_chars:
         raise ValueError(f"{field} must be non-empty and bounded")
     if _PRIVATE_RUN_TOKEN_PATTERN.search(value) is not None:
         raise PrivateRunDisclosureError("model-visible text contains a private run token")
@@ -167,7 +173,15 @@ class TaskTerminalOutcome:
             raise TypeError("status must be an exact built-in string")
         if self.status not in _TERMINAL_STATUSES:
             raise ValueError("status must be a terminal task status")
-        _validate_outcome_text(self.summary, "summary")
+        _validate_outcome_text(
+            self.summary,
+            "summary",
+            max_chars=(
+                _MAX_COMPLETED_SUMMARY_CHARS
+                if self.status == "completed"
+                else _MAX_OUTCOME_TEXT_CHARS
+            ),
+        )
         _validate_outcome_text(self.reason, "reason")
         if self.status == "completed":
             if self.summary is None or self.reason is not None:
@@ -657,7 +671,9 @@ class ConversationTaskController:
         _validate_run_id(update.run_id)
         summary = update.payload.summary
         reason = update.payload.reason
-        _validate_outcome_text(summary, "summary")
+        _validate_outcome_text(
+            summary, "summary", max_chars=_MAX_COMPLETED_SUMMARY_CHARS
+        )
         _validate_outcome_text(reason, "reason")
         evidence = _TerminalEvidence(
             task_id=update.task_id,
