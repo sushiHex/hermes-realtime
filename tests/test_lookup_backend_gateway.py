@@ -79,7 +79,8 @@ def test_responses_gateway_adds_no_metadata_egress():
 ])
 def test_responses_gateway_requires_same_native_presentation_route(field, value):
     config = metadata_config()
-    config["plugins"]["entries"]["ordinary-lookup-experimental"]["settings"]["presentation"][field] = value
+    presentation = config["plugins"]["entries"]["ordinary-lookup-experimental"]["settings"]
+    presentation["presentation"][field] = value
     with pytest.raises(RuntimeError, match="metadata_route_mismatch"):
         gateway().metadata_urls_from_config(config)
 
