@@ -416,6 +416,53 @@ def test_native_tools_profile_binds_environment_load_and_readback(
     assert result["startup_profile"] == "NATIVE_TOOLS_4K"
 
 
+@pytest.mark.parametrize("rendering", ["go_template", "builtin_renderer_parser"])
+def test_lookup_16k_binds_owned_inference_environment_mcp_and_readback(
+        selected, owned, tmp_path, monkeypatch, rendering):
+    if rendering == "builtin_renderer_parser":
+        rewrite_rendering_layout(selected)
+        sync_owned_digest(selected, owned)
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "64000")
+    monkeypatch.setenv("OLLAMA_GO_TEMPLATE", "1")
+    owned[5]["ps"]["models"][0].update(
+        context_length=16384, size=4096, size_vram=4096)
+    observed = []
+
+    async def loader(**kwargs):
+        observed.append(kwargs)
+        return True
+
+    deadline = model.time.monotonic() + 10
+    result = model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+        deadline, startup_profile=model.StartupProfile.LOOKUP_16K, mcp_loader=loader)
+    env = owned[0].calls[0][2]["env"]
+    assert env["OLLAMA_CONTEXT_LENGTH"] == "16384"
+    assert "OLLAMA_GO_TEMPLATE" not in env
+    assert env["OLLAMA_NUM_PARALLEL"] == "1" and env["OLLAMA_KEEP_ALIVE"] == "-1"
+    assert observed == [{"base_url": "http://127.0.0.1:11440", "model": selected["model"],
+                         "deadline": deadline, "startup_profile": model.StartupProfile.LOOKUP_16K}]
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
+    assert result["startup_profile"] == "LOOKUP_16K"
+    assert result["context_default_tokens"] == result["configured_context_tokens"] == 16384
+    assert result["startup_budget_ceiling_seconds"] == 60
+
+
+@pytest.mark.parametrize("readback", [64000, 4096, None, True])
+def test_lookup_16k_refuses_wrong_configured_context(selected, owned, tmp_path, readback):
+    owned[5]["ps"]["models"][0].update(
+        context_length=readback, size=4096, size_vram=4096)
+
+    async def loader(**_kwargs):
+        return True
+
+    with pytest.raises(ValueError, match="loaded-context"):
+        model.start_model(selected, owned[0], owned[1], tmp_path / "evidence",
+            model.time.monotonic() + 10, startup_profile=model.StartupProfile.LOOKUP_16K,
+            mcp_loader=loader)
+    assert owned[0].killed == [model.MODEL_PROCESS_NAME]
+    assert [(r.method, r.url.path) for r in owned[4]] == [("GET", "/api/ps")]
+
+
 def test_native_startup_admits_load_after_sixty_before_120(
         selected, owned, tmp_path, monkeypatch):
     now = [1000.0]
@@ -826,7 +873,8 @@ def test_load_and_readback_precede_ready(selected, owned, tmp_path):
         "options": {"num_ctx": 64000}}
 
 
-@pytest.mark.parametrize("profile", list(model.StartupProfile), ids=["lookup", "native"])
+@pytest.mark.parametrize("profile", list(model.StartupProfile),
+                         ids=["lookup64", "native", "lookup16"])
 def test_mcp_loader_replaces_native_load_and_shares_readback(selected, owned, tmp_path, profile):
     calls = []
     owned[5]["ps"]["models"][0]["context_length"] = profile.context_tokens
