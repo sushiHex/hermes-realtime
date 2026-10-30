@@ -54,22 +54,12 @@ class SessionBindings:
             self._by_session[session_id] = binding
             return binding
 
-    def session_for(self, participant_id: str) -> str | None:
-        binding = self.binding_for(participant_id)
-        return None if binding is None else binding.session_id
-
     def binding_for(self, participant_id: str) -> SessionBinding | None:
         """Return the current immutable binding generation for a participant."""
 
         participant_id = self._normalize_identifier(participant_id, "participant_id")
         with self._lock:
             return self._by_participant.get(participant_id)
-
-    def is_active(self, binding: SessionBinding) -> bool:
-        """Check whether a previously observed binding is still current."""
-
-        with self._lock:
-            return self._by_participant.get(binding.participant_id) is binding
 
     @contextmanager
     def admission(self, binding: SessionBinding) -> Iterator[bool]:

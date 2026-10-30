@@ -25,7 +25,7 @@ def test_session_binding_is_idempotent_for_reconnect() -> None:
     second = bindings.bind("participant_001", "session_001")
 
     assert first == second
-    assert bindings.session_for("participant_001") == "session_001"
+    assert bindings.binding_for("participant_001") == first
 
 
 def test_session_binding_rejects_participant_rebind() -> None:
@@ -51,7 +51,7 @@ def test_released_session_binding_can_be_reassigned() -> None:
     released = bindings.release(original)
 
     assert released == original
-    assert bindings.session_for("participant_001") is None
+    assert bindings.binding_for("participant_001") is None
     assert bindings.bind("participant_002", "session_001").session_id == "session_001"
 
 
@@ -59,9 +59,9 @@ def test_binding_lookup_and_release_normalize_participant_id() -> None:
     bindings = SessionBindings()
     original = bindings.bind("  participant_001  ", "session_001")
 
-    assert bindings.session_for("  participant_001  ") == "session_001"
+    assert bindings.binding_for("  participant_001  ") == original
     assert bindings.release(original) == original
-    assert bindings.session_for("participant_001") is None
+    assert bindings.binding_for("participant_001") is None
 
 
 def test_stale_binding_release_cannot_remove_rebound_generation() -> None:
@@ -95,7 +95,9 @@ def test_binding_admission_serializes_release_and_rebind() -> None:
 
     releaser.join(timeout=1)
     assert release_completed.is_set()
-    assert bindings.session_for("participant_002") == "session_001"
+    rebound = bindings.binding_for("participant_002")
+    assert rebound is not None
+    assert rebound.session_id == "session_001"
 
 
 class BlockingDispatcher:

@@ -163,7 +163,7 @@ class HermesIntegrationService:
                         dispatch_task = asyncio.create_task(
                             self._dispatch_once(request, key, binding)
                         )
-                        dispatch_task.add_done_callback(self._schedule_completed_prune)
+                        dispatch_task.add_done_callback(self._schedule_prune)
                         self._dispatch_tasks[key] = dispatch_task
                         self._dispatch_fingerprints[key] = fingerprint
         if capacity_rejected:
@@ -246,9 +246,7 @@ class HermesIntegrationService:
                     cancellation_task = asyncio.create_task(
                         self._cancel_once(request, targets, known_run_ids)
                     )
-                    cancellation_task.add_done_callback(
-                        self._schedule_completed_cancellation_prune
-                    )
+                    cancellation_task.add_done_callback(self._schedule_prune)
                     self._cancellation_tasks[key] = cancellation_task
                     self._cancellation_fingerprints[key] = fingerprint
 
@@ -356,17 +354,7 @@ class HermesIntegrationService:
             del self._cancellation_tasks[completed_key]
             del self._cancellation_fingerprints[completed_key]
 
-    def _schedule_completed_prune(
-        self,
-        completed: asyncio.Task[WorkDispatchAcknowledgedEvent],
-    ) -> None:
-        del completed
-        asyncio.create_task(self._prune_after_completion())
-
-    def _schedule_completed_cancellation_prune(
-        self,
-        completed: asyncio.Task[ControlCancelAcknowledgedEvent],
-    ) -> None:
+    def _schedule_prune(self, completed: object) -> None:
         del completed
         asyncio.create_task(self._prune_after_completion())
 
