@@ -300,7 +300,7 @@ def test_replay_authority_rejects_source_lineage_from_predecessor_binding() -> N
             reason=BindingCloseReason.RETENTION_ROLLOVER,
         )
     )
-    replay =scheduler.try_reserve(ConversationOperationKind.REPLAY)
+    replay = scheduler.try_reserve(ConversationOperationKind.REPLAY)
     assert replay is not None
 
     with pytest.raises(ReservationError, match="source binding"):
