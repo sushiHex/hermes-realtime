@@ -1526,11 +1526,8 @@ class CodexAppServerStreamingInference:
                     "type": "function",
                     "name": "start_work",
                     "description": (
-                        "Propose work for the host's configured task admission policy: "
-                        "research, tools, "
-                        "inspection, commands, builds, changes, or verification. "
-                        "Never use for conversation, indirect requests, "
-                        "or inactive continuation."
+                        "Propose requested work, including a clarified continuation. "
+                        "Never use for conversation alone."
                     ),
                     "inputSchema": {
                         "type": "object",

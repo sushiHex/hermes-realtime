@@ -275,6 +275,42 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
 
 
 @pytest.mark.asyncio
+async def test_codex_outbound_clarification_retains_context_and_work_contract() -> None:
+    """Outbound contract only; the fake model does not prove routing obedience."""
+    messages = (
+        ConversationMessage("user", "Check the current service availability."),
+        ConversationMessage("assistant", "Which service?"),
+        ConversationMessage("user", "The public Atlas service."),
+    )
+    snapshot = ConversationInferenceRequest(revision=3, messages=messages, active_tasks=())
+    transport = FakeCodexTransport(assistant_delta="Understood.")
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    try:
+        assert [part async for part in inference.stream(
+            snapshot, turn_id="turn_clarification_contract",
+        )] == ["Understood."]
+    finally:
+        await inference.close()
+    thread = next(row for row in transport.sent if row.get("method") == "thread/start")
+    turn = next(row for row in transport.sent if row.get("method") == "turn/start")
+    payload = json.loads(turn["params"]["input"][0]["text"].splitlines()[-1])
+    assert payload["messages"] == [
+        {"role": message.role, "text": message.text} for message in messages
+    ]
+    assert_aligned_work_routing(thread["params"]["baseInstructions"], task_status_available=True)
+    tools = thread["params"]["dynamicTools"]
+    assert [tool["name"] for tool in tools] == ["start_work", "task_status"]
+    assert "clarified continuation" in tools[0]["description"]
+    assert "indirect requests" not in tools[0]["description"]
+    assert "inactive continuation" not in tools[0]["description"]
+    assert handler.starts == handler.cancels == handler.exact_cancels == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", _CONTEXT_CASES, ids=lambda case: case["id"])
 async def test_codex_outbound_work_request_retains_actual_user_context(case) -> None:
     store = ConversationContextStore()
@@ -2638,10 +2674,8 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
             "type": "function",
             "name": "start_work",
             "description": (
-                "Propose work for the host's configured task admission policy: research, tools, "
-                "inspection, commands, builds, changes, or verification. "
-                "Never use for conversation, indirect requests, "
-                "or inactive continuation."
+                "Propose requested work, including a clarified continuation. "
+                "Never use for conversation alone."
             ),
             "inputSchema": {
                 "type": "object",
