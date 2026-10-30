@@ -79,11 +79,7 @@ export class VoiceDeleteControls {
         await this.options.request("/api/v1/delete-voice-conversation", credential.token),
       );
       if (state !== "pending" && state !== "complete") throw new TypeError("delete did not start");
-      if (
-        this.epoch !== epoch ||
-        this.options.credential()?.participantIdentity !== credential.participantIdentity ||
-        this.options.credential()?.token !== credential.token
-      ) return;
+      if (this.superseded(epoch, credential)) return;
       this.present(state);
       if (this.pending) this.schedule(credential.participantIdentity);
     } catch {
@@ -108,22 +104,22 @@ export class VoiceDeleteControls {
       const state = parseVoiceDeleteState(
         await this.options.request("/api/v1/voice-delete-status", credential.token),
       );
-      if (
-        this.epoch !== epoch ||
-        this.options.credential()?.participantIdentity !== credential.participantIdentity ||
-        this.options.credential()?.token !== credential.token
-      ) return;
+      if (this.superseded(epoch, credential)) return;
       this.present(state);
       if (this.pending) this.schedule(credential.participantIdentity);
     } catch {
-      if (
-        this.epoch !== epoch ||
-        this.options.credential()?.participantIdentity !== credential.participantIdentity ||
-        this.options.credential()?.token !== credential.token
-      ) return;
+      if (this.superseded(epoch, credential)) return;
       this.status.textContent = "Deletion status unavailable. Checking again.";
       if (this.pending) this.schedule(credential.participantIdentity);
     }
+  }
+
+  private superseded(epoch: number, credential: Credential): boolean {
+    return (
+      this.epoch !== epoch ||
+      this.options.credential()?.participantIdentity !== credential.participantIdentity ||
+      this.options.credential()?.token !== credential.token
+    );
   }
 
   private present(state: VoiceDeleteState): void {

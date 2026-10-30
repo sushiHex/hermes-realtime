@@ -40,6 +40,15 @@ def _word_stop_outcome(audio: AudioFrame, position: int, stop: int) -> str:
     return "end" if stop == total else "cap"
 
 
+def _rtc_frame(pcm: bytes, sample_rate_hz: int, channels: int) -> rtc.AudioFrame:
+    return rtc.AudioFrame(
+        data=pcm,
+        sample_rate=sample_rate_hz,
+        num_channels=channels,
+        samples_per_channel=len(pcm) // (2 * channels),
+    )
+
+
 class _Publication(Protocol):
     sid: str
 
@@ -252,39 +261,9 @@ class LiveKitRoomPeer:
                 await self._prepare_audio_locked("hermes-audio")
                 if self._audio_source is None:
                     raise RuntimeError("audio source preparation failed")
-                samples_per_channel = len(frame.pcm) // (2 * frame.channels)
                 await self._audio_source.capture_frame(
-                    rtc.AudioFrame(
-                        data=frame.pcm,
-                        sample_rate=frame.sample_rate_hz,
-                        num_channels=frame.channels,
-                        samples_per_channel=samples_per_channel,
-                    )
+                    _rtc_frame(frame.pcm, frame.sample_rate_hz, frame.channels)
                 )
-
-    async def prepare_audio(
-        self,
-        frame: AudioFrame,
-        *,
-        timeout_seconds: float = 10,
-    ) -> None:
-        """Publish the audio track before the first latency-sensitive PCM frame."""
-
-        self._validate_audio_publish(frame, timeout_seconds)
-        async with asyncio.timeout(timeout_seconds):
-            async with self._publish_lock:
-                await self._prepare_audio_locked("hermes-audio")
-
-    async def clear_audio_queue(self, *, timeout_seconds: float = 10) -> None:
-        """Discard provider-buffered PCM so cancelled speech cannot resume."""
-
-        if not self._connected:
-            raise RuntimeError("peer is not connected")
-        self._validate_timeout(timeout_seconds)
-        async with asyncio.timeout(timeout_seconds):
-            async with self._publish_lock:
-                if self._audio_source is not None:
-                    self._audio_source.clear_queue()
 
     async def prepare_speech_chunk(
         self,
@@ -343,15 +322,9 @@ class LiveKitRoomPeer:
                 source = self._audio_source
                 if source is None:
                     raise RuntimeError("audio source preparation failed")
-                samples_per_channel = len(chunk.audio.pcm) // (2 * chunk.audio.channels)
                 self._speech_playout = (chunk_key, self._clock())
                 await source.capture_frame(
-                    rtc.AudioFrame(
-                        data=chunk.audio.pcm,
-                        sample_rate=chunk.audio.sample_rate_hz,
-                        num_channels=chunk.audio.channels,
-                        samples_per_channel=samples_per_channel,
-                    )
+                    _rtc_frame(chunk.audio.pcm, chunk.audio.sample_rate_hz, chunk.audio.channels)
                 )
 
     async def finish_speech_chunk(
@@ -482,14 +455,7 @@ class LiveKitRoomPeer:
             block_bytes = 2 * audio.channels * block
             pcm = faded.pcm + bytes(-len(faded.pcm) % block_bytes)
             fade_started = self._clock()
-            await source.capture_frame(
-                rtc.AudioFrame(
-                    data=pcm,
-                    sample_rate=rate,
-                    num_channels=audio.channels,
-                    samples_per_channel=len(pcm) // (2 * audio.channels),
-                )
-            )
+            await source.capture_frame(_rtc_frame(pcm, rate, audio.channels))
             evidence["faded"] = True
             # Drain on the playout clock, not wait_for_playout's 15.6 ms loop
             # clock: every fade block, plus up to one tick of phase.
@@ -654,15 +620,6 @@ class LiveKitRoomPeer:
                         channels=event.frame.num_channels,
                     ),
                 )
-
-    async def prepare_receive_audio(self, *, timeout_seconds: float = 10) -> None:
-        """Wait until the remote audio track is subscribed and ready to read."""
-
-        if not self._connected:
-            raise RuntimeError("peer is not connected")
-        self._validate_timeout(timeout_seconds)
-        async with asyncio.timeout(timeout_seconds):
-            await self._prepare_receive_audio_locked()
 
     async def prepare_receive_speech_chunk(
         self,

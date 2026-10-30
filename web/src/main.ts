@@ -545,7 +545,6 @@ interface TaskCardView {
 }
 
 interface ApprovalCardView {
-  readonly approvalId: string;
   readonly item: HTMLLIElement;
   readonly status: HTMLParagraphElement;
   readonly approve: HTMLButtonElement;
@@ -859,7 +858,7 @@ function projectApprovalCard(data: PublicEvent["data"]): void {
   controls.append(approve, reject);
   item.append(label, title, status, commandView, meta, controls);
   const view: ApprovalCardView = {
-    approvalId, item, status, approve, reject, actionable: true,
+    item, status, approve, reject, actionable: true,
     participantIdentity: credential?.participantIdentity ?? null, pendingDecision: null,
   };
   approvalCardViews.set(approvalId, view);
@@ -1079,16 +1078,6 @@ const playbackVolumeControls = new PlaybackVolumeControls(
   writeSpeechRendererVolume,
 );
 
-function boundedMapSet<Key, Value>(map: Map<Key, Value>, key: Key, value: Value, limit = 32): void {
-  if (map.has(key)) map.delete(key);
-  map.set(key, value);
-  while (map.size > limit) {
-    const oldest = map.keys().next().value as Key | undefined;
-    if (oldest === undefined) break;
-    map.delete(oldest);
-  }
-}
-
 function refreshAssistantRetention(view: AssistantTurnView): boolean {
   if (!view.item.isConnected) return false;
   updateTranscriptBounded(view.item);
@@ -1202,8 +1191,8 @@ function admitAssistantSegment(event: PublicEvent, text: string): boolean {
     if (separator !== null) {
       separator.className = "assistant-separator";
       separator.textContent = " ";
+      view.content.append(separator);
     }
-    if (separator !== null) view.content.append(separator);
     const element = document.createElement("span");
     element.className = "assistant-segment";
     element.dataset.chunkId = identity.chunkId;
@@ -1449,6 +1438,14 @@ function resetProvisionalSpeechYield(): void {
   provisionalSpeechYieldController.reset();
   provisionalSpeechYieldStartedAt = null;
   setSpeechRendererVolume(1);
+}
+
+function resetSpeechYield(): void {
+  resetProvisionalSpeechYield();
+  speechYieldController.reset();
+  locallySilencedSpeech = null;
+  speechYieldPending = false;
+  renderSpeechControl("idle");
 }
 
 async function recoverSpeechRenderer(): Promise<void> {
@@ -2607,18 +2604,19 @@ class SessionRebindRejected extends ConnectionRequestRejected {}
 async function connectionFetch(
   input: RequestInfo | URL,
   init: RequestInit,
-  parentSignal: AbortSignal,
+  parentSignal: AbortSignal | undefined,
+  timeoutMs = connectionRequestTimeoutMs,
 ): Promise<Response> {
   const request = new AbortController();
   const abort = (): void => request.abort();
-  if (parentSignal.aborted) abort();
-  else parentSignal.addEventListener("abort", abort, { once: true });
-  const timeout = window.setTimeout(abort, connectionRequestTimeoutMs);
+  if (parentSignal?.aborted) abort();
+  else parentSignal?.addEventListener("abort", abort, { once: true });
+  const timeout = window.setTimeout(abort, timeoutMs);
   try {
     return await fetch(input, { ...init, signal: request.signal });
   } finally {
     window.clearTimeout(timeout);
-    parentSignal.removeEventListener("abort", abort);
+    parentSignal?.removeEventListener("abort", abort);
   }
 }
 
@@ -2726,13 +2724,9 @@ async function announceMediaActivation(
   incarnation: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  const request = new AbortController();
-  const abort = (): void => request.abort();
-  if (signal?.aborted) abort();
-  else signal?.addEventListener("abort", abort, { once: true });
-  const timeout = window.setTimeout(abort, stopRequestTimeoutMs);
-  try {
-    const response = await fetch("/api/v1/media", {
+  const response = await connectionFetch(
+    "/api/v1/media",
+    {
       method: "POST",
       headers: {
         ...authorization(activeCredential.token),
@@ -2742,13 +2736,11 @@ async function announceMediaActivation(
       cache: "no-store",
       credentials: "omit",
       referrerPolicy: "no-referrer",
-      signal: request.signal,
-    });
-    if (!response.ok) throw new ConnectionRequestRejected(response.status);
-  } finally {
-    window.clearTimeout(timeout);
-    signal?.removeEventListener("abort", abort);
-  }
+    },
+    signal,
+    stopRequestTimeoutMs,
+  );
+  if (!response.ok) throw new ConnectionRequestRejected(response.status);
 }
 
 async function refreshCredential(): Promise<void> {
@@ -3050,8 +3042,6 @@ function bindRoomEvents(activeRoom: Room): void {
       stopKaraoke();
       if (activeRemoteTrack !== null && activeRemoteTrack !== track) {
         setSpeechRendererVolume(1);
-      }
-      if (activeRemoteTrack !== null && activeRemoteTrack !== track) {
         activeRemoteTrack = replaceRemoteAudio(activeRemoteTrack, track, remoteAudio);
       } else {
         activeRemoteTrack = track;
@@ -3127,11 +3117,7 @@ function bindRoomEvents(activeRoom: Room): void {
   activeRoom.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
     if (!remoteAudioTrackIsCurrent(activeRoom, room, track, activeRemoteTrack)) return;
     activeRemoteTrack = releaseRemoteAudio(track, remoteAudio);
-    resetProvisionalSpeechYield();
-    speechYieldController.reset();
-    locallySilencedSpeech = null;
-    speechYieldPending = false;
-    renderSpeechControl("idle");
+    resetSpeechYield();
     stopKaraoke();
   });
 }
@@ -3202,6 +3188,25 @@ async function enableSelectedMicrophone(
   }
 }
 
+function commitMicrophoneTrack(
+  activeRoom: Room,
+  track: LocalTrack | null,
+  incarnation: number,
+): void {
+  microphoneReady = track !== null;
+  if (track !== null) {
+    activeMicrophoneTrack = track;
+    microphoneReadinessAuthority.activate(activeRoom, track, incarnation);
+    attachMicrophoneSignalMonitor(track);
+    renderMicrophoneMute();
+  } else {
+    activeMicrophoneTrack = null;
+    microphoneReadinessAuthority.invalidate();
+    microphoneSignalMonitor.stop();
+    clearVoicePathReadinessTimer();
+  }
+}
+
 async function reverifyMicrophoneAfterNativeReconnect(
   activeRoom: Room,
   verificationGeneration: number,
@@ -3265,18 +3270,7 @@ async function reverifyMicrophoneAfterNativeReconnect(
         )
       : settled.value;
   const selectedMicrophoneReady = authoritativeTrack !== null;
-  microphoneReady = selectedMicrophoneReady;
-  if (authoritativeTrack !== null) {
-    activeMicrophoneTrack = authoritativeTrack;
-    microphoneReadinessAuthority.activate(activeRoom, authoritativeTrack, incarnation);
-    attachMicrophoneSignalMonitor(authoritativeTrack);
-    renderMicrophoneMute();
-  } else {
-    activeMicrophoneTrack = null;
-    microphoneReadinessAuthority.invalidate();
-    microphoneSignalMonitor.stop();
-    clearVoicePathReadinessTimer();
-  }
+  commitMicrophoneTrack(activeRoom, authoritativeTrack, incarnation);
   const mediaCommitted = await settleMediaActivation(
     announceMediaActivation(activeCredential, incarnation),
     () =>
@@ -3344,11 +3338,7 @@ async function connect(projectionResync = false): Promise<void> {
         room = null;
       },
     );
-    resetProvisionalSpeechYield();
-    speechYieldController.reset();
-    locallySilencedSpeech = null;
-    speechYieldPending = false;
-    renderSpeechControl("idle");
+    resetSpeechYield();
     await releaseLocalMedia(residualRoom);
     try {
       const disconnectOperation = residualRoom?.disconnect();
@@ -3521,18 +3511,7 @@ async function connect(projectionResync = false): Promise<void> {
     );
     if (!settled.committed) return;
     const selectedMicrophoneReady = settled.value !== null;
-    microphoneReady = selectedMicrophoneReady;
-    if (settled.value !== null) {
-      activeMicrophoneTrack = settled.value;
-      microphoneReadinessAuthority.activate(activeRoom, settled.value, incarnation);
-      attachMicrophoneSignalMonitor(settled.value);
-      renderMicrophoneMute();
-    } else {
-      activeMicrophoneTrack = null;
-      microphoneReadinessAuthority.invalidate();
-      microphoneSignalMonitor.stop();
-      clearVoicePathReadinessTimer();
-    }
+    commitMicrophoneTrack(activeRoom, settled.value, incarnation);
     failureStage = "activation";
     const mediaCommitted = await settleMediaActivation(
       announceMediaActivation(activeCredential, incarnation, localOperation.signal),
@@ -3715,11 +3694,7 @@ async function disconnectLocal(): Promise<void> {
       room = null;
     },
   );
-  resetProvisionalSpeechYield();
-  speechYieldController.reset();
-  locallySilencedSpeech = null;
-  speechYieldPending = false;
-  renderSpeechControl("idle");
+  resetSpeechYield();
   const cleanup = closeLocalRoom(activeRoom, authoritativeTrack);
   microphoneReady = null;
   if (["connecting", "preparing", "connected", "reconnecting"].includes(controller.state)) {

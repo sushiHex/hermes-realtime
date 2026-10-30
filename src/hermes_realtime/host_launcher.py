@@ -97,6 +97,7 @@ from hermes_realtime.evidence import (
     EvidenceConsentRequestV1,
     EvidenceRevokeRequestV1,
     FullPurgeV1,
+    ProjectionReservation,
     PurgeDisposition,
     RecoveryDisposition,
     RevokeDisposition,
@@ -443,6 +444,24 @@ def _reserve_host_evidence_consent(
     return BrowserEvidenceConsentOperation(complete=complete, settlement=settlement)
 
 
+def _publish_runtime_capture_status(
+    runtime: HostEvidenceRuntimeV1,
+    projection: BrowserEventProjection,
+    reservation: ProjectionReservation,
+) -> None:
+    status = runtime.capture_status(disclosure_digest=_evidence_disclosure_digest())
+    projection.publish_capture_status(
+        reservation,
+        {
+            "available": status.available,
+            "captureState": status.capture_state.value,
+            "retentionHours": status.retention_hours,
+            "consentVersion": status.consent_version,
+            "disclosureDigest": status.disclosure_digest,
+        },
+    )
+
+
 def _reserve_host_evidence_revoke(
     *,
     runtime: HostEvidenceRuntimeV1,
@@ -457,17 +476,7 @@ def _reserve_host_evidence_revoke(
         projection_reservation=status_reservation,
         validate_projection_reservation=projection.validate_capture_status_reservation,
     )
-    status = runtime.capture_status(disclosure_digest=_evidence_disclosure_digest())
-    projection.publish_capture_status(
-        status_reservation,
-        {
-            "available": status.available,
-            "captureState": status.capture_state.value,
-            "retentionHours": status.retention_hours,
-            "consentVersion": status.consent_version,
-            "disclosureDigest": status.disclosure_digest,
-        },
-    )
+    _publish_runtime_capture_status(runtime, projection, status_reservation)
 
     async def complete() -> BrowserEvidenceControlResponse:
         disposition = await runtime.activate_revoke(authority, timeout_seconds=2.0)
@@ -485,19 +494,7 @@ def _reserve_host_evidence_revoke(
                     return False
                 if terminal_published:
                     return True
-                terminal_status = runtime.capture_status(
-                    disclosure_digest=_evidence_disclosure_digest()
-                )
-                projection.publish_capture_status(
-                    terminal_status_reservation,
-                    {
-                        "available": terminal_status.available,
-                        "captureState": terminal_status.capture_state.value,
-                        "retentionHours": terminal_status.retention_hours,
-                        "consentVersion": terminal_status.consent_version,
-                        "disclosureDigest": terminal_status.disclosure_digest,
-                    },
-                )
+                _publish_runtime_capture_status(runtime, projection, terminal_status_reservation)
                 terminal_published = True
                 return True
 
@@ -719,13 +716,11 @@ class _FullHostWorkCloseOwner:
                 errors.append(error)
             else:
                 self._closed[index] = True
+        self._record_close_result(CloseResultV1.FAILED if errors else CloseResultV1.SUCCEEDED)
         if len(errors) == 1:
-            self._record_close_result(CloseResultV1.FAILED)
             raise errors[0]
         if errors:
-            self._record_close_result(CloseResultV1.FAILED)
             raise BaseExceptionGroup("full-host work close failed", errors)
-        self._record_close_result(CloseResultV1.SUCCEEDED)
 
     def _record_close_result(self, result: CloseResultV1) -> None:
         recorder = self._production_observation_recorder
@@ -1018,8 +1013,7 @@ def _validate_livekit_origin(value: str, *, remote_mode: bool) -> str:
         port_suffix = "" if port is None or port == 443 else f":{port}"
         return f"wss://{bracketed}{port_suffix}"
     if (
-        shared_invalid
-        or parsed.scheme != "ws"
+        parsed.scheme != "ws"
         or hostname not in {"127.0.0.1", "::1", "localhost"}
         or port is None
     ):
@@ -1733,9 +1727,6 @@ class ProactiveCompletionUpdatePolicy:
         if completion.status == "completed":
             assert completion.summary is not None
             detail = completion.summary
-        elif completion.status == "failed":
-            assert completion.reason is not None
-            detail = completion.reason
         else:
             assert completion.reason is not None
             detail = completion.reason
@@ -1767,11 +1758,9 @@ class ProactiveCompletionUpdatePolicy:
 def _conversation_profile_duration_limit(profile: str) -> float | None:
     if type(profile) is not str:
         raise TypeError("conversation_profile must be an exact built-in string")
-    if profile == "legacy":
-        return None
-    if profile == "natural_v1":
-        return None
-    raise ValueError("conversation_profile must be legacy or natural_v1")
+    if profile not in ("legacy", "natural_v1"):
+        raise ValueError("conversation_profile must be legacy or natural_v1")
+    return None
 
 
 _QUALIFICATION_NO_TASK_COMPOSITION: ContextVar[bool] = ContextVar(
@@ -2170,8 +2159,6 @@ def build_local_host_launcher(
             segment_text_offset_utf16=ownership[3],
         )
         if data is None:
-            active_renderer_authority = None
-            active_renderer_presentation = None
             return
         active_renderer_authority = (
             chunk.turn_id,
@@ -2929,8 +2916,21 @@ def build_local_host_launcher(
         production_observation_recorder=production_observation_recorder,
     )
 
+    def adopt_restart_announcement() -> None:
+        nonlocal restart_announcement
+        settlement = (
+            task_session.restart_settlement
+            if type(task_session) is HermesApiTaskSession
+            else None
+        )
+        announcement = _restart_announcement(settlement)
+        if announcement is not None:
+            # Stopped work is history, never active: the prompt must not imply it runs.
+            context.mark_prior_work_ended()
+            restart_announcement = announcement
+
     async def preflight() -> None:
-        nonlocal readiness_cue_template, restart_announcement
+        nonlocal readiness_cue_template
         if ollama_num_ctx is not None:
             if type(inference) is not OllamaStreamingInference:
                 try:
@@ -2956,39 +2956,13 @@ def build_local_host_launcher(
             # preparation owns only a fresh adapter and the tool-less readiness probe.
             if not qualification_no_hermes_tasks:
                 await _start_host_task_session(cast(_TaskSessionStarter, task_session))
-                settlement = (
-                    task_session.restart_settlement
-                    if type(task_session) is HermesApiTaskSession else None
-                )
-                restart_announcement = _restart_announcement(settlement)
-                if restart_announcement is not None:
-                    context.mark_prior_work_ended()
+                adopt_restart_announcement()
             return
         if qualification_no_hermes_tasks:
-            snapshot = ConversationInferenceRequest(
-                revision=0,
-                messages=(
-                    ConversationMessage(
-                        role=ConversationRole.USER.value,
-                        text="Reply with one short sentence confirming readiness.",
-                    ),
-                ),
-                active_tasks=(),
-                updates=(),
+            readiness_cue_template = await _run_inference_speech_readiness(
+                cast(OllamaStreamingInference | CodexAppServerStreamingInference, inference),
+                synthesizer,
             )
-            segments = [
-                segment async for segment in inference.stream(snapshot, turn_id="turn_preflight")
-            ]
-            if not segments:
-                raise RuntimeError("local inference preflight produced no speakable output")
-            if type(synthesizer) is KokoroSynthesizer:
-                await synthesizer.warm()
-            probes = [
-                chunk async for chunk in synthesizer.synthesize("Ready.", "turn_tts_preflight")
-            ]
-            if len(probes) != 1 or type(probes[0]) is not SpeechChunk:
-                raise RuntimeError("TTS preflight did not produce one playable chunk")
-            readiness_cue_template = probes[0]
             if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
                 await inference.observe_context()
             return
@@ -2999,18 +2973,9 @@ def build_local_host_launcher(
             surface=work_surface,
             natural_work_tools=natural_work_tools,
         )
-        settlement = (
-            task_session.restart_settlement
-            if type(task_session) is HermesApiTaskSession
-            else None
-        )
-        announcement = _restart_announcement(settlement)
         if ollama_num_ctx is not None and type(inference) is OllamaStreamingInference:
             await inference.observe_context()
-        if announcement is not None:
-            # Stopped work is history, never active: the prompt must not imply it runs.
-            context.mark_prior_work_ended()
-            restart_announcement = announcement
+        adopt_restart_announcement()
 
     stt_providers = (
         (cast(MoonshineStreamingTranscriber, transcriber),) if stt_provider == "moonshine" else ()

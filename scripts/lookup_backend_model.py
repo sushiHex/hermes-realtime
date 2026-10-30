@@ -29,6 +29,14 @@ from scripts.qualification_file_seals import _relative_windows_member
 
 MODEL_PROCESS_NAME = "lookup-model"
 SUPPORTED_VERSION = "0.40.4"
+# Source-audited at ollama/ollama 45e6011815c74acde6a346512856b69dd79dd22b.
+# A builtin name is a runtime capability, not an exception for a model tag.
+SUPPORTED_BUILTIN_RENDERING = frozenset({("qwen3.5", "qwen3.5")})
+MCP_CALLBACK_REFUSALS = frozenset({
+    "mcp-result", "mcp-capability", "mcp-scope", "mcp-preflight", "mcp-warm-ack",
+    "mcp-session-factory", "mcp-reused", "mcp-input", "mcp-budget", "mcp-other",
+    "mcp-timeout", "mcp-cancelled",
+})
 
 
 class StartupProfile(Enum):
@@ -71,12 +79,12 @@ _REFUSALS = frozenset({
     "artifact-context-override", "listener-owner", "metadata-redirect", "metadata-kind",
     "metadata-status", "metadata-bound", "metadata-shape", "model-port", "model-already-attempted",
     "owner-containment", "port-occupied", "model-exited", "metadata-version", "metadata-model",
-    "metadata-template", "metadata-capabilities", "artifact-proof",
+    "metadata-template", "metadata-capabilities", "artifact-proof", "model-rendering-profile",
     "load-ack", "loaded-model", "loaded-context", "startup-profile", "readiness-status",
     "readiness-bound",
     "readiness-shape", "readiness-json", "model-readiness-loop", "startup-timeout",
-    "mcp-loader", "mcp-load-ack",
-})
+    "mcp-loader", "mcp-load-ack", "loaded-gpu-fit",
+}) | MCP_CALLBACK_REFUSALS
 _SELECTION = ("model", "model_store", "model_manifest_sha256", "ollama_runtime",
               "ollama_archive", "ollama_archive_sha256", "model_port")
 
@@ -227,9 +235,16 @@ def _model(manifest: Mapping[str, Any], deadline: float) -> dict[str, Any]:
     family = config.get("model_family")
     if (config.get("model_format") != "gguf" or type(family) is not str
             or re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", family) is None
-            or config.get("renderer") is not None or config.get("parser") is not None
             or config.get("rootfs", {}).get("diff_ids")
             != [row["digest"] for row in selected["layers"]]):
+        raise ValueError("model-config")
+    renderer, parser = config.get("renderer"), config.get("parser")
+    if renderer is None and parser is None:
+        rendering_kind = "go_template"
+    elif (type(renderer) is str and type(parser) is str
+          and (renderer, parser) in SUPPORTED_BUILTIN_RENDERING):
+        rendering_kind = "builtin_renderer_parser"
+    else:
         raise ValueError("model-config")
     templates = [row for row in selected["layers"]
                  if row.get("mediaType") in {"application/vnd.ollama.image.template",
@@ -238,18 +253,27 @@ def _model(manifest: Mapping[str, Any], deadline: float) -> dict[str, Any]:
               if row.get("mediaType") == "application/vnd.ollama.image.params"]
     weights = [row for row in selected["layers"]
                if row.get("mediaType") == "application/vnd.ollama.image.model"]
-    if (len(templates) != 1 or templates[0]["mediaType"] != "application/vnd.ollama.image.template"
-            or len(params) > 1 or not weights or templates[0]["size"] > _JSON_LIMIT):
+    template_layout = (len(templates) == 1
+        and templates[0]["mediaType"] == "application/vnd.ollama.image.template"
+        and templates[0]["size"] <= _JSON_LIMIT)
+    builtin_layout = len(templates) == 0
+    if (len(params) > 1 or not weights
+            or (rendering_kind == "go_template" and not template_layout)
+            or (rendering_kind == "builtin_renderer_parser" and not builtin_layout)):
         raise ValueError("model-layer-layout")
     if params:
         options = _json_file(store / "blobs" / params[0]["digest"].replace(":", "-"))
         if "num_ctx" in options:
             raise ValueError("artifact-context-override")
-    return {"model_manifest_sha256": identity,
+    facts = {"model_manifest_sha256": identity,
         "model_config_sha256": selected["config"]["digest"][7:],
         "model_blob_count": len(descriptors), "model_family": family,
-        "template_sha256": templates[0]["digest"][7:], "template_bytes": templates[0]["size"],
+        "rendering_kind": rendering_kind, "renderer": renderer, "parser": parser,
         "model_bytes": sum(row["size"] for row in weights)}
+    if rendering_kind == "go_template":
+        facts.update(template_sha256=templates[0]["digest"][7:],
+                     template_bytes=templates[0]["size"])
+    return facts
 
 
 def verify_artifacts(manifest: Mapping[str, Any], deadline: float) -> VerifiedArtifacts:
@@ -434,6 +458,14 @@ async def _load_readiness(manifest: Mapping[str, Any], process: Any, deadline: f
                     or row["context_length"] != startup_profile.context_tokens):
                 raise ValueError("loaded-context")
             state["configured_context_tokens"] = row["context_length"]
+            if mcp_loader is not None:
+                state["stage"] = "model-readback-gpu-fit"
+                size, vram = row.get("size"), row.get("size_vram")
+                if (type(size) is not int or type(vram) is not int
+                        or size <= 0 or vram != size):
+                    raise ValueError("loaded-gpu-fit")
+                # Ollama's residency report, not an OS/driver memory bound.
+                state["full_gpu_residency_reported"] = True
 
 
 def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
@@ -513,6 +545,9 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
             raise ValueError("artifact-proof")
         artifact = dict(verified.facts)
         state["artifact"] = artifact
+        if (artifact["rendering_kind"] == "builtin_renderer_parser"
+                and startup_profile.go_template is not None):
+            raise ValueError("model-rendering-profile")
         env = {key: value for key, value in os.environ.items()
                if not key.upper().startswith(("OLLAMA_", "LLAMA_ARG_"))}
         env.update({"OLLAMA_HOST": f"127.0.0.1:{port}",
@@ -564,10 +599,12 @@ def start_model(manifest: Mapping[str, Any], processes: Any, containment: Any,
         if len(rows) != 1 or rows[0].get("digest") != selected["model_manifest_sha256"]:
             raise ValueError("metadata-model")
         show = read("show")
-        template = show.get("template")
-        if (type(template) is not str or len(template.encode()) != artifact["template_bytes"]
-                or hashlib.sha256(template.encode()).hexdigest() != artifact["template_sha256"]):
-            raise ValueError("metadata-template")
+        if artifact["rendering_kind"] == "go_template":
+            template = show.get("template")
+            if (type(template) is not str or len(template.encode()) != artifact["template_bytes"]
+                    or hashlib.sha256(template.encode()).hexdigest()
+                    != artifact["template_sha256"]):
+                raise ValueError("metadata-template")
         if (show.get("details", {}).get("format") != "gguf"
                 or show.get("details", {}).get("family") != artifact["model_family"]
                 or type(show.get("capabilities")) is not list

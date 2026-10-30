@@ -234,12 +234,7 @@ class BrowserEventProjection:
     def publish_voice_clear(self, reservation: ProjectionReservation) -> BrowserPublicEvent:
         """Consume the exact slot after the voice tail delete intent is durable."""
 
-        if (
-            type(reservation) is not ProjectionReservation
-            or reservation not in self._voice_clear_reservations
-        ):
-            raise RuntimeError("voice clear reservation is stale or foreign")
-        self._voice_clear_reservations.remove(reservation)
+        self.release_voice_clear(reservation)
         return self._publish_validated("voice_conversation_cleared", {}, reserved=True)
 
     def release_voice_clear(self, reservation: ProjectionReservation) -> None:
@@ -267,15 +262,7 @@ class BrowserEventProjection:
             raise TypeError("capture status slot count must be an exact integer")
         if not 1 <= slots <= 4:
             raise ValueError("capture status slot count must be between one and four")
-        if (
-            self._overflowed
-            or len(self._events)
-            + len(self._pending_replay)
-            + len(self._capture_status_reservations)
-            + len(self._voice_clear_reservations)
-            + slots
-            > self._capacity
-        ):
+        if not self._has_room(slots):
             self._overflowed = True
             raise RuntimeError("public event projection capacity was exceeded")
         reservations = tuple(object.__new__(ProjectionReservation) for _ in range(slots))
@@ -289,11 +276,7 @@ class BrowserEventProjection:
     ) -> BrowserPublicEvent:
         """Consume one exact reservation to publish authoritative capture status."""
 
-        if (
-            type(reservation) is not ProjectionReservation
-            or reservation not in self._capture_status_reservations
-        ):
-            raise RuntimeError("capture status reservation is stale or foreign")
+        self.validate_capture_status_reservation(reservation)
         self._validate_capture_status(data)
         self._capture_status_reservations.remove(reservation)
         return self._publish_validated("capture_status", data, reserved=True)
@@ -331,17 +314,19 @@ class BrowserEventProjection:
             raise TypeError("projection slot count must be an exact integer")
         if not 1 <= slots <= self._capacity:
             raise ValueError("projection slot count is outside the capacity bound")
-        if (
-            self._overflowed
-            or len(self._events)
+        if not self._has_room(slots):
+            self._overflowed = True
+            raise RuntimeError("public event projection capacity was exceeded")
+
+    def _has_room(self, slots: int) -> bool:
+        return not self._overflowed and (
+            len(self._events)
             + len(self._pending_replay)
             + len(self._capture_status_reservations)
             + len(self._voice_clear_reservations)
             + slots
-            > self._capacity
-        ):
-            self._overflowed = True
-            raise RuntimeError("public event projection capacity was exceeded")
+            <= self._capacity
+        )
 
     def publish(self, kind: str, data: dict[str, PublicValue]) -> BrowserPublicEvent:
         """Publish one validated event or permanently fail closed on overflow."""
@@ -603,18 +588,10 @@ class BrowserEventProjection:
     ) -> BrowserPublicEvent | None:
         """Publish a droppable display event without latching capacity overflow."""
 
-        # The guard must mirror ensure_capacity() exactly, reservations included.
-        # A narrower test would fall through to publish() and latch _overflowed,
-        # permanently killing the projection this method promises never to fail.
-        if (
-            self._overflowed
-            or len(self._events)
-            + len(self._pending_replay)
-            + len(self._capture_status_reservations)
-            + len(self._voice_clear_reservations)
-            + 1
-            > self._capacity
-        ):
+        # The guard shares ensure_capacity()'s predicate, so it cannot fall through
+        # to publish() and latch _overflowed, which would permanently kill the
+        # projection this method promises never to fail.
+        if not self._has_room(1):
             return None
         return self.publish(kind, data)
 

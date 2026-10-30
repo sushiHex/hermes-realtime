@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 from hermes_realtime.conversation.output_style import require_output_style
@@ -41,6 +41,13 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("typed input contains a duplicate field")
         value[key] = item
     return value
+
+
+def _strict_json_body(body: bytes, label: str) -> Any:
+    try:
+        return json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(f"{label} body must be strict UTF-8 JSON") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,13 +313,7 @@ class BrowserBootstrapApplication:
                     raise ValueError("stable rebind body must contain 1 to 384 bytes")
                 if headers.get("content-type") != "application/json":
                     raise ValueError("stable rebind content-type must be application/json")
-                try:
-                    decoded = json.loads(
-                        body.decode("utf-8"),
-                        object_pairs_hook=_strict_json_object,
-                    )
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise ValueError("stable rebind body must be strict UTF-8 JSON") from None
+                decoded = _strict_json_body(body, "stable rebind")
                 # A reloaded page kept only its identity, so it also asks for a fresh view.
                 required = {"participantIdentity", "requestId"}
                 if type(decoded) is not dict or set(decoded) not in (
@@ -391,12 +392,7 @@ class BrowserBootstrapApplication:
                 raise ValueError("rebind request body must contain 1 to 192 bytes")
             if headers.get("content-type") != "application/json":
                 raise ValueError("rebind content-type must be application/json")
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"), object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("rebind body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "rebind")
             if type(decoded) is not dict or set(decoded) != {"requestId"}:
                 raise ValueError("rebind must contain exactly requestId")
             request_id = decoded["requestId"]
@@ -459,10 +455,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("audio diagnostic content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("audio diagnostic body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "audio diagnostic")
             if type(decoded) is not dict or set(decoded) != {
                 "version",
                 "streamId",
@@ -517,13 +510,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("media activation content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("media activation body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "media activation")
             if type(decoded) is not dict or set(decoded) != {"mediaIncarnation"}:
                 raise ValueError("media activation must contain exactly mediaIncarnation")
             media_incarnation = decoded["mediaIncarnation"]
@@ -541,13 +528,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("yield content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("yield body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "yield")
             if type(decoded) is not dict or set(decoded) != {
                 "turnId",
                 "turnGeneration",
@@ -580,13 +561,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("typed input content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("typed input body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "typed input")
             if type(decoded) is not dict or set(decoded) != {"sequence", "text"}:
                 raise ValueError("typed input must contain exact sequence and text fields")
             sequence = decoded["sequence"]
@@ -606,10 +581,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("proposal decision content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("proposal decision body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "proposal decision")
             if type(decoded) is not dict or set(decoded) != {
                 "proposalId", "objective", "generation", "decision", "sequence",
             }:
@@ -628,13 +600,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("approval content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("approval body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "approval")
             if type(decoded) is not dict or set(decoded) != {
                 "approvalId",
                 "decision",
@@ -671,13 +637,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("events content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("events body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "events")
             if type(decoded) is not dict or set(decoded) != {"after"}:
                 raise ValueError("events request must contain the exact after field")
             after = decoded["after"]
@@ -728,13 +688,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("model content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("model body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "model")
             if type(decoded) is not dict or set(decoded) != {"effort", "model"}:
                 raise ValueError("model request must contain exact effort and model fields")
             model = decoded["model"]
@@ -754,13 +708,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("style content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("style body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "style")
             if type(decoded) is not dict or set(decoded) != {"style"}:
                 raise ValueError("style request must contain the exact style field")
             style = require_output_style(decoded["style"])
@@ -777,13 +725,7 @@ class BrowserBootstrapApplication:
             if headers.get("content-type") != "application/json":
                 raise ValueError("voice content-type must be application/json")
             identity = self._verifier.verify(bearer)
-            try:
-                decoded = json.loads(
-                    body.decode("utf-8"),
-                    object_pairs_hook=_strict_json_object,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ValueError("voice body must be strict UTF-8 JSON") from None
+            decoded = _strict_json_body(body, "voice")
             if type(decoded) is not dict or set(decoded) != {"voice"}:
                 raise ValueError("voice request must contain the exact voice field")
             voice = decoded["voice"]
@@ -802,15 +744,7 @@ class BrowserBootstrapApplication:
             refreshed = await self._sessions.refresh_credential(
                 participant_identity=identity,
             )
-            payload = {
-                "expiresInSeconds": refreshed.expires_in_seconds,
-                "participantIdentity": refreshed.participant_identity,
-                "roomName": refreshed.room_name,
-                "token": refreshed.token,
-                "url": refreshed.url,
-                "version": 1,
-                "workerIdentity": self._worker_identity,
-            }
+            payload = self._credential_payload(refreshed)
             status = 200
         else:
             request_id = None
@@ -819,13 +753,7 @@ class BrowserBootstrapApplication:
                     raise ValueError("stop request body must contain at most 192 bytes")
                 if headers.get("content-type") != "application/json":
                     raise ValueError("stop content-type must be application/json")
-                try:
-                    decoded = json.loads(
-                        body.decode("utf-8"),
-                        object_pairs_hook=_strict_json_object,
-                    )
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise ValueError("stop body must be strict UTF-8 JSON") from None
+                decoded = _strict_json_body(body, "stop")
                 if type(decoded) is not dict or set(decoded) != {"requestId"}:
                     raise ValueError("stop must contain exactly requestId")
                 request_id = decoded["requestId"]

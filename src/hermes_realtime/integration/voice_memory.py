@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
+from functools import partial
 from typing import Protocol
 
 from hermes_realtime.conversation.context import ConversationContextStore
@@ -37,16 +38,14 @@ class VoiceMemoryLink(Protocol):
 def memory_connector(
     *, host: str, port: int, token: str
 ) -> Callable[[], Awaitable[VoiceMemoryLink]]:
-    async def connect() -> VoiceMemoryLink:
-        return await LocalHermesBridgeClient.connect(
-            host=host,
-            port=port,
-            token=token,
-            participant_id="voice-memory",
-            capabilities=(VOICE_MEMORY_CAPABILITY,),
-        )
-
-    return connect
+    return partial(
+        LocalHermesBridgeClient.connect,
+        host=host,
+        port=port,
+        token=token,
+        participant_id="voice-memory",
+        capabilities=(VOICE_MEMORY_CAPABILITY,),
+    )
 
 
 def _marker(evidence: dict[str, str | int]) -> None:

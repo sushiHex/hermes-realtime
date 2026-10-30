@@ -285,26 +285,24 @@ def check_surface() -> tuple[str, ...]:
 def check_review_surface() -> tuple[str, ...]:
     """Refuse a changed pinned review function before building a review parent."""
 
-    failures: list[str] = []
-    for entry in REVIEW_SURFACE:
-        if entry.name == "SessionDB.db_path" or entry.name in REVIEW_INSTANCE_FIELDS:
-            continue  # Instance attribute, verified against the exact SessionDB below.
-        try:
-            target = _lookup(entry.name)
-            if entry.parameters is not None:
-                actual = tuple(inspect.signature(target).parameters)
-                if actual != entry.parameters:
-                    failures.append(f"signature:{entry.name}")
-        except (ImportError, AttributeError, TypeError, ValueError):
-            failures.append(f"missing:{entry.name}")
-    return tuple(failures)
+    # Instance attributes are skipped here and verified against the exact SessionDB below.
+    return _surface_failures(
+        tuple(
+            entry for entry in REVIEW_SURFACE
+            if entry.name != "SessionDB.db_path" and entry.name not in REVIEW_INSTANCE_FIELDS
+        )
+    )
 
 
 def check_memory_surface() -> tuple[str, ...]:
     """Refuse a changed pinned built-in memory reader."""
 
+    return _surface_failures(MEMORY_SURFACE)
+
+
+def _surface_failures(entries: tuple[SurfaceName, ...]) -> tuple[str, ...]:
     failures: list[str] = []
-    for entry in MEMORY_SURFACE:
+    for entry in entries:
         try:
             target = _lookup(entry.name)
             if (
@@ -370,13 +368,20 @@ def read_projection(db: Any, session_id: str, cap: int) -> Projection | None:
     )
 
 
-def _compression_child(child: dict[str, Any], parent_id: str) -> bool:
-    """Match the pinned Hermes continuation rule, refusing malformed lineage."""
+_CHILDREN_SQL = (
+    "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
+    "length(model_config) AS config_length FROM sessions "
+    "WHERE parent_session_id = ? ORDER BY id LIMIT ?"
+)
+
+
+def _child_config(child: dict[str, Any]) -> dict[str, Any] | None:
+    """A child's bounded model_config, or None for a tool-sourced child; malformed is refused."""
     size = child.get("config_length")
     if type(size) is int and size > 4096:
         raise ArchiveRefusal("lineage")
     if child["source"] == "tool":
-        return False
+        return None
     raw = child["model_config"]
     try:
         config = {} if raw is None else json.loads(raw)
@@ -384,7 +389,17 @@ def _compression_child(child: dict[str, Any], parent_id: str) -> bool:
         raise ArchiveRefusal("lineage") from None
     if type(config) is not dict:
         raise ArchiveRefusal("lineage")
-    return config.get("_branched_from") != parent_id and config.get("_delegate_from") != parent_id
+    return config
+
+
+def _compression_child(child: dict[str, Any], parent_id: str) -> bool:
+    """Match the pinned Hermes continuation rule, refusing malformed lineage."""
+    config = _child_config(child)
+    return (
+        config is not None
+        and config.get("_branched_from") != parent_id
+        and config.get("_delegate_from") != parent_id
+    )
 
 
 def _bounded_delete_subtree(conn: Any, session_id: str) -> None:
@@ -430,10 +445,7 @@ def capture_delete_targets(
                 if row["end_reason"] != "compression":
                     break
                 children = conn.execute(
-                    "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
-                    "length(model_config) AS config_length FROM sessions "
-                    "WHERE parent_session_id = ? ORDER BY id LIMIT ?",
-                    (current, MAX_BOUND_CONVERSATIONS + 1),
+                    _CHILDREN_SQL, (current, MAX_BOUND_CONVERSATIONS + 1)
                 ).fetchall()
                 if len(children) > MAX_BOUND_CONVERSATIONS:
                     raise ArchiveRefusal("lineage")
@@ -466,10 +478,7 @@ def delete_target(db: Any, target: DeleteTarget) -> bool:
                 ).fetchone()
                 if parent is not None and parent["end_reason"] == "compression":
                     children = conn.execute(
-                        "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
-                        "length(model_config) AS config_length FROM sessions "
-                        "WHERE parent_session_id = ? LIMIT ?",
-                        (session_id, MAX_BOUND_CONVERSATIONS + 1),
+                        _CHILDREN_SQL, (session_id, MAX_BOUND_CONVERSATIONS + 1)
                     ).fetchall()
                     if len(children) > MAX_BOUND_CONVERSATIONS or any(
                         _compression_child(dict(child), session_id) for child in children
@@ -537,10 +546,7 @@ def capture_copies(db: Any, session_ids: tuple[str, ...]) -> tuple[str, ...]:
         while frontier:
             parent = frontier.pop(0)
             children = conn.execute(
-                "SELECT id, source, substr(model_config, 1, 4097) AS model_config, "
-                "length(model_config) AS config_length FROM sessions "
-                "WHERE parent_session_id = ? ORDER BY id LIMIT ?",
-                (parent, MAX_BOUND_CONVERSATIONS + 1),
+                _CHILDREN_SQL, (parent, MAX_BOUND_CONVERSATIONS + 1)
             ).fetchall()
             linked = [
                 child["id"] for child in children
@@ -565,19 +571,8 @@ def capture_copies(db: Any, session_ids: tuple[str, ...]) -> tuple[str, ...]:
 
 def _delegated_child(child: dict[str, Any], parent_id: str) -> bool:
     """A delegated task's session: a tool-sourced child, or one marked as delegated."""
-    size = child.get("config_length")
-    if type(size) is int and size > 4096:
-        raise ArchiveRefusal("lineage")
-    if child["source"] == "tool":
-        return True
-    raw = child["model_config"]
-    try:
-        config = {} if raw is None else json.loads(raw)
-    except (TypeError, ValueError):
-        raise ArchiveRefusal("lineage") from None
-    if type(config) is not dict:
-        raise ArchiveRefusal("lineage")
-    return config.get("_delegate_from") == parent_id
+    config = _child_config(child)
+    return config is None or config.get("_delegate_from") == parent_id
 
 
 def copies_absent(db: Any, session_ids: tuple[str, ...], copies: tuple[str, ...]) -> bool:
@@ -746,19 +741,22 @@ class HermesArchivePort:
             self._schedule_failed_parent_close(parent)
         return not failed
 
-    def _schedule_failed_parent_close(self, parent: Any) -> None:
+    @staticmethod
+    def _cleanup_thread(cleanup: Any, name: str) -> tuple[threading.Thread, threading.Event]:
         succeeded = threading.Event()
 
-        def cleanup() -> None:
+        def run() -> None:
             try:
-                self.close_parent(parent)
+                cleanup()
             except BaseException:
                 return
             succeeded.set()
 
-        worker = threading.Thread(
-            target=cleanup,
-            name="voice-review-parent-cleanup", daemon=True,
+        return threading.Thread(target=run, name=name, daemon=True), succeeded
+
+    def _schedule_failed_parent_close(self, parent: Any) -> None:
+        worker, succeeded = self._cleanup_thread(
+            lambda: self.close_parent(parent), "voice-review-parent-cleanup"
         )
         self._failed_parent_closes.append((parent, worker, succeeded))
         try:
@@ -770,17 +768,8 @@ class HermesArchivePort:
     def _rollback_worker(
         self, parent: Any, token: Any
     ) -> tuple[Any, Any, threading.Thread, threading.Event]:
-        succeeded = threading.Event()
-
-        def cleanup() -> None:
-            try:
-                self.finish(parent, token)
-            except BaseException:
-                return
-            succeeded.set()
-
-        worker = threading.Thread(
-            target=cleanup, name="voice-review-rollback-finish", daemon=True,
+        worker, succeeded = self._cleanup_thread(
+            lambda: self.finish(parent, token), "voice-review-rollback-finish"
         )
         return parent, token, worker, succeeded
 

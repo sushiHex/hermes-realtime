@@ -919,8 +919,6 @@ def _kernel32() -> ctypes.WinDLL:
         ctypes.c_uint32,
     )
     library.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
-    library.MoveFileExW.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
-    library.MoveFileExW.restype = ctypes.c_int
     library.SetFileInformationByHandle.argtypes = (
         ctypes.c_void_p,
         ctypes.c_int,
@@ -1113,7 +1111,6 @@ class EvidenceRootHandleV1(Protocol):
     def identity(self) -> RootIdentityV1: ...
     def revalidate(self) -> RootIdentityV1: ...
     def compare_fresh(self) -> None: ...
-    def move_no_replace_write_through(self, source: Path, destination: Path) -> None: ...
     def activate_exact_temporary(
         self,
         temporary: Path,
@@ -1392,21 +1389,6 @@ class WindowsEvidenceRootHandleV1:
             raise _path_invalid("the configured evidence root no longer names the same object")
         _require_owner_only_dacl(self._root)
         _require_owner_only_dacl(Path(fresh.final_path))
-
-    def move_no_replace_write_through(self, source: Path, destination: Path) -> None:
-        """Activate a temporary with Windows no-replace write-through semantics."""
-
-        self._require_handle()
-        if not _kernel32().MoveFileExW(str(source), str(destination), ACTIVATION_MOVE_FLAGS):
-            error = ctypes.get_last_error()
-            if error in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS):
-                raise EvidenceStorageError(
-                    WriterFault.OWNERSHIP_UNAVAILABLE,
-                    "another contender already activated this evidence artifact",
-                ) from ctypes.WinError(error)
-            raise _path_invalid(
-                "the evidence artifact could not be activated without replacing"
-            ) from ctypes.WinError(error)
 
     def activate_exact_temporary(
         self,

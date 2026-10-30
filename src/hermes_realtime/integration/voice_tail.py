@@ -251,6 +251,7 @@ def _review_window(rows: list[tuple[int, bool, int]]) -> list[tuple[int, bool, i
 
 
 def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes:
+    review = archive.review or ReviewProgress()
     document = {
         "archive": {
             "conversation_id": archive.conversation_id,
@@ -272,22 +273,22 @@ def voice_tail_bytes(view: DurableConversation, archive: ArchiveOutbox) -> bytes
             ],
             "settled": archive.settled,
             "review": {
-                "cursor": (archive.review or ReviewProgress()).cursor,
-                "users": (archive.review or ReviewProgress()).users,
-                "reviewed_users": (archive.review or ReviewProgress()).reviewed_users,
+                "cursor": review.cursor,
+                "users": review.users,
+                "reviewed_users": review.reviewed_users,
                 "pending": None
-                if archive.review is None or archive.review.pending is None
+                if review.pending is None
                 else {
-                    "seq_from": archive.review.pending.seq_from,
-                    "seq_through": archive.review.pending.seq_through,
-                    "users": archive.review.pending.users,
-                    "closing": archive.review.pending.closing,
+                    "seq_from": review.pending.seq_from,
+                    "seq_through": review.pending.seq_through,
+                    "users": review.pending.users,
+                    "closing": review.pending.closing,
                 },
-                "close_targets": list((archive.review or ReviewProgress()).close_targets),
-                "close_reviewed": (archive.review or ReviewProgress()).close_reviewed,
-                "rows": [list(row) for row in (archive.review or ReviewProgress()).rows],
-                "overflow": (archive.review or ReviewProgress()).overflow,
-                "recent": [list(row) for row in (archive.review or ReviewProgress()).recent],
+                "close_targets": list(review.close_targets),
+                "close_reviewed": review.close_reviewed,
+                "rows": [list(row) for row in review.rows],
+                "overflow": review.overflow,
+                "recent": [list(row) for row in review.recent],
             },
         },
         "messages": [

@@ -17,7 +17,7 @@ from enum import Enum, StrEnum, auto
 from queue import Empty, Full
 from threading import Condition, Event, Lock, RLock
 from time import monotonic
-from typing import Literal, NoReturn, Protocol, SupportsIndex, TypeAlias
+from typing import Literal, NoReturn, SupportsIndex, TypeAlias
 from uuid import uuid4
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
@@ -43,6 +43,7 @@ from .models import (
     DrainDisposition,
     EventKind,
     EvidenceDiagnosticsV1,
+    EvidencePayloadV1,
     EvidenceSnapshotV1,
     ExpireSessionV1,
     ExpiryDisposition,
@@ -78,6 +79,7 @@ from .models import (
     UserFinalAcceptedPayloadV1,
     UserTurnAuthorityV1,
     WriterFault,
+    _copy_snapshot,
     evidence_snapshot_to_primitive,
     resolve_terminal_causes,
     validate_authority_composition,
@@ -441,9 +443,6 @@ class ConversationOperationScheduler:
         return reservation
 
 
-ConversationOperationReservations = ConversationOperationScheduler
-
-
 @dataclass(frozen=True, slots=True, eq=False, init=False, repr=False)
 class EvidenceTerminalReservation(_RuntimeCapability):
     """Two retained queue records for one turn's snapshot and settlement."""
@@ -578,161 +577,6 @@ class DrainTicketV1:
             raise TypeError("terminal_event must be an exact threading.Event")
 
 
-class EvidenceAdmissionV1(Protocol):
-    protocol_version: Literal[1]
-
-    @property
-    def operation_scheduler(self) -> ConversationOperationScheduler: ...
-
-    def try_admit_command(
-        self,
-        authority: CommandAdmissionAuthorityV1,
-        snapshot: EvidenceSnapshotV1,
-    ) -> CommandDisposition: ...
-
-    def try_reserve_user_turn(
-        self,
-        authority: UserTurnAuthorityV1,
-        operation: ConversationOperationReservation,
-    ) -> EvidenceLeaseResultV1: ...
-
-    def try_admit_user_final(
-        self,
-        lease: EvidenceTurnLease,
-        authority: UserTurnAuthorityV1,
-        text: str,
-    ) -> AppendDisposition: ...
-
-    def try_admit_generated(
-        self,
-        lease: EvidenceTurnLease,
-        text: str,
-    ) -> AppendDisposition: ...
-
-    def try_open_non_user_turn(
-        self,
-        lease: EvidenceTurnLease,
-    ) -> AppendDisposition: ...
-
-    def try_admit_transport_confirmed_full(
-        self,
-        lease: EvidenceTurnLease,
-        *,
-        segment_ordinal: int | None,
-        synthesis_attempt_id: str,
-        transport_attempt_id: str,
-        text: str | None,
-    ) -> AppendDisposition: ...
-
-    def settle_spawn_failed(
-        self,
-        lease: EvidenceTurnLease,
-    ) -> AppendDisposition: ...
-
-    def settle_completed(
-        self,
-        lease: EvidenceTurnLease,
-        *,
-        queued_chunk_count: int,
-        started_chunk_count: int,
-        transport_confirmed_full_count: int,
-        assistant_delivery_context_recorded: bool,
-    ) -> AppendDisposition: ...
-
-    def settle_terminal(
-        self,
-        lease: EvidenceTurnLease,
-        *,
-        queued_chunk_count: int,
-        started_chunk_count: int,
-        assistant_delivery_context_recorded: bool,
-    ) -> AppendDisposition: ...
-
-    def try_reserve_proactive_turn(
-        self,
-        authority: ProactiveTurnAuthorityV1,
-        operation: ConversationOperationReservation,
-    ) -> EvidenceLeaseResultV1: ...
-
-    def try_reserve_replay_turn(
-        self,
-        authority: ReplayTurnAuthorityV1,
-        operation: ConversationOperationReservation,
-    ) -> EvidenceLeaseResultV1: ...
-
-    def discard_unopened_user_turn(
-        self,
-        lease: EvidenceTurnLease,
-        authority: UserTurnAuthorityV1,
-    ) -> bool: ...
-
-    def discard_unopened_replay_turn(
-        self,
-        lease: EvidenceTurnLease,
-        authority: ReplayTurnAuthorityV1,
-    ) -> bool: ...
-
-    def discard_unopened_proactive_turn(
-        self,
-        lease: EvidenceTurnLease,
-        authority: ProactiveTurnAuthorityV1,
-    ) -> bool: ...
-
-    def try_append_turn(
-        self,
-        lease: EvidenceTurnLease,
-        snapshot: EvidenceSnapshotV1,
-    ) -> AppendDisposition: ...
-
-    def record_terminal_cause(
-        self,
-        capability: TerminalCauseCapabilityV1,
-        cause: TerminalReason,
-    ) -> CauseDisposition: ...
-
-    def settled_terminal_outcome(
-        self,
-        lease: EvidenceTurnLease,
-    ) -> SettledTerminalOutcomeV1 | None: ...
-
-    def diagnostics(self) -> EvidenceDiagnosticsV1: ...
-
-
-class EvidenceLifecycleControlV1(Protocol):
-    protocol_version: Literal[1]
-
-    def begin_consent(self, authority: ConsentCreateAuthorityV1) -> CreateEpochTicketV1: ...
-
-    def try_close_binding(
-        self,
-        authority: BindingCloseAuthorityV1,
-        snapshot: EvidenceSnapshotV1,
-    ) -> AppendDisposition: ...
-
-    def invalidate_binding(
-        self,
-        authority: BindingCloseAuthorityV1,
-    ) -> AppendDisposition: ...
-
-    def try_rollover(
-        self,
-        authority: RolloverAuthorityV1,
-        command: RolloverSessionV1,
-    ) -> RolloverDisposition: ...
-
-    def begin_expiry(self, authority: SessionExpiryAuthorityV1) -> ExpiryTicketV1: ...
-
-    def request_seal(
-        self,
-        authority: LifecycleSealAuthorityV1,
-        command: SealEpochV1,
-    ) -> SealDisposition: ...
-
-    def begin_revoke(self, authority: ConsentRevokeAuthorityV1) -> RevokeTicketV1: ...
-
-    def request_drain(self, authority: LifecycleDrainAuthorityV1) -> DrainTicketV1: ...
-
-
 class WriterQueueLane(StrEnum):
     ORDERED = "ordered"
     REVOKE = "revoke"
@@ -797,14 +641,6 @@ class EvidenceWriterQueueItemV1:
             DrainAndStopV1,
         ):
             raise ValueError("ordered lane cannot accept independent-lane DTOs")
-
-
-class EvidenceWriterSinkV1(Protocol):
-    """The bounded nonawaiting Task 3 writer-ingress seam."""
-
-    protocol_version: Literal[1]
-
-    def put_nowait(self, item: EvidenceWriterQueueItemV1) -> None: ...
 
 
 class BoundedEvidenceWriterQueueV1:
@@ -883,36 +719,35 @@ class BoundedEvidenceWriterQueueV1:
             self._ordered.extend(items)
             self._condition.notify()
 
-    def get_nowait(self) -> EvidenceWriterQueueItemV1:
+    def _pop_next_locked(self) -> EvidenceWriterQueueItemV1 | None:
         """Select revoke first, then ordered FIFO, and drain only after both."""
 
+        if self._revoke is not None:
+            item = self._revoke
+            self._revoke = None
+            return item
+        if self._ordered:
+            return self._ordered.popleft()
+        if self._drain is not None:
+            item = self._drain
+            self._drain = None
+            return item
+        return None
+
+    def get_nowait(self) -> EvidenceWriterQueueItemV1:
         with self._lock:
-            if self._revoke is not None:
-                item = self._revoke
-                self._revoke = None
-                return item
-            if self._ordered:
-                return self._ordered.popleft()
-            if self._drain is not None:
-                item = self._drain
-                self._drain = None
-                return item
+            item = self._pop_next_locked()
+        if item is None:
             raise Empty
+        return item
 
     def get_blocking(self) -> EvidenceWriterQueueItemV1 | None:
         """Wait for the next priority item or permanent consumer stop."""
 
         with self._condition:
             while True:
-                if self._revoke is not None:
-                    item = self._revoke
-                    self._revoke = None
-                    return item
-                if self._ordered:
-                    return self._ordered.popleft()
-                if self._drain is not None:
-                    item = self._drain
-                    self._drain = None
+                item = self._pop_next_locked()
+                if item is not None:
                     return item
                 if self._consumer_stopped:
                     return None
@@ -950,18 +785,12 @@ def _walk_text_values(value: object) -> tuple[str, ...]:
     return ()
 
 
-def _copy_snapshot(snapshot: EvidenceSnapshotV1) -> EvidenceSnapshotV1:
-    if type(snapshot) is not EvidenceSnapshotV1:
-        raise TypeError("snapshot must be an exact EvidenceSnapshotV1")
-    return EvidenceSnapshotV1(
-        schema_version=snapshot.schema_version,
-        installation_id=snapshot.installation_id,
-        producer_instance_id=snapshot.producer_instance_id,
-        logical_session_id=snapshot.logical_session_id,
-        event_id=snapshot.event_id,
-        event_sequence=snapshot.event_sequence,
-        event_kind=snapshot.event_kind,
-        payload=snapshot.payload,
+def _text_exceeds_admission_bound(text: str) -> bool:
+    code_points = len(text)
+    return (
+        code_points > 4_096
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in text)
+        or 6 * code_points + 8_192 > MAX_CANONICAL_RECORD_BYTES
     )
 
 
@@ -971,12 +800,7 @@ def _canonical_record_representation(
     exact_snapshot = _copy_snapshot(snapshot)
     primitive = evidence_snapshot_to_primitive(exact_snapshot)
     for text in _walk_text_values(primitive):
-        code_points = len(text)
-        if (
-            code_points > 4_096
-            or any(0xD800 <= ord(character) <= 0xDFFF for character in text)
-            or 6 * code_points + 8_192 > MAX_CANONICAL_RECORD_BYTES
-        ):
+        if _text_exceeds_admission_bound(text):
             raise EvidenceAdmissionError("evidence text exceeds its exact admission bound")
     encoded = json.dumps(
         primitive,
@@ -1012,12 +836,7 @@ def _raw_snapshot_text_is_oversize(snapshot: object) -> bool:
         return False
     if type(text) is not str:
         raise TypeError("snapshot text must be an exact built-in string")
-    code_points = len(text)
-    return (
-        code_points > 4_096
-        or any(0xD800 <= ord(character) <= 0xDFFF for character in text)
-        or 6 * code_points + 8_192 > MAX_CANONICAL_RECORD_BYTES
-    )
+    return _text_exceeds_admission_bound(text)
 
 
 class _CreateReservationPhase(Enum):
@@ -1736,25 +1555,13 @@ class EvidenceAdmissionControllerV1:
     def _charged_records(self) -> int:
         return self._capacity.charged_records
 
-    @_charged_records.setter
-    def _charged_records(self, value: int) -> None:
-        self._capacity.charged_records = value
-
     @property
     def _charged_bytes(self) -> int:
         return self._capacity.charged_bytes
 
-    @_charged_bytes.setter
-    def _charged_bytes(self, value: int) -> None:
-        self._capacity.charged_bytes = value
-
     @property
     def _ordered_physical_items(self) -> int:
         return self._capacity.ordered_physical_items
-
-    @_ordered_physical_items.setter
-    def _ordered_physical_items(self, value: int) -> None:
-        self._capacity.ordered_physical_items = value
 
     @property
     def _next_admission_ordinal(self) -> int:
@@ -2791,18 +2598,7 @@ class EvidenceAdmissionControllerV1:
             assert item is not None and type(item.payload) is RolloverSessionV1
             command = item.payload
             del self._session_controls[preparation.reservation]
-            self._current_session_control = preparation.successor
-            successor_open = command.snapshots[2]
-            self._installation_id = successor_open.installation_id
-            self._producer_instance_id = successor_open.producer_instance_id
-            self._logical_session_id = command.successor_logical_session_id
-            self._next_event_sequence = 3
-            self._phase = RuntimeSessionPhase.OPEN
-            self._binding_close_admitted = False
-            self._seal_ticket_disposition = None
-            self._expiry_authority = None
-            self._session_reserved_events = 2
-            self._session_reserved_bytes = 0
+            self._activate_rollover_successor_locked(command, preparation.successor)
             preparation.terminal = True
             self._rollover_preparation = None
             _set_ticket_signal(preparation.ticket.event)
@@ -2848,19 +2644,26 @@ class EvidenceAdmissionControllerV1:
                 logical_session_id=command.successor_logical_session_id,
                 cleanup_only=False,
             )
-            self._current_session_control = successor
-            successor_open = command.snapshots[2]
-            self._installation_id = successor_open.installation_id
-            self._producer_instance_id = successor_open.producer_instance_id
-            self._logical_session_id = command.successor_logical_session_id
-            self._next_event_sequence = 3
-            self._phase = RuntimeSessionPhase.OPEN
-            self._binding_close_admitted = False
-            self._seal_ticket_disposition = None
-            self._expiry_authority = None
-            self._session_reserved_events = 2
-            self._session_reserved_bytes = 0
+            self._activate_rollover_successor_locked(command, successor)
             return successor
+
+    def _activate_rollover_successor_locked(
+        self,
+        command: RolloverSessionV1,
+        successor: SessionControlReservation,
+    ) -> None:
+        self._current_session_control = successor
+        successor_open = command.snapshots[2]
+        self._installation_id = successor_open.installation_id
+        self._producer_instance_id = successor_open.producer_instance_id
+        self._logical_session_id = command.successor_logical_session_id
+        self._next_event_sequence = 3
+        self._phase = RuntimeSessionPhase.OPEN
+        self._binding_close_admitted = False
+        self._seal_ticket_disposition = None
+        self._expiry_authority = None
+        self._session_reserved_events = 2
+        self._session_reserved_bytes = 0
 
     def try_admit_command(
         self,
@@ -2947,41 +2750,29 @@ class EvidenceAdmissionControllerV1:
                     or _turn_authority_signature(authority) != state.authority_signature
                 ):
                     return AppendDisposition.INVALID_AUTHORITY
-                if len(text) > 4_096 or any(
-                    0xD800 <= ord(character) <= 0xDFFF for character in text
-                ):
+                if _text_exceeds_admission_bound(text):
                     self._taint_locked(TaintCode.OVERSIZE)
                     return AppendDisposition.REJECTED_OVERSIZE
                 if self._next_event_sequence is None:
                     return AppendDisposition.CONSENT_MISSING
-                installation_id = self._installation_id
-                producer_instance_id = self._producer_instance_id
-                if installation_id is None or producer_instance_id is None:
+                if self._installation_id is None or self._producer_instance_id is None:
                     return AppendDisposition.CONSENT_MISSING
-                opened = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=installation_id,
-                    producer_instance_id=producer_instance_id,
-                    logical_session_id=authority.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.TURN_OPENED,
-                    payload=TurnOpenedPayloadV1(
+                opened = self._turn_event_snapshot_locked(
+                    authority.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.TURN_OPENED,
+                    TurnOpenedPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         turn_kind=TurnKind.USER_RESPONSE,
                         utterance_id=authority.utterance_id,
                         replay_of_evidence_turn_id=None,
                     ),
                 )
-                accepted = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=installation_id,
-                    producer_instance_id=producer_instance_id,
-                    logical_session_id=authority.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence + 1,
-                    event_kind=EventKind.USER_FINAL_ACCEPTED,
-                    payload=UserFinalAcceptedPayloadV1(
+                accepted = self._turn_event_snapshot_locked(
+                    authority.logical_session_id,
+                    self._next_event_sequence + 1,
+                    EventKind.USER_FINAL_ACCEPTED,
+                    UserFinalAcceptedPayloadV1(
                         utterance_id=authority.utterance_id,
                         evidence_turn_id=lease.evidence_turn_id,
                         source=authority.source,
@@ -3009,27 +2800,12 @@ class EvidenceAdmissionControllerV1:
     ) -> bool:
         """Release an exact user lease only before its opening batch is admitted."""
 
-        claimed: _AdmissionRolloverPreparationV1 | None = None
-        callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
-        with self._admission_lock:
-            if type(lease) is not EvidenceTurnLease or type(authority) is not UserTurnAuthorityV1:
-                return False
-            state = self._leases.get(lease)
-            if (
-                state is None
-                or state.authority is not authority
-                or state.turn_kind is not TurnKind.USER_RESPONSE
-                or state.opened
-                or not self._lease_lineage_matches_locked(lease)
-                or _turn_authority_signature(authority) != state.authority_signature
-            ):
-                return False
-            self._discard_unopened_lease_locked(lease)
-            claimed = self._try_claim_capacity_rollover_locked()
-            callback = self._rollover_claimed
-        self._dispatch_claimed_rollover(claimed, callback)
-        self._advance_revoke_finalization_if_ready()
-        return True
+        return self._discard_unopened_turn(
+            lease,
+            authority,
+            authority_type=UserTurnAuthorityV1,
+            turn_kind=TurnKind.USER_RESPONSE,
+        )
 
     def discard_unopened_replay_turn(
         self,
@@ -3038,27 +2814,12 @@ class EvidenceAdmissionControllerV1:
     ) -> bool:
         """Release one exact replay lease that never crossed speech admission."""
 
-        claimed: _AdmissionRolloverPreparationV1 | None = None
-        callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
-        with self._admission_lock:
-            if type(lease) is not EvidenceTurnLease or type(authority) is not ReplayTurnAuthorityV1:
-                return False
-            state = self._leases.get(lease)
-            if (
-                state is None
-                or state.authority is not authority
-                or state.turn_kind is not TurnKind.REPLAY
-                or state.opened
-                or not self._lease_lineage_matches_locked(lease)
-                or _turn_authority_signature(authority) != state.authority_signature
-            ):
-                return False
-            self._discard_unopened_lease_locked(lease)
-            claimed = self._try_claim_capacity_rollover_locked()
-            callback = self._rollover_claimed
-        self._dispatch_claimed_rollover(claimed, callback)
-        self._advance_revoke_finalization_if_ready()
-        return True
+        return self._discard_unopened_turn(
+            lease,
+            authority,
+            authority_type=ReplayTurnAuthorityV1,
+            turn_kind=TurnKind.REPLAY,
+        )
 
     def discard_unopened_proactive_turn(
         self,
@@ -3067,19 +2828,33 @@ class EvidenceAdmissionControllerV1:
     ) -> bool:
         """Release one exact proactive lease that never crossed speech admission."""
 
+        return self._discard_unopened_turn(
+            lease,
+            authority,
+            authority_type=ProactiveTurnAuthorityV1,
+            turn_kind=TurnKind.PROACTIVE_UPDATE,
+        )
+
+    def _discard_unopened_turn(
+        self,
+        lease: EvidenceTurnLease,
+        authority: UserTurnAuthorityV1 | ProactiveTurnAuthorityV1 | ReplayTurnAuthorityV1,
+        *,
+        authority_type: type[
+            UserTurnAuthorityV1 | ProactiveTurnAuthorityV1 | ReplayTurnAuthorityV1
+        ],
+        turn_kind: TurnKind,
+    ) -> bool:
         claimed: _AdmissionRolloverPreparationV1 | None = None
         callback: Callable[[_AdmissionRolloverPreparationV1], None] | None = None
         with self._admission_lock:
-            if (
-                type(lease) is not EvidenceTurnLease
-                or type(authority) is not ProactiveTurnAuthorityV1
-            ):
+            if type(lease) is not EvidenceTurnLease or type(authority) is not authority_type:
                 return False
             state = self._leases.get(lease)
             if (
                 state is None
                 or state.authority is not authority
-                or state.turn_kind is not TurnKind.PROACTIVE_UPDATE
+                or state.turn_kind is not turn_kind
                 or state.opened
                 or not self._lease_lineage_matches_locked(lease)
                 or _turn_authority_signature(authority) != state.authority_signature
@@ -3135,19 +2910,13 @@ class EvidenceAdmissionControllerV1:
                     return AppendDisposition.SESSION_TAINTED
                 if self._next_event_sequence is None:
                     return AppendDisposition.CONSENT_MISSING
-                installation_id = self._installation_id
-                producer_instance_id = self._producer_instance_id
-                if installation_id is None or producer_instance_id is None:
+                if self._installation_id is None or self._producer_instance_id is None:
                     return AppendDisposition.CONSENT_MISSING
-                snapshot = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=installation_id,
-                    producer_instance_id=producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.TURN_SNAPSHOT,
-                    payload=TurnSnapshotPayloadV1(
+                snapshot = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.TURN_SNAPSHOT,
+                    TurnSnapshotPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         turn_kind=state.turn_kind,
                         generated_segment_count=state.generated_segment_count,
@@ -3158,15 +2927,11 @@ class EvidenceAdmissionControllerV1:
                         assistant_delivery_context_recorded=False,
                     ),
                 )
-                settled = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=installation_id,
-                    producer_instance_id=producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence + 1,
-                    event_kind=EventKind.TURN_SETTLED,
-                    payload=TurnSettledPayloadV1(
+                settled = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence + 1,
+                    EventKind.TURN_SETTLED,
+                    TurnSettledPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         terminal_disposition=resolution.terminal_disposition,
                         terminal_reason=resolution.terminal_reason,
@@ -3253,15 +3018,11 @@ class EvidenceAdmissionControllerV1:
                     or self._producer_instance_id is None
                 ):
                     return AppendDisposition.CONSENT_MISSING
-                snapshot = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.TURN_SNAPSHOT,
-                    payload=TurnSnapshotPayloadV1(
+                snapshot = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.TURN_SNAPSHOT,
+                    TurnSnapshotPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         turn_kind=state.turn_kind,
                         generated_segment_count=state.generated_segment_count,
@@ -3272,15 +3033,11 @@ class EvidenceAdmissionControllerV1:
                         assistant_delivery_context_recorded=(assistant_delivery_context_recorded),
                     ),
                 )
-                settled = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence + 1,
-                    event_kind=EventKind.TURN_SETTLED,
-                    payload=TurnSettledPayloadV1(
+                settled = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence + 1,
+                    EventKind.TURN_SETTLED,
+                    TurnSettledPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         terminal_disposition=resolution.terminal_disposition,
                         terminal_reason=resolution.terminal_reason,
@@ -3349,15 +3106,11 @@ class EvidenceAdmissionControllerV1:
                     or self._producer_instance_id is None
                 ):
                     return AppendDisposition.CONSENT_MISSING
-                snapshot = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.TURN_SNAPSHOT,
-                    payload=TurnSnapshotPayloadV1(
+                snapshot = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.TURN_SNAPSHOT,
+                    TurnSnapshotPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         turn_kind=state.turn_kind,
                         generated_segment_count=state.generated_segment_count,
@@ -3368,15 +3121,11 @@ class EvidenceAdmissionControllerV1:
                         assistant_delivery_context_recorded=(assistant_delivery_context_recorded),
                     ),
                 )
-                settled = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence + 1,
-                    event_kind=EventKind.TURN_SETTLED,
-                    payload=TurnSettledPayloadV1(
+                settled = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence + 1,
+                    EventKind.TURN_SETTLED,
+                    TurnSettledPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         terminal_disposition=resolution.terminal_disposition,
                         terminal_reason=resolution.terminal_reason,
@@ -3475,26 +3224,18 @@ class EvidenceAdmissionControllerV1:
                     or not self._lease_lineage_matches_locked(lease)
                 ):
                     return AppendDisposition.INVALID_AUTHORITY
-                if len(text) > 4_096 or any(
-                    0xD800 <= ord(character) <= 0xDFFF for character in text
-                ):
+                if _text_exceeds_admission_bound(text):
                     self._taint_locked(TaintCode.OVERSIZE)
                     return AppendDisposition.REJECTED_OVERSIZE
                 if self._next_event_sequence is None:
                     return AppendDisposition.CONSENT_MISSING
-                installation_id = self._installation_id
-                producer_instance_id = self._producer_instance_id
-                if installation_id is None or producer_instance_id is None:
+                if self._installation_id is None or self._producer_instance_id is None:
                     return AppendDisposition.CONSENT_MISSING
-                generated = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=installation_id,
-                    producer_instance_id=producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.ASSISTANT_SEGMENT_GENERATED,
-                    payload=AssistantSegmentGeneratedPayloadV1(
+                generated = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.ASSISTANT_SEGMENT_GENERATED,
+                    AssistantSegmentGeneratedPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         evidence_segment_id=str(uuid4()),
                         segment_ordinal=state.generated_segment_count + 1,
@@ -3559,15 +3300,11 @@ class EvidenceAdmissionControllerV1:
                     if type(authority) is ReplayTurnAuthorityV1
                     else None
                 )
-                opened = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.TURN_OPENED,
-                    payload=TurnOpenedPayloadV1(
+                opened = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.TURN_OPENED,
+                    TurnOpenedPayloadV1(
                         evidence_turn_id=lease.evidence_turn_id,
                         turn_kind=state.turn_kind,
                         utterance_id=None,
@@ -3642,15 +3379,11 @@ class EvidenceAdmissionControllerV1:
                     or self._producer_instance_id is None
                 ):
                     return AppendDisposition.CONSENT_MISSING
-                snapshot = EvidenceSnapshotV1(
-                    schema_version=1,
-                    installation_id=self._installation_id,
-                    producer_instance_id=self._producer_instance_id,
-                    logical_session_id=lease.logical_session_id,
-                    event_id=str(uuid4()),
-                    event_sequence=self._next_event_sequence,
-                    event_kind=EventKind.ASSISTANT_CHUNK_TRANSPORT_CONFIRMED_FULL,
-                    payload=payload,
+                snapshot = self._turn_event_snapshot_locked(
+                    lease.logical_session_id,
+                    self._next_event_sequence,
+                    EventKind.ASSISTANT_CHUNK_TRANSPORT_CONFIRMED_FULL,
+                    payload,
                 )
                 if _raw_snapshot_text_is_oversize(snapshot):
                     self._taint_locked(TaintCode.OVERSIZE)
@@ -4307,21 +4040,7 @@ class EvidenceAdmissionControllerV1:
             if not self._enabled or self._sticky_fault is not None:
                 return None
             with self._credit_lock:
-                if not self._try_charge_locked(
-                    TERMINAL_RECORD_CREDITS,
-                    TERMINAL_CANONICAL_BYTE_CREDITS,
-                    physical_items=0,
-                ):
-                    return None
-                reservation = object.__new__(EvidenceTerminalReservation)
-                object.__setattr__(reservation, "owner_generation", self._owner_generation)
-                object.__setattr__(
-                    reservation,
-                    "reservation_serial",
-                    self._allocate_reservation_serial_locked(),
-                )
-                self._terminal_reservations[reservation] = _TerminalReservationState()
-                return reservation
+                return self._try_reserve_terminal_locked()
 
     def release_terminal_reservation(
         self,
@@ -4336,12 +4055,7 @@ class EvidenceAdmissionControllerV1:
                     raise ReservationError("terminal reservation is stale")
                 if state.queued_records:
                     raise ReservationError("queued terminal credits cannot be released early")
-                del self._terminal_reservations[reservation]
-                self._release_charge_locked(
-                    state.remaining_records,
-                    state.remaining_bytes,
-                    physical_items=0,
-                )
+                self._release_terminal_locked(reservation)
 
     def _preliminary_append_disposition_locked(self) -> AppendDisposition | None:
         if not self._enabled:
@@ -4911,6 +4625,49 @@ class EvidenceAdmissionControllerV1:
             self._cause_states.pop(lease.terminal_cause, None)
             self._release_terminal_locked(state.terminal_reservation)
 
+    def _turn_event_snapshot_locked(
+        self,
+        logical_session_id: str,
+        event_sequence: int,
+        event_kind: EventKind,
+        payload: EvidencePayloadV1,
+    ) -> EvidenceSnapshotV1:
+        """Build one fresh-ID envelope after the caller has checked consent lineage."""
+
+        installation_id = self._installation_id
+        producer_instance_id = self._producer_instance_id
+        assert installation_id is not None and producer_instance_id is not None
+        return EvidenceSnapshotV1(
+            schema_version=1,
+            installation_id=installation_id,
+            producer_instance_id=producer_instance_id,
+            logical_session_id=logical_session_id,
+            event_id=str(uuid4()),
+            event_sequence=event_sequence,
+            event_kind=event_kind,
+            payload=payload,
+        )
+
+    def _screen_ordinary_snapshot_locked(
+        self,
+        snapshot: EvidenceSnapshotV1,
+    ) -> AppendDisposition | None:
+        if self._deny_filter is not None:
+            denied = self._deny_filter(snapshot)
+            if type(denied) is not bool:
+                raise TypeError("deny_filter must return an exact built-in bool")
+            if denied:
+                self._taint_locked(TaintCode.DENY_FILTER)
+                return AppendDisposition.REJECTED_DENIED
+        if self._quota_check is not None:
+            allowed = self._quota_check(snapshot)
+            if type(allowed) is not bool:
+                raise TypeError("quota_check must return an exact built-in bool")
+            if not allowed:
+                self._taint_locked(TaintCode.QUOTA_EXCEEDED)
+                return AppendDisposition.QUOTA_EXCEEDED
+        return None
+
     def _try_enqueue_ordinary_locked(
         self,
         snapshot: EvidenceSnapshotV1,
@@ -4926,20 +4683,9 @@ class EvidenceAdmissionControllerV1:
         except EvidenceAdmissionError:
             self._taint_locked(TaintCode.OVERSIZE)
             return AppendDisposition.REJECTED_OVERSIZE
-        if self._deny_filter is not None:
-            denied = self._deny_filter(snapshot)
-            if type(denied) is not bool:
-                raise TypeError("deny_filter must return an exact built-in bool")
-            if denied:
-                self._taint_locked(TaintCode.DENY_FILTER)
-                return AppendDisposition.REJECTED_DENIED
-        if self._quota_check is not None:
-            allowed = self._quota_check(snapshot)
-            if type(allowed) is not bool:
-                raise TypeError("quota_check must return an exact built-in bool")
-            if not allowed:
-                self._taint_locked(TaintCode.QUOTA_EXCEEDED)
-                return AppendDisposition.QUOTA_EXCEEDED
+        refusal = self._screen_ordinary_snapshot_locked(snapshot)
+        if refusal is not None:
+            return refusal
         if self._next_event_sequence is None:
             return AppendDisposition.CONSENT_MISSING
         if snapshot.event_sequence != self._next_event_sequence:
@@ -5017,20 +4763,9 @@ class EvidenceAdmissionControllerV1:
             except EvidenceAdmissionError:
                 self._taint_locked(TaintCode.OVERSIZE)
                 return AppendDisposition.REJECTED_OVERSIZE
-            if self._deny_filter is not None:
-                denied = self._deny_filter(snapshot)
-                if type(denied) is not bool:
-                    raise TypeError("deny_filter must return an exact built-in bool")
-                if denied:
-                    self._taint_locked(TaintCode.DENY_FILTER)
-                    return AppendDisposition.REJECTED_DENIED
-            if self._quota_check is not None:
-                allowed = self._quota_check(snapshot)
-                if type(allowed) is not bool:
-                    raise TypeError("quota_check must return an exact built-in bool")
-                if not allowed:
-                    self._taint_locked(TaintCode.QUOTA_EXCEEDED)
-                    return AppendDisposition.QUOTA_EXCEEDED
+            refusal = self._screen_ordinary_snapshot_locked(snapshot)
+            if refusal is not None:
+                return refusal
         with self._credit_lock:
             if self._sticky_fault is not None:
                 return AppendDisposition.WRITER_FAULT
@@ -5604,7 +5339,6 @@ __all__ = [
     "CREATE_EPOCH_CANONICAL_BYTE_CREDITS",
     "CREATE_EPOCH_RECORD_CREDITS",
     "ConversationOperationReservation",
-    "ConversationOperationReservations",
     "ConversationOperationScheduler",
     "EvidenceAdmissionControllerV1",
     "EvidenceAdmissionError",
@@ -5613,7 +5347,6 @@ __all__ = [
     "EvidenceTerminalReservation",
     "EvidenceTurnLease",
     "EvidenceWriterQueueItemV1",
-    "EvidenceWriterSinkV1",
     "MAX_CANONICAL_RECORD_BYTES",
     "MAX_QUEUE_CANONICAL_BYTES",
     "MAX_QUEUE_PHYSICAL_ITEMS",

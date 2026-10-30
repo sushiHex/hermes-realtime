@@ -157,15 +157,6 @@ class _Closable:
         self.closed = True
 
 
-class _QueueSource(_Closable):
-    def __init__(self) -> None:
-        super().__init__()
-        self.clear_count = 0
-
-    def clear_queue(self) -> None:
-        self.clear_count += 1
-
-
 class _FailingRoom:
     async def disconnect(self) -> None:
         raise RuntimeError("provider disconnect failed")
@@ -272,18 +263,6 @@ async def test_sdk_disconnected_event_updates_state_and_retains_local_cleanup() 
 
 
 @pytest.mark.asyncio
-async def test_clear_audio_queue_discards_buffered_pcm() -> None:
-    peer = LiveKitRoomPeer(_connection(), identity="peer")
-    source = _QueueSource()
-    peer._audio_source = cast(Any, source)
-    peer._connected = True
-
-    await peer.clear_audio_queue()
-
-    assert source.clear_count == 1
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("timeout_seconds", "error_type"),
     [
@@ -303,7 +282,7 @@ async def test_peer_rejects_invalid_timeout_values(
     peer._connected = True
 
     with pytest.raises(error_type):
-        await peer.clear_audio_queue(timeout_seconds=cast(Any, timeout_seconds))
+        await peer.receive_participant_audio(timeout_seconds=cast(Any, timeout_seconds))
 
 
 class _FailingPublisher:

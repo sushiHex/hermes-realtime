@@ -450,9 +450,7 @@ class ConversationTaskController:
                 )
             pending = self._pending_dispatches.get(task_id)
             if pending is None:
-                error = RuntimeError("dispatch acknowledgment had no pending reservation")
-                self._fail_locked(error)
-                raise error
+                raise self._failure_locked("dispatch acknowledgment had no pending reservation")
             try:
                 self._validate_dispatch_acknowledgment(acknowledgment)
             except BaseException as exc:
@@ -462,30 +460,24 @@ class ConversationTaskController:
                 acknowledgment.task_id != task_id
                 or acknowledgment.session_id != self._session_id
             ):
-                error = RuntimeError("dispatch acknowledgment does not match its request")
-                self._fail_locked(error)
-                raise error
+                raise self._failure_locked("dispatch acknowledgment does not match its request")
             preack = self._preack_terminals.get(task_id)
             if acknowledgment.sequence <= request_sequence or (
                 preack is not None
                 and preack.event_sequence <= acknowledgment.sequence
             ):
-                error = RuntimeError(
+                raise self._failure_locked(
                     "dispatch acknowledgment sequence contradicted request or terminal ordering"
                 )
-                self._fail_locked(error)
-                raise error
             self._claim_inbound_event_locked(
                 acknowledgment,
                 reordered_after=None if preack is None else preack.event_sequence,
             )
             if not acknowledgment.payload.accepted:
                 if preack is not None:
-                    error = RuntimeError(
+                    raise self._failure_locked(
                         "terminal evidence contradicted a rejected dispatch acknowledgment"
                     )
-                    self._fail_locked(error)
-                    raise error
                 self._context.discard_task(pending.admission)
                 del self._pending_dispatches[task_id]
                 return TaskDispatchOutcome(
@@ -495,11 +487,9 @@ class ConversationTaskController:
                 )
             run_id = acknowledgment.payload.run_id
             if run_id is None:
-                error = RuntimeError(
+                raise self._failure_locked(
                     "accepted dispatch acknowledgment omitted its run identity"
                 )
-                self._fail_locked(error)
-                raise error
             try:
                 self._context.record_reserved_task_accepted(
                     admission=pending.admission,
@@ -615,17 +605,11 @@ class ConversationTaskController:
                 or acknowledgment.scope is not CancelScope.TASK
                 or acknowledgment.task_id != task_id
             ):
-                error = RuntimeError(
-                    "cancellation acknowledgment does not match its request"
-                )
-                self._fail_locked(error)
-                raise error
+                raise self._failure_locked("cancellation acknowledgment does not match its request")
             if acknowledgment.sequence <= request_sequence:
-                error = RuntimeError(
+                raise self._failure_locked(
                     "cancellation acknowledgment sequence did not follow its request"
                 )
-                self._fail_locked(error)
-                raise error
             self._claim_inbound_event_locked(
                 acknowledgment,
                 reordered_after=self._terminal_sequences.get(task_id),
@@ -639,11 +623,9 @@ class ConversationTaskController:
                 )
             signaled_run_ids = acknowledgment.payload.signaled_run_ids
             if len(signaled_run_ids) != 1 or signaled_run_ids[0] != expected_run_id:
-                error = RuntimeError(
+                raise self._failure_locked(
                     "cancellation acknowledgment did not contain exact active run authority"
                 )
-                self._fail_locked(error)
-                raise error
             return TaskCancelOutcome(task_id=task_id, accepted=True)
 
     async def _consume_terminals(self) -> None:
@@ -722,6 +704,11 @@ class ConversationTaskController:
         if self._terminal_updates.empty():
             self._terminal_updates.put_nowait(self._terminal_error)
 
+    def _failure_locked(self, message: str) -> RuntimeError:
+        error = RuntimeError(message)
+        self._fail_locked(error)
+        return error
+
     def _raise_if_unavailable(self) -> None:
         if self._terminal_error is not None:
             raise self._terminal_error
@@ -737,28 +724,20 @@ class ConversationTaskController:
         event_id = event.event_id
         sequence = event.sequence
         if event_id in self._used_inbound_event_ids:
-            error = RuntimeError("inbound event identity was reused")
-            self._fail_locked(error)
-            raise error
+            raise self._failure_locked("inbound event identity was reused")
         if sequence in self._used_inbound_sequences:
-            error = RuntimeError("inbound event sequence was reused")
-            self._fail_locked(error)
-            raise error
+            raise self._failure_locked("inbound event sequence was reused")
         if sequence <= self._max_inbound_sequence and (
             reordered_after is None or sequence >= reordered_after
         ):
-            error = RuntimeError("inbound event sequence was stale")
-            self._fail_locked(error)
-            raise error
+            raise self._failure_locked("inbound event sequence was stale")
         self._used_inbound_event_ids.add(event_id)
         self._used_inbound_sequences.add(sequence)
         self._max_inbound_sequence = max(self._max_inbound_sequence, sequence)
 
     def _claim_event_id_locked(self, event_id: str) -> None:
         if event_id in self._used_event_ids:
-            error = RuntimeError("generated event identity was reused")
-            self._fail_locked(error)
-            raise error
+            raise self._failure_locked("generated event identity was reused")
         self._used_event_ids.add(event_id)
 
     def _raise_if_operation_budget_exhausted(self) -> None:

@@ -39,6 +39,7 @@ from .updates import (
     ConversationUpdateDirector,
     UpdateDecision,
     UpdateDecisionKind,
+    _operation_failed,
     _UpdateActionClaim,
 )
 
@@ -166,7 +167,6 @@ class ConversationUpdateExecutor:
             raise
         self._records: deque[UpdateActionRecord] = deque(maxlen=max_action_records)
         self._action_recorded = asyncio.Event()
-        self._dropped_record_count = 0
         self._cleanup_timeout = float(cleanup_timeout_seconds)
         self._operation_scheduler = (
             operation_scheduler
@@ -258,10 +258,6 @@ class ConversationUpdateExecutor:
         return self._speech.foreground_active
 
     @property
-    def dropped_action_record_count(self) -> int:
-        return self._dropped_record_count
-
-    @property
     def active_operation_count(self) -> int:
         return len(self._owned_operations)
 
@@ -321,12 +317,6 @@ class ConversationUpdateExecutor:
             if self._closed:
                 raise RuntimeError("conversation update executor is closed")
             self._action_recorded.clear()
-            for record in self._records:
-                if record.decision.sequence == sequence:
-                    return UpdateActionRecord(
-                        decision=record.decision,
-                        disposition=record.disposition,
-                    )
             await self._action_recorded.wait()
 
     def start(self) -> None:
@@ -571,10 +561,7 @@ class ConversationUpdateExecutor:
 
         async def resume() -> None:
             try:
-                if evidence_lease is None:
-                    result = await self._speech.resume_interrupted()
-                else:
-                    result = await self._speech.resume_interrupted(evidence_lease)
+                result = await self._speech.resume_interrupted(evidence_lease)
                 if type(result) is not bool:
                     raise TypeError("speech resume result must be an exact boolean")
                 if not result:
@@ -643,30 +630,17 @@ class ConversationUpdateExecutor:
             self._foreground_cancel_operation = operation
             self._owned_operations.add(operation)
             operation.add_done_callback(self._operation_done)
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            raise
+        await asyncio.shield(operation)
 
     async def close(self) -> None:
         operation = self._close_operation
-        if operation is None or self._close_failed(operation):
+        if operation is None or _operation_failed(operation):
             operation = asyncio.create_task(
                 self._close_owned(),
                 name="conversation-update-executor-close",
             )
             self._close_operation = operation
         await asyncio.shield(operation)
-
-    @staticmethod
-    def _close_failed(operation: asyncio.Task[None]) -> bool:
-        if not operation.done():
-            return False
-        if operation.cancelled():
-            return True
-        return operation.exception() is not None
 
     async def _execute_response(
         self,
@@ -689,23 +663,14 @@ class ConversationUpdateExecutor:
                 self._speech_authority,
                 turn_id,
             )
-            if evidence_lease is None:
-                await self._speech._respond_with_updates(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    transcript,
-                    decisions,
-                )
-            else:
-                await self._speech._respond_with_updates(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    transcript,
-                    decisions,
-                    evidence_lease,
-                )
+            await self._speech._respond_with_updates(
+                self._speech_authority,
+                operation,
+                turn_id,
+                transcript,
+                decisions,
+                evidence_lease,
+            )
         except asyncio.CancelledError:
             disposition = "superseded"
             raise
@@ -892,21 +857,13 @@ class ConversationUpdateExecutor:
                     turn_id,
                     evidence_authority,
                 )
-            if evidence_lease is None:
-                started = await self._speech._announce_idle_update(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    decision,
-                )
-            else:
-                started = await self._speech._announce_idle_update(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    decision,
-                    evidence_lease,
-                )
+            started = await self._speech._announce_idle_update(
+                self._speech_authority,
+                operation,
+                turn_id,
+                decision,
+                evidence_lease,
+            )
             if not started:
                 discard_unopened_proactive_lease(required=True)
                 return False
@@ -1013,21 +970,13 @@ class ConversationUpdateExecutor:
             )
         disposition = "delivered"
         try:
-            if evidence_lease is None:
-                await self._speech._announce_update(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    decision,
-                )
-            else:
-                await self._speech._announce_update(
-                    self._speech_authority,
-                    operation,
-                    turn_id,
-                    decision,
-                    evidence_lease,
-                )
+            await self._speech._announce_update(
+                self._speech_authority,
+                operation,
+                turn_id,
+                decision,
+                evidence_lease,
+            )
         except asyncio.CancelledError:
             disposition = "superseded"
             raise
@@ -1130,19 +1079,14 @@ class ConversationUpdateExecutor:
         if self._terminal_error is not None:
             errors.insert(0, self._terminal_error)
             self._terminal_error = None
-        if len(errors) == 1:
-            if recorder is not None:
-                recorder.record_close_stage(
-                    stage=CloseStageV1.UPDATE_EXECUTOR,
-                    result=CloseResultV1.FAILED,
-                )
-            raise errors[0]
         if errors:
             if recorder is not None:
                 recorder.record_close_stage(
                     stage=CloseStageV1.UPDATE_EXECUTOR,
                     result=CloseResultV1.FAILED,
                 )
+            if len(errors) == 1:
+                raise errors[0]
             raise BaseExceptionGroup("conversation update executor close failed", errors)
         if recorder is not None:
             recorder.record_close_stage(
@@ -1151,9 +1095,6 @@ class ConversationUpdateExecutor:
             )
 
     def _record(self, decision: UpdateDecision, disposition: str) -> None:
-        if len(self._records) == self._records.maxlen:
-            self._records.popleft()
-            self._dropped_record_count += 1
         self._records.append(
             UpdateActionRecord(decision=decision, disposition=disposition)
         )

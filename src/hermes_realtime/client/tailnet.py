@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from .loopback import _socket_peer
+
 _TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
 _TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 _MAX_WHOIS_BYTES = 65_536
@@ -37,26 +39,14 @@ class TailnetPeerAddress:
 
     @classmethod
     def from_peername(cls, peername: object) -> TailnetPeerAddress:
-        if type(peername) is not tuple or len(peername) not in {2, 4}:
-            raise TypeError("socket peer metadata is invalid")
-        raw_ip, raw_port = peername[0], peername[1]
-        if type(raw_ip) is not str or type(raw_port) is not int:
-            raise TypeError("socket peer metadata is invalid")
-        if not 1 <= raw_port <= 65_535:
-            raise ValueError("socket peer port is invalid")
-        try:
-            address = ipaddress.ip_address(raw_ip)
-        except ValueError:
-            raise ValueError("socket peer address is invalid") from None
-        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-            address = address.ipv4_mapped
+        address, port = _socket_peer(peername)
         if (
             address.is_unspecified
             or address.is_loopback
             or address not in (_TAILNET_V4 if address.version == 4 else _TAILNET_V6)
         ):
             raise ValueError("socket peer is not a Tailnet address")
-        return cls(ip=address.compressed, port=raw_port)
+        return cls(ip=address.compressed, port=port)
 
     @property
     def socket_argument(self) -> str:

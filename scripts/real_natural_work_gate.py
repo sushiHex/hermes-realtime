@@ -1857,10 +1857,8 @@ def _codex_fingerprint(executable: str) -> _CodexFingerprint:
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise RuntimeError("resolved Codex executable is not a regular file")
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        while chunk := stream.read(64 * 1024):
-            digest.update(chunk)
+        digest = hashlib.file_digest(stream, "sha256")
     after = path.stat()
     before_identity = (
         before.st_dev,

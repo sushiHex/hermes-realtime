@@ -23,6 +23,7 @@ from hermes_realtime.evidence.models import (
     CaptureStatusV1,
     EvidenceConsentRequestV1,
     EvidenceRevokeRequestV1,
+    ProjectionReservation,
     capture_status_to_primitive,
 )
 from hermes_realtime.providers.ollama_models import OllamaContextObservation
@@ -47,6 +48,21 @@ if TYPE_CHECKING:
 
 class NoBrowserSession(RuntimeError):
     """No browser session is active: the one state refusal a client may act on as such."""
+
+
+def _validate_rebind_request_id(request_id: object) -> None:
+    if request_id is None:
+        return
+    if type(request_id) is not str:
+        raise TypeError("request_id must be an exact built-in string or None")
+    suffix = request_id.removeprefix("rebind_")
+    if (
+        not 16 <= len(request_id) <= 128
+        or suffix == request_id
+        or not suffix.isascii()
+        or not suffix.replace("-", "").isalnum()
+    ):
+        raise ValueError("request_id must be a canonical rebind request identifier")
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,12 +582,7 @@ class BrowserSessionDirector:
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("participant does not own the active session")
+            identity, generation = self._require_active_binding(participant_identity)
             return BrowserBindingSnapshot(
                 participant_identity=identity,
                 binding_generation=generation,
@@ -587,28 +598,10 @@ class BrowserSessionDirector:
 
         if type(request) is not SearchEgressConsentRequestV1:
             raise TypeError("request must be an exact SearchEgressConsentRequestV1")
-        async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("participant does not own the active session")
-            authority = self._search_egress_authority
-            if authority is None:
-                raise RuntimeError("public search egress is unavailable")
-            binding = SearchEgressBindingV1(
-                participant_identity=identity,
-                binding_generation=generation,
-            )
-            self._projection.ensure_capacity()
-            status = authority.consent(binding, request)
-            self._projection.publish(
-                "search_egress_status",
-                cast(dict[str, PublicValue], search_egress_status_to_primitive(status)),
-            )
-            self._touch_activity()
-            return status
+        return await self._change_search_egress(
+            participant_identity,
+            lambda authority, binding: authority.consent(binding, request),
+        )
 
     async def revoke_search_egress(
         self,
@@ -620,13 +613,18 @@ class BrowserSessionDirector:
 
         if type(request) is not SearchEgressRevokeRequestV1:
             raise TypeError("request must be an exact SearchEgressRevokeRequestV1")
+        return await self._change_search_egress(
+            participant_identity,
+            lambda authority, binding: authority.revoke(binding, request),
+        )
+
+    async def _change_search_egress(
+        self,
+        participant_identity: str,
+        change: Callable[[SearchEgressAuthority, SearchEgressBindingV1], SearchEgressStatusV1],
+    ) -> SearchEgressStatusV1:
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("participant does not own the active session")
+            identity, generation = self._require_active_binding(participant_identity)
             authority = self._search_egress_authority
             if authority is None:
                 raise RuntimeError("public search egress is unavailable")
@@ -635,13 +633,16 @@ class BrowserSessionDirector:
                 binding_generation=generation,
             )
             self._projection.ensure_capacity()
-            status = authority.revoke(binding, request)
-            self._projection.publish(
-                "search_egress_status",
-                cast(dict[str, PublicValue], search_egress_status_to_primitive(status)),
-            )
+            status = change(authority, binding)
+            self._publish_search_egress_status(status)
             self._touch_activity()
             return status
+
+    def _publish_search_egress_status(self, status: SearchEgressStatusV1) -> None:
+        self._projection.publish(
+            "search_egress_status",
+            cast(dict[str, PublicValue], search_egress_status_to_primitive(status)),
+        )
 
     async def consent_to_evidence(
         self,
@@ -657,12 +658,7 @@ class BrowserSessionDirector:
         if callback is None:
             raise RuntimeError("evidence capture is unavailable")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("participant does not own the active session")
+            identity, generation = self._require_active_binding(participant_identity)
             binding = BrowserBindingSnapshot(
                 participant_identity=identity,
                 binding_generation=generation,
@@ -767,25 +763,19 @@ class BrowserSessionDirector:
             raise RuntimeError("pending evidence consent has no settlement callback")
         try:
             result = await asyncio.shield(settle())
-        except asyncio.CancelledError:
+        except BaseException as error:
             # A browser reset cancels this passive observer itself.  In contrast,
             # runtime close can settle the host-owned response with cancellation;
             # detach local state in that case without treating the browser as the
-            # owner that cancelled the retained runtime operation.
+            # owner that cancelled the retained runtime operation.  Other
+            # settlement failures detach the same way.
             current = asyncio.current_task()
-            if current is not None and current.cancelling():
+            if (
+                isinstance(error, asyncio.CancelledError)
+                and current is not None
+                and current.cancelling()
+            ):
                 raise
-            async with self._start_lock:
-                if (
-                    self._pending_evidence_consent is task
-                    and self._pending_evidence_consent_operation is operation
-                ):
-                    self._pending_evidence_consent_key = None
-                    self._pending_evidence_consent_operation = None
-                    self._pending_evidence_consent = None
-                    self._pending_evidence_consent_settlement = None
-            return
-        except BaseException:
             async with self._start_lock:
                 if (
                     self._pending_evidence_consent is task
@@ -833,10 +823,7 @@ class BrowserSessionDirector:
                 binding_generation=generation,
             )
         )
-        self._projection.publish(
-            "search_egress_status",
-            cast(dict[str, PublicValue], search_egress_status_to_primitive(authority.status())),
-        )
+        self._publish_search_egress_status(authority.status())
 
     def _invalidate_search_egress(self, identity: str, generation: int) -> None:
         authority = self._search_egress_authority
@@ -848,10 +835,7 @@ class BrowserSessionDirector:
                 binding_generation=generation,
             )
         )
-        self._projection.publish(
-            "search_egress_status",
-            cast(dict[str, PublicValue], search_egress_status_to_primitive(authority.status())),
-        )
+        self._publish_search_egress_status(authority.status())
 
     def require_model_prepared(self) -> None:
         if self._local_model_configuration is not None:
@@ -995,38 +979,9 @@ class BrowserSessionDirector:
             try:
                 if self._on_session_started is not None:
                     self._on_session_started(credential.participant_identity, generation)
-                self._projection.ensure_capacity(
-                    1
-                    + (1 if self._model_configuration is not None else 0)
-                    + (1 if self._search_egress_authority is not None else 0)
-                    + self._projection.open_state_count
-                )
-                self._projection.publish(
-                    "session_ready",
-                    {
-                        "conversationProfile": self._conversation_profile,
-                        "mode": "microphone_or_typed",
-                        **self._speech_runtime.public_data(),
-                    },
-                )
-                if self._model_configuration is not None:
-                    self._projection.publish(
-                        "session_model",
-                        self._model_configuration.public_data(),
-                    )
+                self._publish_session_description()
                 if status_reservation is not None:
-                    status_provider = self._evidence_status
-                    assert status_provider is not None
-                    evidence_status = status_provider()
-                    if type(evidence_status) is not CaptureStatusV1:
-                        raise TypeError("evidence_status must return an exact CaptureStatusV1")
-                    self._projection.publish_capture_status(
-                        status_reservation,
-                        cast(
-                            dict[str, PublicValue],
-                            capture_status_to_primitive(evidence_status),
-                        ),
-                    )
+                    self._publish_capture_status(status_reservation)
                 self._projection.republish_open_state()
             except BaseException as callback_error:
                 cancellations, rollback_error = await self._settle_start_rollback(
@@ -1174,14 +1129,9 @@ class BrowserSessionDirector:
         async with self._model_operation_lock, self._start_lock:
                 if self._projection_resync_consumed:
                     raise RuntimeError("projection resync was already attempted")
-                identity = self._active_identity
-                generation = self._active_generation
-                if identity is None or generation is None:
-                    raise NoBrowserSession("no browser session is active")
-                if participant_identity != identity:
-                    raise PermissionError(
-                        "projection resync participant does not own the active session"
-                    )
+                identity, generation = self._require_active_binding(
+                    participant_identity, "projection resync participant"
+                )
                 reprovision = self._reprovision
                 if reprovision is None:
                     raise RuntimeError("browser session rebind is unavailable")
@@ -1204,20 +1154,10 @@ class BrowserSessionDirector:
                         raise ValueError("reprovision generation must be a new positive generation")
                     self._fresh_view()
                 except BaseException as replacement_error:
-                    (
-                        cancellations,
-                        rollback_generation,
-                        rollback_error,
-                    ) = await self._settle_rebind_rollback(reprovision, identity)
-                    if rollback_generation is not None:
-                        self._active_generation = rollback_generation
-                        if self._search_egress_authority is not None:
-                            self._projection.ensure_capacity()
-                            self._bind_search_egress(identity, rollback_generation)
-                        self._touch_activity()
-                    failures: list[BaseException] = [replacement_error, *cancellations]
-                    if rollback_error is not None:
-                        failures.append(rollback_error)
+                    failures = [
+                        replacement_error,
+                        *await self._roll_back_replacement(reprovision, identity),
+                    ]
                     if len(failures) > 1:
                         raise BaseExceptionGroup(
                             "projection resync and rollback failed",
@@ -1264,6 +1204,19 @@ class BrowserSessionDirector:
         """
 
         self._projection.reset(initial_slots=self._fresh_view_initial_slots())
+        self._publish_session_description()
+        if self._evidence_status is not None:
+            self._publish_capture_status(self._projection.reserve_capture_status())
+        self._projection.republish_open_state()
+        self._last_input_sequence = 0
+        self._last_input_request = None
+        self._last_approval_sequence = 0
+        self._last_approval_request = None
+        self._proposal_decision_binding = None
+        self._last_proposal_decision = None
+        self._last_proposal_failure = None
+
+    def _publish_session_description(self) -> None:
         self._projection.ensure_capacity(
             1
             + (1 if self._model_configuration is not None else 0)
@@ -1283,29 +1236,17 @@ class BrowserSessionDirector:
                 "session_model",
                 self._model_configuration.public_data(),
             )
-        status_reservation = (
-            self._projection.reserve_capture_status()
-            if self._evidence_status is not None
-            else None
+
+    def _publish_capture_status(self, reservation: ProjectionReservation) -> None:
+        status_provider = self._evidence_status
+        assert status_provider is not None
+        status = status_provider()
+        if type(status) is not CaptureStatusV1:
+            raise TypeError("evidence_status must return an exact CaptureStatusV1")
+        self._projection.publish_capture_status(
+            reservation,
+            cast(dict[str, PublicValue], capture_status_to_primitive(status)),
         )
-        if status_reservation is not None:
-            status_provider = self._evidence_status
-            assert status_provider is not None
-            status = status_provider()
-            if type(status) is not CaptureStatusV1:
-                raise TypeError("evidence_status must return an exact CaptureStatusV1")
-            self._projection.publish_capture_status(
-                status_reservation,
-                cast(dict[str, PublicValue], capture_status_to_primitive(status)),
-            )
-        self._projection.republish_open_state()
-        self._last_input_sequence = 0
-        self._last_input_request = None
-        self._last_approval_sequence = 0
-        self._last_approval_request = None
-        self._proposal_decision_binding = None
-        self._last_proposal_decision = None
-        self._last_proposal_failure = None
 
     async def _rebind_after_model_operations(
         self,
@@ -1318,17 +1259,7 @@ class BrowserSessionDirector:
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
-        if request_id is not None:
-            if type(request_id) is not str:
-                raise TypeError("request_id must be an exact built-in string or None")
-            suffix = request_id.removeprefix("rebind_")
-            if (
-                not 16 <= len(request_id) <= 128
-                or suffix == request_id
-                or not suffix.isascii()
-                or not suffix.replace("-", "").isalnum()
-            ):
-                raise ValueError("request_id must be a canonical rebind request identifier")
+        _validate_rebind_request_id(request_id)
         async with self._start_lock:
             identity = self._active_identity
             generation = self._active_generation
@@ -1366,18 +1297,10 @@ class BrowserSessionDirector:
                     self._fresh_view()
                 self._touch_activity()
             except BaseException as replacement_error:
-                cancellations, rollback_generation, rollback_error = (
-                    await self._settle_rebind_rollback(reprovision, identity)
-                )
-                if rollback_generation is not None:
-                    self._active_generation = rollback_generation
-                    if self._search_egress_authority is not None:
-                        self._projection.ensure_capacity()
-                        self._bind_search_egress(identity, rollback_generation)
-                    self._touch_activity()
-                failures: list[BaseException] = [replacement_error, *cancellations]
-                if rollback_error is not None:
-                    failures.append(rollback_error)
+                failures = [
+                    replacement_error,
+                    *await self._roll_back_replacement(reprovision, identity),
+                ]
                 if len(failures) > 1:
                     raise BaseExceptionGroup(
                         "browser session rebind and rollback failed",
@@ -1423,12 +1346,9 @@ class BrowserSessionDirector:
         if not 1 <= media_incarnation <= (1 << 53) - 1:
             raise ValueError("media_incarnation is outside the browser-safe range")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("media participant does not own the active session")
+            identity, generation = self._require_active_binding(
+                participant_identity, "media participant"
+            )
             activate = self._activate_media
             if activate is None:
                 raise RuntimeError("media activation authority is unavailable")
@@ -1454,14 +1374,9 @@ class BrowserSessionDirector:
         if type(diagnostic) is not BrowserAudioDiagnostic:
             raise TypeError("diagnostic must be an exact BrowserAudioDiagnostic")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError(
-                    "audio diagnostic participant does not own the active session"
-                )
+            identity, generation = self._require_active_binding(
+                participant_identity, "audio diagnostic participant"
+            )
             previous = self._audio_diagnostics.get(diagnostic.stream_id)
             if previous is not None:
                 if diagnostic == previous:
@@ -1518,12 +1433,9 @@ class BrowserSessionDirector:
         if not text.strip() or len(text) > 4096:
             raise ValueError("text must contain 1 to 4096 characters")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("typed participant does not own the active session")
+            identity, generation = self._require_active_binding(
+                participant_identity, "typed participant"
+            )
             request = (sequence, text)
             if sequence == self._last_input_sequence and request == self._last_input_request:
                 self._touch_activity()
@@ -1581,12 +1493,9 @@ class BrowserSessionDirector:
         if not 1 <= turn_generation <= (1 << 53) - 1:
             raise ValueError("turn_generation must be a positive safe integer")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("yield participant does not own the active session")
+            identity, generation = self._require_active_binding(
+                participant_identity, "yield participant"
+            )
             callback = self._yield_speech
             if callback is None:
                 raise RuntimeError("exact speech yield is unavailable")
@@ -1625,12 +1534,9 @@ class BrowserSessionDirector:
         if not 1 <= sequence <= (1 << 53) - 1:
             raise ValueError("sequence is outside the supported range")
         async with self._start_lock:
-            identity = self._active_identity
-            generation = self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("approval participant does not own the active session")
+            identity, generation = self._require_active_binding(
+                participant_identity, "approval participant"
+            )
             request = (sequence, approval_id, decision)
             if (
                 sequence == self._last_approval_sequence
@@ -1855,10 +1761,7 @@ class BrowserSessionDirector:
             raise TypeError("participant_identity must be an exact string")
         selected = require_output_style(style)
         async with self._start_lock:
-            if self._active_identity is None or self._active_generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != self._active_identity:
-                raise PermissionError("style participant does not own the active session")
+            self._require_active_binding(participant_identity, "style participant")
             selector = self._select_output_style
             if selector is None:
                 raise RuntimeError("output style selection is unavailable")
@@ -1888,11 +1791,9 @@ class BrowserSessionDirector:
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact string")
         async with self._start_lock:
-            identity, generation = self._active_identity, self._active_generation
-            if identity is None or generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != identity:
-                raise PermissionError("delete participant does not own the active session")
+            identity, generation = self._require_active_binding(
+                participant_identity, "delete participant"
+            )
             operation = self._delete_voice_conversation
             if operation is None:
                 raise RuntimeError("voice delete is unavailable")
@@ -1907,10 +1808,7 @@ class BrowserSessionDirector:
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact string")
         async with self._start_lock:
-            if self._active_identity is None or self._active_generation is None:
-                raise NoBrowserSession("no browser session is active")
-            if participant_identity != self._active_identity:
-                raise PermissionError("delete participant does not own the active session")
+            self._require_active_binding(participant_identity, "delete participant")
             status = self._voice_delete_status
             state = "unavailable" if status is None else status()
             if type(state) is not str or state not in {
@@ -1930,17 +1828,7 @@ class BrowserSessionDirector:
 
         if type(participant_identity) is not str:
             raise TypeError("participant_identity must be an exact built-in string")
-        if request_id is not None:
-            if type(request_id) is not str:
-                raise TypeError("request_id must be an exact built-in string or None")
-            suffix = request_id.removeprefix("rebind_")
-            if (
-                not 16 <= len(request_id) <= 128
-                or suffix == request_id
-                or not suffix.isascii()
-                or not suffix.replace("-", "").isalnum()
-            ):
-                raise ValueError("request_id must be a canonical rebind request identifier")
+        _validate_rebind_request_id(request_id)
         async with self._start_lock:
             identity = self._active_identity
             generation = self._active_generation
@@ -2061,6 +1949,25 @@ class BrowserSessionDirector:
             return tuple(cancellations), None, error
         return tuple(cancellations), generation, None
 
+    async def _roll_back_replacement(
+        self,
+        reprovision: Callable[[str], Awaitable[int]],
+        identity: str,
+    ) -> list[BaseException]:
+        cancellations, rollback_generation, rollback_error = await self._settle_rebind_rollback(
+            reprovision, identity
+        )
+        if rollback_generation is not None:
+            self._active_generation = rollback_generation
+            if self._search_egress_authority is not None:
+                self._projection.ensure_capacity()
+                self._bind_search_egress(identity, rollback_generation)
+            self._touch_activity()
+        failures: list[BaseException] = [*cancellations]
+        if rollback_error is not None:
+            failures.append(rollback_error)
+        return failures
+
     def _begin_rebind_finalization(
         self,
         rollback: asyncio.Task[int],
@@ -2145,13 +2052,23 @@ class BrowserSessionDirector:
         if pending is not None and not pending.done():
             pending.cancel()
 
-    def _model_snapshot(self, participant_identity: str) -> tuple[str, int, int]:
+    def _require_active_binding(
+        self,
+        participant_identity: str,
+        owner: str = "participant",
+    ) -> tuple[str, int]:
         identity = self._active_identity
         generation = self._active_generation
         if identity is None or generation is None:
             raise NoBrowserSession("no browser session is active")
         if participant_identity != identity:
-            raise PermissionError("model participant does not own the active session")
+            raise PermissionError(f"{owner} does not own the active session")
+        return identity, generation
+
+    def _model_snapshot(self, participant_identity: str) -> tuple[str, int, int]:
+        identity, generation = self._require_active_binding(
+            participant_identity, "model participant"
+        )
         return identity, generation, self._model_operation_epoch
 
     def _require_current_model_snapshot(

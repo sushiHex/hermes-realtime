@@ -11,10 +11,8 @@ from enum import StrEnum
 from typing import Protocol
 
 from .context import (
-    ActiveTaskSummary,
     ConversationContextSnapshot,
     ConversationContextStore,
-    ConversationMessage,
     PrivateRunDisclosureError,
 )
 from .tasks import ConversationTaskController, TaskTerminalOutcome
@@ -60,6 +58,14 @@ def _validate_text(text: str | None, *, kind: str) -> None:
         raise PrivateRunDisclosureError("update text contains a private run token")
 
 
+def _operation_failed(operation: asyncio.Task[None]) -> bool:
+    if not operation.done():
+        return False
+    if operation.cancelled():
+        return True
+    return operation.exception() is not None
+
+
 def _trusted_completion(update: TaskTerminalOutcome) -> TaskTerminalOutcome:
     if type(update) is not TaskTerminalOutcome:
         raise TypeError("completion must be an exact TaskTerminalOutcome")
@@ -76,19 +82,8 @@ def _trusted_snapshot(snapshot: ConversationContextSnapshot) -> ConversationCont
         raise TypeError("context must be an exact ConversationContextSnapshot")
     return ConversationContextSnapshot(
         revision=snapshot.revision,
-        messages=tuple(
-            ConversationMessage(
-                role=message.role,
-                text=message.text,
-                interrupted=message.interrupted,
-                source=message.source,
-            )
-            for message in snapshot.messages
-        ),
-        active_tasks=tuple(
-            ActiveTaskSummary(task_id=task.task_id, objective=task.objective)
-            for task in snapshot.active_tasks
-        ),
+        messages=snapshot.messages,
+        active_tasks=snapshot.active_tasks,
         terminal_task_count=snapshot.terminal_task_count,
         memory=snapshot.memory,
         recent_task_results=snapshot.recent_task_results,
@@ -527,21 +522,13 @@ class ConversationUpdateDirector:
 
     async def close(self) -> None:
         operation = self._close_operation
-        if operation is None or self._close_failed(operation):
+        if operation is None or _operation_failed(operation):
             operation = asyncio.create_task(
                 self._close_owned(),
                 name="conversation-update-director-close",
             )
             self._close_operation = operation
         await asyncio.shield(operation)
-
-    @staticmethod
-    def _close_failed(operation: asyncio.Task[None]) -> bool:
-        if not operation.done():
-            return False
-        if operation.cancelled():
-            return True
-        return operation.exception() is not None
 
     async def _close_owned(self) -> None:
         async with self._condition:

@@ -14,11 +14,11 @@ import secrets
 import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Self, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
@@ -37,6 +37,7 @@ from hermes_realtime.protocol import (
     VoiceArchiveAckEvent,
     VoiceArchiveEvent,
     VoiceArchiveRefusedEvent,
+    VoiceEvent,
     VoiceForgetAckEvent,
     VoiceForgetEvent,
     VoiceForgetRefusedEvent,
@@ -290,24 +291,24 @@ class LocalHermesBridgeServer:
         if runtime is not None and type(runtime) is not RuntimeAttestation:
             raise TypeError("runtime must be an exact RuntimeAttestation or None")
         self._runtime = runtime
-        self._offered = (
-            frozenset({VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY})
-            if voice is not None
-            and interval is not None
-            and callable(getattr(voice, "review", None))
-            else frozenset({VOICE_ARCHIVE_CAPABILITY})
-            if voice is not None
-            else frozenset()
-        ) | (frozenset({RUNTIME_ATTESTATION_CAPABILITY}) if runtime is not None else frozenset())
-        self._server: asyncio.Server | None = None
-        if (getattr(voice, "memory_available", False) is True
-                and callable(getattr(voice, "memory", None))):
-            self._offered |= frozenset({VOICE_MEMORY_CAPABILITY})
-        if (getattr(voice, "forget_available", False) is True
-                and callable(getattr(voice, "forget", None))):
-            self._offered |= frozenset({VOICE_FORGET_CAPABILITY})
         # Required, never merely offered: a hello without it is refused.
-        self._offered |= frozenset({MUTUAL_AUTH_CAPABILITY})
+        offered = {MUTUAL_AUTH_CAPABILITY}
+        if voice is not None:
+            offered.add(VOICE_ARCHIVE_CAPABILITY)
+            if interval is not None and callable(getattr(voice, "review", None)):
+                offered.add(VOICE_REVIEW_CAPABILITY)
+            if getattr(voice, "memory_available", False) is True and callable(
+                getattr(voice, "memory", None)
+            ):
+                offered.add(VOICE_MEMORY_CAPABILITY)
+            if getattr(voice, "forget_available", False) is True and callable(
+                getattr(voice, "forget", None)
+            ):
+                offered.add(VOICE_FORGET_CAPABILITY)
+        if runtime is not None:
+            offered.add(RUNTIME_ATTESTATION_CAPABILITY)
+        self._offered = frozenset(offered)
+        self._server: asyncio.Server | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe_completion: Callable[[], None] | None = None
         self._completion_tasks: set[asyncio.Task[WorkCompletedEvent | None]] = set()
@@ -537,15 +538,7 @@ class LocalHermesBridgeServer:
         if not claimed:
             return None
         try:
-            if route is None:
-                return await self._finish_completion(
-                    run_id,
-                    status=status,
-                    summary=summary,
-                    reason=reason,
-                    route=None,
-                )
-            async with route.connection.event_lock:
+            async with nullcontext() if route is None else route.connection.event_lock:
                 return await self._finish_completion(
                     run_id,
                     status=status,
@@ -682,10 +675,11 @@ class LocalHermesBridgeServer:
         try:
             participant_id, negotiated = await self._authenticate(reader, connection)
             while raw := await reader.readline():
-                if _event_type(raw) == "voice_memory":
+                kind = _event_type(raw)
+                if kind == "voice_memory":
                     await self._route_memory(connection, negotiated, raw, reader)
                     return
-                if _event_type(raw) in VOICE_EVENT_TYPES:
+                if kind in VOICE_EVENT_TYPES:
                     await self._route_voice(connection, negotiated, raw)
                     continue
                 event = parse_event(raw)
@@ -1187,16 +1181,8 @@ class LocalHermesBridgeClient:
             raise BridgeProtocolError("the companion did not advertise the voice capability")
         if type(event) is not VoiceArchiveEvent:
             raise TypeError("event must be an exact VoiceArchiveEvent")
-        payload = event.model_dump_json().encode("utf-8") + b"\n"
-        if len(payload) > _MAX_LINE_BYTES:
-            raise BridgeProtocolError("Hermes bridge event exceeds the line limit")
-        async with self._write_lock:
-            self._writer.write(payload)
-            await self._writer.drain()
-        raw = await self._reader.readline()
-        if not raw:
-            raise BridgeProtocolError("the companion closed before answering")
-        reply = parse_voice_event(raw)
+        await self._write_event(event)
+        reply = await self._read_voice_reply()
         if not isinstance(reply, (VoiceArchiveAckEvent, VoiceArchiveRefusedEvent)):
             raise BridgeProtocolError("the companion answered with a request")
         return reply
@@ -1208,16 +1194,8 @@ class LocalHermesBridgeClient:
             raise BridgeProtocolError("the companion did not advertise voice review")
         if type(event) is not VoiceReviewEvent:
             raise TypeError("event must be an exact VoiceReviewEvent")
-        payload = event.model_dump_json().encode("utf-8") + b"\n"
-        if len(payload) > _MAX_LINE_BYTES:
-            raise BridgeProtocolError("Hermes bridge event exceeds the line limit")
-        async with self._write_lock:
-            self._writer.write(payload)
-            await self._writer.drain()
-        raw = await self._reader.readline()
-        if not raw:
-            raise BridgeProtocolError("the companion closed before answering")
-        reply = parse_voice_event(raw)
+        await self._write_event(event)
+        reply = await self._read_voice_reply()
         if not isinstance(reply, (VoiceReviewAckEvent, VoiceReviewRefusedEvent)):
             raise BridgeProtocolError("the companion answered with another voice event")
         return reply
@@ -1230,10 +1208,7 @@ class LocalHermesBridgeClient:
         if type(event) is not VoiceForgetEvent:
             raise TypeError("forget request must be exact")
         await self._send_json(event.model_dump(mode="json"))
-        raw = await self._reader.readline()
-        if not raw:
-            raise BridgeProtocolError("the companion closed before answering")
-        reply = parse_voice_event(raw)
+        reply = await self._read_voice_reply()
         if type(reply) not in (VoiceForgetAckEvent, VoiceForgetRefusedEvent):
             raise BridgeProtocolError("the companion answered with another voice event")
         return cast(VoiceForgetAckEvent | VoiceForgetRefusedEvent, reply)
@@ -1274,6 +1249,13 @@ class LocalHermesBridgeClient:
         *,
         admission_guard: Callable[[], None] | None = None,
     ) -> None:
+        await self._write_event(event, admission_guard)
+
+    async def _write_event(
+        self,
+        event: BaseModel,
+        admission_guard: Callable[[], None] | None = None,
+    ) -> None:
         payload = event.model_dump_json().encode("utf-8") + b"\n"
         if len(payload) > _MAX_LINE_BYTES:
             raise BridgeProtocolError("Hermes bridge event exceeds the line limit")
@@ -1282,6 +1264,12 @@ class LocalHermesBridgeClient:
                 admission_guard()
             self._writer.write(payload)
             await self._writer.drain()
+
+    async def _read_voice_reply(self) -> VoiceEvent:
+        raw = await self._reader.readline()
+        if not raw:
+            raise BridgeProtocolError("the companion closed before answering")
+        return parse_voice_event(raw)
 
     async def receive(self) -> ProtocolEvent:
         raw = await self._reader.readline()

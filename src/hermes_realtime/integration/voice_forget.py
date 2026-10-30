@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from functools import partial
 from typing import Protocol
 
 from hermes_realtime.integration.bridge import LocalHermesBridgeClient
@@ -35,16 +36,14 @@ class VoiceForgetLink(Protocol):
 def forget_connector(
     *, host: str, port: int, token: str
 ) -> Callable[[], Awaitable[VoiceForgetLink]]:
-    async def connect() -> VoiceForgetLink:
-        return await LocalHermesBridgeClient.connect(
-            host=host,
-            port=port,
-            token=token,
-            participant_id="voice-forget",
-            capabilities=(VOICE_FORGET_CAPABILITY,),
-        )
-
-    return connect
+    return partial(
+        LocalHermesBridgeClient.connect,
+        host=host,
+        port=port,
+        token=token,
+        participant_id="voice-forget",
+        capabilities=(VOICE_FORGET_CAPABILITY,),
+    )
 
 
 def _marker(evidence: dict[str, str | int]) -> None:

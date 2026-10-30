@@ -343,6 +343,22 @@ def test_owned_runner_forwards_loader_from_its_process_owner(
     assert result["category"] == "refused" and state.stops == 1
 
 
+@pytest.mark.parametrize("startup,expected", [(None, 360), (180, 480), (600, 900)])
+def test_owned_watchdog_preserves_work_budget_after_longer_startup(
+    owned_runner_before_gateway, monkeypatch, startup, expected,
+):
+    state = owned_runner_before_gateway
+    intervals = []
+
+    def timer(seconds, *_args, **_kwargs):
+        intervals.append(seconds)
+        return SimpleNamespace(start=lambda: None, cancel=lambda: None)
+
+    monkeypatch.setattr(state.task, "threading", SimpleNamespace(Timer=timer))
+    state.task.run_owned(state.manifest, startup_timeout_seconds=startup)
+    assert intervals == [expected]
+
+
 @pytest.mark.parametrize("loader", [None, object()])
 def test_owned_runner_rejects_missing_factory_loader_before_native_fallback(
     owned_runner_before_gateway, loader, capsys,

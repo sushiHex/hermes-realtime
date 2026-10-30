@@ -7,6 +7,7 @@ import contextlib
 import json
 import math
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Protocol
 
 from hermes_realtime.integration.bridge import LocalHermesBridgeClient
@@ -52,16 +53,14 @@ def review_idle_allowed(*, speech_active: bool, foreground_tasks: int) -> bool:
 def review_connector(
     *, host: str, port: int, token: str
 ) -> Callable[[], Awaitable[VoiceReviewLink]]:
-    async def connect() -> VoiceReviewLink:
-        return await LocalHermesBridgeClient.connect(
-            host=host,
-            port=port,
-            token=token,
-            participant_id="voice-review",
-            capabilities=(VOICE_REVIEW_CAPABILITY,),
-        )
-
-    return connect
+    return partial(
+        LocalHermesBridgeClient.connect,
+        host=host,
+        port=port,
+        token=token,
+        participant_id="voice-review",
+        capabilities=(VOICE_REVIEW_CAPABILITY,),
+    )
 
 
 class VoiceReviewSender:
@@ -83,24 +82,15 @@ class VoiceReviewSender:
             raise TypeError("writer must be an exact VoiceTailWriter")
         if not callable(connect) or not callable(idle_allowed):
             raise TypeError("connect and idle_allowed must be callable")
-        if any(
-            type(v) not in (int, float)
-            for v in (
-                idle_seconds,
-                reply_timeout,
-                close_timeout,
-                initial_backoff_seconds,
-                max_backoff_seconds,
-            )
-        ) or not all(
-            math.isfinite(v)
-            for v in (
-                idle_seconds,
-                reply_timeout,
-                close_timeout,
-                initial_backoff_seconds,
-                max_backoff_seconds,
-            )
+        values = (
+            idle_seconds,
+            reply_timeout,
+            close_timeout,
+            initial_backoff_seconds,
+            max_backoff_seconds,
+        )
+        if any(type(v) not in (int, float) for v in values) or not all(
+            math.isfinite(v) for v in values
         ):
             raise ValueError("review timing must be finite")
         if not 0 < idle_seconds <= 3600 or not 0 < reply_timeout <= 3600:

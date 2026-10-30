@@ -92,9 +92,6 @@ class EventKind(StrEnum):
     SESSION_TAINTED = "session_tainted"
 
 
-EvidenceEventKind = EventKind
-
-
 class PersistentSessionState(StrEnum):
     OPEN = "open"
     SEALED = "sealed"
@@ -378,17 +375,11 @@ class ExpiryMode(StrEnum):
     ERASE_STUCK = "erase_stuck"
 
 
-SessionExpiryMode = ExpiryMode
-
-
 class EligibilityOutcome(StrEnum):
     ELIGIBLE = "eligible"
     NEVER_PERSISTED = "never_persisted"
     PERSISTED_BUT_EXCLUDED = "persisted_but_excluded"
     PURGED = "purged"
-
-
-EvidenceQualificationOutcome = EligibilityOutcome
 
 
 _EnumT = TypeVar("_EnumT", bound=StrEnum)
@@ -599,11 +590,13 @@ def _decode_json_document(
     raise _EvidenceTypeError("JSON document must be exact built-in bytes")
 
 
-def _parse_json_object(
+def parse_strict_json_object(
     document: object,
     *,
-    max_bytes: int,
+    max_bytes: int = _DEFAULT_JSON_LIMIT,
 ) -> dict[str, object]:
+    """Parse exact UTF-8 bytes as strict, finite, integer-only JSON object data."""
+
     text = _decode_json_document(document, max_bytes)
     try:
         parsed: object = json.loads(
@@ -620,16 +613,6 @@ def _parse_json_object(
     if type(validated) is not dict:
         raise _EvidenceTypeError("strict JSON root must be an object")
     return cast(dict[str, object], validated)
-
-
-def parse_strict_json_object(
-    document: object,
-    *,
-    max_bytes: int = _DEFAULT_JSON_LIMIT,
-) -> dict[str, object]:
-    """Parse exact UTF-8 bytes as strict, finite, integer-only JSON object data."""
-
-    return _parse_json_object(document, max_bytes=max_bytes)
 
 
 class _FinalModel:
@@ -975,29 +958,21 @@ _PAYLOAD_CLASSES = (
     SessionTaintedPayloadV1,
 )
 
+# Payload fields whose primitive form is the exact enum value.
+_PAYLOAD_ENUM_FIELDS: dict[str, type[StrEnum]] = {
+    "source": InputSource,
+    "turn_kind": TurnKind,
+    "terminal_disposition": TerminalDisposition,
+    "terminal_reason": TerminalReason,
+    "close_reason": BindingCloseReason,
+    "taint_code": TaintCode,
+}
+
 
 def event_payload_to_primitive(payload: EvidencePayloadV1) -> dict[str, object]:
     """Project one exact payload to a fresh exact-key primitive dictionary."""
 
     payload = _reconstruct_payload(payload)
-    if type(payload) is SessionOpenedPayloadV1:
-        return {
-            "consent_epoch_id": payload.consent_epoch_id,
-            "binding_id": payload.binding_id,
-            "consent_version": payload.consent_version,
-            "disclosure_digest": payload.disclosure_digest,
-            "retention_hours": payload.retention_hours,
-            "microphone_accepted": payload.microphone_accepted,
-            "typed_accepted": payload.typed_accepted,
-            "predecessor_session_id": payload.predecessor_session_id,
-        }
-    if type(payload) is BindingOpenedPayloadV1:
-        return {
-            "binding_id": payload.binding_id,
-            "binding_generation": payload.binding_generation,
-            "microphone_available": payload.microphone_available,
-            "typed_available": payload.typed_available,
-        }
     if type(payload) is TurnOpenedPayloadV1:
         opened_result: dict[str, object] = {
             "evidence_turn_id": payload.evidence_turn_id,
@@ -1008,27 +983,6 @@ def event_payload_to_primitive(payload: EvidencePayloadV1) -> dict[str, object]:
         if payload.replay_of_evidence_turn_id is not None:
             opened_result["replay_of_evidence_turn_id"] = payload.replay_of_evidence_turn_id
         return opened_result
-    if type(payload) is UserFinalAcceptedPayloadV1:
-        return {
-            "utterance_id": payload.utterance_id,
-            "evidence_turn_id": payload.evidence_turn_id,
-            "source": payload.source.value,
-            "routing_disposition": payload.routing_disposition,
-            "text": payload.text,
-        }
-    if type(payload) is CommandRoutedPayloadV1:
-        return {
-            "utterance_id": payload.utterance_id,
-            "source": payload.source.value,
-            "routing_disposition": payload.routing_disposition,
-        }
-    if type(payload) is AssistantSegmentGeneratedPayloadV1:
-        return {
-            "evidence_turn_id": payload.evidence_turn_id,
-            "evidence_segment_id": payload.evidence_segment_id,
-            "segment_ordinal": payload.segment_ordinal,
-            "text": payload.text,
-        }
     if type(payload) is AssistantChunkTransportConfirmedFullPayloadV1:
         confirmed_result: dict[str, object] = {
             "evidence_turn_id": payload.evidence_turn_id,
@@ -1041,46 +995,11 @@ def event_payload_to_primitive(payload: EvidencePayloadV1) -> dict[str, object]:
             confirmed_result["evidence_segment_id"] = payload.evidence_segment_id
             confirmed_result["text"] = payload.text
         return confirmed_result
-    if type(payload) is TurnSnapshotPayloadV1:
-        return {
-            "evidence_turn_id": payload.evidence_turn_id,
-            "turn_kind": payload.turn_kind.value,
-            "generated_segment_count": payload.generated_segment_count,
-            "queued_chunk_count": payload.queued_chunk_count,
-            "started_chunk_count": payload.started_chunk_count,
-            "transport_confirmed_full_count": payload.transport_confirmed_full_count,
-            "model_context_admitted": payload.model_context_admitted,
-            "assistant_delivery_context_recorded": (
-                payload.assistant_delivery_context_recorded
-            ),
-        }
-    if type(payload) is TurnSettledPayloadV1:
-        return {
-            "evidence_turn_id": payload.evidence_turn_id,
-            "terminal_disposition": payload.terminal_disposition.value,
-            "terminal_reason": payload.terminal_reason.value,
-            "context_committed": payload.context_committed,
-            "generated_segment_count": payload.generated_segment_count,
-            "transport_confirmed_full_count": payload.transport_confirmed_full_count,
-        }
-    if type(payload) is BindingClosedPayloadV1:
-        return {
-            "binding_id": payload.binding_id,
-            "close_reason": payload.close_reason.value,
-        }
-    if type(payload) is SessionSealRequestedPayloadV1:
-        return {
-            "final_event_sequence": payload.final_event_sequence,
-            "consent_epoch_id": payload.consent_epoch_id,
-            "consent_version": payload.consent_version,
-            "disclosure_digest": payload.disclosure_digest,
-        }
-    if type(payload) is SessionTaintedPayloadV1:
-        return {"taint_code": payload.taint_code.value}
-    raise _EvidenceTypeError("payload must be one exact V1 payload class")
-
-
-event_payload_to_primitive_v1 = event_payload_to_primitive
+    result: dict[str, object] = {}
+    for name in _payload_field_names(type(payload)):
+        value = getattr(payload, name)
+        result[name] = value.value if name in _PAYLOAD_ENUM_FIELDS else value
+    return result
 
 
 def _payload_class(event_kind: EventKind) -> type[_PayloadMapping]:
@@ -1157,53 +1076,7 @@ def validate_event_payload(
     if type(payload) is expected_class:
         result = _reconstruct_payload(cast(EvidencePayloadV1, payload))
     elif type(payload) is dict:
-        if kind is EventKind.SESSION_OPENED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "consent_epoch_id",
-                        "binding_id",
-                        "consent_version",
-                        "disclosure_digest",
-                        "retention_hours",
-                        "microphone_accepted",
-                        "typed_accepted",
-                        "predecessor_session_id",
-                    }
-                ),
-            )
-            result = SessionOpenedPayloadV1(
-                consent_epoch_id=cast(str, data["consent_epoch_id"]),
-                binding_id=cast(str, data["binding_id"]),
-                consent_version=cast(str, data["consent_version"]),
-                disclosure_digest=cast(str, data["disclosure_digest"]),
-                retention_hours=cast(int, data["retention_hours"]),
-                microphone_accepted=cast(bool, data["microphone_accepted"]),
-                typed_accepted=cast(bool, data["typed_accepted"]),
-                predecessor_session_id=cast(str | None, data["predecessor_session_id"]),
-            )
-        elif kind is EventKind.BINDING_OPENED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "binding_id",
-                        "binding_generation",
-                        "microphone_available",
-                        "typed_available",
-                    }
-                ),
-            )
-            result = BindingOpenedPayloadV1(
-                binding_id=cast(str, data["binding_id"]),
-                binding_generation=cast(int, data["binding_generation"]),
-                microphone_available=cast(bool, data["microphone_available"]),
-                typed_available=cast(bool, data["typed_available"]),
-            )
-        elif kind is EventKind.TURN_OPENED:
-            if type(payload) is not dict:
-                raise _EvidenceTypeError("turn_opened payload must be an exact dict")
+        if kind is EventKind.TURN_OPENED:
             raw = cast(dict[str, object], payload)
             if "turn_kind" not in raw:
                 raise _EvidenceValueError("turn_opened payload is missing turn_kind")
@@ -1226,49 +1099,6 @@ def validate_event_payload(
                     str | None,
                     data.get("replay_of_evidence_turn_id"),
                 ),
-            )
-        elif kind is EventKind.USER_FINAL_ACCEPTED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "utterance_id",
-                        "evidence_turn_id",
-                        "source",
-                        "routing_disposition",
-                        "text",
-                    }
-                ),
-            )
-            result = UserFinalAcceptedPayloadV1(
-                utterance_id=cast(str, data["utterance_id"]),
-                evidence_turn_id=cast(str, data["evidence_turn_id"]),
-                source=_enum_from_primitive(data["source"], InputSource, "source"),
-                routing_disposition=cast(str, data["routing_disposition"]),
-                text=cast(str, data["text"]),
-            )
-        elif kind is EventKind.COMMAND_ROUTED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset({"utterance_id", "source", "routing_disposition"}),
-            )
-            result = CommandRoutedPayloadV1(
-                utterance_id=cast(str, data["utterance_id"]),
-                source=_enum_from_primitive(data["source"], InputSource, "source"),
-                routing_disposition=cast(str, data["routing_disposition"]),
-            )
-        elif kind is EventKind.ASSISTANT_SEGMENT_GENERATED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {"evidence_turn_id", "evidence_segment_id", "segment_ordinal", "text"}
-                ),
-            )
-            result = AssistantSegmentGeneratedPayloadV1(
-                evidence_turn_id=cast(str, data["evidence_turn_id"]),
-                evidence_segment_id=cast(str, data["evidence_segment_id"]),
-                segment_ordinal=cast(int, data["segment_ordinal"]),
-                text=cast(str, data["text"]),
             )
         elif kind is EventKind.ASSISTANT_CHUNK_TRANSPORT_CONFIRMED_FULL:
             base = {
@@ -1295,109 +1125,19 @@ def validate_event_payload(
                 chunk_ordinal=cast(int, data["chunk_ordinal"]),
                 text=cast(str | None, data.get("text")),
             )
-        elif kind is EventKind.TURN_SNAPSHOT:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "evidence_turn_id",
-                        "turn_kind",
-                        "generated_segment_count",
-                        "queued_chunk_count",
-                        "started_chunk_count",
-                        "transport_confirmed_full_count",
-                        "model_context_admitted",
-                        "assistant_delivery_context_recorded",
-                    }
-                ),
-            )
-            result = TurnSnapshotPayloadV1(
-                evidence_turn_id=cast(str, data["evidence_turn_id"]),
-                turn_kind=_enum_from_primitive(data["turn_kind"], TurnKind, "turn_kind"),
-                generated_segment_count=cast(int, data["generated_segment_count"]),
-                queued_chunk_count=cast(int, data["queued_chunk_count"]),
-                started_chunk_count=cast(int, data["started_chunk_count"]),
-                transport_confirmed_full_count=cast(
-                    int,
-                    data["transport_confirmed_full_count"],
-                ),
-                model_context_admitted=cast(bool, data["model_context_admitted"]),
-                assistant_delivery_context_recorded=cast(
-                    bool,
-                    data["assistant_delivery_context_recorded"],
-                ),
-            )
-        elif kind is EventKind.TURN_SETTLED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "evidence_turn_id",
-                        "terminal_disposition",
-                        "terminal_reason",
-                        "context_committed",
-                        "generated_segment_count",
-                        "transport_confirmed_full_count",
-                    }
-                ),
-            )
-            result = TurnSettledPayloadV1(
-                evidence_turn_id=cast(str, data["evidence_turn_id"]),
-                terminal_disposition=_enum_from_primitive(
-                    data["terminal_disposition"],
-                    TerminalDisposition,
-                    "terminal_disposition",
-                ),
-                terminal_reason=_enum_from_primitive(
-                    data["terminal_reason"],
-                    TerminalReason,
-                    "terminal_reason",
-                ),
-                context_committed=cast(bool, data["context_committed"]),
-                generated_segment_count=cast(int, data["generated_segment_count"]),
-                transport_confirmed_full_count=cast(
-                    int,
-                    data["transport_confirmed_full_count"],
-                ),
-            )
-        elif kind is EventKind.BINDING_CLOSED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset({"binding_id", "close_reason"}),
-            )
-            result = BindingClosedPayloadV1(
-                binding_id=cast(str, data["binding_id"]),
-                close_reason=_enum_from_primitive(
-                    data["close_reason"],
-                    BindingCloseReason,
-                    "close_reason",
-                ),
-            )
-        elif kind is EventKind.SESSION_SEAL_REQUESTED:
-            data = _expect_payload_keys(
-                payload,
-                frozenset(
-                    {
-                        "final_event_sequence",
-                        "consent_epoch_id",
-                        "consent_version",
-                        "disclosure_digest",
-                    }
-                ),
-            )
-            result = SessionSealRequestedPayloadV1(
-                final_event_sequence=cast(int, data["final_event_sequence"]),
-                consent_epoch_id=cast(str, data["consent_epoch_id"]),
-                consent_version=cast(str, data["consent_version"]),
-                disclosure_digest=cast(str, data["disclosure_digest"]),
-            )
-        elif kind is EventKind.SESSION_TAINTED:
-            data = _expect_payload_keys(payload, frozenset({"taint_code"}))
-            result = SessionTaintedPayloadV1(
-                taint_code=_enum_from_primitive(data["taint_code"], TaintCode, "taint_code")
-            )
         else:
-            raise _EvidenceValueError("unsupported V1 event kind")
+            names = _payload_field_names(expected_class)
+            data = _expect_payload_keys(payload, frozenset(names))
+            result = cast(Any, expected_class)(
+                **{
+                    name: (
+                        _enum_from_primitive(data[name], _PAYLOAD_ENUM_FIELDS[name], name)
+                        if name in _PAYLOAD_ENUM_FIELDS
+                        else data[name]
+                    )
+                    for name in names
+                }
+            )
     else:
         raise _EvidenceTypeError("event kind requires its exact payload class or primitive dict")
 
@@ -1425,10 +1165,7 @@ def parse_event_payload_json(
     *,
     turn_kind: TurnKind | None = None,
 ) -> EvidencePayloadV1:
-    data = _parse_json_object(
-        document,
-        max_bytes=_EVENT_JSON_LIMIT,
-    )
+    data = parse_strict_json_object(document, max_bytes=_EVENT_JSON_LIMIT)
     return validate_event_payload(event_kind, data, turn_kind=turn_kind)
 
 
@@ -1502,9 +1239,6 @@ def evidence_snapshot_to_primitive(snapshot: EvidenceSnapshotV1) -> dict[str, ob
     }
 
 
-evidence_snapshot_to_primitive_v1 = evidence_snapshot_to_primitive
-
-
 def parse_evidence_snapshot_json(document: object) -> EvidenceSnapshotV1:
     data = parse_strict_json_object(document, max_bytes=_EVENT_JSON_LIMIT)
     expected = frozenset(
@@ -1544,7 +1278,6 @@ class _TurnHistory:
     next_segment_ordinal: int = 1
     next_chunk_ordinal: int = 1
     segments: dict[str, str] | None = None
-    chunk_ids: set[str] | None = None
     snapshot: TurnSnapshotPayloadV1 | None = None
     settlement: TurnSettledPayloadV1 | None = None
     active_replay_turn_id: str | None = None
@@ -1554,8 +1287,6 @@ class _TurnHistory:
     def __post_init__(self) -> None:
         if self.segments is None:
             self.segments = {}
-        if self.chunk_ids is None:
-            self.chunk_ids = set()
 
 
 def _turn_for_event(
@@ -1790,7 +1521,6 @@ def validate_event_sequence(events: tuple[EvidenceSnapshotV1, ...]) -> None:
                     raise _EvidenceValueError("confirmed text does not match its segment")
             elif confirmed.evidence_segment_id is not None or confirmed.text is not None:
                 raise _EvidenceValueError("non-user confirmation must be content-free")
-            cast(set[str], turn.chunk_ids).add(confirmed.evidence_chunk_id)
             chunk_ids.add(confirmed.evidence_chunk_id)
             turn.next_chunk_ordinal += 1
             continue
@@ -1969,41 +1699,36 @@ def _opaque_dataclass(model_type: type[_OpaqueT]) -> type[_OpaqueT]:
 
 
 def _validate_authority_common(
-    *,
-    protocol_version: object,
-    owner_generation: object,
-    binding_id: object,
-    binding_generation: object,
-    consent_epoch_id: object,
-    logical_session_id: object,
+    authority: FinalInputAuthorityV1
+    | CommandAdmissionAuthorityV1
+    | UserTurnAuthorityV1
+    | ProactiveTurnAuthorityV1
+    | ReplayTurnAuthorityV1
+    | BindingCloseAuthorityV1
+    | LifecycleSealAuthorityV1,
 ) -> None:
-    _require_version(protocol_version)
-    _unsigned_63(owner_generation, "owner_generation")
-    validate_canonical_uuid4(binding_id, field_name="binding_id")
-    _unsigned_63(binding_generation, "binding_generation")
-    validate_canonical_uuid4(consent_epoch_id, field_name="consent_epoch_id")
-    validate_canonical_uuid4(logical_session_id, field_name="logical_session_id")
+    _require_version(authority.protocol_version)
+    _unsigned_63(authority.owner_generation, "owner_generation")
+    validate_canonical_uuid4(authority.binding_id, field_name="binding_id")
+    _unsigned_63(authority.binding_generation, "binding_generation")
+    validate_canonical_uuid4(authority.consent_epoch_id, field_name="consent_epoch_id")
+    validate_canonical_uuid4(authority.logical_session_id, field_name="logical_session_id")
 
 
 def _validate_final_input_fields(
-    *,
-    utterance_id: object,
-    source: object,
-    input_incarnation: object,
-    media_incarnation: object,
-    typed_sequence: object,
+    authority: FinalInputAuthorityV1 | CommandAdmissionAuthorityV1 | UserTurnAuthorityV1,
 ) -> None:
-    validate_canonical_uuid4(utterance_id, field_name="utterance_id")
-    exact_source = _require_enum(source, InputSource, "source")
-    _unsigned_63(input_incarnation, "input_incarnation")
+    validate_canonical_uuid4(authority.utterance_id, field_name="utterance_id")
+    exact_source = _require_enum(authority.source, InputSource, "source")
+    _unsigned_63(authority.input_incarnation, "input_incarnation")
     if exact_source is InputSource.MICROPHONE:
-        _unsigned_63(media_incarnation, "media_incarnation")
-        if typed_sequence is not None:
+        _unsigned_63(authority.media_incarnation, "media_incarnation")
+        if authority.typed_sequence is not None:
             raise _EvidenceValueError("microphone authority forbids typed_sequence")
     elif exact_source is InputSource.TYPED:
-        if media_incarnation is not None:
+        if authority.media_incarnation is not None:
             raise _EvidenceValueError("typed authority forbids media_incarnation")
-        _browser_integer(typed_sequence, "typed_sequence")
+        _browser_integer(authority.typed_sequence, "typed_sequence")
     else:
         raise _EvidenceValueError("input source has no V1 authority rule")
 
@@ -2035,21 +1760,8 @@ class FinalInputAuthorityV1(_OpaqueCapability):
     typed_sequence: int | None
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
-        _validate_final_input_fields(
-            utterance_id=self.utterance_id,
-            source=self.source,
-            input_incarnation=self.input_incarnation,
-            media_incarnation=self.media_incarnation,
-            typed_sequence=self.typed_sequence,
-        )
+        _validate_authority_common(self)
+        _validate_final_input_fields(self)
 
 
 @_opaque_dataclass
@@ -2069,21 +1781,8 @@ class CommandAdmissionAuthorityV1(_OpaqueCapability):
     routing_disposition: str
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
-        _validate_final_input_fields(
-            utterance_id=self.utterance_id,
-            source=self.source,
-            input_incarnation=self.input_incarnation,
-            media_incarnation=self.media_incarnation,
-            typed_sequence=self.typed_sequence,
-        )
+        _validate_authority_common(self)
+        _validate_final_input_fields(self)
         _unsigned_63(self.routing_serial, "routing_serial")
         _require_literal(self.routing_disposition, "command", "routing_disposition")
 
@@ -2105,21 +1804,8 @@ class UserTurnAuthorityV1(_OpaqueCapability):
     routing_disposition: str
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
-        _validate_final_input_fields(
-            utterance_id=self.utterance_id,
-            source=self.source,
-            input_incarnation=self.input_incarnation,
-            media_incarnation=self.media_incarnation,
-            typed_sequence=self.typed_sequence,
-        )
+        _validate_authority_common(self)
+        _validate_final_input_fields(self)
         _unsigned_63(self.routing_serial, "routing_serial")
         _require_literal(self.routing_disposition, "response", "routing_disposition")
 
@@ -2135,14 +1821,7 @@ class ProactiveTurnAuthorityV1(_OpaqueCapability):
     proactive_invocation_serial: int
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
+        _validate_authority_common(self)
         _unsigned_63(self.proactive_invocation_serial, "proactive_invocation_serial")
 
 
@@ -2158,14 +1837,7 @@ class ReplayTurnAuthorityV1(_OpaqueCapability):
     replay_generation: int
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
+        _validate_authority_common(self)
         validate_canonical_uuid4(
             self.replay_of_evidence_turn_id,
             field_name="replay_of_evidence_turn_id",
@@ -2184,14 +1856,7 @@ class BindingCloseAuthorityV1(_OpaqueCapability):
     close_reason: BindingCloseReason
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
+        _validate_authority_common(self)
         reason = _require_enum(self.close_reason, BindingCloseReason, "close_reason")
         if reason in _ROLLOVER_CLOSE_REASONS:
             raise _EvidenceValueError(
@@ -2249,14 +1914,7 @@ class LifecycleSealAuthorityV1(_OpaqueCapability):
     close_epoch: bool
 
     def _validate(self) -> None:
-        _validate_authority_common(
-            protocol_version=self.protocol_version,
-            owner_generation=self.owner_generation,
-            binding_id=self.binding_id,
-            binding_generation=self.binding_generation,
-            consent_epoch_id=self.consent_epoch_id,
-            logical_session_id=self.logical_session_id,
-        )
+        _validate_authority_common(self)
         reason = _require_enum(self.close_reason, BindingCloseReason, "close_reason")
         _bounded_integer(
             self.final_event_sequence,
@@ -2550,9 +2208,6 @@ def resolve_terminal_causes(
     raise _EvidenceValueError("terminal cause set contains no supported V1 cause")
 
 
-resolve_terminal_causes_v1 = resolve_terminal_causes
-
-
 _PERSISTENT_EDGES = frozenset(
     {
         (PersistentSessionState.OPEN, PersistentSessionState.SEALED),
@@ -2685,33 +2340,8 @@ class EvidenceEligibilityFactsV1(_FinalModel):
             raise _EvidenceValueError("eligibility terminal facts are contradictory")
 
 
-TurnEligibilityFactsV1 = EvidenceEligibilityFactsV1
-
-
 def evaluate_eligibility(facts: EvidenceEligibilityFactsV1) -> EligibilityOutcome:
-    if type(facts) is not EvidenceEligibilityFactsV1:
-        raise _EvidenceTypeError("facts must be an exact EvidenceEligibilityFactsV1")
-    checked = EvidenceEligibilityFactsV1(
-        text_persisted=facts.text_persisted,
-        text_ever_persisted=facts.text_ever_persisted,
-        purge_verified=facts.purge_verified,
-        purge_failed=facts.purge_failed,
-        turn_kind=facts.turn_kind,
-        snapshot_count=facts.snapshot_count,
-        snapshot_valid=facts.snapshot_valid,
-        settlement_count=facts.settlement_count,
-        settlement_valid=facts.settlement_valid,
-        terminal_disposition=facts.terminal_disposition,
-        terminal_reason=facts.terminal_reason,
-        context_committed=facts.context_committed,
-        session_state=facts.session_state,
-        gap_free=facts.gap_free,
-        conflict_free=facts.conflict_free,
-        epoch_state=facts.epoch_state,
-        unexpired=facts.unexpired,
-        pending_erasure=facts.pending_erasure,
-        hash_valid=facts.hash_valid,
-    )
+    checked = _copy_exact_model(facts, EvidenceEligibilityFactsV1, "facts")
     if checked.purge_verified:
         return EligibilityOutcome.PURGED
     if not checked.text_ever_persisted:
@@ -3592,10 +3222,8 @@ __all__ = [
     "EvidenceConsentSourcesV1",
     "EvidenceDiagnosticsV1",
     "EvidenceEligibilityFactsV1",
-    "EvidenceEventKind",
     "EvidenceModelError",
     "EvidencePayloadV1",
-    "EvidenceQualificationOutcome",
     "EvidenceRevokeRequestV1",
     "EvidenceSnapshotV1",
     "EventKind",
@@ -3630,7 +3258,6 @@ __all__ = [
     "SealEpochV1",
     "SentinelState",
     "SessionExpiryAuthorityV1",
-    "SessionExpiryMode",
     "SessionOpenedPayloadV1",
     "SessionSealRequestedPayloadV1",
     "SessionTaintedPayloadV1",
@@ -3640,7 +3267,6 @@ __all__ = [
     "TerminalDisposition",
     "TerminalReason",
     "TerminalResolutionV1",
-    "TurnEligibilityFactsV1",
     "TurnKind",
     "TurnOpenedPayloadV1",
     "TurnSettledPayloadV1",
@@ -3654,9 +3280,7 @@ __all__ = [
     "control_result_http_status",
     "evaluate_eligibility",
     "event_payload_to_primitive",
-    "event_payload_to_primitive_v1",
     "evidence_snapshot_to_primitive",
-    "evidence_snapshot_to_primitive_v1",
     "is_turn_eligible_v1",
     "parse_evidence_consent_request",
     "parse_evidence_consent_request_json",
@@ -3668,7 +3292,6 @@ __all__ = [
     "parse_projection_resync_request_json",
     "parse_strict_json_object",
     "resolve_terminal_causes",
-    "resolve_terminal_causes_v1",
     "validate_authority_composition",
     "validate_canonical_utc",
     "validate_canonical_uuid4",
