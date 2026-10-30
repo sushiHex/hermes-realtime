@@ -209,13 +209,21 @@ def metadata_urls_from_config(config: Any) -> Any:
         "presentation"
     ]
     base = model["base_url"]
+    mode = model.get("api_mode", "chat_completions")
     if (
         model.get("provider") != "custom"
         or presentation.get("provider") != model["provider"]
         or presentation.get("model") != model["default"]
         or presentation.get("base_url") != base
+        or presentation.get("api_mode", "chat_completions") != mode
     ):
         raise RuntimeError("metadata_route_mismatch")
+    if mode == "codex_responses" and base == "https://chatgpt.com/backend-api/codex":
+        # This selected cloud route has no local Ollama metadata endpoint.
+        # An empty allowlist adds no requests-based network authority.
+        return frozenset()
+    if mode != "chat_completions":
+        raise RuntimeError("metadata_route_refused")
     parsed = urlsplit(base)
     if (
         parsed.scheme != "http"

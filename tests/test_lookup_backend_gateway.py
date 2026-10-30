@@ -61,6 +61,40 @@ def gateway():
     return module
 
 
+def metadata_config(base="https://chatgpt.com/backend-api/codex", mode="codex_responses"):
+    return {"model": {"provider": "custom", "default": "cloud-model", "base_url": base,
+                      "api_mode": mode},
+            "plugins": {"entries": {"ordinary-lookup-experimental": {"settings": {
+                "presentation": {"provider": "custom", "model": "cloud-model",
+                                 "base_url": base, "api_mode": mode}}}}}}
+
+
+def test_responses_gateway_adds_no_metadata_egress():
+    assert gateway().metadata_urls_from_config(metadata_config()) == frozenset()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "foreign"), ("model", "foreign"), ("base_url", "https://foreign.invalid"),
+    ("api_mode", "chat_completions"),
+])
+def test_responses_gateway_requires_same_native_presentation_route(field, value):
+    config = metadata_config()
+    config["plugins"]["entries"]["ordinary-lookup-experimental"]["settings"]["presentation"][field] = value
+    with pytest.raises(RuntimeError, match="metadata_route_mismatch"):
+        gateway().metadata_urls_from_config(config)
+
+
+@pytest.mark.parametrize("base,mode", [
+    ("https://foreign.invalid", "codex_responses"),
+    ("https://chatgpt.com/backend-api/codex", "codex_app_server"),
+    ("http://127.0.0.1:11441/v1", "codex_app_server"),
+    ("https://chatgpt.com/backend-api/codex?secret=1", "codex_responses"),
+])
+def test_responses_gateway_refuses_unsupported_route(base, mode):
+    with pytest.raises(RuntimeError, match="metadata_route_refused"):
+        gateway().metadata_urls_from_config(metadata_config(base, mode))
+
+
 def witness():
     return {
         "searchRequests": 0,
