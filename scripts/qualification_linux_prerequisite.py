@@ -508,13 +508,6 @@ def bound_prefinal_linux_receipt_metadata(
     return value.metadata
 
 
-def _bound_linux_receipt_payload_for_consumer(
-    receipt: BoundPrefinalLinuxReceiptV1,
-) -> LinuxReceiptPayloadV1:
-    bound_prefinal_linux_receipt_metadata(receipt)
-    return _BOUND[receipt].observation.payload
-
-
 def _bound_linux_receipt_for_consumer(
     receipt: BoundPrefinalLinuxReceiptV1,
 ) -> _BoundReceipt:

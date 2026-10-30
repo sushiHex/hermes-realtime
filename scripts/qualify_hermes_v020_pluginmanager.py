@@ -402,16 +402,6 @@ def _snapshot_single_file(
         return ("file", metadata.st_dev, metadata.st_ino, size, digest.hexdigest())
 
 
-def require_config_only_delta(
-    before: Mapping[str, tuple[object, ...]], after: Mapping[str, tuple[object, ...]]
-) -> None:
-    changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
-    if changed != {"config.yaml"} or "config.yaml" not in after:
-        raise RuntimeError(
-            f"Hermes enable did not produce an exact config-only delta: {sorted(changed)!r}"
-        )
-
-
 def require_tree_unchanged(
     before: Mapping[str, tuple[object, ...]], after: Mapping[str, tuple[object, ...]]
 ) -> None:
@@ -726,7 +716,6 @@ class WindowsRetainedImmutableInputs:
         self._changed = threading.Event()
         self._closed = False
         self._inventories: dict[Path, dict[str, tuple[object, ...]]] = {}
-        self._file_seals: dict[Path, tuple[int, int, int, str]] = {}
         self._retained: dict[Path, tuple[int, tuple[object, ...]]] = {}
         self._ignore_known_notifications: frozenset[str] = frozenset()
         self._request = request
@@ -1430,7 +1419,6 @@ def _new_source_workspace_watcher(
     watcher._changed = threading.Event()
     watcher._closed = False
     watcher._inventories = {}
-    watcher._file_seals = {}
     watcher._retained = {}
     watcher._ignore_known_notifications = frozenset()
     watcher._bind()
@@ -1968,27 +1956,6 @@ def _qualify_governed_request_body(
     return facts
 
 
-def _qualify_governed_request_unretained(
-    request: ParentRequest,
-    *,
-    job: _Job,
-    base_environment: Mapping[str, str] | None = None,
-    revalidate_inputs: Callable[[], None],
-    source_archive_payload: bytes,
-    wheelhouse_manifest_payload: bytes,
-    venv_name: str | None = None,
-) -> dict[str, object]:
-    return _qualify_governed_request_body(
-        request,
-        job=job,
-        base_environment=base_environment,
-        revalidate_inputs=revalidate_inputs,
-        source_archive_payload=source_archive_payload,
-        wheelhouse_manifest_payload=wheelhouse_manifest_payload,
-        venv_name=venv_name,
-    )
-
-
 def _qualify_governed_request(
     request: ParentRequest,
     *,
@@ -2012,7 +1979,7 @@ def _qualify_governed_request(
                 maximum_bytes=_MAX_HERMES_SOURCE_ARCHIVE_BYTES,
             )
             wheelhouse_manifest_payload = retained.read_retained_bytes(request.wheelhouse_manifest)
-            facts = _qualify_governed_request_unretained(
+            facts = _qualify_governed_request_body(
                 request,
                 job=job,
                 base_environment=base_environment,

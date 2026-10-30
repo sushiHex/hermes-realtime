@@ -279,7 +279,6 @@ def bare_windows_owner(module: ModuleType) -> object:
     owner._changed = threading.Event()
     owner._closed = False
     owner._inventories = {}
-    owner._file_seals = {}
     owner._retained = {}
     owner._request = None
     owner._bind()
