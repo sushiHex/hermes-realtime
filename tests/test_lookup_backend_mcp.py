@@ -101,6 +101,17 @@ async def test_one_warm_with_exact_isolated_settings_and_bounded_wait():
 
 
 @pytest.mark.asyncio
+async def test_lookup_16k_warm_uses_exact_context_and_strict_fit():
+    session = Session(result=warm(num_ctx=16384))
+    assert await invoke(session, profile=StartupProfile.LOOKUP_16K) is True
+    assert [name for name, _ in session.calls] == ["list_loaded", "warm"]
+    arguments = session.calls[1][1]
+    assert arguments["num_ctx"] == 16384
+    assert arguments["strict_fit"] is True and arguments["force"] is False
+    assert arguments["num_parallel"] == 1 and arguments["keep_alive"] == "-1"
+
+
+@pytest.mark.asyncio
 async def test_deadline_reserve_refuses_before_warm():
     session = Session()
     with pytest.raises(ValueError, match="mcp-budget"):

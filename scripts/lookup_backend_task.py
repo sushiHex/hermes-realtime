@@ -255,7 +255,8 @@ def require_owned_listeners(rows: Any, members: Any) -> None:
 
 
 def run_owned(m: Any, *, mcp_loader_factory: Any = None,
-              startup_timeout_seconds: Any = None, model_response_capture: Any = "off") -> Any:
+              startup_timeout_seconds: Any = None, model_response_capture: Any = "off",
+              startup_profile: Any = None) -> Any:
     """Own one task; a supplied loader factory must return an actual loader."""
     from scripts.lookup_model_capture import capture_endpoint, validate_mode
 
@@ -268,7 +269,10 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     sys.path.insert(1, str(ROOT / "scripts"))  # Owner's sibling imports; target stays first.
     from scripts import rehearse_desktop_mvp as owner
     from scripts.lookup_backend_logs import CappedProcesses
-    from scripts.lookup_backend_model import start_model
+    from scripts.lookup_backend_model import StartupProfile, start_model
+
+    selected_profile = (StartupProfile.LOOKUP_64K
+                        if startup_profile is None else startup_profile)
 
     output = Path(m["output"])
     with (output / "attempted.json").open("x", encoding="utf-8") as stream:
@@ -292,6 +296,17 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     result: dict[str, Any] = {"category": "refused"}
     capture_mode = "off"
     try:
+        if startup_profile is not None:
+            require(type(selected_profile) is StartupProfile, "startup_profile_invalid")
+            try:
+                config = read_json(Path(m["profile"]) / "config.yaml")
+            except (OSError, ValueError) as error:
+                raise ValueError("startup_profile_config") from error
+            model_config = config.get("model") if type(config) is dict else None
+            require(type(model_config) is dict
+                    and type(model_config.get("context_length")) is int
+                    and model_config["context_length"] == selected_profile.context_tokens,
+                    "startup_profile_config")
         capture_mode = validate_mode(model_response_capture)
         if capture_mode != "off":
             from scripts.setup_lookup_backend import protect_directory
@@ -311,9 +326,12 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
             containment,
             output,
             time.monotonic() + (
-                60 if startup_timeout_seconds is None else startup_timeout_seconds
+                (selected_profile.startup_seconds
+                 if type(selected_profile) is StartupProfile else 60)
+                if startup_timeout_seconds is None else startup_timeout_seconds
             ),
             verified=m["_verified_artifacts"],
+            startup_profile=selected_profile,
             startup_timeout_seconds=startup_timeout_seconds,
             mcp_loader=mcp_loader,
         )
@@ -383,9 +401,11 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
         result["failure_kind"] = type(error).__name__
         if type(error) is ValueError:
             result["failure_category"] = (
-                "mcp_loader_required"
+                error.args[0]
                 if len(error.args) == 1 and type(error.args[0]) is str
-                and error.args[0] == "mcp_loader_required" else "validation_refused"
+                and error.args[0] in {
+                    "mcp_loader_required", "startup_profile_invalid", "startup_profile_config"
+                } else "validation_refused"
             )
     finally:
         result["cleanup_begin_ns"] = time.monotonic_ns()
@@ -438,7 +458,8 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
                     "completed", "refused", "cleanup_refused",
                 } else "refused",
                 "failure_category": failure if failure in {
-                    "none", "mcp_loader_required", "validation_refused",
+                    "none", "mcp_loader_required", "startup_profile_invalid",
+                    "startup_profile_config", "validation_refused",
                 } else "unclassified_failure",
                 "cleanup_failures": len(cleanup_errors),
                 "owned_listeners_gone": result.get("owned_listeners_gone") is True,

@@ -343,6 +343,47 @@ def test_owned_runner_forwards_loader_from_its_process_owner(
     assert result["category"] == "refused" and state.stops == 1
 
 
+def test_owned_runner_explicitly_forwards_lookup_16k(
+        owned_runner_before_gateway, tmp_path):
+    from scripts.lookup_backend_model import StartupProfile
+
+    state = owned_runner_before_gateway
+    state.manifest["profile"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        json.dumps({"model": {"context_length": 16384}}), encoding="utf-8")
+    state.task.run_owned(state.manifest, startup_profile=StartupProfile.LOOKUP_16K)
+    args, kwargs = state.model_calls[0]
+    assert args[4] == 1060
+    assert kwargs["startup_profile"] is StartupProfile.LOOKUP_16K
+    assert kwargs["startup_timeout_seconds"] is None
+    assert state.stops == 1
+
+
+@pytest.mark.parametrize("context", [64000, 4096, "16384", None])
+def test_owned_runner_refuses_explicit_profile_inference_context_drift(
+        owned_runner_before_gateway, tmp_path, context):
+    from scripts.lookup_backend_model import StartupProfile
+
+    state = owned_runner_before_gateway
+    state.manifest["profile"] = str(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        json.dumps({"model": {"context_length": context}}), encoding="utf-8")
+    result = state.task.run_owned(state.manifest, startup_profile=StartupProfile.LOOKUP_16K)
+    assert result["category"] == "refused"
+    assert result["failure_category"] == "startup_profile_config"
+    assert state.model_calls == [] and state.stops == 1
+
+
+@pytest.mark.parametrize("invalid", [16384, "LOOKUP_16K", object()])
+def test_owned_runner_refuses_raw_or_invalid_profile_before_model_start(
+        owned_runner_before_gateway, invalid):
+    state = owned_runner_before_gateway
+    result = state.task.run_owned(state.manifest, startup_profile=invalid)
+    assert result["category"] == "refused"
+    assert result["failure_category"] == "startup_profile_invalid"
+    assert state.model_calls == [] and state.stops == 1
+
+
 @pytest.mark.parametrize("startup,expected", [(None, 360), (180, 480), (600, 900)])
 def test_owned_watchdog_preserves_work_budget_after_longer_startup(
     owned_runner_before_gateway, monkeypatch, startup, expected,
