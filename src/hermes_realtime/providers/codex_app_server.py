@@ -1120,9 +1120,8 @@ class CodexAppServerStreamingInference:
                 f"Today's date is {local_now.date().isoformat()}. "
                 "Your parametric knowledge may be stale. Never present current, latest, live, "
                 "recent, or time-sensitive specifics from memory. Use supplied evidence; otherwise "
-                "say you cannot verify them. Foreground lookup claims require a current-turn "
-                "lookup result. Missing foreground evidence says nothing about accepted "
-                "background work. "
+                "say you cannot verify them. Never claim a lookup ran, failed, timed out, or "
+                "returned results without a current-turn lookup result. "
             )
             private_turn = latest_user is not None and contains_private_material(latest_user)
             search_available = bool(
@@ -3211,9 +3210,6 @@ class CodexAppServerStreamingInference:
             "the user may not have heard the rest. "
             "Interpret continuation wording "
             "from the full conversation rather than a fixed phrase list. "
-            "A reply supplying the detail you asked for continues the unresolved request. "
-            "Do not reconfirm it merely for being a fragment or having speech filler; "
-            "clarify only remaining material ambiguity. "
             "Write for natural speech and keep the first sentence under 12 words when meaning "
             "permits. Do not add filler or a preamble merely to make the opening short."
         )

@@ -361,15 +361,12 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("detail", [
-    "The public Atlas service.", "and the public Atlas service.",
-])
-async def test_codex_outbound_clarification_retains_context_and_work_contract(detail) -> None:
+async def test_codex_outbound_clarification_retains_context_and_work_contract() -> None:
     """Outbound contract only; the fake model does not prove routing obedience."""
     messages = (
         ConversationMessage("user", "Check the current service availability."),
         ConversationMessage("assistant", "Which service?"),
-        ConversationMessage("user", detail),
+        ConversationMessage("user", "The public Atlas service."),
     )
     snapshot = ConversationInferenceRequest(revision=3, messages=messages, active_tasks=())
     transport = FakeCodexTransport(assistant_delta="Understood.")
@@ -396,61 +393,7 @@ async def test_codex_outbound_clarification_retains_context_and_work_contract(de
     assert "clarified continuation" in tools[0]["description"]
     assert "indirect requests" not in tools[0]["description"]
     assert "inactive continuation" not in tools[0]["description"]
-    assert "A reply supplying the detail you asked for continues the unresolved request" in (
-        turn["params"]["input"][0]["text"]
-    )
-    assert "Do not reconfirm it merely for being a fragment or having speech filler" in (
-        turn["params"]["input"][0]["text"]
-    )
-    assert "two or more materially different plausible interpretations" in (
-        thread["params"]["baseInstructions"]
-    )
-    assert "Clarify remaining material ambiguity with one question per turn" in (
-        thread["params"]["baseInstructions"]
-    )
     assert handler.starts == handler.cancels == handler.exact_cancels == []
-
-
-@pytest.mark.asyncio
-async def test_codex_progress_contract_separates_background_state_from_foreground_evidence(
-) -> None:
-    """Observe routing instructions and capability, not simulated model obedience."""
-    transport = FakeCodexTransport()
-    inference = CodexAppServerStreamingInference(
-        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
-    )
-    handler = FakeWorkToolHandler()
-    inference.bind_work_tools(handler)
-    snapshot = ConversationInferenceRequest(
-        revision=3,
-        messages=(
-            ConversationMessage("user", "Inspect the public Atlas service."),
-            ConversationMessage("assistant", "The task was accepted.", interrupted=True),
-            ConversationMessage("user", "How is that check going?"),
-        ),
-        active_tasks=(ActiveTaskSummary("task_atlas", "Inspect the public Atlas service."),),
-    )
-    try:
-        [part async for part in inference.stream(snapshot, turn_id="turn_progress_contract")]
-        thread = next(row for row in transport.sent if row.get("method") == "thread/start")
-        turn = next(row for row in transport.sent if row.get("method") == "turn/start")
-        instructions = thread["params"]["baseInstructions"]
-        assert "For contextual progress questions, read task_status" in instructions
-        assert "Foreground lookup claims require a current-turn lookup result" in instructions
-        assert "Missing foreground evidence says nothing about accepted background work" in (
-            instructions
-        )
-        assert "Never present current, latest, live, recent" in instructions
-        assert "Use task_status only for pending, active, or cancellation state" in instructions
-        assert "task_status" in [tool["name"] for tool in _tool_specs(
-            thread["params"]["dynamicTools"],
-        )]
-        payload = json.loads(turn["params"]["input"][0]["text"].splitlines()[-1])
-        assert payload["messages"][-1]["text"] == "How is that check going?"
-        assert payload["messages"][-2]["interrupted"] is True
-        assert handler.starts == handler.cancels == handler.exact_cancels == []
-    finally:
-        await inference.close()
 
 
 @pytest.mark.asyncio

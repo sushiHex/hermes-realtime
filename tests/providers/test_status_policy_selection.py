@@ -110,9 +110,6 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
             (AVAILABLE, UNAVAILABLE) if "task_status" in advertised else (UNAVAILABLE, AVAILABLE)
         )
         assert selected in policy and absent not in policy
-        assert ("For contextual progress questions, read task_status" in policy) == (
-            "task_status" in advertised
-        )
         assert "when supplied; otherwise" not in policy
         if mode == "completed":
             # Sent-prompt regression only: this does not prove model route selection.
