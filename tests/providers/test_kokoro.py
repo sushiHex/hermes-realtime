@@ -15,6 +15,80 @@ from hermes_realtime.providers.kokoro import _strip_markdown_emphasis_for_speech
 from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
 
 
+@pytest.mark.asyncio
+async def test_default_kokoro_cache_is_bound_to_model_digest_without_touching_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    legacy = tmp_path / ".cache" / "hermes-realtime" / "kokoro"
+    legacy.mkdir(parents=True)
+    previous = legacy / "kokoro-v1.0.onnx"
+    previous.write_bytes(b"synthetic previous export")
+    requests = []
+
+    def stop_before_download(request: urllib.request.Request, timeout: int) -> None:
+        requests.append(request.full_url)
+        raise RuntimeError("synthetic download boundary")
+
+    monkeypatch.setattr(kokoro_module.urllib.request, "urlopen", stop_before_download)
+    synthesizer = KokoroSynthesizer()
+    try:
+        assert synthesizer._cache_dir == legacy / kokoro_module._MODEL_ASSET.sha256
+        with pytest.raises(RuntimeError, match="synthetic download boundary"):
+            synthesizer._ensure_asset(kokoro_module._MODEL_ASSET)
+        assert len(requests) == 1
+        assert previous.read_bytes() == b"synthetic previous export"
+        assert list(synthesizer._cache_dir.iterdir()) == []
+    finally:
+        await synthesizer.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_kokoro_cache_remains_exact(tmp_path: Path) -> None:
+    explicit = tmp_path / "operator-cache"
+    synthesizer = KokoroSynthesizer(cache_dir=explicit)
+    try:
+        assert synthesizer._cache_dir == explicit
+        assert not explicit.exists()
+    finally:
+        await synthesizer.close()
+
+
+@pytest.mark.asyncio
+async def test_kokoro_pins_official_full_precision_english_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    # Official model-files-v1.1 release metadata, checked independently of provider constants.
+    expected = (
+        ("kokoro-v1.0.onnx", 325_505_369,
+         "beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a"),
+        ("voices-v1.0.bin", 28_214_398,
+         "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"),
+    )
+    assets = (kokoro_module._MODEL_ASSET, kokoro_module._VOICES_ASSET)
+    assert tuple((asset.filename, asset.size, asset.sha256) for asset in assets) == expected
+    requested = []
+
+    def stop_before_download(request: urllib.request.Request, timeout: int) -> None:
+        assert timeout == 60
+        requested.append(request.full_url)
+        raise RuntimeError("synthetic download boundary")
+
+    monkeypatch.setattr(kokoro_module.urllib.request, "urlopen", stop_before_download)
+    synthesizer = KokoroSynthesizer(cache_dir=tmp_path)
+    try:
+        for asset in assets:
+            with pytest.raises(RuntimeError, match="synthetic download boundary"):
+                synthesizer._ensure_asset(asset)
+        assert requested == [
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+            f"model-files-v1.1/{filename}" for filename, _, _ in expected
+        ]
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        await synthesizer.close()
+
+
 def test_kokoro_asset_request_identifies_runtime_version(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

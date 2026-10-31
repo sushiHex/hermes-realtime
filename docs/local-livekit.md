@@ -760,11 +760,17 @@ install and its import check, and the Hermes clone, sync and wheel install.
    acceptance evidence.
 
    On Windows, the full host defaults to local `kokoro-onnx==0.6.1` with the full English
-   v1.0 model and British female Isabella voice (`bf_isabella`), upsampled from native
+   v1.0 model exported in the official
+   [`model-files-v1.1` release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.1)
+   and British female Isabella voice (`bf_isabella`), upsampled from native
    24 kHz to the existing 48 kHz mono LiveKit transport. Other platforms default to Edge
    because the locked Kokoro dependency is Windows-only. Explicit provider selection never
    falls back. Model and voice assets are pinned by
-   exact size and SHA-256. The CPU session defaults to 8 ONNX intra-op threads; override it with
+   exact size and SHA-256. The default asset cache is
+   `~/.cache/hermes-realtime/kokoro/<full-model-sha256>/`, so model revisions coexist without
+   replacing the previous cache. Explicit `KokoroSynthesizer(cache_dir=...)` paths are unchanged
+   and still require matching pinned assets. The CPU session defaults to 8 ONNX intra-op threads;
+   override it with
    `--kokoro-intra-op-threads` when profiling different hardware. `--kokoro-speed` remains
    available for a deliberate speaking-rate tradeoff. `--tts-provider edge` remains an
    explicit diagnostic alternative; it is never selected as a fallback when Kokoro fails.
