@@ -85,7 +85,22 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
             [part async for part in inference.stream(snapshot, turn_id="turn_policy")]
         if provider == "codex":
             thread = next(m for m in transport.sent if m.get("method") == "thread/start")
-            advertised = {tool["name"] for tool in thread["params"]["dynamicTools"]}
+            dynamic_tools = thread["params"]["dynamicTools"]
+            assert type(dynamic_tools) is list
+            if dynamic_tools:
+                assert len(dynamic_tools) == 1
+                namespace = dynamic_tools[0]
+                assert type(namespace) is dict and namespace.get("type") == "namespace"
+                assert namespace.get("name") == "hermes"
+                functions = namespace.get("tools")
+                assert type(functions) is list and len(functions) <= 16
+                assert all(
+                    type(tool) is dict and tool.get("type") == "function"
+                    for tool in functions
+                )
+                advertised = {tool["name"] for tool in functions}
+            else:
+                advertised = set()
             policy = thread["params"]["baseInstructions"]
         else:
             schema = sent[0].get("format", {})

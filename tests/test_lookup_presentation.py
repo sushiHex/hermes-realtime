@@ -19,6 +19,7 @@ CONFIG = {
     "model": "test-model",
     "api_key_env": "LOOKUP_TEST_KEY",
 }
+CODEX_CONFIG = CONFIG | {"api_mode": "codex_responses"}
 
 
 def completion(content, *, reason="stop", calls=None):
@@ -53,20 +54,83 @@ def retrieve(generation, result, before_result=None):
     )
 
 
+def retrieve_attempts(generation, results, before_attempt=None):
+    """Exercise one admitted search through its ticket, including any policy retry."""
+    args = {"query": "synthetic lookup"}
+    call = SimpleNamespace(id="retrieval-call", function=SimpleNamespace(
+        name="web_search", arguments=json.dumps(args)))
+    response = completion(None, reason="tool_calls", calls=[call])
+    response = generation.model_gate(
+        api_mode="chat_completions", api_request_id="retrieval-request",
+        request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: response)
+    call = response.choices[0].message.tool_calls[0]
+    attempts = []
+    results = iter(results)
+
+    def original(actual_args):
+        attempts.append(json.loads(json.dumps(actual_args)))
+        if before_attempt is not None:
+            before_attempt(len(attempts), actual_args)
+        return json.dumps(next(results))
+
+    result = generation.tool_gate(
+        tool_name="web_search", tool_call_id=call.id, api_request_id="retrieval-request",
+        args=args, next_call=generation.wrap_search(original),
+    )
+    return result, attempts, args
+
+
+def retrieve_batch(generation, results_by_attempt, *, primary_count):
+    """Admit a bounded primary search batch and execute each call once in order."""
+    args_rows = [{"query": f"synthetic lookup {index}"} for index in range(primary_count)]
+    calls = [SimpleNamespace(
+        id=f"search-call-{index}", function=SimpleNamespace(
+            name="web_search", arguments=json.dumps(args),
+        ),
+    ) for index, args in enumerate(args_rows)]
+    response = completion(None, reason="tool_calls", calls=calls)
+    response = generation.model_gate(
+        api_mode="chat_completions", api_request_id="batch-request",
+        request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: response,
+    )
+    actual_calls = response.choices[0].message.tool_calls
+    attempt_results = iter(results_by_attempt)
+    attempts = []
+    outputs = []
+    for call in actual_calls:
+        args = json.loads(call.function.arguments)
+
+        def original(actual_args):
+            attempts.append(json.loads(json.dumps(actual_args)))
+            return json.dumps(next(attempt_results))
+
+        outputs.append(generation.tool_gate(
+            tool_name="web_search", tool_call_id=call.id, api_request_id="batch-request",
+            args=args, next_call=generation.wrap_search(original),
+        ))
+    return outputs, attempts
+
+
 @pytest.fixture
 def setup(monkeypatch, request):
     retrieval = getattr(request, "param", {
         "success": True, "data": {"web": [{"url": "https://example.invalid/source"}]},
     })
     session = {"run": "selected"}
-    for name in ("tools", "tools.approval", "tools.registry"):
+    for name in ("tools", "tools.approval", "tools.registry", "agent", "agent.codex_headers"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     sys.modules["tools.approval"].get_current_session_key = lambda **_: session["run"]
     sys.modules["tools.registry"].registry = SimpleNamespace(get_entry=lambda _: None)
+    sys.modules["agent.codex_headers"].codex_cloudflare_headers = (
+        lambda token, *, base_url: {"X-Codex-Test": "explicit-token-bound"}
+    )
     spec = importlib.util.spec_from_file_location("lookup_presentation_policy", SOURCE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    captured = {"requests": [], "closed": 0, "sdk": [], "http": []}
+    captured = {"requests": [], "responses_requests": [], "closed": 0,
+                "stream_closed": 0, "sdk": [], "http": []}
 
     class Http:
         def __init__(self, **kw):
@@ -84,6 +148,7 @@ def setup(monkeypatch, request):
         def __init__(self, **kw):
             captured["sdk"].append(kw)
             self.chat = SimpleNamespace(completions=self)
+            self.responses = SimpleNamespace(create=self.create_responses)
 
         async def create(self, **kw):
             captured["requests"].append(kw)
@@ -96,6 +161,58 @@ def setup(monkeypatch, request):
                     '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
             )
 
+        async def create_responses(self, **kw):
+            if captured.get("wire_mutation"):
+                captured["wire_mutation"](kw)
+            captured["responses_requests"].append(kw)
+            for hook in captured["http"][-1]["event_hooks"]["request"]:
+                await hook(SimpleNamespace(content=json.dumps(kw).encode()))
+            if captured.get("callback"):
+                await captured["callback"]()
+            if captured.get("responses_error") is not None:
+                raise captured["responses_error"]
+            return ResponseStream(captured.get("stream_events", codex_events()))
+
+    class ResponseStream:
+        def __init__(self, events):
+            self.events = events
+
+        def __aiter__(self):
+            async def iterate():
+                for event in self.events:
+                    yield event
+            return iterate()
+
+        async def close(self):
+            captured["stream_closed"] += 1
+            if captured.get("stream_close_callback"):
+                await captured["stream_close_callback"]()
+
+    def codex_message(text, *, phase="final_answer", item_id="msg_native"):
+        return SimpleNamespace(
+            type="message", id=item_id, role="assistant", status="completed", phase=phase,
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )
+
+    def codex_response(output, *, status="completed", usage=None,
+                       incomplete_details=None, output_text=None):
+        return SimpleNamespace(
+            id="resp_native", object="response", status=status,
+            output=output, output_text=output_text, usage=usage,
+            incomplete_details=incomplete_details,
+        )
+
+    def codex_events(response=None, *, deltas=None):
+        response = response or codex_response([
+            codex_message(
+                '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7))
+        events = [SimpleNamespace(type="response.created")]
+        events.extend(SimpleNamespace(type="response.output_text.delta", delta=delta)
+                      for delta in (deltas or ['{"voice":"Short."}']))
+        events.append(SimpleNamespace(type="response.completed", response=response))
+        return events
+
     monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(AsyncClient=Http))
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=Client))
     monkeypatch.setenv("LOOKUP_TEST_KEY", "local")
@@ -105,6 +222,8 @@ def setup(monkeypatch, request):
     g.handles = [SimpleNamespace(active=True)]
     row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 1,
            "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
+           "search_attempts_reserved": 0, "empty_retry_reserved": False,
+           "search_primary_started": set(),
            "objective": "synthetic lookup"}
     g.budgets["selected"] = row
     g.members = MappingProxyType({"selected": (module.VERSION, "identity", row)})
@@ -119,12 +238,23 @@ def setup(monkeypatch, request):
     def run(**changes):
         kw = dict(api_mode="chat_completions", api_request_id="task-request",
                   provider=CONFIG["provider"], base_url=CONFIG["base_url"], model=CONFIG["model"],
-                  request=request, next_call=lambda _: original)
+                  request=request, next_call=lambda _: run.original)
         kw.update(changes)
         return g.model_gate(**kw)
+    run.original = original
 
     return SimpleNamespace(module=module, g=g, row=row, original=original, request=request,
-                           run=run, captured=captured, refused=refused, session=session)
+                           run=run, captured=captured, refused=refused, session=session,
+                           codex_response=codex_response, codex_message=codex_message,
+                           codex_events=codex_events)
+
+
+def test_formatter_requests_localizable_instants_without_guessing_missing_time(setup):
+    instructions = setup.module.PRESENTATION_INSTRUCTIONS
+    assert "YYYY-MM-DDTHH:MM:SSZ" in instructions
+    assert "host-local time" in instructions
+    assert "original source timestamp in detail" in instructions
+    assert "Never invent a missing date or zone" in instructions
 
 
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
@@ -146,8 +276,12 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert body["reasoning_effort"] == "none"
     assert body["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(body["messages"][-1]["content"])
-    assert payload == {"answer": s.original.choices[0].message.content, "sources": [
-        {"id": 0, "url": "https://example.invalid/source"}]}
+    assert payload["answer"] == s.original.choices[0].message.content
+    assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
+    assert payload["objective"] == "synthetic lookup"
+    assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "",
+                                    "original_bytes": 0, "truncated": False}]
+    assert payload["missing_source_ids"] == [0]
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
     assert s.captured["sdk"][0]["max_retries"] == 0
@@ -158,6 +292,382 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
     assert s.row["presentation_evidence"]["wire_requests"] == 1
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda body: body["input"][0].update(content=body["input"][0]["content"] + " "),
+    lambda body: body.update(tools=[]),
+    lambda body: body["text"]["format"].update(strict=False),
+    lambda body: body.update(store=True),
+    lambda body: body.update(stream=False),
+    lambda body: body["reasoning"].update(effort="high"),
+    lambda body: body.update(model="other-model"),
+    lambda body: body.update(instructions="changed"),
+    lambda body: body.update(extra="unexpected"),
+], ids=["input", "tools", "schema", "store", "stream", "reasoning", "model",
+        "instructions", "extra-field"])
+def test_codex_wire_contract_mutations_refuse_before_accepting_response(setup, mutate):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["wire_mutation"] = mutate
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert s.row["presentation_evidence"]["category"] == "refused"
+    assert s.row["presentation_evidence"]["wire_requests"] == 0
+    assert s.row["presentation_evidence"]["local_http_settled"] is True
+
+
+def test_presentation_route_mode_is_explicit_and_bound(setup):
+    s = setup
+    formatter = s.module.Presentation(CODEX_CONFIG)
+    formatter.validate_route({
+        "provider": CODEX_CONFIG["provider"],
+        "base_url": CODEX_CONFIG["base_url"],
+        "model": CODEX_CONFIG["model"],
+        "api_mode": "codex_responses",
+        "request": {"model": CODEX_CONFIG["model"]},
+    })
+    with pytest.raises(ValueError, match="presentation-route"):
+        formatter.validate_route({
+            "provider": CODEX_CONFIG["provider"],
+            "base_url": CODEX_CONFIG["base_url"],
+            "model": CODEX_CONFIG["model"],
+            "api_mode": "chat_completions",
+            "request": {"model": CODEX_CONFIG["model"]},
+        })
+    with pytest.raises(ValueError, match="presentation-config"):
+        s.module.Presentation(CONFIG | {"api_mode": "codex_app_server"})
+
+
+def test_codex_responses_function_call_uses_call_id_for_ticket_identity(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    source_url = "https://example.invalid/source"
+    s.row.update(phase="search", reserved=1, settled=1, urls={source_url})
+    args = {"urls": [source_url]}
+    raw = SimpleNamespace(
+        id="resp_native",
+        status="completed",
+        output=[SimpleNamespace(
+            type="function_call", id="fc_item_id", call_id="call_ticket_id",
+            name="web_extract", arguments=json.dumps(args), status=None,
+        )],
+        usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+    )
+    s.run.original = raw
+    request = _request_with_lookup_tools("codex_responses")
+    result = s.run(api_mode="codex_responses", request=request)
+    assert result is raw
+    assert s.row["plan"] == {"call_ticket_id": ("web_extract", s.module.frozen(args))}
+    result = s.g.tool_gate(
+        tool_name="web_extract", tool_call_id="call_ticket_id",
+        api_request_id="task-request", args=args, next_call=lambda _: "admitted",
+    )
+    assert result == "admitted"
+    assert s.row["spent"] == {"call_ticket_id"}
+
+
+def test_codex_host_search_returns_native_responses_envelope(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.row.update(phase="new", reserved=0, settled=0, urls=set())
+    request = {"tools": [{
+        "type": "function", "name": "web_search",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }]}
+    result = s.run(api_mode="codex_responses", request=request,
+                   next_call=lambda _: pytest.fail("host retrieval must not call the model"))
+    assert result.status == "completed" and result.id.startswith("host-response-")
+    assert len(result.output) == 1 and result.output[0].type == "function_call"
+    assert result.output[0].name == "web_search"
+    assert result.output[0].call_id.startswith("host-search-")
+    assert json.loads(result.output[0].arguments) == {"query": "synthetic lookup"}
+
+
+def test_codex_mode_refusal_is_a_completed_native_message(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    result = s.run(api_mode="codex_responses", request={"tools": []})
+    assert result.status == "completed"
+    assert result.output[0].status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    original_final = s.codex_message(
+        '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+    reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status=None, summary=[])
+    commentary = s.codex_message("Progress text must not be published.", phase="commentary",
+                                 item_id="msg_commentary")
+    raw = s.codex_response(
+        [reasoning, commentary, original_final],
+        usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+    )
+    s.run.original = raw
+    s.captured["stream_events"] = s.codex_events(
+        s.codex_response([
+            s.codex_message("{\"voice\":\"Short.\",\"detail\":\"Full source result.\","
+                            "\"source_ids\":[0]}")
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7)),
+        deltas=['{"voice":', '"Short."}'],
+    )
+    result = s.run(api_mode="codex_responses")
+    assert result is not s.refused and result.id == raw.id
+    assert result.usage is raw.usage and result.output[0] is reasoning
+    assert result.output[1] is commentary
+    final_text = result.output[2].content[0].text
+    assert final_text == (
+        "<voice>Short.</voice><detail>Full source result.\n\nSources:\n"
+        "https://example.invalid/source</detail>"
+    )
+    assert original_final.content[0].text.startswith('{"voice"')
+    assert len(s.captured["responses_requests"]) == 1
+    body = s.captured["responses_requests"][0]
+    assert set(body) == {"model", "instructions", "input", "store", "stream", "text", "reasoning"}
+    assert body["model"] == CODEX_CONFIG["model"]
+    assert body["store"] is False and body["stream"] is True
+    assert body["reasoning"] == {"effort": "low"}
+    assert body["text"]["format"] == {
+        "type": "json_schema", "name": "voice_detail", "strict": True,
+        "schema": s.module.PRESENTATION_SCHEMA,
+    }
+    assert "tools" not in body and "tool_choice" not in body
+    assert s.captured["stream_closed"] == 1
+    assert s.row["presentation_evidence"]["usage"] == {
+        "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+    }
+    assert s.row["presentation_evidence"]["wire"]["tools_absent"] is True
+    assert s.row["presentation_evidence"]["wire"]["input_matches"] is True
+    assert s.row["presentation_evidence"]["wire"]["instructions_match"] is True
+
+
+def test_codex_stream_close_is_cancellation_boundary(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+
+    async def cancel_during_close():
+        s.g.cancel_presentation(s.row)
+        await asyncio.sleep(0)
+
+    s.captured["stream_close_callback"] = cancel_during_close
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert s.captured["stream_closed"] == 1
+    assert s.row["presentation_evidence"]["local_http_settled"] is True
+    assert s.row["presentation_active"] is None
+
+
+@pytest.mark.parametrize("events", [
+    [],
+    [SimpleNamespace(type="response.incomplete", response=SimpleNamespace(status="incomplete"))],
+    [SimpleNamespace(type="response.unknown_future_event")],
+    [SimpleNamespace(type="response.completed", response=None)],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="not-completed", status="incomplete", output=[], usage=None))],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="null-output", status="completed", output=None, usage=None))],
+    [SimpleNamespace(type="response.completed", response=SimpleNamespace(
+        id="refusal", status="completed", output=[SimpleNamespace(
+            type="message", role="assistant", status="completed", phase="final_answer",
+            content=[SimpleNamespace(type="refusal", refusal="denied")])], usage=None))],
+], ids=["missing-terminal", "incomplete-event", "unknown-event", "terminal-null",
+        "native-not-completed", "output-null", "refusal"])
+def test_codex_formatter_fails_closed_on_noncompleted_or_unusable_terminal(setup, events):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([
+        s.codex_message("Grounded source answer.")
+    ])
+    s.captured["stream_events"] = events
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert s.row["presentation_evidence"]["category"] == "refused"
+    assert s.captured["stream_closed"] == 1
+
+
+def test_codex_metadata_stream_extension_is_opaque_before_terminal(setup, capsys):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["stream_events"] = [
+        SimpleNamespace(type="response.metadata", metadata={
+            "private": "SYNTHETIC_PRIVATE_METADATA",
+        }),
+        *s.codex_events(),
+    ]
+    result = s.run(api_mode="codex_responses")
+    assert result.id == "resp_native"
+    assert s.row["presentation_evidence"]["category"] == "presented"
+    assert "SYNTHETIC_PRIVATE_METADATA" not in capsys.readouterr().out
+
+
+def test_codex_metadata_only_stream_still_requires_terminal(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["stream_events"] = [SimpleNamespace(
+        type="response.metadata", metadata={"private": "ignored"},
+    )]
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider"
+    assert evidence["provider_rejection"] == "responses-terminal-count"
+
+
+def test_codex_metadata_after_terminal_is_rejected(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    terminal = s.codex_response([s.codex_message("formatter terminal")])
+    s.captured["stream_events"] = [
+        SimpleNamespace(type="response.completed", response=terminal),
+        SimpleNamespace(type="response.metadata", metadata={"private": "ignored"}),
+    ]
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider"
+    assert evidence["provider_rejection"] == "responses-event-after-terminal"
+
+
+@pytest.mark.parametrize(("failure", "marker", "event_type", "event_kind"), [
+    ("wire", "presentation-wire-contract", None, None),
+    ("stream", "responses-event-unknown", "response.future_private_event", "other"),
+    ("stream", "responses-event-unknown", "response.reasoning_text.delta",
+     "response.reasoning_text.delta"),
+    ("stream", "responses-event-unknown", "response.reasoning_text.done",
+     "response.reasoning_text.done"),
+    ("stream", "responses-event-unknown", "response.reasoning_part.added",
+     "response.reasoning_part.added"),
+    ("stream", "responses-event-unknown", "response.reasoning_part.done",
+     "response.reasoning_part.done"),
+    ("stream", "responses-event-unknown", "response.refusal.delta", "response.refusal.delta"),
+    ("stream", "responses-event-unknown", "response.refusal.done", "response.refusal.done"),
+    ("stream", "responses-event-unknown", "response.function_call_arguments.delta",
+     "response.function_call_arguments.delta"),
+    ("stream", "responses-event-unknown", "response.function_call_arguments.done",
+     "response.function_call_arguments.done"),
+], ids=["wire-contract", "unknown-other", "reasoning-delta", "reasoning-done",
+        "reasoning-part-added", "reasoning-part-done", "refusal-delta", "refusal-done",
+        "function-arguments-delta", "function-arguments-done"])
+def test_codex_provider_rejection_marker_uses_fixed_allowlist(
+    setup, capsys, failure, marker, event_type, event_kind,
+):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    if failure == "wire":
+        s.captured["wire_mutation"] = lambda body: body.update(function_call="auto")
+    else:
+        s.captured["stream_events"] = [SimpleNamespace(type=event_type, delta="SECRET")]
+
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider" and evidence["failure_kind"] == "ValueError"
+    assert evidence["provider_rejection"] == marker
+    if event_kind is not None:
+        assert evidence["provider_event_kind"] == event_kind
+    output = capsys.readouterr().out
+    assert "SECRET" not in output
+    assert "future_private_event" not in output
+
+
+def test_codex_provider_does_not_publish_unrecognized_value_error_text(setup, capsys):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.captured["responses_error"] = ValueError("SYNTHETIC_PRIVATE_PROVIDER_TEXT")
+    result = s.run(api_mode="codex_responses")
+    assert result.status == "completed"
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "provider" and evidence["failure_kind"] == "ValueError"
+    assert "provider_rejection" not in evidence
+    assert "SYNTHETIC_PRIVATE_PROVIDER_TEXT" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("invalid_commentary", [
+    lambda s: [SimpleNamespace(type="refusal", refusal="do not log this"),
+               SimpleNamespace(type="output_text", text="commentary")],
+    lambda s: [SimpleNamespace(type="future_content_part", text="do not log this")],
+], ids=["refusal-part", "unknown-content-part"])
+def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_commentary):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    commentary = s.codex_message("untrusted", phase="commentary",
+                                 item_id="msg_commentary_invalid")
+    commentary.content = invalid_commentary(s)
+    s.run.original = s.codex_response([
+        commentary,
+        s.codex_message(
+            '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ])
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+@pytest.mark.parametrize("response", [
+    lambda s: s.codex_response([
+        SimpleNamespace(type="reasoning", status="in_progress", id="rs_partial"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ]),
+    lambda s: s.codex_response([
+        SimpleNamespace(type="reasoning", status="incomplete", id="rs_partial"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+    ]),
+], ids=["reasoning-in-progress", "reasoning-incomplete"])
+def test_codex_refuses_noncompleted_reasoning_items(setup, response):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = response(s)
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "incomplete"])
+def test_codex_refuses_noncompleted_function_call_item_status(setup, status):
+    s = setup
+    raw = s.codex_response([SimpleNamespace(
+        type="function_call", status=status, call_id="call_partial",
+        name="web_extract", arguments='{"urls":[]}',
+    )])
+    with pytest.raises(ValueError, match="responses-function-call-incomplete"):
+        s.module._raw_responses_result(raw)
+
+
+def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    s.run.original = s.codex_response([
+        s.codex_message("intermediate", phase="commentary"),
+        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}',
+                        phase=None),
+    ])
+    result = s.run(api_mode="codex_responses")
+    assert result.output[0].content[0].text == s.module.REFUSAL
+    assert not s.captured["responses_requests"]
+
+
+def test_codex_diagnostic_whitelists_unrecognized_output_types(setup, capsys):
+    s = setup
+    s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    sentinel = "PRIVATE_SENTINEL_" + "x" * 512
+    raw = s.codex_response([SimpleNamespace(type=sentinel)])
+    facts = s.module.response_facts(raw, "source", "codex_responses")
+    assert facts["source_output_item_types"] == ["other"]
+    s.run.original = raw
+    s.run(api_mode="codex_responses")
+    assert sentinel not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("setup", [None], indirect=True)
@@ -265,6 +775,190 @@ def test_failed_initial_search_never_retries_or_calls_provider(setup):
     assert calls == [] and not setup.captured["requests"]
 
 
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_successful_empty_search_reserves_one_identical_query_retry(setup, capsys):
+    s = setup
+    second = {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/recovered", "description": "Recovered result."}
+    ]}}
+    result, attempts, args = retrieve_attempts(
+        s.g, [{"success": True, "data": {"web": []}}, second])
+
+    assert json.loads(result) == second
+    assert attempts == [args, args] == [{"query": "synthetic lookup"}] * 2
+    assert s.row["search_attempts_reserved"] == 2
+    assert s.row["empty_retry_reserved"] is True
+    assert s.row["reserved"] == s.row["settled"] == 1
+    assert s.row["spent"] == s.row["admitted"] and len(s.row["spent"]) == 1
+    assert s.row["urls"] == {"https://example.invalid/recovered"}
+    assert s.run() is not s.refused
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [{"attempts_reserved": 2, "category": "empty_retry_reserved",
+                       "version": 1}]
+    assert "synthetic lookup" not in str(events) and "https://" not in str(events)
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_second_successful_empty_result_preserves_retrieval_refusal(setup, capsys):
+    empty = {"success": True, "data": {"web": []}}
+    result, attempts, args = retrieve_attempts(setup.g, [empty, empty])
+
+    assert json.loads(result) == empty
+    assert attempts == [args, args]
+    assert setup.row["search_attempts_reserved"] == 2
+    assert setup.row["empty_retry_reserved"] is True
+    assert setup.row["reserved"] == setup.row["settled"] == 1
+    assert setup.row["urls"] == set()
+    assert setup.run() is setup.refused
+    assert not setup.captured["requests"]
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [{"attempts_reserved": 2, "category": "empty_retry_reserved",
+                       "version": 1}]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("first", [
+    {"success": False, "data": {"web": []}},
+    {"success": True, "error": "failed", "data": {"web": []}},
+    {"success": True, "error": "", "data": {"web": []}},
+    {"success": True, "data": {"web": None}},
+    {"success": True, "data": {"web": [{"url": "https://example.invalid/source"}]}},
+], ids=["unsuccessful", "error", "empty-error", "malformed", "nonempty"])
+def test_search_retry_is_limited_to_successful_empty_result(setup, first):
+    fallback = {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/second"}
+    ]}}
+    _, attempts, _ = retrieve_attempts(setup.g, [first, fallback])
+    assert len(attempts) == 1
+    assert setup.row["search_attempts_reserved"] == 1
+    assert setup.row["empty_retry_reserved"] is False
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_five_planned_searches_leave_no_retry_headroom_but_keep_other_evidence(
+    setup, capsys,
+):
+    setup.g.presentation = None
+    results = [{"success": True, "data": {"web": []}}] + [
+        {"success": True, "data": {"web": [{
+            "url": f"https://example.invalid/{index}",
+        }]}} for index in range(4)
+    ] + [{"success": True, "data": {"web": [{
+        "url": "https://example.invalid/forbidden-extra-retry",
+    }]}}]
+    outputs, attempts = retrieve_batch(setup.g, results, primary_count=5)
+
+    assert len(outputs) == len(attempts) == 5
+    assert setup.row["search_attempts_reserved"] == setup.module.SEARCH_LIMIT
+    assert setup.row["reserved"] == setup.row["settled"] == 5
+    assert setup.row["empty_retry_reserved"] is False
+    assert setup.row["closed"] is False
+    assert setup.row["urls"] == {
+        f"https://example.invalid/{index}" for index in range(4)
+    }
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    assert facts == {"attempts_reserved": setup.module.SEARCH_LIMIT,
+                     "category": "empty_retry_budget_full", "version": 1}
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_two_searches_allow_only_one_runwide_empty_retry(setup, capsys):
+    setup.g.presentation = None
+    results = [
+        {"success": True, "data": {"web": []}},
+        {"success": True, "data": {"web": [{
+            "url": "https://example.invalid/recovered",
+        }]}},
+        {"success": True, "data": {"web": []}},
+        {"success": True, "data": {"web": [{
+            "url": "https://example.invalid/forbidden-extra-retry",
+        }]}},
+    ]
+    outputs, attempts = retrieve_batch(setup.g, results, primary_count=2)
+
+    assert len(outputs) == 2
+    assert attempts == [
+        {"query": "synthetic lookup 0"},
+        {"query": "synthetic lookup 0"},
+        {"query": "synthetic lookup 1"},
+    ]
+    assert setup.row["search_attempts_reserved"] == 3
+    assert setup.row["reserved"] == setup.row["settled"] == 2
+    assert setup.row["empty_retry_reserved"] is True
+    assert setup.row["closed"] is False
+    assert setup.row["urls"] == {"https://example.invalid/recovered"}
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [
+        {"attempts_reserved": 3, "category": "empty_retry_reserved", "version": 1},
+        {"attempts_reserved": 3, "category": "empty_retry_already_used", "version": 1},
+    ]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("change", [
+    "cancel", "deadline", "arguments", "phase", "request", "ticket", "run",
+])
+def test_search_retry_revalidates_run_ticket_deadline_and_exact_arguments(setup, change, capsys):
+    def before_attempt(count, args):
+        if count != 1:
+            return
+        if change == "cancel":
+            setup.row["cancelled"] = True
+        elif change == "deadline":
+            setup.row["deadline"] = time.monotonic() - 1
+        elif change == "arguments":
+            args["query"] = "changed query"
+        elif change == "phase":
+            setup.row["phase"] = "extract"
+        elif change == "request":
+            setup.row["request"] = "changed-request"
+        elif change == "ticket":
+            setup.g.ticket.set(("selected", "changed-request", "changed-call",
+                                "web_search", setup.module.frozen(args)))
+        else:
+            setup.session["run"] = "different-run"
+
+    _, attempts, _ = retrieve_attempts(
+        setup.g, [{"success": True, "data": {"web": []}},
+                  {"success": True, "data": {"web": [{"url": "https://example.invalid/x"}]}}],
+        before_attempt=before_attempt,
+    )
+    assert len(attempts) == 1
+    assert setup.row["search_attempts_reserved"] == 1
+    assert setup.row["empty_retry_reserved"] is False
+    assert setup.row["closed"] is True
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    expected = ("empty_retry_binding_refused"
+                if change in {"arguments", "phase", "request", "ticket"}
+                else "empty_retry_state_refused")
+    assert facts == {"attempts_reserved": 1, "category": expected, "version": 1}
+    assert "changed query" not in event
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_search_attempt_requires_exact_retry_state_types(setup, capsys):
+    setup.row["empty_retry_reserved"] = 0
+    _, attempts, _ = retrieve_attempts(
+        setup.g, [{"success": True, "data": {"web": []}},
+                  {"success": True, "data": {"web": [{"url": "https://example.invalid/x"}]}}])
+    assert attempts == [] and setup.row["closed"] is True
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    assert facts == {"attempts_reserved": 1, "category": "attempt_state_refused",
+                     "version": 1}
+
+
 def test_successful_initial_search_returns_to_one_native_provider_call(setup):
     calls = []
     request = {"model": "test-model", "tools": [
@@ -296,6 +990,202 @@ def test_successful_admitted_search_without_extraction_reaches_presentation(setu
     assert setup.row["phase"] == "search" and setup.row["settled"] == 1
     assert setup.row["spent"] == setup.row["admitted"] and len(setup.row["spent"]) == 1
     assert setup.run() is not setup.refused and len(setup.captured["requests"]) == 1
+
+
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/b", "title": "Published date", "description":
+     "Published October 21. Deployment in early 2027, once utilities are ready."},
+    {"url": "https://example.invalid/a", "description": "Bolt with Lucid."}]}}], indirect=True)
+def test_search_passages_are_immutable_and_bound_to_sorted_source_ids(setup):
+    s = setup
+    snapshots = s.row["passages"]
+    with pytest.raises(TypeError):
+        snapshots["https://example.invalid/a"] = ()
+    assert s.run() is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["objective"] == s.row["objective"]
+    assert payload["missing_source_ids"] == []
+    assert payload["evidence"][0] == {
+        "source_id": 0, "kind": "search", "text": "Bolt with Lucid.",
+        "original_bytes": len(b"Bolt with Lucid."), "truncated": False}
+    assert payload["evidence"][1]["source_id"] == 1
+    assert "Published October 21" in payload["evidence"][1]["text"]
+    assert "once utilities are ready" in payload["evidence"][1]["text"]
+    assert s.row["passages"] is snapshots
+
+
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/a", "description": "dated context. " + "界" * 20000},
+    {"url": "https://example.invalid/b", "description": "qualified context. " + "b" * 20000}]}}],
+    indirect=True)
+def test_evidence_pack_bounds_serialized_bytes_and_exposes_exact_prefix_omissions(setup):
+    s = setup
+    assert s.run() is not s.refused
+    packed = s.captured["requests"][0]["messages"][-1]["content"]
+    assert len(packed.encode("utf-8")) <= 16384
+    payload = json.loads(packed)
+    assert len(payload["evidence"]) == 2
+    for item in payload["evidence"]:
+        original = s.row["passages"][payload["sources"][item["source_id"]]["url"]][0][1]
+        assert original.startswith(item["text"]) and item["text"]
+        assert item["truncated"] is True
+        assert item["original_bytes"] == len(original.encode("utf-8"))
+
+
+def test_passage_map_replacement_during_presentation_is_refused(setup):
+    s = setup
+    async def replace():
+        s.row["passages"] = MappingProxyType(dict(s.row["passages"]))
+    s.captured["callback"] = replace
+    assert s.run() is s.refused
+    assert s.row["presentation_evidence"]["stage"] == "catalog-publication"
+
+
+def test_passage_catalog_mismatch_is_refused_before_formatter(setup):
+    setup.row["passages"] = MappingProxyType(dict(setup.row["passages"]) | {
+        "https://example.invalid/other": (("search", "Stale source text"),)})
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+
+
+def test_mutable_passage_snapshot_is_refused_before_formatter(setup):
+    setup.row["passages"] = dict(setup.row["passages"])
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_invalid_passage_shape_refuses_without_retaining_private_values(setup, capsys):
+    retrieve(setup.g, {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/a", "description": 7}]}})
+    assert setup.run() is setup.refused and not setup.captured["requests"]
+    assert "[lookup-evidence]" in capsys.readouterr().out
+
+
+async def extract_passage(s, payload, before_result=None, urls=None):
+    args = {"urls": ["https://example.invalid/source"] if urls is None else urls}
+    s.row["request"] = "extract-request"
+    s.row["spent"].add("extract-call")
+    token = s.g.ticket.set(("selected", "extract-request", "extract-call", "web_extract",
+                            s.module.frozen(args)))
+    async def original(_):
+        if before_result:
+            before_result()
+        return payload
+    try:
+        return await s.g.wrap_extract(original)(args)
+    finally:
+        s.g.ticket.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_admitted_extraction_retains_same_url_content_as_immutable_snapshot(setup):
+    s = setup
+    before = s.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source",
+        "title": "Observation", "content": "Published October 21; available early 2027."}]})
+    assert await extract_passage(s, result) == result
+    assert s.row["passages"] is not before
+    assert before["https://example.invalid/source"] == (("search", ""),)
+    assert await asyncio.to_thread(s.run) is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["missing_source_ids"] == []
+    assert payload["evidence"][1]["kind"] == "extract"
+    assert payload["evidence"][1]["text"] == (
+        "Observation\nPublished October 21; available early 2027.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["request", "catalog"])
+async def test_extraction_cannot_attach_another_admitted_catalog_sources_text(
+    setup, capsys, binding,
+):
+    s = setup
+    # Catalog membership alone is insufficient: only this extraction's request may bind text.
+    if binding == "request":
+        s.row["urls"].add("https://example.invalid/other")
+    before = s.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/other",
+                                     "content": "SYNTHETIC_PRIVATE_TEXT"}]})
+    urls = ["https://example.invalid/other"] if binding == "catalog" else None
+    assert await extract_passage(s, result, urls=urls) == result
+    assert not s.row["closed"]
+    assert set(s.row["passages"]) == set(before)
+    assert all("SYNTHETIC_PRIVATE_TEXT" not in text
+               for values in s.row["passages"].values() for _, text in values)
+    if binding == "request":
+        assert ("extract-unavailable", "") in s.row["passages"]["https://example.invalid/source"]
+    output = capsys.readouterr().out
+    assert '"category":"unbound"' in output and "SYNTHETIC_PRIVATE_TEXT" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/caf\u00e9", "description": "Dated search context."}]}}],
+    indirect=True)
+async def test_canonicalized_extraction_echo_is_an_explicit_gap_without_refusing_run(setup):
+    s = setup
+    requested = "https://example.invalid/caf\u00e9"
+    echoed = "https://example.invalid/caf%C3%A9"
+    result = json.dumps({"results": [{"url": echoed, "content": "Unbound extraction text"}]})
+    assert await extract_passage(s, result, urls=[requested]) == result
+    assert not s.row["closed"] and s.row["urls"] == {requested}
+    assert s.row["passages"][requested] == (
+        ("search", "Dated search context."), ("extract-unavailable", ""))
+    assert await asyncio.to_thread(s.run) is not s.refused
+    payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
+    assert payload["evidence"][1]["kind"] == "extract-unavailable"
+    assert payload["evidence"][1]["text"] == ""
+    assert "Unbound extraction text" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["closed", "replaced"])
+async def test_late_extraction_never_updates_retained_passages(setup, kind):
+    s = setup
+    before = s.row["passages"]
+    def late():
+        if kind == "closed":
+            s.row["closed"] = s.row["cancelled"] = True
+        else:
+            replacement = dict(s.row)
+            s.g.budgets["selected"] = replacement
+            s.g.members = MappingProxyType({
+                "selected": (s.module.VERSION, "identity", replacement)})
+            s.g._membership_authority = s.g.members
+    result = json.dumps({"results": [{"url": "https://example.invalid/source", "content": "Late"}]})
+    assert await extract_passage(s, result, late) == s.module.REFUSAL
+    assert s.row["passages"] is before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["x" * 262145, "界" * 100000], ids=["characters", "utf8"])
+async def test_extraction_snapshot_ingress_is_bounded_before_retention(
+    setup, capsys, monkeypatch, text,
+):
+    before = setup.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source", "content": text}]},
+                        ensure_ascii=False)
+    parsed = []
+    original_loads = setup.module.json.loads
+    def loads(value, *args, **kwargs):
+        parsed.append(True)
+        return original_loads(value, *args, **kwargs)
+    monkeypatch.setattr(setup.module.json, "loads", loads)
+    assert await extract_passage(setup, result) == setup.module.REFUSAL
+    assert setup.row["passages"] is before
+    assert parsed == []
+    assert '"category":"bound"' in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
+    {"url": "https://example.invalid/source", "description": "s" * 180000}]}}], indirect=True)
+async def test_combined_snapshot_bytes_are_bounded_atomically(setup, capsys):
+    before = setup.row["passages"]
+    result = json.dumps({"results": [{"url": "https://example.invalid/source",
+                                     "content": "e" * 100000}]})
+    assert await extract_passage(setup, result) == setup.module.REFUSAL
+    assert setup.row["passages"] is before
+    assert '"category":"bound"' in capsys.readouterr().out
 
 
 def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
@@ -439,9 +1329,11 @@ def test_budget_only_completion_does_not_claim_or_require_retrieval(setup):
     assert setup.run() is setup.original and not setup.captured["requests"]
 
 
-def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
+def test_formatter_reasoning_control_projects_without_mutating_native_task_request(setup):
     s = setup
     s.request["reasoning_effort"] = "high"
+    s.row.update(phase="search", reserved=1, settled=1)
+    original = json.loads(json.dumps(s.request))
     seen = []
 
     def native(request):
@@ -449,7 +1341,12 @@ def test_formatter_reasoning_control_does_not_modify_native_task_request(setup):
         return s.original
 
     assert s.run(next_call=native) is not s.refused
-    assert seen == [s.request] and s.request["reasoning_effort"] == "high"
+    assert len(seen) == 1 and seen[0] is not s.request
+    assert s.request == original and s.request["reasoning_effort"] == "high"
+    assert seen[0]["reasoning_effort"] == "high"
+    assert seen[0]["tools"] == []
+    assert all(key not in seen[0] for key in (
+        "tool_choice", "parallel_tool_calls", "functions", "function_call"))
     assert s.captured["requests"][0]["reasoning_effort"] == "none"
 
 
@@ -695,6 +1592,205 @@ def test_native_rejection_category_is_fixed_and_does_not_emit_arguments(
     assert evidence["calls"] == 0 and not s.captured["requests"]
     output = capsys.readouterr().out
     assert "SYNTHETIC_PRIVATE" not in output and "Out of range float values" not in output
+
+
+@pytest.mark.parametrize(
+    ("args", "kind", "count", "cause", "nonstring", "duplicate", "unadmitted"), [
+    ({}, "missing", 0, "not_list", 0, 0, 0),
+    ({"urls": "SYNTHETIC_PRIVATE_WRONG_TYPE"}, "string", 0, "not_list", 0, 0, 0),
+    ({"urls": []}, "list", 0, "count", 0, 0, 0),
+    ({"urls": ["a", "b", "c", "SYNTHETIC_PRIVATE_EXTRA", "e"]},
+     "list", 4, "count", 0, 0, 0),
+    ({"urls": [None, "SYNTHETIC_PRIVATE_NONSTRING"]}, "list", 2, "non_string", 1, 0, 0),
+    ({"urls": ["https://example.invalid/source"] * 2}, "list", 2, "duplicate", 0, 1, 0),
+    ({"urls": ["https://example.invalid/SYNTHETIC_PRIVATE_UNADMITTED"]},
+     "list", 1, "not_admitted", 0, 0, 1),
+], ids=["missing", "wrong-type", "empty", "too-many", "non-string",
+        "duplicate", "unadmitted"])
+def test_extract_url_rejection_emits_only_bounded_cause_counts(
+    setup, capsys, args, kind, count, cause, nonstring, duplicate, unadmitted,
+):
+    s = setup
+    call = SimpleNamespace(id="synthetic-extract-call", function=SimpleNamespace(
+        name="web_extract", arguments=json.dumps(args)))
+    s.run.original = completion(None, reason="tool_calls", calls=[call])
+    assert s.run() is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["rejection"] == "url-membership"
+    assert evidence["extract_urls_kind"] == kind
+    assert evidence["extract_urls_count"] == count
+    assert evidence["extract_urls_rejection_cause"] == cause
+    assert evidence["extract_urls_non_string_count"] == nonstring
+    assert evidence["extract_urls_duplicate_count"] == duplicate
+    assert evidence["extract_urls_unadmitted_count"] == unadmitted
+    output = capsys.readouterr().out
+    assert "SYNTHETIC_PRIVATE" not in output
+    assert "https://example.invalid" not in output
+
+
+def _request_with_lookup_tools(api_mode):
+    parameters = {
+        "type": "object", "title": "Native web_extract parameters",
+        "properties": {
+            "urls": {
+                "type": "array", "description": "Native URL field",
+                "minItems": 0, "maxItems": 100, "uniqueItems": False,
+                "items": {"type": "string", "description": "Native URL item"},
+            },
+            "char_limit": {
+                "type": "integer", "description": "Native file-recovery advice",
+                "minimum": 2000,
+            },
+        },
+        "required": ["urls"],
+        "additionalProperties": False,
+    }
+    names = ("web_search", "web_extract", "read_file")
+    if api_mode == "chat_completions":
+        tools = [{"type": "function", "function": {
+            "name": name, "description": "Native description " + name,
+            "parameters": json.loads(json.dumps(parameters)),
+        }} for name in names]
+    else:
+        tools = [{"type": "function", "name": name,
+                  "description": "Native description " + name,
+                  "parameters": json.loads(json.dumps(parameters))} for name in names]
+    return {
+        "model": "test-model", "tools": tools,
+        "tool_choice": {"type": "function", "name": "web_search"},
+        "parallel_tool_calls": True,
+        "functions": [{"name": "read_file"}], "function_call": "auto",
+        "metadata": {"preserve": "this"},
+    }
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_settled_search_projects_exact_optional_extract_tool(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+        s.run.original = s.codex_response([SimpleNamespace(
+            type="function_call", id="extract-item", call_id="extract-call",
+            name="web_extract",
+            arguments=json.dumps({"urls": ["https://example.invalid/source"]}),
+            status=None,
+        )])
+    else:
+        tool_call = SimpleNamespace(
+            id="extract-call", type="function",
+            function=SimpleNamespace(
+                name="web_extract", arguments='{"urls":["https://example.invalid/source"]}'),
+        )
+        s.run.original = completion(None, reason="tool_calls", calls=[tool_call])
+    s.row["urls"].add("https://example.invalid/second")
+    request = _request_with_lookup_tools(api_mode)
+    original = json.loads(json.dumps(request))
+    forwarded = []
+
+    def native(value):
+        forwarded.append(value)
+        return s.run.original
+
+    result = s.run(api_mode=api_mode, request=request, next_call=native)
+    assert result is s.run.original and s.row["phase"] == "extract"
+    assert len(forwarded) == 1 and forwarded[0] is not request
+    assert request == original
+    projected = forwarded[0]
+    assert [
+        item["function"]["name"] if api_mode == "chat_completions" else item["name"]
+        for item in projected["tools"]
+    ] == ["web_extract"]
+    tool = projected["tools"][0]
+    function = tool["function"] if api_mode == "chat_completions" else tool
+    assert function["description"] == s.module.EXTRACT_TOOL_DESCRIPTION
+    assert function["parameters"] == {
+        "type": "object", "title": "Native web_extract parameters",
+        "properties": {
+            "urls": {
+                "type": "array", "description": s.module.EXTRACT_URLS_DESCRIPTION,
+                "minItems": 1, "maxItems": s.module.EXTRACT_LIMIT, "uniqueItems": True,
+                "items": {"type": "string", "description": "Native URL item",
+                          "enum": sorted(s.row["urls"])},
+            },
+            "char_limit": {
+                "type": "integer", "description": s.module.EXTRACT_CHAR_LIMIT_DESCRIPTION,
+                "minimum": 2000,
+            },
+        },
+        "required": ["urls"], "additionalProperties": False,
+    }
+    assert projected["tool_choice"] == "auto"
+    assert projected["parallel_tool_calls"] is False
+    assert "functions" not in projected and "function_call" not in projected
+    assert projected["metadata"] == {"preserve": "this"}
+    assert "browser" not in function["description"].lower()
+    assert "read_file" not in function["description"].lower()
+    assert "read_file" not in function["parameters"]["properties"]["char_limit"][
+        "description"].lower()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_after_extract_projection_removes_tool_controls(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+    args = {"urls": ["https://example.invalid/source"]}
+    if api_mode == "chat_completions":
+        tool_call = SimpleNamespace(
+            id="extract-call", type="function",
+            function=SimpleNamespace(name="web_extract", arguments=json.dumps(args)),
+        )
+        s.run.original = completion(None, reason="tool_calls", calls=[tool_call])
+    else:
+        s.run.original = s.codex_response([SimpleNamespace(
+            type="function_call", id="extract-item", call_id="extract-call",
+            name="web_extract", arguments=json.dumps(args), status=None,
+        )])
+    request = _request_with_lookup_tools(api_mode)
+    original = json.loads(json.dumps(request))
+    first = s.run(api_mode=api_mode, request=request, next_call=lambda _: s.run.original)
+    assert first is s.run.original and s.row["phase"] == "extract"
+    s.g.tool_gate(
+        tool_name="web_extract", tool_call_id="extract-call", api_request_id="task-request",
+        args=args, next_call=lambda _: "extracted",
+    )
+
+    if api_mode == "chat_completions":
+        s.run.original = completion("Grounded source answer.")
+    else:
+        s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    forwarded = []
+    result = s.run(api_mode=api_mode, request=request,
+                   next_call=lambda value: forwarded.append(value) or s.run.original)
+    assert result is not s.refused and len(forwarded) == 1
+    assert request == original
+    assert all(key not in forwarded[0] for key in (
+        "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"))
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_search_projection_waits_until_all_searches_settle(setup, api_mode):
+    s = setup
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+        s.run.original = s.codex_response([s.codex_message("Grounded source answer.")])
+    s.row["reserved"] += 1
+    request = _request_with_lookup_tools(api_mode)
+    forwarded = []
+    result = s.run(api_mode=api_mode, request=request,
+                   next_call=lambda value: forwarded.append(value) or s.run.original)
+    assert result is not s.refused
+    assert forwarded == [request] and forwarded[0] is request
+
+
+def test_unselected_run_receives_the_original_native_request(setup):
+    s = setup
+    s.session["run"] = "unselected"
+    request = _request_with_lookup_tools("chat_completions")
+    forwarded = []
+    result = s.run(next_call=lambda value: forwarded.append(value) or s.original, request=request)
+    assert result is s.original
+    assert forwarded == [request] and forwarded[0] is request
 
 
 def test_unknown_native_guard_exception_does_not_emit_its_secret_message(setup, capsys):

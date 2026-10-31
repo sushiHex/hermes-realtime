@@ -8,7 +8,7 @@ import shutil
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
+from hermes_realtime.providers._speech_text import project_speech_text
 from hermes_realtime.speech import AudioFrame, SpeechChunk
 
 _MAX_TEXT_CHARS = 4096
@@ -158,7 +158,7 @@ class EdgeTtsSynthesizer:
     @staticmethod
     def project_spoken_text(text: str) -> str:
         """Expose the canonical text submitted to Edge synthesis."""
-        return strip_markdown_emphasis_for_speech(text)
+        return project_speech_text(text)
 
     async def _edge_synthesize(self, text: str, voice: str) -> bytes:
         try:

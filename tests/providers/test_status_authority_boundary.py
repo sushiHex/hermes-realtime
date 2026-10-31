@@ -86,7 +86,20 @@ async def _request(provider, snapshot, *, with_tools=True):
     finally:
         await inference.close()
     thread = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in thread["params"]["dynamicTools"]] == (
+    dynamic_tools = thread["params"]["dynamicTools"]
+    assert type(dynamic_tools) is list
+    if not dynamic_tools:
+        assert not with_tools
+        functions = []
+    else:
+        assert len(dynamic_tools) == 1
+        namespace = dynamic_tools[0]
+        assert type(namespace) is dict and namespace.get("type") == "namespace"
+        assert namespace.get("name") == "hermes"
+        functions = namespace.get("tools")
+        assert type(functions) is list and len(functions) <= 16
+        assert all(type(tool) is dict and tool.get("type") == "function" for tool in functions)
+    assert [tool["name"] for tool in functions] == (
         ["start_work", "task_status"] if with_tools else []
     )
     turn = next(row for row in transport.sent if row.get("method") == "turn/start")

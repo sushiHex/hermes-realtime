@@ -1171,6 +1171,7 @@ def terminal_event(
     session_id: str = "session_001",
     event_id: str = "evt_completed_001",
     sequence: int = 4,
+    summary: str = "Finished",
 ) -> WorkCompletedEvent:
     return WorkCompletedEvent(
         type="work.completed",
@@ -1182,9 +1183,73 @@ def terminal_event(
         run_id=run_id,
         payload=WorkCompletedPayload(
             status=WorkTerminalStatus.COMPLETED,
-            summary="Finished",
+            summary=summary,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_completed_summary_keeps_api_bound_while_context_stores_bounded_reference() -> None:
+    from hermes_realtime.conversation.tasks import _MAX_COMPLETED_SUMMARY_CHARS
+    from hermes_realtime.integration.api import _MAX_TERMINAL_TEXT_CHARS
+
+    assert _MAX_COMPLETED_SUMMARY_CHARS == _MAX_TERMINAL_TEXT_CHARS == 4096
+    summary = (
+        "<voice>Deployment confirmed; details are ready.</voice><detail>"
+        "Prepared-site deployment confirmed at https://example.com/source. "
+        + "Verified detail. " * 90
+        + "</detail>"
+    )
+    assert 1024 < len(summary) <= _MAX_TERMINAL_TEXT_CHARS
+
+    class CompletedSession(AcceptingTaskSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.updates: asyncio.Queue[WorkCompletedEvent] = asyncio.Queue()
+
+        async def next_update(self) -> WorkCompletedEvent:
+            return await self.updates.get()
+
+    context = ConversationContextStore()
+    session = CompletedSession()
+    controller = ConversationTaskController(
+        context=context,
+        session=session,
+        session_id="session_001",
+        id_factory=iter(("deployment", "dispatch_deployment")).__next__,
+    )
+    dispatch = await controller.dispatch(
+        objective="check deployment", utterance_id="utterance_001"
+    )
+    await session.updates.put(terminal_event(task_id=dispatch.task_id, summary=summary))
+
+    outcome = await controller.next_completion()
+
+    assert outcome.summary == summary
+    snapshot = context.snapshot()
+    assert snapshot.active_tasks == ()
+    assert len(snapshot.recent_task_results) == 1
+    reference = snapshot.recent_task_results[0].text
+    assert len(reference) <= 1024
+    assert "example.com" in reference
+    await controller.close()
+
+
+def test_terminal_text_bounds_remain_distinct_and_exact() -> None:
+    from hermes_realtime.conversation.tasks import _MAX_COMPLETED_SUMMARY_CHARS
+    from hermes_realtime.integration.api import _MAX_TERMINAL_TEXT_CHARS
+
+    assert _MAX_COMPLETED_SUMMARY_CHARS == _MAX_TERMINAL_TEXT_CHARS == 4096
+    TaskTerminalOutcome(
+        task_id="task_summary", status="completed", summary="x" * _MAX_TERMINAL_TEXT_CHARS
+    )
+    with pytest.raises(ValueError, match="summary"):
+        TaskTerminalOutcome(
+            task_id="task_summary", status="completed", summary="x" * (_MAX_TERMINAL_TEXT_CHARS + 1)
+        )
+    TaskTerminalOutcome(task_id="task_reason", status="failed", reason="x" * 1024)
+    with pytest.raises(ValueError, match="reason"):
+        TaskTerminalOutcome(task_id="task_reason", status="failed", reason="x" * 1025)
 
 
 @pytest.mark.asyncio

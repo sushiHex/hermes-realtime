@@ -61,6 +61,44 @@ def gateway():
     return module
 
 
+def metadata_config(base="https://chatgpt.com/backend-api/codex", mode="codex_responses"):
+    return {"model": {"provider": "custom", "default": "cloud-model", "base_url": base,
+                      "api_mode": mode},
+            "plugins": {"entries": {"ordinary-lookup-experimental": {"settings": {
+                "presentation": {"provider": "custom", "model": "cloud-model",
+                                 "base_url": base, "api_mode": mode}}}}}}
+
+
+def test_responses_gateway_binds_only_native_metadata_paths():
+    base = "https://chatgpt.com/backend-api/codex"
+    assert gateway().metadata_urls_from_config(metadata_config()) == frozenset({
+        base + "/models", base + "/v1/models",
+    })
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "foreign"), ("model", "foreign"), ("base_url", "https://foreign.invalid"),
+    ("api_mode", "chat_completions"),
+])
+def test_responses_gateway_requires_same_native_presentation_route(field, value):
+    config = metadata_config()
+    presentation = config["plugins"]["entries"]["ordinary-lookup-experimental"]["settings"]
+    presentation["presentation"][field] = value
+    with pytest.raises(RuntimeError, match="metadata_route_mismatch"):
+        gateway().metadata_urls_from_config(config)
+
+
+@pytest.mark.parametrize("base,mode", [
+    ("https://foreign.invalid", "codex_responses"),
+    ("https://chatgpt.com/backend-api/codex", "codex_app_server"),
+    ("http://127.0.0.1:11441/v1", "codex_app_server"),
+    ("https://chatgpt.com/backend-api/codex?secret=1", "codex_responses"),
+])
+def test_responses_gateway_refuses_unsupported_route(base, mode):
+    with pytest.raises(RuntimeError, match="metadata_route_refused"):
+        gateway().metadata_urls_from_config(metadata_config(base, mode))
+
+
 def witness():
     return {
         "searchRequests": 0,
@@ -246,3 +284,313 @@ def test_policy_diagnostic_saturates_counters():
     tee.write('[lookup-presentation] {"category":"refused","stage":"source"}\n')
     assert state["policyDiagnostics"]["observed"] == 1000000
     assert len(state["policyDiagnostics"]["events"]) == 1
+
+
+def test_cloud_metadata_lane_preserves_native_fallback_and_two_request_limit(capsys):
+    module, state, calls = gateway(), witness(), []
+    allowed = module.metadata_urls_from_config(metadata_config())
+    response = SimpleNamespace(
+        status_code=404, raw=SimpleNamespace(read=lambda *_a, **_k: b"{}"), close=lambda: None,
+    )
+    session = SimpleNamespace(
+        get_adapter=lambda _: SimpleNamespace(max_retries=SimpleNamespace(total=0)),
+    )
+
+    def forward(_session, request, **kwargs):
+        calls.append(request.url)
+        assert kwargs == {"allow_redirects": False, "stream": True,
+                          "timeout": (5, 10), "proxies": {}}
+        return response
+
+    send = module.bounded_exa_send(
+        forward, state, set(), lambda: None, SimpleNamespace(), allowed,
+    )
+    for url in sorted(allowed):
+        assert send(session, SimpleNamespace(url=url, method="GET", body=None)) is response
+    assert len(calls) == state["metadataRequests"] == 2
+    assert state["transportRefused"] is False
+    assert [row["httpStatus"] for row in state["transportResponses"]] == [404, 404]
+    with pytest.raises(RuntimeError, match="metadata_request_refused"):
+        send(session, SimpleNamespace(url=sorted(allowed)[0], method="GET", body=None))
+    assert len(calls) == 2
+    assert marker(capsys.readouterr().out)["forwarded"] is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://chatgpt.com/backend-api/codex/models?extra=1",
+    "https://chatgpt.com/backend-api/codex/models/other",
+    "https://chatgpt.com.attacker.invalid/backend-api/codex/models",
+])
+def test_cloud_metadata_lane_refuses_neighboring_urls(url):
+    module, state = gateway(), witness()
+    send = module.bounded_exa_send(
+        lambda *_a, **_k: pytest.fail("must not forward"), state, set(), lambda: None,
+        SimpleNamespace(), module.metadata_urls_from_config(metadata_config()),
+    )
+    with pytest.raises(RuntimeError, match="metadata_request_refused"):
+        send(None, SimpleNamespace(url=url, method="GET", body=None))
+
+
+def _search_send_case(module, witness_state, wire_state, *, proof_caps, body_query=None):
+    request_query = wire_state.search["query"] if body_query is None else body_query
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "web_search_exa", "arguments": {
+                           "query": request_query, "numResults": wire_state.search["limit"]}}})
+    response = SimpleNamespace(
+        status_code=200,
+        raw=SimpleNamespace(read=lambda *_a, **_k: b"{}"),
+        close=lambda: None,
+    )
+    forwarded = []
+
+    def original(_session, _request, **_kwargs):
+        forwarded.append(True)
+        return response
+
+    send = module.bounded_exa_send(
+        original, witness_state, set(), lambda: None, wire_state, proof_caps=proof_caps,
+    )
+    result = send(None, SimpleNamespace(
+        url="https://mcp.exa.ai/mcp", method="POST", body=body,
+    ), timeout=30)
+    return result, forwarded
+
+
+def test_proof_profile_retains_process_wide_search_cap():
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    for index in range(5):
+        wire.search = {"query": f"query-{index}", "limit": 5, "spent": False}
+        result, forwarded = _search_send_case(module, state, wire, proof_caps=True)
+        assert forwarded == [True] and result.status_code == 200
+    wire.search = {"query": "sixth", "limit": 5, "spent": False}
+    with pytest.raises(RuntimeError, match="exa_search_binding_refused"):
+        _search_send_case(module, state, wire, proof_caps=True)
+    assert state["searchRequests"] == 5
+
+
+def test_transport_profile_keeps_proof_caps_defaulted_only_to_proof_mode():
+    select_caps = gateway().proof_caps_enabled
+    assert select_caps("proof") is True
+    assert select_caps("interactive") is False
+    with pytest.raises(ValueError, match="transport_profile_invalid"):
+        select_caps("unknown")
+
+
+def test_proof_profile_retains_process_wide_extract_cap():
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    allowed = {f"https://source-{index}.invalid/page" for index in range(4)}
+    send = module.bounded_exa_send(
+        lambda *_a, **_k: SimpleNamespace(
+            status_code=200,
+            raw=SimpleNamespace(read=lambda *_args, **_kwargs: b"{}"),
+            close=lambda: None,
+        ),
+        state, allowed, lambda: None, wire, proof_caps=True,
+    )
+    for index in range(3):
+        url = f"https://source-{index}.invalid/page"
+        wire.extract = {"urls": {url}, "spent": set()}
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "web_fetch_exa", "arguments": {"urls": [url]}}})
+        send(None, SimpleNamespace(url="https://mcp.exa.ai/mcp", method="POST", body=body),
+             timeout=30)
+    url = "https://source-3.invalid/page"
+    wire.extract = {"urls": {url}, "spent": set()}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "web_fetch_exa", "arguments": {"urls": [url]}}})
+    with pytest.raises(RuntimeError, match="exa_extract_binding_refused"):
+        send(None, SimpleNamespace(url="https://mcp.exa.ai/mcp", method="POST", body=body),
+             timeout=30)
+    assert state["extractRequests"] == 3
+
+
+def test_interactive_profile_ignores_old_process_total_but_keeps_query_binding():
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    # A prior run can exhaust the proof-only process total; each active provider call still
+    # binds its exact query and one send. Per-run policy budgets remain plugin-owned.
+    state["searchRequests"] = 5
+    wire.search = {"query": "first-run", "limit": 5, "spent": False}
+    result, forwarded = _search_send_case(module, state, wire, proof_caps=False)
+    assert forwarded == [True] and result.status_code == 200
+    assert state["searchRequests"] == 6
+
+    wire.search = {"query": "second-run", "limit": 5, "spent": False}
+    result, forwarded = _search_send_case(module, state, wire, proof_caps=False)
+    assert forwarded == [True] and result.status_code == 200
+    assert state["searchRequests"] == 7
+
+    wire.search = {"query": "second-run", "limit": 5, "spent": False}
+    with pytest.raises(RuntimeError, match="exa_search_binding_refused"):
+        _search_send_case(module, state, wire, proof_caps=False, body_query="first-run")
+    assert state["searchRequests"] == 7
+
+
+def test_interactive_profile_keeps_single_wire_send_per_active_search_call():
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    wire.search = {"query": "same-run", "limit": 5, "spent": False}
+    _search_send_case(module, state, wire, proof_caps=False)
+    with pytest.raises(RuntimeError, match="exa_search_binding_refused"):
+        _search_send_case(module, state, wire, proof_caps=False)
+    assert state["searchRequests"] == 1
+
+
+def test_interactive_profile_keeps_consecutive_extractions_bound_to_active_call():
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    state["extractRequests"] = 3
+    response = SimpleNamespace(
+        status_code=200,
+        raw=SimpleNamespace(read=lambda *_a, **_k: b"{}"),
+        close=lambda: None,
+    )
+    forwarded = []
+
+    def original(_session, _request, **_kwargs):
+        forwarded.append(True)
+        return response
+
+    send = module.bounded_exa_send(
+        original, state, set(), lambda: None, wire, proof_caps=False,
+    )
+    for url in ("https://source-one.invalid/page", "https://source-two.invalid/page"):
+        wire.extract = {"urls": {url}, "spent": set()}
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "web_fetch_exa", "arguments": {"urls": [url]}}})
+        assert send(None, SimpleNamespace(
+            url="https://mcp.exa.ai/mcp", method="POST", body=body,
+        ), timeout=30) is response
+    assert len(forwarded) == 2 and state["extractRequests"] == 5
+
+    wire.extract = {"urls": {"https://source-two.invalid/page"}, "spent": set()}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "web_fetch_exa", "arguments": {
+                           "urls": ["https://source-one.invalid/page"]}}})
+    with pytest.raises(RuntimeError, match="exa_extract_binding_refused"):
+        send(None, SimpleNamespace(url="https://mcp.exa.ai/mcp", method="POST", body=body),
+             timeout=30)
+    assert state["extractRequests"] == 5
+
+
+def test_interactive_transport_receipts_are_bounded():
+    module, state = gateway(), witness()
+    allowed = module.metadata_urls_from_config(metadata_config())
+    response = SimpleNamespace(
+        status_code=200,
+        raw=SimpleNamespace(read=lambda *_a, **_k: b"{}"),
+        close=lambda: None,
+    )
+    session = SimpleNamespace(
+        get_adapter=lambda _: SimpleNamespace(max_retries=SimpleNamespace(total=0)),
+    )
+    send = module.bounded_exa_send(
+        lambda *_a, **_k: response, state, set(), lambda: None, SimpleNamespace(), allowed,
+        proof_caps=False,
+    )
+    url = sorted(allowed)[0]
+    request = SimpleNamespace(url=url, method="GET", body=None)
+    for _ in range(20):
+        send(session, request)
+    assert len(state["transportResponses"]) == 16
+    assert state["transportResponseCount"] == 20
+    assert state["transportResponsesTruncated"] is True
+
+
+def test_interactive_profile_requires_enabled_reviewed_staged_policy(tmp_path):
+    module = gateway()
+    stage = module._stage_lookup_policy_module()
+    plugin = tmp_path / "plugins" / stage.PLUGIN
+    plugin.mkdir(parents=True)
+    # Use the staging module's reviewed digests and exact fixed bootstrap artifacts.
+    reviewed = {
+        "entrypoint.py": (
+            Path(__file__).resolve().parents[1]
+            / "tests/fixtures/plugin_generation_candidate/entrypoint.py"
+        ).read_bytes(),
+        "policy.py": (Path(__file__).resolve().parents[1]
+                      / "tests/fixtures/plugin_generation_candidate/policy.py").read_bytes(),
+        "__init__.py": stage.BOOTSTRAP,
+        "plugin.yaml": stage.MANIFEST,
+    }
+    for name, payload in reviewed.items():
+        (plugin / name).write_bytes(payload)
+    config = {"plugins": {
+        "enabled": ["hermes-realtime", stage.PLUGIN],
+        "entries": {stage.PLUGIN: {"allow_tool_override": True}},
+    }}
+    module.require_interactive_policy_profile(config, tmp_path)
+
+    config["plugins"]["enabled"].remove(stage.PLUGIN)
+    with pytest.raises(RuntimeError, match="interactive_policy_profile_refused"):
+        module.require_interactive_policy_profile(config, tmp_path)
+    config["plugins"]["enabled"].append(stage.PLUGIN)
+    config["plugins"]["entries"][stage.PLUGIN]["allow_tool_override"] = False
+    with pytest.raises(RuntimeError, match="interactive_policy_profile_refused"):
+        module.require_interactive_policy_profile(config, tmp_path)
+
+
+def test_interactive_profile_refuses_changed_policy_bytes(tmp_path):
+    module = gateway()
+    stage = module._stage_lookup_policy_module()
+    plugin = tmp_path / "plugins" / stage.PLUGIN
+    plugin.mkdir(parents=True)
+    reviewed = {
+        "entrypoint.py": (
+            Path(__file__).resolve().parents[1]
+            / "tests/fixtures/plugin_generation_candidate/entrypoint.py"
+        ).read_bytes(),
+        "policy.py": (Path(__file__).resolve().parents[1]
+                      / "tests/fixtures/plugin_generation_candidate/policy.py").read_bytes(),
+        "__init__.py": stage.BOOTSTRAP,
+        "plugin.yaml": stage.MANIFEST,
+    }
+    for name, payload in reviewed.items():
+        (plugin / name).write_bytes(payload)
+    config = {"plugins": {
+        "enabled": ["hermes-realtime", stage.PLUGIN],
+        "entries": {stage.PLUGIN: {"allow_tool_override": True}},
+    }}
+    (plugin / "policy.py").write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="interactive_policy_profile_refused"):
+        module.require_interactive_policy_profile(config, tmp_path)
+
+
+def test_interactive_profile_bounds_reads_of_oversized_policy(tmp_path, monkeypatch):
+    module = gateway()
+    stage = module._stage_lookup_policy_module()
+    plugin = tmp_path / "plugins" / stage.PLUGIN
+    plugin.mkdir(parents=True)
+    source_root = Path(__file__).resolve().parents[1] / "tests/fixtures/plugin_generation_candidate"
+    (plugin / "entrypoint.py").write_bytes((source_root / "entrypoint.py").read_bytes())
+    (plugin / "policy.py").write_bytes(b"x" * 500000)
+    (plugin / "__init__.py").write_bytes(stage.BOOTSTRAP)
+    (plugin / "plugin.yaml").write_bytes(stage.MANIFEST)
+    config = {"plugins": {
+        "enabled": ["hermes-realtime", stage.PLUGIN],
+        "entries": {stage.PLUGIN: {"allow_tool_override": True}},
+    }}
+
+    oversized = plugin / "policy.py"
+    original_open = Path.open
+    requested_reads = []
+
+    class ReadSpy:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.stream.close()
+
+        def read(self, size=-1):
+            requested_reads.append(size)
+            return self.stream.read(size)
+
+    def spy_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return ReadSpy(stream) if path == oversized else stream
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    with pytest.raises(RuntimeError, match="interactive_policy_profile_refused"):
+        module.require_interactive_policy_profile(config, tmp_path)
+    assert requested_reads == [100001]

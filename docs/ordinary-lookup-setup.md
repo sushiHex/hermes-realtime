@@ -10,10 +10,22 @@ not a provider-controlled choice or evidence of objective fidelity. See
 [ADR 0004](adr/0004-model-action-authority.md).
 The equivalent host CLI flags are `--natural-work-tools --task-start-policy automatic`.
 
-Routing guidance requires a new work request or explicit retry in the latest user
-turn. A social acknowledgment, status question, or earlier failure alone does not
-authorize another task. This is model-directed intent selection, not a deterministic
-semantic guarantee; the host's existing admission and cancellation boundaries remain.
+The Codex adapter groups host tools in the `hermes` namespace and explicitly sets
+`features.code_mode.direct_only_tool_namespaces=["hermes"]` on its isolated
+app-server command. This keeps those tools directly callable when model metadata
+selects `code_mode_only`; native execution remains disabled. Callbacks must match
+the exact advertised namespace and function. The adapter does not rewrite model
+metadata or expose the global `functions` namespace. Setting only the user's
+Codex configuration is insufficient because the isolated home copies only login
+material. The supported namespace setting is defined by the
+[pinned official CLI source](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/features/src/feature_configs.rs#L56).
+
+Routing guidance interprets the latest user turn in retained context. Supplying
+requested missing details continues an unresolved user request; repetition is not
+required. An assistant offer, social acknowledgment, status question, or earlier
+failed/completed task alone does not authorize more work. This remains model-directed
+intent selection, not a semantic guarantee; host admission and cancellation stay
+unchanged.
 
 This is the explicit, disabled-by-default backend configuration delivered by
 [#301](https://github.com/sushiHex/hermes-realtime/pull/301), not a foreground
@@ -27,6 +39,75 @@ task and cleanup. Use that command rather than an unpublished operator helper.
 Its backend-only execution and source/semantic evidence must be recorded before
 claiming a walkthrough passed; it does not qualify the foreground profile or a
 fresh model download.
+
+## Evidence-aware presentation
+
+The selected plugin retains immutable text snapshots from admitted, successful
+search and extraction results. Extraction text must name a URL from that exact
+admitted extraction request and the same run's source catalog. The formatter gets
+no text from an unbound extraction echo: the tool result and run are preserved,
+with an explicit `extract-unavailable` passage for the requested catalog sources.
+This includes canonicalized echoes whose equivalence has not been established.
+The formatter gets the original objective, the fallible native draft, stable source IDs and URL mapping,
+and these untrusted passages. Its instructions require evidence-aware synthesis,
+including supplied dates, qualifications and explicit gaps, rather than faithful
+repetition of unsupported draft claims.
+
+The complete serialized presentation input remains capped at 16,384 UTF-8 bytes.
+Packing shares one character-prefix allowance across passages and measures the
+actual serialized byte size. Every excerpt carries its original byte count and an
+explicit truncation flag; sources with no text are identified separately. Prefix
+packing does not establish that omitted context is immaterial. Voice remains capped
+at 220 characters and rendered detail, including selected citation URLs, at 1,800.
+These checks prove source binding, bounds and valid references, not factual truth
+or faithful inference. Actual answer quality and voice acceptance remain separately
+observed outcomes under [the grounding investigation](https://github.com/sushiHex/hermes-realtime/issues/386).
+
+Presentation keeps `chat_completions` as its default. A plugin configuration may
+explicitly select `api_mode: codex_responses`; this is a same-provider, same-base-
+URL, same-model direct Responses request with no advertised tools, strict schema,
+streaming, `store: false` and low reasoning. The bounded stream must terminate in
+one completed response; unknown events or output, refusal, incomplete/null
+terminal state, or missing final answer refuse publication. Deltas are not used to
+reconstruct a response. A successful result retains its raw Responses envelope
+and rewrites only the final-answer text. The observed subscription-provider
+`response.metadata` extension is ignored without inspecting its payload; it
+still counts toward the stream bound and is rejected after the terminal event.
+It cannot supply answer content or authorize work. Other unknown events remain
+refused. This is observed provider compatibility, not a claim that the extension
+is part of the documented Responses event set. This route uses an explicitly supplied
+token through the SDK Codex headers helper, without OAuth lookup or refresh, and
+does not establish foreground Codex support or native task qualification.
+
+For the pinned Hermes resolver, a plain `model.provider: custom` configuration
+at the Codex subscription endpoint does **not** preserve `model.api_mode`.
+Declare a named provider entry literally called `custom`, with the same endpoint,
+model, credential environment variable and explicit `api_mode: codex_responses`.
+This resolves to canonical provider `custom` while preserving the Responses mode.
+Keep the model and presentation route bindings equal, and verify the actual
+resolved route before dispatch. This explicit-token configuration does not
+qualify OAuth discovery or refresh. A direct endpoint request alone does not
+prove the native Runs path.
+
+For a selected lookup, the advertised tools reflect the existing execution policy:
+after search settles, the model may answer or make one extraction request using
+unique URLs from that run's admitted catalog, within the existing extraction
+limit. After extraction, no further tools are advertised. The request is copied;
+shared native schemas and handlers remain unchanged. Runtime admission still
+checks every proposal independently; schema guidance does not authorize a call,
+repair its arguments, or guarantee that a model will comply.
+
+A search handler may make one additional attempt with the exact same arguments
+only when its normalized response is successful, has no error, and contains an
+exact empty `data.web` list. The extra attempt is reserved against the existing
+five-attempt per-run limit and original 120-second admission deadline; it does not
+create another model call, tool call or ticket. Errors, malformed results,
+cancellation and expired runs do not retry. If the second successful result is
+also empty, presentation remains refused for missing retrieval evidence. The
+deadline gates retry admission and later publication; an already-admitted
+synchronous handler may settle afterward under the existing execution contract.
+The ticket still admits one logical search call; the optional retry consumes a
+separately reserved attempt slot under that same call.
 
 ## Freeze the source and artifacts
 
@@ -244,6 +325,36 @@ without a retention override preserve that lease in the
 The caller must retain its Job, watchdog and final settlement for the entire
 consumer session. This prevents idle expiration; it does not prove future runner
 survival or replace process/listener cleanup.
+
+The one-task proof command starts the gateway with its default
+`--transport-profile proof`. Its independent transport caps are five search
+requests, three extraction requests and two metadata requests for that gateway
+process; frozen replay remains
+available only there. For a persistent interactive preview, start the owned gateway
+with `--transport-profile interactive`. That profile refuses startup unless the
+disposable home enables the exact staged, reviewed `ordinary-lookup-experimental`
+plugin with tool override enabled. It removes only process-lifetime proof caps and
+does not retain the proof gateway's cumulative source URL cache. The plugin's native
+per-run admission, URL catalog, search/extraction budgets and cancellation remain
+the enforcement boundary; the transport wrapper still binds every request to its
+active provider call and exact endpoint, method, arguments and response limits.
+The voice host must also select `hermes_lookup_policy="ordinary-lookup/v1"` (or
+`HermesApiConfig.lookup_policy`); its existing per-run readiness check binds dispatch
+to the loaded plugin generation and refuses when that readiness is absent.
+The interactive witness retains at most 16 transport receipts and bounded counters.
+The preview is operator-owned until explicitly stopped; this profile is not a new
+dispatcher or a substitute for the process owner's cleanup.
+
+Speech uses full month names and the host's local time by default. For a supported
+instant with a complete date and explicit source offset, the formatter emits an
+ISO timestamp in its short voice projection; the host renders that instant with
+the operating system's local-time rules, including date rollover and daylight
+saving. The detailed source timestamp remains unchanged. Missing or ambiguous
+dates/zones are not guessed. This is host-local time, not automatic inference of
+another location's timezone. Foreground prose follows wording guidance; only
+explicit ISO instants have deterministic conversion. A speech expansion that
+would exceed the existing visual voice bound retains the original visual text;
+TTS still applies the local-time projection.
 
 Startup timing remains separate from the model/context profile and the task's
 120-second authority. `start_model(..., startup_timeout_seconds=300)` explicitly

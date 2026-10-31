@@ -933,6 +933,10 @@ async def test_full_host_active_response_host_shutdown_is_capture_equivalent(
 class _CapacityInference:
     """Emit separate valid generated segments until ordinary credits saturate."""
 
+    @staticmethod
+    def segment(index: int) -> str:
+        return f"capacity generated segment {index}."
+
     def stream(self, snapshot: ConversationContextSnapshot, *, turn_id: str) -> AsyncIterator[str]:
         return self._stream(snapshot, turn_id)
 
@@ -944,7 +948,7 @@ class _CapacityInference:
             yield "Ready."
             return
         for index in range(80):
-            yield f"capacity generated segment {index}."
+            yield self.segment(index)
 
     async def cancel(self, turn_id: str) -> None:
         del turn_id
@@ -1186,6 +1190,13 @@ async def test_full_host_capacity_saturation_reports_record_binding_and_release(
             (7 + index, 2 + index) for index in range(1, 58)
         ]
         assert MAX_QUEUE_RECORDS * MAX_CANONICAL_RECORD_BYTES == MAX_QUEUE_CANONICAL_BYTES
+        # The uncoalesced fixture occupied 193,497 canonical bytes. Joining segments
+        # 0 and 1 preserves the record count, admitting segment 57 plus one join space.
+        # Derive that delta from fixture text, never from the observed byte counter.
+        extra_segment_index = MAX_QUEUE_RECORDS - 7
+        expected_canonical_bytes = 193_497 + len(
+            (" " + _CapacityInference.segment(extra_segment_index)).encode("utf-8")
+        )
         capacity_evidence = {
             "ordinaryRecordCount": admitted[-1][2],
             "ordinaryCanonicalBytes": admitted[-1][3],
@@ -1197,18 +1208,20 @@ async def test_full_host_capacity_saturation_reports_record_binding_and_release(
         }
         assert capacity_evidence == {
             "ordinaryRecordCount": MAX_QUEUE_RECORDS,
-            "ordinaryCanonicalBytes": 193_497,
+            "ordinaryCanonicalBytes": expected_canonical_bytes,
             "ordinaryPhysicalItems": 59,
             "aggregateByteSaturation": "unreachable under the frozen valid-record schema",
             "physicalItemSaturation": (
                 "unreachable before record capacity under the frozen production batched trace"
             ),
         }
-        assert admitted[-1][3] == 193_497
+        assert admitted[-1][3] == expected_canonical_bytes
         assert admitted[-1][3] < 2 * 1024 * 1024
         assert admitted[-1][4] < MAX_QUEUE_PHYSICAL_ITEMS
         assert all(
-            item == ("ordinary_rejected", "record_capacity", 64, 193_497, 59, False)
+            item == (
+                "ordinary_rejected", "record_capacity", 64, expected_canonical_bytes, 59, False,
+            )
             for item in rejected
         )
         transports[0].release.set()

@@ -63,6 +63,7 @@ from .work_tools import _validate_task_id
 _MAX_SEGMENT_CHARS_LIMIT = 65_536
 _MAX_SEGMENTS_LIMIT = 4096
 _MAX_PROMPT_UPDATES = 16
+_MIN_INITIAL_SEGMENT_CHARS = 32
 DEFAULT_MAX_RESPONSE_SEGMENTS = 256
 
 _PublicValue = str | int | bool | None
@@ -950,6 +951,8 @@ class StreamingSpeechLoop:
                 host_item_seen = False
                 automatic_proposal: HostTaskProposalRequest | None = None
                 iteration_error: BaseException | None = None
+                pending_initial_segment: str | None = None
+                coalesce_initial_segment = transcript is not None and segments is None
                 try:
                     async for segment in inference:
                         if host_item_seen:
@@ -965,6 +968,8 @@ class StreamingSpeechLoop:
                             assert self._task_proposals is not None
                             if self._task_proposals.automatic_start:
                                 automatic_proposal = segment
+                                coalesce_initial_segment = False
+                                pending_initial_segment = None
                                 continue
                             proposal = self._task_proposals.offer(segment)
                             proposal_readback.append(proposal)
@@ -997,10 +1002,45 @@ class StreamingSpeechLoop:
                             observer = self._observer
                             if observer is not None:
                                 observer("first_foreground_token", {})
+                        if coalesce_initial_segment:
+                            coalesce_initial_segment = False
+                            if (
+                                source == "conversation"
+                                and len(segment) < _MIN_INITIAL_SEGMENT_CHARS
+                            ):
+                                pending_initial_segment = segment
+                                continue
+                        if pending_initial_segment is not None:
+                            combined = f"{pending_initial_segment} {segment}"
+                            if (
+                                source == "conversation"
+                                and len(combined) <= self._max_segment_chars
+                                and len(combined) <= self._context.max_item_chars
+                            ):
+                                if len(combined) < _MIN_INITIAL_SEGMENT_CHARS:
+                                    pending_initial_segment = combined
+                                    continue
+                                segment = combined
+                                pending_initial_segment = None
+                            else:
+                                if not await lease.publish(
+                                    pending_initial_segment,
+                                    on_admit=admit_generated,
+                                    source="conversation",
+                                ):
+                                    break
+                                pending_initial_segment = None
                         if not await lease.publish(
                             segment, on_admit=admit_generated, source=source,
                         ):
                             break
+                    else:
+                        if pending_initial_segment is not None:
+                            await lease.publish(
+                                pending_initial_segment,
+                                on_admit=admit_generated,
+                                source="conversation",
+                            )
                 except asyncio.CancelledError:
                     raise
                 except BaseException as error:

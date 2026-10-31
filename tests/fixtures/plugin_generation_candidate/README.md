@@ -26,10 +26,18 @@ The request enters the existing reservation and tool/effect-ticket chain, then
 Hermes's normal conversation executor, approval and result-persistence path. It is
 not a fabricated tool result or retrieved-source claim. Only the actual admitted
 handler result may populate the same-run URL catalog. Successful retrieval allows
-normal provider execution afterward; failed/empty retrieval refuses without a
-retry or another provider call. Generic runs and budget-only deployments retain
-their existing behavior. No `tool_choice`, direct registry dispatch, new executor,
+normal provider execution afterward. A failed, errored or malformed search result
+does not retry. One normalized successful result with an exact empty `data.web`
+list may reserve one additional search attempt with the exact same arguments, only
+within the five-attempt run budget and original deadline. An empty second result
+still refuses publication. Ordinary unselected runs retain their existing
+behavior. No `tool_choice`, direct registry dispatch, new executor,
 model-specific branch or Hermes patch is used.
+
+The single-use effect ticket admits one logical `web_search` call. Its only retry
+is the separately reserved internal search attempt described above, under that
+same call and ticket; it does not create a second logical tool call or ticket.
+Ordinary unselected runs keep their existing handler behavior.
 
 The native entrypoint additionally requires explicit plugin-local
 `settings.presentation` with exactly `provider`, `base_url`, `model`, and
@@ -69,15 +77,28 @@ flag. Its presence records admitted search-result metadata, not page extraction,
 answer correctness, citation fidelity, source authority or freshness. Those remain
 separate acceptance checks.
 Presentation freezes the complete admitted URL catalog in deterministic order and
-supplies it alongside the native answer. The whole JSON input must fit 16 KiB in
-UTF-8; an oversized catalog refuses without truncation or a formatter call. The
+supplies it alongside the exact objective, fallible native draft and immutable
+same-run search/extraction text snapshots. Extraction text must match both the
+admitted request and catalog URL. An unbound extraction echo leaves the tool result unchanged
+and records explicit `extract-unavailable` context for the requested catalog
+sources, rather than attaching unproven text or refusing the run. The formatter
+is instructed to synthesize from these untrusted passages and correct or omit unsupported draft claims, rather
+than repeat them as verified facts. This is a presentation mitigation, not evidence
+that the native generator improved.
+The whole JSON input must fit 16 KiB in UTF-8; an oversized catalog refuses without
+truncation or a formatter call. Evidence packing uses one shared prefix allowance,
+measuring the actual serialized byte size. Every prefix records its original byte
+length and truncation flag, and sources without passage text are explicit. Packing
+does not establish that omitted context is immaterial. The
 formatter selects unique, exact integer catalog IDs. Its schema permits an empty
 selection when no source supports the answer; publication refuses that outcome.
 Only selected IDs are resolved to the exact frozen URLs, rendered as a source list
 in detail. The existing 1800-character detail limit and reserved-markup validation
 apply after rendering, including all links. Catalog drift before publication
-refuses. No URL rewriting, extra source, repair call or new semantic verifier is
-added. URL metadata establishes reference eligibility, not claim support.
+refuses, as does replacement of the frozen passage snapshot during presentation.
+No URL rewriting, extra source, second repair call or lexical truth guard is added.
+Reference eligibility and evidence availability do not prove claim support; the
+actual output remains subject to the content rubric.
 Model-written voice/detail containing case-insensitive `http://`, `https://` or
 `www.` is refused rather than repaired. Web links are rendered only by the host
 from selected catalog IDs. This is a narrow web-link syntax rule: domain names,
@@ -87,11 +108,25 @@ Generic native completion and the budget-only fixture deployment do not promise
 source support and keep their prior completion behavior. Historical bounded-tool
 qualification does not become source-backed publication qualification retroactively.
 
-The presentation request sets `reasoning_effort: none`; native task reasoning
-is unchanged. The configured endpoint must support this request control.
-Unsupported requests fail closed without a fallback. The 1024-token cap, schema
-and admission deadline remain unchanged; wire evidence records the serialized
-control as a boolean without recording request content.
+The legacy presentation request uses `chat_completions`. An explicit optional
+`api_mode: codex_responses` selects the official Codex Responses endpoint for
+presentation and the native Hermes raw-Responses envelope for policy-authored
+search calls. It binds the same provider, base URL and model, sends no tools,
+uses strict `text.format` JSON schema, `store: false`, streaming and low reasoning,
+and accepts only one completed terminal response. Streaming is bounded to 4,096
+events and 8,192 text characters; deltas are never assembled into a result.
+Unknown events/items, refusal or incomplete terminal state, null output and
+unusable final text refuse presentation. Only the final-answer message is
+rewritten, preserving the original response identity, usage and other output
+items. This mode needs an explicit access token in the configured environment
+variable; it does not resolve or refresh Codex OAuth credentials. The caller
+must supply a valid token. Native Hermes task reasoning is unchanged.
+
+`tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
+streaming producer through presentation and publication using synthetic SDK
+transports. It checks native and SDK response metadata and original-response
+preservation. It is an explicit offline proof, not a model or gateway qualification;
+its source, policy, runtime and fresh receipt paths are supplied by the caller.
 
 `tests/native_lookup_presentation_case.py` separately exercises the pinned Hermes
 streaming producer through presentation and publication using synthetic SDK
@@ -112,9 +147,12 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1 to 5 searches may be followed by one extraction of 1 to 3
-  distinct, exact URLs returned by successful searches. No classification,
-  normalization, retry, extra batch or budget reset occurs.
+- One complete tool-call batch of 1 to 5 searches may be followed by one extraction
+  of 1 to 3 distinct, exact URLs returned by successful searches. A normalized
+  successful search result with an exact empty `data.web` list may reserve one
+  additional attempt for that same query, counted within the five-attempt limit.
+  There is no query classification or rewriting, extra model/tool batch, or budget
+  reset.
 - Immutable designation/refusal snapshots remain for the process lifetime.
   Missing or replaced mutable budgets refuse designated runs selectively;
   detected authority or guard loss closes the dedicated generation. This does

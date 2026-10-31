@@ -23,6 +23,27 @@ from hermes_realtime.conversation.work_tools import WorkCancelResult
 from hermes_realtime.providers import codex_app_server as provider
 
 
+def _advertised_functions(request):
+    value = request["params"]["dynamicTools"]
+    assert type(value) is list
+    if not value:
+        return []
+    assert len(value) == 1
+    namespace = value[0]
+    assert type(namespace) is dict and namespace.get("type") == "namespace"
+    assert namespace.get("name") == "hermes" and set(namespace) == {
+        "type", "name", "description", "tools",
+    }
+    functions = namespace["tools"]
+    assert type(functions) is list and 1 <= len(functions) <= 16
+    assert all(
+        type(row) is dict and row.get("type") == "function"
+        and type(row.get("name")) is str and 1 <= len(row["name"]) <= 64
+        for row in functions
+    )
+    return functions
+
+
 @pytest.mark.parametrize("tool", ("cancel_active_work", "cancel_work", "approve_work"))
 def test_codex_removed_controls_are_not_valid_dynamic_semantics(tool, capsys) -> None:
     inference = provider.CodexAppServerStreamingInference(
@@ -63,7 +84,7 @@ async def test_codex_advertises_start_without_model_cancellation(active: bool) -
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+    assert [tool["name"] for tool in _advertised_functions(request)] == [
         "start_work", "task_status",
     ]
     assert "cancel_active_work" not in request["params"]["baseInstructions"]
@@ -108,7 +129,8 @@ def test_codex_valid_start_semantics_emit_no_control_refusal(capsys) -> None:
     )
     inference.bind_work_tools(FakeWorkToolHandler())
     assert inference._dynamic_semantics({
-        "tool": "start_work", "arguments": {"objective": "Inspect the build"},
+        "tool": "start_work", "namespace": "hermes",
+        "arguments": {"objective": "Inspect the build"},
     })[0] == "start_work"
     assert capsys.readouterr().out == ""
 
@@ -156,7 +178,7 @@ async def test_codex_execution_cannot_bypass_removed_model_controls(
     call = provider._DynamicCall(
         identity=("thread_synthetic", "turn_synthetic", "call_synthetic"),
         tool=tool,
-        namespace=None,
+        namespace="hermes",
         arguments=arguments,
         canonical_arguments=json.dumps(arguments),
         deadline=0,
@@ -267,7 +289,7 @@ async def test_codex_natural_current_request_can_propose_after_terminal_work(
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+    assert [tool["name"] for tool in _advertised_functions(request)] == [
         "start_work", "task_status",
     ]
     if utterance == "Please find out what public hearings are happening in Anaheim.":

@@ -113,8 +113,11 @@ def main():
             forwarded.append(body)
             assert not any(key in body for key in ("tools", "tool_choice", "functions"))
             payload = json.loads(body["messages"][-1]["content"])
-            assert payload == {"answer": source_text, "sources": [
-                {"id": 0, "url": "https://example.invalid/source"}]}
+            assert payload == {"answer": source_text, "objective": "synthetic lookup",
+                "sources": [{"id": 0, "url": "https://example.invalid/source"}],
+                "evidence": [{"source_id": 0, "kind": "search", "text": "",
+                              "original_bytes": 0, "truncated": False}],
+                "missing_source_ids": [0]}
             assert body["reasoning_effort"] == "none"
             response = sdk.model_dump(mode="json")
             response["choices"][0]["message"]["content"] = json.dumps({
