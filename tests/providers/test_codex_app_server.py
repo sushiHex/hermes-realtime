@@ -153,6 +153,8 @@ async def test_accepted_start_projects_only_accepted_objective_and_style(style) 
         assert "acceptance only" in instructions
         assert "natural conversational sentence" in instructions
         assert "not a one-word status label" in instructions
+        assert "Use everyday language about the request" in instructions
+        assert "avoid internal task or acceptance terminology" in instructions
         assert "Do not prescribe a fixed phrase" in instructions
         assert thread["params"]["dynamicTools"] == []
         combined = json.dumps([thread, turn])
@@ -3160,6 +3162,75 @@ async def test_local_search_exposes_work_but_not_external_search() -> None:
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
     tools = _tool_specs(thread_request["params"]["dynamicTools"])  # type: ignore[index]
     assert [tool["name"] for tool in tools] == ["start_work"]
+    await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_current_fact_without_direct_lookup_uses_advertised_research_tool() -> None:
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+    )
+    inference.bind_work_tools(FakeWorkToolHandler())
+    snapshot = ConversationContextSnapshot(
+        revision=1,
+        messages=(ConversationMessage(
+            role="user",
+            text="What is the value as of today?",
+        ),),
+        active_tasks=(),
+    )
+
+    assert [segment async for segment in inference.stream(
+        snapshot, turn_id="turn_current_without_direct_lookup"
+    )]
+
+    thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
+    params = thread_request["params"]
+    tools = _tool_specs(params["dynamicTools"])
+    tool_names = [tool["name"] for tool in tools]
+    assert "start_work" in tool_names
+    assert "search_knowledge" not in tool_names
+    instructions = params["baseInstructions"]
+    assert "No external-source lookup is available for this source-sensitive request." not in (
+        instructions
+    )
+    assert "Use supplied evidence; otherwise say you cannot verify them." not in instructions
+    assert "Use start_work to propose the complete objective." in instructions
+    assert "Use the advertised research tool to pursue source-sensitive facts" in instructions
+    assert "No research tool is available for this turn." not in instructions
+    await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_current_fact_without_any_research_tool_says_cannot_verify() -> None:
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra",
+        effort="low",
+        transport_factory=lambda: transport,
+    )
+    snapshot = ConversationContextSnapshot(
+        revision=1,
+        messages=(ConversationMessage(
+            role="user",
+            text="What is the value as of today?",
+        ),),
+        active_tasks=(),
+    )
+
+    assert [segment async for segment in inference.stream(
+        snapshot, turn_id="turn_current_without_research_tool"
+    )]
+
+    thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
+    params = thread_request["params"]
+    assert _tool_specs(params["dynamicTools"]) == []
+    instructions = params["baseInstructions"]
+    assert "No research tool is available for this turn." in instructions
+    assert "Briefly say you cannot verify the requested facts" in instructions
     await inference.close()
 
 

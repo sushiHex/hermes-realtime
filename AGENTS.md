@@ -69,6 +69,11 @@ investigation when its recorded stopping condition is met. Do not demand finer c
 attribution unless it changes the implementation or acceptance decision. Run the broader
 matrix after the mechanism works; preserve all explicit final qualification requirements.
 
+Before asking the owner to test changed voice-task behavior, exercise the affected journey
+through the actual typed runtime and configured providers. Unit fixtures and offline
+preflights do not establish integration success. Reuse applicable retained evidence;
+reserve owner voice checks for recognition, interruption, pronunciation, and usability.
+
 ### 4. Report outcomes and stop expanding scope
 
 Report delivered behavior, exact candidate evidence, remaining limits, and blockers with
