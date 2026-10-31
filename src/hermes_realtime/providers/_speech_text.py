@@ -30,8 +30,8 @@ def project_speech_text(text: str) -> str:
         if local.second:
             clock += f":{local.second:02d}"
         period = "AM" if local.hour < 12 else "PM"
-        return (f"{_MONTHS[local.month - 1]} {local.day}, {local.year} at "
-                f"{clock} {period} {zone}")
+        return (f"{clock} {period} {zone} on "
+                f"{_MONTHS[local.month - 1]} {local.day}, {local.year}")
 
     projected = _ISO_INSTANT.sub(local_time, strip_markdown_emphasis_for_speech(text))
     if len(projected) > 4096:

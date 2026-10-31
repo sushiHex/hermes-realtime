@@ -11,11 +11,11 @@ from hermes_realtime.providers.kokoro import KokoroSynthesizer
 
 @pytest.mark.parametrize("source, local, expected", [
     ("2026-10-31T02:15:00Z", (2026, 10, 30, 19, 15, -7, "Pacific Daylight Time"),
-     "October 30, 2026 at 7:15 PM Pacific Daylight Time"),
+     "7:15 PM Pacific Daylight Time on October 30, 2026"),
     ("2026-03-08T09:30:00+00:00", (2026, 3, 8, 1, 30, -8, "Pacific Standard Time"),
-     "March 8, 2026 at 1:30 AM Pacific Standard Time"),
+     "1:30 AM Pacific Standard Time on March 8, 2026"),
     ("2026-03-08T10:30:00Z", (2026, 3, 8, 3, 30, -7, "Pacific Daylight Time"),
-     "March 8, 2026 at 3:30 AM Pacific Daylight Time"),
+     "3:30 AM Pacific Daylight Time on March 8, 2026"),
 ])
 @pytest.mark.asyncio
 async def test_local_timestamp_projection_reaches_both_backends_preserving_source(

@@ -27,7 +27,7 @@ def test_complete_result_localizes_voice_without_rewriting_source_detail(monkeyp
         f"<voice>{voice}</voice><detail>{detail}</detail>"
     )
     assert projected == (
-        "NWS reported 70 degrees at October 30, 2026 at 2:53 PM Pacific Daylight Time."
+        "NWS reported 70 degrees at 2:53 PM Pacific Daylight Time on October 30, 2026."
     )
     assert retained == detail
 
