@@ -2188,7 +2188,11 @@ async def test_normal_completion_records_one_heard_row_per_turn_without_marker()
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to remain a separate segment.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2196,14 +2200,28 @@ async def test_normal_completion_records_one_heard_row_per_turn_without_marker()
 
     await loop.respond("turn_001", Transcript(text="Question?", final=True))
 
-    # The first two short clauses share a publication; the final clause stays separate.
+    # Each long segment publishes separately, while delivered speech remains one row.
     assert playback.context_at_play == [
         ["Question?"],
-        ["Question?", "First answer. Second answer."],
+        [
+            "Question?",
+            "The first answer is long enough to publish independently.",
+        ],
+        [
+            "Question?",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to remain a separate segment.",
+        ],
     ]
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer. Third answer.", False),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to remain a separate segment. "
+            "Third answer.",
+            False,
+        ),
     ]
 
 
@@ -2349,11 +2367,15 @@ async def test_an_interrupted_rolled_over_turn_flags_only_its_last_row() -> None
 async def test_an_interrupted_multi_sentence_turn_is_one_flagged_row_and_its_replay_one_more(
 ) -> None:
     context = ConversationContextStore()
-    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_2"),))
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_3"),))
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to interrupt separately.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2368,14 +2390,24 @@ async def test_an_interrupted_multi_sentence_turn_is_one_flagged_row_and_its_rep
 
     assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
     ]
 
     assert await loop.resume_interrupted() is True
 
     assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
         ("assistant", "Third answer.", False),
     ]
 
@@ -2441,11 +2473,15 @@ async def test_interruption_mid_segment_records_heard_slice_plus_marker() -> Non
 @pytest.mark.asyncio
 async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
     context = ConversationContextStore()
-    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_2"),))
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_3"),))
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to interrupt separately.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2461,7 +2497,12 @@ async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
 
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
     ]
 
 
