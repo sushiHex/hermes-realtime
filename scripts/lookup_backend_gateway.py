@@ -43,6 +43,8 @@ _DIAGNOSTIC_COUNTS = {
     "calls", "wire_requests", "catalog_count", "selected_source_count", "rendered_detail_length",
 }
 _DIAGNOSTIC_FLAGS = {"local_http_settled"}
+_MAX_TRANSPORT_RESPONSES = 16
+_MAX_WITNESS_COUNT = 1000000000
 for _prefix in ("source", "response"):
     for _name in ("kind", "reasoning_content_kind", "reasoning_kind"):
         _DIAGNOSTIC_ENUMS[f"{_prefix}_{_name}"] = {"string", "none", "other"}
@@ -249,7 +251,10 @@ def bounded_exa_send(
     state: Any,
     metadata_urls: Any = frozenset(),
     frozen_replay: bool = False,
+    proof_caps: bool = True,
 ) -> Any:
+    if type(proof_caps) is not bool:
+        raise ValueError("transport_profile_invalid")
     lock = threading.RLock()
 
     def send(session: Any, request: Any, **kwargs: Any) -> Any:
@@ -273,13 +278,15 @@ def bounded_exa_send(
                         request.url not in metadata_urls
                         or request.method != "GET"
                         or request.body is not None
-                        or witness.get("metadataRequests", 0) >= 2
+                        or (proof_caps and witness.get("metadataRequests", 0) >= 2)
                     ):
                         raise RuntimeError("metadata_request_refused")
                     adapter = session.get_adapter(request.url)
                     if adapter.max_retries.total != 0:
                         raise RuntimeError("metadata_retry_refused")
-                    witness["metadataRequests"] = witness.get("metadataRequests", 0) + 1
+                    witness["metadataRequests"] = min(
+                        _MAX_WITNESS_COUNT, witness.get("metadataRequests", 0) + 1,
+                    )
                     receipt["phase"] = "metadata"
                     forwarded = True
                 kwargs.update(allow_redirects=False, stream=True, timeout=(5, 10), proxies={})
@@ -313,29 +320,33 @@ def bounded_exa_send(
                     if (
                         search is None
                         or search["spent"]
-                        or witness["searchRequests"] >= 5
+                        or (proof_caps and witness["searchRequests"] >= 5)
                         or args != {"query": search["query"], "numResults": search["limit"]}
                     ):
                         raise RuntimeError("exa_search_binding_refused")
                     search["spent"] = True
-                    witness["searchRequests"] += 1
+                    witness["searchRequests"] = min(
+                        _MAX_WITNESS_COUNT, witness["searchRequests"] + 1,
+                    )
                     receipt["phase"] = "search"
                 elif params.get("name") == "web_fetch_exa":
                     urls = args.get("urls")
                     if (
                         extract is None
-                        or witness["extractRequests"] >= 3
+                        or (proof_caps and witness["extractRequests"] >= 3)
                         or type(urls) is not list
                         or len(urls) != 1
                         or type(urls[0]) is not str
                         or args != {"urls": urls}
-                        or urls[0] not in allowed_urls
+                        or (proof_caps and urls[0] not in allowed_urls)
                         or urls[0] not in extract["urls"]
                         or urls[0] in extract["spent"]
                     ):
                         raise RuntimeError("exa_extract_binding_refused")
                     extract["spent"].add(urls[0])
-                    witness["extractRequests"] += 1
+                    witness["extractRequests"] = min(
+                        _MAX_WITNESS_COUNT, witness["extractRequests"] + 1,
+                    )
                     receipt["phase"] = "extract"
                 else:
                     raise RuntimeError("exa_request_binding_refused")
@@ -397,7 +408,13 @@ def bounded_exa_send(
         finally:
             with lock:
                 if forwarded:
-                    witness["transportResponses"].append(receipt)
+                    if len(witness["transportResponses"]) < _MAX_TRANSPORT_RESPONSES:
+                        witness["transportResponses"].append(receipt)
+                    else:
+                        witness["transportResponsesTruncated"] = True
+                    witness["transportResponseCount"] = min(
+                        _MAX_WITNESS_COUNT, witness.get("transportResponseCount", 0) + 1,
+                    )
                 try:
                     save()
                 finally:
@@ -443,6 +460,67 @@ def _frozen_search_module() -> Any:
     return module
 
 
+def _stage_lookup_policy_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "owned_stage_lookup_policy", ROOT / "stage_lookup_policy.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("lookup_policy_stage_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def require_interactive_policy_profile(config: Any, home: Path) -> None:
+    """Require the explicitly enabled, reviewed plugin that owns per-run admission."""
+    stage = _stage_lookup_policy_module()
+    plugins = config.get("plugins") if type(config) is dict else None
+    enabled = plugins.get("enabled") if type(plugins) is dict else None
+    entries = plugins.get("entries") if type(plugins) is dict else None
+    entry = entries.get(stage.PLUGIN) if type(entries) is dict else None
+    if not (
+        type(enabled) is list
+        and enabled.count(stage.PLUGIN) == 1
+        and type(entry) is dict
+        and entry.get("allow_tool_override") is True
+    ):
+        raise RuntimeError("interactive_policy_profile_refused")
+
+    root = home / "plugins" / stage.PLUGIN
+    expected = {
+        **stage.REVIEWED_SOURCES,
+        "__init__.py": hashlib.sha256(stage.BOOTSTRAP).hexdigest(),
+        "plugin.yaml": hashlib.sha256(stage.MANIFEST).hexdigest(),
+    }
+    try:
+        if (
+            home.is_symlink()
+            or (home / "plugins").is_symlink()
+            or root.is_symlink()
+            or not root.is_dir()
+        ):
+            raise RuntimeError("interactive_policy_profile_refused")
+        root.resolve(strict=True).relative_to(home.resolve(strict=True))
+        if {path.name for path in root.iterdir()} != set(expected):
+            raise RuntimeError("interactive_policy_profile_refused")
+        for name, sha256 in expected.items():
+            path = root / name
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("interactive_policy_profile_refused")
+            with path.open("rb") as stream:
+                payload = stream.read(100001)
+            if len(payload) > 100000 or hashlib.sha256(payload).hexdigest() != sha256:
+                raise RuntimeError("interactive_policy_profile_refused")
+    except (OSError, ValueError):
+        raise RuntimeError("interactive_policy_profile_refused") from None
+
+
+def proof_caps_enabled(profile: Any) -> bool:
+    if type(profile) is not str or profile not in {"proof", "interactive"}:
+        raise ValueError("transport_profile_invalid")
+    return profile == "proof"
+
+
 def main() -> Any:
     global INSTALL
     parser = argparse.ArgumentParser(description=__doc__)
@@ -451,7 +529,13 @@ def main() -> Any:
                         choices=("off", "metadata", "controlled-public"))
     parser.add_argument("--frozen-search-fixture")
     parser.add_argument("--frozen-search-sha256")
+    parser.add_argument("--transport-profile", default="proof", choices=("proof", "interactive"))
     args = parser.parse_args()
+    proof_caps = proof_caps_enabled(args.transport_profile)
+    if args.transport_profile == "interactive" and (
+        args.frozen_search_fixture is not None or args.frozen_search_sha256 is not None
+    ):
+        raise RuntimeError("interactive_frozen_replay_refused")
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
     replay = _frozen_search_module().load_frozen_search(
@@ -479,6 +563,7 @@ def main() -> Any:
     witness: dict[str, Any] = {
         "harnessToolBudgetEnforcement": False,
         "nativePolicyRequested": True,
+        "transportProfile": args.transport_profile,
         "searchRequests": 0,
         "extractRequests": 0,
         "transportResponses": [],
@@ -522,6 +607,8 @@ def main() -> Any:
     if len(config_raw) > 65536:
         raise RuntimeError("metadata_config_bound")
     config = yaml.safe_load(config_raw)
+    if args.transport_profile == "interactive":
+        require_interactive_policy_profile(config, Path(os.environ["HERMES_HOME"]))
     metadata_urls = metadata_urls_from_config(config)
     capture_context: Any = nullcontext()
     if args.model_response_capture != "off":
@@ -554,7 +641,7 @@ def main() -> Any:
         if type(result) is dict and result.get("success") is True:
             data = result.get("data")
             rows = data.get("web") if type(data) is dict else None
-            if type(rows) is list:
+            if type(rows) is list and args.transport_profile == "proof":
                 with projection_lock:
                     returned_urls.update(
                         row["url"]
@@ -570,7 +657,7 @@ def main() -> Any:
             finally:
                 witness["frozenSearchReplay"] = replay.summary()
                 save()
-        if type(urls) is list:
+        if type(urls) is list and args.transport_profile == "proof":
             with projection_lock:
                 allowed_urls.update(
                     url for url in urls if type(url) is str and url in returned_urls
@@ -587,6 +674,7 @@ def main() -> Any:
     requests.sessions.Session.send = bounded_exa_send(
         requests.sessions.Session.send, witness, allowed_urls, save, wire_state, metadata_urls,
         frozen_replay=replay is not None,
+        proof_caps=proof_caps,
     )
     witness.update(
         searchProviderReady=True,

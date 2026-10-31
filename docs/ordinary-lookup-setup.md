@@ -326,6 +326,25 @@ The caller must retain its Job, watchdog and final settlement for the entire
 consumer session. This prevents idle expiration; it does not prove future runner
 survival or replace process/listener cleanup.
 
+The one-task proof command starts the gateway with its default
+`--transport-profile proof`. Its independent transport caps are five search
+requests, three extraction requests and two metadata requests for that gateway
+process; frozen replay remains
+available only there. For a persistent interactive preview, start the owned gateway
+with `--transport-profile interactive`. That profile refuses startup unless the
+disposable home enables the exact staged, reviewed `ordinary-lookup-experimental`
+plugin with tool override enabled. It removes only process-lifetime proof caps and
+does not retain the proof gateway's cumulative source URL cache. The plugin's native
+per-run admission, URL catalog, search/extraction budgets and cancellation remain
+the enforcement boundary; the transport wrapper still binds every request to its
+active provider call and exact endpoint, method, arguments and response limits.
+The voice host must also select `hermes_lookup_policy="ordinary-lookup/v1"` (or
+`HermesApiConfig.lookup_policy`); its existing per-run readiness check binds dispatch
+to the loaded plugin generation and refuses when that readiness is absent.
+The interactive witness retains at most 16 transport receipts and bounded counters.
+The preview is operator-owned until explicitly stopped; this profile is not a new
+dispatcher or a substitute for the process owner's cleanup.
+
 Startup timing remains separate from the model/context profile and the task's
 120-second authority. `start_model(..., startup_timeout_seconds=300)` explicitly
 selects a bounded cold-start allowance in an existing Python composition; accepted
