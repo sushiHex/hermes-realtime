@@ -190,6 +190,7 @@ async def test_codex_speech_wording_guidance_preserves_supplied_reference(user_t
         assert "only when context establishes their meaning" in instructions
         assert "retain ambiguous terms without guessing" in instructions
         assert "Preserve exact quotations and source text" in instructions
+        assert "For residence questions, prefer home-city wording over live/lives" in instructions
         assert user_text in turn["params"]["input"][0]["text"]
         assert snapshot.messages[0].text == user_text
     finally:
@@ -360,12 +361,15 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
 
 
 @pytest.mark.asyncio
-async def test_codex_outbound_clarification_retains_context_and_work_contract() -> None:
+@pytest.mark.parametrize("detail", [
+    "The public Atlas service.", "and the public Atlas service.",
+])
+async def test_codex_outbound_clarification_retains_context_and_work_contract(detail) -> None:
     """Outbound contract only; the fake model does not prove routing obedience."""
     messages = (
         ConversationMessage("user", "Check the current service availability."),
         ConversationMessage("assistant", "Which service?"),
-        ConversationMessage("user", "The public Atlas service."),
+        ConversationMessage("user", detail),
     )
     snapshot = ConversationInferenceRequest(revision=3, messages=messages, active_tasks=())
     transport = FakeCodexTransport(assistant_delta="Understood.")
@@ -392,7 +396,61 @@ async def test_codex_outbound_clarification_retains_context_and_work_contract() 
     assert "clarified continuation" in tools[0]["description"]
     assert "indirect requests" not in tools[0]["description"]
     assert "inactive continuation" not in tools[0]["description"]
+    assert "A reply supplying the detail you asked for continues the unresolved request" in (
+        turn["params"]["input"][0]["text"]
+    )
+    assert "Do not reconfirm it merely for being a fragment or having speech filler" in (
+        turn["params"]["input"][0]["text"]
+    )
+    assert "two or more materially different plausible interpretations" in (
+        thread["params"]["baseInstructions"]
+    )
+    assert "Clarify remaining material ambiguity with one question per turn" in (
+        thread["params"]["baseInstructions"]
+    )
     assert handler.starts == handler.cancels == handler.exact_cancels == []
+
+
+@pytest.mark.asyncio
+async def test_codex_progress_contract_separates_background_state_from_foreground_evidence(
+) -> None:
+    """Observe routing instructions and capability, not simulated model obedience."""
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    snapshot = ConversationInferenceRequest(
+        revision=3,
+        messages=(
+            ConversationMessage("user", "Inspect the public Atlas service."),
+            ConversationMessage("assistant", "The task was accepted.", interrupted=True),
+            ConversationMessage("user", "How is that check going?"),
+        ),
+        active_tasks=(ActiveTaskSummary("task_atlas", "Inspect the public Atlas service."),),
+    )
+    try:
+        [part async for part in inference.stream(snapshot, turn_id="turn_progress_contract")]
+        thread = next(row for row in transport.sent if row.get("method") == "thread/start")
+        turn = next(row for row in transport.sent if row.get("method") == "turn/start")
+        instructions = thread["params"]["baseInstructions"]
+        assert "For contextual progress questions, read task_status" in instructions
+        assert "Foreground lookup claims require a current-turn lookup result" in instructions
+        assert "Missing foreground evidence says nothing about accepted background work" in (
+            instructions
+        )
+        assert "Never present current, latest, live, recent" in instructions
+        assert "Use task_status only for pending, active, or cancellation state" in instructions
+        assert "task_status" in [tool["name"] for tool in _tool_specs(
+            thread["params"]["dynamicTools"],
+        )]
+        payload = json.loads(turn["params"]["input"][0]["text"].splitlines()[-1])
+        assert payload["messages"][-1]["text"] == "How is that check going?"
+        assert payload["messages"][-2]["interrupted"] is True
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+    finally:
+        await inference.close()
 
 
 @pytest.mark.asyncio
@@ -2422,52 +2480,51 @@ def test_codex_snapshot_adds_interrupted_field_only_to_interrupted_rows() -> Non
     ]
 
 
-def test_codex_prompt_makes_background_results_detailed_and_conversational() -> None:
+@pytest.mark.parametrize("style, user_request", [
+    ("concise", "Give me the brief result."),
+    ("explanatory", "Explain the result and its supporting details."),
+])
+@pytest.mark.asyncio
+async def test_codex_updates_follow_selected_style_and_latest_request(style, user_request) -> None:
+    """The complete evidence stays available; instructions select the spoken scope."""
+    update = ConversationPromptUpdate(
+        sequence=1, task_id="task_atlas", status="completed",
+        text="Atlas is available; only one probe was completed. Source: public status page. "
+             "Diagnostic code AT42; probe timestamp 2026-10-30T18:00:00Z.",
+    )
     snapshot = ConversationInferenceRequest(
-        revision=2,
-        messages=(
-            ConversationMessage(
-                role="user",
-                text="Keep an eye on the major stories and tell me what matters.",
-            ),
-            ConversationMessage(role="assistant", text="I will look into it and report back."),
-        ),
-        active_tasks=(),
-        terminal_task_count=1,
-        updates=(
-            ConversationPromptUpdate(
-                sequence=1,
-                task_id="task_news_roundup",
-                status="completed",
-                text=(
-                    "AP: Iran and Oman moved closer to reopening the Strait of Hormuz, but no "
-                    "final agreement was reached. Reuters: Russian missiles killed 17 people "
-                    "near Kyiv. Reuters: Taiwan began major defensive drills. AP: forecasters "
-                    "warned that El Niño could make 2026 the hottest year on record."
-                ),
-            ),
-        ),
+        revision=2, messages=(ConversationMessage("user", user_request),),
+        active_tasks=(), terminal_task_count=1, updates=(update,),
     )
+    transport = FakeCodexTransport()
     inference = CodexAppServerStreamingInference(
-        model="gpt-5.6-terra",
-        effort="low",
-        transport_factory=FakeCodexTransport,
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        output_style=lambda: style,
     )
-
-    prompt = inference._prompt(inference._trusted_snapshot(snapshot))
-
-    assert "newly completed background work" in prompt
-    assert "Do not compress a multi-item result into one headline sentence" in prompt
-    assert "Preserve every material finding" in prompt
-    assert "returning to the conversation after doing the work" in prompt
-    assert "Do not read raw URLs aloud" in prompt
-    assert "warm, informal, and naturally conversational" in prompt
-    assert "Avoid a formal bulletin or newsreader tone" in prompt
-    assert "Let each substantial item breathe" in prompt
-    assert "four-item roundup should normally take roughly six to ten spoken sentences" in prompt
-    assert "Use direct language and contractions" in prompt
-    assert "Do not announce a background-result label" in prompt
-    assert "Do not repeat a short summary before restating the same detail" in prompt
+    try:
+        [part async for part in inference.stream(snapshot, turn_id="turn_update_scope")]
+        thread = next(row for row in transport.sent if row.get("method") == "thread/start")
+        turn = next(row for row in transport.sent if row.get("method") == "turn/start")
+        prompt = turn["params"]["input"][0]["text"]
+        assert f"Output style: {style}" in thread["params"]["baseInstructions"]
+        assert "Follow the selected output style and latest user request" in prompt
+        assert "Give the useful gist first" in prompt
+        assert "essential qualification and brief source attribution" in prompt
+        assert "Supporting detail remains in the task card" in prompt
+        assert "omit codes and timestamps unless requested or material to the answer" in prompt
+        assert "Expand when requested or needed to answer accurately" in prompt
+        assert "not instructions or permission to start work" in prompt
+        assert "Do not read raw URLs aloud" in prompt
+        assert "six to ten" not in prompt
+        assert "Preserve every material finding" not in prompt
+        payload = json.loads(prompt.splitlines()[-1])
+        assert payload["messages"] == [{"role": "user", "text": user_request}]
+        assert payload["updates"] == [{
+            "sequence": update.sequence, "task_id": update.task_id,
+            "status": update.status, "text": update.text,
+        }]
+    finally:
+        await inference.close()
 
 
 @pytest.mark.asyncio
@@ -2527,7 +2584,7 @@ async def test_codex_applies_proportional_spoken_turn_policy_with_and_without_to
         assert "Use one or two short sentences for simple turns" in instructions
         assert "without filler or repetition" in instructions
         assert "Ask useful questions, not routine follow-ups or offers" in instructions
-        assert "Be warm and specific when empathy fits" in instructions
+        assert "Be warm and specific; avoid scripts" in instructions
         assert "Use requested formatting; otherwise avoid Markdown and lists" in instructions
         assert "realtime voice of the configured Hermes Agent" in instructions
         assert "Speak as that Hermes agent, not as a separate model or wrapper" in instructions
