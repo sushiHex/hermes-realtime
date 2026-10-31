@@ -292,5 +292,3 @@ async def test_codex_natural_current_request_can_propose_after_terminal_work(
     assert [tool["name"] for tool in _advertised_functions(request)] == [
         "start_work", "task_status",
     ]
-    if utterance == "Please find out what public hearings are happening in Anaheim.":
-        assert "delegate appropriate research through it" in request["params"]["baseInstructions"]

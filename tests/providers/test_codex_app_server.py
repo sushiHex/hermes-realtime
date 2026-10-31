@@ -3165,8 +3165,12 @@ async def test_local_search_exposes_work_but_not_external_search() -> None:
     await inference.close()
 
 
+@pytest.mark.parametrize("utterance", (
+    "What is the value as of today?",
+    "Please find out what public hearings are happening in Anaheim.",
+))
 @pytest.mark.asyncio
-async def test_current_fact_without_direct_lookup_uses_advertised_research_tool() -> None:
+async def test_current_fact_without_direct_lookup_uses_advertised_research_tool(utterance) -> None:
     transport = FakeCodexTransport()
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra",
@@ -3178,7 +3182,7 @@ async def test_current_fact_without_direct_lookup_uses_advertised_research_tool(
         revision=1,
         messages=(ConversationMessage(
             role="user",
-            text="What is the value as of today?",
+            text=utterance,
         ),),
         active_tasks=(),
     )
