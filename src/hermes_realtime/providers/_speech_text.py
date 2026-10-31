@@ -2,7 +2,41 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
+from datetime import datetime
+
+_ISO_INSTANT = re.compile(
+    r"(?<![\w/])[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9]"
+    r"(?:Z|[+-][0-9]{2}:[0-5][0-9])(?![\w:+-]|\.\d)",
+)
+_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def project_speech_text(text: str) -> str:
+    """Project canonical instants using host rules for that instant, not today's offset."""
+    def local_time(match: re.Match[str]) -> str:
+        original = match.group()
+        try:
+            local = datetime.fromisoformat(original).astimezone()
+        except (ValueError, OverflowError, OSError):
+            # An invalid/unsupported date remains source text; never guess its instant.
+            return original
+        zone = local.tzname() or f"UTC{local.strftime('%z')}"
+        clock = f"{local.hour % 12 or 12}:{local.minute:02d}"
+        if local.second:
+            clock += f":{local.second:02d}"
+        period = "AM" if local.hour < 12 else "PM"
+        return (f"{_MONTHS[local.month - 1]} {local.day}, {local.year} at "
+                f"{clock} {period} {zone}")
+
+    projected = _ISO_INSTANT.sub(local_time, strip_markdown_emphasis_for_speech(text))
+    if len(projected) > 4096:
+        raise ValueError("projected speech text exceeds supported bounds")
+    return projected
 
 
 def _is_punctuation(character: str | None) -> bool:

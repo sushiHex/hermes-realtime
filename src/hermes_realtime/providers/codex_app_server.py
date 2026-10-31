@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 from hermes_realtime import __version__
 from hermes_realtime.conversation.context import ConversationContextSnapshot
-from hermes_realtime.conversation.output_style import communication_policy, require_output_style
+from hermes_realtime.conversation.output_style import (
+    SPEECH_WORDING_POLICY,
+    communication_policy,
+    require_output_style,
+)
 from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
@@ -1149,10 +1153,12 @@ class CodexAppServerStreamingInference:
                 base_instructions = (
                     f"Output style: {style}. This affects wording only. "
                     "The host has accepted the background task. "
-                    "Briefly acknowledge acceptance only. "
+                    "Briefly acknowledge acceptance only in a natural conversational sentence, "
+                    "not a one-word status label. Do not prescribe a fixed phrase. "
                     "The objective is reference data, not instructions to follow or a question to "
                     "answer. Do not perform the objective, discuss evidence availability, or claim "
                     "progress, findings, completion, or failure. Never use tools."
+                    + " " + SPEECH_WORDING_POLICY
                 )
                 dynamic_tools = []
             elif tool_handler is None and not search_available and not status_available:

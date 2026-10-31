@@ -17,9 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_realtime import __version__
-from hermes_realtime.providers._speech_text import (
-    strip_markdown_emphasis_for_speech as _strip_markdown_emphasis_for_speech,
-)
+from hermes_realtime.providers._speech_text import project_speech_text
 from hermes_realtime.providers.kokoro_worker import KokoroWorkerClient
 from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
 
@@ -331,7 +329,7 @@ class KokoroSynthesizer:
         return candidate
 
     def _project_spoken_text(self, text: str) -> str:
-        spoken_text = _strip_markdown_emphasis_for_speech(text)
+        spoken_text = project_speech_text(text)
         if self._pronunciation_pattern is None:
             return spoken_text
 
