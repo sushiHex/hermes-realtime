@@ -117,7 +117,7 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
             assert (
                 "Answer completed findings from available results; preserve missing details."
             ) in policy
-            assert "Preserve material findings, uncertainty and source attribution." in policy
+            assert "Preserve material qualifications and uncertainty." in policy
             outbound = json.dumps(transport.sent if provider == "codex" else sent)
             assert "Sunny; observation time unavailable." in outbound
     finally:

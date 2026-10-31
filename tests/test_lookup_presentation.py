@@ -257,6 +257,18 @@ def test_formatter_requests_localizable_instants_without_guessing_missing_time(s
     assert "Never invent a missing date or zone" in instructions
 
 
+def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
+    instructions = setup.module.PRESENTATION_INSTRUCTIONS
+    assert (
+        "Omit source names, domains, and citations unless the objective explicitly asks"
+        in instructions
+    )
+    assert "including the most material qualification" in instructions
+    assert "hard limit is 220 characters" in instructions
+    assert "source attribution; do not collapse a multi-item result" in instructions
+    assert "Return JSON with exactly voice, detail and source_ids" in instructions
+
+
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     s = setup
     result = s.run()

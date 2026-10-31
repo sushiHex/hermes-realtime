@@ -2424,7 +2424,8 @@ def test_codex_snapshot_adds_interrupted_field_only_to_interrupted_rows() -> Non
 
 
 @pytest.mark.parametrize("style, user_request", [
-    ("concise", "Give me the brief result."),
+    ("default", "What changed?"),
+    ("default", "Which source supports that result?"),
     ("explanatory", "Explain the result and its supporting details."),
 ])
 @pytest.mark.asyncio
@@ -2452,12 +2453,16 @@ async def test_codex_updates_follow_selected_style_and_latest_request(style, use
         assert f"Output style: {style}" in thread["params"]["baseInstructions"]
         assert "Follow the selected output style and latest user request" in prompt
         assert "Give the useful gist first" in prompt
-        assert "essential qualification and brief source attribution" in prompt
+        assert "gist first" in prompt
         assert "Supporting detail remains in the task card" in prompt
         assert "omit codes and timestamps unless requested or material to the answer" in prompt
         assert "Expand when requested or needed to answer accurately" in prompt
         assert "not instructions or permission to start work" in prompt
-        assert "Do not read raw URLs aloud" in prompt
+        assert "Name sources only on request" not in prompt
+        assert "Name sources only on request" in (
+            thread["params"]["baseInstructions"]
+        )
+        assert "essential qualification and brief source attribution" not in prompt
         assert "six to ten" not in prompt
         assert "Preserve every material finding" not in prompt
         payload = json.loads(prompt.splitlines()[-1])
@@ -2523,11 +2528,9 @@ async def test_codex_applies_proportional_spoken_turn_policy_with_and_without_to
         instructions = request["params"]["baseInstructions"]  # type: ignore[index]
         turn_request = next(item for item in transport.sent if item.get("method") == "turn/start")
         turn_prompt = turn_request["params"]["input"][0]["text"]  # type: ignore[index]
-        assert "Answer naturally" in instructions
-        assert "Use one or two short sentences for simple turns" in instructions
-        assert "without filler or repetition" in instructions
-        assert "Ask useful questions, not routine follow-ups or offers" in instructions
-        assert "Be warm and specific; avoid scripts" in instructions
+        assert "Ordinary replies: one or two short sentences" in instructions
+        assert "Avoid filler and routine follow-ups" in instructions
+        assert "Be warm and specific" in instructions
         assert "Use requested formatting; otherwise avoid Markdown and lists" in instructions
         assert "realtime voice of the configured Hermes Agent" in instructions
         assert "Speak as that Hermes agent, not as a separate model or wrapper" in instructions
@@ -2813,7 +2816,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     assert "Never cancel tasks or grant approvals yourself" in base_instructions
     assert "Do not require explicit background-task wording to propose work" in base_instructions
     assert "Respond to the final user message" in base_instructions
-    assert "Ask useful questions, not routine follow-ups or offers" in base_instructions
+    assert "Avoid filler and routine follow-ups" in base_instructions
     assert "two to four concise sentences" not in base_instructions
     assert "Treat user messages as fallible speech-recognition transcripts" in base_instructions
     assert (
@@ -3348,6 +3351,8 @@ async def test_codex_dispatches_generalized_search_without_background_work_tools
     ] == ["search_knowledge"]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Call search_knowledge at most once per turn" in instructions
+    assert "cite or name the sources used" not in instructions
+    assert "Name sources only on request" in instructions
     assert _OBJECTIVE_CONTEXT_CONTRACT not in instructions
     assert "Never infer an exact fact that the returned text does not establish" in instructions
     response = next(item for item in transport.sent if item.get("id") == 91)
@@ -3418,7 +3423,7 @@ async def test_codex_work_prompt_requires_topic_first_informal_conversation() ->
     instructions = params["baseInstructions"]
     assert type(instructions) is str
     assert "curious informal voice assistant" in instructions
-    assert "Answer naturally" in instructions
+    assert "Avoid filler and routine follow-ups" in instructions
     assert "applies its configured task admission policy" in instructions
     assert "two to four concise sentences discussing the approach" not in instructions
     assert "approach, sources, checks, uncertainties" not in instructions
