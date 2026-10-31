@@ -514,7 +514,8 @@ class _ManySegmentInference(_Inference):
     async def _stream(self, *, turn_id: str) -> AsyncIterator[str]:
         del turn_id
         for index in range(129):
-            yield f"segment {index}"
+            # Exercise trace capacity with independently publishable speech segments.
+            yield f"An independently publishable synthetic segment {index}"
 
 
 class _ManySegmentSynthesizer(_Synthesizer):
