@@ -33,7 +33,7 @@ _MAX_PRONUNCIATION_TERM_CHARS = 64
 _MAX_PRONUNCIATION_SPOKEN_CHARS = 128
 _MIN_STREAM_CHUNK_CHARS = 32
 _MAX_STREAM_CHUNK_CHARS = 1024
-_MODEL_BASE_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+_MODEL_BASE_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1"
 _VOICE_IDS = frozenset(
     {
         "af_alloy",
@@ -107,8 +107,8 @@ class _PinnedAsset:
 
 _MODEL_ASSET = _PinnedAsset(
     filename="kokoro-v1.0.onnx",
-    size=325_532_387,
-    sha256="7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+    size=325_505_369,
+    sha256="beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a",
 )
 _VOICES_ASSET = _PinnedAsset(
     filename="voices-v1.0.bin",
@@ -198,7 +198,9 @@ class KokoroSynthesizer:
         self._speed = speed
         self._intra_op_threads = intra_op_threads
         self._language = language
-        self._cache_dir = cache_dir or Path.home() / ".cache" / "hermes-realtime" / "kokoro"
+        self._cache_dir = cache_dir or (
+            Path.home() / ".cache" / "hermes-realtime" / "kokoro" / _MODEL_ASSET.sha256
+        )
         self._max_pcm_bytes = max_pcm_bytes
         self._max_active_turns = max_active_turns
         self._stream_chunk_chars = stream_chunk_chars

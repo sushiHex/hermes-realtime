@@ -82,11 +82,13 @@ Installing an optional extra creates a combined runtime environment with those d
 
 ### Kokoro v1.0
 
-`src/hermes_realtime/providers/kokoro.py` downloads exactly these assets from the `thewh1teagle/kokoro-onnx` `model-files-v1.0` GitHub release and rejects size or SHA-256 drift:
+`src/hermes_realtime/providers/kokoro.py` downloads exactly these assets from the official
+[`model-files-v1.1` release](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.1)
+and rejects size or SHA-256 drift. The selected model is the full-precision English export.
 
 | Asset | Size | SHA-256 |
 |---|---:|---|
-| `kokoro-v1.0.onnx` | 325,532,387 bytes | `7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5` |
+| `kokoro-v1.0.onnx` | 325,505,369 bytes | `beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a` |
 | `voices-v1.0.bin` | 28,214,398 bytes | `bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d` |
 
 Upstream identifies `kokoro-onnx` as MIT and the Kokoro model as Apache-2.0. The model and voice assets are not redistributed in this repository.
