@@ -54,6 +54,65 @@ def retrieve(generation, result, before_result=None):
     )
 
 
+def retrieve_attempts(generation, results, before_attempt=None):
+    """Exercise one admitted search through its ticket, including any policy retry."""
+    args = {"query": "synthetic lookup"}
+    call = SimpleNamespace(id="retrieval-call", function=SimpleNamespace(
+        name="web_search", arguments=json.dumps(args)))
+    response = completion(None, reason="tool_calls", calls=[call])
+    response = generation.model_gate(
+        api_mode="chat_completions", api_request_id="retrieval-request",
+        request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: response)
+    call = response.choices[0].message.tool_calls[0]
+    attempts = []
+    results = iter(results)
+
+    def original(actual_args):
+        attempts.append(json.loads(json.dumps(actual_args)))
+        if before_attempt is not None:
+            before_attempt(len(attempts), actual_args)
+        return json.dumps(next(results))
+
+    result = generation.tool_gate(
+        tool_name="web_search", tool_call_id=call.id, api_request_id="retrieval-request",
+        args=args, next_call=generation.wrap_search(original),
+    )
+    return result, attempts, args
+
+
+def retrieve_batch(generation, results_by_attempt, *, primary_count):
+    """Admit a bounded primary search batch and execute each call once in order."""
+    args_rows = [{"query": f"synthetic lookup {index}"} for index in range(primary_count)]
+    calls = [SimpleNamespace(
+        id=f"search-call-{index}", function=SimpleNamespace(
+            name="web_search", arguments=json.dumps(args),
+        ),
+    ) for index, args in enumerate(args_rows)]
+    response = completion(None, reason="tool_calls", calls=calls)
+    response = generation.model_gate(
+        api_mode="chat_completions", api_request_id="batch-request",
+        request={"tools": [{"type": "function", "function": {"name": "web_search"}}]},
+        next_call=lambda _: response,
+    )
+    actual_calls = response.choices[0].message.tool_calls
+    attempt_results = iter(results_by_attempt)
+    attempts = []
+    outputs = []
+    for call in actual_calls:
+        args = json.loads(call.function.arguments)
+
+        def original(actual_args):
+            attempts.append(json.loads(json.dumps(actual_args)))
+            return json.dumps(next(attempt_results))
+
+        outputs.append(generation.tool_gate(
+            tool_name="web_search", tool_call_id=call.id, api_request_id="batch-request",
+            args=args, next_call=generation.wrap_search(original),
+        ))
+    return outputs, attempts
+
+
 @pytest.fixture
 def setup(monkeypatch, request):
     retrieval = getattr(request, "param", {
@@ -163,6 +222,8 @@ def setup(monkeypatch, request):
     g.handles = [SimpleNamespace(active=True)]
     row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 1,
            "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
+           "search_attempts_reserved": 0, "empty_retry_reserved": False,
+           "search_primary_started": set(),
            "objective": "synthetic lookup"}
     g.budgets["selected"] = row
     g.members = MappingProxyType({"selected": (module.VERSION, "identity", row)})
@@ -704,6 +765,190 @@ def test_failed_initial_search_never_retries_or_calls_provider(setup):
     result = setup.run(next_call=lambda _: calls.append("provider") or setup.original)
     assert result is setup.refused
     assert calls == [] and not setup.captured["requests"]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_successful_empty_search_reserves_one_identical_query_retry(setup, capsys):
+    s = setup
+    second = {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/recovered", "description": "Recovered result."}
+    ]}}
+    result, attempts, args = retrieve_attempts(
+        s.g, [{"success": True, "data": {"web": []}}, second])
+
+    assert json.loads(result) == second
+    assert attempts == [args, args] == [{"query": "synthetic lookup"}] * 2
+    assert s.row["search_attempts_reserved"] == 2
+    assert s.row["empty_retry_reserved"] is True
+    assert s.row["reserved"] == s.row["settled"] == 1
+    assert s.row["spent"] == s.row["admitted"] and len(s.row["spent"]) == 1
+    assert s.row["urls"] == {"https://example.invalid/recovered"}
+    assert s.run() is not s.refused
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [{"attempts_reserved": 2, "category": "empty_retry_reserved",
+                       "version": 1}]
+    assert "synthetic lookup" not in str(events) and "https://" not in str(events)
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_second_successful_empty_result_preserves_retrieval_refusal(setup, capsys):
+    empty = {"success": True, "data": {"web": []}}
+    result, attempts, args = retrieve_attempts(setup.g, [empty, empty])
+
+    assert json.loads(result) == empty
+    assert attempts == [args, args]
+    assert setup.row["search_attempts_reserved"] == 2
+    assert setup.row["empty_retry_reserved"] is True
+    assert setup.row["reserved"] == setup.row["settled"] == 1
+    assert setup.row["urls"] == set()
+    assert setup.run() is setup.refused
+    assert not setup.captured["requests"]
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [{"attempts_reserved": 2, "category": "empty_retry_reserved",
+                       "version": 1}]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("first", [
+    {"success": False, "data": {"web": []}},
+    {"success": True, "error": "failed", "data": {"web": []}},
+    {"success": True, "error": "", "data": {"web": []}},
+    {"success": True, "data": {"web": None}},
+    {"success": True, "data": {"web": [{"url": "https://example.invalid/source"}]}},
+], ids=["unsuccessful", "error", "empty-error", "malformed", "nonempty"])
+def test_search_retry_is_limited_to_successful_empty_result(setup, first):
+    fallback = {"success": True, "data": {"web": [
+        {"url": "https://example.invalid/second"}
+    ]}}
+    _, attempts, _ = retrieve_attempts(setup.g, [first, fallback])
+    assert len(attempts) == 1
+    assert setup.row["search_attempts_reserved"] == 1
+    assert setup.row["empty_retry_reserved"] is False
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_five_planned_searches_leave_no_retry_headroom_but_keep_other_evidence(
+    setup, capsys,
+):
+    setup.g.presentation = None
+    results = [{"success": True, "data": {"web": []}}] + [
+        {"success": True, "data": {"web": [{
+            "url": f"https://example.invalid/{index}",
+        }]}} for index in range(4)
+    ] + [{"success": True, "data": {"web": [{
+        "url": "https://example.invalid/forbidden-extra-retry",
+    }]}}]
+    outputs, attempts = retrieve_batch(setup.g, results, primary_count=5)
+
+    assert len(outputs) == len(attempts) == 5
+    assert setup.row["search_attempts_reserved"] == setup.module.SEARCH_LIMIT
+    assert setup.row["reserved"] == setup.row["settled"] == 5
+    assert setup.row["empty_retry_reserved"] is False
+    assert setup.row["closed"] is False
+    assert setup.row["urls"] == {
+        f"https://example.invalid/{index}" for index in range(4)
+    }
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    assert facts == {"attempts_reserved": setup.module.SEARCH_LIMIT,
+                     "category": "empty_retry_budget_full", "version": 1}
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_two_searches_allow_only_one_runwide_empty_retry(setup, capsys):
+    setup.g.presentation = None
+    results = [
+        {"success": True, "data": {"web": []}},
+        {"success": True, "data": {"web": [{
+            "url": "https://example.invalid/recovered",
+        }]}},
+        {"success": True, "data": {"web": []}},
+        {"success": True, "data": {"web": [{
+            "url": "https://example.invalid/forbidden-extra-retry",
+        }]}},
+    ]
+    outputs, attempts = retrieve_batch(setup.g, results, primary_count=2)
+
+    assert len(outputs) == 2
+    assert attempts == [
+        {"query": "synthetic lookup 0"},
+        {"query": "synthetic lookup 0"},
+        {"query": "synthetic lookup 1"},
+    ]
+    assert setup.row["search_attempts_reserved"] == 3
+    assert setup.row["reserved"] == setup.row["settled"] == 2
+    assert setup.row["empty_retry_reserved"] is True
+    assert setup.row["closed"] is False
+    assert setup.row["urls"] == {"https://example.invalid/recovered"}
+    events = [json.loads(line.removeprefix("[lookup-search-recovery] "))
+              for line in capsys.readouterr().out.splitlines()
+              if line.startswith("[lookup-search-recovery] ")]
+    assert events == [
+        {"attempts_reserved": 3, "category": "empty_retry_reserved", "version": 1},
+        {"attempts_reserved": 3, "category": "empty_retry_already_used", "version": 1},
+    ]
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+@pytest.mark.parametrize("change", [
+    "cancel", "deadline", "arguments", "phase", "request", "ticket", "run",
+])
+def test_search_retry_revalidates_run_ticket_deadline_and_exact_arguments(setup, change, capsys):
+    def before_attempt(count, args):
+        if count != 1:
+            return
+        if change == "cancel":
+            setup.row["cancelled"] = True
+        elif change == "deadline":
+            setup.row["deadline"] = time.monotonic() - 1
+        elif change == "arguments":
+            args["query"] = "changed query"
+        elif change == "phase":
+            setup.row["phase"] = "extract"
+        elif change == "request":
+            setup.row["request"] = "changed-request"
+        elif change == "ticket":
+            setup.g.ticket.set(("selected", "changed-request", "changed-call",
+                                "web_search", setup.module.frozen(args)))
+        else:
+            setup.session["run"] = "different-run"
+
+    _, attempts, _ = retrieve_attempts(
+        setup.g, [{"success": True, "data": {"web": []}},
+                  {"success": True, "data": {"web": [{"url": "https://example.invalid/x"}]}}],
+        before_attempt=before_attempt,
+    )
+    assert len(attempts) == 1
+    assert setup.row["search_attempts_reserved"] == 1
+    assert setup.row["empty_retry_reserved"] is False
+    assert setup.row["closed"] is True
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    expected = ("empty_retry_binding_refused"
+                if change in {"arguments", "phase", "request", "ticket"}
+                else "empty_retry_state_refused")
+    assert facts == {"attempts_reserved": 1, "category": expected, "version": 1}
+    assert "changed query" not in event
+
+
+@pytest.mark.parametrize("setup", [None], indirect=True)
+def test_search_attempt_requires_exact_retry_state_types(setup, capsys):
+    setup.row["empty_retry_reserved"] = 0
+    _, attempts, _ = retrieve_attempts(
+        setup.g, [{"success": True, "data": {"web": []}},
+                  {"success": True, "data": {"web": [{"url": "https://example.invalid/x"}]}}])
+    assert attempts == [] and setup.row["closed"] is True
+    event = next(line for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("[lookup-search-recovery] "))
+    facts = json.loads(event.removeprefix("[lookup-search-recovery] "))
+    assert facts == {"attempts_reserved": 1, "category": "attempt_state_refused",
+                     "version": 1}
 
 
 def test_successful_initial_search_returns_to_one_native_provider_call(setup):

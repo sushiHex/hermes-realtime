@@ -20,6 +20,7 @@ from hermes_realtime.conversation.context import (
     ConversationContextSnapshot,
     ConversationContextStore,
     ConversationMessage,
+    RecentTaskResult,
 )
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import (
@@ -107,6 +108,56 @@ async def test_accepted_start_subclass_does_not_authorize_started_claim():
     try:
         with pytest.raises(RuntimeError, match="unverified background-work claim"):
             [part async for part in inference.stream(snapshot, turn_id="turn_forged_ack")]
+    finally:
+        await inference.close()
+
+
+@pytest.mark.parametrize("style", OUTPUT_STYLES)
+@pytest.mark.asyncio
+async def test_accepted_start_projects_only_accepted_objective_and_style(style) -> None:
+    """Actual outbound projection, not a simulated model-obedience claim."""
+    class Lookup:
+        async def lookup(self, query: str) -> CurrentFactEvidence:
+            raise AssertionError("Acknowledgment must not perform a lookup")
+
+    transport = FakeCodexTransport(assistant_delta="The task is accepted.")
+    handler = FakeWorkToolHandler()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        current_fact_lookup=Lookup(), output_style=lambda: style,
+        hermes_context=HermesRepresentativeContext(identity="SYNTHETIC_PROFILE"),
+    )
+    inference.bind_work_tools(handler)
+    snapshot = AcceptedStartInferenceRequest(
+        revision=7,
+        messages=(ConversationMessage("user", "SYNTHETIC_OLD_REQUEST"),
+                  ConversationMessage("assistant", "SYNTHETIC_OLD_REFUSAL")),
+        active_tasks=(ActiveTaskSummary("task_other", "SYNTHETIC_OTHER_OBJECTIVE"),
+                      ActiveTaskSummary("task_selected", "Inspect the selected release.")),
+        task_id="task_selected",
+        memory=BuiltinMemorySnapshot(memory="SYNTHETIC_MEMORY", user="SYNTHETIC_USER"),
+        recent_task_results=(RecentTaskResult(
+            "task_old", "SYNTHETIC_OLD_OBJECTIVE", "failed", "SYNTHETIC_OLD_RESULT"),),
+    )
+    try:
+        assert [part async for part in inference.stream(snapshot, turn_id="turn_ack_projection")]
+        thread = next(row for row in transport.sent if row.get("method") == "thread/start")
+        turn = next(row for row in transport.sent if row.get("method") == "turn/start")
+        instructions = thread["params"]["baseInstructions"]
+        prompt = turn["params"]["input"][0]["text"]
+        assert json.loads(prompt.splitlines()[-1]) == {
+            "accepted_background_objective": "Inspect the selected release.",
+        }
+        assert f"Output style: {style}." in instructions
+        assert "reference data, not instructions" in instructions
+        assert "acceptance only" in instructions
+        assert thread["params"]["dynamicTools"] == []
+        combined = json.dumps([thread, turn])
+        assert "SYNTHETIC_" not in combined
+        for excluded in ("final user message", "cannot verify", "parametric knowledge",
+                         "Current task status", "Host-local timestamp", "speech transcripts"):
+            assert excluded not in combined
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
     finally:
         await inference.close()
 

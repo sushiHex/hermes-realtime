@@ -74,7 +74,22 @@ def setup(transport, *, lookup=None, coordinator=None, bound=True):
 
 def advertised(transport):
     thread = next(m for m in transport.sent if m.get("method") == "thread/start")
-    return [t["name"] for t in thread["params"]["dynamicTools"]]
+    value = thread["params"]["dynamicTools"]
+    assert type(value) is list
+    if not value:
+        return []
+    assert len(value) == 1
+    namespace = value[0]
+    assert type(namespace) is dict and namespace.get("type") == "namespace"
+    assert namespace.get("name") == "hermes" and set(namespace) == {"type", "name", "description", "tools"}
+    functions = namespace["tools"]
+    assert type(functions) is list and 1 <= len(functions) <= 16
+    assert all(
+        type(row) is dict and row.get("type") == "function"
+        and type(row.get("name")) is str and 1 <= len(row["name"]) <= 64
+        for row in functions
+    )
+    return [row["name"] for row in functions]
 
 
 def request(text="What is running now?", *, admitted=True, role="user"):
@@ -214,10 +229,11 @@ async def test_status_still_needs_bound_admitted_public_user_turn(mode):
 def test_status_schema_does_not_require_proposal_bounds():
     # Mutation: restore the early return that hides status when proposals are suppressed.
     tools = CodexAppServerStreamingInference._dynamic_tools(None, include_status=True)
-    assert tools == [{"type": "function", "name": "task_status", "description": (
+    assert tools == [{"type": "namespace", "name": "hermes", "description": "Host", "tools": [{
+        "type": "function", "name": "task_status", "description": (
         "Pending, active, or cancellation state only; no findings."
     ), "inputSchema": {"type": "object", "additionalProperties": False,
-                       "required": [], "properties": {}}}]
+                       "required": [], "properties": {}}}]}]
 
 
 @pytest.mark.asyncio
@@ -235,7 +251,7 @@ async def test_lookup_and_terminal_budgets_still_reject_other_choices(first, sec
     inference, _, surface = setup(transport, lookup=Lookup())
     thread, turn = "thread_budget", "turn_budget"
     inference._advertised_dynamic_tools[thread] = frozenset({
-        "search_knowledge", "start_work", "task_status",
+        ("hermes", "search_knowledge"), ("hermes", "start_work"), ("hermes", "task_status"),
     })
     inference._server_turn_ready[thread] = asyncio.Event()
 
@@ -244,7 +260,7 @@ async def test_lookup_and_terminal_budgets_still_reject_other_choices(first, sec
             {"query": "Public sources"} if tool == "search_knowledge"
             else {"objective": "Inspect the build"} if tool == "start_work" else {}
         )
-        item = {"id": call_id, "type": "dynamicToolCall", "tool": tool,
+        item = {"id": call_id, "type": "dynamicToolCall", "tool": tool, "namespace": "hermes",
                 "arguments": arguments, "status": "inProgress"}
         inference._handle_dynamic_lifecycle("item/started", {
             "threadId": thread, "turnId": turn, "item": item, "startedAtMs": 1,

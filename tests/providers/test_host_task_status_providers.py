@@ -206,7 +206,19 @@ async def test_codex_status_not_advertised_without_admitted_user(snapshot_kind):
     finally:
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert {tool["name"] for tool in request["params"]["dynamicTools"]} == (
+    dynamic_tools = request["params"]["dynamicTools"]
+    assert type(dynamic_tools) is list
+    if not dynamic_tools:
+        assert snapshot_kind != "plain"
+        return
+    assert len(dynamic_tools) == 1
+    namespace = dynamic_tools[0]
+    assert type(namespace) is dict and namespace.get("type") == "namespace"
+    assert namespace.get("name") == "hermes"
+    functions = namespace.get("tools")
+    assert type(functions) is list and 1 <= len(functions) <= 16
+    assert all(type(tool) is dict and tool.get("type") == "function" for tool in functions)
+    assert {tool["name"] for tool in functions} == (
         {"start_work"} if snapshot_kind == "plain" else set()
     )
 
@@ -221,7 +233,9 @@ def test_codex_status_accepts_no_arguments(arguments):
         model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport
     )
     with pytest.raises(RuntimeError, match="arguments"):
-        inference._dynamic_semantics({"tool": "task_status", "arguments": arguments})
+        inference._dynamic_semantics({
+            "tool": "task_status", "namespace": "hermes", "arguments": arguments,
+        })
 
 
 @pytest.mark.asyncio

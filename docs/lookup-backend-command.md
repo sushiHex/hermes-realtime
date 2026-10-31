@@ -119,7 +119,10 @@ execution has a 360-second watchdog covering model startup (60 seconds),
 gateway startup, one task and settlement. The task retains its original
 120-second admission authority; preflight/startup/cleanup time does not extend
 that authority. A watchdog/outer timeout is a failed observation with cleanup
-unproven, never permission to retry automatically.
+unproven, never permission to rerun the owned task automatically. The one
+same-query retry for a normalized successful empty search result is an internal
+attempt inside that task's existing five-attempt budget and original deadline,
+using a separately reserved attempt slot under the same logical search-call ticket.
 
 Within that same 60-second startup deadline, execution now makes one native
 `/api/chat` request with empty messages, `stream=false` and `num_ctx=64000`.

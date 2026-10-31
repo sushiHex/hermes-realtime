@@ -156,11 +156,11 @@ async def test_item_activity_before_ack_is_not_lost():
 async def test_dynamic_request_counts_as_activity_before_async_routing():
     call = {"id": 91, "method": "item/tool/call", "params": {
         "threadId": "thread_server_1", "turnId": "turn_server_1", "callId": "call_synthetic",
-        "namespace": None, "tool": "start_work", "arguments": {"objective": "Synthetic work"},
+        "namespace": "hermes", "tool": "start_work", "arguments": {"objective": "Synthetic work"},
     }}
     started = item("dynamicToolCall")
     started["params"]["item"].update({
-        "id": "call_synthetic", "tool": "start_work", "namespace": None,
+        "id": "call_synthetic", "tool": "start_work", "namespace": "hermes",
         "arguments": {"objective": "Synthetic work"}, "status": "inProgress",
     })
     started["params"]["startedAtMs"] = 1

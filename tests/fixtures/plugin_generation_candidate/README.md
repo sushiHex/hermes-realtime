@@ -26,10 +26,18 @@ The request enters the existing reservation and tool/effect-ticket chain, then
 Hermes's normal conversation executor, approval and result-persistence path. It is
 not a fabricated tool result or retrieved-source claim. Only the actual admitted
 handler result may populate the same-run URL catalog. Successful retrieval allows
-normal provider execution afterward; failed/empty retrieval refuses without a
-retry or another provider call. Generic runs and budget-only deployments retain
-their existing behavior. No `tool_choice`, direct registry dispatch, new executor,
+normal provider execution afterward. A failed, errored or malformed search result
+does not retry. One normalized successful result with an exact empty `data.web`
+list may reserve one additional search attempt with the exact same arguments, only
+within the five-attempt run budget and original deadline. An empty second result
+still refuses publication. Ordinary unselected runs retain their existing
+behavior. No `tool_choice`, direct registry dispatch, new executor,
 model-specific branch or Hermes patch is used.
+
+The single-use effect ticket admits one logical `web_search` call. Its only retry
+is the separately reserved internal search attempt described above, under that
+same call and ticket; it does not create a second logical tool call or ticket.
+Ordinary unselected runs keep their existing handler behavior.
 
 The native entrypoint additionally requires explicit plugin-local
 `settings.presentation` with exactly `provider`, `base_url`, `model`, and
@@ -139,9 +147,12 @@ execution middleware, registry lookup and the approval-session accessor.
   real accepted run ID before execution. Native status/body stay native; response
   headers acknowledge that ID, generation and version. Policy-bearing profile
   alias admission is refused before dispatch; ordinary aliases remain native.
-- One complete batch of 1 to 5 searches may be followed by one extraction of 1 to 3
-  distinct, exact URLs returned by successful searches. No classification,
-  normalization, retry, extra batch or budget reset occurs.
+- One complete tool-call batch of 1 to 5 searches may be followed by one extraction
+  of 1 to 3 distinct, exact URLs returned by successful searches. A normalized
+  successful search result with an exact empty `data.web` list may reserve one
+  additional attempt for that same query, counted within the five-attempt limit.
+  There is no query classification or rewriting, extra model/tool batch, or budget
+  reset.
 - Immutable designation/refusal snapshots remain for the process lifetime.
   Missing or replaced mutable budgets refuse designated runs selectively;
   detected authority or guard loss closes the dedicated generation. This does

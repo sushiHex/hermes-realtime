@@ -164,6 +164,39 @@ def host_search_request(query, api_mode="chat_completions"):
                 tool_calls=[call]))])
 
 
+def _successful_empty_search(result):
+    """Recognize only the normalized successful empty search shape."""
+    if type(result) is not str:
+        return False
+    try:
+        if len(result.encode("utf-8")) > 262144:
+            return False
+        value = json.loads(result)
+    except (TypeError, UnicodeError, ValueError):
+        return False
+    if type(value) is not dict or value.get("success") is not True:
+        return False
+    if "error" in value and value["error"] is not None and value["error"] is not False:
+        return False
+    data = value.get("data")
+    return type(data) is dict and type(data.get("web")) is list and not data["web"]
+
+
+def _search_recovery_event(category, attempts_reserved):
+    categories = {
+        "attempt_state_refused", "empty_retry_reserved",
+        "empty_retry_budget_full", "empty_retry_already_used",
+        "empty_retry_state_refused", "empty_retry_binding_refused",
+    }
+    if category not in categories:
+        category = "attempt_state_refused"
+    count = min(max(attempts_reserved, 0), SEARCH_LIMIT) if type(attempts_reserved) is int else 0
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        print("[lookup-search-recovery] " + frozen({
+            "attempts_reserved": count, "category": category, "version": 1,
+        }), flush=True)
+
+
 def _raw_output(response):
     output = getattr(response, "output", None)
     if type(output) is not list or len(output) > 64:
@@ -927,6 +960,9 @@ class Generation:
                                 "admitted": set(),
                                 "reserved": 0,
                                 "settled": 0,
+                                "search_attempts_reserved": 0,
+                                "empty_retry_reserved": False,
+                                "search_primary_started": set(),
                                 "urls": set(),
                                 "passages": MappingProxyType({}),
                                 "objective": objective if self.presentation is not None else None,
@@ -1087,6 +1123,8 @@ class Generation:
                     and 1 <= len(calls) <= SEARCH_LIMIT
                 ):
                     row["phase"], row["reserved"] = "search", len(calls)
+                    row["search_attempts_reserved"] = len(calls)
+                    row["search_primary_started"] = set()
                 elif (
                     row["phase"] == "search"
                     and names == {"web_extract"}
@@ -1342,6 +1380,80 @@ class Generation:
             row["admitted"].add(ticket[2])
             return run_id, row
 
+    def _reserve_search_attempt(self, run_id, row, *, ticket, args, retry=False):
+        category = "attempt_state_refused"
+        allowed = False
+        ordinary_denial = False
+        with self.lock:
+            try:
+                current_run, current = self.scope()
+                if current_run != run_id or current is not row or row["closed"]:
+                    category = "empty_retry_state_refused" if retry else "attempt_state_refused"
+                    raise ValueError("search-attempt-state")
+                if row["cancelled"] or time.monotonic() >= row["deadline"]:
+                    category = "empty_retry_state_refused" if retry else "attempt_state_refused"
+                    raise ValueError("search-attempt-deadline")
+                category = "empty_retry_binding_refused" if retry else "attempt_state_refused"
+                snapshot = frozen(args)
+                plan = row.get("plan")
+                planned = row.get("reserved")
+                primary_started = row.get("search_primary_started")
+                if (
+                    type(plan) is not dict
+                    or type(planned) is not int or not 1 <= planned <= SEARCH_LIMIT
+                    or type(ticket) is not tuple or len(ticket) != 5
+                    or self.ticket.get() is not ticket
+                    or ticket[0] != run_id
+                    or ticket[1] != row["request"]
+                    or ticket[2] not in plan
+                    or ticket[3:] != ("web_search", snapshot)
+                    or row["phase"] != "search"
+                    or plan[ticket[2]] != ("web_search", snapshot)
+                    or type(row.get("empty_retry_reserved")) is not bool
+                    or type(primary_started) is not set
+                ):
+                    raise ValueError("search-attempt-binding")
+                attempts = row.get("search_attempts_reserved")
+                if type(attempts) is not int or not 0 <= attempts <= SEARCH_LIMIT:
+                    category = "empty_retry_state_refused" if retry else "attempt_state_refused"
+                    raise ValueError("search-attempt-state")
+                if retry:
+                    if (
+                        ticket[2] not in primary_started
+                        or planned != len(plan)
+                        or attempts != planned + int(row["empty_retry_reserved"])
+                    ):
+                        category = "empty_retry_state_refused"
+                        raise ValueError("search-retry-state")
+                    if row["empty_retry_reserved"]:
+                        category = "empty_retry_already_used"
+                        ordinary_denial = True
+                    elif attempts >= SEARCH_LIMIT:
+                        category = "empty_retry_budget_full"
+                        ordinary_denial = True
+                    else:
+                        row["empty_retry_reserved"] = True
+                        row["search_attempts_reserved"] = attempts + 1
+                        allowed = True
+                        category = "empty_retry_reserved"
+                else:
+                    expected_attempts = planned + int(row["empty_retry_reserved"])
+                    if (
+                        ticket[2] in primary_started
+                        or attempts != expected_attempts
+                        or planned != len(plan)
+                    ):
+                        raise ValueError("search-primary-state")
+                    primary_started.add(ticket[2])
+                    allowed = True
+                    category = "attempt_reserved"
+            except BaseException:
+                if not ordinary_denial:
+                    self.refuse(run_id)
+        if retry or not allowed:
+            _search_recovery_event(category, row.get("search_attempts_reserved", 0))
+        return allowed
+
     def wrap_search(self, original):
         def guarded(args, **kw):
             run_id = ""
@@ -1351,7 +1463,20 @@ class Generation:
                 with self.lock:
                     self.refuse(run_id)
                 return REFUSAL
+            ticket = self.ticket.get()
+            if row is not None and not self._reserve_search_attempt(
+                run_id, row, ticket=ticket, args=args,
+            ):
+                return REFUSAL
             result = original(args, **kw)
+            if (
+                row is not None
+                and _successful_empty_search(result)
+                and self._reserve_search_attempt(
+                    run_id, row, ticket=ticket, args=args, retry=True,
+                )
+            ):
+                result = original(args, **kw)
             try:
                 if row is not None:
                     with self.lock:

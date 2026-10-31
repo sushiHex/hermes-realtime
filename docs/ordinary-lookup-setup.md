@@ -10,10 +10,22 @@ not a provider-controlled choice or evidence of objective fidelity. See
 [ADR 0004](adr/0004-model-action-authority.md).
 The equivalent host CLI flags are `--natural-work-tools --task-start-policy automatic`.
 
-Routing guidance requires a new work request or explicit retry in the latest user
-turn. A social acknowledgment, status question, or earlier failure alone does not
-authorize another task. This is model-directed intent selection, not a deterministic
-semantic guarantee; the host's existing admission and cancellation boundaries remain.
+The Codex adapter groups host tools in the `hermes` namespace and explicitly sets
+`features.code_mode.direct_only_tool_namespaces=["hermes"]` on its isolated
+app-server command. This keeps those tools directly callable when model metadata
+selects `code_mode_only`; native execution remains disabled. Callbacks must match
+the exact advertised namespace and function. The adapter does not rewrite model
+metadata or expose the global `functions` namespace. Setting only the user's
+Codex configuration is insufficient because the isolated home copies only login
+material. The supported namespace setting is defined by the
+[pinned official CLI source](https://github.com/openai/codex/blob/360319d8dee62d87e2d59fc0c21805d79519cfed/codex-rs/features/src/feature_configs.rs#L56).
+
+Routing guidance interprets the latest user turn in retained context. Supplying
+requested missing details continues an unresolved user request; repetition is not
+required. An assistant offer, social acknowledgment, status question, or earlier
+failed/completed task alone does not authorize more work. This remains model-directed
+intent selection, not a semantic guarantee; host admission and cancellation stay
+unchanged.
 
 This is the explicit, disabled-by-default backend configuration delivered by
 [#301](https://github.com/sushiHex/hermes-realtime/pull/301), not a foreground
@@ -84,6 +96,18 @@ limit. After extraction, no further tools are advertised. The request is copied;
 shared native schemas and handlers remain unchanged. Runtime admission still
 checks every proposal independently; schema guidance does not authorize a call,
 repair its arguments, or guarantee that a model will comply.
+
+A search handler may make one additional attempt with the exact same arguments
+only when its normalized response is successful, has no error, and contains an
+exact empty `data.web` list. The extra attempt is reserved against the existing
+five-attempt per-run limit and original 120-second admission deadline; it does not
+create another model call, tool call or ticket. Errors, malformed results,
+cancellation and expired runs do not retry. If the second successful result is
+also empty, presentation remains refused for missing retrieval evidence. The
+deadline gates retry admission and later publication; an already-admitted
+synchronous handler may settle afterward under the existing execution contract.
+The ticket still admits one logical search call; the optional retry consumes a
+separately reserved attempt slot under that same call.
 
 ## Freeze the source and artifacts
 
