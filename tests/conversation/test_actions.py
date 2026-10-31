@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from hermes_realtime.client import BrowserEventProjection
 from hermes_realtime.conversation import (
     ConversationContextSnapshot,
     ConversationContextStore,
@@ -19,6 +20,7 @@ from hermes_realtime.conversation import (
     UpdateDirective,
     UpdatePolicyInput,
 )
+from hermes_realtime.host_launcher import ProactiveCompletionUpdatePolicy
 from hermes_realtime.speech import (
     AudioFrame,
     DeliveredSpeechLedger,
@@ -551,6 +553,71 @@ async def test_mid_turn_mention_drains_when_foreground_releases_without_another_
     assert director.pending_mentions() == ()
     record = await asyncio.wait_for(executor.wait_for_action_record(1), timeout=1)
     assert record.disposition == "delivered"
+    await executor.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_mention_speaks_concise_projection_and_retains_full_context() -> None:
+    context = ConversationContextStore()
+    source = GatedCompletionSource(
+        TaskTerminalOutcome(
+            task_id="task_local_time_report",
+            status="completed",
+            summary=(
+                "<voice>The result was observed at 2 AM local time.</voice>"
+                "<detail>The result was observed at 09:00 UTC. "
+                "Sources: Example report.</detail>"
+            ),
+        )
+    )
+    director = director_for_test(
+        context,
+        source,
+        policy=ProactiveCompletionUpdatePolicy(
+            projection=BrowserEventProjection(),
+            floor_available=lambda: False,
+        ),
+    )
+    playback = BlockingPlayback()
+    speech = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=RecordingInference(),
+        synthesizer=Synthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    executor = ConversationUpdateExecutor(director=director, speech=speech)
+    executor.start()
+    response = asyncio.create_task(
+        executor.respond(
+            "turn_local_time",
+            Transcript(text="Summarize the report.", final=True),
+        )
+    )
+    await playback.first_started.wait()
+
+    source.release.set()
+    for _ in range(100):
+        if director.pending_mentions():
+            break
+        await asyncio.sleep(0)
+    assert director.pending_mentions()
+    retained = director.pending_mentions()[0]
+    assert retained.text == (
+        "The result was observed at 09:00 UTC. Sources: Example report."
+    )
+    assert retained.speech_text == "The result was observed at 2 AM local time."
+
+    playback.release_first.set()
+    await asyncio.wait_for(response, timeout=1)
+    await asyncio.wait_for(playback.update_played.wait(), timeout=1)
+
+    assert playback.played_text == [
+        "I have the report.",
+        "The result was observed at 2 AM local time.",
+    ]
+    assert director.pending_mentions() == ()
     await executor.close()
 
 

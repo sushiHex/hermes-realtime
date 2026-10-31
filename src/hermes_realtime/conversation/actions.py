@@ -77,6 +77,7 @@ class UpdateActionRecord:
             completion=self.decision.completion,
             kind=self.decision.kind,
             text=self.decision.text,
+            speech_text=self.decision.speech_text,
         )
         if type(self.disposition) is not str:
             raise TypeError("action disposition must be an exact built-in string")

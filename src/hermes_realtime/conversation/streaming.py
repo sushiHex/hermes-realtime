@@ -683,6 +683,7 @@ class StreamingSpeechLoop:
             completion=decision.completion,
             kind=decision.kind,
             text=decision.text,
+            speech_text=decision.speech_text,
         )
         if decision.kind != UpdateDecisionKind.INTERRUPT.value:
             raise ValueError("only interrupt decisions can start an announcement")
@@ -719,6 +720,7 @@ class StreamingSpeechLoop:
             completion=decision.completion,
             kind=decision.kind,
             text=decision.text,
+            speech_text=decision.speech_text,
         )
         if decision.kind != UpdateDecisionKind.MENTION_NEXT.value:
             raise ValueError("only mention-next decisions can start an idle announcement")
@@ -726,7 +728,11 @@ class StreamingSpeechLoop:
         return await self._run_turn(
             turn_id,
             transcript=None,
-            announcement=decision.text,
+            announcement=(
+                decision.text
+                if decision.speech_text is None
+                else decision.speech_text
+            ),
             updates=(),
             update_operation=operation,
             idle_only=True,
@@ -2377,6 +2383,7 @@ class StreamingSpeechLoop:
                 completion=candidate.completion,
                 kind=candidate.kind,
                 text=candidate.text,
+                speech_text=candidate.speech_text,
             )
             if decision.kind != UpdateDecisionKind.MENTION_NEXT.value:
                 raise ValueError("only mention_next decisions may enter inference")
