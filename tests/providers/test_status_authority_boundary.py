@@ -150,14 +150,15 @@ async def test_sent_policy_has_one_status_authority(provider, with_tools):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status, expected", [
-    (TaskStatusSnapshot(), "No confirmed active background tasks."),
-    (TaskStatusSnapshot(active=1), "1 confirmed active background tasks."),
-    (TaskStatusSnapshot(pending=1), "1 background task requests awaiting acknowledgment."),
-    (TaskStatusSnapshot(cancel_pending=1), "1 task cancellation requests awaiting acknowledgment."),
+    (TaskStatusSnapshot(), "No active background tasks in this session."),
+    (TaskStatusSnapshot(active=1), "One background task is running."),
+    (TaskStatusSnapshot(pending=1), "One background task is awaiting acknowledgment."),
+    (TaskStatusSnapshot(cancel_pending=1),
+     "One task has a cancellation request awaiting acknowledgment."),
     (TaskStatusSnapshot(cancelling=1),
-     "1 tasks with cancellation acknowledged, awaiting completion."),
+     "Cancellation has been acknowledged for one task; it is not finished yet."),
     (TaskStatusSnapshot(available=False),
-     "Background task status is unavailable. Use the task controls to check work."),
+     "I can't check background task status right now."),
 ], ids=["none", "active", "missing-ack", "cancel-pending", "cancelling", "unavailable"])
 async def test_actual_status_route_reads_host_at_consumption(provider, status, expected):
     # Mutation: consumer substitutes empty state or serves a historical host answer.
@@ -165,7 +166,7 @@ async def test_actual_status_route_reads_host_at_consumption(provider, status, e
     context = ConversationContextStore()
     context.restore(DurableConversation(
         messages=(ConversationMessage(
-            "assistant", "1 confirmed active background tasks.", source="host_task_status",
+            "assistant", "One background task is running.", source="host_task_status",
         ),),
         prior_work=True,
     ))
@@ -197,12 +198,7 @@ async def test_actual_status_route_reads_host_at_consumption(provider, status, e
     try:
         await loop.respond("turn_status", Transcript(text="What is running now?", final=True))
         heard = context.snapshot().messages[-1]
-        suffix = (
-            " To cancel work, use the task's Cancel control."
-            if status.pending or status.active or status.cancel_pending or status.cancelling
-            else ""
-        )
-        assert (heard.source, heard.text) == ("host_task_status", expected + suffix)
+        assert (heard.source, heard.text) == ("host_task_status", expected)
         assert reads == [1]
         if provider == "ollama":
             assert handler.calls == []

@@ -845,7 +845,8 @@ def test_reference_kinds_equal_every_section_actually_sent() -> None:
         messages=(
             ConversationMessage("user", "What is running?"),
             ConversationMessage(
-                "assistant", "No confirmed active background tasks.", source="host_task_status"
+                "assistant", "No active background tasks in this session.",
+                source="host_task_status",
             ),
             ConversationMessage("user", "And now?"),
         ),

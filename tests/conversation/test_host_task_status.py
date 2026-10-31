@@ -24,16 +24,37 @@ def test_status_empty_and_unavailable_are_distinct():
     assert owner.task_status() == TaskStatusSnapshot()
     owner._terminal_error = RuntimeError("synthetic")
     assert owner.task_status() == TaskStatusSnapshot(available=False)
-    assert "unavailable" in owner.task_status().render()
+    assert owner.task_status().render() == "I can't check background task status right now."
 
 
 def test_empty_status_does_not_offer_cancellation():
-    assert TaskStatusSnapshot().render() == "No confirmed active background tasks."
+    assert TaskStatusSnapshot().render() == "No active background tasks in this session."
+
+
+@pytest.mark.parametrize("snapshot, expected", [
+    (TaskStatusSnapshot(available=False), "I can't check background task status right now."),
+    (TaskStatusSnapshot(pending=1), "One background task is awaiting acknowledgment."),
+    (TaskStatusSnapshot(pending=2), "2 background tasks are awaiting acknowledgment."),
+    (TaskStatusSnapshot(active=1), "One background task is running."),
+    (TaskStatusSnapshot(active=2), "2 background tasks are running."),
+    (TaskStatusSnapshot(cancel_pending=1),
+     "One task has a cancellation request awaiting acknowledgment."),
+    (TaskStatusSnapshot(cancel_pending=2),
+     "2 tasks have cancellation requests awaiting acknowledgment."),
+    (TaskStatusSnapshot(cancelling=1),
+     "Cancellation has been acknowledged for one task; it is not finished yet."),
+    (TaskStatusSnapshot(cancelling=2),
+     "Cancellation has been acknowledged for 2 tasks; they are not finished yet."),
+])
+def test_status_copy_is_concise_and_preserves_count_state(snapshot, expected):
+    rendered = snapshot.render()
+    assert rendered == expected
+    assert "Cancel control" not in rendered
 
 
 def test_status_source_is_exact_and_preserved_by_snapshot():
     row = ConversationMessage(
-        "assistant", "No confirmed active background tasks.", source="host_task_status"
+        "assistant", "No active background tasks in this session.", source="host_task_status"
     )
     assert row.source == "host_task_status"
     with pytest.raises(ValueError):
@@ -312,7 +333,7 @@ async def test_interrupted_host_speech_records_heard_prefix_and_replays_source()
         synthesizer=SentenceSliceSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
-        task_status=lambda: TaskStatusSnapshot(active=1),
+        task_status=lambda: TaskStatusSnapshot(pending=1, active=1),
     )
     response = asyncio.create_task(loop.respond("turn_001", Transcript(text="Status?", final=True)))
     await playback.blocked.wait()
@@ -321,13 +342,13 @@ async def test_interrupted_host_speech_records_heard_prefix_and_replays_source()
     heard = context.snapshot().messages[-1]
     assert (heard.source, heard.text, heard.interrupted) == (
         "host_task_status",
-        "1 confirmed active background tasks.",
+        "One background task is awaiting acknowledgment.",
         True,
     )
     assert await loop.resume_interrupted()
     replayed = context.snapshot().messages[-1]
     assert replayed.source == "host_task_status"
-    assert replayed.text == " To cancel work, use the task's Cancel control."
+    assert replayed.text == " One background task is running."
     assert not replayed.interrupted
     await loop.close()
 
