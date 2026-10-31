@@ -82,7 +82,7 @@ async def test_accepted_start_continuation_is_tool_free_and_claim_is_scoped():
         parts = [part async for part in inference.stream(snapshot, turn_id="turn_ack")]
         assert " ".join(parts) == "I've started the investigation."
         thread = next(row for row in transport.sent if row.get("method") == "thread/start")
-        assert thread["params"]["dynamicTools"] == []
+        assert _tool_specs(thread["params"]["dynamicTools"]) == []
         assert "host has accepted" in thread["params"]["baseInstructions"]
         assert handler.starts == []
     finally:
@@ -130,7 +130,7 @@ async def test_codex_output_style_is_captured_before_waiting_for_turn(style) -> 
     first = next(row for row in transport.sent if row.get("method") == "thread/start")
     assert f"Output style: {style}.\n" in first["params"]["baseInstructions"]
     assert "communication preference only" in first["params"]["baseInstructions"]
-    assert first["params"]["dynamicTools"] == []
+    assert _tool_specs(first["params"]["dynamicTools"]) == []
     await _collect_stream(inference, "turn_next")
     next_request = [row for row in transport.sent if row.get("method") == "thread/start"][-1]
     assert f"Output style: {selection.get()}.\n" in next_request["params"]["baseInstructions"]
@@ -157,7 +157,7 @@ async def test_codex_style_policy_has_explicit_separator_before_next_policy(
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     instructions = request["params"]["baseInstructions"]
     policy = communication_policy(style, task_status_available=any(
-        tool["name"] == "task_status" for tool in request["params"]["dynamicTools"]
+        tool["name"] == "task_status" for tool in _tool_specs(request["params"]["dynamicTools"])
     ))
     _, assembled_policy, following = instructions.partition(policy)
     assert assembled_policy == policy
@@ -199,7 +199,7 @@ async def test_codex_request_carries_lifecycle_framing_without_granting_authorit
         "was approved, or completed merely because the user requested it; report lifecycle "
         "changes only from trusted acknowledged task state."
     )
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+    assert [tool["name"] for tool in _tool_specs(request["params"]["dynamicTools"])] == [
         "start_work", "task_status",
     ]
     assert handler.starts == handler.cancels == handler.exact_cancels == []
@@ -220,7 +220,7 @@ async def test_codex_outbound_work_request_carries_objective_context_contract() 
         await inference.close()
     request = next(row for row in transport.sent if row.get("method") == "thread/start")
     assert request["params"]["baseInstructions"].count(_OBJECTIVE_CONTEXT_CONTRACT) == 1
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == [
+    assert [tool["name"] for tool in _tool_specs(request["params"]["dynamicTools"])] == [
         "start_work", "task_status",
     ]
     assert handler.starts == handler.cancels == handler.exact_cancels == []
@@ -261,10 +261,10 @@ async def test_codex_outbound_request_assembles_shared_semantic_routes(
     assert_aligned_work_routing(
         instructions,
         task_status_available=any(
-            tool["name"] == "task_status" for tool in request["params"]["dynamicTools"]
+            tool["name"] == "task_status" for tool in _tool_specs(request["params"]["dynamicTools"])
         ),
     )
-    assert [tool["name"] for tool in request["params"]["dynamicTools"]] == (
+    assert [tool["name"] for tool in _tool_specs(request["params"]["dynamicTools"])] == (
         (["search_knowledge"] if foreground_lookup else []) + ["start_work"]
         + (["task_status"] if admitted else [])
     )
@@ -302,7 +302,7 @@ async def test_codex_outbound_clarification_retains_context_and_work_contract() 
         {"role": message.role, "text": message.text} for message in messages
     ]
     assert_aligned_work_routing(thread["params"]["baseInstructions"], task_status_available=True)
-    tools = thread["params"]["dynamicTools"]
+    tools = _tool_specs(thread["params"]["dynamicTools"])
     assert [tool["name"] for tool in tools] == ["start_work", "task_status"]
     assert "clarified continuation" in tools[0]["description"]
     assert "indirect requests" not in tools[0]["description"]
@@ -474,7 +474,7 @@ async def test_codex_omits_prior_work_projection_without_classifying_current_use
     assert '"work_state"' not in prompt
     assert "Only active_tasks establish active background work" not in prompt
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    advertised = {tool["name"] for tool in thread_request["params"]["dynamicTools"]}
+    advertised = {tool["name"] for tool in _tool_specs(thread_request["params"]["dynamicTools"])}
     assert advertised == {"start_work"}
     await inference.close()
 
@@ -499,7 +499,7 @@ async def test_codex_allows_explicit_new_work_after_terminal_history() -> None:
         "Four."
     ]
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    advertised = {tool["name"] for tool in thread_request["params"]["dynamicTools"]}
+    advertised = {tool["name"] for tool in _tool_specs(thread_request["params"]["dynamicTools"])}
     assert "start_work" in advertised
     prompt = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Never use native agent, subagent, shell, or execution tools" in prompt
@@ -549,7 +549,7 @@ async def test_legacy_work_handler_binds_without_advertising_model_cancellation(
     ] == ["Four."]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert [tool["name"] for tool in thread_request["params"]["dynamicTools"]] == [
+    assert [tool["name"] for tool in _tool_specs(thread_request["params"]["dynamicTools"])] == [
         "start_work", "task_status",
     ]
     await inference.close()
@@ -1270,7 +1270,7 @@ class DynamicStartCodexTransport(FakeCodexTransport):
                 "id": self.call_id,
                 "type": "dynamicToolCall",
                 "tool": self.tool,
-                "namespace": None,
+                "namespace": "".join(("her", "mes")),
                 "arguments": self.arguments,
                 "status": "inProgress",
             }
@@ -1293,7 +1293,7 @@ class DynamicStartCodexTransport(FakeCodexTransport):
                         "threadId": "thread_server_1",
                         "turnId": "turn_server_1",
                         "callId": self.call_id,
-                        "namespace": None,
+                        "namespace": "".join(("her", "mes")),
                         "tool": self.tool,
                         "arguments": self.arguments,
                     },
@@ -1306,7 +1306,7 @@ class DynamicStartCodexTransport(FakeCodexTransport):
             "id": self.call_id,
             "type": "dynamicToolCall",
             "tool": self.tool,
-            "namespace": None,
+            "namespace": "".join(("her", "mes")),
             "arguments": self.arguments,
             "status": "completed",
             "contentItems": message["result"]["contentItems"],  # type: ignore[index]
@@ -1400,7 +1400,7 @@ class InterruptingDynamicCodexTransport(DynamicStartCodexTransport):
                             "id": self.call_id,
                             "type": "dynamicToolCall",
                             "tool": self.tool,
-                            "namespace": None,
+                            "namespace": "".join(("her", "mes")),
                             "arguments": self.arguments,
                             "status": "failed",
                             "contentItems": message["result"]["contentItems"],  # type: ignore[index]
@@ -1509,7 +1509,7 @@ class ManualDynamicCodexTransport(FakeCodexTransport):
             "status": "inProgress",
         }
         if include_namespace:
-            item["namespace"] = None
+            item["namespace"] = "".join(("her", "mes"))
         if optional_fields:
             item.update(
                 {
@@ -1552,7 +1552,7 @@ class ManualDynamicCodexTransport(FakeCodexTransport):
             "arguments": ({"objective": "Inspect the build"} if arguments is None else arguments),
         }
         if include_namespace:
-            params["namespace"] = None
+            params["namespace"] = "".join(("her", "mes"))
         message: dict[str, object] = {
             "id": request_id,
             "method": "item/tool/call",
@@ -1578,12 +1578,13 @@ class ManualDynamicCodexTransport(FakeCodexTransport):
         item: dict[str, object] = {
             "id": call_id,
             "type": "dynamicToolCall",
+            "namespace": "hermes",
             "tool": tool,
             "arguments": ({"objective": "Inspect the build"} if arguments is None else arguments),
             "status": status,
         }
         if include_namespace:
-            item["namespace"] = None
+            item["namespace"] = "".join(("her", "mes"))
         if response is not None:
             result = response["result"]
             assert type(result) is dict
@@ -1939,6 +1940,7 @@ def test_codex_process_boundary_disables_tools_and_scrubs_api_overrides() -> Non
     assert command[0] == "C:/tools/codex.exe"
     assert command[1:3] == ("app-server", "--stdio")
     assert "--strict-config" in command
+    assert command.count('features.code_mode.direct_only_tool_namespaces=["hermes"]') == 1
     assert command[-4:-2] == ("-c", 'web_search="disabled"')
     assert command[-2:] == ("-c", "mcp_servers={}")
     assert {
@@ -2669,13 +2671,12 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     ] == ["Four."]
 
     thread_request = transport.sent[2]
-    assert thread_request["params"]["dynamicTools"] == [  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == [  # type: ignore[index]
         {
             "type": "function",
             "name": "start_work",
             "description": (
-                "Propose requested work, including a clarified continuation. "
-                "Never use for conversation alone."
+                "Propose work, including clarified continuation. No conversation."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2723,7 +2724,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
     assert "applies its configured task admission policy" in base_instructions
     assert "Do not ask the user to confirm in model prose" in base_instructions
     assert "claim acceptance, progress, or that work has started" in base_instructions
-    assert "Never use for conversation" in thread_request["params"]["dynamicTools"][0][  # type: ignore[index]
+    assert "No conversation" in _tool_specs(thread_request["params"]["dynamicTools"])[0][
         "description"
     ]
     assert "Task cancellation is controlled only by explicit user commands" in base_instructions
@@ -2745,7 +2746,7 @@ async def test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas() -> N
         "not request" in base_instructions
     )
     assert "Treat tool arguments and results as private protocol data." in base_instructions
-    assert [tool["name"] for tool in inference._dynamic_tools(321)] == [
+    assert [tool["name"] for tool in _tool_specs(inference._dynamic_tools(321))] == [
         "start_work"
     ]
     await inference.close()
@@ -2875,7 +2876,7 @@ async def test_codex_current_request_uses_retrieved_evidence_and_stale_knowledge
     ]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Your parametric knowledge may be stale" in instructions
     assert "Never present current, latest, live, recent" in instructions
@@ -2961,7 +2962,7 @@ async def test_prefetched_quick_fact_disables_background_work_tools() -> None:
     ]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Never use tools" in instructions
     assert "start_work" not in instructions
@@ -3005,7 +3006,7 @@ async def test_successful_multi_step_prefetch_disables_background_work_tools() -
 
     assert [segment async for segment in inference.stream(snapshot, turn_id="turn_deep_success")]
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     assert "start_work" not in thread_request["params"]["baseInstructions"]  # type: ignore[index]
     await inference.close()
 
@@ -3039,7 +3040,7 @@ async def test_private_multi_step_request_disables_work_without_lookup_coordinat
     assert [segment async for segment in inference.stream(snapshot, turn_id="turn_private")]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     assert handler.starts == []
     await inference.close()
 
@@ -3072,7 +3073,7 @@ async def test_local_search_exposes_work_but_not_external_search() -> None:
     assert [segment async for segment in inference.stream(snapshot, turn_id="turn_local_search")]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    tools = thread_request["params"]["dynamicTools"]  # type: ignore[index]
+    tools = _tool_specs(thread_request["params"]["dynamicTools"])  # type: ignore[index]
     assert [tool["name"] for tool in tools] == ["start_work"]
     await inference.close()
 
@@ -3111,7 +3112,7 @@ async def test_failed_quick_lookup_does_not_escalate_to_unbounded_background_wor
     assert [segment async for segment in inference.stream(snapshot, turn_id="turn_quick_fail")]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "bounded lookup reached its limit" in instructions
     assert "start_work" not in instructions
@@ -3152,7 +3153,7 @@ async def test_failed_multi_step_prefetch_cannot_escalate_to_background_work() -
     assert [segment async for segment in inference.stream(snapshot, turn_id="turn_deep_fail")]
 
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "bounded lookup reached its limit" in instructions
     assert "start_work" not in instructions
@@ -3202,7 +3203,7 @@ async def test_reserved_coordinator_route_without_evidence_cannot_expose_backgro
         )
     ] == ["Four."]
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
-    assert thread_request["params"]["dynamicTools"] == []  # type: ignore[index]
+    assert _tool_specs(thread_request["params"]["dynamicTools"]) == []  # type: ignore[index]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "start_work" not in instructions
     await inference.close()
@@ -3261,7 +3262,7 @@ async def test_codex_dispatches_generalized_search_without_background_work_tools
     thread_request = next(item for item in transport.sent if item.get("method") == "thread/start")
     assert [
         tool["name"]
-        for tool in thread_request["params"]["dynamicTools"]  # type: ignore[index]
+        for tool in _tool_specs(thread_request["params"]["dynamicTools"])  # type: ignore[index]
     ] == ["search_knowledge"]
     instructions = thread_request["params"]["baseInstructions"]  # type: ignore[index]
     assert "Call search_knowledge at most once per turn" in instructions
@@ -3309,7 +3310,7 @@ async def test_codex_bound_work_tools_omit_cancel_without_active_work() -> None:
     thread_request = transport.sent[2]
     assert [
         tool["name"]
-        for tool in thread_request["params"]["dynamicTools"]  # type: ignore[index]
+        for tool in _tool_specs(thread_request["params"]["dynamicTools"])  # type: ignore[index]
     ] == [
         "start_work", "task_status",
     ]
@@ -3670,7 +3671,7 @@ async def test_codex_disabled_work_tools_preserve_exact_no_tools_contract() -> N
 
     params = transport.sent[2]["params"]
     assert type(params) is dict
-    assert params["dynamicTools"] == []
+    assert _tool_specs(params["dynamicTools"]) == []
     base_instructions = params["baseInstructions"]
     assert type(base_instructions) is str
     assert base_instructions.startswith(
@@ -3719,7 +3720,7 @@ async def test_codex_real_user_turn_closes_work_tool_binding_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_codex_accepts_trace_absent_namespace_and_nullable_lifecycle_fields() -> None:
+async def test_codex_accepts_trace_exact_namespace_and_nullable_lifecycle_fields() -> None:
     transport = ManualDynamicCodexTransport()
     handler = FakeWorkToolHandler()
     inference = CodexAppServerStreamingInference(
@@ -3733,12 +3734,12 @@ async def test_codex_accepts_trace_absent_namespace_and_nullable_lifecycle_field
     await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
 
     await transport.start_item(
-        include_namespace=False,
+        include_namespace=True,
         optional_fields=True,
     )
     await transport.request_tool(
         request_id="server_call_1",
-        include_namespace=False,
+        include_namespace=True,
         trace={
             "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
             "tracestate": None,
@@ -3747,7 +3748,7 @@ async def test_codex_accepts_trace_absent_namespace_and_nullable_lifecycle_field
     response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
     await transport.complete_item(
         response,
-        include_namespace=False,
+        include_namespace=True,
         optional_fields=True,
     )
     await transport.complete_turn(delta="Handled.")
@@ -3807,6 +3808,7 @@ def test_codex_rejects_private_dynamic_knowledge_query_before_dispatch() -> None
             inference._dynamic_semantics(
                 {
                     "tool": "search_knowledge",
+                    "namespace": "hermes",
                     "arguments": {"query": query},
                 }
             )
@@ -3856,7 +3858,7 @@ async def test_codex_turn_selects_one_search_or_work_route_at_first_admission(
     thread_id = "thread_route"
     turn_id = "turn_route"
     inference._advertised_dynamic_tools[thread_id] = frozenset(
-        {"search_knowledge", "start_work"}
+        {("hermes", "search_knowledge"), ("hermes", "start_work")}
     )
     ready = asyncio.Event()
     ready.set()
@@ -3866,6 +3868,7 @@ async def test_codex_turn_selects_one_search_or_work_route_at_first_admission(
         item: dict[str, object] = {
             "id": call_id,
             "type": "dynamicToolCall",
+            "namespace": "hermes",
             "tool": tool,
             "arguments": arguments,
             "status": "inProgress",
@@ -4749,7 +4752,7 @@ async def test_codex_event_arriving_while_expired_tool_settles_is_delivered(
     call = codex_app_server_module._DynamicCall(
         identity=identity,
         tool="start_work",
-        namespace=None,
+        namespace="hermes",
         arguments={"objective": "Inspect the release evidence"},
         canonical_arguments='{"objective":"Inspect the release evidence"}',
         deadline=asyncio.get_running_loop().time() + 0.05,
@@ -4787,3 +4790,63 @@ async def test_codex_event_arriving_while_expired_tool_settles_is_delivered(
         await responder
         inference._dynamic_calls.pop(identity, None)
         await inference.close()
+
+
+def test_codex_dynamic_namespace_schema_is_exact_and_empty_surface_stays_empty() -> None:
+    tools = CodexAppServerStreamingInference._dynamic_tools(321, include_status=True)
+    assert len(tools) == 1
+    assert set(tools[0]) == {"type", "name", "description", "tools"}
+    assert tools[0]["type"] == "namespace" and tools[0]["name"] == "hermes"
+    assert [tool["name"] for tool in tools[0]["tools"]] == ["start_work", "task_status"]
+    assert CodexAppServerStreamingInference._dynamic_tools(None) == []
+
+
+class _NamespaceString(str):
+    pass
+
+
+@pytest.mark.parametrize("namespace", [None, "foreign", "", "missing", 1,
+                                        _NamespaceString("hermes")])
+def test_codex_dynamic_namespace_requires_exact_hermes(namespace, capsys) -> None:
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport)
+    inference.bind_work_tools(FakeWorkToolHandler())
+    value = {"tool": "start_work", "arguments": {"objective": "Inspect the release"}}
+    if namespace != "missing":
+        value["namespace"] = namespace
+    with pytest.raises(RuntimeError, match="namespace"):
+        inference._dynamic_semantics(value)
+    assert capsys.readouterr().out == (
+        '[codex-tool-refusal] {"refusal":"model_control_unavailable",'
+        '"tool":"work","version":1}\n'
+    )
+
+
+def test_codex_advertisement_binds_namespace_and_name_independently(monkeypatch, capsys) -> None:
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=FakeCodexTransport)
+    inference.bind_work_tools(FakeWorkToolHandler())
+    inference._advertised_dynamic_tools["thread_namespace"] = frozenset({("hermes", "start_work")})
+    # Isolate the advertisement guard from the separate namespace validator.
+    monkeypatch.setattr(inference, "_dynamic_semantics", lambda *args, **kwargs: (
+        "start_work", "foreign", {"objective": "Inspect the release"}, "{}"))
+    with pytest.raises(RuntimeError, match="unadvertised"):
+        inference._handle_dynamic_lifecycle("item/started", {
+            "threadId": "thread_namespace", "turnId": "turn_namespace", "startedAtMs": 1,
+            "item": {}}, {"id": "call_namespace", "type": "dynamicToolCall",
+            "tool": "start_work", "namespace": "foreign", "arguments": {},
+            "status": "inProgress"})
+    assert capsys.readouterr().out == (
+        '[codex-tool-refusal] {"refusal":"model_control_unavailable",'
+        '"tool":"work","version":1}\n'
+    )
+
+
+def _tool_specs(rows):
+    if not rows:
+        return []
+    assert len(rows) == 1
+    assert set(rows[0]) == {"type", "name", "description", "tools"}
+    assert rows[0]["type"] == "namespace" and rows[0]["name"] == "hermes"
+    assert rows[0]["description"] == "Host"
+    return rows[0]["tools"]

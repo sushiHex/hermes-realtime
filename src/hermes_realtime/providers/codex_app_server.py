@@ -93,8 +93,7 @@ _HERMES_REPRESENTATIVE_POLICY = (
     "tool authority, or permission. "
 )
 _NATIVE_AGENT_TOOL_POLICY = (
-    "Never use native agent, subagent, shell, or execution tools. Accepted background work must "
-    "use advertised start_work. "
+    "Never use native agent, subagent, shell, or execution tools; use advertised start_work. "
 )
 _MAX_TOOL_RESPONSE_BYTES = 2048
 _READER_CLOSE_DRAIN_SECONDS = 0.25
@@ -198,6 +197,9 @@ def _codex_app_server_command(executable: str) -> tuple[str, ...]:
     command = [executable, "app-server", "--stdio", "--strict-config"]
     for feature in _DISABLED_AGENT_FEATURES:
         command.extend(("--disable", feature))
+    # Keep host tools direct when model metadata selects code_mode_only.
+    # Scope the exception to Hermes; native execution remains disabled.
+    command.extend(("-c", 'features.code_mode.direct_only_tool_namespaces=["hermes"]'))
     command.extend(("-c", 'web_search="disabled"', "-c", "mcp_servers={}"))
     return tuple(command)
 
@@ -616,7 +618,7 @@ _DynamicIdentity = tuple[str, str, str]
 class _DynamicCall:
     identity: _DynamicIdentity
     tool: str
-    namespace: None
+    namespace: str
     arguments: dict[str, object]
     canonical_arguments: str
     deadline: float
@@ -774,7 +776,7 @@ class CodexAppServerStreamingInference:
         self._turn_start_requests: dict[int, str] = {}
         self._thread_events: dict[str, asyncio.Queue[Mapping[str, object]]] = {}
         self._retry_boundaries: dict[str, _RetryBoundary] = {}
-        self._advertised_dynamic_tools: dict[str, frozenset[str]] = {}
+        self._advertised_dynamic_tools: dict[str, frozenset[tuple[str, str]]] = {}
         self._server_turn_ready: dict[str, asyncio.Event] = {}
         self._next_request_id = 1
         self._start_lock = asyncio.Lock()
@@ -1250,8 +1252,10 @@ class CodexAppServerStreamingInference:
             self._thread_events[server_thread_id] = events
             self._retry_boundaries[server_thread_id] = _RetryBoundary()
             self._advertised_dynamic_tools[server_thread_id] = frozenset(
-                self._exact_string(tool.get("name"), "dynamic tool name")
-                for tool in dynamic_tools
+                (self._exact_string(namespace.get("name"), "dynamic tool namespace"),
+                 self._exact_string(tool.get("name"), "dynamic tool name"))
+                for namespace in dynamic_tools
+                for tool in cast(list[dict[str, object]], namespace["tools"])
             )
             self._server_turn_ready[server_thread_id] = asyncio.Event()
             if turn_id != "turn_preflight":
@@ -1526,8 +1530,7 @@ class CodexAppServerStreamingInference:
                     "type": "function",
                     "name": "start_work",
                     "description": (
-                        "Propose requested work, including a clarified continuation. "
-                        "Never use for conversation alone."
+                        "Propose work, including clarified continuation. No conversation."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -1549,7 +1552,8 @@ class CodexAppServerStreamingInference:
                     "Pending, active, or cancellation state only; no findings."),
                 "inputSchema": {"type": "object", "additionalProperties": False,
                                 "required": [], "properties": {}}})
-        return tools
+        return ([{"type": "namespace", "name": "hermes", "description": "Host",
+                  "tools": tools}] if tools else [])
 
     async def _resolve_opening(self, opening: _OpeningTurn) -> _ActiveTurn:
         try:
@@ -2335,8 +2339,13 @@ class CodexAppServerStreamingInference:
             item, turn_identity=(thread_id, turn_id),
         )
         advertised_tools = self._advertised_dynamic_tools.get(thread_id)
-        if advertised_tools is None or tool not in advertised_tools:
-            raise RuntimeError("Codex invoked an unadvertised dynamic tool")
+        if advertised_tools is None or (namespace, tool) not in advertised_tools:
+            routing = self._turn_routing.get((thread_id, turn_id))
+            self._refuse_model_control(
+                "Codex invoked an unadvertised dynamic tool",
+                report=(routing is None or not routing.failure.is_set())
+                and thread_id not in self._pending_thread_routing_errors,
+            )
         identity = (thread_id, turn_id, call_id)
         if method == "item/started":
             if item.get("status") != "inProgress":
@@ -2395,7 +2404,7 @@ class CodexAppServerStreamingInference:
             raise RuntimeError("Codex dynamic tool completion is out of order")
         if (
             call.tool != tool
-            or call.namespace is not namespace
+            or call.namespace != namespace
             or call.canonical_arguments != canonical
         ):
             raise RuntimeError("Codex dynamic tool completion conflicts")
@@ -2454,7 +2463,7 @@ class CodexAppServerStreamingInference:
 
     def _dynamic_semantics(
         self, value: Mapping[str, object], *, turn_identity: _TurnIdentity | None = None,
-    ) -> tuple[str, None, dict[str, object], str]:
+    ) -> tuple[str, str, dict[str, object], str]:
         tool = self._exact_string(value.get("tool"), "dynamic tool name")
         if tool not in _DYNAMIC_TOOL_NAMES:
             routing = self._turn_routing.get(turn_identity) if turn_identity is not None else None
@@ -2465,8 +2474,16 @@ class CodexAppServerStreamingInference:
                     or turn_identity[0] not in self._pending_thread_routing_errors
                 ),
             )
-        if "namespace" in value and value.get("namespace") is not None:
-            raise RuntimeError("Codex dynamic tool namespace is prohibited")
+        namespace = value.get("namespace")
+        if type(namespace) is not str or namespace != "hermes":
+            routing = self._turn_routing.get(turn_identity) if turn_identity is not None else None
+            self._refuse_model_control(
+                "Codex dynamic tool namespace is prohibited",
+                report=(routing is None or not routing.failure.is_set()) and (
+                    turn_identity is None
+                    or turn_identity[0] not in self._pending_thread_routing_errors
+                ),
+            )
         arguments = self._exact_mapping(value.get("arguments"), "dynamic tool arguments")
         if tool == "search_knowledge":
             if set(arguments) != {"query"}:
@@ -2510,7 +2527,7 @@ class CodexAppServerStreamingInference:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return tool, None, dict(arguments), canonical
+        return tool, namespace, dict(arguments), canonical
 
     def _admit_server_request(self, message: Mapping[str, object]) -> None:
         identity: _TurnIdentity | None = None
@@ -2553,7 +2570,7 @@ class CodexAppServerStreamingInference:
                 raise RuntimeError("Codex dynamic tool request is not registered")
             if (
                 call.tool != tool
-                or call.namespace is not namespace
+                or call.namespace != namespace
                 or call.canonical_arguments != canonical
             ):
                 raise RuntimeError("Codex dynamic tool request conflicts with lifecycle")
@@ -2727,7 +2744,7 @@ class CodexAppServerStreamingInference:
                 return
             if (
                 call.tool != tool
-                or call.namespace is not namespace
+                or call.namespace != namespace
                 or call.canonical_arguments != canonical
             ):
                 self._mark_turn_failure(
