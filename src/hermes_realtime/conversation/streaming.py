@@ -1017,6 +1017,9 @@ class StreamingSpeechLoop:
                                 and len(combined) <= self._max_segment_chars
                                 and len(combined) <= self._context.max_item_chars
                             ):
+                                if len(combined) < _MIN_INITIAL_SEGMENT_CHARS:
+                                    pending_initial_segment = combined
+                                    continue
                                 segment = combined
                                 pending_initial_segment = None
                             else:

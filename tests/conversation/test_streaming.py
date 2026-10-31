@@ -664,6 +664,19 @@ class ShortThenContextInference(PerTurnInference):
         yield "I can help with the next step."
 
 
+class ThreeShortSegmentsInference(PerTurnInference):
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        yield "Hi."
+        yield "I'm here."
+        yield "Ready?"
+
+
 class ShortThenBlockingInference(PerTurnInference):
     def __init__(self) -> None:
         super().__init__()
@@ -1949,6 +1962,23 @@ async def test_coalesces_short_leading_segment_with_next_complete_clause() -> No
     expected = "I'm here. I can help with the next step."
     assert synthesizer.texts == [expected]
     assert [chunk.text for chunk in playback.chunks] == [expected]
+
+
+@pytest.mark.asyncio
+async def test_keeps_short_leading_fragments_buffered_until_context_or_completion() -> None:
+    synthesizer = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=ThreeShortSegmentsInference(),
+        synthesizer=synthesizer,
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert synthesizer.texts == ["Hi. I'm here. Ready?"]
 
 
 @pytest.mark.asyncio
