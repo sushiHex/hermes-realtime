@@ -31,7 +31,9 @@ def _advertised_functions(request):
     assert len(value) == 1
     namespace = value[0]
     assert type(namespace) is dict and namespace.get("type") == "namespace"
-    assert namespace.get("name") == "hermes" and set(namespace) == {"type", "name", "description", "tools"}
+    assert namespace.get("name") == "hermes" and set(namespace) == {
+        "type", "name", "description", "tools",
+    }
     functions = namespace["tools"]
     assert type(functions) is list and 1 <= len(functions) <= 16
     assert all(

@@ -94,7 +94,10 @@ async def test_sent_status_policy_matches_actual_advertisement(provider, mode):
                 assert namespace.get("name") == "hermes"
                 functions = namespace.get("tools")
                 assert type(functions) is list and len(functions) <= 16
-                assert all(type(tool) is dict and tool.get("type") == "function" for tool in functions)
+                assert all(
+                    type(tool) is dict and tool.get("type") == "function"
+                    for tool in functions
+                )
                 advertised = {tool["name"] for tool in functions}
             else:
                 advertised = set()
