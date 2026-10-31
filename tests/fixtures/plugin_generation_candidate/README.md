@@ -46,6 +46,8 @@ credential fallback. On a selected run's final native response, one tool-free,
 nonstreaming OpenAI SDK call presents that completed result as strict JSON
 `voice`/`detail` and selected `source_ids`, then copies validated content into the
 existing envelope.
+Spoken summaries omit source names, domains and citations unless the objective
+explicitly requests sources; the detailed result retains its source catalog.
 The trusted route must equal the actual middleware route and request model.
 Tools, functions, tool choice, retries and redirects are unavailable to this
 call. Its deadline is the selected admission's original 120-second deadline,
