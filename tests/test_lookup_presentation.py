@@ -249,6 +249,14 @@ def setup(monkeypatch, request):
                            codex_events=codex_events)
 
 
+def test_formatter_requests_localizable_instants_without_guessing_missing_time(setup):
+    instructions = setup.module.PRESENTATION_INSTRUCTIONS
+    assert "YYYY-MM-DDTHH:MM:SSZ" in instructions
+    assert "host-local time" in instructions
+    assert "original source timestamp in detail" in instructions
+    assert "Never invent a missing date or zone" in instructions
+
+
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     s = setup
     result = s.run()

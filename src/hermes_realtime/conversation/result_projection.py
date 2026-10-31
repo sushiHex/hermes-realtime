@@ -33,6 +33,14 @@ def _completion_projections(detail: str) -> tuple[str, str]:
             and ">" not in voice
         )
         if valid_voice:
+            # Providers depend on the conversation types during package startup.
+            from hermes_realtime.providers import _speech_text
+
+            projected = _speech_text.project_speech_text(voice)
+            # Formatting must not drop a valid result or widen its publication bound.
+            # The TTS projection still localizes the original if expansion will not fit.
+            if len(projected) <= _MAX_SPOKEN_COMPLETION_CHARS:
+                return projected, visual or voice
             return voice, visual or voice
         protocol_free = _COMPLETION_PROTOCOL_TAG.sub("", detail).strip()
         return "", visual or protocol_free or _NO_DISPLAYABLE_RESULT

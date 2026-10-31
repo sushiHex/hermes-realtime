@@ -345,6 +345,17 @@ The interactive witness retains at most 16 transport receipts and bounded counte
 The preview is operator-owned until explicitly stopped; this profile is not a new
 dispatcher or a substitute for the process owner's cleanup.
 
+Speech uses full month names and the host's local time by default. For a supported
+instant with a complete date and explicit source offset, the formatter emits an
+ISO timestamp in its short voice projection; the host renders that instant with
+the operating system's local-time rules, including date rollover and daylight
+saving. The detailed source timestamp remains unchanged. Missing or ambiguous
+dates/zones are not guessed. This is host-local time, not automatic inference of
+another location's timezone. Foreground prose follows wording guidance; only
+explicit ISO instants have deterministic conversion. A speech expansion that
+would exceed the existing visual voice bound retains the original visual text;
+TTS still applies the local-time projection.
+
 Startup timing remains separate from the model/context profile and the task's
 120-second authority. `start_model(..., startup_timeout_seconds=300)` explicitly
 selects a bounded cold-start allowance in an existing Python composition; accepted

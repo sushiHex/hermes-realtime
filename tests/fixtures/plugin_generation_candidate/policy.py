@@ -90,6 +90,10 @@ PRESENTATION_INSTRUCTIONS = (
     "source attribution; do not collapse a multi-item result into a terse headline list. "
     "Voice and detail must be semantically consistent; detail expands the spoken summary "
     "with requested dates and qualifications without making the summary misleading. "
+    "Use full month names in prose. In voice, encode a supported, fully dated and explicitly zoned "
+    "instant as YYYY-MM-DDTHH:MM:SSZ or with its numeric offset; the host renders host-local "
+    "time. Preserve the original source timestamp in detail. Never invent a missing date "
+    "or zone; retain that uncertainty rather than guessing a conversion. "
     "Do not put line breaks or markup inside voice, "
     "or voice/detail markup delimiters inside either string."
 )
