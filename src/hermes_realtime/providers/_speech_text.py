@@ -14,10 +14,20 @@ _MONTHS = (
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 )
+_TEMPERATURE = re.compile(
+    r"(?<![\w.])(?P<value>[+\-−]?(?:\d+(?:\.\d+)?|\.\d+))[ \t]*"
+    r"(?P<unit>°[ \t]*[FC]|[℉℃])(?!\w)",
+)
+_TEMPERATURE_UNITS = {"F": "Fahrenheit", "C": "Celsius", "℉": "Fahrenheit", "℃": "Celsius"}
 
 
 def project_speech_text(text: str) -> str:
-    """Project canonical instants using host rules for that instant, not today's offset."""
+    """Expand explicit units and localize canonical instants without changing source text."""
+    def temperature(match: re.Match[str]) -> str:
+        value = match["value"]
+        quantity = "degree" if re.fullmatch(r"[+\-−]?0*1(?:\.0+)?", value) else "degrees"
+        return f"{value} {quantity} {_TEMPERATURE_UNITS[match['unit'][-1]]}"
+
     def local_time(match: re.Match[str]) -> str:
         original = match.group()
         try:
@@ -33,7 +43,11 @@ def project_speech_text(text: str) -> str:
         return (f"{clock} {period} {zone} on "
                 f"{_MONTHS[local.month - 1]} {local.day}, {local.year}")
 
-    projected = _ISO_INSTANT.sub(local_time, strip_markdown_emphasis_for_speech(text))
+    projected = _TEMPERATURE.sub(
+        temperature,
+        strip_markdown_emphasis_for_speech(text),
+    )
+    projected = _ISO_INSTANT.sub(local_time, projected)
     if len(projected) > 4096:
         raise ValueError("projected speech text exceeds supported bounds")
     return projected
