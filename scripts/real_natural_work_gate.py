@@ -28,11 +28,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 if TYPE_CHECKING:
-    from scripts.real_gate_support import available_port, load_api_key
+    from scripts.real_gate_support import available_port, hermes_namespace_tools, load_api_key
 elif __package__:
-    from .real_gate_support import available_port, load_api_key
+    from .real_gate_support import available_port, hermes_namespace_tools, load_api_key
 else:
-    from real_gate_support import available_port, load_api_key
+    from real_gate_support import available_port, hermes_namespace_tools, load_api_key
 
 from hermes_realtime.conversation import (
     ConversationContextStore,
@@ -403,34 +403,10 @@ class WorkActivityObserver:
 
     @staticmethod
     def _hermes_tool_names(value: object) -> tuple[str, ...] | None:
-        if type(value) is not list:
+        tools = hermes_namespace_tools(value)
+        if tools is None:
             return None
-        if not value:
-            return ()
-        if len(value) != 1:
-            return None
-        namespace = value[0]
-        if (
-            type(namespace) is not dict
-            or set(namespace) != {"type", "name", "description", "tools"}
-            or namespace.get("type") != "namespace"
-            or namespace.get("name") != "hermes"
-        ):
-            return None
-        tools = namespace.get("tools")
-        if type(tools) is not list or len(tools) > 16:
-            return None
-        names: list[str] = []
-        for tool in tools:
-            if (
-                type(tool) is not dict
-                or tool.get("type") != "function"
-                or type(tool.get("name")) is not str
-                or not 1 <= len(tool["name"]) <= 64
-            ):
-                return None
-            names.append(tool["name"])
-        return tuple(names)
+        return tuple(cast(str, tool["name"]) for tool in tools)
 
     def observe_send(self, message: Mapping[str, object]) -> None:
         try:

@@ -65,6 +65,8 @@ _REQUIRED_ENDPOINTS = {
 _MAX_HTTP_BODY_BYTES = 64 * 1024
 _MAX_SSE_LINE_BYTES = 32 * 1024
 _MAX_TERMINAL_TEXT_CHARS = 4096
+# The task controller bounds non-completed reasons tighter than completed summaries.
+_MAX_TERMINAL_REASON_CHARS = 1024
 _MAX_ACTIVE_RUNS = 8
 _MAX_PENDING_APPROVALS = 32
 _MAX_SEQUENCE = (1 << 63) - 1
@@ -1189,6 +1191,9 @@ class HermesApiTaskSession:
             terminal_payload = WorkCompletedPayload(status=status, summary=output)
         elif event == "run.failed":
             reason = self._bounded_terminal_text(payload.get("error"), "reason")
+            if len(reason) > _MAX_TERMINAL_REASON_CHARS:
+                # Privacy checks above ran on the full text; shorten only for presentation.
+                reason = reason[: _MAX_TERMINAL_REASON_CHARS - 1].rstrip() + "…"
             status = WorkTerminalStatus.FAILED
             terminal_payload = WorkCompletedPayload(status=status, reason=reason)
         else:

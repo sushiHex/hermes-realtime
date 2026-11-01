@@ -437,38 +437,32 @@ def bounded_exa_send(
     return send
 
 
-def _model_capture_module() -> Any:
-    """Load the adjacent verified helper even under the gateway's -I launch."""
-    spec = importlib.util.spec_from_file_location(
-        "owned_model_capture", ROOT / "lookup_model_capture.py",
-    )
+def _load_sibling(module_name: str, filename: str, unavailable: str) -> Any:
+    """Load an adjacent verified helper even under the gateway's -I launch."""
+    spec = importlib.util.spec_from_file_location(module_name, ROOT / filename)
     if spec is None or spec.loader is None:
-        raise RuntimeError("capture_helper_unavailable")
+        raise RuntimeError(unavailable)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _model_capture_module() -> Any:
+    return _load_sibling(
+        "owned_model_capture", "lookup_model_capture.py", "capture_helper_unavailable",
+    )
 
 
 def _frozen_search_module() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "owned_frozen_search", ROOT / "lookup_frozen_search.py",
+    return _load_sibling(
+        "owned_frozen_search", "lookup_frozen_search.py", "frozen_search_helper_unavailable",
     )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("frozen_search_helper_unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _stage_lookup_policy_module() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "owned_stage_lookup_policy", ROOT / "stage_lookup_policy.py",
+    return _load_sibling(
+        "owned_stage_lookup_policy", "stage_lookup_policy.py", "lookup_policy_stage_unavailable",
     )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("lookup_policy_stage_unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def require_interactive_policy_profile(config: Any, home: Path) -> None:
