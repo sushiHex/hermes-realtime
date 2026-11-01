@@ -504,6 +504,108 @@ def test_owned_runner_existing_capture_artifact_refuses_before_model_start(
     assert "PRIVATE_OLD_CAPTURE" not in marker
 
 
+def test_owned_runner_frozen_fixture_refuses_before_loader(owned_runner_before_gateway, capsys):
+    state = owned_runner_before_gateway
+    called = []
+    result = state.task.run_owned(
+        state.manifest, frozen_search_fixture="PRIVATE_BAD_PATH", frozen_search_sha256="bad",
+        mcp_loader_factory=lambda *_: called.append(True),
+    )
+    assert result["category"] == "refused" and state.model_calls == [] and called == []
+    output = capsys.readouterr().out
+    assert "PRIVATE_BAD_PATH" not in output
+    assert '"category":"frozen_search_config"' in output
+
+
+def test_owned_runner_forwards_frozen_fixture_pair(
+    owned_runner_before_gateway, monkeypatch, tmp_path,
+):
+    import hashlib
+
+    import scripts
+    from tests.test_lookup_frozen_search import snapshot
+
+    state = owned_runner_before_gateway
+    path, digest, _ = snapshot(tmp_path)
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    state.manifest.update(objective="question", profile=str(tmp_path), hermes_source=str(tmp_path))
+    monkeypatch.setattr(state.task.os, "devnull", __import__("os").devnull, raising=False)
+    monkeypatch.setattr(scripts.rehearse_desktop_mvp, "_isolated", lambda _: {}, raising=False)
+    monkeypatch.setattr("scripts.lookup_backend_model.start_model", lambda *a, **k: None)
+    seen = []
+
+    def spawn(_name, command, **_kwargs):
+        seen.append(command)
+        raise RuntimeError("stop before gateway")
+
+    monkeypatch.setattr(state.processes, "spawn", spawn, raising=False)
+    state.task.run_owned(state.manifest, frozen_search_fixture=path, frozen_search_sha256=digest)
+    assert seen[0][-4:] == ["--frozen-search-fixture", str(path), "--frozen-search-sha256", digest]
+
+
+@pytest.mark.parametrize("change,reason", [
+    ("none", None), ("extraction", "frozen_extract_unavailable"),
+    ("digest", "validation_refused"), ("search-count", "validation_refused"),
+    ("live-search", "validation_refused"), ("live-extract", "validation_refused"),
+])
+def test_owned_runner_checks_terminal_frozen_replay(
+    owned_runner_before_gateway, monkeypatch, tmp_path, change, reason,
+):
+    import scripts
+    from tests.test_lookup_frozen_search import snapshot
+
+    state = owned_runner_before_gateway
+    path, identity, _ = snapshot(tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text("{}")
+    (tmp_path / ".env").write_text("API_SERVER_KEY=local\n")
+    state.manifest.update(objective="question", profile=str(tmp_path), hermes_source=str(tmp_path),
+                          recordSha256="record", baseUrl="http://127.0.0.1:28660")
+    frozen = {"mode": "frozen", "sha256": identity, "searches": 1,
+              "extraction_refused": change == "extraction", "refused": False}
+    if change == "digest":
+        frozen["sha256"] = "a" * 64
+    if change == "search-count":
+        frozen["searches"] = 0
+    witness = {"interpreterExact": True, "packageExact": True, "recordSha256": "record",
+               "configSha256": state.task.digest(config), "transportRefused": False,
+               "frozenSearchReplay": frozen, "searchRequests": int(change == "live-search"),
+               "extractRequests": int(change == "live-extract")}
+    (tmp_path / "gateway-witness.private.json").write_text(json.dumps(witness))
+    state.started = False
+
+    def spawn(*_args, **_kwargs):
+        state.started = True
+        return SimpleNamespace(poll=lambda: None)
+
+    original_stop = state.processes.stop_all
+
+    def stop(containment):
+        state.started = False
+        original_stop(containment)
+
+    async def execute(*_args):
+        return {"category": "completed"}
+
+    monkeypatch.setattr(state.processes, "spawn", spawn, raising=False)
+    monkeypatch.setattr(state.processes, "stop_all", stop)
+    monkeypatch.setattr(scripts.rehearse_desktop_mvp, "Containment",
+                        lambda: SimpleNamespace(members=lambda: {444}))
+    monkeypatch.setattr(scripts.rehearse_desktop_mvp, "_isolated", lambda _: {}, raising=False)
+    monkeypatch.setattr(state.task.os, "devnull", __import__("os").devnull, raising=False)
+    monkeypatch.setattr("scripts.lookup_backend_model.start_model", lambda *a, **k: None)
+    monkeypatch.setattr(state.task, "execute", execute)
+    monkeypatch.setattr(state.task, "request_json", lambda *_args: {"pid": 444})
+    monkeypatch.setattr(state.task, "listener_rows", lambda port: (
+        [("127.0.0.1", 444)] if state.started and port in {28660, 28785} else []))
+    result = state.task.run_owned(
+        state.manifest, frozen_search_fixture=path, frozen_search_sha256=identity,
+    )
+    assert result["category"] == ("completed" if reason is None else "refused")
+    assert result.get("failure_category") == reason
+    assert result["owned_processes_settled"] and result["owned_listeners_gone"]
+
+
 @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows-only composition")
 def test_fresh_isolated_parent_imports_owner_before_any_process(tmp_path):
     import subprocess

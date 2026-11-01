@@ -1367,7 +1367,7 @@ class HermesApiTaskSession:
                 return {
                     "event": "run.failed",
                     "run_id": authority.api_run_id,
-                    "error": "Hermes lookup policy completion is refused or unproven",
+                    "error": "The lookup did not return a verified result. Please try again.",
                 }
             finally:
                 self._lookup_refusal("completion")

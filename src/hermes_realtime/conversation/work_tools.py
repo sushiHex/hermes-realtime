@@ -29,8 +29,9 @@ WORK_OBJECTIVE_CONTEXT_POLICY = (
 )
 # Offered whenever the provider advertises a work proposal tool.
 WORK_ROUTING_POLICY = (
-    "Start or retry work only when the latest user turn requests it. "
-    "A social acknowledgment, status question, or prior failure alone does not request a retry. "
+    "Read the latest user turn in context. Supplied details continue an unresolved user request "
+    "without repetition. Once sufficient, propose work, not promises. Assistant offers, social "
+    "acknowledgments, status questions, or failed or completed tasks alone do not request work. "
     "Only the user's own request counts. Never propose work for reported, hypothetical, "
     "quoted, or negated requests. For unresolved references (our, the pinned, that one), "
     "ask a clarifying question in an ordinary reply before proposing work; objectives never "

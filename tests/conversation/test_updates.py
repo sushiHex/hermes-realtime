@@ -362,6 +362,33 @@ def test_embedded_private_run_token_is_rejected_from_update_text() -> None:
         UpdateDirective(kind="retain", text="prefixdeleg_private_run suffix")
 
 
+def test_speech_projection_reuses_update_text_validation() -> None:
+    with pytest.raises(TypeError, match="exact built-in string"):
+        UpdateDirective(kind="mention_next", text="Full result.", speech_text=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bounded"):
+        UpdateDirective(kind="mention_next", text="Full result.", speech_text="x" * 4097)
+    with pytest.raises(PrivateRunDisclosureError, match="private run token"):
+        UpdateDirective(
+            kind="mention_next",
+            text="Full result.",
+            speech_text="prefixdeleg_private_run suffix",
+        )
+    with pytest.raises(TypeError, match="exact built-in string"):
+        UpdateDecision(
+            sequence=1,
+            completion=TaskTerminalOutcome(
+                task_id="task_speech_validation",
+                status="completed",
+                summary="Full result.",
+            ),
+            kind="mention_next",
+            text="Full result.",
+            speech_text=object(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="must not retain text"):
+        UpdateDirective(kind="ignore", speech_text="Should not be retained.")
+
+
 @pytest.mark.asyncio
 async def test_close_wakes_every_blocked_update_consumer() -> None:
     director = _director_for_test(

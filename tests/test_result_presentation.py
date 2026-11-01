@@ -27,6 +27,11 @@ async def test_result_preserves_visual_sources_and_observation_time_in_each_proj
     ), context=ConversationContextStore().snapshot()))
     assert projection.events_after(0)[-1].data["text"] == detail
     assert directive.kind == ("interrupt" if idle else "mention_next")
+    assert directive.speech_text == (
+        None
+        if idle
+        else "The monitor counted 12 sessions at 07:53 UTC, per monitor.example.invalid."
+    )
     assert "07:53 UTC" in directive.text
     assert "the source link" not in directive.text
     if idle:

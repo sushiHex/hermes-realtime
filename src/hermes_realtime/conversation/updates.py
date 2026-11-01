@@ -92,14 +92,17 @@ def _trusted_snapshot(snapshot: ConversationContextSnapshot) -> ConversationCont
 
 @dataclass(frozen=True, slots=True)
 class UpdateDirective:
-    """One provider-neutral policy result before director sequencing."""
+    """Policy output: rich ``text`` plus optional direct-speech projection."""
 
     kind: str
     text: str | None = None
+    speech_text: str | None = None
 
     def __post_init__(self) -> None:
         _validate_kind(self.kind)
         _validate_text(self.text, kind=self.kind)
+        if self.speech_text is not None:
+            _validate_text(self.speech_text, kind=self.kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,18 +190,21 @@ def _trusted_audit(record: UpdateAuditRecord) -> UpdateAuditRecord:
 
 @dataclass(frozen=True, slots=True)
 class UpdateDecision:
-    """One ordered, bounded, model-safe Update Director decision."""
+    """Ordered decision; ``speech_text`` is only for direct idle announcements."""
 
     sequence: int
     completion: TaskTerminalOutcome
     kind: str
     text: str | None = None
+    speech_text: str | None = None
 
     def __post_init__(self) -> None:
         _validate_sequence(self.sequence)
         object.__setattr__(self, "completion", _trusted_completion(self.completion))
         _validate_kind(self.kind)
         _validate_text(self.text, kind=self.kind)
+        if self.speech_text is not None:
+            _validate_text(self.speech_text, kind=self.kind)
 
     @property
     def task_id(self) -> str:
@@ -217,6 +223,7 @@ def _trusted_decision(decision: UpdateDecision) -> UpdateDecision:
         completion=decision.completion,
         kind=decision.kind,
         text=decision.text,
+        speech_text=decision.speech_text,
     )
 
 
@@ -624,12 +631,14 @@ class ConversationUpdateDirector:
                 directive = UpdateDirective(
                     kind=raw_directive.kind,
                     text=raw_directive.text,
+                    speech_text=raw_directive.speech_text,
                 )
                 decision = UpdateDecision(
                     sequence=sequence,
                     completion=completion,
                     kind=directive.kind,
                     text=directive.text,
+                    speech_text=directive.speech_text,
                 )
                 unresolved = UnresolvedUpdate(
                     sequence=sequence,

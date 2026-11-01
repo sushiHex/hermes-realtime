@@ -10,8 +10,7 @@ from hermes_realtime.conversation.output_style import (
 
 
 @pytest.mark.parametrize("style, expected", [
-    ("default", "Use one or two short sentences for simple turns; expand only when the user "
-     "asks or the answer needs it."),
+    ("default", "Keep simple turns brief; expand only when asked or needed."),
     ("proactive", "Suggest a relevant next step when useful; do not perform unrequested work."),
     ("explanatory", "Explain the reasoning and useful context behind the answer."),
     ("learning", "Help the user understand with useful examples and occasional understanding "
@@ -39,6 +38,9 @@ def test_output_styles_are_exact_bounded_communication_preferences() -> None:
         assert "accepted dispatch" in policy
         assert "foreground tools" in policy
         assert "manageable spoken chunks" in policy
+        assert "Ordinary replies: one or two short sentences" in policy
+        assert "Name sources only on request" in policy
+        assert "omit supporting detail unless asked or essential to avoid misleading" in policy
 
 
 @pytest.mark.parametrize("value", ["Default", "", "unknown", True, None, 1])

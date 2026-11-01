@@ -97,6 +97,9 @@ async def test_adapter_boundary_binds_memory_digest_without_content(
 
 
 class BlockingIncrementalInference:
+    first_segment = "The first complete answer is long enough to publish immediately."
+    second_segment = "The second complete answer is long enough to publish separately."
+
     def __init__(self) -> None:
         self.first_segment_emitted = asyncio.Event()
         self.release_second_segment = asyncio.Event()
@@ -110,10 +113,10 @@ class BlockingIncrementalInference:
         turn_id: str,
     ) -> AsyncIterator[str]:
         self.snapshots.append(snapshot)
-        yield "First answer."
+        yield self.first_segment
         self.first_segment_emitted.set()
         await self.release_second_segment.wait()
-        yield "Second answer."
+        yield self.second_segment
         self.completed = True
 
     def stream(
@@ -141,7 +144,7 @@ class CancellationRacingFailureInference:
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "First answer."
+        yield "The first complete answer is long enough to publish immediately."
         await self.release_failure.wait()
         self.failure_ready.set()
         with suppress(asyncio.CancelledError):
@@ -619,6 +622,9 @@ class NonReturningCancelInference(PerTurnInference):
 
 
 class EagerTwoSegmentInference(PerTurnInference):
+    first_segment = "The first complete answer has enough words to stay separately spoken."
+    second_segment = "The second complete answer has enough words to stay separately spoken."
+
     def __init__(self) -> None:
         super().__init__()
         self.second_segment_emitted = asyncio.Event()
@@ -630,9 +636,9 @@ class EagerTwoSegmentInference(PerTurnInference):
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "First answer."
+        yield self.first_segment
         self.second_segment_emitted.set()
-        yield "Second answer."
+        yield self.second_segment
 
 
 class EagerOneSegmentInference(PerTurnInference):
@@ -644,6 +650,52 @@ class EagerOneSegmentInference(PerTurnInference):
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
         yield "Complete answer."
+
+
+class ShortThenContextInference(PerTurnInference):
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        yield "I'm here."
+        yield "I can help with the next step."
+
+
+class ThreeShortSegmentsInference(PerTurnInference):
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        yield "Hi."
+        yield "I'm here."
+        yield "Ready?"
+
+
+class ShortThenBlockingInference(PerTurnInference):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        try:
+            yield "I'm here."
+            self.blocked.set()
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
 
 
 class MatchingTwoChunkInference(PerTurnInference):
@@ -658,6 +710,12 @@ class MatchingTwoChunkInference(PerTurnInference):
 
 
 class EagerThreeSegmentInference(PerTurnInference):
+    segments = (
+        "Segment one contains enough detail to remain its own spoken chunk.",
+        "Segment two contains enough detail to remain its own spoken chunk.",
+        "Segment three contains enough detail to remain its own spoken chunk.",
+    )
+
     async def _stream(
         self,
         snapshot: ConversationContextSnapshot,
@@ -665,8 +723,8 @@ class EagerThreeSegmentInference(PerTurnInference):
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        for index in range(1, 4):
-            yield f"Segment {index}."
+        for segment in self.segments:
+            yield segment
 
 
 class PrefetchProbeSynthesizer(SegmentSynthesizer):
@@ -707,7 +765,7 @@ class CancellationResistantInference(PerTurnInference):
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "First answer."
+        yield "The first complete answer is long enough to play immediately."
         while not self.release_owner.is_set():
             try:
                 await self.release_owner.wait()
@@ -727,7 +785,7 @@ class BlockingAfterFirstInference(PerTurnInference):
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "First answer."
+        yield "The first complete answer is long enough to play immediately."
         try:
             await asyncio.Event().wait()
         finally:
@@ -769,7 +827,7 @@ class BurstInference(PerTurnInference):
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "Segment 0."
+        yield "The first burst segment is long enough to play immediately."
         await self._playback_started.wait()
         for index in range(1, 8):
             yield f"Segment {index}."
@@ -1887,6 +1945,161 @@ async def test_generated_observer_failure_does_not_leave_orphaned_assistant_cont
 
 
 @pytest.mark.asyncio
+async def test_coalesces_short_leading_segment_with_next_complete_clause() -> None:
+    synthesizer = SegmentSynthesizer()
+    playback = RecordingPlayback()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=ShortThenContextInference(),
+        synthesizer=synthesizer,
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    expected = "I'm here. I can help with the next step."
+    assert synthesizer.texts == [expected]
+    assert [chunk.text for chunk in playback.chunks] == [expected]
+
+
+@pytest.mark.asyncio
+async def test_keeps_short_leading_fragments_buffered_until_context_or_completion() -> None:
+    synthesizer = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=ThreeShortSegmentsInference(),
+        synthesizer=synthesizer,
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert synthesizer.texts == ["Hi. I'm here. Ready?"]
+
+
+@pytest.mark.asyncio
+async def test_final_short_segment_is_flushed_unchanged() -> None:
+    synthesizer = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=EagerOneSegmentInference(),
+        synthesizer=synthesizer,
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert synthesizer.texts == ["Complete answer."]
+
+
+@pytest.mark.asyncio
+async def test_short_segment_is_not_combined_past_character_bound() -> None:
+    synthesizer = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=ShortThenContextInference(),
+        synthesizer=synthesizer,
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        max_segment_chars=len("I can help with the next step."),
+    )
+
+    await loop.respond("turn_001", Transcript(text="Question?", final=True))
+
+    assert synthesizer.texts == ["I'm here.", "I can help with the next step."]
+
+
+@pytest.mark.asyncio
+async def test_cancel_drops_pending_short_leading_segment() -> None:
+    inference = ShortThenBlockingInference()
+    synthesizer = SegmentSynthesizer()
+    playback = RecordingPlayback()
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(),
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=synthesizer,
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    response = asyncio.create_task(
+        loop.respond("turn_001", Transcript(text="Question?", final=True))
+    )
+    await asyncio.wait_for(inference.blocked.wait(), timeout=1)
+    assert synthesizer.texts == []
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(playback.first_chunk_played.wait(), timeout=0.05)
+
+    await loop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response
+
+    assert inference.closed.is_set()
+    assert synthesizer.texts == []
+    assert playback.chunks == []
+
+
+@pytest.mark.asyncio
+async def test_automatic_proposal_discards_pending_short_conversation_prefix() -> None:
+    from hermes_realtime.conversation.streaming import AcceptedStartInferenceRequest
+    from hermes_realtime.conversation.task_proposals import (
+        ConversationTaskProposals,
+        HostTaskProposalRequest,
+    )
+    from tests.conversation.test_work_tools import _surface
+
+    context = ConversationContextStore()
+    surface, controller, _events = _surface(context=context)
+    proposals = ConversationTaskProposals(
+        surface=surface,
+        observer=lambda *_: None,
+        start_policy="automatic",
+    )
+    proposals.bind("participant", 1)
+
+    class Inference:
+        calls = 0
+
+        async def stream(self, snapshot, *, turn_id):
+            del turn_id
+            self.calls += 1
+            if self.calls == 1:
+                yield "I'm here."
+                yield HostTaskProposalRequest("Inspect the release")
+                return
+            assert type(snapshot) is AcceptedStartInferenceRequest
+            yield "The task is confirmed active."
+
+        async def cancel(self, turn_id):
+            del turn_id
+
+    inference = Inference()
+    synthesizer = SegmentSynthesizer()
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=synthesizer,
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        task_proposals=proposals,
+    )
+    try:
+        await loop.respond("turn_001", Transcript(text="Inspect release", final=True))
+        assert controller.dispatches == [("Inspect the release", "utterance_local_1")]
+        assert synthesizer.texts == ["The task is confirmed active."]
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
 async def test_interruption_keeps_unheard_segments_out_of_context_but_in_projection() -> None:
     context = ConversationContextStore()
     playback = PresentationBlockingPlayback()
@@ -1922,7 +2135,7 @@ async def test_interruption_keeps_unheard_segments_out_of_context_but_in_project
             "assistant_text_generated",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": EagerTwoSegmentInference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "segmentId": "segment_1",
@@ -1932,7 +2145,7 @@ async def test_interruption_keeps_unheard_segments_out_of_context_but_in_project
             "assistant_text_generated",
             {
                 "role": "assistant",
-                "text": "Second answer.",
+                "text": EagerTwoSegmentInference.second_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "segmentId": "segment_2",
@@ -1975,7 +2188,11 @@ async def test_normal_completion_records_one_heard_row_per_turn_without_marker()
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to remain a separate segment.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -1983,15 +2200,28 @@ async def test_normal_completion_records_one_heard_row_per_turn_without_marker()
 
     await loop.respond("turn_001", Transcript(text="Question?", final=True))
 
-    # Each sentence is its own publication; the turn's heard text grows one row.
+    # Each long segment publishes separately, while delivered speech remains one row.
     assert playback.context_at_play == [
         ["Question?"],
-        ["Question?", "First answer."],
-        ["Question?", "First answer. Second answer."],
+        [
+            "Question?",
+            "The first answer is long enough to publish independently.",
+        ],
+        [
+            "Question?",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to remain a separate segment.",
+        ],
     ]
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer. Third answer.", False),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to remain a separate segment. "
+            "Third answer.",
+            False,
+        ),
     ]
 
 
@@ -2019,12 +2249,13 @@ async def test_the_restart_announcement_row_counts_against_the_window_budget() -
 
 @pytest.mark.asyncio
 async def test_a_chunk_not_located_in_a_later_publication_leaves_the_row_unchanged() -> None:
+    first_segment = "The located first segment has enough words to publish separately."
     context = ConversationContextStore()
     playback = ContextProbePlayback(context)
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("Located.", "Not located."),
+        inference=FixedSegmentsInference(first_segment, "Not located."),
         synthesizer=_FirstLocatedSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2032,10 +2263,10 @@ async def test_a_chunk_not_located_in_a_later_publication_leaves_the_row_unchang
 
     await loop.respond("turn_001", Transcript(text="Question?", final=True))
 
-    assert [chunk.text for chunk in playback.chunks] == ["Located.", "Elsewhere."]
+    assert [chunk.text for chunk in playback.chunks] == [first_segment, "Elsewhere."]
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "Located.", False),
+        ("assistant", first_segment, False),
     ]
 
 
@@ -2106,7 +2337,7 @@ async def test_a_rollover_inside_one_publication_starts_at_its_chunk() -> None:
 @pytest.mark.asyncio
 async def test_an_interrupted_rolled_over_turn_flags_only_its_last_row() -> None:
     context = ConversationContextStore(max_item_chars=32)
-    playback = ContextProbePlayback(context, block=(("turn_001", "slice_3_2"),))
+    playback = ContextProbePlayback(context, block=(("turn_001", "slice_2_2"),))
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
@@ -2140,7 +2371,11 @@ async def test_an_interrupted_multi_sentence_turn_is_one_flagged_row_and_its_rep
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to interrupt separately.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2155,14 +2390,24 @@ async def test_an_interrupted_multi_sentence_turn_is_one_flagged_row_and_its_rep
 
     assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
     ]
 
     assert await loop.resume_interrupted() is True
 
     assert _durable_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer. Second answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
         ("assistant", "Third answer.", False),
     ]
 
@@ -2228,11 +2473,15 @@ async def test_interruption_mid_segment_records_heard_slice_plus_marker() -> Non
 @pytest.mark.asyncio
 async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
     context = ConversationContextStore()
-    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_2"),))
+    playback = ContextProbePlayback(context, block=(("turn_001", "chunk_3"),))
     loop = StreamingSpeechLoop(
         context=context,
         foreground=ForegroundTurnCoordinator(),
-        inference=FixedSegmentsInference("First answer.", "Second answer.", "Third answer."),
+        inference=FixedSegmentsInference(
+            "The first answer is long enough to publish independently.",
+            "The second answer is long enough to interrupt separately.",
+            "Third answer.",
+        ),
         synthesizer=SegmentSynthesizer(),
         playback=playback,
         ledger=DeliveredSpeechLedger(),
@@ -2248,7 +2497,12 @@ async def test_interruption_between_segments_marks_the_last_heard_row() -> None:
 
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer.", True),
+        (
+            "assistant",
+            "The first answer is long enough to publish independently. "
+            "The second answer is long enough to interrupt separately.",
+            True,
+        ),
     ]
 
 
@@ -2318,7 +2572,7 @@ async def test_abnormal_end_after_hearing_all_generated_speech_still_marks_cut_o
     # Every generated segment is fully delivered, but inference is still producing.
     await asyncio.wait_for(first_segment_final.wait(), timeout=1)
     assert inference.completed is False
-    assert _context_texts(context) == ["Question?", "First answer."]
+    assert _context_texts(context) == ["Question?", inference.first_segment]
 
     await loop.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2327,7 +2581,7 @@ async def test_abnormal_end_after_hearing_all_generated_speech_still_marks_cut_o
     # The turn did not complete normally, so the reply was cut off.
     assert _context_rows(context) == [
         ("user", "Question?", False),
-        ("assistant", "First answer.", True),
+        ("assistant", inference.first_segment, True),
     ]
 
 
@@ -2456,10 +2710,16 @@ async def test_interrupted_evidence_response_retains_canonical_replay_identity(
     assert replay.replay_of_evidence_turn_id == evidence_turn_id
     assert replay.replay_generation == 1
     assert replay.replay_of_evidence_turn_id != "turn_001"
-    assert captured == ["First answer.", "Second answer."]
+    assert captured == [
+        EagerTwoSegmentInference.first_segment,
+        EagerTwoSegmentInference.second_segment,
+    ]
 
     assert await loop.resume_interrupted(evidence_lease) is True
-    assert captured == ["First answer.", "Second answer."]
+    assert captured == [
+        EagerTwoSegmentInference.first_segment,
+        EagerTwoSegmentInference.second_segment,
+    ]
 
 
 @pytest.mark.asyncio
@@ -2539,14 +2799,14 @@ async def test_resume_interrupted_replays_unconfirmed_suffix_without_new_inferen
     assert await loop.resume_interrupted() is False
 
     assert [chunk.text for chunk in playback.chunks] == [
-        "First answer.",
-        "First answer.",
-        "Second answer.",
+        EagerTwoSegmentInference.first_segment,
+        EagerTwoSegmentInference.first_segment,
+        EagerTwoSegmentInference.second_segment,
     ]
     # Nothing was heard before the interruption; the replay is one turn, so one row.
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First answer. Second answer.",
+        f"{EagerTwoSegmentInference.first_segment} {EagerTwoSegmentInference.second_segment}",
     ]
 
 
@@ -2768,7 +3028,7 @@ async def test_assistant_projection_carries_stable_turn_and_chunk_identity() -> 
             "transcript_partial",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": EagerTwoSegmentInference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_1",
@@ -2780,7 +3040,7 @@ async def test_assistant_projection_carries_stable_turn_and_chunk_identity() -> 
             "transcript_final",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": EagerTwoSegmentInference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_1",
@@ -2791,7 +3051,7 @@ async def test_assistant_projection_carries_stable_turn_and_chunk_identity() -> 
             "transcript_partial",
             {
                 "role": "assistant",
-                "text": "Second answer.",
+                "text": EagerTwoSegmentInference.second_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_2",
@@ -2803,7 +3063,7 @@ async def test_assistant_projection_carries_stable_turn_and_chunk_identity() -> 
             "transcript_final",
             {
                 "role": "assistant",
-                "text": "Second answer.",
+                "text": EagerTwoSegmentInference.second_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_2",
@@ -2853,7 +3113,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
             "assistant_text_generated",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": inference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "segmentId": "segment_1",
@@ -2861,17 +3121,17 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
         ),
         ("first_playable_audio", {}),
     ]
-    assert [chunk.text for chunk in playback.chunks] == ["First answer."]
+    assert [chunk.text for chunk in playback.chunks] == [inference.first_segment]
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First answer.",
+        inference.first_segment,
     ]
 
     inference.release_second_segment.set()
     await asyncio.wait_for(response, timeout=1)
 
     assert inference.completed is True
-    assert synthesizer.texts == ["First answer.", "Second answer."]
+    assert synthesizer.texts == [inference.first_segment, inference.second_segment]
     assert [event for event in observed if event[0] != "assistant_text_generated"] == [
         ("first_foreground_token", {}),
         ("first_playable_audio", {}),
@@ -2879,7 +3139,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
             "transcript_partial",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": inference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_1",
@@ -2891,7 +3151,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
             "transcript_final",
             {
                 "role": "assistant",
-                "text": "First answer.",
+                "text": inference.first_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_1",
@@ -2902,7 +3162,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
             "transcript_partial",
             {
                 "role": "assistant",
-                "text": "Second answer.",
+                "text": inference.second_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_2",
@@ -2914,7 +3174,7 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
             "transcript_final",
             {
                 "role": "assistant",
-                "text": "Second answer.",
+                "text": inference.second_segment,
                 "turnId": "turn_001",
                 "turnGeneration": 1,
                 "chunkId": "chunk_2",
@@ -2927,12 +3187,12 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
         ),
     ]
     assert [chunk.text for chunk in playback.chunks] == [
-        "First answer.",
-        "Second answer.",
+        inference.first_segment,
+        inference.second_segment,
     ]
     assert [message.text for message in context.snapshot().messages] == [
         "Question?",
-        "First answer. Second answer.",
+        f"{inference.first_segment} {inference.second_segment}",
     ]
     assert foreground.active_task_count == 0
     assert ledger.retained_chunk_count == 0
@@ -3635,17 +3895,17 @@ async def test_synthesis_prefetches_exactly_one_chunk_during_current_playback() 
         await asyncio.wait_for(synthesizer.second_synthesized.wait(), timeout=1)
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(synthesizer.third_synthesis_started.wait(), timeout=0.05)
-        assert [chunk.text for chunk in playback.chunks] == ["Segment 1."]
+        assert [chunk.text for chunk in playback.chunks] == [
+            EagerThreeSegmentInference.segments[0]
+        ]
     finally:
         playback.release_play.set()
         await asyncio.wait_for(response, timeout=1)
 
-    assert synthesizer.texts == ["Segment 1.", "Segment 2.", "Segment 3."]
-    assert [chunk.text for chunk in playback.chunks] == [
-        "Segment 1.",
-        "Segment 2.",
-        "Segment 3.",
-    ]
+    assert synthesizer.texts == list(EagerThreeSegmentInference.segments)
+    assert [chunk.text for chunk in playback.chunks] == list(
+        EagerThreeSegmentInference.segments
+    )
 
 
 @pytest.mark.asyncio

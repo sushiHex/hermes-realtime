@@ -3821,6 +3821,27 @@ async def test_lookup_completion_requires_native_terminal_authority(status, run_
     assert not authority.terminal
 
 
+@pytest.mark.asyncio
+async def test_lookup_unverified_completion_returns_actionable_error_without_output():
+    session = HermesApiTaskSession(config=HermesApiConfig(
+        base_url="http://127.0.0.1:8642", bearer="synthetic-lookup-test-bearer-32-characters"),
+        session_id="session_api_1")
+
+    async def request(*args, **kwargs):
+        kwargs["response_headers"].update({"x-lookup-policy": "ordinary-lookup/v1",
+            "x-lookup-generation": "a" * 32, "x-lookup-policy-refused": "true"})
+        return 200, {"run_id": "run_0123456789abcdef", "status": "completed",
+                     "output": "Unverified draft must not be published."}
+
+    session._request_json = request
+    authority = _RunAuthority(task_id="task_release_check", api_run_id="run_0123456789abcdef",
+                              protocol_run_id="deleg_synthetic", lookup_generation="a" * 32)
+    assert await session._lookup_completion(authority) == {
+        "event": "run.failed", "run_id": authority.api_run_id,
+        "error": "The lookup did not return a verified result. Please try again.",
+    }
+
+
 def test_lookup_refusal_reporting_cannot_replace_primary_error(monkeypatch):
     def unavailable_output(*args, **kwargs):
         raise OSError("synthetic unavailable output")

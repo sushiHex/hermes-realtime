@@ -44,20 +44,36 @@ class TaskStatusSnapshot:
 
     def render(self) -> str:
         if not self.available:
-            return "Background task status is unavailable. Use the task controls to check work."
+            return "I can't check background task status right now."
         parts = []
         if self.pending:
-            parts.append(f"{self.pending} background task requests awaiting acknowledgment")
+            if self.pending == 1:
+                parts.append("One background task is awaiting acknowledgment.")
+            else:
+                parts.append(f"{self.pending} background tasks are awaiting acknowledgment.")
         if self.active:
-            parts.append(f"{self.active} confirmed active background tasks")
+            if self.active == 1:
+                parts.append("One background task is running.")
+            else:
+                parts.append(f"{self.active} background tasks are running.")
         if self.cancel_pending:
-            parts.append(
-                f"{self.cancel_pending} task cancellation requests awaiting acknowledgment"
-            )
+            if self.cancel_pending == 1:
+                parts.append("One task has a cancellation request awaiting acknowledgment.")
+            else:
+                parts.append(
+                    f"{self.cancel_pending} tasks have cancellation requests "
+                    "awaiting acknowledgment."
+                )
         if self.cancelling:
-            parts.append(
-                f"{self.cancelling} tasks with cancellation acknowledged, awaiting completion"
-            )
+            if self.cancelling == 1:
+                parts.append(
+                    "Cancellation has been acknowledged for one task; it is not finished yet."
+                )
+            else:
+                parts.append(
+                    "Cancellation has been acknowledged for "
+                    f"{self.cancelling} tasks; they are not finished yet."
+                )
         if not parts:
-            return "No confirmed active background tasks."
-        return "; ".join(parts) + ". To cancel work, use the task's Cancel control."
+            return "No active background tasks in this session."
+        return " ".join(parts)

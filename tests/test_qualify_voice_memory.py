@@ -584,12 +584,21 @@ async def test_forced_authority_pair_requires_exact_new_policy(
             else:
                 request = next(row for row in transport.sent if row.get("method") == "thread/start")
                 declared = request["params"]["dynamicTools"]
+                functions = _SCRIPT._codex_dynamic_tool_functions(declared)
+                namespace = declared[0]
                 if tool == "start_work":
-                    request["params"]["dynamicTools"] = [
-                        row for row in declared if row["name"] != tool
+                    namespace["tools"] = [
+                        row for row in functions if row["name"] != tool
                     ]
                 else:
-                    declared.append({"name": tool})
+                    namespace["tools"].append({
+                        "type": "function", "name": tool,
+                        "description": "Forbidden cancellation request.",
+                        "inputSchema": {
+                            "type": "object", "additionalProperties": False,
+                            "required": [], "properties": {},
+                        },
+                    })
         return duration, transport
 
     monkeypatch.setattr(_SCRIPT, "_adapter_turn", altered)
@@ -604,3 +613,17 @@ async def test_forced_authority_pair_requires_exact_new_policy(
         # therefore no dispatch; retain that refusal evidence as well.
         changed["memory_dispatches" if with_memory else "baseline_dispatches"] = 0
     assert observed["authority"] == _good()["authority"] | changed
+
+
+@pytest.mark.parametrize("mutation", ["foreign_namespace", "malformed_function"])
+def test_voice_memory_reader_rejects_nonhermes_or_malformed_function(mutation) -> None:
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+
+    tools = CodexAppServerStreamingInference._dynamic_tools(1024, include_status=True)
+    if mutation == "foreign_namespace":
+        tools[0]["name"] = "foreign"
+    else:
+        tools[0]["tools"][0]["type"] = "namespace"
+
+    with pytest.raises(RuntimeError, match="dynamic_tool_schema_invalid"):
+        _SCRIPT._codex_dynamic_tool_functions(tools)

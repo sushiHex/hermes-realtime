@@ -282,7 +282,21 @@ class ToolCallingCodexTransport:
         if method == "thread/start":
             params = cast(dict[str, object], copied["params"])
             dynamic_tools = cast(list[dict[str, object]], params["dynamicTools"])
-            self.advertised_tools = {cast(str, item["name"]) for item in dynamic_tools}
+            assert len(dynamic_tools) == 1
+            namespace = dynamic_tools[0]
+            assert set(namespace) == {"type", "name", "description", "tools"}
+            assert (namespace["type"], namespace["name"], namespace["description"]) == (
+                "namespace", "hermes", "Host",
+            )
+            functions = cast(list[dict[str, object]], namespace["tools"])
+            assert 1 <= len(functions) <= 16
+            assert all(
+                type(function) is dict and function.get("type") == "function"
+                and type(function.get("name")) is str
+                and 1 <= len(cast(str, function["name"])) <= 64
+                for function in functions
+            )
+            self.advertised_tools = {cast(str, item["name"]) for item in functions}
             await self.incoming.put(
                 {
                     "id": request_id,
@@ -345,7 +359,7 @@ class ToolCallingCodexTransport:
             "id": call_id,
             "type": "dynamicToolCall",
             "tool": self.tool,
-            "namespace": None,
+            "namespace": "hermes",
             "arguments": self.arguments,
             "status": "inProgress",
         }
@@ -370,7 +384,7 @@ class ToolCallingCodexTransport:
                     "threadId": self.evidence_thread_id,
                     "turnId": self.evidence_turn_id,
                     "callId": call_id,
-                    "namespace": None,
+                    "namespace": "hermes",
                     "tool": self.tool,
                     "arguments": self.arguments,
                 },
@@ -396,7 +410,7 @@ class ToolCallingCodexTransport:
                         "id": call_id,
                         "type": "dynamicToolCall",
                         "tool": self.tool,
-                        "namespace": None,
+                        "namespace": "hermes",
                         "arguments": self.arguments,
                         "status": ("completed" if result["success"] is True else "failed"),
                         "contentItems": result["contentItems"],

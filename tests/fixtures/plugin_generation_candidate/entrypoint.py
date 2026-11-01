@@ -1,6 +1,7 @@
 """Review candidate entrypoint; explicit override and dedicated process lifetime required.
 
-Only OpenAI chat-completions responses are supported. No user-profile install here.
+The selected presentation mode determines the response envelope; supported modes
+are OpenAI chat-completions and native Codex Responses. No user-profile install.
 """
 
 from openai.types.chat import ChatCompletion

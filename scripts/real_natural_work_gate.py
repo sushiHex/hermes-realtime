@@ -401,6 +401,37 @@ class WorkActivityObserver:
         self._thread_start_schemas.clear()
         self._thread_start_schema_hashes.clear()
 
+    @staticmethod
+    def _hermes_tool_names(value: object) -> tuple[str, ...] | None:
+        if type(value) is not list:
+            return None
+        if not value:
+            return ()
+        if len(value) != 1:
+            return None
+        namespace = value[0]
+        if (
+            type(namespace) is not dict
+            or set(namespace) != {"type", "name", "description", "tools"}
+            or namespace.get("type") != "namespace"
+            or namespace.get("name") != "hermes"
+        ):
+            return None
+        tools = namespace.get("tools")
+        if type(tools) is not list or len(tools) > 16:
+            return None
+        names: list[str] = []
+        for tool in tools:
+            if (
+                type(tool) is not dict
+                or tool.get("type") != "function"
+                or type(tool.get("name")) is not str
+                or not 1 <= len(tool["name"]) <= 64
+            ):
+                return None
+            names.append(tool["name"])
+        return tuple(names)
+
     def observe_send(self, message: Mapping[str, object]) -> None:
         try:
             serialized = json.dumps(
@@ -443,13 +474,10 @@ class WorkActivityObserver:
                 ).encode("utf-8")
             ).hexdigest()
         )
-        names: list[str] = []
-        for tool in tools:
-            if type(tool) is not dict or type(tool.get("name")) is not str:
-                names.append("<malformed>")
-            else:
-                names.append(cast(str, tool["name"]))
-        self._thread_start_schemas.append(tuple(names))
+        names = self._hermes_tool_names(tools)
+        self._thread_start_schemas.append(
+            names if names is not None else ("<malformed>",)
+        )
 
     def observe_receive(self, message: Mapping[str, object]) -> None:
         try:

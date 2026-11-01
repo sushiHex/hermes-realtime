@@ -1752,6 +1752,11 @@ class ProactiveCompletionUpdatePolicy:
                 if floor_available else
                 _conversation_completion_text(completion.status, voice_detail, visual_detail)
             ),
+            speech_text=(
+                None
+                if floor_available
+                else _voice_friendly_completion_text(completion.status, voice_detail)
+            ),
         )
 
 

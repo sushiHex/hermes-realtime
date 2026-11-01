@@ -81,7 +81,8 @@ class _BlockedIncrementalInference:
         turn_id: str,
     ) -> AsyncIterator[str]:
         del snapshot, turn_id
-        yield "First audible answer."
+        # Publish the first segment before this fixture releases inference completion.
+        yield "First audible answer has enough context to play immediately."
         await self.release_completion.wait()
         yield "Second audible answer."
         self.completed = True
@@ -262,13 +263,14 @@ async def test_streaming_loop_confirms_livekit_pcm_before_inference_completes() 
             await response
 
             assert confirmation.confirmed_chunks == [
-                "First audible answer.",
+                "First audible answer has enough context to play immediately.",
                 "Second audible answer.",
             ]
             # Both confirmed chunks are one turn's reply: one heard row.
             assert [message.text for message in context.snapshot().messages] == [
                 "Can you hear this?",
-                "First audible answer. Second audible answer.",
+                "First audible answer has enough context to play immediately. "
+                "Second audible answer.",
             ]
             assert ledger.pending() == ()
             assert ledger.retained_chunk_count == 0

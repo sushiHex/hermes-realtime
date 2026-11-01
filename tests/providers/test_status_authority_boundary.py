@@ -86,7 +86,20 @@ async def _request(provider, snapshot, *, with_tools=True):
     finally:
         await inference.close()
     thread = next(row for row in transport.sent if row.get("method") == "thread/start")
-    assert [tool["name"] for tool in thread["params"]["dynamicTools"]] == (
+    dynamic_tools = thread["params"]["dynamicTools"]
+    assert type(dynamic_tools) is list
+    if not dynamic_tools:
+        assert not with_tools
+        functions = []
+    else:
+        assert len(dynamic_tools) == 1
+        namespace = dynamic_tools[0]
+        assert type(namespace) is dict and namespace.get("type") == "namespace"
+        assert namespace.get("name") == "hermes"
+        functions = namespace.get("tools")
+        assert type(functions) is list and len(functions) <= 16
+        assert all(type(tool) is dict and tool.get("type") == "function" for tool in functions)
+    assert [tool["name"] for tool in functions] == (
         ["start_work", "task_status"] if with_tools else []
     )
     turn = next(row for row in transport.sent if row.get("method") == "turn/start")
@@ -137,14 +150,15 @@ async def test_sent_policy_has_one_status_authority(provider, with_tools):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status, expected", [
-    (TaskStatusSnapshot(), "No confirmed active background tasks."),
-    (TaskStatusSnapshot(active=1), "1 confirmed active background tasks."),
-    (TaskStatusSnapshot(pending=1), "1 background task requests awaiting acknowledgment."),
-    (TaskStatusSnapshot(cancel_pending=1), "1 task cancellation requests awaiting acknowledgment."),
+    (TaskStatusSnapshot(), "No active background tasks in this session."),
+    (TaskStatusSnapshot(active=1), "One background task is running."),
+    (TaskStatusSnapshot(pending=1), "One background task is awaiting acknowledgment."),
+    (TaskStatusSnapshot(cancel_pending=1),
+     "One task has a cancellation request awaiting acknowledgment."),
     (TaskStatusSnapshot(cancelling=1),
-     "1 tasks with cancellation acknowledged, awaiting completion."),
+     "Cancellation has been acknowledged for one task; it is not finished yet."),
     (TaskStatusSnapshot(available=False),
-     "Background task status is unavailable. Use the task controls to check work."),
+     "I can't check background task status right now."),
 ], ids=["none", "active", "missing-ack", "cancel-pending", "cancelling", "unavailable"])
 async def test_actual_status_route_reads_host_at_consumption(provider, status, expected):
     # Mutation: consumer substitutes empty state or serves a historical host answer.
@@ -152,7 +166,7 @@ async def test_actual_status_route_reads_host_at_consumption(provider, status, e
     context = ConversationContextStore()
     context.restore(DurableConversation(
         messages=(ConversationMessage(
-            "assistant", "1 confirmed active background tasks.", source="host_task_status",
+            "assistant", "One background task is running.", source="host_task_status",
         ),),
         prior_work=True,
     ))
@@ -184,12 +198,7 @@ async def test_actual_status_route_reads_host_at_consumption(provider, status, e
     try:
         await loop.respond("turn_status", Transcript(text="What is running now?", final=True))
         heard = context.snapshot().messages[-1]
-        suffix = (
-            " To cancel work, use the task's Cancel control."
-            if status.pending or status.active or status.cancel_pending or status.cancelling
-            else ""
-        )
-        assert (heard.source, heard.text) == ("host_task_status", expected + suffix)
+        assert (heard.source, heard.text) == ("host_task_status", expected)
         assert reads == [1]
         if provider == "ollama":
             assert handler.calls == []

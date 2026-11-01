@@ -11,7 +11,9 @@ import pytest
 from hermes_realtime import __version__
 from hermes_realtime.providers import KokoroSynthesizer
 from hermes_realtime.providers import kokoro as kokoro_module
-from hermes_realtime.providers.kokoro import _strip_markdown_emphasis_for_speech
+from hermes_realtime.providers._speech_text import (
+    strip_markdown_emphasis_for_speech as _strip_markdown_emphasis_for_speech,
+)
 from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
 
 

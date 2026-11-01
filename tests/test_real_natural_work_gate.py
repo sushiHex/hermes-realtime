@@ -1126,6 +1126,20 @@ def test_transport_activity_observer_counts_malformed_pre_handler_attempts() -> 
     assert observer.private_authority_messages == 0
 
 
+@pytest.mark.parametrize("mutation", ["foreign_namespace", "malformed_function"])
+def test_activity_observer_rejects_nonhermes_or_malformed_function(mutation) -> None:
+    tools = _GATE.CodexAppServerStreamingInference._dynamic_tools(1024)
+    if mutation == "foreign_namespace":
+        tools[0]["name"] = "foreign"
+    else:
+        tools[0]["tools"][0]["type"] = "namespace"
+
+    observer = WorkActivityObserver()
+    observer.observe_send({"method": "thread/start", "params": {"dynamicTools": tools}})
+
+    assert observer.thread_start_schemas == (("<malformed>",),)
+
+
 def test_pinned_codex_metadata_matches_protocol_fixture() -> None:
     fixture = json.loads(_GATE._CODEX_PROTOCOL_FIXTURE.read_text(encoding="utf-8"))
     metadata = {

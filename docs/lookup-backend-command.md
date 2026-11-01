@@ -119,7 +119,10 @@ execution has a 360-second watchdog covering model startup (60 seconds),
 gateway startup, one task and settlement. The task retains its original
 120-second admission authority; preflight/startup/cleanup time does not extend
 that authority. A watchdog/outer timeout is a failed observation with cleanup
-unproven, never permission to retry automatically.
+unproven, never permission to rerun the owned task automatically. The one
+same-query retry for a normalized successful empty search result is an internal
+attempt inside that task's existing five-attempt budget and original deadline,
+using a separately reserved attempt slot under the same logical search-call ticket.
 
 Within that same 60-second startup deadline, execution now makes one native
 `/api/chat` request with empty messages, `stream=false` and `num_ctx=64000`.
@@ -255,6 +258,16 @@ This is Ollama's residency report, not a driver-level bound on GPU use or a
 guarantee of desktop responsiveness. Those remain separately observed outcomes.
 
 ## Recorded public-command outcome
+
+For a controlled comparison, `run_owned` also accepts the paired trusted-operator
+arguments `frozen_search_fixture` and `frozen_search_sha256`. The bounded JSON file
+must be an exact provider search-result envelope. Replay is bound to the prepared
+objective, supplies the full frozen rows once, and records its digest and replay
+status. It performs no fresh search; extraction is an explicit fixture-capability
+refusal, not a semantic model failure. All other web transport is refused in replay
+mode. Keep the snapshot private and freeze it with the candidate; without these
+arguments the live path is unchanged. A replay result cannot establish current web
+accuracy or replace real-source product acceptance.
 
 The first full public-command observation at
 `663280ed3507d6145b54c445e6ef038661e02960` (tree

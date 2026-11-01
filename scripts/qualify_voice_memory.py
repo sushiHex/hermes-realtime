@@ -162,6 +162,38 @@ def _emit(evidence: dict[str, object]) -> None:
     print(_PREFIX + json.dumps(evidence, separators=(",", ":"), sort_keys=True), flush=True)
 
 
+def _codex_dynamic_tool_functions(value: object) -> list[dict[str, Any]]:
+    """Read bounded function names from the one exact Hermes namespace."""
+    if type(value) is not list:
+        raise RuntimeError("dynamic_tool_schema_invalid")
+    if not value:
+        return []
+    if len(value) != 1:
+        raise RuntimeError("dynamic_tool_schema_invalid")
+    namespace = value[0]
+    if (
+        type(namespace) is not dict
+        or set(namespace) != {"type", "name", "description", "tools"}
+        or namespace.get("type") != "namespace"
+        or namespace.get("name") != "hermes"
+        or type(namespace.get("tools")) is not list
+        or len(namespace["tools"]) > 16
+    ):
+        raise RuntimeError("dynamic_tool_schema_invalid")
+    functions = namespace["tools"]
+    names: list[str] = []
+    for function in functions:
+        if (
+            type(function) is not dict
+            or function.get("type") != "function"
+            or type(function.get("name")) is not str
+            or not 1 <= len(function["name"]) <= 64
+        ):
+            raise RuntimeError("dynamic_tool_schema_invalid")
+        names.append(function["name"])
+    return functions
+
+
 class _MemoryStandInModel(m2._StandInModel):
     """The M2 review stand-in, with one third synthetic learned correction."""
 
@@ -301,7 +333,7 @@ class _ProbeTransport:
                 )
                 item = {
                     "id": "call_m4", "type": "dynamicToolCall", "tool": self.force_tool,
-                    "namespace": None, "arguments": arguments, "status": "inProgress",
+                    "namespace": "hermes", "arguments": arguments, "status": "inProgress",
                 }
                 await self.incoming.put({"method": "item/started", "params": {
                     "threadId": "thread_m4", "turnId": "turn_m4",
@@ -309,7 +341,7 @@ class _ProbeTransport:
                 }})
                 await self.incoming.put({"id": 91, "method": "item/tool/call", "params": {
                     "threadId": "thread_m4", "turnId": "turn_m4",
-                    "callId": "call_m4", "namespace": None,
+                    "callId": "call_m4", "namespace": "hermes",
                     "tool": self.force_tool, "arguments": arguments,
                 }})
         elif method == "turn/interrupt":
@@ -587,8 +619,9 @@ async def _turn_witness(
     }
     baseline_tools = baseline_thread["dynamicTools"]
     memory_tools = memory_thread["dynamicTools"]
-    assert type(baseline_tools) is list and type(memory_tools) is list
-    tool_names = {item["name"] for item in memory_tools}
+    _codex_dynamic_tool_functions(baseline_tools)
+    memory_functions = _codex_dynamic_tool_functions(memory_tools)
+    tool_names = {item["name"] for item in memory_functions}
     data_only = int(
         attack_seen
         and "memory" not in baseline_payload
@@ -680,8 +713,7 @@ async def _turn_witness(
         request = next(item for item in transport.sent if item.get("method") == "thread/start")
         parameters = request["params"]
         assert type(parameters) is dict
-        declared = parameters["dynamicTools"]
-        assert type(declared) is list
+        declared = _codex_dynamic_tool_functions(parameters["dynamicTools"])
         return tool in {item["name"] for item in declared}
 
     forced_pairs = sum(int(
