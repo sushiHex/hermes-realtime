@@ -997,6 +997,28 @@ def test_presentation_requires_successful_same_run_source(setup):
         assert setup.row["presentation_evidence"]["stage"] == "retrieval"
 
 
+@pytest.mark.parametrize("setup", [{"success": False, "error": "SYNTHETIC_PRIVATE_ERROR",
+                                     "data": {"web": []}}], indirect=True)
+def test_failed_search_refusal_emits_bounded_retrieval_diagnostic(setup, capsys):
+    s = setup
+    assert not s.row["urls"] and s.row["phase"] == "search"
+    assert s.run() is s.refused
+    evidence = s.row["presentation_evidence"]
+    assert evidence["stage"] == "retrieval"
+    assert evidence["rejection"] == "retrieval-required"
+    assert evidence["failure_kind"] == "ValueError"
+    output = capsys.readouterr().out
+    event = next(line for line in output.splitlines()
+                 if line.startswith("[lookup-presentation] "))
+    facts = json.loads(event.removeprefix("[lookup-presentation] "))
+    assert facts == {
+        "category": "refused", "stage": "retrieval",
+        "rejection": "retrieval-required", "failure_kind": "ValueError",
+        "calls": 0, "wire_requests": 0,
+    }
+    assert "SYNTHETIC_PRIVATE_ERROR" not in output
+
+
 def test_successful_admitted_search_without_extraction_reaches_presentation(setup):
     assert setup.row["urls"] == {"https://example.invalid/source"}
     assert setup.row["phase"] == "search" and setup.row["settled"] == 1

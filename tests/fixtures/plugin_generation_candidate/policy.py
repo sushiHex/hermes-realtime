@@ -1036,6 +1036,7 @@ class Generation:
 
     def model_gate(self, **kw):
         run_id = ""
+        row = None
         response = None
         provider_request = kw["request"]
         native_diagnostics = {}
@@ -1074,6 +1075,7 @@ class Generation:
                         row["presentation_evidence"] = {
                             "category": "refused", "stage": "retrieval",
                             "rejection": "retrieval-required",
+                            "failure_kind": "ValueError",
                             "calls": 0, "wire_requests": 0}
                         raise ValueError("retrieval-required")
                     if row["phase"] in {"search", "extract"}:
@@ -1082,6 +1084,10 @@ class Generation:
         except BaseException:
             with self.lock:
                 self.refuse(run_id)
+            evidence = row.get("presentation_evidence") if type(row) is dict else None
+            if type(evidence) is dict and evidence.get("stage") == "retrieval":
+                with contextlib.suppress(OSError, ValueError):
+                    print("[lookup-presentation] " + frozen(evidence), flush=True)
             return self.refusal_for(api_mode)
         if response is None:
             response = kw["next_call"](provider_request)

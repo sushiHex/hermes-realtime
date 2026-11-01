@@ -189,9 +189,9 @@ def test_overflow_refusal_has_fixed_marker_and_preserves_private_cap(capsys):
 def test_policy_diagnostic_retains_only_closed_scalars_and_preserves_stdout():
     module, state, delegate, saved = gateway(), witness(), io.StringIO(), []
     tee = module.PolicyDiagnosticTee(delegate, state, lambda: saved.append(json.dumps(state)))
-    event = {"category": "refused", "stage": "response-envelope", "calls": 1,
-             "wire_requests": 1, "failure_kind": "ValueError", "response_kind": "none",
-             "response_length": 0, "response_finish_reason": "length",
+    event = {"category": "refused", "stage": "retrieval",
+             "rejection": "retrieval-required", "calls": 0, "wire_requests": 0,
+             "failure_kind": "ValueError",
              "body": "synthetic-private-value", "source_sha256": "synthetic-private-value"}
     raw = "synthetic-private-value\n[lookup-presentation] " + json.dumps(event) + "\n"
     assert tee.write(raw) == len(raw)
