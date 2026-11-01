@@ -27,6 +27,7 @@ import qualify_voice_review as m2
 from real_gate_support import (
     HERMES_BASELINE,
     PINNED_HERMES,
+    hermes_namespace_tools,
     installed_hermes_identity,
     provision_pinned_hermes,
 )
@@ -163,34 +164,10 @@ def _emit(evidence: dict[str, object]) -> None:
 
 
 def _codex_dynamic_tool_functions(value: object) -> list[dict[str, Any]]:
-    """Read bounded function names from the one exact Hermes namespace."""
-    if type(value) is not list:
+    """Return the bounded function tools from the one exact Hermes namespace."""
+    functions = hermes_namespace_tools(value)
+    if functions is None:
         raise RuntimeError("dynamic_tool_schema_invalid")
-    if not value:
-        return []
-    if len(value) != 1:
-        raise RuntimeError("dynamic_tool_schema_invalid")
-    namespace = value[0]
-    if (
-        type(namespace) is not dict
-        or set(namespace) != {"type", "name", "description", "tools"}
-        or namespace.get("type") != "namespace"
-        or namespace.get("name") != "hermes"
-        or type(namespace.get("tools")) is not list
-        or len(namespace["tools"]) > 16
-    ):
-        raise RuntimeError("dynamic_tool_schema_invalid")
-    functions = namespace["tools"]
-    names: list[str] = []
-    for function in functions:
-        if (
-            type(function) is not dict
-            or function.get("type") != "function"
-            or type(function.get("name")) is not str
-            or not 1 <= len(function["name"]) <= 64
-        ):
-            raise RuntimeError("dynamic_tool_schema_invalid")
-        names.append(function["name"])
     return functions
 
 

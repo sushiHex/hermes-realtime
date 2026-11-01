@@ -195,3 +195,37 @@ def available_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def hermes_namespace_tools(value: object) -> list[dict[str, object]] | None:
+    """Return the function tools of the one exact Codex ``hermes`` namespace, or None.
+
+    An empty ``dynamicTools`` list is valid and yields no tools. Any other shape is None.
+    """
+
+    if type(value) is not list:
+        return None
+    if not value:
+        return []
+    if len(value) != 1:
+        return None
+    namespace = value[0]
+    if (
+        type(namespace) is not dict
+        or set(namespace) != {"type", "name", "description", "tools"}
+        or namespace.get("type") != "namespace"
+        or namespace.get("name") != "hermes"
+    ):
+        return None
+    tools = namespace.get("tools")
+    if type(tools) is not list or len(tools) > 16:
+        return None
+    for tool in tools:
+        if (
+            type(tool) is not dict
+            or tool.get("type") != "function"
+            or type(tool.get("name")) is not str
+            or not 1 <= len(tool["name"]) <= 64
+        ):
+            return None
+    return tools
