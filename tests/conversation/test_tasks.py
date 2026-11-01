@@ -1236,10 +1236,18 @@ async def test_completed_summary_keeps_api_bound_while_context_stores_bounded_re
 
 
 def test_terminal_text_bounds_remain_distinct_and_exact() -> None:
-    from hermes_realtime.conversation.tasks import _MAX_COMPLETED_SUMMARY_CHARS
-    from hermes_realtime.integration.api import _MAX_TERMINAL_TEXT_CHARS
+    from hermes_realtime.conversation.tasks import (
+        _MAX_COMPLETED_SUMMARY_CHARS,
+        _MAX_OUTCOME_TEXT_CHARS,
+    )
+    from hermes_realtime.integration.api import (
+        _MAX_TERMINAL_REASON_CHARS,
+        _MAX_TERMINAL_TEXT_CHARS,
+    )
 
     assert _MAX_COMPLETED_SUMMARY_CHARS == _MAX_TERMINAL_TEXT_CHARS == 4096
+    # The API session shortens failure reasons to exactly what the controller accepts.
+    assert _MAX_TERMINAL_REASON_CHARS == _MAX_OUTCOME_TEXT_CHARS == 1024
     TaskTerminalOutcome(
         task_id="task_summary", status="completed", summary="x" * _MAX_TERMINAL_TEXT_CHARS
     )

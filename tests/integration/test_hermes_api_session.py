@@ -13,6 +13,7 @@ from typing import TypedDict
 import pytest
 from aiohttp import web
 
+from hermes_realtime.conversation.tasks import TaskTerminalOutcome
 from hermes_realtime.integration import (
     HermesApiConfig,
     HermesApiTaskSession,
@@ -1845,7 +1846,18 @@ async def test_close_settles_run_that_finished_before_its_stop(
 
 
 @pytest.mark.asyncio
-async def test_event_stream_failure_settles_run_that_failed_before_its_stop() -> None:
+@pytest.mark.parametrize(
+    ("error", "expected_reason"),
+    (
+        ("Tool crashed before the stop.", "Tool crashed before the stop."),
+        # A provider error within the API bound must still fit the controller's reason bound.
+        ("Provider error body. " * 100, ("Provider error body. " * 100)[:1023].rstrip() + "…"),
+    ),
+    ids=("short", "over_controller_bound"),
+)
+async def test_event_stream_failure_settles_run_that_failed_before_its_stop(
+    error: str, expected_reason: str,
+) -> None:
     port = _available_port()
     api_run_id = "run_0123456789abcdef"
     state: _RunState = {"status": "running", "stop_calls": 0}
@@ -1863,7 +1875,7 @@ async def test_event_stream_failure_settles_run_that_failed_before_its_stop() ->
                 "object": "hermes.run",
                 "run_id": api_run_id,
                 "status": "failed",
-                "error": "Tool crashed before the stop.",
+                "error": error,
             }
         )
 
@@ -1896,7 +1908,10 @@ async def test_event_stream_failure_settles_run_that_failed_before_its_stop() ->
         assert terminal.task_id == "task_release_check"
         assert terminal.run_id == "deleg_failed_stop_private"
         assert terminal.payload.status is WorkTerminalStatus.FAILED
-        assert terminal.payload.reason == "Tool crashed before the stop."
+        assert terminal.payload.reason == expected_reason
+        TaskTerminalOutcome(
+            task_id=terminal.task_id, status="failed", reason=terminal.payload.reason
+        )
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(session.next_update(), timeout=0.05)
         assert state["stop_calls"] == 1
