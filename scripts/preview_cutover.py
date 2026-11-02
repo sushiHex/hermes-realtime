@@ -365,9 +365,6 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
         plan.realtime_source.resolve(strict=True) == ROOT.resolve(strict=True),
         "realtime_source_root",
     )
-    from scripts import candidate_e2e_fast_track as fast_track
-    from scripts import candidate_source_archive_oracle as archives
-    from scripts import candidate_wheel as wheels
     from scripts import setup_lookup_backend as setup
     from scripts.task13_artifact_orchestrator import verify_clean_tracked_candidate
 
@@ -377,55 +374,27 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
         and identity.candidate_tree_oid == plan.realtime_tree,
         "realtime_source_binding",
     )
-    pin = fast_track._measure_git_pin(plan.git_executable)
-    archive = archives.capture_candidate_source_archive(plan.realtime_source, identity, pin)
-    wheel_token = wheels.verify_candidate_wheel_v1(archive, identity, plan.wheel, plan.wheel_sha256)
-    verified = wheels._wheel_for_consumer(wheel_token, archive, identity)
-    members = verified.members
-    records = [name for name in members if name.endswith(".dist-info/RECORD")]
-    require(len(records) == 1, "wheel_record_set")
-    record_name = records[0]
-    info = record_name.removesuffix("/RECORD")
-    target = plan.runtime_target.resolve(strict=True)
-    require(target.is_dir() and not target.is_symlink(), "runtime_target")
-    actual: dict[str, bytes] = {}
-    for entry in target.rglob("*"):
-        require(
-            not entry.is_symlink()
-            and not (getattr(entry.lstat(), "st_file_attributes", 0) & 0x400),
-            "runtime_target_link",
-        )
-        if entry.is_file():
-            relative = entry.relative_to(target).as_posix()
-            require(
-                len(relative) <= 512
-                and len(actual) < 4096
-                and entry.stat().st_size <= 64 * 1024**2,
-                "runtime_target_bound",
-            )
-            actual[relative] = _read(entry, 64 * 1024**2)
-    generated = {
-        info + "/" + name
-        for name in ("INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json", "RECORD")
-    }
-    expected = (
-        {name for name in members if name != record_name}
-        | generated
-        | {
-            ".lock",
-            "bin/hermes-realtime-host.exe",
-            "bin/hermes-realtime-local.exe",
-        }
+    # DEV preview needs exact source/wheel/installed bytes, not the release
+    # archive oracle's per-object Windows child traversal. CI owns that gate.
+    measured = setup.verify_runtime(
+        {
+            "candidate": plan.realtime_revision,
+            "tree": plan.realtime_tree,
+            "hermes_source": plan.hermes_source,
+            "wheel": plan.wheel,
+            "wheel_sha256": plan.wheel_sha256,
+            "runtime_target": plan.runtime_target,
+        },
+        source_root=plan.realtime_source,
+        hermes_revision=plan.hermes_revision,
     )
-    require(set(actual) == expected and actual.get(".lock") == b"", "runtime_target_file_set")
-    for name, raw in members.items():
-        if name != record_name:
-            require(actual.get(name) == raw, "runtime_target_payload")
+    require(measured["recordSha256"] == plan.runtime_record_sha256, "runtime_record_binding")
+    after = verify_clean_tracked_candidate(plan.realtime_source)
     require(
-        hashlib.sha256(actual[record_name]).hexdigest() == plan.runtime_record_sha256,
-        "runtime_record_binding",
+        after.candidate_head_oid == identity.candidate_head_oid
+        and after.candidate_tree_oid == identity.candidate_tree_oid,
+        "realtime_source_changed",
     )
-    setup.verify_record(actual[record_name], record_name, actual)
     require(
         _git(plan.hermes_source, "rev-parse", "HEAD^{commit}") == plan.hermes_revision
         and _git(plan.hermes_source, "rev-parse", "HEAD^{tree}") == plan.hermes_tree
@@ -445,7 +414,7 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
         "tree": identity.candidate_tree_oid,
         "wheel_sha256": plan.wheel_sha256,
         "record_sha256": plan.runtime_record_sha256,
-        "package_files": sum(name.startswith("hermes_realtime/") for name in members),
+        "package_files": measured["packageFiles"],
     }
 
 

@@ -663,23 +663,58 @@ def test_candidate_wheel_verifier_refusal_is_not_accepted(tmp_path, monkeypatch)
     plan_value["realtime"]["source"] = str(preview_cutover.ROOT)
     plan_path.write_text(json.dumps(plan_value), encoding="utf-8")
     plan = preview_cutover.load_plan(plan_path)
-    candidate_wheel = __import__("scripts.candidate_wheel", fromlist=["unused"])
     monkeypatch.setattr(
         "scripts.task13_artifact_orchestrator.verify_clean_tracked_candidate",
         lambda _path: SimpleNamespace(
             candidate_head_oid=plan.realtime_revision, candidate_tree_oid=plan.realtime_tree
         ),
     )
-    monkeypatch.setattr("scripts.candidate_e2e_fast_track._measure_git_pin", lambda _path: object())
     monkeypatch.setattr(
-        "scripts.candidate_source_archive_oracle.capture_candidate_source_archive",
-        lambda *_: object(),
-    )
-    monkeypatch.setattr(
-        candidate_wheel,
-        "verify_candidate_wheel_v1",
-        lambda *_: (_ for _ in ()).throw(ValueError("candidate wheel rejected")),
+        "scripts.setup_lookup_backend.verify_runtime",
+        lambda *_, **__: (_ for _ in ()).throw(ValueError("candidate wheel rejected")),
     )
 
     with pytest.raises(ValueError, match="candidate wheel rejected"):
         preview_cutover.verify_realtime_runtime(plan)
+
+
+@pytest.mark.parametrize("drift", [None, "record", "source"])
+def test_preview_runtime_uses_scoped_comparator_without_release_archive(
+    tmp_path, monkeypatch, drift
+):
+    plan_path, _ = _plan(tmp_path)
+    value = json.loads(plan_path.read_text())
+    value["realtime"]["source"] = str(preview_cutover.ROOT)
+    plan_path.write_text(json.dumps(value))
+    plan = preview_cutover.load_plan(plan_path)
+    identity = SimpleNamespace(candidate_head_oid=plan.realtime_revision,
+                               candidate_tree_oid=plan.realtime_tree)
+    identities = iter([identity, SimpleNamespace(candidate_head_oid="0" * 40,
+                       candidate_tree_oid=plan.realtime_tree) if drift == "source" else identity])
+    monkeypatch.setattr("scripts.task13_artifact_orchestrator.verify_clean_tracked_candidate",
+                        lambda _: next(identities))
+    monkeypatch.setattr("scripts.candidate_source_archive_oracle.capture_candidate_source_archive",
+                        lambda *_: pytest.fail("release archive must stay outside DEV preflight"))
+    seen = []
+    def compare(manifest, **kwargs):
+        seen.append((manifest, kwargs))
+        return {"recordSha256": "0" * 64 if drift == "record" else plan.runtime_record_sha256,
+                "packageFiles": 114}
+    monkeypatch.setattr("scripts.setup_lookup_backend.verify_runtime", compare)
+    monkeypatch.setattr(preview_cutover, "_git", lambda path, *args:
+                        plan.hermes_revision if args[-1] == "HEAD^{commit}" else
+                        plan.hermes_tree if args[-1] == "HEAD^{tree}" else "")
+    for path in (*plan.executables.values(), plan.hermes_python):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    if drift is not None:
+        category = "runtime_record_binding" if drift == "record" else "realtime_source_changed"
+        with pytest.raises(ValueError, match=category):
+            preview_cutover.verify_realtime_runtime(plan)
+        return
+    result = preview_cutover.verify_realtime_runtime(plan)
+    assert result["package_files"] == 114
+    assert seen[0][1] == {"source_root": plan.realtime_source,
+                          "hermes_revision": plan.hermes_revision}
+    assert seen[0][0]["wheel_sha256"] == plan.wheel_sha256
+    assert seen[0][0]["runtime_target"] == plan.runtime_target

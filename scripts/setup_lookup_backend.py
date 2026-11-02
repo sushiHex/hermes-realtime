@@ -205,16 +205,20 @@ def verify_record(raw: Any, record: Any, members: Any) -> Any:
             )
 
 
-def verify_runtime(m: Any) -> Any:
+def verify_runtime(
+    m: Any, *, source_root: Path | None = None, hermes_revision: str | None = None
+) -> Any:
     """Migrated real20 scoped wheel/source/uv-target comparator; no install action."""
+    candidate_root = ROOT if source_root is None else Path(source_root)
+    expected_hermes_revision = PIN if hermes_revision is None else hermes_revision
     require(
-        git(ROOT, "rev-parse", "HEAD") == m["candidate"]
-        and git(ROOT, "rev-parse", "HEAD^{tree}") == m["tree"],
+        git(candidate_root, "rev-parse", "HEAD") == m["candidate"]
+        and git(candidate_root, "rev-parse", "HEAD^{tree}") == m["tree"],
         "candidate_binding",
     )
-    require(not git(ROOT, "status", "--porcelain=v1"), "candidate_dirty")
+    require(not git(candidate_root, "status", "--porcelain=v1"), "candidate_dirty")
     require(
-        git(m["hermes_source"], "rev-parse", "HEAD") == PIN
+        git(m["hermes_source"], "rev-parse", "HEAD") == expected_hermes_revision
         and not git(m["hermes_source"], "diff", "--name-only", "HEAD", "--", "*.py"),
         "hermes_binding",
     )
@@ -249,9 +253,17 @@ def verify_runtime(m: Any) -> Any:
     record = info + "/RECORD"
     verify_record(members[record], record, members)
     source_names = git(
-        ROOT, "ls-tree", "-r", "--name-only", m["candidate"], "--", "src/hermes_realtime"
+        candidate_root,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        m["candidate"],
+        "--",
+        "src/hermes_realtime",
     ).splitlines()
-    source = {name.removeprefix("src/"): (ROOT / name).read_bytes() for name in source_names}
+    source = {
+        name.removeprefix("src/"): (candidate_root / name).read_bytes() for name in source_names
+    }
     require(
         source
         and source == {n: raw for n, raw in members.items() if n.startswith("hermes_realtime/")},
