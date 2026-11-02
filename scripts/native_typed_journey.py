@@ -92,7 +92,12 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
 
 
 def read_journal(path: Path) -> tuple[set[str], int]:
-    value = read_json(path)
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        # A fresh native adapter has not created its first run record yet.
+        # This never supplies an admitted ID or qualifies a dispatch.
+        return set(), 0
     require(
         type(value) is dict
         and set(value) == {"version", "pending", "admitted"}

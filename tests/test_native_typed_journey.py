@@ -404,3 +404,8 @@ def test_missing_native_env_fails_before_bootstrap_network(tmp_path, monkeypatch
     monkeypatch.setattr(client, "request_json", lambda *a, **kw: pytest.fail("network before env"))
     with pytest.raises(FileNotFoundError):
         asyncio.run(client.execute(options, [], {"outcome": "refused"}))
+
+
+def test_fresh_preview_without_run_record_has_no_recorded_admissions(tmp_path):
+    # The native adapter creates its journal only when its task session starts.
+    assert read_journal(tmp_path / "hermes-runs-v1.json") == (set(), 0)
