@@ -1188,8 +1188,9 @@ def _copy_profile_supplement(plan: PreviewPlanV1, prepared: dict[str, Any]) -> d
             continue
         if item.name == "plugins":
             require(item.is_dir() and not item.is_symlink(), "profile_plugins_shape")
+            (home / "plugins").mkdir(exist_ok=True)
             for plugin_item in item.iterdir():
-                if plan.policy_mode == "lookup" and plugin_item.name == _PLUGIN:
+                if plugin_item.name == _PLUGIN:
                     continue
                 destination = home / "plugins" / plugin_item.name
                 if plugin_item.is_dir():
@@ -1510,13 +1511,15 @@ def _host_environment(plan: PreviewPlanV1, profile: Path) -> dict[str, str]:
 def _gateway_manifest(plan: PreviewPlanV1) -> Path:
     path = plan.output / "gateway-manifest.private.json"
     require(not path.exists(), "gateway_manifest_exists")
+    records = list(plan.runtime_target.glob("*.dist-info/RECORD"))
+    require(len(records) == 1, "runtime_record_set")
     payload = {
         "objective": "Interactive voice preview",
         "hermes_source": str(plan.hermes_source),
         "hermes_python": str(plan.hermes_python),
         "runtime_target": str(plan.runtime_target),
         "packageRoot": str(plan.runtime_target / "hermes_realtime"),
-        "recordPath": str(plan.runtime_target / "hermes_realtime-0.0.3.dist-info" / "RECORD"),
+        "recordPath": str(records[0]),
         "recordSha256": plan.runtime_record_sha256,
         "baseUrl": f"http://127.0.0.1:{plan.ports['api']}",
         "api_port": plan.ports["api"],

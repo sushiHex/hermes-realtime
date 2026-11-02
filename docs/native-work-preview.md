@@ -14,6 +14,19 @@ plans also provide `native_status` with `command`, `sha256`, `state_dir`, and
 state directory are checked before the native profile is staged. Lookup plans
 set `native_status` to `null`.
 
+The native profile grants full MCP trust only to the reviewed, status-only server;
+its exact tool include list excludes model loads and all other server actions.
+`VRAM_MCP_AUDIT=0` avoids a separate tool audit payload; native run lifecycle and
+this operator's bounded receipts remain available. Both profiles keep manual
+consequential-effect approvals. Spoken source names are requested only when the
+user asks for them; rich task results retain attribution.
+
+DEV preparation reuses the scoped source/wheel/installed-byte and RECORD
+comparator. Full source-archive qualification remains in release CI. Install the
+isolated runtime with `uv pip install --no-deps --link-mode copy --target ...` so
+it owns its files rather than sharing cache hard links. Git and the existing
+interpreter environment remain trusted DEV prerequisites.
+
 The plan has exactly these top-level keys: `version`, `output`, `realtime`,
 `hermes`, `profile_mode`, `native_status`, `speech_assets`, `ports`, `models`,
 `speech`, `executables`, and `host_options`. `speech_assets` has `receipt`,

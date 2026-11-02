@@ -503,6 +503,12 @@ def test_prepared_replacement_follows_clean_normal_stop_without_path_constants(
     plan_path, source_profile = _plan(tmp_path)
     (source_profile / ".env").write_bytes(b"opaque-auth-value")
     (source_profile / "SOUL.md").write_text("profile note", encoding="utf-8")
+    lookup_plugin = source_profile / "plugins" / preview_cutover._PLUGIN
+    lookup_plugin.mkdir(parents=True)
+    (lookup_plugin / "__init__.py").write_text("# obsolete lookup policy")
+    preserved_plugin = source_profile / "plugins" / "preserved-helper"
+    preserved_plugin.mkdir()
+    (preserved_plugin / "__init__.py").write_text("# preserved opaque file")
     (source_profile / "skills").mkdir()
     (source_profile / "skills" / "example.md").write_text("skill", encoding="utf-8")
     success = subprocess.CompletedProcess(
@@ -576,6 +582,8 @@ def test_prepared_replacement_follows_clean_normal_stop_without_path_constants(
 
     assert result["category"] == "ready_to_launch"
     staged_home = output / "input" / "home"
+    assert not (staged_home / "plugins" / preview_cutover._PLUGIN).exists()
+    assert (staged_home / "plugins/preserved-helper/__init__.py").is_file()
     assert (staged_home / ".env").read_bytes() == b"opaque-auth-value"
     assert (staged_home / "SOUL.md").read_text(encoding="utf-8") == "profile note"
     assert (staged_home / "skills" / "example.md").read_text(encoding="utf-8") == "skill"
@@ -718,3 +726,14 @@ def test_preview_runtime_uses_scoped_comparator_without_release_archive(
                           "hermes_revision": plan.hermes_revision}
     assert seen[0][0]["wheel_sha256"] == plan.wheel_sha256
     assert seen[0][0]["runtime_target"] == plan.runtime_target
+
+
+def test_lookup_gateway_manifest_uses_verified_distribution_record(tmp_path):
+    path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    record = plan.runtime_target / "hermes_realtime-1.2.3.dist-info" / "RECORD"
+    record.parent.mkdir(parents=True)
+    record.write_bytes(b"fixture")
+    plan.output.mkdir()
+    manifest_path = preview_cutover._gateway_manifest(plan)
+    assert json.loads(manifest_path.read_text())["recordPath"] == str(record)
