@@ -43,6 +43,19 @@ def test_output_styles_are_exact_bounded_communication_preferences() -> None:
         assert "omit supporting detail unless asked or essential to avoid misleading" in policy
 
 
+def test_casual_quantity_guidance_preserves_requested_precision() -> None:
+    # Prompt contract only: model compliance and playable latency need a real journey.
+    for style in OUTPUT_STYLES:
+        policy = communication_policy(style)
+        assert (
+            "Round casual spoken quantities only without losing meaning; mark approximations."
+            in policy
+        )
+        assert "Keep exact values in detail, on request and in quotes" in policy
+        assert "never invent units/conversions" in policy
+        assert "Preserve material qualifications and uncertainty." in policy
+
+
 @pytest.mark.parametrize("value", ["Default", "", "unknown", True, None, 1])
 def test_style_refusal_retains_previous_selection(value: object) -> None:
     selection = OutputStyleSelection()
