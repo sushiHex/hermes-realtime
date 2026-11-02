@@ -457,7 +457,7 @@ def test_host_spawn_follows_gateway_readiness_and_protected_snapshot_is_diagnost
     assert "require_owned_listeners" in calls
     assert "_require_owned_endpoint_rows" in calls
     assert "_require_gateway_health_owner" in calls
-    assert "'pid': host_process.pid" in ast.unparse(tree)
+    assert "'pid': host_pid" in ast.unparse(tree)
 
     host_tree = ast.parse(inspect.getsource(preview_cutover._host_child))
     host_ready = next(
@@ -747,3 +747,17 @@ def test_isolated_operator_can_import_existing_process_owner():
     completed = subprocess.run([sys.executable, "-I", "-B", "-c", code],
                                capture_output=True, text=True, timeout=20)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_windows_python_listener_may_be_an_owned_role_descendant():
+    assert preview_cutover._require_owned_endpoint_rows(
+        [("127.0.0.1", 502), ("127.0.0.1", 502)], 501, {501, 502, 503}, 2,
+        role_pids={501, 502},
+    ) == 502
+
+
+@pytest.mark.parametrize("role_pids,members", [({501}, {501, 502}), ({501, 502}, {501})])
+def test_listener_refuses_wrong_role_or_foreign_job(role_pids, members):
+    with pytest.raises(ValueError, match="endpoint_owner"):
+        preview_cutover._require_owned_endpoint_rows(
+            [("127.0.0.1", 502)], 501, members, 1, role_pids=role_pids)

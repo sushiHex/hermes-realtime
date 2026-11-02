@@ -1006,12 +1006,17 @@ def _listener_rows(port: int) -> list[tuple[str, int]]:
 
 
 def _require_owned_endpoint_rows(
-    rows: Any, expected_pid: int, members: set[int], expected_count: int
-) -> None:
+    rows: Any, expected_pid: int, members: set[int], expected_count: int,
+    *, role_pids: set[int] | None = None,
+) -> int:
+    allowed = {expected_pid} if role_pids is None else role_pids
     require(
         type(expected_pid) is int
         and expected_pid > 0
         and expected_pid in members
+        and type(allowed) is set
+        and expected_pid in allowed
+        and allowed <= members
         and type(rows) is list
         and len(rows) == expected_count
         and all(
@@ -1019,11 +1024,20 @@ def _require_owned_endpoint_rows(
             and len(row) == 2
             and row[0] == "127.0.0.1"
             and type(row[1]) is int
-            and row[1] == expected_pid
+            and row[1] in allowed
             for row in rows
         ),
         "endpoint_owner",
     )
+    owners = {row[1] for row in rows}
+    require(len(owners) == 1, "endpoint_owner")
+    return next(iter(owners))
+
+
+def _owned_role_members(root_pid: int, members: set[int]) -> set[int]:
+    from scripts.rehearse_desktop_mvp import descendants, process_table
+
+    return descendants(process_table(), {root_pid}) & members
 
 
 def _require_gateway_health_owner(health: Any, expected_pid: int, members: set[int]) -> None:
@@ -1640,14 +1654,17 @@ def serve(active_path: Path) -> int:
 
                 gateway_rows = api_rows + companion_rows
                 require_owned_listeners(gateway_rows, members)
-                _require_owned_endpoint_rows(gateway_rows, gateway_process.pid, members, 2)
+                gateway_pid = _require_owned_endpoint_rows(
+                    gateway_rows, gateway_process.pid, members, 2,
+                    role_pids=_owned_role_members(gateway_process.pid, members),
+                )
                 _require_owned_endpoint_rows(livekit_rows, livekit_process.pid, members, 1)
                 try:
                     health = request_json(base_url + "/health/detailed", token, timeout=3)
                 except (OSError, ValueError, TimeoutError):
                     pass
                 else:
-                    _require_gateway_health_owner(health, gateway_process.pid, members)
+                    _require_gateway_health_owner(health, gateway_pid, members)
                     gateway_ready = True
                     break
             time.sleep(_STOP_POLL_SECONDS)
@@ -1666,13 +1683,15 @@ def serve(active_path: Path) -> int:
             require(processes.roots["host"].poll() is None, "host_exited_during_start")
             time.sleep(_STOP_POLL_SECONDS)
         require(host_ready_path.is_file(), "host_start_timeout")
+        members = containment.members()
+        host_pid = _require_owned_endpoint_rows(
+            listener_rows(plan.ports["host"]), host_process.pid, members, 1,
+            role_pids=_owned_role_members(host_process.pid, members),
+        )
         host_ready = _read_json_file(host_ready_path)
         require(
-            host_ready == {"version": 1, "ready": True, "pid": host_process.pid},
+            host_ready == {"version": 1, "ready": True, "pid": host_pid},
             "host_ready_receipt",
-        )
-        _require_owned_endpoint_rows(
-            listener_rows(plan.ports["host"]), host_process.pid, containment.members(), 1
         )
         result.update(category="ready", ready=True, ports=ports)
         _write_new(output / "ready-receipt.private.json", result)
