@@ -259,6 +259,12 @@ local endpoint its value is the nonsecret placeholder `local`. It has no ambient
 credential fallback. Companion credentials and port, if used, are separately
 generated and isolated. Keep raw config, environment and gateway logs private.
 
+For operator review, run `python scripts/profile_summary.py <profile>/config.yaml`
+with the Hermes Python environment. It prints only the selected native and
+presentation model/provider/mode labels and equality checks. It never prints the
+input path, other configuration fields, environment values or parse errors. Do
+not use raw `Get-Content`, `rg`, or configuration dumps for profile diagnostics.
+
 ## Select the production adapter explicitly
 
 Use the existing Python composition seam, not an extra per-event field:
