@@ -1287,7 +1287,10 @@ async def test_assistant_partial_is_visible_before_delivery_confirmed_final() ->
     await asyncio.wait_for(playback.play_started.wait(), timeout=1)
 
     assert observed == [
-        ("first_foreground_token", {}),
+        (
+            "first_foreground_token",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
         (
             "assistant_text_generated",
             {
@@ -1298,7 +1301,10 @@ async def test_assistant_partial_is_visible_before_delivery_confirmed_final() ->
                 "segmentId": "segment_1",
             },
         ),
-        ("first_playable_audio", {}),
+        (
+            "first_playable_audio",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
         (
             "transcript_partial",
             {
@@ -2874,6 +2880,10 @@ async def test_resume_replays_publication_when_later_speech_subchunk_was_interru
         len("First subchunk."),
         len("First subchunk."),
     ]
+    assert [data for kind, data in observed if kind == "first_playable_audio"] == [
+        {"turnId": "turn_001", "turnGeneration": 1},
+        {"turnId": "turn_001", "turnGeneration": 1},
+    ]
     lifecycle_events = [
         data
         for kind, data in observed
@@ -3108,7 +3118,10 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
     assert inference.completed is False
     assert response.done() is False
     assert observed[:3] == [
-        ("first_foreground_token", {}),
+        (
+            "first_foreground_token",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
         (
             "assistant_text_generated",
             {
@@ -3119,7 +3132,10 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
                 "segmentId": "segment_1",
             },
         ),
-        ("first_playable_audio", {}),
+        (
+            "first_playable_audio",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
     ]
     assert [chunk.text for chunk in playback.chunks] == [inference.first_segment]
     assert [message.text for message in context.snapshot().messages] == [
@@ -3133,8 +3149,14 @@ async def test_final_transcript_streams_first_audio_before_inference_completes()
     assert inference.completed is True
     assert synthesizer.texts == [inference.first_segment, inference.second_segment]
     assert [event for event in observed if event[0] != "assistant_text_generated"] == [
-        ("first_foreground_token", {}),
-        ("first_playable_audio", {}),
+        (
+            "first_foreground_token",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
+        (
+            "first_playable_audio",
+            {"turnId": "turn_001", "turnGeneration": 1},
+        ),
         (
             "transcript_partial",
             {

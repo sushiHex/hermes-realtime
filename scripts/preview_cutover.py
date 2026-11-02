@@ -1506,7 +1506,7 @@ async def _host_child(active_path: Path) -> int:
 
 
 def _base_environment() -> dict[str, str]:
-    names = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+    names = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PROGRAMFILES")
     return {name: os.environ[name] for name in names if os.environ.get(name)}
 
 

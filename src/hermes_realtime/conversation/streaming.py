@@ -1007,7 +1007,13 @@ class StreamingSpeechLoop:
                         if segment_count == 1 and transcript is not None:
                             observer = self._observer
                             if observer is not None:
-                                observer("first_foreground_token", {})
+                                observer(
+                                    "first_foreground_token",
+                                    {
+                                        "turnId": turn_id,
+                                        "turnGeneration": lease.generation,
+                                    },
+                                )
                         if coalesce_initial_segment:
                             coalesce_initial_segment = False
                             if (
@@ -1593,7 +1599,13 @@ class StreamingSpeechLoop:
                 if not first_playable_observed:
                     observer = self._observer
                     if observer is not None:
-                        observer("first_playable_audio", {})
+                        observer(
+                            "first_playable_audio",
+                            {
+                                "turnId": presentation_turn_id,
+                                "turnGeneration": presentation_generation,
+                            },
+                        )
                     first_playable_observed = True
                 observer = self._observer
                 if observer is not None:

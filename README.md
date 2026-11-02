@@ -168,6 +168,8 @@ groups in [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) an
 [Milestones](https://github.com/sushiHex/hermes-realtime/milestones).
 
 - [Desktop MVP setup and diagnostic session](docs/desktop-mvp-diagnostic.md)
+- [Native work preview cutover](docs/native-work-preview.md)
+- [Typed native journey client](docs/native-typed-journey.md)
 - [Local LiveKit setup and automated gates](docs/local-livekit.md)
 - [Hermes bridge and natural-work authority](docs/hermes-bridge.md)
 - [Source-backed routing, privacy, and benchmark controls](docs/source-backed-latency.md)

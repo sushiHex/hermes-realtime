@@ -181,3 +181,31 @@ def test_only_matching_terminal_records_and_fifo_is_bounded():
     assert [row.task_id for row in context.snapshot().recent_task_results] == [
         f"task_{n}" for n in range(1, 9)
     ]
+
+
+@pytest.mark.parametrize("conclusion, detail", [
+    ("The temperature could not be read.", "Samples: none. The sensor request failed."),
+    ("The inventory could not be checked.", "Items: []. The upstream service was unavailable."),
+    ("The successful search found no tickets.", "The completed search returned an empty list."),
+])
+def test_completed_reference_retains_qualified_conclusion_and_supporting_evidence(
+    conclusion, detail
+):
+    from hermes_realtime.conversation.result_projection import completed_result_reference
+
+    reference = completed_result_reference(f"<voice>{conclusion}</voice><detail>{detail}</detail>")
+    assert conclusion in reference
+    assert detail in reference
+    assert "<voice>" not in reference and "<detail>" not in reference
+
+
+def test_completed_reference_sanitizes_both_conclusion_and_detail():
+    from hermes_realtime.conversation.result_projection import completed_result_reference
+
+    reference = completed_result_reference(
+        "<voice>Reading unavailable; see https://user:SYNTHETIC_SECRET@example.com/private?token=hidden.</voice>"
+        "<detail>No samples; the read failed. https://example.org/private?token=hidden</detail>"
+    )
+    assert "Reading unavailable" in reference and "No samples; the read failed." in reference
+    assert "SYNTHETIC_SECRET" not in reference and "hidden" not in reference
+    assert "https://" not in reference and "/private" not in reference
