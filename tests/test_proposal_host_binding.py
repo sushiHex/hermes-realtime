@@ -33,6 +33,16 @@ def test_projection_capability_is_shared_with_non_provider_wrappers():
     assert host_launcher._proposal_spoken_text(Wrapper(), "Inspect release") == "Inspect release"
 
 
+@pytest.mark.parametrize("provider", [EdgeTtsSynthesizer, KokoroSynthesizer])
+def test_confirmation_values_match_supported_provider_expansion(provider):
+    synth = object.__new__(provider)
+    if provider is KokoroSynthesizer:
+        synth._pronunciation_pattern = None
+    text = "Check 32\u00b0F at 2026-11-02T12:30:00Z."
+
+    assert host_launcher._proposal_confirmation_values(text) == synth.project_spoken_text(text)
+
+
 @pytest.mark.parametrize("failure", ["raises", "wrong_type"])
 def test_failed_projection_keeps_confirmation_card_available(failure):
     class Wrapper:

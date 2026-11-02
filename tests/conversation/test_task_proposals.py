@@ -191,6 +191,57 @@ async def test_spoken_confirmation_requires_complete_readback_and_clean_capture(
 
 
 @pytest.mark.asyncio
+async def test_spoken_confirmation_accepts_only_trusted_value_expansion_and_keeps_raw_objective():
+    proposals, surface, _events, _now = owner()
+    objective = "Check 32\u00b0F at 2026-11-02T12:30:00Z."
+
+    def values(text: str) -> str:
+        return text.replace("32\u00b0F", "32 degrees Fahrenheit").replace(
+            "2026-11-02T12:30:00Z", "4:30 AM PST on November 2, 2026"
+        )
+
+    proposals = ConversationTaskProposals(
+        surface=surface,
+        observer=lambda *_: None,
+        clock=lambda: 1.0,
+        speech_projection=values,
+        confirmation_value_projection=values,
+    )
+    proposals.bind("participant", 1)
+    proposal = proposals.offer(HostTaskProposalRequest(objective))
+    spoken = values(proposal.readback)
+    proposals.complete_readback(proposal, spoken, queued_chunks=1, confirmed_chunks=1)
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+
+    assert (
+        await proposals.consume_input("yes", expected_proposal=proposal)
+        is WorkCommandAdmission.ADMITTED
+    )
+    assert surface.calls == [(objective, "confirmed_" + proposal.proposal_id)]
+
+
+@pytest.mark.asyncio
+async def test_spoken_confirmation_rejects_extra_tts_word_loss_after_value_expansion():
+    proposals, surface, _events, _now = owner()
+
+    def values(text: str) -> str:
+        return text.replace("32\u00b0F", "32 degrees Fahrenheit")
+
+    proposal = proposals.offer(HostTaskProposalRequest("Check 32\u00b0F and retain every word."))
+    proposals._speech_projection = lambda text: values(text).replace("retain ", "")
+    proposals._confirmation_value_projection = values
+    confirmed = values(proposal.readback)
+    proposals.complete_readback(proposal, confirmed, queued_chunks=1, confirmed_chunks=1)
+    proposals.capture_started(participant="participant", generation=1, clean=True)
+
+    assert (
+        await proposals.consume_input("yes", expected_proposal=proposal)
+        is WorkCommandAdmission.REFUSED
+    )
+    assert surface.calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "blocker",
     [
