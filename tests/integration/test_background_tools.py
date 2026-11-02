@@ -28,6 +28,7 @@ def test_catalog_identity_is_exact(change):
 def test_native_reader_uses_the_plain_runs_profile_and_resolver(monkeypatch):
     import sys
     from types import ModuleType
+
     from hermes_realtime.integration.tool_catalog import _native_tool_names
 
     config = object()
