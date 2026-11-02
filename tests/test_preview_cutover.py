@@ -125,6 +125,8 @@ def _plan(tmp_path: Path) -> tuple[Path, Path]:
     (profile / "config.yaml").write_text(
         json.dumps(
             {
+                "model": {"default": "gpt-6-luna"},
+                "agent": {"reasoning_effort": "low"},
                 "approvals": {"mode": "manual", "unattended_mode": "deny"},
                 "plugins": {
                     "enabled": ["hermes-realtime"],
@@ -317,6 +319,77 @@ def test_native_staging_uses_the_reviewed_status_profile_projection(tmp_path):
     assert staged_kokoro.read_bytes() == _FAKE_MODEL_BYTES
     assert "MOONSHINE_VOICE_CACHE" in inspect.getsource(preview_cutover._host_environment)
     preview_cutover.verify_profile(plan, staged_home)
+
+
+def test_native_profile_accepts_bounded_yaml_for_staging_and_verification(tmp_path):
+    yaml = pytest.importorskip("yaml")
+
+    plan_path, source_profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    config = json.loads((source_profile / "config.yaml").read_text(encoding="utf-8"))
+    (source_profile / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    plan.output.mkdir()
+
+    staged_home = preview_cutover.stage_preflight_profile(plan)
+
+    staged_path = staged_home / "config.yaml"
+    staged = json.loads(staged_path.read_text(encoding="utf-8"))
+    assert staged["model"]["default"] == "gpt-6-luna"
+    staged_path.write_text(yaml.safe_dump(staged), encoding="utf-8")
+    preview_cutover.verify_profile(plan, staged_home)
+
+
+def test_native_profile_json_duplicate_fields_still_refuse(tmp_path):
+    plan_path, source_profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    (source_profile / "config.yaml").write_text(
+        '{"model":{"default":"gpt-6-luna"},"model":{"default":"gpt-6-luna"}}',
+        encoding="utf-8",
+    )
+    plan.output.mkdir()
+
+    with pytest.raises(ValueError, match="json_duplicate_field"):
+        preview_cutover.stage_preflight_profile(plan)
+
+
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [("gpt-5.6-terra", "low"), ("gpt-6-luna", "high")],
+)
+def test_native_profile_model_and_effort_must_match_plan(tmp_path, model, effort):
+    plan_path, source_profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    config = json.loads((source_profile / "config.yaml").read_text(encoding="utf-8"))
+    config["model"]["default"] = model
+    config["agent"]["reasoning_effort"] = effort
+    (source_profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+    plan.output.mkdir()
+
+    with pytest.raises(ValueError, match="native_model_binding"):
+        preview_cutover.stage_preflight_profile(plan)
+
+
+def test_native_profile_refuses_provider_prefixed_reasoning_override(tmp_path):
+    plan_path, source_profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    config = json.loads((source_profile / "config.yaml").read_text(encoding="utf-8"))
+    config["agent"]["reasoning_overrides"] = {"openai/gpt-6-luna": "high"}
+    (source_profile / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+    plan.output.mkdir()
+
+    with pytest.raises(ValueError, match="native_model_binding"):
+        preview_cutover.stage_preflight_profile(plan)
+
+
+def test_livekit_command_binds_planned_port(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "scripts.local_livekit.server_command",
+        lambda executable: [str(executable), "--dev", "--bind", "127.0.0.1"],
+    )
+
+    assert preview_cutover._livekit_command(tmp_path / "livekit-server", 17880) == [
+        str(tmp_path / "livekit-server"), "--dev", "--bind", "127.0.0.1", "--port", "17880"
+    ]
 
 
 def test_speech_asset_hash_drift_refuses_preflight(tmp_path):

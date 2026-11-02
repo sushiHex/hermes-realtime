@@ -74,6 +74,42 @@ def _json(raw: bytes) -> Any:
     return json.loads(raw, object_pairs_hook=pairs)
 
 
+def _profile_config(raw: bytes) -> dict[str, Any]:
+    """Parse the bounded Hermes profile config without weakening JSON checks."""
+    try:
+        value = _json(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            import yaml
+
+            value = yaml.safe_load(raw.decode("utf-8"))
+        except Exception:
+            raise PreviewRefusal("profile_config_parse") from None
+    require(type(value) is dict, "profile_config_parse")
+    return value
+
+
+def _validate_native_model_binding(config: dict[str, Any], plan: PreviewPlanV1) -> None:
+    """Match the plan's native defaults; this plan forbids model-specific overrides.
+
+    Hermes accepts provider-prefixed model aliases when resolving per-model
+    reasoning overrides. To avoid duplicating that resolver here, native plans
+    require an empty ``agent.reasoning_overrides`` map.
+    """
+    model_section = config.get("model")
+    if type(model_section) is dict:
+        model = model_section.get("default") or model_section.get("model")
+    else:
+        model = model_section
+    agent = config.get("agent")
+    require(type(model) is str and model == plan.models["background"], "native_model_binding")
+    require(type(agent) is dict, "native_model_binding")
+    effort = agent.get("reasoning_effort")
+    overrides = agent.get("reasoning_overrides", {})
+    require(type(overrides) is dict and not overrides, "native_model_binding")
+    require(effort == plan.models["background_effort"], "native_model_binding")
+
+
 @dataclass(frozen=True)
 class PreviewPlanV1:
     output: Path
@@ -451,19 +487,7 @@ def verify_profile(plan: PreviewPlanV1, home: Path) -> dict[str, Any]:
     config_path = home / "config.yaml"
     require(config_path.is_file() and config_path.stat().st_size <= _JSON_LIMIT, "profile_config")
     raw = _read(config_path, _JSON_LIMIT)
-    try:
-        config = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        try:
-            import yaml
-
-            config = yaml.safe_load(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ImportError, ValueError):
-            raise ValueError("profile_config_parse") from None
-        except Exception:
-            raise ValueError("profile_config_parse") from None
-    if type(config) is not dict:
-        raise ValueError("profile_config_parse") from None
+    config = _profile_config(raw)
     if plan.policy_mode == "lookup":
         from scripts.lookup_backend_gateway import require_interactive_policy_profile
 
@@ -472,6 +496,7 @@ def verify_profile(plan: PreviewPlanV1, home: Path) -> dict[str, Any]:
         from scripts.native_work_profile import validate_native_work_profile
 
         require(plan.native_status is not None, "native_status_missing")
+        _validate_native_model_binding(config, plan)
         validate_native_work_profile(config, plan.native_status)
     return {
         "profile_mode": plan.policy_mode,
@@ -864,8 +889,8 @@ def stage_preflight_profile(plan: PreviewPlanV1) -> Path:
         from scripts.native_work_profile import build_native_work_profile
 
         require(plan.native_status is not None, "native_status_missing")
-        base_config = _json(_read(source_config, _JSON_LIMIT))
-        require(type(base_config) is dict, "native_base_profile")
+        base_config = _profile_config(_read(source_config, _JSON_LIMIT))
+        _validate_native_model_binding(base_config, plan)
         staged_config = build_native_work_profile(base_config, plan.native_status)
         (profile / "config.yaml").write_text(
             json.dumps(staged_config, sort_keys=True), encoding="utf-8"
@@ -1413,6 +1438,12 @@ def _gateway_child(active_path: Path) -> int:
     return result if type(result) is int else 0
 
 
+def _livekit_command(executable: Path, port: int) -> list[str]:
+    from scripts import local_livekit
+
+    return local_livekit.server_command(executable) + ["--port", str(port)]
+
+
 async def _host_child(active_path: Path) -> int:
     plan, _, profile = _active_plan(active_path)
     _, host = _runtime_modules(plan)
@@ -1619,7 +1650,7 @@ def serve(active_path: Path) -> int:
         livekit_env = _base_environment() | {"LIVEKIT_KEYS": local_livekit.DEVELOPMENT_KEYS}
         livekit_process = processes.spawn(
             "livekit",
-            local_livekit.server_command(livekit_path),
+            _livekit_command(livekit_path, plan.ports["livekit"]),
             env=livekit_env,
             cwd=livekit_path.parent,
             log=Path(os.devnull),

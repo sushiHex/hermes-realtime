@@ -12,7 +12,10 @@ model and speech settings, executable paths, and owned/protected ports. Native
 plans also provide `native_status` with `command`, `sha256`, `state_dir`, and
 `python_user_base` (a path or `null`). The status command hash and existing
 state directory are checked before the native profile is staged. Lookup plans
-set `native_status` to `null`.
+set `native_status` to `null`. Native plans verify `model.default` and
+`agent.reasoning_effort` against the declared background settings and require an
+empty `agent.reasoning_overrides` mapping; they do not reimplement Hermes
+provider-specific override resolution.
 
 The native profile grants full MCP trust only to the reviewed, status-only server;
 its exact tool include list excludes model loads and all other server actions.
