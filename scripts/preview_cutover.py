@@ -1099,6 +1099,11 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         "previous_normal_stop",
     )
     previous_ports = result.get("ports")
+    if "ports" not in result:
+        # The existing persistent supervisor records these same four ports flat.
+        previous_ports = [result.get(key) for key in (
+            "api_port", "companion_port", "livekit_port", "browser_port",
+        )]
     require(
         type(previous_ports) is list
         and len(previous_ports) == 4

@@ -462,8 +462,9 @@ def test_gateway_health_refuses_wrong_pid_or_missing_job_membership(health, expe
         preview_cutover._require_gateway_health_owner(health, expected_pid, members)
 
 
+@pytest.mark.parametrize("legacy_ports", [False, True])
 def test_prepared_replacement_follows_clean_normal_stop_without_path_constants(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy_ports
 ):
     plan_path, source_profile = _plan(tmp_path)
     (source_profile / ".env").write_bytes(b"opaque-auth-value")
@@ -499,6 +500,12 @@ def test_prepared_replacement_follows_clean_normal_stop_without_path_constants(
         ),
         encoding="utf-8",
     )
+    if legacy_ports:
+        receipt_path = previous / "result-receipt.private.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt.pop("ports")
+        receipt.update(api_port=59876, companion_port=59877, livekit_port=7880, browser_port=28765)
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     (previous / "pids.json").write_text(
         json.dumps(
             {
@@ -583,6 +590,20 @@ def test_finalize_refuses_unsettled_or_still_owned_previous_run(tmp_path, monkey
 
     with pytest.raises(ValueError):
         preview_cutover.verify_normal_stop(previous, plan)
+
+
+def test_legacy_ports_keep_strict_port_validation(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    previous = tmp_path / "legacy-preview"
+    previous.mkdir()
+    (previous / "result-receipt.private.json").write_text(json.dumps({
+        "category": "stopped", "cleanup_settled": True, "cleanup_failed": False,
+        "owned_survivor_count": 0, "remaining_owned_listeners": 0,
+        "protected_listeners_unchanged": True,
+        "api_port": True, "companion_port": 59877, "livekit_port": 7880, "browser_port": 28765,
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="previous_ports_shape"):
+        preview_cutover.verify_normal_stop(previous, preview_cutover.load_plan(plan_path))
 
 
 def test_realtime_source_binding_refuses_before_wheel_acceptance(tmp_path, monkeypatch):
