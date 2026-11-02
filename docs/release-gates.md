@@ -43,10 +43,13 @@ CI cache and interpreter-installation locations remain available.
 
 The `release-candidate` job runs, from that fresh candidate:
 
-1. a forced import from `src/`, then default `pytest -q`, `ruff check .`, and
-   `mypy src` with the lockfile and development group, plus a `speech-verification`-extra run of
-   `tests/providers/test_speech_presence.py` and a typed pass over the governed
-   qualification and real-gate scripts, including the private run journal;
+1. a forced import from `src/`, then the focused provider request-size, status-authority
+   and status-policy tests alongside `tests/providers/test_speech_presence.py` with
+   the `speech-verification` extra. These cheap contracts fail before the full matrix;
+   their small overlap with default `pytest -q` is intentional. The full Python suite,
+   `ruff check .`, `mypy src` and a typed pass over the governed
+   qualification and real-gate scripts, including the private run journal, follow
+   with the frozen lockfile and development group;
 2. `npm ci --ignore-scripts`, browser unit tests, and the production browser
    build;
 3. source/static parity after CRLF-to-LF normalization for package files captured from the archived
@@ -73,6 +76,9 @@ scenarios do not establish the full installed dependency or physical matrix.
 The `native-livekit` job downloads the documented Windows LiveKit 1.13.4
 binary, verifies its SHA-256, starts it on `127.0.0.1` in development mode, and
 then runs the native local LiveKit, browser LiveKit, and local launcher tests.
+Those existing native checks now precede the full Python, browser and artifact
+matrix, after source-import and focused provider checks. Executable/hash/PID and
+credential bindings remain required; the later release checks still all run.
 `InsecureKeyLengthWarning` is promoted to an error. This is a required release job rather than an
 ambient local prerequisite.
 

@@ -25,6 +25,7 @@ from hermes_realtime.conversation.context import (
 from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
 from hermes_realtime.conversation.output_style import (
     OUTPUT_STYLES,
+    QUANTITY_PRESENTATION_POLICY,
     OutputStyleSelection,
     communication_policy,
 )
@@ -171,6 +172,8 @@ async def test_accepted_start_projects_only_accepted_objective_and_style(style) 
     "The supplied place is Fullerton, CA, in California, dated Oct 30.",
     "The supplied report defines CPU as central processing unit and ms as milliseconds.",
     "The source only says CA and does not identify its meaning.",
+    "Roughly how much is available? The reported quantity is 23147 MiB, with uncertainty.",
+    'Give the exact reported value and quote "23147 MiB" without conversion.',
 ])
 @pytest.mark.asyncio
 async def test_codex_speech_wording_guidance_preserves_supplied_reference(user_text) -> None:
@@ -193,7 +196,9 @@ async def test_codex_speech_wording_guidance_preserves_supplied_reference(user_t
         assert "retain ambiguous terms without guessing" in instructions
         assert "Preserve exact quotations and source text" in instructions
         assert "For residence questions, prefer home-city wording over live/lives" in instructions
-        assert user_text in turn["params"]["input"][0]["text"]
+        assert QUANTITY_PRESENTATION_POLICY in instructions
+        outbound = json.loads(turn["params"]["input"][0]["text"].rsplit("\n", 1)[1])
+        assert outbound["messages"] == [{"role": "user", "text": user_text}]
         assert snapshot.messages[0].text == user_text
     finally:
         await inference.close()

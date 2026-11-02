@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 
+from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
 from hermes_realtime.integration import run_record
 from hermes_realtime.integration.run_record import PendingRun
 from hermes_realtime.protocol import (
@@ -114,7 +115,8 @@ _BACKGROUND_INSTRUCTIONS = (
     "multi-item result into a terse headline list</detail>. Voice and detail must "
     "be semantically consistent; detail may expand voice but must not replace its "
     "important findings. Do not put line breaks or markup inside voice, or text "
-    "outside these elements."
+    "outside these elements. "
+    + QUANTITY_PRESENTATION_POLICY
 )
 
 

@@ -128,6 +128,134 @@ async def test_live_selected_capacity_stays_128(life):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["healthy", "exhausted", "foreign-source"])
+async def test_consecutive_selected_runs_isolate_spent_budgets_and_sources(life, case):
+    """Exercise real admission/tickets/wrappers, with synthetic native work and results.
+
+    This is selected lookup isolation, not the separate general-native real-model
+    journey or formatter/usefulness qualification. No provider or network runs.
+    """
+    from tests.test_lookup_presentation import completion
+
+    effects = []
+
+    def propose(name, arguments, request_id, call_id="call"):
+        response = completion(None, reason="tool_calls", calls=[SimpleNamespace(
+            id=call_id, function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+        )])
+        return life.g.model_gate(
+            api_mode="chat_completions", api_request_id=request_id,
+            request={"tools": []}, next_call=lambda _: response,
+        )
+
+    def searches(label):
+        calls = [SimpleNamespace(id=f"search-{i}", function=SimpleNamespace(
+            name="web_search", arguments=json.dumps({"query": f"synthetic {label} {i}"}),
+        )) for i in range(life.module.SEARCH_LIMIT)]
+        response = completion(None, reason="tool_calls", calls=calls)
+        assert life.g.model_gate(
+            api_mode="chat_completions", api_request_id=label,
+            request={"tools": []}, next_call=lambda _: response,
+        ) is response
+        sources = set()
+        for i, call in enumerate(calls):
+            args = json.loads(call.function.arguments)
+            url = f"https://example.invalid/{label}/{i}"
+            sources.add(url)
+            payload = {"success": True, "data": {"web": [{"url": url}]}}
+
+            def original(actual, payload=payload):
+                effects.append((label, "search", actual))
+                return json.dumps(payload)
+
+            result = life.g.tool_gate(
+                tool_name="web_search", tool_call_id=call.id, api_request_id=label, args=args,
+                next_call=life.g.wrap_search(original),
+            )
+            assert json.loads(result) == payload
+        return sources
+
+    async def settle():
+        life.native.release.set()
+        await life.native.task
+        await asyncio.sleep(0)
+
+    first = await start(life)
+    first_row = life.g.budgets[first]
+    first_sources = searches("first")
+    assert first_row["search_attempts_reserved"] == life.module.SEARCH_LIMIT
+    if case == "healthy":
+        final = completion("Synthetic first findings")
+        assert life.g.model_gate(
+            api_mode="chat_completions", api_request_id="first-final",
+            request={"tools": []}, next_call=lambda _: final,
+        ) is final
+    else:
+        # The first search batch has spent its complete allowance; a second
+        # batch must refuse before any additional synthetic handler effect.
+        assert propose("web_search", {"query": "one too many"}, "first-extra") is life.refused
+        assert first_row["closed"] and first in life.g.refused
+    await settle()
+    assert first not in life.g.members and first not in life.g.budgets
+    assert life.g.terminal[first][2] is (case != "healthy")
+
+    second = await start(life)
+    second_row = life.g.budgets[second]
+    assert second_row is not first_row and second_row["urls"] is not first_row["urls"]
+    assert second_row["phase"] == "new" and not second_row["closed"]
+    assert second_row["reserved"] == second_row["settled"] == 0
+    assert second_row["search_attempts_reserved"] == 0
+    assert not second_row["urls"] and not second_row["spent"] and not second_row["admitted"]
+    second_sources = searches("second")
+    assert second_row["urls"] == second_sources and first_row["urls"] == first_sources
+    assert not second_sources.intersection(first_sources)
+    assert second_row["search_attempts_reserved"] == life.module.SEARCH_LIMIT
+
+    # A retired first-run callback cannot inherit the second run's authority,
+    # spend its allowance, or change either source catalog.
+    before_late = len(effects)
+    life.session["run"] = first
+    assert life.g.tool_gate(
+        tool_name="web_search", tool_call_id="search-0", api_request_id="second",
+        args={"query": "synthetic second 0"},
+        next_call=life.g.wrap_search(lambda _: effects.append("late-first")),
+    ) == life.module.REFUSAL
+    assert len(effects) == before_late and not second_row["closed"]
+    assert second_row["urls"] == second_sources and first_row["urls"] == first_sources
+    life.session["run"] = second
+
+    args = {"urls": [min(first_sources if case == "foreign-source" else second_sources)]}
+    proposal = propose("web_extract", args, "second-extract")
+    if case == "foreign-source":
+        assert proposal is life.refused
+        assert second_row["closed"] and second in life.g.refused
+    else:
+        assert proposal is not life.refused
+
+        async def extract(actual):
+            effects.append(("second", "extract", actual))
+            return json.dumps({"results": [{"url": actual["urls"][0], "content": "Synthetic"}]})
+
+        # Native tool execution is synchronous at the middleware boundary and
+        # settles the asynchronous handler before returning its result.
+        result = await asyncio.to_thread(
+            life.g.tool_gate,
+            tool_name="web_extract", tool_call_id="call", api_request_id="second-extract",
+            args=args, next_call=lambda actual: asyncio.run(life.g.wrap_extract(extract)(actual)),
+        )
+        assert json.loads(result)["results"][0]["url"] in second_sources
+        final = completion("Synthetic second findings")
+        assert life.g.model_gate(
+            api_mode="chat_completions", api_request_id="second-final",
+            request={"tools": []}, next_call=lambda _: final,
+        ) is final
+    await settle()
+    assert not life.g.members and not life.g.budgets
+    assert life.g.terminal[second][2] is (case == "foreign-source")
+    assert len(effects) == 2 * life.module.SEARCH_LIMIT + int(case != "foreign-source")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("held", ["task", "terminal", "owned_work", "presentation"])
 async def test_retirement_requires_all_settlement_authorities(life, held):
     run_id = await start(life)

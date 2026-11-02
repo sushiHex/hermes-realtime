@@ -809,19 +809,10 @@ def gate_materialized_candidate(
         cwd=root,
         env=source_env,
     )
-    run(
-        "uv",
-        "run",
-        "--frozen",
-        "--group",
-        "dev",
-        "pytest",
-        "-q",
-        *PYTEST_DURATIONS,
-        *((f"--native-git-executable={git_executable}",) if git_executable is not None else ()),
-        cwd=root,
-        env=environment,
-    )
+    # Fail on the small, relevant provider contracts and native LiveKit path
+    # before the full release matrix. This intentionally repeats a few tiny
+    # provider tests in the full suite; no second suite is run. All checks stay
+    # bound to this same materialized candidate and retain their final gates.
     speech_verification_env = dict(environment)
     speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"
     run(
@@ -835,9 +826,39 @@ def gate_materialized_candidate(
         "pytest",
         "-q",
         *PYTEST_DURATIONS,
+        "tests/providers/test_codex_app_server.py::test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas",
+        "tests/providers/test_status_authority_boundary.py",
+        "tests/providers/test_status_policy_selection.py",
         "tests/providers/test_speech_presence.py",
         cwd=root,
         env=speech_verification_env,
+    )
+    if livekit:
+        if (
+            livekit_executable is None
+            or livekit_executable_sha256 is None
+            or livekit_pid is None
+        ):
+            fail("native LiveKit gate requires verified executable ownership arguments")
+        check_livekit(
+            root,
+            environment,
+            executable=livekit_executable,
+            expected_sha256=livekit_executable_sha256,
+            process_id=livekit_pid,
+        )
+    run(
+        "uv",
+        "run",
+        "--frozen",
+        "--group",
+        "dev",
+        "pytest",
+        "-q",
+        *PYTEST_DURATIONS,
+        *((f"--native-git-executable={git_executable}",) if git_executable is not None else ()),
+        cwd=root,
+        env=environment,
     )
     run(
         "uv",
@@ -867,20 +888,6 @@ def gate_materialized_candidate(
     sdist_built_wheel = build_sdist_wheel(root, sdist, environment)
     check_sdist_built_wheel_disclosure_parity(root, sdist_built_wheel)
     check_installed_wheel(root, wheel, environment)
-    if livekit:
-        if (
-            livekit_executable is None
-            or livekit_executable_sha256 is None
-            or livekit_pid is None
-        ):
-            fail("native LiveKit gate requires verified executable ownership arguments")
-        check_livekit(
-            root,
-            environment,
-            executable=livekit_executable,
-            expected_sha256=livekit_executable_sha256,
-            process_id=livekit_pid,
-        )
 
 
 def gate(

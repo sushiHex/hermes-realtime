@@ -366,6 +366,9 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
             in instructions
         )
         assert "at most 1800 characters" in instructions
+        from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
+
+        assert QUANTITY_PRESENTATION_POLICY in instructions
     finally:
         for authority in session._runs_by_task.values():
             authority.terminal = True
