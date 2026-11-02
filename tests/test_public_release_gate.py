@@ -9,6 +9,10 @@ from runpy import run_path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+_FAST_PROVIDER_TARGET = (
+    "tests/providers/test_codex_app_server.py::"
+    "test_codex_bound_work_tools_supply_exact_narrow_dynamic_schemas"
+)
 
 
 @pytest.mark.parametrize("explicit", [False, True], ids=["automatic", "explicit"])
@@ -24,7 +28,10 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
 
     def observe(*command: str, **kwargs: object) -> None:
         commands.append(command)
-        if "pytest" in command:
+        if (
+            "pytest" in command
+            and not any("tests/providers/" in value for value in command)
+        ):
             raise FullPytestReached
 
     for name in ("reject_ambient_paths", "scan_for_secrets"):
@@ -47,12 +54,85 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
         *expected,
     )
     assert all("--native-git-executable" not in command for command in commands[:-1])
+    provider_command = next(
+        command for command in commands
+        if _FAST_PROVIDER_TARGET in command
+    )
+    assert commands.index(provider_command) < commands.index(commands[-1])
+    assert "tests/providers/test_speech_presence.py" in provider_command
+    assert "tests/providers/test_status_authority_boundary.py" in provider_command
+    assert "tests/providers/test_status_policy_selection.py" in provider_command
     parsed = pytest.Config.fromdictargs({}, list(commands[-1][6:]))
     try:
         assert parsed.getoption("native_git_executable") == selected
         assert parsed.rootpath == ROOT
     finally:
         parsed._ensure_unconfigure()
+
+
+def test_native_and_provider_contract_checks_precede_full_pytest_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = run_path(str(ROOT / "scripts" / "release_gate.py"))["gate_materialized_candidate"]
+    events: list[tuple[str, object]] = []
+
+    class FullPytestReached(Exception):
+        pass
+
+    def observe(*command: str, **kwargs: object) -> None:
+        events.append(("command", command))
+        if (
+            "pytest" in command
+            and not any("tests/providers/" in value for value in command)
+        ):
+            raise FullPytestReached
+
+    def observe_livekit(root, environment, **ownership) -> None:
+        events.append(("native", ownership))
+
+    for name in ("reject_ambient_paths", "scan_for_secrets"):
+        monkeypatch.setitem(gate.__globals__, name, lambda root: None)
+    monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", lambda root, target: None)
+    monkeypatch.setitem(gate.__globals__, "run", observe)
+    monkeypatch.setitem(gate.__globals__, "check_livekit", observe_livekit)
+    executable = tmp_path / "livekit-server.exe"
+
+    with pytest.raises(FullPytestReached):
+        gate(
+            tmp_path,
+            livekit=True,
+            livekit_executable=executable,
+            livekit_executable_sha256="a" * 64,
+            livekit_pid=321,
+        )
+
+    full_matrix_index = next(
+        index
+        for index, (kind, value) in enumerate(events)
+        if kind == "command"
+        and "pytest" in value
+        and not any("tests/providers/" in item for item in value)
+    )
+    provider_index = next(
+        index
+        for index, (kind, value) in enumerate(events)
+        if kind == "command" and _FAST_PROVIDER_TARGET in value
+    )
+    native_index = next(index for index, (kind, _) in enumerate(events) if kind == "native")
+    assert provider_index < full_matrix_index
+    provider_command = events[provider_index][1]
+    assert "tests/providers/test_speech_presence.py" in provider_command
+    assert "tests/providers/test_status_authority_boundary.py" in provider_command
+    assert "tests/providers/test_status_policy_selection.py" in provider_command
+    assert native_index < full_matrix_index
+    assert events[native_index] == (
+        "native",
+        {
+            "executable": executable,
+            "expected_sha256": "a" * 64,
+            "process_id": 321,
+        },
+    )
 
 
 def _run(*command: str, cwd: Path) -> bytes:
