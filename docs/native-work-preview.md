@@ -69,7 +69,7 @@ Python executable; they do not install dependencies into Hermes.
   --prepared .\preview\prepared.private.json `
   --previous .\previous-run
 # In one terminal:
-& $previewPython -I -B scripts/preview_cutover.py serve --active .\preview\active.private.json
+& $previewPython -I -B scripts/preview_cutover.py serve --active (Resolve-Path .\preview\active.private.json).Path
 # From another terminal, request graceful stop and wait for cleanup settlement:
 & $previewPython -I -B scripts/preview_cutover.py stop --output .\preview
 ```
@@ -80,3 +80,8 @@ journal. `serve` checks the prepared bindings again, owns the gateway, LiveKit,
 and host children, and reports readiness only after their checks pass. Stop
 through the command so the owner can settle children and write its receipt; do
 not edit private receipts to advance a run.
+
+On Windows, the preview owner preserves `PROGRAMFILES` as an OS runtime path in
+its reduced child environment. NVIDIA capacity queries require it on the
+observed host; this does not copy provider credentials. Use an absolute active
+receipt path for `serve`, since child processes run from the Hermes checkout.

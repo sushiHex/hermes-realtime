@@ -22,6 +22,19 @@ def test_failure_metadata_keeps_operator_category_without_echoing_dependency_err
     private = "synthetic_private_exception_value"
     assert private not in json.dumps(preview_cutover._failure_status(ValueError(private)))
 
+
+def test_base_environment_preserves_programfiles_without_passing_credentials(monkeypatch):
+    monkeypatch.setenv("PATH", "C:\\Windows\\System32")
+    monkeypatch.setenv("SYSTEMROOT", "C:\\Windows")
+    monkeypatch.setenv("PROGRAMFILES", "C:\\Program Files")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-private-key")
+
+    env = preview_cutover._base_environment()
+
+    assert env["PROGRAMFILES"] == "C:\\Program Files"
+    assert "OPENAI_API_KEY" not in env
+    assert set(env) <= {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PROGRAMFILES"}
+
 _FAKE_MODEL_BYTES = b"fixture-kokoro-model"
 _FAKE_VOICE_BYTES = b"fixture-kokoro-voices"
 _FAKE_MODEL = SimpleNamespace(

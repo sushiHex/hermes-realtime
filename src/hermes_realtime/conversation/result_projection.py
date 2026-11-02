@@ -90,9 +90,13 @@ def _completion_reference_text(detail: str) -> str:
 
 
 def completed_result_reference(detail: str) -> str:
-    """Return the existing bounded, source-safe visual result as untrusted data."""
-    _, visual = _completion_projections(detail)
-    safe = _COMPLETION_MACHINE_TOKEN.sub("the reference", _completion_reference_text(visual))
+    """Preserve the qualified conclusion and detail as bounded untrusted data."""
+    voice, visual = _completion_projections(detail)
+    reference = (
+        f"Summary: {voice} Details: {visual}"
+        if voice and voice != visual else visual
+    )
+    safe = _COMPLETION_MACHINE_TOKEN.sub("the reference", _completion_reference_text(reference))
     safe = _PRIVATE_RESULT_HANDLE.sub("private reference", safe)
     safe = " ".join(safe.replace("•", " ").split()).strip()
     return _bounded_result(safe) or _NO_DISPLAYABLE_RESULT
