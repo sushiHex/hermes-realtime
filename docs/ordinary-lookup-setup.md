@@ -313,6 +313,34 @@ support: inspect retained results and answer separately.
 
 ## Execution and remaining walkthrough boundary
 
+### General native background work
+
+The lookup contract above belongs to its dedicated deployment. Operational tasks
+must use an explicitly configured general-native deployment through the same
+Hermes Runs API, with `lookup_policy=None`; the objective never selects or changes
+the policy. This does not relax the lookup deployment's completion checks.
+
+The reference native profile builder in `scripts/native_work_profile.py` preserves
+normal manual approvals and enables web tools plus one existing MCP VRAM status
+tool. It enables no terminal, model-loading tool, or other MCP server. Its
+descriptor binds the reviewed launcher and existing coordination-state directory.
+This is a first read-only native capability, not a claim that arbitrary local work
+or system RAM observation is configured.
+
+With `plugins.entries.hermes-realtime.settings.background_capabilities: true`,
+the plugin exposes authenticated `GET /hermes-realtime/v1/tools`. It uses the
+same native profile/tool resolver as ordinary Runs and includes resolved MCP tools
+that the native `/v1/toolsets` listing omits. The version-1 response contains only
+`object`, `version`, `platform`, and bounded tool names; no settings or credentials.
+
+Select `HermesApiConfig(discover_tools=True, ...)`, or
+`build_local_host_launcher(hermes_discover_tools=True, ...)`, to supply that
+startup-resolved inventory as descriptive foreground context. It grants no
+foreground execution authority. Actual work still requires an accepted native
+dispatch and retains its existing approval, cancellation, and recovery behavior.
+The maintained [preview command](../scripts/preview_cutover.py) keeps native and
+lookup deployment modes explicit.
+
 Start only the pinned Hermes gateway, using `hermes gateway run`, under the
 existing [Processes/Containment owner](../scripts/rehearse_desktop_mvp.py).
 Use hidden Windows children, stdin disconnected, bounded startup and an outer
