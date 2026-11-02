@@ -622,18 +622,12 @@ def _speech_asset_manifest(plan: PreviewPlanV1) -> list[tuple[Path, Path, str, i
         "speech_asset_binding",
     )
 
-    inventory: dict[Path, set[Path]] = {moonshine_root: set(), kokoro_root: set()}
-    for root in inventory:
-        entries = [root, *root.rglob("*")]
+    cache_roots = (moonshine_root, kokoro_root)
+    for root in cache_roots:
         require(
-            all(
-                not entry.is_symlink()
-                and not (getattr(entry.lstat(), "st_file_attributes", 0) & 0x400)
-                for entry in entries
-            ),
+            not root.is_symlink() and not (getattr(root.lstat(), "st_file_attributes", 0) & 0x400),
             "speech_asset_link",
         )
-        inventory[root] = {entry.resolve(strict=True) for entry in entries if entry.is_file()}
 
     result: list[tuple[Path, Path, str, int]] = []
     found_kokoro: set[str] = set()
@@ -652,7 +646,7 @@ def _speech_asset_manifest(plan: PreviewPlanV1) -> list[tuple[Path, Path, str, i
             "speech_asset_missing",
         )
         source = source.resolve(strict=True)
-        roots = [root for root in inventory if source.is_relative_to(root)]
+        roots = [root for root in cache_roots if source.is_relative_to(root)]
         require(len(roots) == 1, "speech_asset_outside_cache")
         root = roots[0]
         size = sizes[raw_path]
@@ -687,14 +681,9 @@ def _speech_asset_manifest(plan: PreviewPlanV1) -> list[tuple[Path, Path, str, i
             else:
                 raise ValueError("kokoro_asset_unexpected")
         result.append((source, destination, expected_sha, size))
-    require(
-        inventory[moonshine_root]
-        == {source for source, _, _, _ in result if source.is_relative_to(moonshine_root)}
-        and inventory[kokoro_root]
-        == {source for source, _, _, _ in result if source.is_relative_to(kokoro_root)}
-        and found_kokoro == {"model", "voice"},
-        "speech_asset_inventory",
-    )
+    # The receipt is the admitted catalog. Unrelated shared-cache files are
+    # never read or staged; verify_speech_assets requires exact staged equality.
+    require(found_kokoro == {"model", "voice"}, "speech_asset_inventory")
     return result
 
 
@@ -978,7 +967,7 @@ def prepare(plan_path: Path) -> dict[str, Any]:
         completed = run_preflight(staged_plan_path, profile)
         status = parse_preflight_result(completed)
     except ValueError as error:
-        status = {
+        status = _failure_status(error) if type(error) is PreviewRefusal else {
             "category": "refused",
             "failure_kind": "RuntimeError",
             "failure_category": (

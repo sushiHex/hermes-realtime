@@ -330,6 +330,40 @@ def test_speech_asset_hash_drift_refuses_preflight(tmp_path):
         preview_cutover.stage_preflight_profile(plan)
 
 
+def test_unadmitted_shared_cache_metadata_is_not_copied(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    extra = plan.speech_assets["moonshine_cache"] / "unrelated-cache-metadata.json"
+    extra.write_bytes(b"unadmitted shared-cache data")
+    plan.output.mkdir()
+    home = preview_cutover.stage_preflight_profile(plan)
+    assert not (home / ".cache" / "moonshine" / extra.name).exists()
+    preview_cutover.verify_speech_assets(plan, home)
+
+
+def test_prepare_retains_fixed_stage_refusal_category(tmp_path, monkeypatch):
+    plan_path, _ = _plan(tmp_path)
+
+    def refuse(_):
+        raise preview_cutover.PreviewRefusal("speech_cache_integrity")
+
+    monkeypatch.setattr(preview_cutover, "stage_preflight_profile", refuse)
+    with pytest.raises(ValueError, match="preflight_refused"):
+        preview_cutover.prepare(plan_path)
+    receipt = json.loads((tmp_path / "preview/preparation-refused.private.json").read_text())
+    assert receipt["failure_category"] == "speech_cache_integrity"
+
+
+def test_staged_cache_refuses_unadmitted_files(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.output.mkdir()
+    home = preview_cutover.stage_preflight_profile(plan)
+    (home / ".cache/moonshine/unadmitted.json").write_bytes(b"not in receipt")
+    with pytest.raises(ValueError, match="speech_asset_stage_inventory"):
+        preview_cutover.verify_speech_assets(plan, home)
+
+
 def test_native_profile_revalidation_refuses_removed_platform_toolset(tmp_path):
     plan_path, _ = _plan(tmp_path)
     plan = preview_cutover.load_plan(plan_path)
