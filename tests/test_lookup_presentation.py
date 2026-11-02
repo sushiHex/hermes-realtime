@@ -220,6 +220,10 @@ def setup(monkeypatch, request):
     refused = object()
     g = module.Generation(lambda: refused, presentation=formatter)
     g.handles = [SimpleNamespace(active=True)]
+    # These formatter tests inject native admission; lifecycle tests use real Tasks.
+    def bind_synthetic_native(_adapter):
+        g.native_tasks = {name: asyncio.current_task() for name in ("new", "new-selected")}
+    g.bind_native = bind_synthetic_native
     row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 1,
            "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
            "search_attempts_reserved": 0, "empty_retry_reserved": False,
@@ -2091,3 +2095,14 @@ def test_presentation_unload_cancels_from_authority_when_budget_container_is_cor
     assert s.run() is s.refused
     assert s.captured["closed"] == 2 and s.row["presentation_active"] is None
     assert s.row["presentation_evidence"]["failure_kind"] == "CancelledError"
+
+
+@pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [{
+    "url": "https://example.invalid/source", "title": None,
+    "description": "Bound source passage.",
+}]}}], indirect=True)
+def test_optional_null_title_preserves_bound_search_passage(setup):
+    assert not setup.row["closed"]
+    assert setup.row["passages"]["https://example.invalid/source"] == (
+        ("search", "Bound source passage."),
+    )

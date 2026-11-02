@@ -475,3 +475,31 @@ readiness nor native worker settlement. A follow-up must compose that owner with
 the native fixture, retain old process handles and policy records until verified
 owned shutdown, then accept a different, ready generation in the same disposable
 profile. This PR does not add that composition or claim full #306 acceptance.
+
+
+### Persistent generation settlement
+
+The selected active-run cap remains 128. A selected row retires only after its
+captured native asyncio Task is done, native status is terminal, and all owned
+model/tool/formatter work has settled. The last 128 terminal identities retain
+policy/refusal attestation without retaining objectives, passages, or task objects.
+An evicted status GET has explicit unavailable policy attestation; a selected
+replay cannot obtain fresh authority after eviction.
+
+Native `run_` approval scopes require retained selected authority or an exact live
+ordinary task admitted by the pinned adapter. Retired and unknown native scopes
+never fall through to ordinary effects. Ordinary tracking is weak and removed on
+task completion; it adds no concurrency cap, including when the native cap is
+disabled. Non-native ordinary session scopes retain their existing behavior.
+
+This composition pins both native API implementation files and their actual task
+and status registry objects. It supports the default asyncio Task factory only:
+the pinned handler creates/stores the task and returns through its wrapper without
+another await, permitting policy binding before execution. Custom/eager factories
+are refused. `tests/native_lookup_lifecycle_case.py` proves this ordering and row
+retirement against the real pinned adapter with a synthetic agent and no provider
+requests. `tests/test_lookup_lifecycle.py` covers capacity, delayed settlement,
+replay/status behavior, and late effects independently of model behavior.
+
+Optional null titles are treated as absent metadata. Passage text, returned-size,
+missing-results, and source-membership requirements are unchanged.

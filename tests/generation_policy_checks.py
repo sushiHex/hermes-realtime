@@ -4,6 +4,7 @@ These are policy unit checks in the prepared Hermes environment, not Runs,
 provider, or lifecycle qualification. Each mutant is a separate source copy.
 """
 
+import asyncio
 import importlib.util
 import json
 from pathlib import Path
@@ -44,8 +45,8 @@ TARGETS = {
         "True",
     ),
     "scope-ordinary": (
-        "if designated and (",
-        "if (",
+        "if designated:",
+        "if True:",
     ),
     "policy-version": (
         'if selected not in {"", VERSION}:',
@@ -82,7 +83,7 @@ TARGETS = {
         'and path.endswith("/stop")\n                        and True',
     ),
     "status-ordinary": (
-        "elif run_id in self.members:",
+        "elif run_id in self.members or run_id in self.terminal:",
         "else:",
     ),
     "status-unavailable": (
@@ -260,6 +261,9 @@ async def evaluate(name, cls, installed, completion):
         objective="Synthetic input.",
     ):
         app = web.Application()
+        # This unit guard harness supplies an admission task, not native lifecycle proof.
+        g.bind_native = lambda _: None
+        g.native_tasks = {run: asyncio.current_task()}
         g.wire(app, None)
 
         async def body():
