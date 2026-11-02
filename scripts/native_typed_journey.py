@@ -404,34 +404,36 @@ class Journey:
 
 
 async def execute(options, steps, receipt) -> None:
-    from livekit import rtc
-
     from hermes_realtime.host_launcher import _load_api_bearer
+
+    bearer = _load_api_bearer(options.native_profile / ".env")
+    from livekit import rtc
 
     require(
         read_journal(options.preview_dir / "state/hermes-runs-v1.json") == (set(), 0),
         "journey_initial_work",
     )
-    code, credential = await asyncio.to_thread(
-        request_json, options.browser_origin, "stable-bootstrap"
-    )
-    suffix = hashlib.sha256(str(options.preview_dir / "active.private.json").encode()).hexdigest()[
-        :16
-    ]
-    require(
-        code == 200
-        and credential.get("workerIdentity") == "worker_preview_" + suffix
-        and credential.get("roomName") == "hermes-preview-" + suffix
-        and credential.get("url") == options.livekit_url
-        and type(credential.get("token")) is str
-        and type(credential.get("participantIdentity")) is str
-        and type(credential.get("expiresInSeconds")) is int
-        and 1 <= credential["expiresInSeconds"] <= 3600,
-        "journey_bootstrap_binding",
-    )
-    journey = Journey(options, credential, _load_api_bearer(options.native_profile / ".env"))
-    room = rtc.Room()
+    credential, journey, room, bootstrap_code = None, None, None, None
     try:
+        bootstrap_code, credential = await asyncio.to_thread(
+            request_json, options.browser_origin, "stable-bootstrap"
+        )
+        suffix = hashlib.sha256(
+            str(options.preview_dir / "active.private.json").encode()
+        ).hexdigest()[:16]
+        require(
+            bootstrap_code == 200
+            and credential.get("workerIdentity") == "worker_preview_" + suffix
+            and credential.get("roomName") == "hermes-preview-" + suffix
+            and credential.get("url") == options.livekit_url
+            and type(credential.get("token")) is str
+            and type(credential.get("participantIdentity")) is str
+            and type(credential.get("expiresInSeconds")) is int
+            and 1 <= credential["expiresInSeconds"] <= 3600,
+            "journey_bootstrap_binding",
+        )
+        journey = Journey(options, credential, bearer)
+        room = rtc.Room()
         await asyncio.wait_for(
             room.connect(
                 credential["url"],
@@ -451,31 +453,33 @@ async def execute(options, steps, receipt) -> None:
         receipt["outcome"] = "completed"
     finally:
         receipt["cleanup"] = {
-            "ownedTasksSettled": False,
+            "ownedTasksSettled": journey is None,
             "sessionStopped": False,
-            "roomDisconnected": False,
+            "roomDisconnected": room is None,
         }
-        with contextlib.suppress(Exception):
-            receipt["cleanup"]["ownedTasksSettled"] = await journey.settle_owned()
-        # Stop only this authenticated browser lease, never a service or native process.
-        try:
-            code, _ = await asyncio.to_thread(
-                request_json, options.browser_origin, "stop", token=journey.credential["token"]
-            )
-            receipt["cleanup"]["sessionStopped"] = code in {200, 202}
-        except Exception:
-            pass
-        finally:
-            try:
+        if journey is not None:
+            with contextlib.suppress(Exception):
+                receipt["cleanup"]["ownedTasksSettled"] = await journey.settle_owned()
+            credential = journey.credential
+        # Even a mismatched bootstrap may have provisioned a lease. Its returned
+        # bearer is authority only to stop that lease at the same browser origin.
+        token = credential.get("token") if type(credential) is dict else None
+        if bootstrap_code == 200 and type(token) is str and 0 < len(token) <= 16_384:
+            with contextlib.suppress(Exception):
+                code, _ = await asyncio.to_thread(
+                    request_json, options.browser_origin, "stop", token=token
+                )
+                receipt["cleanup"]["sessionStopped"] = code in {200, 202}
+        if room is not None:
+            with contextlib.suppress(Exception):
                 await asyncio.wait_for(room.disconnect(), 10)
                 receipt["cleanup"]["roomDisconnected"] = True
-            except Exception:
-                pass
-        receipt.update(
-            turns=journey.tracker.receipt(),
-            tasks=journey.results,
-            acceptedDispatches=len(journey.bindings),
-        )
+        if journey is not None:
+            receipt.update(
+                turns=journey.tracker.receipt(),
+                tasks=journey.results,
+                acceptedDispatches=len(journey.bindings),
+            )
         if receipt["outcome"] == "completed":
             require(all(receipt["cleanup"].values()), "journey_cleanup_unsettled")
 

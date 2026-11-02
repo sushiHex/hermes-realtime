@@ -355,3 +355,52 @@ def test_preflight_never_contacts_runtime_and_existing_receipt_is_preserved(tmp_
     assert b"Private synthetic input" not in saved and b"preflight_only" in saved
     assert main(argv) == 1
     assert receipt.read_bytes() == saved
+
+
+def test_bootstrap_binding_mismatch_stops_only_the_just_issued_lease(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+
+    options = SimpleNamespace(
+        preview_dir=tmp_path,
+        native_profile=tmp_path,
+        browser_origin="http://127.0.0.1:1",
+        livekit_url="ws://127.0.0.1:2",
+    )
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "private-native-bearer")
+    requests = []
+
+    def request(origin, route, **kwargs):
+        requests.append((origin, route, kwargs.get("token")))
+        if route == "stable-bootstrap":
+            return 200, {"workerIdentity": "mismatched", "token": "private-issued-lease"}
+        assert route == "stop"
+        return 200, {}
+
+    monkeypatch.setattr(client, "request_json", request)
+    receipt = {"outcome": "refused"}
+    with pytest.raises(ValueError, match="journey_bootstrap_binding"):
+        asyncio.run(client.execute(options, [], receipt))
+    assert requests == [
+        (options.browser_origin, "stable-bootstrap", None),
+        (options.browser_origin, "stop", "private-issued-lease"),
+    ]
+    assert receipt["cleanup"] == {
+        "ownedTasksSettled": True,
+        "sessionStopped": True,
+        "roomDisconnected": True,
+    }
+    assert "private-" not in json.dumps(receipt)
+
+
+def test_missing_native_env_fails_before_bootstrap_network(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    options = SimpleNamespace(
+        preview_dir=tmp_path, native_profile=tmp_path, browser_origin="http://127.0.0.1:1"
+    )
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    monkeypatch.setattr(client, "request_json", lambda *a, **kw: pytest.fail("network before env"))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(client.execute(options, [], {"outcome": "refused"}))
