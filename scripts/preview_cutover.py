@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from scripts.native_work_profile import StatusServer
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 _PREFIX = "[voice-preview] "
 _STATUS_LIMIT = 8192
 _JSON_LIMIT = 65536

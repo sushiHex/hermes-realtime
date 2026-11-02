@@ -737,3 +737,13 @@ def test_lookup_gateway_manifest_uses_verified_distribution_record(tmp_path):
     plan.output.mkdir()
     manifest_path = preview_cutover._gateway_manifest(plan)
     assert json.loads(manifest_path.read_text())["recordPath"] == str(record)
+
+
+def test_isolated_operator_can_import_existing_process_owner():
+    code = (
+        "import runpy; runpy.run_path(" + repr(str(Path(preview_cutover.__file__))) + "); "
+        "from scripts.rehearse_desktop_mvp import Processes, Containment, started_at"
+    )
+    completed = subprocess.run([sys.executable, "-I", "-B", "-c", code],
+                               capture_output=True, text=True, timeout=20)
+    assert completed.returncode == 0, completed.stderr
