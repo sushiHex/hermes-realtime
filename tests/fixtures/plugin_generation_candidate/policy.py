@@ -15,6 +15,8 @@ import re
 import secrets
 import threading
 import time
+import weakref
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -806,7 +808,12 @@ class Generation:
         self.epoch = secrets.token_hex(16)
         self.lock = threading.RLock()
         self.members = MappingProxyType({})
-        self._membership_authority = self.members  # Retained until actual process exit.
+        self._membership_authority = self.members
+        self.terminal = MappingProxyType({})
+        self._terminal_authority = self.terminal
+        self.ordinary = weakref.WeakKeyDictionary()
+        self._ordinary_authority = self.ordinary
+        self.adapter = None
         self.budgets = {}  # Deliberately separate mutable rows.
         self.refused = frozenset()
         self._refusal_authority = self.refused
@@ -820,6 +827,98 @@ class Generation:
         self.late_denied = 0
         self.late_results = 0
         self.presentation = presentation
+
+    def bind_native(self, adapter):
+        from gateway.platforms import api_server, api_server_runs
+        for module, digest in (
+            (api_server, "6aec6687d47c81b3567e930882a499c5c5c041ecbe40e1d08f93038212401962"),
+            (api_server_runs, "048ae843592d701ff47437bd8edd47cd64ca6c0fdf88a71045bdb6fb337fbc63"),
+        ):
+            if hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() != digest:
+                raise ValueError("native-lifecycle-source")
+        if type(adapter) is not api_server.APIServerAdapter:
+            raise ValueError("native-lifecycle-adapter")
+        self.adapter = adapter
+        self.native_tasks = adapter._active_run_tasks
+        self.native_statuses = adapter._run_statuses
+        self.native_loop = asyncio.get_running_loop()
+        if (type(self.native_tasks) is not dict or type(self.native_statuses) is not dict
+                or self.native_loop.get_task_factory() is not None):
+            raise ValueError("native-lifecycle-composition")
+
+    def forget_ordinary(self, task):
+        with self.lock:
+            if self.ordinary is self._ordinary_authority:
+                self.ordinary.pop(task, None)
+
+    def captured_task(self, member, row):
+        # Adapter-free unit fixtures do not claim native lifecycle authority.
+        if self.adapter is None:
+            return row.get("native_task")
+        task = member[3]  # Immutable admission authority, never recovered from the row.
+        if row.get("native_task") is not task:
+            raise ValueError("native-task-authority")
+        return task
+
+    def retire(self):
+        """Only settled native tasks lose heavy state; old effects never become ordinary."""
+        with self.lock:
+            if not self.available():
+                return
+            members = dict(self.members)
+            terminal = dict(self.terminal)
+            for run_id, member in tuple(members.items()):
+                row = member[2]
+                try:
+                    task = self.captured_task(member, row)
+                except ValueError:
+                    self.refuse(run_id)
+                    self.work_refused()
+                    continue
+                if (task is not None and self.native_tasks.get(run_id) is not None
+                        and self.native_tasks.get(run_id) is not task):
+                    self.refuse(run_id)
+                    self.work_refused()
+                    continue
+                status = self.native_statuses.get(run_id) if self.adapter is not None else None
+                if (task is None or not task.done() or row.get("owned_work", 0) != 0
+                        or row.get("presentation_active") is not None
+                        or type(status) is not dict
+                        or status.get("status") not in {"completed", "failed", "cancelled"}):
+                    continue
+                if self.budgets.get(run_id) is not row:
+                    self.refuse(run_id)
+                    self.work_refused()
+                    continue
+                row["closed"] = True
+                terminal[run_id] = (member[0], member[1], run_id in self.refused)
+                while len(terminal) > 128:
+                    del terminal[next(iter(terminal))]
+                del members[run_id]
+                del self.budgets[run_id]
+                self.refused = self.refused - {run_id}
+            self.members = MappingProxyType(members)
+            self._membership_authority = self.members
+            self.terminal = MappingProxyType(terminal)
+            self._terminal_authority = self.terminal
+            self._refusal_authority = self.refused
+
+    def begin_work(self):
+        with self.lock:
+            _, row = self.scope()
+            if row is not None:
+                row["owned_work"] = row.get("owned_work", 0) + 1
+            return row
+
+    def end_work(self, row):
+        if row is not None:
+            with self.lock:
+                row["owned_work"] -= 1
+                self.retire()
+
+    def work_refused(self):
+        with contextlib.suppress(OSError, ValueError):
+            print('[lookup-lifecycle] {"category":"effect_refused"}', flush=True)
 
     def refusal_for(self, api_mode):
         if api_mode == "codex_responses":
@@ -843,14 +942,26 @@ class Generation:
     def close(self):
         with self.lock:
             self.closed = True
-            for _, _, row in self._membership_authority.values():
+            for member in self._membership_authority.values():
+                row = member[2]
                 row["closed"] = row["cancelled"] = True
                 self.cancel_presentation(row)
 
     def available(self):
+        lifecycle_invalid = (
+            self.terminal is not self._terminal_authority
+            or self.ordinary is not self._ordinary_authority
+            or (self.adapter is not None and (
+                self.adapter._active_run_tasks is not self.native_tasks
+                or self.adapter._run_statuses is not self.native_statuses
+                or self.native_loop.get_task_factory() is not None))
+        )
+        if lifecycle_invalid:
+            self.work_refused()
         if (
             self.members is not self._membership_authority
             or self.refused is not self._refusal_authority
+            or lifecycle_invalid
             or type(self.budgets) is not dict
             or not self.handles
             or not all(handle is not None and handle.active for handle in self.handles)
@@ -877,10 +988,29 @@ class Generation:
         if not self.available():
             raise ValueError("generation-unavailable")
         designated = run_id in self.members
+        if not designated and (
+            run_id in self.terminal or re.fullmatch(r"run_[0-9a-f]{32}", run_id)
+        ):
+            task = self.native_tasks.get(run_id) if self.adapter is not None else None
+            if (task is None or task.done() or self.ordinary.get(task) != run_id):
+                raise ValueError("retired-or-unbound-run")
         row = self.budgets.get(run_id)
-        if designated and (run_id in self.refused or row is not self.members[run_id][2]):
-            self.refuse(run_id)
-            raise ValueError("budget-unavailable")
+        if designated:
+            member = self.members[run_id]
+            if run_id in self.refused or row is not member[2]:
+                self.refuse(run_id)
+                raise ValueError("budget-unavailable")
+            try:
+                task = self.captured_task(member, row)
+            except ValueError:
+                self.refuse(run_id)
+                raise
+            if task is not None and (task.done() or (
+                self.native_tasks.get(run_id) is not None
+                and self.native_tasks.get(run_id) is not task
+            )):
+                self.refuse(run_id)
+                raise ValueError("budget-unavailable")
         return run_id, row if designated else None
 
     def readiness(self):
@@ -888,6 +1018,12 @@ class Generation:
             return {"ready": self.available(), "generation": self.epoch, "policy": VERSION}
 
     def wire(self, app, adapter):
+        try:
+            self.bind_native(adapter)
+        except BaseException:
+            self.closed = True
+            self.work_refused()
+            raise
         @web.middleware
         async def admission(request, handler):
             admitted_at = time.monotonic()
@@ -899,6 +1035,8 @@ class Generation:
             profile = request.match_info.get("profile")
             if profile and path.startswith("/p/" + profile + "/"):
                 path = path[len("/p/" + profile) :]
+
+            native_start = request.method == "POST" and path == "/v1/runs"
 
             async def call_native():
                 nonlocal native_error
@@ -916,6 +1054,7 @@ class Generation:
                     return web.json_response({"error": "policy_route_unsupported"}, status=400)
                 if starting:
                     with self.lock:
+                        self.retire()
                         if not self.available():
                             return web.json_response({"error": "policy_unavailable"}, status=503)
                         if selected not in {"", VERSION}:
@@ -940,12 +1079,12 @@ class Generation:
                         identity = hashlib.sha256(frozen(body).encode()).hexdigest()
                 response = await call_native()
                 with self.lock:
-                    if starting and response.status == 202:
+                    if native_start and response.status == 202:
                         if not self.available():
                             return web.json_response({"error": "policy_unavailable"}, status=503)
                         accepted = json.loads(response.body)
                         run_id = accepted["run_id"]
-                        known = self.members.get(run_id)
+                        known = self.members.get(run_id) or self.terminal.get(run_id)
                         if known is not None:
                             if not selected or known[:2] != (VERSION, identity):
                                 return web.json_response({"error": "policy_conflict"}, status=409)
@@ -954,7 +1093,12 @@ class Generation:
                                 return web.json_response(
                                     {"error": "policy_old_generation"}, status=409
                                 )
+                            task = self.native_tasks.get(run_id)
+                            if type(task) is not asyncio.Task or task.done():
+                                raise ValueError("native-task-binding")
                             row = {
+                                "native_task": task,
+                                "owned_work": 0,
                                 "deadline": admitted_at + 120,
                                 "phase": "new",
                                 "closed": False,
@@ -974,9 +1118,16 @@ class Generation:
                             }
                             self.budgets[run_id] = row
                             members = dict(self.members)
-                            members[run_id] = (VERSION, identity, row)
+                            members[run_id] = (VERSION, identity, row, task)
                             self.members = MappingProxyType(members)
                             self._membership_authority = self.members
+                            task.add_done_callback(lambda _: self.retire())
+                        elif accepted.get("replayed") is not True:
+                            task = self.native_tasks.get(run_id)
+                            if type(task) is not asyncio.Task or task.done():
+                                raise ValueError("native-task-binding")
+                            self.ordinary[task] = run_id
+                            task.add_done_callback(self.forget_ordinary)
                         if selected:
                             response.headers["X-Lookup-Generation"] = self.epoch
                             response.headers["X-Lookup-Policy"] = VERSION
@@ -1008,18 +1159,24 @@ class Generation:
                         run_id = path.split("/")[3]
                         if not self.available():
                             response.headers["X-Lookup-Policy-Outcome"] = "unavailable"
-                        elif run_id in self.members:
+                        elif run_id in self.members or run_id in self.terminal:
                             response.headers["X-Lookup-Generation"] = self.epoch
                             response.headers["X-Lookup-Policy"] = VERSION
                             response.headers["X-Lookup-Policy-Refused"] = (
-                                "true" if run_id in self.refused else "false"
+                                "true" if (run_id in self.refused or
+                                           self.terminal.get(run_id, (None, None, False))[2])
+                                else "false"
                             )
+                        elif re.fullmatch(r"run_[0-9a-f]{32}", run_id):
+                            response.headers["X-Lookup-Policy-Outcome"] = "unavailable"
+                            self.work_refused()
                 return response
             except BaseException:
                 if native_error:
                     raise
                 with self.lock:
                     self.closed = True
+                self.work_refused()
                 return web.json_response({"error": "policy_unavailable"}, status=503)
             finally:
                 if reserved:
@@ -1035,6 +1192,17 @@ class Generation:
         app.router.add_get("/lookup-policy/ready", ready)
 
     def model_gate(self, **kw):
+        try:
+            row = self.begin_work()
+        except BaseException:
+            self.work_refused()
+            return self.refusal_for(kw.get("api_mode", "chat_completions"))
+        try:
+            return self._model_gate(**kw)
+        finally:
+            self.end_work(row)
+
+    def _model_gate(self, **kw):
         run_id = ""
         row = None
         response = None
@@ -1344,6 +1512,17 @@ class Generation:
             print("[lookup-presentation] " + frozen(evidence), flush=True)
 
     def tool_gate(self, **kw):
+        try:
+            row = self.begin_work()
+        except BaseException:
+            self.work_refused()
+            return REFUSAL
+        try:
+            return self._tool_gate(**kw)
+        finally:
+            self.end_work(row)
+
+    def _tool_gate(self, **kw):
         run_id = ""
         token = None
         try:
@@ -1466,6 +1645,20 @@ class Generation:
         return allowed
 
     def wrap_search(self, original):
+        inner = self._wrap_search(original)
+        def guarded(args, **kw):
+            try:
+                row = self.begin_work()
+            except BaseException:
+                self.work_refused()
+                return REFUSAL
+            try:
+                return inner(args, **kw)
+            finally:
+                self.end_work(row)
+        return guarded
+
+    def _wrap_search(self, original):
         def guarded(args, **kw):
             run_id = ""
             try:
@@ -1526,6 +1719,20 @@ class Generation:
         return guarded
 
     def wrap_extract(self, original):
+        inner = self._wrap_extract(original)
+        async def guarded(args, **kw):
+            try:
+                row = self.begin_work()
+            except BaseException:
+                self.work_refused()
+                return REFUSAL
+            try:
+                return await inner(args, **kw)
+            finally:
+                self.end_work(row)
+        return guarded
+
+    def _wrap_extract(self, original):
         async def guarded(args, **kw):
             run_id = ""
             try:
@@ -1602,6 +1809,8 @@ class Generation:
                 if item.get("error") or item.get("blocked_by_policy"):
                     continue
                 title = item.get("title", "")
+                if title is None:
+                    title = ""
                 text = item.get("description" if kind == "search" else "content", "")
                 if type(title) is not str or type(text) is not str:
                     raise ValueError("evidence-shape")

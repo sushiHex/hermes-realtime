@@ -1392,6 +1392,17 @@ def _proposal_spoken_text(synthesizer: object, text: str) -> str | None:
     return projected if type(projected) is str else None
 
 
+def _proposal_confirmation_values(text: str) -> str | None:
+    """Expand only the numeric/date values known to be spoken by supported TTS."""
+    try:
+        from hermes_realtime.providers._speech_text import project_confirmation_values
+
+        projected = project_confirmation_values(text)
+    except Exception:
+        return None
+    return projected if type(projected) is str else None
+
+
 def _hermes_restart_notice(settlement: HermesRestartSettlement | None) -> str | None:
     """Tell the operator once what a start settled from a crashed session's run record."""
     if settlement is None or settlement.stopped + settlement.unknown == 0:
@@ -2276,6 +2287,7 @@ def build_local_host_launcher(
         proposals = ConversationTaskProposals(
             surface=work_surface, observer=observe_proposal,
             speech_projection=lambda text: _proposal_spoken_text(synthesizer, text),
+            confirmation_value_projection=_proposal_confirmation_values,
             start_policy=task_start_policy,
         )
 

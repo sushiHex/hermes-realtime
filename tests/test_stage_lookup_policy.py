@@ -163,6 +163,9 @@ async def test_staged_native_register_wires_only_real_policy_with_inert_dependen
         assert middleware == ["llm_execution", "tool_execution"]
         assert [platform for platform, _ in platforms] == ["api_server"]
         app = web.Application()
+        # This packaging check is deliberately adapter-free. Native lifecycle
+        # binding is exercised by the separate pinned-adapter proof.
+        monkeypatch.setattr(platforms[0][1].__self__, "bind_native", lambda _adapter: None)
         platforms[0][1](app, None)
         assert {route.resource.canonical for route in app.router.routes()} == {
             "/lookup-policy/ready"

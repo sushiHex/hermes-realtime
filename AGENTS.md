@@ -88,6 +88,10 @@ or an in-progress run; never imply that PR checks establish main's result.
 
 Windows is the primary target and several hazards are specific to it.
 
+- For private profile diagnostics, use `scripts/profile_summary.py` to emit
+  allowlisted routing metadata. Never print or search raw private configuration,
+  `.env`, authentication caches, or environment dumps into tool output. Read
+  needed private fields internally without rendering their values.
 - Every operation that loads anything into VRAM must go through `vram-mcp`,
   including inference that may implicitly load a model. A status check, reservation,
   or claim followed by a direct API, script, or native-launcher load is not sufficient.

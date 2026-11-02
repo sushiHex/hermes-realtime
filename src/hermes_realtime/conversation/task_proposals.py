@@ -80,6 +80,7 @@ class ConversationTaskProposals:
         observer: Callable[[str, dict[str, _PublicValue]], None],
         clock: Callable[[], float] = time.monotonic,
         speech_projection: Callable[[str], str | None] | None = None,
+        confirmation_value_projection: Callable[[str], str | None] | None = None,
         start_policy: TaskStartPolicy = "confirm",
     ) -> None:
         validate_task_start_policy(start_policy)
@@ -90,6 +91,11 @@ class ConversationTaskProposals:
         self._proposal_prefix = secrets.token_hex(8)
         self._proposal_serial = 0
         self._speech_projection = speech_projection
+        self._confirmation_value_projection = (
+            (lambda text: text)
+            if confirmation_value_projection is None
+            else confirmation_value_projection
+        )
         self._binding: tuple[str, int] | None = None
         self._pending: TaskProposal | None = None
         self._pending_visible = False
@@ -136,16 +142,26 @@ class ConversationTaskProposals:
             return
         self._readback_settled = True
         project = self._speech_projection
+        spoken_readback: str | None = None
+        canonical_readback: str | None = None
+        if project is not None:
+            try:
+                spoken_readback = project(proposal.readback)
+                canonical_readback = self._confirmation_value_projection(proposal.readback)
+            except Exception:
+                pass
         if (
             self._deadline is not None
             and self._clock() < self._deadline
-            and confirmed_text == proposal.readback
+            and type(confirmed_text) is str
             and type(queued_chunks) is int
             and type(confirmed_chunks) is int
             and queued_chunks > 0
             and queued_chunks == confirmed_chunks
             and project is not None
-            and project(proposal.readback) == proposal.readback
+            and spoken_readback is not None
+            and canonical_readback is not None
+            and spoken_readback == canonical_readback == confirmed_text
         ):
             self._readback_complete = proposal
             self._deadline = self._clock() + 60.0
