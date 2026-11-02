@@ -107,13 +107,14 @@ _BACKGROUND_INSTRUCTIONS = (
     "tool, failed command, or empty output as a negative finding; state the failure or "
     "uncertainty unless positive evidence verifies the result. Return the final answer exactly "
     "<voice>one or two natural conversational sentences, at most 220 characters, covering "
-    "the direct answer and all material findings from detail, including source attribution "
-    "when source-backed</voice><detail>friendly, naturally written, display-ready supporting "
-    "detail, at most 1800 characters. Preserve every material finding, its useful context, "
-    "uncertainty, and source attribution; do not collapse a multi-item result into a terse "
-    "headline list</detail>. Voice and detail must be semantically consistent; detail may "
-    "expand voice but must not replace its important findings. Do not put line breaks or "
-    "markup inside voice, or text outside these elements."
+    "the direct answer and all material findings from detail. Name or cite sources only "
+    "when the objective asks for them</voice><detail>friendly, naturally written, display-ready "
+    "supporting detail, at most 1800 characters. Preserve every material finding, "
+    "its useful context, uncertainty, and source attribution; do not collapse a "
+    "multi-item result into a terse headline list</detail>. Voice and detail must "
+    "be semantically consistent; detail may expand voice but must not replace its "
+    "important findings. Do not put line breaks or markup inside voice, or text "
+    "outside these elements."
 )
 
 
@@ -154,8 +155,11 @@ class HermesApiConfig:
     run_reasoning_effort: str | None = None
     run_service_tier: str | None = None
     lookup_policy: str | None = None
+    discover_tools: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.discover_tools) is not bool:
+            raise TypeError("discover_tools must be an exact boolean")
         if type(self.base_url) is not str:
             raise TypeError("base_url must be an exact built-in string")
         parsed = urlsplit(self.base_url)
@@ -342,6 +346,7 @@ class HermesApiTaskSession:
         self._restart_settlement: HermesRestartSettlement | None = None
         self._started = False
         self._closed = False
+        self._configured_tools: tuple[str, ...] | None = None
 
     async def start(self) -> None:
         async with self._state_lock:
@@ -426,6 +431,19 @@ class HermesApiTaskSession:
                     or endpoint.get("path") != path
                 ):
                     raise RuntimeError(f"Hermes API endpoint capability is invalid: {name}")
+            configured_tools = None
+            if self._config.discover_tools:
+                from .tool_catalog import TOOL_CATALOG_PATH, parse_tool_catalog
+
+                try:
+                    tool_status, catalog = await self._request_json("GET", TOOL_CATALOG_PATH)
+                    if tool_status != 200:
+                        raise ValueError("tool catalog unavailable")
+                    configured_tools = parse_tool_catalog(catalog)
+                except Exception:
+                    print('[hermes-tool-catalog] {"category":"discovery_refused","version":1}',
+                          flush=True)
+                    raise RuntimeError("Hermes API tool catalog discovery failed") from None
             settlement: HermesRestartSettlement | None = None
             if self._run_record_path is not None:
                 settlement = await self._settle_run_record(self._run_record_path, resend_window)
@@ -440,7 +458,13 @@ class HermesApiTaskSession:
                 raise RuntimeError("Hermes API task session closed during startup")
             self._resend_window = resend_window
             self._restart_settlement = settlement
+            self._configured_tools = configured_tools
             self._started = True
+
+    @property
+    def configured_tools(self) -> tuple[str, ...] | None:
+        """Startup-resolved native names; descriptive data, never execution authority."""
+        return self._configured_tools if self._started and not self._closed else None
 
     def _release_run_record(self) -> None:
         owner = self._record_owner

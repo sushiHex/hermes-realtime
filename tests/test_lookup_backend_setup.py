@@ -1,6 +1,11 @@
 """Consequential selection controls for the explicit disposable setup command."""
 
+import base64
+import csv
+import hashlib
+import io
 import json
+import zipfile
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +13,93 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.setup_lookup_backend import validate_manifest
+
+
+def _record(members: dict[str, bytes], record: str) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    for name, raw in sorted(members.items()):
+        if name == record:
+            writer.writerow((name, "", ""))
+        else:
+            digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
+            writer.writerow((name, "sha256=" + digest, str(len(raw))))
+    return output.getvalue().encode()
+
+
+def _runtime_comparator_fixture(tmp_path: Path, wheel_source: bytes):
+    from scripts import setup_lookup_backend as setup
+
+    source_root = tmp_path / "alternate-candidate"
+    source_package = source_root / "src" / "hermes_realtime"
+    source_package.mkdir(parents=True)
+    (source_package / "__init__.py").write_bytes(b"source package bytes")
+    hermes_source = tmp_path / "alternate-hermes"
+    hermes_source.mkdir()
+    candidate = "a" * 40
+    tree = "b" * 40
+    hermes_revision = "c" * 40
+    info = "hermes_realtime-0.0.3.dist-info"
+    record = info + "/RECORD"
+    package_name = "hermes_realtime/__init__.py"
+    wheel_members = {package_name: wheel_source}
+    wheel_members[record] = b""
+    wheel_members[record] = _record(wheel_members, record)
+    wheel = tmp_path / "runtime.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, raw in wheel_members.items():
+            archive.writestr(name, raw)
+
+    target = tmp_path / "target"
+    target.mkdir()
+    installed = {name: raw for name, raw in wheel_members.items() if name != record}
+    installed.update(
+        {
+            info + "/INSTALLER": b"uv",
+            info + "/REQUESTED": b"",
+            info + "/direct_url.json": b"{}",
+            info + "/uv_cache.json": b"{}",
+            "bin/hermes-realtime-host.exe": b"host exe",
+            "bin/hermes-realtime-local.exe": b"local exe",
+        }
+    )
+    installed[record] = _record(installed | {record: b""}, record)
+    for name, raw in installed.items():
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
+    (target / ".lock").write_bytes(b"")
+
+    value = manifest(tmp_path)
+    value.update(
+        candidate=candidate,
+        tree=tree,
+        hermes_source=str(hermes_source),
+        runtime_target=str(target),
+        wheel=str(wheel),
+        wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
+    )
+    calls = []
+
+    def git(path, *arguments):
+        calls.append((Path(path), arguments))
+        if Path(path) == source_root:
+            return {
+                ("rev-parse", "HEAD"): candidate,
+                ("rev-parse", "HEAD^{tree}"): tree,
+                ("status", "--porcelain=v1"): "",
+                ("ls-tree", "-r", "--name-only", candidate, "--", "src/hermes_realtime"):
+                    "src/hermes_realtime/__init__.py",
+            }.get(arguments, "")
+        if Path(path) == hermes_source:
+            return {
+                ("rev-parse", "HEAD"): hermes_revision,
+                ("diff", "--name-only", "HEAD", "--", "*.py"): "",
+                ("ls-files", "--others", "--exclude-standard", "--", "*.py"): "",
+            }.get(arguments, "")
+        pytest.fail("runtime verifier used a path outside its explicit source bindings")
+
+    return setup, value, source_root, hermes_revision, calls, git, record
 
 
 def manifest(tmp_path):
@@ -230,6 +322,37 @@ def test_untracked_python_refused_before_wheel_read(monkeypatch, tmp_path):
     )
     with pytest.raises(ValueError, match="hermes_untracked_python"):
         setup.verify_runtime(value)
+
+
+def test_runtime_comparator_accepts_parameterized_source_and_hermes_revision(
+    monkeypatch, tmp_path
+):
+    setup, value, source_root, hermes_revision, calls, git, record = _runtime_comparator_fixture(
+        tmp_path, b"source package bytes"
+    )
+    monkeypatch.setattr(setup, "git", git)
+
+    result = setup.verify_runtime(
+        value, source_root=source_root, hermes_revision=hermes_revision
+    )
+
+    assert result["packageFiles"] == 1
+    assert Path(result["recordPath"]).as_posix().endswith(record)
+    assert any(path == source_root for path, _ in calls)
+    assert any(path == Path(value["hermes_source"]) for path, _ in calls)
+    assert all(path != setup.ROOT for path, _ in calls)
+
+
+def test_parameterized_runtime_comparator_keeps_source_wheel_byte_equality(
+    monkeypatch, tmp_path
+):
+    setup, value, source_root, hermes_revision, _, git, _ = _runtime_comparator_fixture(
+        tmp_path, b"wheel source mismatch"
+    )
+    monkeypatch.setattr(setup, "git", git)
+
+    with pytest.raises(ValueError, match="source_wheel"):
+        setup.verify_runtime(value, source_root=source_root, hermes_revision=hermes_revision)
 
 
 def test_default_preparation_never_executes_task(monkeypatch, tmp_path, capsys):

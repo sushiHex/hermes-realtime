@@ -62,6 +62,9 @@ def register(context: object) -> None:
     global _runtime, _companion
     with _lock:
         _runtime = HermesPluginRuntime(context)
+        from .integration.tool_catalog import register_tool_catalog
+
+        register_tool_catalog(context)
         try:
             endpoint = companion_endpoint(os.environ)
         except ValueError:

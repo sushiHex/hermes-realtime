@@ -1304,6 +1304,7 @@ def _build_streaming_inference(
     knowledge_timing_observer: Callable[[dict[str, _PublicValue]], None] | None = None,
     knowledge_coordinator: KnowledgePrefetchCoordinator | None = None,
     hermes_context: HermesRepresentativeContext | None = None,
+    background_tools: Callable[[], tuple[str, ...] | None] | None = None,
     output_style: Callable[[], str] | None = None,
 ) -> OllamaStreamingInference | CodexAppServerStreamingInference:
     if type(inference_provider) is not str:
@@ -1352,6 +1353,8 @@ def _build_streaming_inference(
         }
         if hermes_context is not None:
             codex_options["hermes_context"] = hermes_context
+        if background_tools is not None:
+            codex_options["background_tools"] = background_tools
         return CodexAppServerStreamingInference(**codex_options)  # type: ignore[arg-type]
     raise ValueError("inference_provider must be exactly 'ollama' or 'codex'")
 
@@ -1842,6 +1845,7 @@ def build_local_host_launcher(
     hermes_api_bearer: str | None,
     hermes_api_url: str = DEFAULT_HERMES_API_URL,
     hermes_lookup_policy: str | None = None,
+    hermes_discover_tools: bool = False,
     hermes_model_source: Literal["foreground", "gateway"] = "foreground",
     livekit_url: str = "ws://127.0.0.1:7880",
     livekit_api_key: str = "devkey",
@@ -1902,6 +1906,8 @@ def build_local_host_launcher(
     or qualify the experimental policy plugin.
     ``hermes_model_source="gateway"`` delegates background model selection to the
     gateway configuration; the default retains the foreground Codex overrides.
+    ``hermes_discover_tools`` reads the plugin's authenticated native inventory
+    for descriptive foreground context; it does not grant execution authority.
     ``task_start_policy="automatic"`` applies standing host authorization to valid
     natural task selections; the default retains per-objective confirmation.
     ``voice_tail`` names the durable heard-context file; None disables it.
@@ -1910,6 +1916,8 @@ def build_local_host_launcher(
     """
 
     validate_task_start_policy(task_start_policy)
+    if type(hermes_discover_tools) is not bool:
+        raise TypeError("hermes_discover_tools must be an exact boolean")
     if type(hermes_model_source) is not str or hermes_model_source not in ("foreground", "gateway"):
         try:
             raise ValueError("hermes_model_source must be exactly 'foreground' or 'gateway'")
@@ -1936,6 +1944,8 @@ def build_local_host_launcher(
         if voice_tail is None:
             raise ValueError("archiving through the companion needs a voice tail")
     if qualification_no_hermes_tasks:
+        if hermes_discover_tools:
+            raise ValueError("qualification no-task composition rejects Hermes tool discovery")
         if hermes_lookup_policy is not None:
             raise ValueError("qualification no-task composition rejects a lookup policy")
         if hermes_api_bearer is not None:
@@ -2054,6 +2064,7 @@ def build_local_host_launcher(
             run_reasoning_effort=codex_effort if foreground_model else None,
             run_service_tier="priority" if foreground_model else None,
             lookup_policy=hermes_lookup_policy,
+            discover_tools=hermes_discover_tools,
         )
     )
     livekit_url = _validate_livekit_origin(livekit_url, remote_mode=remote_mode)
@@ -2371,6 +2382,9 @@ def build_local_host_launcher(
                 knowledge_timing_observer=lambda data: observe("knowledge_timing", data),
                 knowledge_coordinator=knowledge_coordinator,
                 hermes_context=hermes_context,
+                background_tools=(
+                    lambda: cast(HermesApiTaskSession, task_session).configured_tools
+                ) if hermes_discover_tools and not qualification_no_hermes_tasks else None,
                 output_style=output_style_selection.get,
             )
         )
