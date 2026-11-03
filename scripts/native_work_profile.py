@@ -22,6 +22,27 @@ class StatusServer:
     python_user_base: Path | None = None
 
 
+def web_evidence_selected(config: dict[str, Any]) -> bool:
+    """Read an explicit deployment choice; never infer grounding from tool names."""
+    settings = config.get("plugins", {}).get("entries", {}).get(
+        "hermes-realtime", {}
+    ).get("settings", {})
+    selected = settings.get("web_evidence", False)
+    if type(selected) is not bool:
+        raise ValueError("native web evidence selection refused")
+    if selected:
+        presentation = settings.get("presentation")
+        if type(presentation) is not dict:
+            raise ValueError("native web evidence presentation refused")
+        from hermes_realtime.integration.presentation_transport import Presentation
+
+        try:
+            Presentation(presentation)
+        except (TypeError, ValueError):
+            raise ValueError("native web evidence presentation refused") from None
+    return selected
+
+
 def _server_config(server: StatusServer) -> dict[str, Any]:
     if (
         not server.command.is_absolute()
@@ -80,6 +101,7 @@ def validate_native_work_profile(config: dict[str, Any], server: StatusServer) -
         or entry.get("settings", {}).get("background_capabilities") is not True
     ):
         raise ValueError("native plugin capability refused")
+    web_evidence_selected(config)
     return {
         "version": 1,
         "mode": "native-work/v1",

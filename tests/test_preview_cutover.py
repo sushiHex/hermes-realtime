@@ -14,6 +14,67 @@ import pytest
 from scripts import preview_cutover
 
 
+def test_native_evidence_host_selection_is_explicit():
+    from scripts.preview_cutover import native_web_evidence_contract
+
+    assert native_web_evidence_contract({}) is None
+    config = {"plugins": {"entries": {"hermes-realtime": {"settings": {
+        "web_evidence": True,
+        "presentation": {
+            "provider": "synthetic", "base_url": "https://example.invalid/v1",
+            "model": "synthetic", "api_key_env": "SYNTHETIC_KEY",
+        },
+    }}}}}
+    assert native_web_evidence_contract(config) == "hermes.web-evidence/v1"
+    config["plugins"]["entries"]["hermes-realtime"]["settings"]["web_evidence"] = "true"
+    with pytest.raises(ValueError, match="evidence"):
+        native_web_evidence_contract(config)
+
+
+@pytest.mark.asyncio
+async def test_native_preview_forwards_evidence_contract_to_actual_launcher(tmp_path, monkeypatch):
+    plan_path, profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    config_path = profile / "config.yaml"
+    config = json.loads(config_path.read_text())
+    config["plugins"]["entries"]["hermes-realtime"]["settings"].update({
+        "web_evidence": True,
+        "presentation": {
+            "provider": "synthetic", "base_url": "https://example.invalid/v1",
+            "model": "synthetic", "api_key_env": "SYNTHETIC_KEY",
+        },
+    })
+    config_path.write_text(json.dumps(config))
+    plan.output.mkdir()
+    (plan.output / "host.stop").touch()
+    calls = []
+
+    class Launcher:
+        async def start(self):
+            calls.append("start")
+
+        async def close(self):
+            calls.append("close")
+
+    def build(*, hermes_discover_tools=False, hermes_web_evidence_contract=None, **kwargs):
+        assert hermes_discover_tools is True
+        assert hermes_web_evidence_contract == "hermes.web-evidence/v1"
+        assert kwargs["hermes_lookup_policy"] is None
+        return Launcher()
+
+    host = SimpleNamespace(
+        _load_api_bearer=lambda _: "synthetic-not-a-credential",
+        _load_voice_companion=lambda *_: None,
+        LoopbackPeerAuthorizer=object,
+        build_local_host_launcher=build,
+    )
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda _: (plan, None, profile))
+    monkeypatch.setattr(preview_cutover, "_runtime_modules", lambda _: (None, host))
+    assert await preview_cutover._host_child(tmp_path / "active.json") == 0
+    assert calls == ["start", "close"]
+
+
+
 def test_failure_metadata_keeps_operator_category_without_echoing_dependency_errors():
     try:
         preview_cutover.require(False, "runtime_import_origin")

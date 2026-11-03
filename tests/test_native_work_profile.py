@@ -83,6 +83,43 @@ def test_lookup_plugin_is_removed_only_from_the_new_profile_copy(server):
     assert set(config["plugins"]["entries"]) == {"hermes-realtime"}
 
 
+@pytest.mark.parametrize("selection", ["true", 1, {}, None])
+def test_native_web_evidence_requires_an_explicit_boolean(server, selection):
+    original = base_config()
+    original["plugins"]["entries"]["hermes-realtime"]["settings"] = {
+        "web_evidence": selection
+    }
+    with pytest.raises(ValueError, match="evidence"):
+        build_native_work_profile(original, server)
+
+
+def test_native_web_evidence_requires_a_reviewed_presentation_route(server):
+    original = base_config()
+    original["plugins"]["entries"]["hermes-realtime"]["settings"] = {"web_evidence": True}
+    with pytest.raises(ValueError, match="evidence"):
+        build_native_work_profile(original, server)
+
+
+def test_explicit_web_presentation_preserves_native_capabilities(server):
+    original = base_config()
+    settings = {
+        "web_evidence": True,
+        "presentation": {
+            "provider": "synthetic", "base_url": "https://example.invalid/v1",
+            "model": "synthetic-model", "api_key_env": "SYNTHETIC_KEY",
+        },
+    }
+    original["plugins"]["entries"]["hermes-realtime"]["settings"] = settings
+    before = copy.deepcopy(original)
+    config = build_native_work_profile(original, server)
+    assert original == before
+    staged = config["plugins"]["entries"]["hermes-realtime"]["settings"]
+    assert staged == settings | {"background_capabilities": True}
+    assert config["approvals"] == original["approvals"]
+    assert config["platform_toolsets"]["api_server"] == ["web", "mcp-vram"]
+    assert validate_native_work_profile(config, server)["lookup_policy"] is None
+
+
 @pytest.mark.parametrize(
     "change",
     [

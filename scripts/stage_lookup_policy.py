@@ -10,15 +10,21 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "2e528940b23b0d3283e47655b058f99098b2a2cb"
+REVIEWED_REVISION = "64601d0181df5cea70380f990a944f9eb62a37e4"
 REVIEWED_SOURCES = {
     "entrypoint.py": "484ff3b2743e824abe22d3c6a87d3af26912ccc07f891286f088a6971d32ae50",
-    "policy.py": "9edc019732016302f4fd7d4075cc2a20f28b4cacf74a2f6603ee0a9a87055529",
+    "policy.py": "0dbcf1d93cb4faba1fd8a6f527f69c808e07004764c7c1847932ac52d1bf90d5",
 }
-REVIEWED_SIZES = {"entrypoint.py": 2612, "policy.py": 88352}
+REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53711}
+REVIEWED_SHARED_SOURCES = {
+    "evidence_presentation": "290806de8f8d738f603823ef24c772a24db0b6395422b5c11e16b6a85d27c47f",
+    "presentation_transport": "e184625c744eac4016961eeb30068daaee2e1504eadd0cf28fa85e7569219d36",
+}
+REVIEWED_SHARED_SIZES = {"evidence_presentation": 22348, "presentation_transport": 16614}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
@@ -44,6 +50,17 @@ def stage_lookup_policy(owned_profile: Path, reviewed_source: Path) -> dict[str,
     try:
         if owned_profile.is_symlink() or not owned_profile.is_dir() or any(owned_profile.iterdir()):
             raise StagingRefusal(category)
+        # The fixture now imports the shipped formatter. Pin its actual runtime
+        # implementation too; reviewing the thinner facade alone is insufficient.
+        category = "reviewed-runtime-mismatch"
+        for name, expected in REVIEWED_SHARED_SOURCES.items():
+            module = importlib.import_module("hermes_realtime.integration." + name)
+            if module.__file__ is None:
+                raise StagingRefusal(category)
+            with Path(module.__file__).open("rb") as stream:
+                raw = stream.read(REVIEWED_SHARED_SIZES[name] + 1)
+            if hashlib.sha256(raw).hexdigest() != expected:
+                raise StagingRefusal(category)
         category = "reviewed-source-unreadable"
         try:
             payloads = {}

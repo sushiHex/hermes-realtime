@@ -23,6 +23,7 @@ import aiohttp
 
 from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
 from hermes_realtime.integration import run_record
+from hermes_realtime.integration import web_evidence_contract as web_contract
 from hermes_realtime.integration.run_record import PendingRun
 from hermes_realtime.protocol import (
     CancelScope,
@@ -145,6 +146,8 @@ class HermesApiConfig:
     ``lookup_policy`` designates every dispatch through this adapter for a dedicated
     ordinary-lookup deployment. None keeps native runs unchanged. Selection is a
     trusted host decision, never a classifier or a model-supplied field.
+    ``web_evidence_contract`` is a separate default-off native presentation
+    attestation. Mixed work remains ordinary, explicitly ungrounded output.
     """
 
     base_url: str
@@ -157,6 +160,7 @@ class HermesApiConfig:
     run_reasoning_effort: str | None = None
     run_service_tier: str | None = None
     lookup_policy: str | None = None
+    web_evidence_contract: str | None = None
     discover_tools: bool = False
 
     def __post_init__(self) -> None:
@@ -227,6 +231,12 @@ class HermesApiConfig:
             type(self.lookup_policy) is not str or self.lookup_policy != _LOOKUP_POLICY
         ):
             raise ValueError("lookup_policy is unsupported")
+        if self.web_evidence_contract is not None and (
+            type(self.web_evidence_contract) is not str
+            or self.web_evidence_contract != web_contract.CONTRACT
+            or self.lookup_policy is not None
+        ):
+            raise ValueError("web_evidence_contract is unsupported or conflicts with lookup_policy")
         if self.run_service_tier not in {None, "auto", "default", "priority"}:
             raise ValueError("run_service_tier is unsupported")
 
@@ -239,7 +249,8 @@ class HermesApiConfig:
             f"settlement_poll_seconds={self.settlement_poll_seconds!r}, "
             f"run_provider={self.run_provider!r}, run_model={self.run_model!r}, "
             f"run_reasoning_effort={self.run_reasoning_effort!r}, "
-            f"run_service_tier={self.run_service_tier!r}, lookup_policy={self.lookup_policy!r})"
+            f"run_service_tier={self.run_service_tier!r}, lookup_policy={self.lookup_policy!r}, "
+            f"web_evidence_contract={self.web_evidence_contract!r})"
         )
 
     __str__ = __repr__
@@ -279,6 +290,7 @@ class _RunAuthority:
     event_task: asyncio.Task[None] | None = None
     terminal: bool = False
     lookup_generation: str | None = None
+    web_evidence_generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,7 +581,8 @@ class HermesApiTaskSession:
                 "/v1/runs",
                 body=entry.body,
                 headers={"Idempotency-Key": entry.key}
-                | ({"X-Lookup-Policy": entry.lookup_policy} if entry.lookup_policy else {}),
+                | ({"X-Lookup-Policy": entry.lookup_policy} if entry.lookup_policy else {})
+                | self._web_selection_headers(entry),
             )
         except RuntimeError:
             return "unknown"
@@ -589,6 +602,11 @@ class HermesApiTaskSession:
         operation = asyncio.current_task()
         if operation is None:
             raise RuntimeError("Hermes API dispatch requires an asyncio task")
+        web_generation = None
+        if self._config.web_evidence_contract is not None:
+            async with self._state_lock:
+                self._require_started_locked()
+            web_generation = await self._web_readiness()
         async with self._state_lock:
             self._require_started_locked()
             if trusted.task_id in self._runs_by_task or trusted.task_id in self._pending_dispatches:
@@ -607,7 +625,7 @@ class HermesApiTaskSession:
                     accepted=False,
                     reason="background task capacity exhausted",
                 )
-            pending = self._mint_pending_run(trusted)
+            pending = self._mint_pending_run(trusted, web_evidence_generation=web_generation)
             if self._run_record_path is not None:
                 self._record_pending.append(pending)
             self._pending_dispatches.add(trusted.task_id)
@@ -633,7 +651,13 @@ class HermesApiTaskSession:
                 self._pending_dispatches.discard(trusted.task_id)
                 self._inflight_dispatches.discard(operation)
 
-    def _mint_pending_run(self, trusted: WorkDispatchRequestedEvent) -> PendingRun:
+    def _mint_pending_run(
+        self, trusted: WorkDispatchRequestedEvent, *, web_evidence_generation: str | None = None
+    ) -> PendingRun:
+        if not web_contract.valid_selection(
+            self._config.web_evidence_contract, web_evidence_generation
+        ):
+            raise ValueError("web evidence readiness generation is required before dispatch")
         body: dict[str, object] = {
             "input": trusted.payload.objective,
             "instructions": _BACKGROUND_INSTRUCTIONS,
@@ -653,7 +677,9 @@ class HermesApiTaskSession:
         key = secrets.token_hex(16) if self._resend_window is not None else None
         # Wall-clock time also counts a suspended host, which the retention window does.
         return PendingRun(
-            key=key, minted_at=time.time(), body=body, lookup_policy=self._config.lookup_policy
+            key=key, minted_at=time.time(), body=body, lookup_policy=self._config.lookup_policy,
+            web_evidence_contract=self._config.web_evidence_contract,
+            web_evidence_generation=web_evidence_generation,
         )
 
     async def _dispatch_admitted(
@@ -745,6 +771,14 @@ class HermesApiTaskSession:
             finally:
                 self._lookup_refusal("acknowledgment")
             raise RuntimeError("Hermes lookup policy acknowledgment is not authoritative")
+        if pending.web_evidence_contract is not None and not self._web_binding(
+            response_headers, pending.web_evidence_generation, api_run_id
+        ):
+            try:
+                await self._settle_unpublished(api_run_id)
+            finally:
+                self._web_refusal("acknowledgment")
+            raise RuntimeError("Hermes web evidence acknowledgment is not authoritative")
         private_token = self._private_id_factory()
         if type(private_token) is not str or _PRIVATE_TOKEN.fullmatch(private_token) is None:
             await self._settle_unpublished(api_run_id)
@@ -762,6 +796,7 @@ class HermesApiTaskSession:
             api_run_id=api_run_id,
             protocol_run_id=protocol_run_id,
             lookup_generation=generation,
+            web_evidence_generation=pending.web_evidence_generation,
         )
         publication_error: RuntimeError | None = None
         async with self._state_lock:
@@ -807,6 +842,9 @@ class HermesApiTaskSession:
         headers = {}
         if pending.lookup_policy is not None:
             headers["X-Lookup-Policy"] = pending.lookup_policy
+            options["response_headers"] = response_headers
+        if pending.web_evidence_contract is not None:
+            headers.update(self._web_selection_headers(pending))
             options["response_headers"] = response_headers
         if window is None or pending.key is None:
             if headers:
@@ -1211,6 +1249,9 @@ class HermesApiTaskSession:
         if event == "run.completed" and authority.lookup_generation is not None:
             payload = await self._lookup_completion(authority)
             event = payload["event"]
+        if event == "run.completed" and authority.web_evidence_generation is not None:
+            payload = await self._web_completion(authority)
+            event = payload["event"]
         if event == "run.completed":
             output = self._completed_result_text(payload.get("output"))
             status = WorkTerminalStatus.COMPLETED
@@ -1348,6 +1389,70 @@ class HermesApiTaskSession:
                 flush=True,
             )
 
+    @staticmethod
+    def _web_refusal(category: str) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            print("[hermes-web-evidence] " + json.dumps(
+                {"category": category, "version": 1}, separators=(",", ":"), sort_keys=True
+            ), flush=True)
+
+    @staticmethod
+    def _web_selection_headers(pending: PendingRun) -> dict[str, str]:
+        if pending.web_evidence_contract is None:
+            if pending.web_evidence_generation is not None:
+                raise ValueError("web evidence selection is incomplete")
+            return {}
+        if not web_contract.valid_selection(
+            pending.web_evidence_contract, pending.web_evidence_generation
+        ):
+            raise ValueError("web evidence selection is incomplete")
+        assert pending.web_evidence_generation is not None
+        return {web_contract.CONTRACT_HEADER: pending.web_evidence_contract,
+                web_contract.GENERATION_HEADER: pending.web_evidence_generation}
+
+    async def _web_readiness(self) -> str:
+        status, body = await self._request_json("GET", web_contract.READY_PATH)
+        generation = body.get("generation")
+        if (status != 200 or set(body) != {"contract", "generation", "ready"}
+                or body.get("ready") is not True or body.get("contract") != web_contract.CONTRACT
+                or not web_contract.valid_generation(generation)):
+            self._web_refusal("readiness")
+            raise RuntimeError("Hermes web evidence readiness is not authoritative")
+        assert isinstance(generation, str)
+        return generation
+
+    @staticmethod
+    def _web_binding(headers: dict[str, str], generation: str | None, run_id: str) -> bool:
+        return (web_contract.valid_generation(generation)
+                and headers.get(web_contract.CONTRACT_HEADER.lower()) == web_contract.CONTRACT
+                and headers.get(web_contract.GENERATION_HEADER.lower()) == generation
+                and headers.get(web_contract.RUN_HEADER.lower()) == run_id)
+
+    async def _web_completion(self, authority: _RunAuthority) -> dict[str, Any]:
+        """No-web/mixed preserve ordinary output, without a factual-grounding claim."""
+        headers: dict[str, str] = {}
+        status, body = await self._request_json(
+            "GET", f"/v1/runs/{quote(authority.api_run_id, safe='')}",
+            response_headers=headers,
+        )
+        if (status != 200 or body.get("object") != "hermes.run"
+                or body.get("run_id") != authority.api_run_id):
+            raise RuntimeError("Hermes web evidence status lacks native authority")
+        terminal = self._terminal_from_status(authority.api_run_id, body)
+        if terminal is None:
+            raise RuntimeError("Hermes web evidence completion lacks terminal authority")
+        if terminal["event"] != "run.completed":
+            return terminal
+        assert authority.web_evidence_generation is not None
+        if web_contract.attestation_valid(
+            headers.get(web_contract.ATTESTATION_HEADER.lower()),
+            authority.web_evidence_generation, authority.api_run_id, terminal.get("output"),
+        ):
+            return terminal
+        self._web_refusal("completion")
+        return {"event": "run.failed", "run_id": authority.api_run_id,
+                "error": "The task did not return a verified presentation. Please try again."}
+
     async def _lookup_readiness(self) -> str:
         status, body = await self._request_json("GET", "/lookup-policy/ready")
         generation = body.get("generation")
@@ -1435,7 +1540,7 @@ class HermesApiTaskSession:
                 if response_headers is not None:
                     response_headers.clear()
                     for name in response.headers:
-                        if name.lower().startswith("x-lookup-"):
+                        if name.lower().startswith(("x-lookup-", "x-web-evidence-")):
                             values = response.headers.getall(name)
                             response_headers[name.lower()] = values[0] if len(values) == 1 else ""
                 return response.status, payload

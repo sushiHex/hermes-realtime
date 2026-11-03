@@ -13,6 +13,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_realtime.integration.web_evidence_contract import valid_selection
+
 _VERSION = 1
 _KEY = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_FIELDS = frozenset({"input", "instructions", "provider", "model", "model_options"})
@@ -27,6 +29,8 @@ class PendingRun:
     minted_at: float
     body: dict[str, object]
     lookup_policy: str | None = None
+    web_evidence_contract: str | None = None
+    web_evidence_generation: str | None = None
 
 
 def max_run_record_bytes(max_entries: int, max_request_bytes: int) -> int:
@@ -184,12 +188,21 @@ def run_record_bytes(pending: list[PendingRun], admitted: list[str]) -> bytes:
             type(entry.lookup_policy) is not str or entry.lookup_policy != "ordinary-lookup/v1"
         ):
             raise ValueError("pending lookup policy is unsupported")
-    version = 2 if any(entry.lookup_policy is not None for entry in pending) else _VERSION
+        if not valid_selection(entry.web_evidence_contract, entry.web_evidence_generation) or (
+            entry.lookup_policy is not None and entry.web_evidence_contract is not None
+        ):
+            raise ValueError("pending web evidence contract is unsupported")
+    version = (
+        3 if any(entry.web_evidence_contract is not None for entry in pending)
+        else 2 if any(entry.lookup_policy is not None for entry in pending) else _VERSION
+    )
     document = {
         "admitted": admitted,
         "pending": [
             {"key": entry.key, "minted_at": entry.minted_at, "request": entry.body}
-            | ({"lookup_policy": entry.lookup_policy} if version == 2 else {})
+            | ({"lookup_policy": entry.lookup_policy} if version >= 2 else {})
+            | ({"web_evidence_contract": entry.web_evidence_contract,
+                "web_evidence_generation": entry.web_evidence_generation} if version == 3 else {})
             for entry in pending
         ],
         "version": version,
@@ -214,7 +227,7 @@ def parse_run_record(
     if type(document) is not dict or set(document) != {"admitted", "pending", "version"}:
         return None
     version, pending, admitted = document["version"], document["pending"], document["admitted"]
-    if type(version) is not int or version not in {_VERSION, 2}:
+    if type(version) is not int or version not in {_VERSION, 2, 3}:
         return None
     if type(pending) is not list or type(admitted) is not list:
         return None
@@ -230,11 +243,19 @@ def parse_run_record(
     entries: list[PendingRun] = []
     keys: set[str] = set()
     for entry in pending:
-        fields = {"key", "minted_at", "request"} | ({"lookup_policy"} if version == 2 else set())
+        fields = {"key", "minted_at", "request"} | ({"lookup_policy"} if version >= 2 else set())
+        if version == 3:
+            fields |= {"web_evidence_contract", "web_evidence_generation"}
         if type(entry) is not dict or set(entry) != fields:
             return None
         policy = entry.get("lookup_policy")
         if policy is not None and (type(policy) is not str or policy != "ordinary-lookup/v1"):
+            return None
+        contract = entry.get("web_evidence_contract")
+        generation = entry.get("web_evidence_generation")
+        if not valid_selection(contract, generation) or (
+            policy is not None and contract is not None
+        ):
             return None
         key, minted_at, request = entry["key"], entry["minted_at"], entry["request"]
         if key is not None:
@@ -245,7 +266,9 @@ def parse_run_record(
             return None
         if not _is_run_request(request, max_request_bytes):
             return None
-        entries.append(PendingRun(key=key, minted_at=minted_at, body=request, lookup_policy=policy))
+        entries.append(PendingRun(key=key, minted_at=minted_at, body=request, lookup_policy=policy,
+                                  web_evidence_contract=contract,
+                                  web_evidence_generation=generation))
     return entries, run_ids
 
 

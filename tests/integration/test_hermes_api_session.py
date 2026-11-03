@@ -3109,7 +3109,7 @@ def _record_text(**fields: object) -> str:
     [
         pytest.param("not json", id="not-json"),
         pytest.param("[]", id="not-an-object"),
-        pytest.param(_record_text(version=3), id="unknown-version"),
+        pytest.param(_record_text(version=4), id="unknown-version"),
         pytest.param(_record_text(version=True), id="version-not-int"),
         pytest.param(_record_text(extra=1), id="extra-field"),
         pytest.param(json.dumps({"admitted": [], "version": 1}), id="missing-field"),

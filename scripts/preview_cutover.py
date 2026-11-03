@@ -725,6 +725,12 @@ def verify_speech_assets(plan: PreviewPlanV1, home: Path | None = None) -> dict[
     }
 
 
+def native_web_evidence_contract(config: dict[str, Any]) -> str | None:
+    from scripts.native_work_profile import web_evidence_selected
+
+    return "hermes.web-evidence/v1" if web_evidence_selected(config) else None
+
+
 def verify_host_profile_mode(plan: PreviewPlanV1) -> None:
     import importlib
     import inspect
@@ -738,6 +744,12 @@ def verify_host_profile_mode(plan: PreviewPlanV1) -> None:
         parameters = inspect.signature(module.build_local_host_launcher).parameters
         if plan.policy_mode == "native":
             require("hermes_discover_tools" in parameters, "native_discovery_unavailable")
+            config = _profile_config(_read(plan.profile_source / "config.yaml", _JSON_LIMIT))
+            if native_web_evidence_contract(config) is not None:
+                require(
+                    "hermes_web_evidence_contract" in parameters,
+                    "native_web_evidence_unavailable",
+                )
         else:
             require("hermes_lookup_policy" in parameters, "lookup_policy_unavailable")
     finally:
@@ -1491,6 +1503,12 @@ async def _host_child(active_path: Path) -> int:
         "voice_tail": plan.output / "state" / "voice-tail-v1.json",
         "voice_companion": companion,
     }
+    if plan.policy_mode == "native":
+        config = _profile_config(_read(profile / "config.yaml", _JSON_LIMIT))
+        contract = native_web_evidence_contract(config)
+        if contract is not None:
+            require("hermes_web_evidence_contract" in parameters, "native_web_evidence_unavailable")
+            kwargs["hermes_web_evidence_contract"] = contract
     if "hermes_discover_tools" in parameters:
         kwargs["hermes_discover_tools"] = discover
     launcher = host.build_local_host_launcher(**kwargs)

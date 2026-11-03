@@ -69,6 +69,15 @@ post-stop Connect cause, or physical recovery. Those limits remain tracked in
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159). This addition does
 not advance the page-wide reviewed baseline.
 
+Native web-only background work can opt into the
+[versioned evidence handoff](native-web-evidence.md), separately from the selected
+lookup policy. The formatter reuses its bounded same-run passage package; the
+host validates generation, run identity and exact output binding before
+publication. Nonweb and mixed work retain ordinary native behavior, with mixed
+results explicitly outside this grounding claim. These boundaries do not prove
+factual entailment or completeness; semantic quality remains tracked in
+[#386](https://github.com/sushiHex/hermes-realtime/issues/386).
+
 The browser history presentation keeps worker results in one expandable task
 card per task identity, alongside the independently delivered assistant transcript.
 Active cards move into a stack only after reaching the history viewport top;

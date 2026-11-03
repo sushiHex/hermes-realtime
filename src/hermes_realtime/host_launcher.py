@@ -1845,6 +1845,7 @@ def build_local_host_launcher(
     hermes_api_bearer: str | None,
     hermes_api_url: str = DEFAULT_HERMES_API_URL,
     hermes_lookup_policy: str | None = None,
+    hermes_web_evidence_contract: str | None = None,
     hermes_discover_tools: bool = False,
     hermes_model_source: Literal["foreground", "gateway"] = "foreground",
     livekit_url: str = "ws://127.0.0.1:7880",
@@ -1904,6 +1905,9 @@ def build_local_host_launcher(
     ``hermes_lookup_policy`` explicitly designates all background runs through this
     host's API adapter. None preserves ordinary native runs; this does not install
     or qualify the experimental policy plugin.
+    ``hermes_web_evidence_contract`` separately opts native runs into web-evidence
+    attestation. No-web and mixed-ungrounded outcomes retain ordinary output;
+    they do not establish factual grounding or enable lookup tool restrictions.
     ``hermes_model_source="gateway"`` delegates background model selection to the
     gateway configuration; the default retains the foreground Codex overrides.
     ``hermes_discover_tools`` reads the plugin's authenticated native inventory
@@ -1948,6 +1952,8 @@ def build_local_host_launcher(
             raise ValueError("qualification no-task composition rejects Hermes tool discovery")
         if hermes_lookup_policy is not None:
             raise ValueError("qualification no-task composition rejects a lookup policy")
+        if hermes_web_evidence_contract is not None:
+            raise ValueError("qualification no-task composition rejects a web evidence contract")
         if hermes_api_bearer is not None:
             raise ValueError("qualification no-task composition rejects Hermes credentials")
         if allow_unsandboxed_tasks or natural_work_tools:
@@ -2064,6 +2070,7 @@ def build_local_host_launcher(
             run_reasoning_effort=codex_effort if foreground_model else None,
             run_service_tier="priority" if foreground_model else None,
             lookup_policy=hermes_lookup_policy,
+            web_evidence_contract=hermes_web_evidence_contract,
             discover_tools=hermes_discover_tools,
         )
     )
