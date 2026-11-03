@@ -194,3 +194,33 @@ async def test_deferred_source_catalog_speaks_each_label_once_without_losing_lin
     assert result_event.kind == "task_result"
     assert result_event.data["taskId"] == "task_source_catalog"
     assert result_event.data["text"] == detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle", [False, True])
+async def test_dated_utc_result_localizes_speech_and_keeps_original_detail(monkeypatch, idle):
+    from datetime import datetime, timedelta, timezone
+
+    from hermes_realtime.providers import _speech_text
+
+    class LocalClock(datetime):
+        def astimezone(self, tz=None):
+            assert tz is None
+            return datetime(2026, 11, 3, 12, 53,
+                            tzinfo=timezone(timedelta(hours=-8), "Pacific Standard Time"))
+
+    monkeypatch.setattr(_speech_text, "datetime", LocalClock)
+    voice = "It was 72°F at 20:53 UTC on November 3, 2026."
+    detail = voice + "\n\nSource timestamp: 2026-11-03T20:53:00Z."
+    projection = BrowserEventProjection()
+    directive = await ProactiveCompletionUpdatePolicy(
+        projection=projection, floor_available=lambda: idle,
+    ).decide(UpdatePolicyInput(sequence=1, completion=TaskTerminalOutcome(
+        task_id="task_local_time", status="completed",
+        summary=f"<voice>{voice}</voice><detail>{detail}</detail>",
+    ), context=ConversationContextStore().snapshot()))
+    expected = ("It was 72 degrees Fahrenheit at 12:53 PM Pacific Standard Time "
+                "on November 3, 2026.")
+    assert projection.events_after(0)[-1].data["text"] == detail
+    assert directive.kind == ("interrupt" if idle else "mention_next")
+    assert (directive.text if idle else directive.speech_text) == expected

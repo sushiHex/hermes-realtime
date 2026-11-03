@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import datetime
+from datetime import UTC, datetime
 
 _ISO_INSTANT = re.compile(
     r"(?<![\w/])[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9]"
@@ -13,6 +13,22 @@ _ISO_INSTANT = re.compile(
 _MONTHS = (
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
+)
+_UTC_DATE = (r"(?P<month>" + "|".join(_MONTHS)
+             + r")[ \t]+(?P<day>[0-9]{1,2}),?[ \t]+(?P<year>[0-9]{4})")
+_UTC_CLOCK = r"(?P<hour>[0-9]{1,2}):(?P<minute>[0-9]{2})(?::(?P<second>[0-9]{2}))?"
+_UTC_PROSE = (
+    re.compile(r"(?<![\w/])" + _UTC_CLOCK + r"[ \t]+UTC,?[ \t]+on[ \t]+" + _UTC_DATE
+               + r"(?![\w/+-]|\.\d)"),
+    re.compile(r"(?<![\w/])" + _UTC_DATE + r",?[ \t]+at[ \t]+" + _UTC_CLOCK
+               + r"[ \t]+UTC(?![\w:/+-]|\.\d)"),
+)
+# Only new prose forms exclude literal/source spans; existing ISO behavior stays intact.
+_PROSE_LITERALS = re.compile(
+    r'https?://\S+|www\.\S+|`[^`]*`|"(?:\\.|[^"\\])*"|“[^”]*”|'
+    r"(?<!\w)'(?:\\.|(?<=\w)'(?=\w)|[^'\\])*'(?!\w)|"
+    r"‘(?:(?<=\w)’(?=\w)|[^’])*’(?!\w)",
+    re.IGNORECASE,
 )
 _TEMPERATURE = re.compile(
     r"(?<![\w.])(?P<value>[+\-−]?(?:\d+(?:\.\d+)?|\.\d+))[ \t]*"
@@ -34,6 +50,10 @@ def _local_instant(match: re.Match[str]) -> str:
     except (ValueError, OverflowError, OSError):
         # An invalid/unsupported date remains source text; never guess its instant.
         return original
+    return _spoken_local_instant(local)
+
+
+def _spoken_local_instant(local: datetime) -> str:
     zone = local.tzname() or f"UTC{local.strftime('%z')}"
     clock = f"{local.hour % 12 or 12}:{local.minute:02d}"
     if local.second:
@@ -43,10 +63,31 @@ def _local_instant(match: re.Match[str]) -> str:
             f"{_MONTHS[local.month - 1]} {local.day}, {local.year}")
 
 
+def _local_utc_prose(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        if any(start < match.end() and match.start() < end for start, end in literals):
+            return match.group()
+        try:
+            instant = datetime(
+                int(match["year"]), _MONTHS.index(match["month"]) + 1, int(match["day"]),
+                int(match["hour"]), int(match["minute"]), int(match["second"] or 0),
+                tzinfo=UTC,
+            )
+            return _spoken_local_instant(instant.astimezone())
+        except (ValueError, OverflowError, OSError):
+            return match.group()
+
+    for pattern in _UTC_PROSE:
+        literals = tuple(match.span() for match in _PROSE_LITERALS.finditer(text))
+        text = pattern.sub(replace, text)
+    return text
+
+
 def project_confirmation_values(text: str) -> str:
     """Expand only explicit numeric units and instants for exact spoken confirmation."""
     projected = _TEMPERATURE.sub(_temperature_value, text)
     projected = _ISO_INSTANT.sub(_local_instant, projected)
+    projected = _local_utc_prose(projected)
     if len(projected) > 4096:
         raise ValueError("projected speech text exceeds supported bounds")
     return projected

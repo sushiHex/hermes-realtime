@@ -306,7 +306,7 @@ def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     instructions = setup.module.PRESENTATION_INSTRUCTIONS
     assert "Return JSON with exactly answer and source_ids" in instructions
     assert "Lead is a complete standalone conversational answer" in instructions
-    assert "host speaks lead verbatim" in instructions
+    assert "host uses this lead for speech with deterministic unit/time projection" in instructions
     assert "at most 220 characters" in instructions
     assert "complete display" in instructions and "limited to 1800 characters" in instructions
     assert "Put every supported requested date, qualification" in instructions
@@ -331,6 +331,7 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert set(body) == {
         "model", "messages", "response_format", "max_tokens", "stream", "reasoning_effort"
     }
+    assert "Use ordinary spoken language" in body["messages"][0]["content"]
     assert body["reasoning_effort"] == "none"
     assert body["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(body["messages"][-1]["content"])
@@ -563,6 +564,7 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     assert len(s.captured["responses_requests"]) == 1
     body = s.captured["responses_requests"][0]
     assert set(body) == {"model", "instructions", "input", "store", "stream", "text", "reasoning"}
+    assert "Use ordinary spoken language" in body["instructions"]
     assert body["model"] == CODEX_CONFIG["model"]
     assert body["store"] is False and body["stream"] is True
     assert body["reasoning"] == {"effort": "low"}

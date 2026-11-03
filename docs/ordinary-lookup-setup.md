@@ -387,8 +387,12 @@ ISO timestamp in its short voice projection; the host renders that instant with
 the operating system's local-time rules, including date rollover and daylight
 saving. The detailed source timestamp remains unchanged. Missing or ambiguous
 dates/zones are not guessed. This is host-local time, not automatic inference of
-another location's timezone. Foreground prose follows wording guidance; only
-explicit ISO instants have deterministic conversion. A speech expansion that
+another location's timezone. The shared speech/confirmation projection also
+recognizes the fully dated forms `20:53 UTC on November 3, 2026` and
+`November 3, 2026 at 20:53 UTC` (full month names, optional seconds). New prose
+recognition excludes balanced quoted/code literals and URL spans. It does not
+interpret general English, infer omitted dates/zones, or detect a request to keep
+unquoted UTC. Source detail stays exact. A speech expansion that
 would exceed the existing visual voice bound retains the original visual text;
 TTS still applies the local-time projection.
 
