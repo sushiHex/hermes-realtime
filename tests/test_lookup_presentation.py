@@ -22,6 +22,43 @@ CONFIG = {
 CODEX_CONFIG = CONFIG | {"api_mode": "codex_responses"}
 
 
+def test_selected_lookup_reuses_shipped_presentation_implementation(setup):
+    from hermes_realtime.integration import evidence_presentation, presentation_transport
+
+    assert setup.module.Presentation is presentation_transport.Presentation
+    assert setup.module.presentation_input is evidence_presentation.presentation_input
+    assert setup.module.PRESENTATION_SCHEMA is evidence_presentation.PRESENTATION_SCHEMA
+    assert setup.module.PRESENTATION_INSTRUCTIONS is evidence_presentation.PRESENTATION_INSTRUCTIONS
+    assert setup.module._raw_responses_result is evidence_presentation._raw_responses_result
+    assert setup.module._consume_codex_stream is presentation_transport._consume_codex_stream
+
+
+def test_shipped_presentation_imports_without_native_sdk_or_tools():
+    import os
+    import subprocess
+
+    code = '''
+import importlib.abc
+import sys
+
+class NoNativeImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'openai', 'httpx', 'agent', 'tools'}:
+            raise AssertionError('native dependency imported before formatter call')
+        return None
+
+sys.meta_path.insert(0, NoNativeImports())
+from hermes_realtime.integration import evidence_presentation, presentation_transport
+assert evidence_presentation.PRESENTATION_SCHEMA
+assert presentation_transport.Presentation
+'''
+    subprocess.run(
+        [sys.executable, "-c", code],
+        env=os.environ | {"PYTHONPATH": str(SOURCE.parents[2].parent / "src")},
+        capture_output=True, check=True, timeout=15,
+    )
+
+
 def completion(content, *, reason="stop", calls=None):
     return SimpleNamespace(
         id="original-id", model="test-model", created=42,
