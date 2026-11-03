@@ -25,7 +25,8 @@ _UTC_PROSE = (
 )
 # Only new prose forms exclude literal/source spans; existing ISO behavior stays intact.
 _PROSE_LITERALS = re.compile(
-    r'https?://\S+|www\.\S+|`[^`]*`|"(?:\\.|[^"\\])*"|“[^”]*”|'
+    r'https?://\S+|www\.\S+|(?<!`)(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)|'
+    r'"(?:\\.|[^"\\])*"|“[^”]*”|'
     r"(?<!\w)'(?:\\.|(?<=\w)'(?=\w)|[^'\\])*'(?!\w)|"
     r"‘(?:(?<=\w)’(?=\w)|[^’])*’(?!\w)",
     re.IGNORECASE,

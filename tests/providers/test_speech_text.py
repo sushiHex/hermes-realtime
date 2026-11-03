@@ -97,6 +97,10 @@ async def test_local_timestamp_projection_reaches_both_backends_preserving_sourc
     r'Quote "Say \"20:53 UTC on November 3, 2026\""',
     r"Quote 'Say \'November 3, 2026 at 20:53 UTC\''",
     "Code `20:53 UTC on November 3, 2026`.",
+    pytest.param("``20:53 UTC on November 3, 2026``", id="double_backtick_literal"),
+    pytest.param("````\nNovember 3, 2026 at 20:53 UTC\n````", id="four_backtick_fence"),
+    pytest.param("``Keep `20:53 UTC on November 3, 2026` exact``",
+                 id="backtick_literal_with_shorter_runs"),
     "```\nNovember 3, 2026 at 20:53 UTC\n```",
 ])
 def test_ambiguous_invalid_and_embedded_timestamps_remain_exact(monkeypatch, source) -> None:
