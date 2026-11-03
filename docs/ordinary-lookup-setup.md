@@ -339,7 +339,9 @@ startup-resolved inventory as descriptive foreground context. It grants no
 foreground execution authority. Actual work still requires an accepted native
 dispatch and retains its existing approval, cancellation, and recovery behavior.
 The maintained [preview command](../scripts/preview_cutover.py) keeps native and
-lookup deployment modes explicit.
+lookup deployment modes explicit. For persistent operator use, follow the
+[independent `launch` path](native-work-preview.md), which does not inherit a coding
+controller's lifetime. Unrelated owner failures can still make the preview unavailable.
 
 Start only the pinned Hermes gateway, using `hermes gateway run`, under the
 existing [Processes/Containment owner](../scripts/rehearse_desktop_mvp.py).
