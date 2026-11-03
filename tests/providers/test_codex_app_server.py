@@ -3925,6 +3925,116 @@ async def test_codex_accepts_trace_exact_namespace_and_nullable_lifecycle_fields
     await inference.close()
 
 
+class TimestampMetadataCodexTransport(ManualDynamicCodexTransport):
+    def __init__(self, fields: dict[str, object], phase: str = "both") -> None:
+        super().__init__()
+        self.fields = fields
+        self.phase = phase
+
+    async def receive(self) -> Mapping[str, object]:
+        message = await super().receive()
+        if (message.get("method") in {"item/started", "item/completed"}
+                and (self.phase == "both" or message["method"] == self.phase)):
+            params = message["params"]
+            assert type(params) is dict
+            item = params["item"]
+            assert type(item) is dict
+            item.update(self.fields)
+        return message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", [
+    {},
+    {"startedAtMs": None, "completedAtMs": None},
+    {"startedAtMs": 0, "completedAtMs": (1 << 63) - 1},
+    # Nested timestamps are inert: no relationship to each other or outer timestamps.
+    {"startedAtMs": 900, "completedAtMs": 3},
+])
+async def test_codex_accepts_observed_nested_timestamp_metadata(fields) -> None:
+    transport = TimestampMetadataCodexTransport(fields)
+    handler = FakeWorkToolHandler()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        request_timeout_seconds=1,
+    )
+    inference.bind_work_tools(handler)
+    stream_task = asyncio.create_task(_collect_stream(inference, "turn_nested_timestamps"))
+    try:
+        await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
+        await transport.start_item(optional_fields=True)
+        await transport.request_tool(request_id="timestamp_call")
+        response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
+        await transport.complete_item(response, optional_fields=True)
+        await transport.complete_turn(delta="Handled.")
+        _assert_proposal(await asyncio.wait_for(stream_task, timeout=0.2), inference)
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["item/started", "item/completed"])
+@pytest.mark.parametrize("field", ["startedAtMs", "completedAtMs"])
+@pytest.mark.parametrize("value", [True, -1, 1 << 63, 1.0, "1", {}, []])
+async def test_codex_rejects_invalid_nested_timestamp_metadata(phase, field, value) -> None:
+    transport = TimestampMetadataCodexTransport({field: value}, phase)
+    handler = FakeWorkToolHandler()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        request_timeout_seconds=1,
+    )
+    inference.bind_work_tools(handler)
+    stream_task = asyncio.create_task(_collect_stream(inference, "turn_bad_nested_timestamp"))
+    try:
+        await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
+        await transport.start_item(optional_fields=True)
+        if phase == "item/completed":
+            await transport.request_tool(request_id="timestamp_call")
+            response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
+            await transport.complete_item(response, optional_fields=True)
+        with pytest.raises(RuntimeError) as failure:
+            await asyncio.wait_for(stream_task, timeout=0.2)
+        assert isinstance(failure.value.__cause__, RuntimeError)
+        assert "nested timestamp is invalid" in str(failure.value.__cause__)
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("violation", ["unknown_field", "cross_turn", "arguments"])
+async def test_codex_nested_timestamps_preserve_exact_lifecycle_authority(violation) -> None:
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=ManualDynamicCodexTransport,
+    )
+    handler = FakeWorkToolHandler()
+    inference.bind_work_tools(handler)
+    inference._advertised_dynamic_tools["thread_metadata"] = frozenset({("hermes", "start_work")})
+    inference._server_turn_ready["thread_metadata"] = asyncio.Event()
+    item = {"id": "call_metadata", "type": "dynamicToolCall", "tool": "start_work",
+            "namespace": "hermes", "arguments": {"objective": "Inspect the build"},
+            "status": "inProgress", "startedAtMs": 9, "completedAtMs": None}
+    params = {"threadId": "thread_metadata", "turnId": "turn_metadata", "item": item,
+              "startedAtMs": 1}
+    try:
+        inference._handle_dynamic_lifecycle("item/started", params, item)
+        completed = item | {"status": "failed", "completedAtMs": 10}
+        params = {"threadId": "thread_metadata", "turnId": "turn_metadata",
+                  "item": completed, "completedAtMs": 2}
+        if violation == "unknown_field":
+            completed["futureAtMs"] = 10
+        elif violation == "cross_turn":
+            params["turnId"] = "turn_foreign"
+        else:
+            completed["arguments"] = {"objective": "Different work"}
+        with pytest.raises(RuntimeError):
+            inference._handle_dynamic_lifecycle("item/completed", params, completed)
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+    finally:
+        await inference.close()
+
+
 @pytest.mark.asyncio
 async def test_codex_server_request_id_does_not_resolve_colliding_client_id() -> None:
     class CollidingIdTransport(DynamicStartCodexTransport):

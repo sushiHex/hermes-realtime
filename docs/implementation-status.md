@@ -78,6 +78,14 @@ results explicitly outside this grounding claim. These boundaries do not prove
 factual entailment or completeness; semantic quality remains tracked in
 [#386](https://github.com/sushiHex/hermes-realtime/issues/386).
 
+The foreground Codex adapter accepts the two optional nested lifecycle timestamps
+observed from CLI 0.166.0 as nullable, nonnegative int64 metadata. It does not use
+them for execution, ordering, deadlines or model context; all call identity and
+argument checks remain independent, and other unknown fields remain refused.
+The generated dynamic-item schema omitted these observed fields; the bounded
+wire evidence and compatibility decision belong to
+[#420](https://github.com/sushiHex/hermes-realtime/issues/420).
+
 The browser history presentation keeps worker results in one expandable task
 card per task identity, alongside the independently delivered assistant transcript.
 Active cards move into a stack only after reaching the history viewport top;

@@ -2369,6 +2369,8 @@ class CodexAppServerStreamingInference:
             "contentItems",
             "durationMs",
             "success",
+            "startedAtMs",
+            "completedAtMs",
         }
         if not required_item <= set(item) <= allowed_item:
             raise RuntimeError("Codex dynamic tool lifecycle item is invalid")
@@ -2462,6 +2464,15 @@ class CodexAppServerStreamingInference:
         cls,
         item: Mapping[str, object],
     ) -> None:
+        # CLI 0.166.0 emits these nested fields although its generated dynamic-item
+        # schema omits them. Accept only inert nullable int64 metadata; outer
+        # lifecycle timestamps and all tool/turn authority checks remain separate.
+        for key in ("startedAtMs", "completedAtMs"):
+            timestamp = item.get(key)
+            if timestamp is not None and (
+                type(timestamp) is not int or not 0 <= timestamp <= (1 << 63) - 1
+            ):
+                raise RuntimeError("Codex dynamic tool nested timestamp is invalid")
         if "contentItems" in item:
             content_items = item.get("contentItems")
             if content_items is not None:
