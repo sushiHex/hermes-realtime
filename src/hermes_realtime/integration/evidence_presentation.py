@@ -38,7 +38,15 @@ REFUSAL = json.dumps({"error": "policy_refused"})
 PRESENTATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "answer": {"type": "string", "minLength": 1, "maxLength": 1800},
+        "answer": {
+            "type": "object",
+            "properties": {
+                "lead": {"type": "string", "minLength": 1, "maxLength": 220},
+                "support": {"type": "string", "maxLength": 1800},
+            },
+            "required": ["lead", "support"],
+            "additionalProperties": False,
+        },
         "source_ids": {"type": "array", "minItems": 0, "maxItems": 256,
                        "items": {"type": "integer", "minimum": 0, "maximum": 255}},
     },
@@ -57,26 +65,24 @@ PRESENTATION_INSTRUCTIONS = (
     "the supplied evidence is insufficient; never infer absent context. "
     "An extract-unavailable entry means returned extraction identity could not be bound "
     "to that requested source; its text was omitted, not verified as empty. "
-    "Return JSON with exactly answer and source_ids. Write one evidence-grounded answer "
-    "narrative. Its first paragraph must be a complete standalone conversational answer "
-    "to the objective, including the most material qualification, at most 220 characters, "
-    "with no line breaks or markup in that paragraph. The host speaks that exact paragraph "
-    "verbatim. Keep source names, domains, and citations out of that lead unless the "
-    "objective explicitly asks for sources. Put useful supporting detail, requested dates, "
-    "uncertainty, and source "
-    "attribution in later paragraphs separated by a blank line. Preserve supported material "
-    "findings and useful context; do not collapse multi-item results into terse headlines. "
-    "The complete answer is at most 1800 characters including any host Sources footer. "
-    "Do not truncate or paraphrase the first paragraph for display; keep the full answer "
-    "as the detail. Select only unique catalog IDs that support the answer; use an empty "
+    "Return JSON with exactly answer and source_ids. Answer must contain exactly lead and "
+    "support. Lead is a complete standalone conversational answer to the objective, "
+    "including the most material qualification, at most 220 characters, with no line "
+    "breaks or markup. The host speaks lead verbatim. Keep source names, domains, and "
+    "citations out of lead unless the objective asks for sources. Put every supported "
+    "requested date, qualification, useful context, uncertainty, and source attribution in "
+    "support; do not omit these to shorten lead or collapse multi-item results into headlines. "
+    "Support may be empty only when lead fully answers the objective. The complete display, "
+    "including source footer, is limited to 1800 characters. Select only unique catalog IDs "
+    "that support the answer; use an empty "
     "source_ids array when no supplied source supports a factual answer. If evidence is "
     "insufficient, say what cannot be established without guessing. Never invent sources. "
-    "Do not write URLs or voice/detail markup in the answer; the host renders selected URLs. "
+    "Do not write URLs or voice/detail markup in lead or support; the host renders selected URLs. "
     "Do not add outside facts, tools or actions. Use full month names in prose. Encode a "
     "supported, fully dated and explicitly zoned instant as YYYY-MM-DDTHH:MM:SSZ or with "
     "its numeric offset; the host renders host-local time. Preserve the original source "
-    "timestamp in later detail. Never invent a missing date or zone; retain uncertainty. "
-    "Do not put markup delimiters inside the answer."
+    "timestamp in support. Never invent a missing date or zone; retain uncertainty. "
+    "Do not put markup delimiters inside lead or support."
 )
 
 def frozen(value: object) -> str:
@@ -411,13 +417,23 @@ def render_presentation_response(
     evidence["stage"] = "content"
     answer = value["answer"]
     if (
-        type(answer) is not str or not answer.strip() or len(answer) > 1800
-        or any(token in answer for token in (
-                    "<voice>", "</voice>", "<detail>", "</detail>"))):
+        type(answer) is not dict or set(answer) != {"lead", "support"}
+    ):
+        raise ValueError("presentation-content")
+    lead, support = answer["lead"], answer["support"]
+    if (
+        type(lead) is not str
+        or not lead.strip()
+        or len(lead) > 220
+        or "\n" in lead
+        or "\r" in lead
+        or type(support) is not str
+        or len(support) > 1800
+        or any(
+            token in lead + support for token in ("<voice>", "</voice>", "<detail>", "</detail>")
+        )
+    ):
             raise ValueError("presentation-content")
-    lead = answer.split("\n\n", 1)[0]
-    if not lead.strip() or len(lead) > 220 or "\n" in lead or "\r" in lead:
-        raise ValueError("presentation-lead")
     evidence["stage"] = "source-selection"
     ids = value["source_ids"]
     if type(ids) is not list:
@@ -433,10 +449,10 @@ def render_presentation_response(
         raise ValueError("presentation-source-id-duplicate")
     evidence["selected_source_count"] = len(ids)
     evidence["stage"] = "inline-links"
-    if any(marker in answer.casefold()
+    if any(marker in (lead + "\n\n" + support).casefold()
            for marker in ("http://", "https://", "www.")):
         raise ValueError("presentation-inline-link")
-    detail = answer
+    detail = lead + ("\n\n" + support if support else "")
     if ids:
         detail += "\n\nSources:\n" + "\n".join(catalog[index] for index in ids)
     evidence["stage"] = "content"

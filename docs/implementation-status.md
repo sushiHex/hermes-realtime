@@ -74,8 +74,8 @@ Native web-only background work can opt into the
 lookup policy. The formatter reuses its bounded same-run passage package; the
 host validates generation, run identity and exact output binding before
 publication. Shared presentation synthesizes one evidence-only answer; its bounded
-opening paragraph supplies canonical speech, while display retains that same
-answer and any selected source links. Native draft prose is excluded from formatter
+lead supplies canonical speech, while display composes that same lead with an
+explicit supporting-detail slot and any selected source links. Native draft prose is excluded from formatter
 input. Empty citation selection can express uncertainty without a sources footer.
 This removes separately authored speech/detail summaries but does not prove logical
 consistency within an answer. Nonweb and mixed work retain ordinary native behavior, with mixed

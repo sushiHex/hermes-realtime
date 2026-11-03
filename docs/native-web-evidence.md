@@ -63,14 +63,17 @@ native task's lifetime, with a plugin-owned 120-second allowance measured from
 admission. That allowance does not shorten ordinary or mixed native work.
 Cancellation/unload closes owned formatter work and prevents late publication.
 
-The formatter returns one `answer` narrative and `source_ids`. Its first paragraph
-is a standalone gist of at most 220 characters, used verbatim as the canonical
-speech text. Display retains the full narrative and the validated sources footer,
-within the existing 1800-character detail bound. Overlong openings are refused,
-never truncated or independently summarized. Normal speech normalization still
-applies after this projection. An empty source list is permitted for uncertainty
-and produces no sources footer. This shares wording between speech and display;
-it does not mechanically prove agreement between paragraphs or factual support.
+The formatter returns one `answer` object with required `lead` and `support`
+strings, plus `source_ids`. The lead is a standalone gist of at most 220 characters,
+used verbatim as canonical speech text. Display composes that same lead and any
+nonempty support into one narrative, followed by the validated sources footer.
+The combined display still fits the existing 1800-character detail bound. Support
+can be empty when the lead fully answers the request, including honest uncertainty;
+its explicit slot retains requested supporting dates and qualifications for richer
+answers. Overlong leads are refused, never truncated or independently summarized.
+Normal speech normalization still applies after this projection. An empty source
+list is permitted for uncertainty and produces no sources footer. Shared wording
+and a required support slot do not prove agreement or factual completeness.
 
 The observer bounds active rows, retained source bytes, source membership and
 observations before presenting. Exceeding an observation bound refuses

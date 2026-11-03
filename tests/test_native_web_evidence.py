@@ -124,8 +124,10 @@ class _Presentation:
                     message=SimpleNamespace(
                         content=json.dumps(
                             {
-                                "answer": "The report found a supported result.\n\n"
-                                "The retrieved report supports this result.",
+                                "answer": {
+                                    "lead": "The report found a supported result.",
+                                    "support": "The retrieved report supports this result.",
+                                },
                                 "source_ids": [0],
                             }
                         ),

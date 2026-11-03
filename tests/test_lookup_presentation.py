@@ -196,7 +196,7 @@ def setup(monkeypatch, request):
                 await captured["callback"]()
             return captured.get(
                 "response", completion(
-                    '{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}'
+                    '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
                 ),
             )
 
@@ -243,12 +243,14 @@ def setup(monkeypatch, request):
 
     def codex_events(response=None, *, deltas=None):
         response = response or codex_response([
-            codex_message('{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}')
+            codex_message(
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+            )
         ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7),
         )
         events = [SimpleNamespace(type="response.created")]
         events.extend(SimpleNamespace(type="response.output_text.delta", delta=delta)
-                      for delta in (deltas or ['{"answer":"Short."}']))
+                      for delta in (deltas or ['{"answer":{"lead":"Short.","support":""}}']))
         events.append(SimpleNamespace(type="response.completed", response=response))
         return events
 
@@ -296,18 +298,18 @@ def test_formatter_requests_localizable_instants_without_guessing_missing_time(s
     instructions = setup.module.PRESENTATION_INSTRUCTIONS
     assert "YYYY-MM-DDTHH:MM:SSZ" in instructions
     assert "host-local time" in instructions
-    assert "original source timestamp in later detail" in instructions
+    assert "original source timestamp in support" in instructions
     assert "Never invent a missing date or zone" in instructions
 
 
 def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     instructions = setup.module.PRESENTATION_INSTRUCTIONS
     assert "Return JSON with exactly answer and source_ids" in instructions
-    assert "first paragraph must be a complete standalone conversational answer" in instructions
-    assert "host speaks that exact paragraph verbatim" in instructions
+    assert "Lead is a complete standalone conversational answer" in instructions
+    assert "host speaks lead verbatim" in instructions
     assert "at most 220 characters" in instructions
-    assert "complete answer is at most 1800 characters" in instructions
-    assert "later paragraphs separated by a blank line" in instructions
+    assert "complete display" in instructions and "limited to 1800 characters" in instructions
+    assert "Put every supported requested date, qualification" in instructions
 
 
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
@@ -342,7 +344,10 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
     assert set(schema["properties"]) == {"answer", "source_ids"}
-    assert schema["properties"]["answer"]["maxLength"] == 1800
+    answer_schema = schema["properties"]["answer"]
+    assert set(answer_schema["properties"]) == {"lead", "support"}
+    assert answer_schema["properties"]["lead"]["maxLength"] == 220
+    assert answer_schema["properties"]["support"]["maxLength"] == 1800
     assert s.captured["sdk"][0]["max_retries"] == 0
     assert s.captured["http"][0]["follow_redirects"] is False
     assert s.captured["closed"] == 2 and s.row["presentation_active"] is None
@@ -365,28 +370,55 @@ def test_formatter_input_contains_no_fallible_native_draft():
 
 
 def test_single_answer_lead_is_reused_verbatim_in_voice_and_detail(setup):
-    answer = "The result is 12.\n\nThe report also notes the sample was small."
-    setup.captured["response"] = completion(json.dumps({"answer": answer, "source_ids": [0]}))
+    lead = "The result is 12."
+    support = "The report also notes the sample was small."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": support}, "source_ids": [0]}))
 
     result = setup.run()
 
     assert result is not setup.refused
     assert result.choices[0].message.content == (
-        "<voice>The result is 12.</voice><detail>"
-        + answer
+        f"<voice>{lead}</voice><detail>{lead}\n\n{support}"
         + "\n\nSources:\nhttps://example.invalid/source</detail>"
     )
 
 
+def test_nested_answer_refuses_unknown_support_fields(setup):
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": "Short.", "support": "Supported detail.", "extra": "ignored"},
+        "source_ids": [0],
+    }))
+
+    assert setup.run() is setup.refused
+    assert setup.row["presentation_evidence"]["stage"] == "content"
+
+
 def test_single_answer_without_selected_sources_has_no_sources_footer(setup):
-    answer = "The supplied evidence does not establish the requested detail."
-    setup.captured["response"] = completion(json.dumps({"answer": answer, "source_ids": []}))
+    lead = "The supplied evidence does not establish the requested detail."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": ""}, "source_ids": []}))
 
     result = setup.run()
 
     assert result is not setup.refused
     assert result.choices[0].message.content == (
-        f"<voice>{answer}</voice><detail>{answer}</detail>"
+        f"<voice>{lead}</voice><detail>{lead}</detail>"
+    )
+
+
+def test_lead_and_support_keep_requested_dates_and_qualifications(setup):
+    lead = "The deployment is planned for early 2027, subject to site readiness."
+    support = "Published October 21. The site needs 14 days of preparation."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": support}, "source_ids": [0]}))
+
+    result = setup.run()
+
+    assert result is not setup.refused
+    assert result.choices[0].message.content == (
+        f"<voice>{lead}</voice><detail>{lead}\n\n{support}"
+        "\n\nSources:\nhttps://example.invalid/source</detail>"
     )
 
 
@@ -496,7 +528,7 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s = setup
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     original_final = s.codex_message(
-        '{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}'
+        '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
     )
     reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status=None, summary=[])
     commentary = s.codex_message("Progress text must not be published.", phase="commentary",
@@ -508,10 +540,15 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s.run.original = raw
     s.captured["stream_events"] = s.codex_events(
         s.codex_response([
-            s.codex_message('{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}')
+            s.codex_message(
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+            )
         ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7),
         ),
-        deltas=['{"answer":', '"Short.\\n\\nFull source result.","source_ids":[0]}'],
+        deltas=[
+            '{"answer":{"lead":"Short.","support":',
+            '"Full source result."},"source_ids":[0]}',
+        ],
     )
     result = s.run(api_mode="codex_responses")
     assert result is not s.refused and result.id == raw.id
@@ -704,7 +741,9 @@ def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_c
     commentary.content = invalid_commentary(s)
     s.run.original = s.codex_response([
         commentary,
-        s.codex_message('{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}'),
+        s.codex_message(
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ])
     result = s.run(api_mode="codex_responses")
     assert result.output[0].content[0].text == s.module.REFUSAL
@@ -714,11 +753,15 @@ def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_c
 @pytest.mark.parametrize("response", [
     lambda s: s.codex_response([
         SimpleNamespace(type="reasoning", status="in_progress", id="rs_partial"),
-        s.codex_message('{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}'),
+        s.codex_message(
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ]),
     lambda s: s.codex_response([
         SimpleNamespace(type="reasoning", status="incomplete", id="rs_partial"),
-        s.codex_message('{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}'),
+        s.codex_message(
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ]),
 ], ids=["reasoning-in-progress", "reasoning-incomplete"])
 def test_codex_refuses_noncompleted_reasoning_items(setup, response):
@@ -747,7 +790,7 @@ def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
     s.run.original = s.codex_response([
         s.codex_message("intermediate", phase="commentary"),
         s.codex_message(
-                '{"answer":"Short.\\n\\nFull source result.","source_ids":[0]}',
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}',
                         phase=None),
     ])
     result = s.run(api_mode="codex_responses")
@@ -1320,7 +1363,9 @@ async def test_combined_snapshot_bytes_are_bounded_atomically(setup, capsys):
 def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
     s = setup
     s.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": [0]})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
     )
     result = s.run()
     assert result is not s.refused
@@ -1336,7 +1381,9 @@ def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
 def test_attribution_selects_subset_from_whole_frozen_catalog_without_url_rewrite(setup):
     s = setup
     s.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": [1]})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [1]
+        })
     )
     result = s.run()
     assert result is not s.refused
@@ -1355,7 +1402,9 @@ def test_attribution_selects_subset_from_whole_frozen_catalog_without_url_rewrit
 )
 def test_attribution_refuses_invalid_selected_ids(setup, ids):
     setup.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": ids})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": ids
+        })
     )
     assert setup.run() is setup.refused
     expected = (
@@ -1369,7 +1418,13 @@ def test_attribution_refuses_invalid_selected_ids(setup, ids):
 
 @pytest.mark.parametrize("marker", ["HtTp://", "HTTPS://", "WwW."], ids=["http", "https", "www"])
 def test_attribution_refuses_model_inline_web_links_without_repair(setup, capsys, marker):
-    value = {"answer": marker + "invented.example.invalid/PRIVATE_UNADMITTED", "source_ids": [0]}
+    value = {
+        "answer": {
+            "lead": "Short.",
+            "support": marker + "invented.example.invalid/PRIVATE_UNADMITTED",
+        },
+        "source_ids": [0],
+    }
     setup.captured["response"] = completion(json.dumps(value))
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["stage"] == "inline-links"
@@ -1378,7 +1433,7 @@ def test_attribution_refuses_model_inline_web_links_without_repair(setup, capsys
 
 def test_attribution_does_not_join_fields_into_an_artificial_web_link(setup):
     setup.captured["response"] = completion(
-        json.dumps({"answer": "htt\n\np://not-a-web-link", "source_ids": [0]})
+        json.dumps({"answer": {"lead": "htt", "support": "p://not-a-web-link"}, "source_ids": [0]})
     )
     assert setup.run() is not setup.refused
 
@@ -1394,7 +1449,9 @@ def test_attribution_refuses_whole_catalog_over_input_bound_without_call(setup):
     {"url": "https://example.invalid/" + "x" * 1790}]}}], indirect=True)
 def test_attribution_refuses_rendered_detail_over_1800_without_clipping(setup):
     setup.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": [0]})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
     )
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["stage"] == "content"
@@ -1404,7 +1461,9 @@ def test_attribution_refuses_rendered_detail_over_1800_without_clipping(setup):
     {"url": "https://example.invalid/</detail>"}]}}], indirect=True)
 def test_attribution_rendered_urls_still_pass_reserved_markup_validation(setup):
     setup.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": [0]})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
     )
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["stage"] == "terminal-contract"
@@ -1414,7 +1473,9 @@ def test_attribution_rendered_urls_still_pass_reserved_markup_validation(setup):
 def test_attribution_refuses_catalog_drift_before_publication(setup, change):
     s = setup
     s.captured["response"] = completion(
-        json.dumps({"answer": "Short.\n\nSupported answer.", "source_ids": [0]})
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
     )
 
     async def drift():
@@ -1551,17 +1612,20 @@ def test_presentation_refuses_unbounded_or_empty_source(setup, source):
 
 
 @pytest.mark.parametrize("content", [
-        '{"answer":"Answer.","source_ids":[0],"extra":"x"}',
-        '{"answer":"A.","answer":"B.","source_ids":[0]}',
-        '{"answer":5,"source_ids":[0]}',
-        '{"answer":"' + "v" * 221 + '","source_ids":[0]}',
-        '{"answer":"' + "d" * 1801 + '","source_ids":[0]}',
-        '{"answer":"v</voice>","source_ids":[0]}',
-        '{"answer":"","source_ids":[0]}',
-        '{"answer":"line\\nbreak","source_ids":[0]}',
-], ids=["extra-key", "duplicate-key", "wrong-type",
+        '{"answer":{"lead":"Answer.","support":""},"source_ids":[0],"extra":"x"}',
+        '{"answer":{"lead":"A.","lead":"B.","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"A."},"source_ids":[0]}',
+        '{"answer":{"lead":5,"support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"A.","support":5},"source_ids":[0]}',
+        '{"answer":{"lead":"' + "v" * 221 + '","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"v","support":"' + "d" * 1801 + '"},"source_ids":[0]}',
+        '{"answer":{"lead":"v</voice>","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"line\\nbreak","support":""},"source_ids":[0]}',
+], ids=["extra-key", "duplicate-nested-key", "missing-nested-key", "wrong-lead-type",
+        "wrong-support-type",
         "lead-bound",
-        "answer-bound",
+        "support-bound",
         "delimiter",
         "empty-answer",
         "lead-newline",
@@ -1577,7 +1641,9 @@ def test_presentation_refuses_invalid_content_without_repair(setup, content):
 
 def test_presentation_refuses_tool_or_truncated_response(setup):
     s = setup
-    s.captured["response"] = completion('{"answer":"v","source_ids":[0]}', reason="length")
+    s.captured["response"] = completion(
+        '{"answer":{"lead":"v","support":""},"source_ids":[0]}', reason="length"
+    )
     assert s.run() is s.refused
 
 
@@ -1619,7 +1685,7 @@ def test_source_refusal_records_only_fixed_categories_and_counts(
 
 
 def test_presentation_refuses_explicit_formatter_refusal(setup):
-    response = completion('{"answer":"v","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     response.choices[0].message.refusal = "synthetic-refusal"
     setup.captured["response"] = response
     assert setup.run() is setup.refused
@@ -1627,22 +1693,22 @@ def test_presentation_refuses_explicit_formatter_refusal(setup):
 
 @pytest.mark.parametrize("case,count,kind,length,finish,tools,refusal,parsed", [
     ("zero-choices", 0, "none", 0, "missing", False, False, False),
-    ("extra-choices", 2, "string", 31, "stop", False, False, False),
+    ("extra-choices", 2, "string", 53, "stop", False, False, False),
     ("none-content", 1, "none", 0, "stop", False, False, False),
     ("other-content", 1, "other", 0, "stop", False, False, False),
     ("oversize", 1, "string", 8193, "stop", False, False, False),
-    ("length-stop", 1, "string", 31, "length", False, False, False),
-    ("unknown-finish", 1, "string", 31, "other", False, False, False),
-    ("missing-finish", 1, "string", 31, "missing", False, False, False),
-    ("tool-call", 1, "string", 31, "stop", True, False, False),
-    ("refusal", 1, "string", 31, "stop", False, True, False),
+    ("length-stop", 1, "string", 53, "length", False, False, False),
+    ("unknown-finish", 1, "string", 53, "other", False, False, False),
+    ("missing-finish", 1, "string", 53, "missing", False, False, False),
+    ("tool-call", 1, "string", 53, "stop", True, False, False),
+    ("refusal", 1, "string", 53, "stop", False, True, False),
     ("parsed-only", 1, "none", 0, "stop", False, False, True),
 ])
 def test_formatter_envelope_refusal_retains_shape_and_usage_without_content(
     setup, capsys, case, count, kind, length, finish, tools, refusal, parsed,
 ):
     s = setup
-    response = completion('{"answer":"v","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     message = response.choices[0].message
     if case == "zero-choices":
         response.choices = []
@@ -1975,13 +2041,16 @@ def test_response_reasoning_facts_and_usage_are_bounded_observations(setup, caps
 
 def test_presentation_refuses_response_tool_calls(setup):
     s = setup
-    s.captured["response"] = completion('{"answer":"v","source_ids":[0]}', calls=["not-allowed"])
+    s.captured["response"] = completion(
+        '{"answer":{"lead":"v","support":""},"source_ids":[0]}',
+        calls=["not-allowed"],
+    )
     assert s.run() is s.refused
 
 
 def test_presentation_refuses_extra_choices(setup):
     s = setup
-    response = completion('{"answer":"v","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     response.choices *= 2
     s.captured["response"] = response
     assert s.run() is s.refused
@@ -1992,7 +2061,8 @@ def test_presentation_refuses_extra_choices(setup):
                          ids=["newline", "control", "emphasis", "markup"],
 )
 def test_presentation_uses_existing_terminal_contract(setup, answer):
-    setup.captured["response"] = completion(json.dumps({"answer": answer, "source_ids": [0]}))
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": answer, "support": ""}, "source_ids": [0]}))
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["failure_kind"] == "ValueError"
 
