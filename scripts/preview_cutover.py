@@ -1607,6 +1607,22 @@ def _gateway_manifest(plan: PreviewPlanV1) -> Path:
     return path
 
 
+def launch_preview(active_path: Path) -> dict[str, Any]:
+    """Request an independent owner; readiness remains the owner's receipt."""
+    require(sys.platform == "win32", "windows_required")
+    active_path = active_path.resolve()
+    plan, _, _ = _active_plan(active_path)
+    from scripts.preview_owner_launch import PreviewOwnerLaunchRefusal, launch_preview_owner
+
+    try:
+        launch_preview_owner(
+            interpreter=plan.executables["host_python"], active=active_path, output=plan.output
+        )
+    except PreviewOwnerLaunchRefusal as error:
+        raise PreviewRefusal(error.category) from None
+    return {"category": "launch_requested", "launch_authorized": True, "ready": False}
+
+
 def serve(active_path: Path) -> int:
     require(sys.platform == "win32", "windows_required")
     plan, _, profile = _active_plan(active_path)
@@ -1643,6 +1659,15 @@ def serve(active_path: Path) -> int:
     startup_error: str | None = None
     gateway_manifest = None
     try:
+        from scripts.preview_owner_launch import (
+            PreviewOwnerLaunchRefusal,
+            assert_independent_owner,
+        )
+
+        try:
+            assert_independent_owner()
+        except PreviewOwnerLaunchRefusal as error:
+            raise PreviewRefusal(error.category) from None
         containment = Containment()
         owned = Processes(output)
         processes = CappedProcesses(owned, output)
@@ -1929,6 +1954,8 @@ def main(argv: list[str] | None = None) -> int:
     finalize_parser.add_argument("--previous", type=Path, required=True)
     serve_parser = commands.add_parser("serve")
     serve_parser.add_argument("--active", type=Path, required=True)
+    launch_parser = commands.add_parser("launch")
+    launch_parser.add_argument("--active", type=Path, required=True)
     stop_parser = commands.add_parser("stop")
     stop_parser.add_argument("--output", type=Path, required=True)
     host_child_parser = commands.add_parser("host-child", help=argparse.SUPPRESS)
@@ -1966,6 +1993,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "serve":
             return serve(args.active)
+        if args.command == "launch":
+            emit(launch_preview(args.active))
+            return 0
         if args.command == "stop":
             emit(stop_preview(args.output))
             return 0

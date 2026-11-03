@@ -951,3 +951,99 @@ def test_listener_refuses_wrong_role_or_foreign_job(role_pids, members):
     with pytest.raises(ValueError, match="endpoint_owner"):
         preview_cutover._require_owned_endpoint_rows(
             [("127.0.0.1", 502)], 501, members, 1, role_pids=role_pids)
+
+
+class _OwnerLaunchRefusal(RuntimeError):
+    def __init__(self, category):
+        self.category = category
+        super().__init__(category)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_persistent_launch_binds_plan_and_never_claims_readiness(tmp_path, monkeypatch, relative):
+    active = tmp_path / "active.private.json"
+    plan = SimpleNamespace(output=tmp_path, executables={"host_python": tmp_path / "bound-python"})
+    calls = []
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda path: (plan, {}, tmp_path))
+    helper = SimpleNamespace(
+        PreviewOwnerLaunchRefusal=_OwnerLaunchRefusal,
+        launch_preview_owner=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "scripts.preview_owner_launch", helper)
+
+    monkeypatch.chdir(tmp_path)
+    result = preview_cutover.launch_preview(Path(active.name) if relative else active)
+
+    assert calls == [{"interpreter": plan.executables["host_python"],
+                      "active": active, "output": tmp_path}]
+    assert result == {"category": "launch_requested", "launch_authorized": True, "ready": False}
+    assert not (tmp_path / "supervisor.pid.private.txt").exists()
+    assert not (tmp_path / "ready-receipt.private.json").exists()
+
+
+def test_launch_cli_reports_only_the_launch_request(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def launch(active):
+        calls.append(active)
+        return {"category": "launch_requested", "launch_authorized": True, "ready": False}
+
+    monkeypatch.setattr(preview_cutover, "launch_preview", launch)
+    active = tmp_path / "active.private.json"
+    assert preview_cutover.main(["launch", "--active", str(active)]) == 0
+    assert calls == [active]
+    output = capsys.readouterr().out
+    assert output.startswith("[voice-preview] ")
+    assert json.loads(output.removeprefix("[voice-preview] "))["ready"] is False
+
+
+def test_persistent_launch_preserves_fixed_spawn_refusal(tmp_path, monkeypatch):
+    plan = SimpleNamespace(output=tmp_path, executables={"host_python": tmp_path / "bound-python"})
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda path: (plan, {}, tmp_path))
+
+    def refuse(**kwargs):
+        raise _OwnerLaunchRefusal("breakaway_not_permitted")
+
+    helper = SimpleNamespace(
+        PreviewOwnerLaunchRefusal=_OwnerLaunchRefusal, launch_preview_owner=refuse)
+    monkeypatch.setitem(sys.modules, "scripts.preview_owner_launch", helper)
+    with pytest.raises(preview_cutover.PreviewRefusal, match="breakaway_not_permitted"):
+        preview_cutover.launch_preview(tmp_path / "active.private.json")
+
+
+def test_actual_serve_refuses_inherited_job_before_containment_or_children(tmp_path, monkeypatch):
+    from scripts import lookup_backend_task, rehearse_desktop_mvp
+
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state/hermes-runs-v1.json").write_text(
+        json.dumps({"version": 1, "pending": [], "admitted": []}), encoding="utf-8")
+    ports = {"api": 49001, "companion": 49002, "livekit": 49003, "host": 49004,
+             "protected": [49005]}
+    plan = SimpleNamespace(output=tmp_path, ports=ports)
+    calls = []
+    monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda path: (plan, {}, tmp_path))
+    monkeypatch.setattr(preview_cutover, "preflight", lambda *_: None)
+    monkeypatch.setattr(lookup_backend_task, "listener_rows", lambda _: [])
+
+    def inherited():
+        raise _OwnerLaunchRefusal("owner_inherited_job")
+
+    def forbidden_containment():
+        calls.append("containment")
+        raise AssertionError("child ownership must not start")
+
+    monkeypatch.setattr(rehearse_desktop_mvp, "Containment", forbidden_containment)
+    helper = SimpleNamespace(
+        PreviewOwnerLaunchRefusal=_OwnerLaunchRefusal, assert_independent_owner=inherited)
+    monkeypatch.setitem(sys.modules, "scripts.preview_owner_launch", helper)
+
+    assert preview_cutover.serve(tmp_path / "active.private.json") == 1
+
+    assert calls == []
+    result = json.loads((tmp_path / "result-receipt.private.json").read_text(encoding="utf-8"))
+    assert result["failure_category"] == "owner_inherited_job"
+    assert result["cleanup_settled"] is True
+    assert not (tmp_path / "ready-receipt.private.json").exists()
