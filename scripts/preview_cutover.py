@@ -134,13 +134,14 @@ class PreviewPlanV1:
     speech: dict[str, Any]
     executables: dict[str, Path]
     host_options: dict[str, Any]
+    readiness_policy: str = "kernel_listeners"
 
 
 def load_plan(path: Path) -> PreviewPlanV1:
     value = _json(_read(path))
     require(
         type(value) is dict
-        and set(value)
+        and set(value) - {"readiness_policy"}
         == {
             "version",
             "output",
@@ -158,6 +159,10 @@ def load_plan(path: Path) -> PreviewPlanV1:
         "plan_fields",
     )
     require(type(value["version"]) is int and value["version"] == 1, "plan_version")
+    readiness_policy = value.get("readiness_policy", "kernel_listeners")
+    require(type(readiness_policy) is str
+            and readiness_policy in {"kernel_listeners", "dev_owned_services"},
+            "readiness_policy")
     require(
         type(value["profile_mode"]) is str and value["profile_mode"] in {"lookup", "native"},
         "profile_mode",
@@ -378,6 +383,7 @@ def load_plan(path: Path) -> PreviewPlanV1:
         speech=dict(speech),
         executables={key: abs_path(raw, key) for key, raw in executables.items()},
         host_options=dict(host_options),
+        readiness_policy=readiness_policy,
     )
 
 
@@ -1057,6 +1063,38 @@ def _listener_rows(port: int) -> list[tuple[str, int]]:
     return listener_rows(port)
 
 
+def _dev_readiness(plan: PreviewPlanV1) -> bool:
+    return plan.readiness_policy == "dev_owned_services"
+
+
+def _tcp_accepting(port: int) -> bool:
+    from scripts.preview_readiness import tcp_accepting
+
+    return tcp_accepting(port)
+
+
+def _endpoint_snapshot(plan: PreviewPlanV1, ports: Any) -> dict[int, Any]:
+    observe = _tcp_accepting if _dev_readiness(plan) else _listener_rows
+    return {port: observe(port) for port in ports}
+
+
+def _endpoint_count(plan: PreviewPlanV1, snapshot: dict[int, Any]) -> int:
+    return sum(snapshot.values()) if _dev_readiness(plan) else sum(map(len, snapshot.values()))
+
+
+def _require_host_http_ready(port: int) -> None:
+    import http.client
+
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        require(response.status == 200, "host_http_not_ready")
+        response.close()
+    finally:
+        connection.close()
+
+
 def _require_owned_endpoint_rows(
     rows: Any, expected_pid: int, members: set[int], expected_count: int,
     *, role_pids: set[int] | None = None,
@@ -1111,15 +1149,35 @@ def _started_at(pid: int) -> int | None:
 def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
     result_path = previous / "result-receipt.private.json"
     result = _read_json_file(result_path)
+    previous_policy = result.get("readiness_policy", "kernel_listeners")
+    previous_dev = previous_policy == "dev_owned_services"
+    require(previous_policy in {"kernel_listeners", "dev_owned_services"}, "previous_normal_stop")
+    if previous_dev:
+        require(
+            _dev_readiness(plan)
+            and result.get("listener_ownership") == "unavailable"
+            and result.get("remaining_owned_listeners") is None
+            and result.get("protected_listeners_unchanged") is None
+            and type(result.get("remaining_accepting_endpoints")) is int
+            and result["remaining_accepting_endpoints"] == 0
+            and (result.get("protected_endpoints_unchanged") is None
+                 or type(result["protected_endpoints_unchanged"]) is bool),
+            "previous_normal_stop",
+        )
+    else:
+        require(
+            result.get("listener_ownership", "verified") == "verified"
+            and type(result.get("remaining_owned_listeners")) is int
+            and result["remaining_owned_listeners"] == 0
+            and type(result.get("protected_listeners_unchanged")) is bool,
+            "previous_normal_stop",
+        )
     require(
         result.get("category") == "stopped"
         and result.get("cleanup_settled") is True
         and result.get("cleanup_failed") is False
         and type(result.get("owned_survivor_count")) is int
-        and result["owned_survivor_count"] == 0
-        and type(result.get("remaining_owned_listeners")) is int
-        and result["remaining_owned_listeners"] == 0
-        and type(result.get("protected_listeners_unchanged")) is bool,
+        and result["owned_survivor_count"] == 0,
         "previous_normal_stop",
     )
     previous_ports = result.get("ports")
@@ -1157,7 +1215,7 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
     all_ports = sorted(
         set(previous_ports) | {plan.ports[name] for name in ("api", "companion", "livekit", "host")}
     )
-    require(all(not _listener_rows(port) for port in all_ports), "previous_listener_alive")
+    require(not any(_endpoint_snapshot(plan, all_ports).values()), "previous_listener_alive")
     journal = _read_json_file(previous / "state" / "hermes-runs-v1.json")
     require(
         set(journal) == {"version", "pending", "admitted"}
@@ -1173,9 +1231,13 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         "category": "normal_stop_verified",
         "receipt_sha256": digest(result_path),
         "processes_absent": True,
-        "listeners_absent": True,
+        "listeners_absent": None if _dev_readiness(plan) else True,
+        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
         "work_journal_empty": True,
-        "protected_listeners_unchanged": result["protected_listeners_unchanged"],
+        "protected_listeners_unchanged": (
+            None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
+        ),
     }
 
 
@@ -1639,11 +1701,11 @@ def serve(active_path: Path) -> int:
     ):
         require(not (output / name).exists(), "run_artifact_exists")
     ports = [plan.ports[name] for name in ("api", "companion", "livekit", "host")]
-    from scripts.lookup_backend_task import listener_rows, request_json
+    from scripts.lookup_backend_task import request_json
 
-    require(all(not listener_rows(port) for port in ports), "selected_port_occupied")
+    require(not any(_endpoint_snapshot(plan, ports).values()), "selected_port_occupied")
     try:
-        protected_before = {port: listener_rows(port) for port in plan.ports["protected"]}
+        protected_before = _endpoint_snapshot(plan, plan.ports["protected"])
     except BaseException:
         protected_before = None
     with (output / "supervisor.pid.private.txt").open("x", encoding="ascii") as stream:
@@ -1655,7 +1717,10 @@ def serve(active_path: Path) -> int:
     containment = None
     owned = None
     processes = None
-    result: dict[str, Any] = {"category": "starting", "ready": False}
+    result: dict[str, Any] = {
+        "category": "starting", "ready": False, "readiness_policy": plan.readiness_policy,
+        "listener_ownership": "unavailable" if _dev_readiness(plan) else "not_established",
+    }
     startup_error: str | None = None
     gateway_manifest = None
     try:
@@ -1734,28 +1799,52 @@ def serve(active_path: Path) -> int:
                 all(processes.roots[name].poll() is None for name in ("gateway", "livekit")),
                 "child_exited_during_start",
             )
-            api_rows = listener_rows(plan.ports["api"])
-            companion_rows = listener_rows(plan.ports["companion"])
-            livekit_rows = listener_rows(plan.ports["livekit"])
-            if api_rows and companion_rows and livekit_rows:
-                members = containment.members()
-                from scripts.lookup_backend_task import require_owned_listeners
+            if _dev_readiness(plan):
+                if all(_endpoint_snapshot(plan, [plan.ports[name] for name in
+                                                ("api", "companion", "livekit")]).values()):
+                    from urllib.error import HTTPError
 
-                gateway_rows = api_rows + companion_rows
-                require_owned_listeners(gateway_rows, members)
-                gateway_pid = _require_owned_endpoint_rows(
-                    gateway_rows, gateway_process.pid, members, 2,
-                    role_pids=_owned_role_members(gateway_process.pid, members),
-                )
-                _require_owned_endpoint_rows(livekit_rows, livekit_process.pid, members, 1)
-                try:
-                    health = request_json(base_url + "/health/detailed", token, timeout=3)
-                except (OSError, ValueError, TimeoutError):
-                    pass
-                else:
-                    _require_gateway_health_owner(health, gateway_pid, members)
-                    gateway_ready = True
-                    break
+                    from scripts.preview_readiness import require_gateway_health_owner
+
+                    members = containment.members()
+                    require(livekit_process.pid in members, "livekit_process_owner")
+                    try:
+                        health = request_json(base_url + "/health/detailed", token, timeout=3)
+                    except HTTPError:
+                        raise PreviewRefusal("gateway_health_refused") from None
+                    except ValueError:
+                        raise PreviewRefusal("gateway_health_invalid") from None
+                    except (OSError, TimeoutError):
+                        pass
+                    else:
+                        require_gateway_health_owner(
+                            health, root_pid=gateway_process.pid, members=members,
+                        )
+                        gateway_ready = True
+                        break
+            else:
+                api_rows = _listener_rows(plan.ports["api"])
+                companion_rows = _listener_rows(plan.ports["companion"])
+                livekit_rows = _listener_rows(plan.ports["livekit"])
+                if api_rows and companion_rows and livekit_rows:
+                    members = containment.members()
+                    from scripts.lookup_backend_task import require_owned_listeners
+
+                    gateway_rows = api_rows + companion_rows
+                    require_owned_listeners(gateway_rows, members)
+                    gateway_pid = _require_owned_endpoint_rows(
+                        gateway_rows, gateway_process.pid, members, 2,
+                        role_pids=_owned_role_members(gateway_process.pid, members),
+                    )
+                    _require_owned_endpoint_rows(livekit_rows, livekit_process.pid, members, 1)
+                    try:
+                        health = request_json(base_url + "/health/detailed", token, timeout=3)
+                    except (OSError, ValueError, TimeoutError):
+                        pass
+                    else:
+                        _require_gateway_health_owner(health, gateway_pid, members)
+                        gateway_ready = True
+                        break
             time.sleep(_STOP_POLL_SECONDS)
         require(gateway_ready, "gateway_start_timeout")
         host_process = processes.spawn(
@@ -1773,16 +1862,25 @@ def serve(active_path: Path) -> int:
             time.sleep(_STOP_POLL_SECONDS)
         require(host_ready_path.is_file(), "host_start_timeout")
         members = containment.members()
-        host_pid = _require_owned_endpoint_rows(
-            listener_rows(plan.ports["host"]), host_process.pid, members, 1,
-            role_pids=_owned_role_members(host_process.pid, members),
-        )
         host_ready = _read_json_file(host_ready_path)
-        require(
-            host_ready == {"version": 1, "ready": True, "pid": host_pid},
-            "host_ready_receipt",
-        )
-        result.update(category="ready", ready=True, ports=ports)
+        if _dev_readiness(plan):
+            from scripts.preview_readiness import require_host_readiness
+
+            require(livekit_process.poll() is None and livekit_process.pid in members,
+                    "livekit_process_owner")
+            require_host_readiness(host_ready, root_pid=host_process.pid, members=members)
+            _require_host_http_ready(plan.ports["host"])
+        else:
+            host_pid = _require_owned_endpoint_rows(
+                _listener_rows(plan.ports["host"]), host_process.pid, members, 1,
+                role_pids=_owned_role_members(host_process.pid, members),
+            )
+            require(
+                host_ready == {"version": 1, "ready": True, "pid": host_pid},
+                "host_ready_receipt",
+            )
+        result.update(category="ready", ready=True, ports=ports,
+                      listener_ownership="unavailable" if _dev_readiness(plan) else "verified")
         _write_new(output / "ready-receipt.private.json", result)
         emit({"category": "ready", "launch_authorized": True, "ports": ports})
         while not (output / "stop.request").exists():
@@ -1831,19 +1929,20 @@ def serve(active_path: Path) -> int:
                 cleanup_failed = True
                 survivors = {"<unknown>": 1}
         survivor_count = sum(survivors.values())
+        remaining: int | None
         try:
-            remaining = sum(len(listener_rows(port)) for port in ports)
+            remaining = _endpoint_count(plan, _endpoint_snapshot(plan, ports))
         except BaseException:
             cleanup_failed = True
-            remaining = max(1, len(ports))
+            remaining = None if _dev_readiness(plan) else max(1, len(ports))
         try:
+            protected_after = _endpoint_snapshot(plan, plan.ports["protected"])
             protected_unchanged = (
-                protected_before is not None
-                and {port: listener_rows(port) for port in plan.ports["protected"]}
-                == protected_before
+                None if protected_before is None and _dev_readiness(plan) else
+                protected_before is not None and protected_after == protected_before
             )
         except BaseException:
-            protected_unchanged = False
+            protected_unchanged = None if _dev_readiness(plan) else False
         journal_path = output / "state" / "hermes-runs-v1.json"
         try:
             journal = _read_json_file(journal_path)
@@ -1866,8 +1965,12 @@ def serve(active_path: Path) -> int:
             "cleanup_settled": settled,
             "cleanup_failed": cleanup_failed,
             "owned_survivor_count": survivor_count,
-            "remaining_owned_listeners": remaining,
-            "protected_listeners_unchanged": protected_unchanged,
+            "readiness_policy": plan.readiness_policy,
+            "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+            "remaining_owned_listeners": None if _dev_readiness(plan) else remaining,
+            "protected_listeners_unchanged": None if _dev_readiness(plan) else protected_unchanged,
+            "remaining_accepting_endpoints": remaining if _dev_readiness(plan) else None,
+            "protected_endpoints_unchanged": protected_unchanged if _dev_readiness(plan) else None,
             "run_journal_empty": journal_empty,
             "ports": ports,
             "child_output_metadata": child_facts,
@@ -1921,6 +2024,8 @@ def stop_preview(output: Path, timeout: float = 180.0) -> dict[str, Any]:
 
 
 def _failure_status(error: BaseException) -> dict[str, str]:
+    from scripts.preview_readiness import PreviewReadinessRefusal
+
     known = {
         "ValueError",
         "RuntimeError",
@@ -1930,10 +2035,11 @@ def _failure_status(error: BaseException) -> dict[str, str]:
         "ImportError",
         "PermissionError",
     }
-    kind = "ValueError" if type(error) is PreviewRefusal else type(error).__name__
+    kind = ("ValueError" if type(error) in (PreviewRefusal, PreviewReadinessRefusal)
+            else type(error).__name__)
     kind = kind if kind in known else "other"
     category = "preflight_failed"
-    if (type(error) is PreviewRefusal and len(error.args) == 1
+    if (type(error) in (PreviewRefusal, PreviewReadinessRefusal) and len(error.args) == 1
             and type(error.args[0]) is str and _LABEL.fullmatch(error.args[0])):
         category = error.args[0]
     return {"category": "refused", "failure_kind": kind, "failure_category": category}

@@ -1021,7 +1021,7 @@ def test_actual_serve_refuses_inherited_job_before_containment_or_children(tmp_p
         json.dumps({"version": 1, "pending": [], "admitted": []}), encoding="utf-8")
     ports = {"api": 49001, "companion": 49002, "livekit": 49003, "host": 49004,
              "protected": [49005]}
-    plan = SimpleNamespace(output=tmp_path, ports=ports,
+    plan = SimpleNamespace(output=tmp_path, ports=ports, readiness_policy="kernel_listeners",
                            executables={"host_python": tmp_path / "bound-python"})
     calls = []
     monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
@@ -1049,3 +1049,77 @@ def test_actual_serve_refuses_inherited_job_before_containment_or_children(tmp_p
     assert result["failure_category"] == "owner_inherited_job"
     assert result["cleanup_settled"] is True
     assert not (tmp_path / "ready-receipt.private.json").exists()
+
+
+def test_dev_readiness_policy_is_explicit_and_default_stays_strict(tmp_path):
+    path, _ = _plan(tmp_path)
+    assert preview_cutover.load_plan(path).readiness_policy == "kernel_listeners"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["readiness_policy"] = "dev_owned_services"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    assert preview_cutover.load_plan(path).readiness_policy == "dev_owned_services"
+
+
+@pytest.mark.parametrize("policy", [True, None, "best_effort", {}, ""])
+def test_readiness_policy_rejects_unknown_or_coerced_values(tmp_path, policy):
+    path, _ = _plan(tmp_path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["readiness_policy"] = policy
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="readiness_policy"):
+        preview_cutover.load_plan(path)
+
+
+@pytest.mark.parametrize("policy", ["kernel_listeners", "dev_owned_services"])
+@pytest.mark.parametrize("receipt_patch", [
+    {}, {"remaining_accepting_endpoints": 1}, {"remaining_accepting_endpoints": False},
+    {"listener_ownership": "verified"}, {"remaining_owned_listeners": 0},
+    {"protected_listeners_unchanged": True}, {"protected_endpoints_unchanged": "unknown"},
+    {"protected_endpoints_unchanged": None},
+])
+def test_dev_stop_never_becomes_kernel_listener_proof(
+    tmp_path, monkeypatch, policy, receipt_patch,
+):
+    path, _ = _plan(tmp_path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["readiness_policy"] = policy
+    path.write_text(json.dumps(value), encoding="utf-8")
+    plan = preview_cutover.load_plan(path)
+    previous = tmp_path / "previous"
+    (previous / "state").mkdir(parents=True)
+    receipt = {"version": 1, "category": "stopped", "cleanup_settled": True,
+               "cleanup_failed": False, "owned_survivor_count": 0,
+               "readiness_policy": "dev_owned_services", "listener_ownership": "unavailable",
+               "remaining_owned_listeners": None, "protected_listeners_unchanged": None,
+               "remaining_accepting_endpoints": 0, "protected_endpoints_unchanged": True,
+               "ports": [59876, 59877, 7880, 28765]}
+    receipt.update(receipt_patch)
+    (previous / "result-receipt.private.json").write_text(json.dumps(receipt), encoding="utf-8")
+    (previous / "pids.json").write_text(json.dumps({"gateway": 101, "livekit": 102,
+                                                   "host": 103}), encoding="utf-8")
+    (previous / "supervisor.pid.private.txt").write_text("104", encoding="ascii")
+    (previous / "state/hermes-runs-v1.json").write_text(json.dumps(
+        {"version": 1, "pending": [], "admitted": []}), encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _: None)
+    monkeypatch.setattr(preview_cutover, "_tcp_accepting", lambda _: False, raising=False)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _: pytest.fail(
+        "DEV finalization must not claim an unavailable kernel observation"))
+    optional_only = receipt_patch == {"protected_endpoints_unchanged": None}
+    if policy == "kernel_listeners" or (receipt_patch and not optional_only):
+        with pytest.raises(ValueError, match="previous_normal_stop"):
+            preview_cutover.verify_normal_stop(previous, plan)
+    else:
+        result = preview_cutover.verify_normal_stop(previous, plan)
+        assert result["listeners_absent"] is None
+        assert result["listener_ownership"] == "unavailable"
+        assert result["endpoints_not_accepting"] is True
+
+
+def test_dev_refusal_keeps_its_bounded_category():
+    from scripts.preview_readiness import PreviewReadinessRefusal
+
+    refusal = PreviewReadinessRefusal("tcp_observation_unavailable")
+    assert preview_cutover._failure_status(refusal) == {
+        "category": "refused", "failure_kind": "ValueError",
+        "failure_category": "tcp_observation_unavailable",
+    }
