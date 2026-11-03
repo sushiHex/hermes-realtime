@@ -13,12 +13,17 @@ import hashlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "2e528940b23b0d3283e47655b058f99098b2a2cb"
+REVIEWED_REVISION = "b2656f2ee1d49eb343c689e78bc3aab112145ab5"
 REVIEWED_SOURCES = {
     "entrypoint.py": "484ff3b2743e824abe22d3c6a87d3af26912ccc07f891286f088a6971d32ae50",
-    "policy.py": "9edc019732016302f4fd7d4075cc2a20f28b4cacf74a2f6603ee0a9a87055529",
+    "policy.py": "b50974099c20f4d3e3d1a89a0b77171fdd3a4cf73c9285b6ab2b3069c68b9e09",
 }
-REVIEWED_SIZES = {"entrypoint.py": 2612, "policy.py": 88352}
+REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
+REVIEWED_SHARED_SOURCES = {
+    "evidence_presentation": "f8cfb90fbb8b3f8e64c2183eb70491ec1403dd79b04bc15d427e1457e0a72a43",
+    "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
+}
+REVIEWED_SHARED_SIZES = {"evidence_presentation": 22466, "presentation_transport": 16551}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
@@ -44,6 +49,16 @@ def stage_lookup_policy(owned_profile: Path, reviewed_source: Path) -> dict[str,
     try:
         if owned_profile.is_symlink() or not owned_profile.is_dir() or any(owned_profile.iterdir()):
             raise StagingRefusal(category)
+        # Pin the shared source too, without importing an ambient installed
+        # runtime. The preview's source/wheel/installed comparator separately
+        # establishes that these are the bytes actually executed.
+        category = "reviewed-shared-source-mismatch"
+        shared_root = Path(__file__).resolve().parents[1] / "src/hermes_realtime/integration"
+        for name, expected in REVIEWED_SHARED_SOURCES.items():
+            with (shared_root / (name + ".py")).open("rb") as stream:
+                raw = stream.read(REVIEWED_SHARED_SIZES[name] + 1)
+            if hashlib.sha256(raw).hexdigest() != expected:
+                raise StagingRefusal(category)
         category = "reviewed-source-unreadable"
         try:
             payloads = {}

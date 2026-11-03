@@ -26,6 +26,21 @@ def test_package_exposes_hermes_plugin_entry_point() -> None:
     assert entry_point.value == "hermes_realtime.hermes_plugin"
 
 
+def test_entrypoint_installs_optional_native_evidence_lifecycle(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_realtime.integration.native_web_evidence",
+        SimpleNamespace(register_web_evidence=calls.append),
+    )
+    context = PluginContextStub("deleg_unused")
+    hermes_realtime_entry_point().load().register(context)
+    assert calls == [context]
+
+
 class PluginContextStub:
     def __init__(self, delegation_id: str) -> None:
         self.delegation_id = delegation_id

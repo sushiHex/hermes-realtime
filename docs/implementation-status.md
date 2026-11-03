@@ -69,6 +69,28 @@ post-stop Connect cause, or physical recovery. Those limits remain tracked in
 [#159](https://github.com/sushiHex/hermes-realtime/issues/159). This addition does
 not advance the page-wide reviewed baseline.
 
+Native web-only background work can opt into the
+[versioned evidence handoff](native-web-evidence.md), separately from the selected
+lookup policy. The formatter reuses its bounded same-run passage package; the
+host validates generation, run identity and exact output binding before
+publication. Shared presentation synthesizes one evidence-only answer; its bounded
+lead supplies canonical speech, while display composes that same lead with an
+explicit supporting-detail slot and any selected source links. Native draft prose is excluded from formatter
+input. Empty citation selection can express uncertainty without a sources footer.
+This removes separately authored speech/detail summaries but does not prove logical
+consistency within an answer. Nonweb and mixed work retain ordinary native behavior, with mixed
+results explicitly outside this grounding claim. These boundaries do not prove
+factual entailment or completeness; semantic quality remains tracked in
+[#386](https://github.com/sushiHex/hermes-realtime/issues/386).
+
+The foreground Codex adapter accepts the two optional nested lifecycle timestamps
+observed from CLI 0.166.0 as nullable, nonnegative int64 metadata. It does not use
+them for execution, ordering, deadlines or model context; all call identity and
+argument checks remain independent, and other unknown fields remain refused.
+The generated dynamic-item schema omitted these observed fields; the bounded
+wire evidence and compatibility decision belong to
+[#420](https://github.com/sushiHex/hermes-realtime/issues/420).
+
 The browser history presentation keeps worker results in one expandable task
 card per task identity, alongside the independently delivered assistant transcript.
 Active cards move into a stack only after reaching the history viewport top;

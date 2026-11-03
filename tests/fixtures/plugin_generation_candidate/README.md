@@ -43,9 +43,12 @@ The native entrypoint additionally requires explicit plugin-local
 `settings.presentation` with exactly `provider`, `base_url`, `model`, and
 `api_key_env`. The named environment variable must exist; there is no ambient
 credential fallback. On a selected run's final native response, one tool-free,
-nonstreaming OpenAI SDK call presents that completed result as strict JSON
-`voice`/`detail` and selected `source_ids`, then copies validated content into the
-existing envelope.
+OpenAI SDK call synthesizes from the objective and bounded retrieved passages,
+excluding native draft prose. Strict JSON contains one `answer` object with
+`lead` and `support`, plus selected `source_ids`. The existing envelope uses the
+exact lead for speech and the same lead plus support for display. The display's
+1800-character limit includes the validated source footer; empty source selection
+can express uncertainty without that footer.
 Spoken summaries omit source names, domains and citations unless the objective
 explicitly requests sources; the detailed result retains its source catalog.
 The trusted route must equal the actual middleware route and request model.

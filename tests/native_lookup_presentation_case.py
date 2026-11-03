@@ -113,7 +113,7 @@ def main():
             forwarded.append(body)
             assert not any(key in body for key in ("tools", "tool_choice", "functions"))
             payload = json.loads(body["messages"][-1]["content"])
-            assert payload == {"answer": source_text, "objective": "synthetic lookup",
+            assert payload == {"objective": "synthetic lookup",
                 "sources": [{"id": 0, "url": "https://example.invalid/source"}],
                 "evidence": [{"source_id": 0, "kind": "search", "text": "",
                               "original_bytes": 0, "truncated": False}],
@@ -121,7 +121,7 @@ def main():
             assert body["reasoning_effort"] == "none"
             response = sdk.model_dump(mode="json")
             response["choices"][0]["message"]["content"] = json.dumps({
-                "voice": "Short.", "detail": source_text, "source_ids": [0]})
+                "answer": {"lead": "Short.", "support": source_text}, "source_ids": [0]})
             return httpx.Response(200, json=response, request=request)
 
         class IsolatedHttp(real_http):
@@ -133,6 +133,8 @@ def main():
         generation.handles = [SimpleNamespace(active=True)]
         row = {"closed": False, "cancelled": False, "deadline": time.monotonic() + 10,
                "phase": "new", "settled": 0, "reserved": 0, "urls": set(),
+               "search_attempts_reserved": 0, "empty_retry_reserved": False,
+               "search_primary_started": set(),
                "objective": "synthetic lookup"}
         generation.budgets["synthetic-run"] = row
         generation.members = MappingProxyType({"synthetic-run": (policy.VERSION, "identity", row)})
@@ -168,7 +170,7 @@ def main():
             assert result.choices[0].message is not source.choices[0].message
             assert source.choices[0].message.content == source_text
             assert result.choices[0].message.content == (
-                "<voice>Short.</voice><detail>" + source_text
+                "<voice>Short.</voice><detail>Short.\n\n" + source_text
                 + "\n\nSources:\n" + source_url + "</detail>"
             )
             assert result.id == source.id and result.model == source.model

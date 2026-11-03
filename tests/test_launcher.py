@@ -1838,11 +1838,14 @@ async def test_full_host_explicit_commands_share_the_composed_work_surface(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lookup_policy", [None, "ordinary-lookup/v1"])
+@pytest.mark.parametrize("lookup_policy,web_contract", [
+    (None, None), ("ordinary-lookup/v1", None), (None, "hermes.web-evidence/v1"),
+])
 async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     lookup_policy: str | None,
+    web_contract: str | None,
 ) -> None:
     class TranscriberStub:
         async def push(self, _frame: AudioFrame) -> tuple[()]:
@@ -1873,6 +1876,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         allow_unsandboxed_tasks=True,
         hermes_run_record=record,
         hermes_lookup_policy=lookup_policy,
+        hermes_web_evidence_contract=web_contract,
     )
     try:
         close_owner = next(
@@ -1882,6 +1886,7 @@ async def test_full_host_hands_its_hermes_run_record_to_the_task_session(
         assert type(task_session) is host_launcher_module.HermesApiTaskSession
         assert task_session._run_record_path == record
         assert task_session._config.lookup_policy == lookup_policy
+        assert task_session._config.web_evidence_contract == web_contract
     finally:
         await launcher.close()
 
@@ -1893,6 +1898,16 @@ def test_full_host_rejects_a_hermes_run_record_that_is_not_a_path(record: object
             hermes_api_bearer="host-test-bearer-value-32-characters",
             allow_unsandboxed_tasks=True,
             hermes_run_record=record,  # type: ignore[arg-type]
+        )
+
+
+def test_qualification_no_task_composition_rejects_web_evidence_selection() -> None:
+    with (
+        host_launcher_module._qualification_no_task_composition(),
+        pytest.raises(ValueError, match="web evidence contract"),
+    ):
+        build_local_host_launcher(
+            hermes_api_bearer=None, hermes_web_evidence_contract="hermes.web-evidence/v1",
         )
 
 

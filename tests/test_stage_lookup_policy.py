@@ -1,5 +1,6 @@
 """Packaging and inert load checks; no native Hermes or provider is started."""
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -46,6 +47,25 @@ def test_stage_copies_only_reviewed_policy_and_new_native_bootstrap(tmp_path):
         "plugin.yaml",
     }
     assert str(owned) not in json.dumps(result)
+
+
+def test_stage_refuses_unreviewed_shared_formatter_before_writing(tmp_path, monkeypatch):
+    owned = profile(tmp_path)
+    monkeypatch.setattr(stage, "REVIEWED_SOURCES", {
+        name: hashlib.sha256((FIXTURE / name).read_bytes()).hexdigest()
+        for name in stage.REVIEWED_SOURCES
+    })
+    monkeypatch.setattr(stage, "REVIEWED_SHARED_SOURCES", {
+        "evidence_presentation": "0" * 64,
+    }, raising=False)
+    with pytest.raises(stage.StagingRefusal, match="reviewed-shared-source-mismatch"):
+        stage.stage_lookup_policy(owned, FIXTURE)
+    assert list(owned.iterdir()) == []
+
+
+def test_stage_shared_source_check_never_imports_ambient_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(importlib, "import_module", lambda *_: pytest.fail("ambient import"))
+    stage.stage_lookup_policy(profile(tmp_path), FIXTURE)
 
 
 @pytest.mark.parametrize("name", ["entrypoint.py", "policy.py"])
@@ -252,6 +272,8 @@ def test_stage_source_ingress_and_readback_are_bounded(tmp_path, monkeypatch):
     owned = profile(tmp_path)
     original = Path.open
     lengths = stage.REVIEWED_SIZES | {
+        name + ".py": size for name, size in stage.REVIEWED_SHARED_SIZES.items()
+    } | {
         "__init__.py": len(stage.BOOTSTRAP),
         "plugin.yaml": len(stage.MANIFEST),
     }

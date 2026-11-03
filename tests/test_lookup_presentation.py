@@ -1,6 +1,7 @@
 """Model-free tests of the selected lookup's one tool-free presentation phase."""
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import sys
@@ -20,6 +21,43 @@ CONFIG = {
     "api_key_env": "LOOKUP_TEST_KEY",
 }
 CODEX_CONFIG = CONFIG | {"api_mode": "codex_responses"}
+
+
+def test_selected_lookup_reuses_shipped_presentation_implementation(setup):
+    from hermes_realtime.integration import evidence_presentation, presentation_transport
+
+    assert setup.module.Presentation is presentation_transport.Presentation
+    assert setup.module.presentation_input is evidence_presentation.presentation_input
+    assert setup.module.PRESENTATION_SCHEMA is evidence_presentation.PRESENTATION_SCHEMA
+    assert setup.module.PRESENTATION_INSTRUCTIONS is evidence_presentation.PRESENTATION_INSTRUCTIONS
+    assert setup.module._raw_responses_result is evidence_presentation._raw_responses_result
+    assert setup.module._consume_codex_stream is presentation_transport._consume_codex_stream
+
+
+def test_shipped_presentation_imports_without_native_sdk_or_tools():
+    import os
+    import subprocess
+
+    code = """
+import importlib.abc
+import sys
+
+class NoNativeImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'openai', 'httpx', 'agent', 'tools'}:
+            raise AssertionError('native dependency imported before formatter call')
+        return None
+
+sys.meta_path.insert(0, NoNativeImports())
+from hermes_realtime.integration import evidence_presentation, presentation_transport
+assert evidence_presentation.PRESENTATION_SCHEMA
+assert presentation_transport.Presentation
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        env=os.environ | {"PYTHONPATH": str(SOURCE.parents[2].parent / "src")},
+        capture_output=True, check=True, timeout=15,
+    )
 
 
 def completion(content, *, reason="stop", calls=None):
@@ -158,7 +196,8 @@ def setup(monkeypatch, request):
                 await captured["callback"]()
             return captured.get(
                 "response", completion(
-                    '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+                    '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+                ),
             )
 
         async def create_responses(self, **kw):
@@ -205,11 +244,13 @@ def setup(monkeypatch, request):
     def codex_events(response=None, *, deltas=None):
         response = response or codex_response([
             codex_message(
-                '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
-        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7))
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+            )
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7),
+        )
         events = [SimpleNamespace(type="response.created")]
         events.extend(SimpleNamespace(type="response.output_text.delta", delta=delta)
-                      for delta in (deltas or ['{"voice":"Short."}']))
+                      for delta in (deltas or ['{"answer":{"lead":"Short.","support":""}}']))
         events.append(SimpleNamespace(type="response.completed", response=response))
         return events
 
@@ -257,20 +298,18 @@ def test_formatter_requests_localizable_instants_without_guessing_missing_time(s
     instructions = setup.module.PRESENTATION_INSTRUCTIONS
     assert "YYYY-MM-DDTHH:MM:SSZ" in instructions
     assert "host-local time" in instructions
-    assert "original source timestamp in detail" in instructions
+    assert "original source timestamp in support" in instructions
     assert "Never invent a missing date or zone" in instructions
 
 
 def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     instructions = setup.module.PRESENTATION_INSTRUCTIONS
-    assert (
-        "Omit source names, domains, and citations unless the objective explicitly asks"
-        in instructions
-    )
-    assert "including the most material qualification" in instructions
-    assert "hard limit is 220 characters" in instructions
-    assert "source attribution; do not collapse a multi-item result" in instructions
-    assert "Return JSON with exactly voice, detail and source_ids" in instructions
+    assert "Return JSON with exactly answer and source_ids" in instructions
+    assert "Lead is a complete standalone conversational answer" in instructions
+    assert "host speaks lead verbatim" in instructions
+    assert "at most 220 characters" in instructions
+    assert "complete display" in instructions and "limited to 1800 characters" in instructions
+    assert "Put every supported requested date, qualification" in instructions
 
 
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
@@ -278,10 +317,13 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     result = s.run()
     assert result is not s.refused and result.id == s.original.id
     assert result.choices[0].message.content == (
-        "<voice>Short.</voice><detail>Full source result.\n\nSources:\n"
+        "<voice>Short.</voice><detail>Short.\n\nFull source result.\n\nSources:\n"
         "https://example.invalid/source</detail>"
     )
     assert s.original.choices[0].message.content == "Full source result."
+    expected_source_hash = hashlib.sha256(b"Full source result.").hexdigest()
+    assert s.row["presentation_evidence"]["source_sha256"] == expected_source_hash
+    assert s.row["presentation_evidence"]["wire"]["source_sha256"] == expected_source_hash
     assert result.usage is s.original.usage
     assert s.row["original_response"] is s.original
     assert len(s.captured["requests"]) == 1
@@ -292,7 +334,8 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert body["reasoning_effort"] == "none"
     assert body["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(body["messages"][-1]["content"])
-    assert payload["answer"] == s.original.choices[0].message.content
+    assert "answer" not in payload
+    assert set(payload) == {"objective", "sources", "evidence", "missing_source_ids"}
     assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
     assert payload["objective"] == "synthetic lookup"
     assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "",
@@ -300,6 +343,11 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert payload["missing_source_ids"] == [0]
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
+    assert set(schema["properties"]) == {"answer", "source_ids"}
+    answer_schema = schema["properties"]["answer"]
+    assert set(answer_schema["properties"]) == {"lead", "support"}
+    assert answer_schema["properties"]["lead"]["maxLength"] == 220
+    assert answer_schema["properties"]["support"]["maxLength"] == 1800
     assert s.captured["sdk"][0]["max_retries"] == 0
     assert s.captured["http"][0]["follow_redirects"] is False
     assert s.captured["closed"] == 2 and s.row["presentation_active"] is None
@@ -308,6 +356,70 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert s.row["presentation_evidence"]["wire"]["reasoning_effort_none"] is True
     assert s.row["presentation_evidence"]["wire_requests"] == 1
     assert s.run() is s.refused and len(s.captured["requests"]) == 1
+
+
+def test_formatter_input_contains_no_fallible_native_draft():
+    from hermes_realtime.integration.evidence_presentation import presentation_input
+
+    catalog = ("https://example.invalid/source",)
+    passages = MappingProxyType({catalog[0]: (("search", "Supported passage."),)})
+    payload = json.loads(presentation_input("synthetic lookup", catalog, passages))
+    assert set(payload) == {"objective", "sources", "evidence", "missing_source_ids"}
+    assert payload["objective"] == "synthetic lookup"
+    assert payload["evidence"][0]["text"] == "Supported passage."
+
+
+def test_single_answer_lead_is_reused_verbatim_in_voice_and_detail(setup):
+    lead = "The result is 12."
+    support = "The report also notes the sample was small."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": support}, "source_ids": [0]}))
+
+    result = setup.run()
+
+    assert result is not setup.refused
+    assert result.choices[0].message.content == (
+        f"<voice>{lead}</voice><detail>{lead}\n\n{support}"
+        + "\n\nSources:\nhttps://example.invalid/source</detail>"
+    )
+
+
+def test_nested_answer_refuses_unknown_support_fields(setup):
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": "Short.", "support": "Supported detail.", "extra": "ignored"},
+        "source_ids": [0],
+    }))
+
+    assert setup.run() is setup.refused
+    assert setup.row["presentation_evidence"]["stage"] == "content"
+
+
+def test_single_answer_without_selected_sources_has_no_sources_footer(setup):
+    lead = "The supplied evidence does not establish the requested detail."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": ""}, "source_ids": []}))
+
+    result = setup.run()
+
+    assert result is not setup.refused
+    assert result.choices[0].message.content == (
+        f"<voice>{lead}</voice><detail>{lead}</detail>"
+    )
+
+
+def test_lead_and_support_keep_requested_dates_and_qualifications(setup):
+    lead = "The deployment is planned for early 2027, subject to site readiness."
+    support = "Published October 21. The site needs 14 days of preparation."
+    setup.captured["response"] = completion(json.dumps({
+        "answer": {"lead": lead, "support": support}, "source_ids": [0]}))
+
+    result = setup.run()
+
+    assert result is not setup.refused
+    assert result.choices[0].message.content == (
+        f"<voice>{lead}</voice><detail>{lead}\n\n{support}"
+        "\n\nSources:\nhttps://example.invalid/source</detail>"
+    )
 
 
 @pytest.mark.parametrize("mutate", [
@@ -416,7 +528,8 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s = setup
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     original_final = s.codex_message(
-        '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}')
+        '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+    )
     reasoning = SimpleNamespace(type="reasoning", id="rs_keep", status=None, summary=[])
     commentary = s.codex_message("Progress text must not be published.", phase="commentary",
                                  item_id="msg_commentary")
@@ -427,10 +540,15 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     s.run.original = raw
     s.captured["stream_events"] = s.codex_events(
         s.codex_response([
-            s.codex_message("{\"voice\":\"Short.\",\"detail\":\"Full source result.\","
-                            "\"source_ids\":[0]}")
-        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7)),
-        deltas=['{"voice":', '"Short."}'],
+            s.codex_message(
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+            )
+        ], usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7),
+        ),
+        deltas=[
+            '{"answer":{"lead":"Short.","support":',
+            '"Full source result."},"source_ids":[0]}',
+        ],
     )
     result = s.run(api_mode="codex_responses")
     assert result is not s.refused and result.id == raw.id
@@ -438,10 +556,10 @@ def test_codex_formatter_stream_uses_final_answer_and_preserves_raw_response(set
     assert result.output[1] is commentary
     final_text = result.output[2].content[0].text
     assert final_text == (
-        "<voice>Short.</voice><detail>Full source result.\n\nSources:\n"
+        "<voice>Short.</voice><detail>Short.\n\nFull source result.\n\nSources:\n"
         "https://example.invalid/source</detail>"
     )
-    assert original_final.content[0].text.startswith('{"voice"')
+    assert original_final.content[0].text.startswith('{"answer"')
     assert len(s.captured["responses_requests"]) == 1
     body = s.captured["responses_requests"][0]
     assert set(body) == {"model", "instructions", "input", "store", "stream", "text", "reasoning"}
@@ -624,7 +742,8 @@ def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_c
     s.run.original = s.codex_response([
         commentary,
         s.codex_message(
-            '{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ])
     result = s.run(api_mode="codex_responses")
     assert result.output[0].content[0].text == s.module.REFUSAL
@@ -634,11 +753,15 @@ def test_codex_commentary_content_is_validated_before_exclusion(setup, invalid_c
 @pytest.mark.parametrize("response", [
     lambda s: s.codex_response([
         SimpleNamespace(type="reasoning", status="in_progress", id="rs_partial"),
-        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+        s.codex_message(
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ]),
     lambda s: s.codex_response([
         SimpleNamespace(type="reasoning", status="incomplete", id="rs_partial"),
-        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}'),
+        s.codex_message(
+            '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}'
+        ),
     ]),
 ], ids=["reasoning-in-progress", "reasoning-incomplete"])
 def test_codex_refuses_noncompleted_reasoning_items(setup, response):
@@ -666,7 +789,8 @@ def test_codex_commentary_with_unphased_final_message_is_ambiguous(setup):
     s.g.presentation = s.module.Presentation(CODEX_CONFIG)
     s.run.original = s.codex_response([
         s.codex_message("intermediate", phase="commentary"),
-        s.codex_message('{"voice":"Short.","detail":"Full source result.","source_ids":[0]}',
+        s.codex_message(
+                '{"answer":{"lead":"Short.","support":"Full source result."},"source_ids":[0]}',
                         phase=None),
     ])
     result = s.run(api_mode="codex_responses")
@@ -747,8 +871,10 @@ async def test_admission_freezes_exact_bounded_objective_before_native_handler(s
     ids=["missing", "empty", "different", "kind", "duplicate"])
 def test_host_search_requires_one_advertised_search_before_any_provider(setup, tools):
     calls = []
-    assert setup.run(request={"tools": tools},
+    assert (
+        setup.run(request={"tools": tools},
         next_call=lambda _: calls.append("provider") or setup.original) is setup.refused
+    )
     assert calls == [] and setup.row["reserved"] == 0
 
 
@@ -859,13 +985,16 @@ def test_five_planned_searches_leave_no_retry_headroom_but_keep_other_evidence(
     setup, capsys,
 ):
     setup.g.presentation = None
-    results = [{"success": True, "data": {"web": []}}] + [
+    results = (
+        [{"success": True, "data": {"web": []}}] + [
         {"success": True, "data": {"web": [{
             "url": f"https://example.invalid/{index}",
         }]}} for index in range(4)
     ] + [{"success": True, "data": {"web": [{
         "url": "https://example.invalid/forbidden-extra-retry",
-    }]}}]
+    }]},
+            }]
+    )
     outputs, attempts = retrieve_batch(setup.g, results, primary_count=5)
 
     assert len(outputs) == len(attempts) == 5
@@ -1053,9 +1182,14 @@ def test_search_passages_are_immutable_and_bound_to_sorted_source_ids(setup):
 
 
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
-    {"url": "https://example.invalid/a", "description": "dated context. " + "界" * 20000},
-    {"url": "https://example.invalid/b", "description": "qualified context. " + "b" * 20000}]}}],
-    indirect=True)
+    {"url": "https://example.invalid/a", "description": "dated context. " + "界" * 20000,
+                    },
+    {"url": "https://example.invalid/b", "description": "qualified context. " + "b" * 20000,
+                    },
+                ]},
+        }],
+    indirect=True,
+)
 def test_evidence_pack_bounds_serialized_bytes_and_exposes_exact_prefix_omissions(setup):
     s = setup
     assert s.run() is not s.refused
@@ -1228,12 +1362,15 @@ async def test_combined_snapshot_bytes_are_bounded_atomically(setup, capsys):
 
 def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
     s = setup
-    s.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": [0]}))
+    s.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
+    )
     result = s.run()
     assert result is not s.refused
     assert result.choices[0].message.content == (
-        "<voice>Short.</voice><detail>Supported answer.\n\nSources:\n"
+        "<voice>Short.</voice><detail>Short.\n\nSupported answer.\n\nSources:\n"
         "https://example.invalid/source</detail>"
     )
     assert s.original.choices[0].message.content == "Full source result."
@@ -1243,8 +1380,11 @@ def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
     {"url": "https://example.invalid/z"}, {"url": "https://example.invalid/a"}]}}], indirect=True)
 def test_attribution_selects_subset_from_whole_frozen_catalog_without_url_rewrite(setup):
     s = setup
-    s.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": [1]}))
+    s.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [1]
+        })
+    )
     result = s.run()
     assert result is not s.refused
     content = result.choices[0].message.content
@@ -1256,24 +1396,35 @@ def test_attribution_selects_subset_from_whole_frozen_catalog_without_url_rewrit
         {"id": 1, "url": "https://example.invalid/z"}]
 
 
-@pytest.mark.parametrize("ids", [[], [False], [-1], [1], [0, 0], "0", None],
-                         ids=["empty", "boolean", "negative", "out-of-range", "duplicate",
-                              "string", "null"])
+@pytest.mark.parametrize("ids", [[False], [-1], [1], [0, 0], "0", None],
+                         ids=["boolean", "negative", "out-of-range", "duplicate",
+                              "string", "null"],
+)
 def test_attribution_refuses_invalid_selected_ids(setup, ids):
-    setup.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": ids}))
+    setup.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": ids
+        })
+    )
     assert setup.run() is setup.refused
-    expected = "source-selection" if type(ids) is not list or not ids else (
+    expected = (
+        "source-selection" if type(ids) is not list
+        else (
         "source-id-type" if any(type(index) is not int for index in ids) else
         "source-id-range" if ids == [-1] or ids == [1] else "source-id-unique")
+    )
     assert setup.row["presentation_evidence"]["stage"] == expected
 
 
-@pytest.mark.parametrize("field", ["voice", "detail"])
 @pytest.mark.parametrize("marker", ["HtTp://", "HTTPS://", "WwW."], ids=["http", "https", "www"])
-def test_attribution_refuses_model_inline_web_links_without_repair(setup, capsys, field, marker):
-    value = {"voice": "Short.", "detail": "Supported answer.", "source_ids": [0]}
-    value[field] = marker + "invented.example.invalid/PRIVATE_UNADMITTED"
+def test_attribution_refuses_model_inline_web_links_without_repair(setup, capsys, marker):
+    value = {
+        "answer": {
+            "lead": "Short.",
+            "support": marker + "invented.example.invalid/PRIVATE_UNADMITTED",
+        },
+        "source_ids": [0],
+    }
     setup.captured["response"] = completion(json.dumps(value))
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["stage"] == "inline-links"
@@ -1281,8 +1432,9 @@ def test_attribution_refuses_model_inline_web_links_without_repair(setup, capsys
 
 
 def test_attribution_does_not_join_fields_into_an_artificial_web_link(setup):
-    setup.captured["response"] = completion(json.dumps({
-        "voice": "htt", "detail": "p://not-a-web-link", "source_ids": [0]}))
+    setup.captured["response"] = completion(
+        json.dumps({"answer": {"lead": "htt", "support": "p://not-a-web-link"}, "source_ids": [0]})
+    )
     assert setup.run() is not setup.refused
 
 
@@ -1296,17 +1448,23 @@ def test_attribution_refuses_whole_catalog_over_input_bound_without_call(setup):
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
     {"url": "https://example.invalid/" + "x" * 1790}]}}], indirect=True)
 def test_attribution_refuses_rendered_detail_over_1800_without_clipping(setup):
-    setup.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": [0]}))
+    setup.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
+    )
     assert setup.run() is setup.refused
-    assert setup.row["presentation_evidence"]["stage"] == "terminal-contract"
+    assert setup.row["presentation_evidence"]["stage"] == "content"
 
 
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
     {"url": "https://example.invalid/</detail>"}]}}], indirect=True)
 def test_attribution_rendered_urls_still_pass_reserved_markup_validation(setup):
-    setup.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": [0]}))
+    setup.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
+    )
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["stage"] == "terminal-contract"
 
@@ -1314,8 +1472,11 @@ def test_attribution_rendered_urls_still_pass_reserved_markup_validation(setup):
 @pytest.mark.parametrize("change", ["add", "remove"])
 def test_attribution_refuses_catalog_drift_before_publication(setup, change):
     s = setup
-    s.captured["response"] = completion(json.dumps({
-        "voice": "Short.", "detail": "Supported answer.", "source_ids": [0]}))
+    s.captured["response"] = completion(
+        json.dumps({
+            "answer": {"lead": "Short.", "support": "Supported answer."}, "source_ids": [0]
+        })
+    )
 
     async def drift():
         if change == "add":
@@ -1451,15 +1612,25 @@ def test_presentation_refuses_unbounded_or_empty_source(setup, source):
 
 
 @pytest.mark.parametrize("content", [
-    '{"voice":"v","detail":"d","source_ids":[0],"extra":"x"}',
-    '{"voice":"v","voice":"v","detail":"d","source_ids":[0]}',
-    '{"voice":5,"detail":"d","source_ids":[0]}',
-    '{"voice":"' + "v" * 221 + '","detail":"d","source_ids":[0]}',
-    '{"voice":"v","detail":"' + "d" * 1801 + '","source_ids":[0]}',
-    '{"voice":"v</voice>","detail":"d","source_ids":[0]}',
-    '{"voice":"v","detail":"","source_ids":[0]}',
-], ids=["extra-key", "duplicate-key", "wrong-type", "voice-bound", "detail-bound",
-        "delimiter", "empty-detail"])
+        '{"answer":{"lead":"Answer.","support":""},"source_ids":[0],"extra":"x"}',
+        '{"answer":{"lead":"A.","lead":"B.","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"A."},"source_ids":[0]}',
+        '{"answer":{"lead":5,"support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"A.","support":5},"source_ids":[0]}',
+        '{"answer":{"lead":"' + "v" * 221 + '","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"v","support":"' + "d" * 1801 + '"},"source_ids":[0]}',
+        '{"answer":{"lead":"v</voice>","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"","support":""},"source_ids":[0]}',
+        '{"answer":{"lead":"line\\nbreak","support":""},"source_ids":[0]}',
+], ids=["extra-key", "duplicate-nested-key", "missing-nested-key", "wrong-lead-type",
+        "wrong-support-type",
+        "lead-bound",
+        "support-bound",
+        "delimiter",
+        "empty-answer",
+        "lead-newline",
+    ],
+)
 def test_presentation_refuses_invalid_content_without_repair(setup, content):
     s = setup
     s.captured["response"] = completion(content)
@@ -1471,7 +1642,8 @@ def test_presentation_refuses_invalid_content_without_repair(setup, content):
 def test_presentation_refuses_tool_or_truncated_response(setup):
     s = setup
     s.captured["response"] = completion(
-        '{"voice":"v","detail":"d","source_ids":[0]}', reason="length")
+        '{"answer":{"lead":"v","support":""},"source_ids":[0]}', reason="length"
+    )
     assert s.run() is s.refused
 
 
@@ -1513,7 +1685,7 @@ def test_source_refusal_records_only_fixed_categories_and_counts(
 
 
 def test_presentation_refuses_explicit_formatter_refusal(setup):
-    response = completion('{"voice":"v","detail":"d","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     response.choices[0].message.refusal = "synthetic-refusal"
     setup.captured["response"] = response
     assert setup.run() is setup.refused
@@ -1521,22 +1693,22 @@ def test_presentation_refuses_explicit_formatter_refusal(setup):
 
 @pytest.mark.parametrize("case,count,kind,length,finish,tools,refusal,parsed", [
     ("zero-choices", 0, "none", 0, "missing", False, False, False),
-    ("extra-choices", 2, "string", 43, "stop", False, False, False),
+    ("extra-choices", 2, "string", 53, "stop", False, False, False),
     ("none-content", 1, "none", 0, "stop", False, False, False),
     ("other-content", 1, "other", 0, "stop", False, False, False),
     ("oversize", 1, "string", 8193, "stop", False, False, False),
-    ("length-stop", 1, "string", 43, "length", False, False, False),
-    ("unknown-finish", 1, "string", 43, "other", False, False, False),
-    ("missing-finish", 1, "string", 43, "missing", False, False, False),
-    ("tool-call", 1, "string", 43, "stop", True, False, False),
-    ("refusal", 1, "string", 43, "stop", False, True, False),
+    ("length-stop", 1, "string", 53, "length", False, False, False),
+    ("unknown-finish", 1, "string", 53, "other", False, False, False),
+    ("missing-finish", 1, "string", 53, "missing", False, False, False),
+    ("tool-call", 1, "string", 53, "stop", True, False, False),
+    ("refusal", 1, "string", 53, "stop", False, True, False),
     ("parsed-only", 1, "none", 0, "stop", False, False, True),
 ])
 def test_formatter_envelope_refusal_retains_shape_and_usage_without_content(
     setup, capsys, case, count, kind, length, finish, tools, refusal, parsed,
 ):
     s = setup
-    response = completion('{"voice":"v","detail":"d","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     message = response.choices[0].message
     if case == "zero-choices":
         response.choices = []
@@ -1763,8 +1935,10 @@ def test_settled_search_projects_exact_optional_extract_tool(setup, api_mode):
     assert projected["metadata"] == {"preserve": "this"}
     assert "browser" not in function["description"].lower()
     assert "read_file" not in function["description"].lower()
-    assert "read_file" not in function["parameters"]["properties"]["char_limit"][
+    assert (
+        "read_file" not in function["parameters"]["properties"]["char_limit"][
         "description"].lower()
+    )
 
 
 @pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
@@ -1868,23 +2042,27 @@ def test_response_reasoning_facts_and_usage_are_bounded_observations(setup, caps
 def test_presentation_refuses_response_tool_calls(setup):
     s = setup
     s.captured["response"] = completion(
-        '{"voice":"v","detail":"d","source_ids":[0]}', calls=["not-allowed"])
+        '{"answer":{"lead":"v","support":""},"source_ids":[0]}',
+        calls=["not-allowed"],
+    )
     assert s.run() is s.refused
 
 
 def test_presentation_refuses_extra_choices(setup):
     s = setup
-    response = completion('{"voice":"v","detail":"d","source_ids":[0]}')
+    response = completion('{"answer":{"lead":"v","support":""},"source_ids":[0]}')
     response.choices *= 2
     s.captured["response"] = response
     assert s.run() is s.refused
 
 
-@pytest.mark.parametrize("voice", ["line\nbreak", "control\x01", "**bold**", "# headline"],
-                         ids=["newline", "control", "emphasis", "markup"])
-def test_presentation_uses_existing_terminal_contract(setup, voice):
+@pytest.mark.parametrize(
+    "answer", ["line\nbreak", "control\x01", "**bold**", "# headline"],
+                         ids=["newline", "control", "emphasis", "markup"],
+)
+def test_presentation_uses_existing_terminal_contract(setup, answer):
     setup.captured["response"] = completion(json.dumps({
-        "voice": voice, "detail": "detail", "source_ids": [0]}))
+        "answer": {"lead": answer, "support": ""}, "source_ids": [0]}))
     assert setup.run() is setup.refused
     assert setup.row["presentation_evidence"]["failure_kind"] == "ValueError"
 

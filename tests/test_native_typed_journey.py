@@ -469,3 +469,10 @@ def test_missing_native_env_fails_before_bootstrap_network(tmp_path, monkeypatch
 def test_fresh_preview_without_run_record_has_no_recorded_admissions(tmp_path):
     # The native adapter creates its journal only when its task session starts.
     assert read_journal(tmp_path / "hermes-runs-v1.json") == (set(), 0)
+
+
+def test_client_reads_version_three_admission_journal_without_changing_authority(tmp_path):
+    path = tmp_path / "hermes-runs-v1.json"
+    run_id = "run_" + "a" * 32
+    path.write_text(json.dumps({"version": 3, "pending": [], "admitted": [run_id]}))
+    assert read_journal(path) == ({run_id}, 0)

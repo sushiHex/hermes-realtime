@@ -104,7 +104,7 @@ def read_journal(path: Path) -> tuple[set[str], int]:
         type(value) is dict
         and set(value) == {"version", "pending", "admitted"}
         and type(value["version"]) is int
-        and value["version"] in {1, 2}
+        and value["version"] in {1, 2, 3}
         and type(value["pending"]) is list
         and type(value["admitted"]) is list
         and len(value["pending"]) + len(value["admitted"]) <= 64,
