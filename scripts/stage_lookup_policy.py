@@ -13,17 +13,17 @@ import hashlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "a764089d792bd0f2432e4486cae715ad477f593e"
+REVIEWED_REVISION = "b2656f2ee1d49eb343c689e78bc3aab112145ab5"
 REVIEWED_SOURCES = {
     "entrypoint.py": "484ff3b2743e824abe22d3c6a87d3af26912ccc07f891286f088a6971d32ae50",
     "policy.py": "b50974099c20f4d3e3d1a89a0b77171fdd3a4cf73c9285b6ab2b3069c68b9e09",
 }
 REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "afffc58f4713c0b2b4e748070905c44d8611e8a2d02054589037f7fd9dce04c9",
+    "evidence_presentation": "f8cfb90fbb8b3f8e64c2183eb70491ec1403dd79b04bc15d427e1457e0a72a43",
     "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
 }
-REVIEWED_SHARED_SIZES = {"evidence_presentation": 22143, "presentation_transport": 16551}
+REVIEWED_SHARED_SIZES = {"evidence_presentation": 22466, "presentation_transport": 16551}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
