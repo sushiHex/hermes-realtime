@@ -141,7 +141,15 @@ def _extract_text_result(
         payload = json.loads(result)
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise ValueError("native-result-json") from exc
-    if type(payload) is not dict or payload.get("error"):
+    if type(payload) is not dict:
+        raise ValueError("native-result-unsuccessful")
+    error = payload.get("error")
+    if payload.get("success") is False:
+        if type(error) is str and error:
+            # Known operational failure: its error and any attached data are not evidence.
+            return result, []
+        raise ValueError("native-result-unsuccessful")
+    if error:
         raise ValueError("native-result-unsuccessful")
     if tool == "web_search":
         if payload.get("success") is not True:
@@ -423,6 +431,10 @@ class NativeWebEvidence:
                     if len(row["urls"] | requested_urls) > 256:
                         raise ValueError("web-evidence-catalog-bound")
                     row["urls"].update(requested_urls)
+                    passages = dict(row["passages"])
+                    for url in requested_urls:
+                        passages.setdefault(url, ())
+                    row["passages"] = MappingProxyType(passages)
                     row["passages"] = captured_passages(
                         row["passages"],
                         items,

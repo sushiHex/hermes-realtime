@@ -94,6 +94,7 @@ class _Presentation:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.source_input: str | None = None
         self.started: threading.Event | None = None
         self.release: threading.Event | None = None
 
@@ -109,6 +110,7 @@ class _Presentation:
         evidence: dict[str, Any],
     ) -> Any:
         self.calls += 1
+        self.source_input = source_input
         assert owner.scope() == (run_id, row)
         assert json.loads(source_input)["objective"] == "Summarize the report."
         if self.started is not None:
@@ -413,6 +415,161 @@ async def test_malformed_observation_preserves_native_result_and_refuses_groundi
     assert calls == 1
     assert observer.rows[RUN_ID]["disposition"] == "refused"
     assert capsys.readouterr().out == '[web-evidence] {"category":"refused","count":1}\n'
+
+
+@pytest.mark.asyncio
+async def test_known_search_failure_preserves_prior_evidence_for_presentation() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    presentation = _Presentation()
+    observer = _observer(presentation)
+    _bind_run(observer, task)
+    good = _search_result()
+    failed = json.dumps(
+        {
+            "success": False,
+            "error": "temporary backend failure",
+            "data": {
+                "web": [
+                    {
+                        "url": "https://example.com/untrusted",
+                        "description": "Must not be evidence.",
+                    }
+                ]
+            },
+        }
+    )
+    calls = 0
+
+    def native_search(_args: dict[str, Any]) -> str:
+        nonlocal calls
+        calls += 1
+        return good if calls == 1 else failed
+
+    assert (
+        observer.tool_execution(
+            tool_name="web_search", args={"query": "report"}, next_call=native_search
+        )
+        == good
+    )
+    assert (
+        observer.tool_execution(
+            tool_name="web_search", args={"query": "report"}, next_call=native_search
+        )
+        == failed
+    )
+    assert observer.rows[RUN_ID]["invalid"] is False
+    native = _final_response()
+    returned = await asyncio.to_thread(
+        observer.llm_execution,
+        request={"model": "test"},
+        provider="test",
+        base_url="https://example.com",
+        model="test",
+        api_mode="chat_completions",
+        next_call=lambda _request: native,
+    )
+
+    assert returned is not native
+    assert observer.rows[RUN_ID]["disposition"] == "presented"
+    assert presentation.source_input is not None
+    assert "A supported result." in presentation.source_input
+    assert "Must not be evidence." not in presentation.source_input
+    assert "https://example.com/untrusted" not in presentation.source_input
+
+
+@pytest.mark.asyncio
+async def test_failed_extract_seeds_requested_missing_catalog_without_error_data() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    observer = _observer()
+    _bind_run(observer, task)
+    failed = json.dumps(
+        {
+            "success": False,
+            "error": "temporary backend failure",
+            "results": [{"url": URL, "content": "Must not be evidence."}],
+        }
+    )
+    calls = 0
+
+    def native_extract(_args: dict[str, Any]) -> str:
+        nonlocal calls
+        calls += 1
+        return failed
+
+    returned = observer.tool_execution(
+        tool_name="web_extract",
+        args={"urls": [URL]},
+        next_call=native_extract,
+    )
+
+    assert returned == failed
+    assert calls == 1
+    row = observer.rows[RUN_ID]
+    assert row["invalid"] is False
+    assert row["urls"] == {URL}
+    assert row["passages"][URL] == ()
+    assert row["disposition"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": False},
+        {"success": False, "error": 7},
+        {"success": False, "error": ""},
+    ],
+)
+@pytest.mark.asyncio
+async def test_incomplete_operational_error_shape_invalidates_observation(
+    payload: dict[str, Any],
+) -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    observer = _observer()
+    _bind_run(observer, task)
+    raw = json.dumps(payload)
+    returned = observer.tool_execution(
+        tool_name="web_search",
+        args={"query": "report"},
+        next_call=lambda _args: raw,
+    )
+
+    assert returned == raw
+    assert observer.rows[RUN_ID]["invalid"] is True
+    assert observer.rows[RUN_ID]["disposition"] == "refused"
+
+
+@pytest.mark.asyncio
+async def test_all_known_search_failures_still_refuse_final_presentation(
+    monkeypatch: Any,
+) -> None:
+    _install_fake_openai_models(monkeypatch)
+    task = asyncio.current_task()
+    assert task is not None
+    observer = _observer()
+    _bind_run(observer, task)
+    failed = json.dumps({"success": False, "error": "temporary backend failure"})
+    observer.tool_execution(
+        tool_name="web_search",
+        args={"query": "report"},
+        next_call=lambda _args: failed,
+    )
+    native = _final_response()
+    returned = await asyncio.to_thread(
+        observer.llm_execution,
+        request={"model": "test"},
+        provider="test",
+        base_url="https://example.com",
+        model="test",
+        api_mode="chat_completions",
+        next_call=lambda _request: native,
+    )
+
+    assert returned is not native
+    assert returned.choices[0].message.content == '{"error": "policy_refused"}'
+    assert json.loads(observer.reports[RUN_ID])["disposition"] == "refused"
 
 
 @pytest.mark.asyncio
