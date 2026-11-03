@@ -73,7 +73,12 @@ Native web-only background work can opt into the
 [versioned evidence handoff](native-web-evidence.md), separately from the selected
 lookup policy. The formatter reuses its bounded same-run passage package; the
 host validates generation, run identity and exact output binding before
-publication. Nonweb and mixed work retain ordinary native behavior, with mixed
+publication. Shared presentation synthesizes one evidence-only answer; its bounded
+opening paragraph supplies canonical speech, while display retains that same
+answer and any selected source links. Native draft prose is excluded from formatter
+input. Empty citation selection can express uncertainty without a sources footer.
+This removes separately authored speech/detail summaries but does not prove logical
+consistency within an answer. Nonweb and mixed work retain ordinary native behavior, with mixed
 results explicitly outside this grounding claim. These boundaries do not prove
 factual entailment or completeness; semantic quality remains tracked in
 [#386](https://github.com/sushiHex/hermes-realtime/issues/386).

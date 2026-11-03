@@ -55,12 +55,22 @@ rather than publishing historical results.
 
 ## Bounds and limits
 
-The immutable formatter input includes the objective, fallible draft, exact
-catalog, retained passage prefixes, and missing/truncation indicators. Its
+The immutable formatter input includes the objective, exact catalog, retained
+passage prefixes, and missing/truncation indicators. Native draft prose is omitted
+from synthesis; its hash remains local diagnostic metadata. Its
 complete UTF-8 representation is at most 16 KiB. Presentation runs inside the
 native task's lifetime, with a plugin-owned 120-second allowance measured from
 admission. That allowance does not shorten ordinary or mixed native work.
 Cancellation/unload closes owned formatter work and prevents late publication.
+
+The formatter returns one `answer` narrative and `source_ids`. Its first paragraph
+is a standalone gist of at most 220 characters, used verbatim as the canonical
+speech text. Display retains the full narrative and the validated sources footer,
+within the existing 1800-character detail bound. Overlong openings are refused,
+never truncated or independently summarized. Normal speech normalization still
+applies after this projection. An empty source list is permitted for uncertainty
+and produces no sources footer. This shares wording between speech and display;
+it does not mechanically prove agreement between paragraphs or factual support.
 
 The observer bounds active rows, retained source bytes, source membership and
 observations before presenting. Exceeding an observation bound refuses

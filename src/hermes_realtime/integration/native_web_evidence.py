@@ -565,7 +565,7 @@ class NativeWebEvidence:
                     raise ValueError("web-evidence-deadline")
                 catalog = tuple(sorted(row["urls"]))
                 passages = row["passages"]
-                source_input = presentation_input(text, row["objective"], catalog, passages)
+                source_input = presentation_input(row["objective"], catalog, passages)
                 if len(source_input.encode("utf-8")) > _MAX_INPUT_BYTES:
                     raise ValueError("web-evidence-input-bound")
                 source_payload = json.loads(source_input)
@@ -588,7 +588,10 @@ class NativeWebEvidence:
                         [{"id": index, "url": url} for index, url in enumerate(catalog)]
                     ).encode()
                 ).hexdigest()
-            evidence: dict[str, Any] = {"wire_requests": 0}
+            evidence: dict[str, Any] = {
+                "wire_requests": 0,
+                "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
             rendered = render_presentation_response(formatted, catalog, api_mode, evidence)
             with self.lock:

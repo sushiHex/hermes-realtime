@@ -171,8 +171,7 @@ class Presentation:
                 "nonstreaming": serialized.get("stream") is False,
                 "reasoning_effort_none": serialized.get("reasoning_effort") == "none",
                 "schema_matches": serialized.get("response_format") == body["response_format"],
-                "source_sha256": hashlib.sha256(
-                    payload["answer"].encode()).hexdigest(),
+                "source_sha256": evidence.get("source_sha256", ""),
                 "input_sha256": hashlib.sha256(actual_input.encode()).hexdigest(),
                 "catalog_sha256": hashlib.sha256(frozen(payload["sources"]).encode()).hexdigest(),
                 "catalog_count": len(payload["sources"]),
@@ -267,7 +266,7 @@ class Presentation:
                 "store_disabled": serialized.get("store") is False,
                 "reasoning_effort_low": serialized.get("reasoning") == {"effort": "low"},
                 "schema_matches": text == expected_text_format,
-                "source_sha256": hashlib.sha256(payload["answer"].encode()).hexdigest(),
+                "source_sha256": evidence.get("source_sha256", ""),
                 "input_sha256": hashlib.sha256(actual_input.encode()).hexdigest(),
                 "catalog_sha256": hashlib.sha256(frozen(payload["sources"]).encode()).hexdigest(),
                 "catalog_count": len(payload["sources"]),

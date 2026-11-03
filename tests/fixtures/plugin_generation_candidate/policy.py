@@ -850,7 +850,7 @@ class Generation:
                 catalog = tuple(sorted(row["urls"]))
                 passages = row.get("passages")
             catalog_data = [{"id": index, "url": url} for index, url in enumerate(catalog)]
-            source_input = presentation_input(source, row["objective"], catalog, passages)
+            source_input = presentation_input(row["objective"], catalog, passages)
             evidence["input_sha256"] = hashlib.sha256(source_input.encode()).hexdigest()
             evidence["catalog_sha256"] = hashlib.sha256(frozen(catalog_data).encode()).hexdigest()
             evidence["catalog_count"] = len(catalog)
