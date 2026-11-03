@@ -13,17 +13,17 @@ import hashlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "64601d0181df5cea70380f990a944f9eb62a37e4"
+REVIEWED_REVISION = "a764089d792bd0f2432e4486cae715ad477f593e"
 REVIEWED_SOURCES = {
     "entrypoint.py": "484ff3b2743e824abe22d3c6a87d3af26912ccc07f891286f088a6971d32ae50",
-    "policy.py": "0dbcf1d93cb4faba1fd8a6f527f69c808e07004764c7c1847932ac52d1bf90d5",
+    "policy.py": "b50974099c20f4d3e3d1a89a0b77171fdd3a4cf73c9285b6ab2b3069c68b9e09",
 }
-REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53711}
+REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "290806de8f8d738f603823ef24c772a24db0b6395422b5c11e16b6a85d27c47f",
-    "presentation_transport": "e184625c744eac4016961eeb30068daaee2e1504eadd0cf28fa85e7569219d36",
+    "evidence_presentation": "afffc58f4713c0b2b4e748070905c44d8611e8a2d02054589037f7fd9dce04c9",
+    "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
 }
-REVIEWED_SHARED_SIZES = {"evidence_presentation": 22348, "presentation_transport": 16614}
+REVIEWED_SHARED_SIZES = {"evidence_presentation": 22143, "presentation_transport": 16551}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
