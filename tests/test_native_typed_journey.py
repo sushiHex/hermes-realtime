@@ -44,6 +44,66 @@ def test_scenario_accepts_followup_without_requiring_duplicate_work(tmp_path):
     assert len(load_scenario(path)) == 3
 
 
+def test_scenario_accepts_standalone_conversation_and_rejects_work_fields(tmp_path):
+    path = tmp_path / "scenario.json"
+    step = {"label": "speech", "kind": "conversation", "text": "Say this exact sentence."}
+    value = {"version": 1, "steps": [step]}
+    path.write_text(json.dumps(value), encoding="utf-8")
+    assert load_scenario(path) == [step]
+    for field, extra in (("task", "lookup"), ("wait", "completed"), ("tool", "web_search")):
+        value["steps"] = [step | {field: extra}]
+        path.write_text(json.dumps(value), encoding="utf-8")
+        with pytest.raises(ValueError, match="journey_conversation_shape"):
+            load_scenario(path)
+
+
+@pytest.mark.parametrize("unexpected", [None, "task", "run"])
+def test_conversation_binds_timing_without_admitting_work(tmp_path, monkeypatch, unexpected):
+    import scripts.native_typed_journey as client
+
+    options = SimpleNamespace(preview_dir=tmp_path)
+    journey = Journey(options, {"expiresInSeconds": 3600}, "secret")
+    runs = {"run_" + "a" * 32} if unexpected == "run" else set()
+    monkeypatch.setattr(client, "read_journal", lambda _: (runs, 0))
+    monkeypatch.setattr(
+        client, "NativeRunWitness", lambda *a, **kw: pytest.fail("ordinary turn read native run")
+    )
+    submitted = []
+    text = 'Say exactly "A synthetic sentence."'
+
+    async def request(route, payload=None):
+        if route == "input":
+            submitted.append(payload)
+            return {}
+        assert route == "events"
+        batch = [
+            event(1, "typed_input_admitted", inputSequence=1),
+            event(2, "transcript_final", role="user", text=text),
+            event(3, "first_foreground_token", turnId="opaque_A", turnGeneration=1),
+            event(4, "assistant_text_generated", turnId="opaque_A", turnGeneration=1),
+            event(5, "first_playable_audio", turnId="opaque_A", turnGeneration=1),
+            event(6, "assistant_turn_completed", turnId="opaque_A", turnGeneration=1),
+        ]
+        if unexpected == "task":
+            batch.append(event(7, "task_state", taskId="task_unexpected", status="active"))
+        for row in batch:
+            row["monotonicMs"] = journey.tracker.started + row["sequence"]
+        return {"version": 1, "events": batch}
+
+    journey.request = request
+    operation = journey.step({"label": "speech", "kind": "conversation", "text": text})
+    if unexpected is not None:
+        with pytest.raises(ValueError, match="journey_followup_dispatched"):
+            asyncio.run(operation)
+    else:
+        asyncio.run(operation)
+        assert journey.tracker.current["outcome"] == "completed"
+        assert journey.tracker.current["tokenToPlayableMs"] == 2
+        assert journey.bindings == {} and journey.results == {}
+        assert text not in json.dumps(journey.tracker.receipt())
+    assert submitted == [{"sequence": 1, "text": text}]
+
+
 def event(sequence, kind, **data):
     return {"sequence": sequence, "kind": kind, "monotonicMs": 10.5 + sequence, "data": data}
 

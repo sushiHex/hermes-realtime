@@ -61,7 +61,7 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
             type(label) is str
             and LABEL.fullmatch(label) is not None
             and label not in labels
-            and kind in {"dispatch", "status", "recall", "cancel"},
+            and kind in {"dispatch", "status", "recall", "cancel", "conversation"},
             "journey_step_identity",
         )
         labels.add(label)
@@ -83,6 +83,8 @@ def load_scenario(path: Path) -> list[dict[str, Any]]:
                     "journey_expected_tool",
                 )
             tasks.add(label)
+        elif kind == "conversation":
+            require(set(step) == {"label", "kind", "text"}, "journey_conversation_shape")
         else:
             require(
                 step.get("task") in tasks and "wait" not in step and "tool" not in step,

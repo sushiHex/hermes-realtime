@@ -55,6 +55,13 @@ ID**. A task that already completed cannot qualify active cancellation. Start a
 distinct authorized task for that case; do not repeatedly ask an answered
 research question merely to force dispatch.
 
+`conversation` has exactly `label`, `kind`, and `text`, with no task reference,
+wait option, or tool assertion. Use it for an ordinary fixed-text turn, including
+speech timing comparisons. It waits for the identity-bound foreground turn to
+complete and, like status/recall, refuses any new task or observed native admission.
+It uses the same timing markers and cleanup; it does not dispatch work to obtain
+a latency measurement or establish that the spoken wording matched the request.
+
 Acceptance binds one new task card to one observed native journal admission.
 The client samples the journal around event polling and retains admitted IDs
 only in memory. If a fast run was never observed, it reports unproven evidence;
