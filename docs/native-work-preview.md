@@ -30,9 +30,10 @@ isolated runtime with `uv pip install --no-deps --link-mode copy --target ...` s
 it owns its files rather than sharing cache hard links. Git and the existing
 interpreter environment remain trusted DEV prerequisites.
 
-The plan has exactly these top-level keys: `version`, `output`, `realtime`,
+The plan has these required top-level keys: `version`, `output`, `realtime`,
 `hermes`, `profile_mode`, `native_status`, `speech_assets`, `ports`, `models`,
-`speech`, `executables`, and `host_options`. `speech_assets` has `receipt`,
+`speech`, `executables`, and `host_options`. The optional `readiness_policy` is
+`kernel_listeners` by default, or explicitly `dev_owned_services`. `speech_assets` has `receipt`,
 `moonshine_cache`, and `kokoro_cache` absolute paths. The receipt binds each
 cached speech file by size and SHA-256, along with the Moonshine tier and Kokoro
 model/voice asset identity. Verified assets are copied into the isolated profile
@@ -100,3 +101,31 @@ its reduced child environment. NVIDIA capacity queries require it on the
 observed host; this does not copy provider credentials. Use the maintained
 `launch` command, which resolves the active receipt path and supplies the verified
 owner-runtime binding; direct `serve` without that binding refuses.
+
+
+## DEV service readiness
+
+The source-bound plan can explicitly select `readiness_policy: dev_owned_services`
+for a trusted local development account. This checks authenticated gateway health
+against the owned gateway process tree and containment, then checks the exact host
+readiness receipt against its owned process tree and containment and requires HTTP
+readiness. Host startup already completes its authenticated LiveKit verifier room
+connection before writing that receipt. The owned LiveKit process must stay alive.
+Actual conversation media connects later when the browser session starts.
+
+This DEV policy uses bounded loopback TCP availability checks for planned ports
+before startup, during readiness, and after owned cleanup. It cannot establish
+complete listener ownership or exclude every competing listener. Readiness and
+stop receipts therefore report `listener_ownership: unavailable`;
+`remaining_owned_listeners` and `protected_listeners_unchanged` are `null`.
+Separate `remaining_accepting_endpoints` and `protected_endpoints_unchanged` fields
+report TCP availability only. Protected-endpoint comparison is optional metadata;
+when unavailable it is `null` and establishes neither personal-service identity
+nor continuity. It does not authorize cleanup of another process.
+Process containment, source/runtime/profile binding,
+cooperative stop and saved-state preservation still apply.
+
+A DEV stop receipt can finalize another explicitly selected DEV preview after
+owned processes and accepting endpoints are gone. It cannot finalize a strict
+preview or satisfy release qualification. Existing plans retain strict kernel
+listener checks, and generic qualification/release code remains strict.
