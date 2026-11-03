@@ -1665,7 +1665,7 @@ def serve(active_path: Path) -> int:
         )
 
         try:
-            assert_independent_owner()
+            assert_independent_owner(interpreter=plan.executables["host_python"])
         except PreviewOwnerLaunchRefusal as error:
             raise PreviewRefusal(error.category) from None
         containment = Containment()

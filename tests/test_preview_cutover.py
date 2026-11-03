@@ -1021,14 +1021,16 @@ def test_actual_serve_refuses_inherited_job_before_containment_or_children(tmp_p
         json.dumps({"version": 1, "pending": [], "admitted": []}), encoding="utf-8")
     ports = {"api": 49001, "companion": 49002, "livekit": 49003, "host": 49004,
              "protected": [49005]}
-    plan = SimpleNamespace(output=tmp_path, ports=ports)
+    plan = SimpleNamespace(output=tmp_path, ports=ports,
+                           executables={"host_python": tmp_path / "bound-python"})
     calls = []
     monkeypatch.setattr(preview_cutover.sys, "platform", "win32")
     monkeypatch.setattr(preview_cutover, "_active_plan", lambda path: (plan, {}, tmp_path))
     monkeypatch.setattr(preview_cutover, "preflight", lambda *_: None)
     monkeypatch.setattr(lookup_backend_task, "listener_rows", lambda _: [])
 
-    def inherited():
+    def inherited(*, interpreter):
+        assert interpreter == plan.executables["host_python"]
         raise _OwnerLaunchRefusal("owner_inherited_job")
 
     def forbidden_containment():

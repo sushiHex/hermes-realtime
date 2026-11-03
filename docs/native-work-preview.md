@@ -76,11 +76,16 @@ Python executable; they do not install dependencies into Hermes.
 
 `prepare` and its `preflight` are offline. `finalize` refuses unless the prior
 run has a settled stop receipt, no owned survivors/listeners, and an empty task
-journal. `launch` uses the bound host interpreter, the existing windowless Windows
-Job breakaway flags, NUL input and exclusive private output files. It reports
+journal. `launch` probes the bound host interpreter and starts its verified base Python
+with CPython's standard virtual-environment launcher variable. This preserves
+the same virtual environment without the Windows venv redirector's extra Job.
+It uses the existing windowless Windows Job breakaway flags, NUL input and
+exclusive private output files. It reports
 only `launch_requested`, not readiness; wait for the owner's readiness receipt.
 The actual `serve` process refuses inherited Job membership before creating its
-own containment. There is no attached-launch fallback when Windows refuses
+own containment. It also verifies its actual executable image and virtual
+environment against the plan-bound interpreter, consuming the launch identity
+before service children start. There is no attached-launch fallback when Windows refuses
 breakaway or membership cannot be determined. `serve` checks the prepared bindings
 again, owns the gateway, LiveKit,
 and host children, and reports readiness only after their checks pass. Stop
@@ -92,6 +97,6 @@ different purposes. See Microsoft's [Job Objects contract](https://learn.microso
 
 On Windows, the preview owner preserves `PROGRAMFILES` as an OS runtime path in
 its reduced child environment. NVIDIA capacity queries require it on the
-observed host; this does not copy provider credentials. Use an absolute active
-receipt path for direct `serve`, since child processes run from the Hermes checkout;
-the maintained `launch` command resolves it before starting the owner.
+observed host; this does not copy provider credentials. Use the maintained
+`launch` command, which resolves the active receipt path and supplies the verified
+owner-runtime binding; direct `serve` without that binding refuses.
