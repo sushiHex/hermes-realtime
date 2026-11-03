@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib
 import json
 from pathlib import Path
 
@@ -50,14 +49,13 @@ def stage_lookup_policy(owned_profile: Path, reviewed_source: Path) -> dict[str,
     try:
         if owned_profile.is_symlink() or not owned_profile.is_dir() or any(owned_profile.iterdir()):
             raise StagingRefusal(category)
-        # The fixture now imports the shipped formatter. Pin its actual runtime
-        # implementation too; reviewing the thinner facade alone is insufficient.
-        category = "reviewed-runtime-mismatch"
+        # Pin the shared source too, without importing an ambient installed
+        # runtime. The preview's source/wheel/installed comparator separately
+        # establishes that these are the bytes actually executed.
+        category = "reviewed-shared-source-mismatch"
+        shared_root = Path(__file__).resolve().parents[1] / "src/hermes_realtime/integration"
         for name, expected in REVIEWED_SHARED_SOURCES.items():
-            module = importlib.import_module("hermes_realtime.integration." + name)
-            if module.__file__ is None:
-                raise StagingRefusal(category)
-            with Path(module.__file__).open("rb") as stream:
+            with (shared_root / (name + ".py")).open("rb") as stream:
                 raw = stream.read(REVIEWED_SHARED_SIZES[name] + 1)
             if hashlib.sha256(raw).hexdigest() != expected:
                 raise StagingRefusal(category)

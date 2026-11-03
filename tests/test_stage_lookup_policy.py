@@ -58,9 +58,14 @@ def test_stage_refuses_unreviewed_shared_formatter_before_writing(tmp_path, monk
     monkeypatch.setattr(stage, "REVIEWED_SHARED_SOURCES", {
         "evidence_presentation": "0" * 64,
     }, raising=False)
-    with pytest.raises(stage.StagingRefusal, match="reviewed-runtime-mismatch"):
+    with pytest.raises(stage.StagingRefusal, match="reviewed-shared-source-mismatch"):
         stage.stage_lookup_policy(owned, FIXTURE)
     assert list(owned.iterdir()) == []
+
+
+def test_stage_shared_source_check_never_imports_ambient_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(importlib, "import_module", lambda *_: pytest.fail("ambient import"))
+    stage.stage_lookup_policy(profile(tmp_path), FIXTURE)
 
 
 @pytest.mark.parametrize("name", ["entrypoint.py", "policy.py"])

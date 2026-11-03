@@ -74,6 +74,49 @@ async def test_native_preview_forwards_evidence_contract_to_actual_launcher(tmp_
     assert calls == ["start", "close"]
 
 
+@pytest.mark.parametrize("fault", [None, "origin", "config"])
+def test_presentation_validation_binds_verified_runtime_before_use(tmp_path, monkeypatch, fault):
+    from hermes_realtime.integration.presentation_transport import Presentation
+
+    plan_path, profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.runtime_target.mkdir()
+    config_path = profile / "config.yaml"
+    config = json.loads(config_path.read_text())
+    route = {
+        "provider": "synthetic", "base_url": "https://example.invalid/v1",
+        "model": "synthetic", "api_key_env": "SYNTHETIC_KEY",
+    }
+    if fault == "config":
+        del route["model"]
+    config["plugins"]["entries"]["hermes-realtime"]["settings"].update(
+        web_evidence=True, presentation=route
+    )
+    config_path.write_text(json.dumps(config))
+
+    def build(*, hermes_discover_tools=False, hermes_web_evidence_contract=None):
+        pass
+
+    host = SimpleNamespace(
+        __file__=str(plan.runtime_target / "hermes_realtime/host_launcher.py"),
+        build_local_host_launcher=build,
+    )
+    presentation = SimpleNamespace(
+        __file__=str((tmp_path if fault == "origin" else plan.runtime_target)
+                     / "hermes_realtime/integration/presentation_transport.py"),
+        Presentation=Presentation,
+    )
+    monkeypatch.setattr(
+        preview_cutover.importlib, "import_module",
+        lambda name: host if name.endswith("host_launcher") else presentation,
+    )
+    if fault is None:
+        preview_cutover.verify_host_profile_mode(plan)
+    else:
+        with pytest.raises(ValueError, match="native_web_presentation_" + fault):
+            preview_cutover.verify_host_profile_mode(plan)
+
+
 
 def test_failure_metadata_keeps_operator_category_without_echoing_dependency_errors():
     try:

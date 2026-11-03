@@ -34,12 +34,6 @@ def web_evidence_selected(config: dict[str, Any]) -> bool:
         presentation = settings.get("presentation")
         if type(presentation) is not dict:
             raise ValueError("native web evidence presentation refused")
-        from hermes_realtime.integration.presentation_transport import Presentation
-
-        try:
-            Presentation(presentation)
-        except (TypeError, ValueError):
-            raise ValueError("native web evidence presentation refused") from None
     return selected
 
 

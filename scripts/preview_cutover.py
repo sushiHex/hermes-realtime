@@ -750,6 +750,21 @@ def verify_host_profile_mode(plan: PreviewPlanV1) -> None:
                     "hermes_web_evidence_contract" in parameters,
                     "native_web_evidence_unavailable",
                 )
+                presentation = importlib.import_module(
+                    "hermes_realtime.integration.presentation_transport"
+                )
+                expected_presentation = (
+                    plan.runtime_target / "hermes_realtime/integration/presentation_transport.py"
+                )
+                require(
+                    Path(presentation.__file__).resolve() == expected_presentation.resolve(),
+                    "native_web_presentation_origin",
+                )
+                settings = config["plugins"]["entries"]["hermes-realtime"]["settings"]
+                try:
+                    presentation.Presentation(settings["presentation"])
+                except (TypeError, ValueError):
+                    raise PreviewRefusal("native_web_presentation_config") from None
         else:
             require("hermes_lookup_policy" in parameters, "lookup_policy_unavailable")
     finally:

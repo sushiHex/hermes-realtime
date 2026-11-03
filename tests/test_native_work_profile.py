@@ -100,7 +100,17 @@ def test_native_web_evidence_requires_a_reviewed_presentation_route(server):
         build_native_work_profile(original, server)
 
 
-def test_explicit_web_presentation_preserves_native_capabilities(server):
+def test_explicit_web_presentation_preserves_native_capabilities(server, monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def no_runtime(name, *args, **kwargs):
+        if name.startswith("hermes_realtime"):
+            raise ImportError("staging must not import the ambient runtime")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_runtime)
     original = base_config()
     settings = {
         "web_evidence": True,
