@@ -27,7 +27,7 @@ FORMATTER = '''
             assert not any(key in payload for key in (
                 "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"))
             source = json.loads(payload["messages"][-1]["content"])
-            assert source["answer"] == "Synthetic completion."
+            assert set(source) == {"objective", "sources", "evidence", "missing_source_ids"}
             assert len(source["sources"]) == 4
             safety["formatter_requests"] = safety.get("formatter_requests", 0) + 1
             safety["formatter_catalog_bound"] = True
@@ -35,8 +35,8 @@ FORMATTER = '''
                 "id": "synthetic-formatter", "object": "chat.completion", "created": 0,
                 "model": "synthetic-proof", "choices": [{"index": 0,
                     "finish_reason": "stop", "message": {"role": "assistant",
-                        "content": json.dumps({"voice": "Synthetic answer.",
-                            "detail": "Synthetic detail.", "source_ids": [0]})}}],
+                        "content": json.dumps({"answer": {"lead": "Synthetic answer.",
+                            "support": "Synthetic detail."}, "source_ids": [0]})}}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
 
         app.router.add_post("/proof/v1/chat/completions", formatter)
