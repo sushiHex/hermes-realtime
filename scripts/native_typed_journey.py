@@ -424,6 +424,8 @@ class Journey:
                 require(
                     any(
                         row["tool"] == step["tool"] and row["successfulResults"] > 0
+                        and (step["tool"] not in {"web_search", "web_extract"}
+                             or row.get("usableResults", 0) > 0)
                         for row in self.results[label]["toolCalls"]
                     ),
                     "journey_tool_unproven",

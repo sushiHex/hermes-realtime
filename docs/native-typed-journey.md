@@ -43,7 +43,8 @@ There are at most 12 steps and 4096 characters per input. `dispatch` defaults to
 waiting for completion; `wait: "accepted"` allows the next status question while
 work runs. An optional `tool` requires paired successful native evidence for
 `web_search`, `web_extract`, or `mcp__vram__vram_status`. Specifying it waits for
-completion. The status-tool witness requires exact integer `cmdline_chars: 0`
+completion. Web assertions additionally require a usable result as defined below.
+The status-tool witness requires exact integer `cmdline_chars: 0`
 and structured status data with command lines omitted. Set that request in the
 external objective. This assertion never alters the model's tool arguments.
 
@@ -71,6 +72,26 @@ subscribes to native Runs SSE, whose queue belongs to the production adapter.
 `toolEventCount` is zero; `toolRecordCount` counts database records. Successful
 pairing proves recorded tool execution, not the truth or completeness of a
 model's prose. Cancelled runs can have explicitly counted unpaired requests.
+
+`pairedResults` and `completed` count recorded request/result pairs, including
+failures. `successfulResults` preserves the legacy result-validation rules;
+`pairSuccess` means every paired result passed those rules with no pending call.
+It is neither a pure transport flag nor proof of relevance or truth.
+
+For web tools, `usableResults` counts **legacy-valid results** containing at least
+one usable row in that same result. A usable row has a structural HTTP(S) target,
+nonempty `description` (search) or `content` (extract), and no item/call error or
+policy block. Extraction also requires supplied request URLs and the existing
+exact returned/requested URL-set match. A title alone is insufficient. The URL
+check reuses the existing parser/literal-IP predicate; it does not resolve DNS,
+prove public reachability, or establish source authenticity.
+
+`usableRows`, `errorRows`, `emptyRows`, and `unboundRows` aggregate retained row
+observations across calls. These categories can overlap. Unbound includes a URL
+or request binding that was not established. A partial extract may have usable
+rows while its `successfulResults` and `usableResults` remain zero; it cannot
+qualify the web assertion. Counts do not assess factual support, passage
+relevance, or completeness, and never include the retained URLs or text.
 
 Receipts contain labels, categories, counts, terminal states, and timings only.
 They omit IDs, credentials, text, arguments, URLs, tool results, and audio.
