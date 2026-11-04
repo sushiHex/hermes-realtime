@@ -3333,7 +3333,9 @@ async def test_event_protocol_v1_notice_and_v2_preserve_the_same_completed_resul
     )
     credential = await director.start()
     boundary_text = "x" * 1022 + "🧭"
-    text = "x" * 1000 + "🧭" * 20 + "\n\nSource: https://example.com/report — 12:45 UTC"
+    suffix = "\n\nSource: https://example.com/report — 12:45 UTC"
+    text = "x" * (1023 - len(suffix)) + "🧭" + suffix
+    assert len(text) == 1024 and len(text.encode("utf-16-le")) // 2 == 1025
     projection.publish(
         "task_result",
         {
