@@ -334,6 +334,7 @@ def captured_passages(
         if not isinstance(current, MappingProxyType):
             raise ValueError("evidence-shape")
         updated: dict[str, tuple[tuple[str, str], ...]] = dict(current)
+        bound_urls: set[str] = set()
         for item in items:
             if type(item) is not dict:
                 raise ValueError("evidence-shape")
@@ -345,11 +346,6 @@ def captured_passages(
                 if kind != "extract":
                     raise ValueError("evidence-membership")
                 unbound += 1
-                for requested in admitted & catalog:
-                    values = updated.get(requested, ())
-                    gap = ("extract-unavailable", "")
-                    if gap not in values:
-                        updated[requested] = values + (gap,)
                 continue
             category = "shape"
             updated.setdefault(url, ())
@@ -363,6 +359,14 @@ def captured_passages(
                 raise ValueError("evidence-shape")
             text = (title + "\n" if title else "") + text
             updated[url] = updated.get(url, ()) + ((kind, text),)
+            bound_urls.add(url)
+        # A later bound row can resolve a request even when an earlier echo could not.
+        if unbound:
+            for requested in (admitted & catalog) - bound_urls:
+                values = updated.get(requested, ())
+                gap = ("extract-unavailable", "")
+                if gap not in values:
+                    updated[requested] = values + (gap,)
         category = "bound"
         if sum(len(text.encode("utf-8")) for values in updated.values()
                for _, text in values) > 262144:
