@@ -3674,11 +3674,14 @@ async def test_full_host_policy_redacts_private_run_handles_before_projection() 
 
 
 @pytest.mark.asyncio
-async def test_full_host_policy_clamps_result_after_private_handle_redaction() -> None:
+@pytest.mark.parametrize("limit", [1024, 4096])
+async def test_full_host_policy_preserves_redaction_or_reports_result_overflow(limit: int) -> None:
+    from hermes_realtime.result_limits import UNUSABLE_RESULT_NOTICE
+
     projection = BrowserEventProjection()
     policy = ProactiveCompletionUpdatePolicy(projection=projection)
     private_prefix = "run_a1b2c3d4 "
-    summary = private_prefix + ("x" * (1024 - len(private_prefix)))
+    summary = private_prefix + ("x" * (limit - len(private_prefix)))
 
     await policy.decide(
         UpdatePolicyInput(
@@ -3694,7 +3697,11 @@ async def test_full_host_policy_clamps_result_after_private_handle_redaction() -
 
     projected = projection.events_after(0)[-1].data["text"]
     assert type(projected) is str
-    assert len(projected) <= 1024
+    if limit == 1024:
+        assert projected == "private reference " + summary[len(private_prefix):]
+    else:
+        assert projected == UNUSABLE_RESULT_NOTICE
+    assert len(projected) <= 4096
     assert "run_a1b2c3d4" not in projected
 
 
