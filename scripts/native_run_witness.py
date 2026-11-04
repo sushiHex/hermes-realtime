@@ -76,6 +76,31 @@ def status_payload(value: dict) -> dict:
     return value
 
 
+def web_row_counts(rows: object, text_key: str, *, source_bound: bool, call_error: bool) -> dict:
+    from hermes_realtime.providers.current_facts import _public_http_target
+
+    counts = {"resultRows": 0, "usableRows": 0, "errorRows": 0, "emptyRows": 0, "unboundRows": 0}
+    if type(rows) is not list:
+        return counts
+    counts["resultRows"] = len(rows)
+    for row in rows:
+        item = row if type(row) is dict else {}
+        url, text = item.get("url"), item.get(text_key)
+        try:
+            target = type(url) is str and bool(url.strip()) and _public_http_target(url)
+        except ValueError:
+            target = False
+        bound = source_bound and target
+        has_text = type(text) is str and bool(text.strip())
+        error = (bool(item.get("error") or item.get("blocked_by_policy"))
+                 or item.get("success") is False)
+        counts["usableRows"] += int(bound and has_text and not error and not call_error)
+        counts["errorRows"] += int(error)
+        counts["emptyRows"] += int(not has_text)
+        counts["unboundRows"] += int(not bound)
+    return counts
+
+
 @contextmanager
 def connect_readonly(path: Path):
     require(path.is_file(), "witness_database_missing")
@@ -211,6 +236,8 @@ class NativeRunWitness:
             require(tool_name == name, "witness_result_tool_binding")
             value = result_object(name, content)
             error = bool(value.get("error")) or value.get("success") is False
+            call_error = error
+            source_bound = name == "web_search"
             valid = not error
             entry = by_name.setdefault(
                 name,
@@ -233,7 +260,6 @@ class NativeRunWitness:
                     and type(data.get("web")) is list
                 )
                 require(valid, "witness_search_shape")
-                entry["resultRows"] = entry.get("resultRows", 0) + len(data["web"])
             elif name == "web_extract" and not error:
                 # Pinned native web_tools returns top-level results, without a success flag.
                 rows = value.get("results")
@@ -265,7 +291,6 @@ class NativeRunWitness:
                     )
                 )
                 error = not valid
-                entry["resultRows"] = len(rows) if type(rows) is list else 0
             elif name == "mcp__vram__vram_status" and not error:
                 value = status_payload(value)
                 require(
@@ -290,6 +315,20 @@ class NativeRunWitness:
                 )
                 entry["zeroCommandlineRequest"] = True
                 entry["statusPayloadStructured"] = True
+            if name in {"web_search", "web_extract"}:
+                data = value.get("data")
+                web_rows = (data.get("web") if type(data) is dict else None)
+                counts = web_row_counts(
+                    web_rows if name == "web_search" else value.get("results"),
+                    "description" if name == "web_search" else "content",
+                    source_bound=source_bound and (name == "web_search" or "urls" in arguments),
+                    call_error=call_error,
+                )
+                for field, count in counts.items():
+                    entry[field] = entry.get(field, 0) + count
+                entry["usableResults"] = (
+                    entry.get("usableResults", 0) + int(valid and counts["usableRows"] > 0)
+                )
             for field in ("started", "completed", "pairedRequests", "pairedResults"):
                 entry[field] += 1
             entry["errorPresent"] += int(error)

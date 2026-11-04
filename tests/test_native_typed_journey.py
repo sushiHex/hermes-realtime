@@ -410,6 +410,172 @@ def test_bridge_status_pair_proves_zero_commandline_request(tmp_path):
     assert receipt["toolCalls"][0]["zeroCommandlineRequest"] is True
 
 
+def replace_web_result(tmp_path, value, *, urls=None):
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute("UPDATE messages SET content=? WHERE role='tool'", (json.dumps(value),))
+        if urls is not None:
+            raw = db.execute("SELECT tool_calls FROM messages WHERE id=1").fetchone()[0]
+            calls = json.loads(raw)
+            calls[0]["function"]["arguments"] = json.dumps({"urls": urls})
+            db.execute("UPDATE messages SET tool_calls=? WHERE id=1", (json.dumps(calls),))
+
+
+def test_empty_search_placeholder_is_operational_not_usable_evidence(tmp_path):
+    subject = witness(tmp_path)
+    replace_web_result(tmp_path, {"success": True, "data": {"web": [
+        {"url": "", "title": "", "description": "", "position": 1},
+    ]}})
+    receipt = subject.read()
+    row = receipt["toolCalls"][0]
+    assert receipt["pairSuccess"] and row["successfulResults"] == row["pairedResults"] == 1
+    assert row["usableResults"] == row["usableRows"] == 0
+    assert row["emptyRows"] == row["unboundRows"] == 1
+
+
+@pytest.mark.parametrize("url,text,error", [
+    ("https://example.test/source", "Synthetic snippet", None),
+    ("", "Synthetic snippet", None),
+    ("file:///synthetic", "Synthetic snippet", None),
+    ("http://[invalid", "Synthetic snippet", None),
+    ("https://example.test/source", "  ", None),
+    ("https://example.test/source", None, None),
+    ("https://example.test/source", "Synthetic snippet", "Synthetic error"),
+])
+def test_search_usable_evidence_requires_url_description_and_no_item_error(
+    tmp_path, url, text, error,
+):
+    subject = witness(tmp_path)
+    replace_web_result(tmp_path, {"success": True, "data": {"web": [
+        {"url": url, "title": "Title alone is insufficient", "description": text, "error": error},
+    ]}})
+    row = subject.read()["toolCalls"][0]
+    expected = int(url == "https://example.test/source"
+                   and bool(text and text.strip()) and not error)
+    assert row["successfulResults"] == 1  # Preserve legacy shape-success meaning.
+    assert row["usableResults"] == row["usableRows"] == expected
+    assert row["errorRows"] == int(bool(error))
+    assert "Synthetic" not in json.dumps(row) and "example.test" not in json.dumps(row)
+
+
+def test_call_error_prevents_usable_evidence_despite_nonempty_rows(tmp_path):
+    subject = witness(tmp_path)
+    replace_web_result(tmp_path, {"success": False, "error": "Synthetic call error", "data": {
+        "web": [{"url": "https://example.test/source", "description": "Synthetic snippet"}],
+    }})
+    row = subject.read()["toolCalls"][0]
+    assert row["successfulResults"] == row["usableResults"] == row["usableRows"] == 0
+    assert row["pairedResults"] == row["errorPresent"] == 1
+
+
+def test_partial_extract_reports_rows_without_changing_legacy_validity(tmp_path):
+    subject = witness(tmp_path, tool="web_extract")
+    first, second = "https://example.test/first", "https://example.test/second"
+    replace_web_result(tmp_path, {"results": [
+        {"url": first, "content": "Synthetic body", "error": None},
+        {"url": second, "content": "", "error": "Synthetic item error"},
+    ]}, urls=[first, second])
+    receipt = subject.read()
+    row = receipt["toolCalls"][0]
+    assert not receipt["pairSuccess"] and row["successfulResults"] == 0
+    assert row["pairedResults"] == row["errorPresent"] == 1
+    assert row["usableResults"] == 0
+    assert row["usableRows"] == row["errorRows"] == row["emptyRows"] == 1
+    assert row["resultRows"] == 2 and row["unboundRows"] == 0
+
+
+def test_extract_success_and_usable_rows_from_different_results_cannot_combine(tmp_path):
+    subject = witness(tmp_path, tool="web_extract")
+    replace_web_result(tmp_path, {"results": [
+        {"url": "file:///synthetic", "content": "Synthetic body", "error": None},
+    ]}, urls=["file:///synthetic"])
+    urls = ["https://example.test/first", "https://example.test/second"]
+    call = [{"id": "call_two", "function": {
+        "name": "web_extract", "arguments": json.dumps({"urls": urls}),
+    }}]
+    result = {"results": [
+        {"url": urls[0], "content": "Synthetic body", "error": None},
+        {"url": urls[1], "content": "", "error": "Synthetic failure"},
+    ]}
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute("INSERT INTO messages VALUES(3,?,?,?,?,?,?,1)",
+                   (subject.run_id, "assistant", None, json.dumps(call), None, None))
+        db.execute("INSERT INTO messages VALUES(4,?,?,?,?,?,?,1)",
+                   (subject.run_id, "tool", json.dumps(result), None, "call_two", "web_extract"))
+    receipt = subject.read()
+    row = receipt["toolCalls"][0]
+    assert row["pairedResults"] == 2 and row["successfulResults"] == row["usableRows"] == 1
+    assert row["usableResults"] == 0 and not receipt["pairSuccess"]
+    assert row["resultRows"] == 3 and row["errorRows"] == row["emptyRows"] == 1
+
+
+def test_extract_without_requested_urls_keeps_legacy_success_but_no_usable_binding(tmp_path):
+    subject = witness(tmp_path, tool="web_extract")
+    replace_web_result(tmp_path, {"results": [
+        {"url": "https://example.test/source", "content": "Synthetic body", "error": None},
+    ]})
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        calls = json.loads(db.execute("SELECT tool_calls FROM messages WHERE id=1").fetchone()[0])
+        calls[0]["function"]["arguments"] = "{}"
+        db.execute("UPDATE messages SET tool_calls=? WHERE id=1", (json.dumps(calls),))
+    row = subject.read()["toolCalls"][0]
+    assert row["successfulResults"] == 1
+    assert row["usableResults"] == row["usableRows"] == 0 and row["unboundRows"] == 1
+
+
+@pytest.mark.parametrize("returned", [
+    ["https://example.test/first"],
+    ["https://example.test/first", "https://foreign.test/second"],
+])
+def test_extract_usable_evidence_keeps_exact_requested_url_set(tmp_path, returned):
+    subject = witness(tmp_path, tool="web_extract")
+    replace_web_result(tmp_path, {"results": [
+        {"url": url, "content": "Synthetic body", "error": None} for url in returned
+    ]}, urls=["https://example.test/first", "https://example.test/second"])
+    row = subject.read()["toolCalls"][0]
+    assert row["successfulResults"] == row["usableResults"] == row["usableRows"] == 0
+    assert row["unboundRows"] == len(returned)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,successful,usable,accepted", [
+    ("web_search", 1, 0, False), ("web_search", 1, 1, True),
+    ("web_extract", 1, 0, False),
+    ("web_extract", 0, 1, False), ("web_extract", 1, 1, True),
+    ("mcp__vram__vram_status", 1, None, True),
+])
+async def test_web_tool_assertion_requires_both_legacy_success_and_usable_evidence(
+    tmp_path, monkeypatch, tool, successful, usable, accepted,
+):
+    import scripts.native_typed_journey as client
+
+    run = "run_" + "a" * 32
+    monkeypatch.setattr(client, "read_journal", lambda _: ({run}, 0))
+    journey = Journey(SimpleNamespace(preview_dir=tmp_path), {"expiresInSeconds": 3600}, "secret")
+
+    async def request(route, payload=None):
+        if route == "input":
+            return {}
+        return {"version": 1, "events": [
+            event(1, "task_state", taskId="task_evidence", status="active"),
+            event(2, "task_result", taskId="task_evidence", status="completed"),
+        ]}
+
+    async def collect(label):
+        row = {"tool": tool, "successfulResults": successful}
+        if usable is not None:
+            row["usableResults"] = usable
+        journey.results[label] = {"terminal": "completed", "toolCalls": [row]}
+
+    journey.request, journey.collect = request, collect
+    operation = journey.step({"kind": "dispatch", "label": "evidence",
+                              "text": "Synthetic task", "tool": tool})
+    if accepted:
+        await operation
+    else:
+        with pytest.raises(ValueError, match="journey_tool_unproven"):
+            await operation
+
+
 @pytest.mark.parametrize(
     "result",
     [
@@ -445,6 +611,7 @@ def test_native_extract_inline_results_without_success_flag_are_accepted(tmp_pat
     db.close()
     receipt = subject.read()
     assert receipt["toolCalls"][0]["successfulResults"] == 1
+    assert receipt["toolCalls"][0]["usableResults"] == receipt["toolCalls"][0]["usableRows"] == 1
     assert receipt["pairSuccess"]
 
 
