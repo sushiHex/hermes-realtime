@@ -20,10 +20,10 @@ REVIEWED_SOURCES = {
 }
 REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "2082d537ac71770cbc4a5e512dd56755e51eddf86a027745a2788c39397b5de8",
+    "evidence_presentation": "56699d1f92ebbf4b6ca2f8644c2238ffd179931e1dc7749690cece6aca9a4cdc",
     "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
 }
-REVIEWED_SHARED_SIZES = {"evidence_presentation": 22855, "presentation_transport": 16551}
+REVIEWED_SHARED_SIZES = {"evidence_presentation": 23026, "presentation_transport": 16551}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
