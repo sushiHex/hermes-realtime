@@ -721,7 +721,7 @@ async def test_cancel_ack_is_written_before_later_terminal_sequence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bridge_bounds_oversized_hermes_completion_summary() -> None:
+async def test_bridge_refuses_oversized_hermes_completion_without_slicing() -> None:
     service, completions = bridge_components()
     async with LocalHermesBridgeServer(
         service=service,
@@ -736,17 +736,14 @@ async def test_bridge_bounds_oversized_hermes_completion_summary() -> None:
         await client.send(request())
         await client.receive()
 
-        await server.complete(
-            "deleg_task_001",
-            status="failed",
-            summary="\x00" * 9000,
-            reason="\x00" * 9000,
-        )
+        with pytest.raises(BridgeProtocolError, match="bound"):
+            await server.complete("deleg_task_001", status="completed", summary="\x00" * 9000)
+        await server.complete("deleg_task_001", status="failed", reason="x" * 1024)
         completion = await client.receive()
 
         assert isinstance(completion, WorkCompletedEvent)
-        assert completion.payload.summary == "\x00" * 4096
-        assert completion.payload.reason == "\x00" * 4096
+        assert completion.payload.summary is None
+        assert completion.payload.reason == "x" * 1024
 
 
 @pytest.mark.asyncio

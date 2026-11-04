@@ -89,7 +89,7 @@ def test_conversation_binds_timing_without_admitting_work(tmp_path, monkeypatch,
             batch.append(event(7, "task_state", taskId="task_unexpected", status="active"))
         for row in batch:
             row["monotonicMs"] = journey.tracker.started + row["sequence"]
-        return {"version": 1, "events": batch}
+        return {"version": 2, "events": batch}
 
     journey.request = request
     operation = journey.step({"label": "speech", "kind": "conversation", "text": text})
@@ -220,7 +220,7 @@ async def test_dispatch_wait_refuses_matching_pretext_interruption_without_timeo
     async def request(route, payload=None):
         if route == "input":
             return {}
-        return {"version": 1, "events": [
+        return {"version": 2, "events": [
             event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
             event(2, "assistant_turn_interrupted", turnId="actual_turn", turnGeneration=1,
                   inputSequence=1, bindingGeneration=7),
@@ -245,7 +245,7 @@ async def test_interrupted_dispatch_keeps_real_accepted_task_bound_for_cleanup(
     async def request(route, payload=None):
         if route == "input":
             return {}
-        return {"version": 1, "events": [
+        return {"version": 2, "events": [
             event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
             event(2, "task_state", taskId="task_accepted", status="active"),
             event(3, "assistant_turn_interrupted", turnId="actual_turn", turnGeneration=1,
@@ -555,7 +555,7 @@ async def test_web_tool_assertion_requires_both_legacy_success_and_usable_eviden
     async def request(route, payload=None):
         if route == "input":
             return {}
-        return {"version": 1, "events": [
+        return {"version": 2, "events": [
             event(1, "task_state", taskId="task_evidence", status="active"),
             event(2, "task_result", taskId="task_evidence", status="completed"),
         ]}
@@ -681,7 +681,7 @@ def test_fast_completed_work_then_status_does_not_require_a_second_dispatch(tmp_
     )
 
     async def request(route, payload=None):
-        return {"version": 1, "events": next(batches)} if route == "events" else {}
+        return {"version": 2, "events": next(batches)} if route == "events" else {}
 
     journey.request = request
 
@@ -795,3 +795,48 @@ def test_client_reads_version_three_admission_journal_without_changing_authority
     run_id = "run_" + "a" * 32
     path.write_text(json.dumps({"version": 3, "pending": [], "admitted": [run_id]}))
     assert read_journal(path) == ({run_id}, 0)
+
+
+@pytest.mark.asyncio
+async def test_client_requires_v2_event_response_without_downgrade(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+
+    monkeypatch.setattr(client, "read_journal", lambda _: (set(), 0))
+    journey = Journey(SimpleNamespace(preview_dir=tmp_path), {"expiresInSeconds": 3600}, "secret")
+
+    async def request(route, payload=None):
+        assert route == "events"
+        return {"version": 1, "events": []}
+
+    journey.request = request
+    with pytest.raises(ValueError, match="journey_event_version"):
+        await journey.poll()
+
+
+@pytest.mark.parametrize("route,version", [("events", 2), ("input", 1)])
+def test_client_uses_versioned_events_without_changing_other_routes(monkeypatch, route, version):
+    import scripts.native_typed_journey as client
+
+    requests = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _limit):
+            return b"{}"
+
+    def opened(request, **_kwargs):
+        requests.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(
+        client.urllib.request, "build_opener", lambda *_: SimpleNamespace(open=opened),
+    )
+    assert client.request_json("http://127.0.0.1:1", route) == (200, {})
+    assert requests == [f"http://127.0.0.1:1/api/v{version}/{route}"]

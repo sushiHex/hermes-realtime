@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
 )
+from hermes_realtime.result_limits import MAX_COMPLETED_RESULT_CHARS, has_valid_result_unicode
 
 from .context import ConversationContextStore, PrivateRunDisclosureError, TaskAdmission
 from .result_projection import completed_result_reference
@@ -39,7 +41,7 @@ _PRIVATE_RUN_TOKEN_PATTERN = re.compile(
 )
 _MAX_TASK_ID_CHARS = 128
 _MAX_OUTCOME_TEXT_CHARS = 1024
-_MAX_COMPLETED_SUMMARY_CHARS = 4096
+_MAX_COMPLETED_SUMMARY_CHARS = MAX_COMPLETED_RESULT_CHARS
 _MAX_PROTOCOL_SEQUENCE = (1 << 63) - 1
 _TERMINAL_STATUSES = frozenset(("completed", "failed", "interrupted"))
 
@@ -186,6 +188,12 @@ class TaskTerminalOutcome:
         if self.status == "completed":
             if self.summary is None or self.reason is not None:
                 raise ValueError("completed status requires summary-only evidence")
+            if not has_valid_result_unicode(self.summary):
+                try:
+                    raise ValueError("completed summary must contain Unicode scalar values")
+                finally:
+                    with contextlib.suppress(OSError, ValueError):
+                        print('[task-result-refusal] {"version":1,"category":"unicode"}')
         elif self.reason is None or self.summary is not None:
             raise ValueError("non-completed status requires reason-only evidence")
 

@@ -14,6 +14,10 @@ from hermes_realtime.evidence.models import (
     parse_evidence_consent_request,
     parse_evidence_revoke_request,
 )
+from hermes_realtime.result_limits import (
+    LEGACY_RESULT_NOTICE,
+    MAX_LEGACY_RESULT_CHARS,
+)
 from hermes_realtime.search_egress import (
     parse_search_egress_consent_request,
     parse_search_egress_revoke_request,
@@ -261,6 +265,7 @@ class BrowserBootstrapApplication:
             "/api/v1/voice-delete-status",
             "/api/v1/voices",
             "/api/v1/yield",
+            "/api/v2/events",
         }
         if self._capability is not None:
             routes.add("/api/v1/bootstrap")
@@ -631,7 +636,7 @@ class BrowserBootstrapApplication:
                 "version": 1,
             }
             status = 202
-        elif path == "/api/v1/events":
+        elif path in {"/api/v1/events", "/api/v2/events"}:
             if not 1 <= len(body) <= 1024:
                 raise ValueError("events request body must contain 1 to 1024 bytes")
             if headers.get("content-type") != "application/json":
@@ -647,17 +652,30 @@ class BrowserBootstrapApplication:
                 participant_identity=identity,
                 sequence=after,
             )
-            payload = {
-                "events": [
+            version = 1 if path == "/api/v1/events" else 2
+            public_events: list[dict[str, object]] = []
+            for event in events:
+                data = dict(event.data)
+                text = data.get("text")
+                if (
+                    version == 1
+                    and event.kind == "task_result"
+                    and data.get("status") == "completed"
+                    and type(text) is str
+                    and len(text.encode("utf-16-le")) // 2 > MAX_LEGACY_RESULT_CHARS
+                ):
+                    data["text"] = LEGACY_RESULT_NOTICE
+                public_events.append(
                     {
-                        "data": dict(event.data),
+                        "data": data,
                         "kind": event.kind,
                         "monotonicMs": event.monotonic_ms,
                         "sequence": event.sequence,
                     }
-                    for event in events
-                ],
-                "version": 1,
+                )
+            payload = {
+                "events": public_events,
+                "version": version,
             }
             status = 200
         elif path == "/api/v1/voices":

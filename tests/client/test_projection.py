@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from hermes_realtime.client import BrowserEventProjection
 from hermes_realtime.evidence.models import ProjectionReservation
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
+)
 
 
 def test_voice_clear_reservation_survives_concurrent_publication() -> None:
@@ -547,6 +554,58 @@ def test_projection_validates_task_result_shape_before_publication() -> None:
                 "text": "Not terminal.",
             },
         )
+
+
+def test_projection_allows_only_bounded_valid_unicode_completed_result_text() -> None:
+    projection = BrowserEventProjection()
+    text = "😀" * 4096
+    event = projection.publish(
+        "task_result",
+        {"status": "completed", "taskId": "task_unicode_result", "text": text},
+    )
+    assert event.data["text"] == text
+
+    for invalid_text in ("😀" * 4097, "valid prefix\ud800"):
+        with pytest.raises((TypeError, ValueError)):
+            projection.publish(
+                "task_result",
+                {
+                    "status": "completed",
+                    "taskId": "task_unicode_result",
+                    "text": invalid_text,
+                },
+            )
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+def test_projection_keeps_noncompleted_result_text_at_legacy_bound(status: str) -> None:
+    projection = BrowserEventProjection()
+    accepted = projection.publish(
+        "task_result",
+        {"status": status, "taskId": "task_noncompleted", "text": "x" * 1024},
+    )
+    assert len(accepted.data["text"]) == 1024
+    retained = projection.publish(
+        "task_result",
+        {"status": status, "taskId": "task_noncompleted", "text": "legacy\ud800"},
+    )
+    assert retained.data["text"] == "legacy\ud800"
+    with pytest.raises(ValueError, match="text"):
+        projection.publish(
+            "task_result",
+            {"status": status, "taskId": "task_noncompleted", "text": "x" * 1025},
+        )
+
+
+def test_browser_result_limits_match_shared_python_constants() -> None:
+    protocol = Path(__file__).resolve().parents[2] / "web/src/protocol.ts"
+    source = protocol.read_text(encoding="utf-8")
+    expected = {
+        "MAX_COMPLETED_RESULT_CHARS": MAX_COMPLETED_RESULT_CHARS,
+        "MAX_LEGACY_RESULT_CHARS": MAX_LEGACY_RESULT_CHARS,
+    }
+    for name, value in expected.items():
+        assert re.search(rf"export const {name} = {value};", source) is not None
 
 
 def test_projection_admits_speech_verifier_advisories() -> None:

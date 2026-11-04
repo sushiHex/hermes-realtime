@@ -538,6 +538,145 @@ async def test_worker_session_receives_proactive_terminal_update() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("negotiated", [False, True])
+@pytest.mark.parametrize("astral", [False, True])
+async def test_bridge_completed_result_preserves_negotiated_bound(negotiated, astral) -> None:
+    from hermes_realtime.result_limits import LEGACY_RESULT_NOTICE
+
+    bindings = SessionBindings()
+    bindings.bind("participant_001", "session_001")
+    sequencer = EventSequencer()
+    event_ids = iter(("evt_ack_001", "evt_completed_001"))
+    service = HermesIntegrationService(
+        bindings=bindings, dispatcher=ImmediateDispatcher(), sequencer=sequencer,
+        event_id_factory=lambda: next(event_ids),
+        clock=lambda: datetime(2026, 7, 19, tzinfo=UTC),
+    )
+    completions = HermesCompletionRouter(
+        sequencer=sequencer, event_id_factory=lambda: next(event_ids),
+        clock=lambda: datetime(2026, 7, 19, tzinfo=UTC),
+    )
+    suffix = " Source: https://example.invalid/source Observed November 4, 2026 at 09:30 UTC."
+    summary = ("🧪" if astral else "x") * (4096 - len(suffix)) + suffix
+    async with LocalHermesBridgeServer(service=service, completions=completions,
+                                      token="test-token-with-sufficient-entropy") as server:
+        async with await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token="test-token-with-sufficient-entropy",
+            participant_id="participant_001",
+            capabilities=("completed_result_v1",) if negotiated else (),
+        ) as client:
+            worker = RealtimeHermesSession(client=client, session_id="session_001")
+            worker.start()
+            try:
+                await worker.dispatch(dispatch_request())
+                await server.complete("deleg_task_001", status="completed", summary=summary)
+                update = await asyncio.wait_for(worker.next_update(), timeout=1)
+                assert update.payload.summary == (summary if negotiated else LEGACY_RESULT_NOTICE)
+                assert update.payload.status == WorkTerminalStatus.COMPLETED
+                retained = await completions.completed("deleg_task_001")
+                assert retained is not None and retained.payload.summary == summary
+                assert await service.active_run_ids() == frozenset()
+            finally:
+                await worker.close()
+
+        # A replay is projected for its new recipient, never persisted as the notice.
+        async with await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token="test-token-with-sufficient-entropy",
+            participant_id="participant_001",
+            capabilities=() if negotiated else ("completed_result_v1",),
+        ) as replay:
+            await replay.send(dispatch_request())
+            await replay.receive()
+            repeated = await replay.receive()
+            assert repeated.payload.summary == (LEGACY_RESULT_NOTICE if negotiated else summary)
+            retained = await completions.completed("deleg_task_001")
+            assert retained is not None and retained.payload.summary == summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "limit"), [("summary", 4096), ("reason", 1024)])
+async def test_bridge_oversized_terminal_refuses_before_claim_and_can_settle(field, limit) -> None:
+    bindings = SessionBindings()
+    bindings.bind("participant_001", "session_001")
+    sequencer = EventSequencer()
+    event_ids = iter(("evt_ack_001", "evt_completed_001"))
+    service = HermesIntegrationService(
+        bindings=bindings, dispatcher=ImmediateDispatcher(), sequencer=sequencer,
+        event_id_factory=lambda: next(event_ids),
+        clock=lambda: datetime(2026, 7, 19, tzinfo=UTC),
+    )
+    completions = HermesCompletionRouter(
+        sequencer=sequencer, event_id_factory=lambda: next(event_ids),
+        clock=lambda: datetime(2026, 7, 19, tzinfo=UTC),
+    )
+    async with LocalHermesBridgeServer(service=service, completions=completions,
+                                      token="test-token-with-sufficient-entropy") as server, (
+        await LocalHermesBridgeClient.connect(
+            host=server.host, port=server.port, token="test-token-with-sufficient-entropy",
+            participant_id="participant_001",
+            capabilities=("completed_result_v1",),
+        )
+    ) as client:
+        worker = RealtimeHermesSession(client=client, session_id="session_001")
+        worker.start()
+        try:
+            await worker.dispatch(dispatch_request())
+            status = "completed" if field == "summary" else "failed"
+            with pytest.raises(BridgeProtocolError, match="bound"):
+                await server.complete("deleg_task_001", status=status,
+                                      **{field: "x" * (limit + 1)})
+            assert await completions.completed("deleg_task_001") is None
+            assert "deleg_task_001" in await service.active_run_ids()
+            value = "x" * (limit if field == "reason" else 1024)
+            await server.complete("deleg_task_001", status=status, **{field: value})
+            update = await asyncio.wait_for(worker.next_update(), timeout=1)
+            assert getattr(update.payload, field) == value
+            assert not await service.active_run_ids()
+        finally:
+            await worker.close()
+
+@pytest.mark.parametrize("capabilities", [None, "completed_result_v1", ["completed_result_v1"],
+                                          {"completed_result_v1"},
+                                          frozenset(),
+                                          frozenset({"completed_result_v1", "unknown"})],
+                         ids=["absent", "string", "list", "set", "unnegotiated", "unknown"])
+def test_worker_never_upgrades_untrusted_capability_shapes(capabilities) -> None:
+    from types import SimpleNamespace
+
+    event = WorkCompletedEvent(
+        type="work.completed", event_id="evt_terminal", session_id="session_001", sequence=2,
+        timestamp=datetime(2026, 7, 19, tzinfo=UTC), task_id="task_001", run_id="deleg_task_001",
+        payload=WorkCompletedPayload(status=WorkTerminalStatus.COMPLETED, summary="x" * 1025),
+    )
+    worker = RealtimeHermesSession(client=SimpleNamespace(capabilities=capabilities),
+                                  session_id="session_001")
+    with pytest.raises(BridgeProtocolError, match="bound"):
+        worker._validate_terminal(event)
+
+
+@pytest.mark.parametrize("summary", ["x" * 4097, "\ud800", "\udfff"],
+                         ids=["over_bound", "high_surrogate", "low_surrogate"])
+def test_negotiated_worker_and_producer_reject_invalid_completed_scalars(summary) -> None:
+    from types import SimpleNamespace
+
+    event = WorkCompletedEvent(
+        type="work.completed", event_id="evt_terminal", session_id="session_001", sequence=2,
+        timestamp=datetime(2026, 7, 19, tzinfo=UTC), task_id="task_001", run_id="deleg_task_001",
+        payload=WorkCompletedPayload(status=WorkTerminalStatus.COMPLETED, summary="valid"),
+    )
+    # The worker revalidates exact model fields even after hostile local mutation.
+    object.__setattr__(event.payload, "summary", summary)
+    worker = RealtimeHermesSession(
+        client=SimpleNamespace(capabilities=frozenset({"completed_result_v1"})),
+        session_id="session_001",
+    )
+    with pytest.raises(BridgeProtocolError, match="bound"):
+        worker._validate_terminal(event)
+    with pytest.raises(BridgeProtocolError, match="bound"):
+        LocalHermesBridgeServer._validate_completion_text(summary, completed=True)
+
+
+@pytest.mark.asyncio
 async def test_worker_session_propagates_exact_task_cancellation() -> None:
     bindings = SessionBindings()
     bindings.bind("participant_001", "session_001")

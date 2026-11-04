@@ -10,6 +10,7 @@ from hermes_realtime.companion.integrity import MAX_BATCH_ROWS, REFUSAL_CATEGORI
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    COMPLETED_RESULT_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
     VOICE_INTEGRITY_REFUSALS,
@@ -73,9 +74,10 @@ def test_the_bridge_stays_at_version_0_3_and_memory_is_a_capability() -> None:
     assert VOICE_REVIEW_CAPABILITY == "voice_review"
     assert VOICE_MEMORY_CAPABILITY == "voice_memory"
     assert RUNTIME_ATTESTATION_CAPABILITY == "runtime_attestation"
+    assert COMPLETED_RESULT_CAPABILITY == "completed_result_v1"
     assert (
         frozenset({"voice_archive", "voice_review", "voice_memory", "runtime_attestation",
-                   "voice_forget", "mutual_auth"})
+                   "voice_forget", "mutual_auth", "completed_result_v1"})
         == BRIDGE_CAPABILITIES
     )
 

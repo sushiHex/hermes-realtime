@@ -3314,6 +3314,79 @@ async def test_authenticated_input_submits_server_bound_sequenced_text() -> None
 
 
 @pytest.mark.asyncio
+async def test_event_protocol_v1_notice_and_v2_preserve_the_same_completed_result() -> None:
+    from hermes_realtime.result_limits import LEGACY_RESULT_NOTICE
+
+    connection = LiveKitConnection("wss://livekit.test", "test-key", "s" * 32)
+    projection = BrowserEventProjection()
+    director = BrowserSessionDirector(
+        issuer=BrowserTokenIssuer(
+            connection=connection,
+            room_name="hermes-local",
+            identity_factory=lambda: "browser_0123456789abcdef",
+        ),
+        provision=lambda _identity: asyncio.sleep(0, result=3),
+        submit=_noop_submit,
+        stop=_noop_stop,
+        approval=_noop_approval,
+        projection=projection,
+    )
+    credential = await director.start()
+    boundary_text = "x" * 1022 + "🧭"
+    suffix = "\n\nSource: https://example.com/report — 12:45 UTC"
+    text = "x" * (1023 - len(suffix)) + "🧭" + suffix
+    assert len(text) == 1024 and len(text.encode("utf-16-le")) // 2 == 1025
+    projection.publish(
+        "task_result",
+        {
+            "status": "completed",
+            "taskId": "task_legacy_boundary",
+            "text": boundary_text,
+        },
+    )
+    projection.publish(
+        "task_result",
+        {"status": "completed", "taskId": "task_release_check", "text": text},
+    )
+    app = BrowserBootstrapApplication(
+        sessions=director,
+        verifier=BrowserTokenVerifier(connection=connection, room_name="hermes-local"),
+        capability=OneTimeBootstrapCapability(token_factory=lambda: "c" * 43),
+        allowed_origin="https://phone.test:8443",
+        worker_identity="worker_hermes_browser",
+    )
+    body = b'{"after":0}'
+
+    async def read_events(path: str) -> dict[str, object]:
+        response = await app.handle(
+            method="POST",
+            path=path,
+            headers={
+                "authorization": f"Bearer {credential.token}",
+                "content-length": str(len(body)),
+                "content-type": "application/json",
+                "origin": "https://phone.test:8443",
+            },
+            body=body,
+        )
+        assert response.status == 200
+        return json.loads(response.body)
+
+    legacy = await read_events("/api/v1/events")
+    current = await read_events("/api/v2/events")
+    legacy_results = [item for item in legacy["events"] if item["kind"] == "task_result"]
+    current_results = [item for item in current["events"] if item["kind"] == "task_result"]
+
+    assert legacy["version"] == 1
+    assert legacy_results[0]["data"]["text"] == boundary_text
+    assert len(boundary_text.encode("utf-16-le")) // 2 == 1024
+    assert legacy_results[1]["data"]["text"] == LEGACY_RESULT_NOTICE
+    assert current["version"] == 2
+    assert current_results[0]["data"]["text"] == boundary_text
+    assert current_results[1]["data"]["text"] == text
+
+
+@pytest.mark.asyncio
 async def test_authenticated_codex_model_catalog_can_select_next_turn_configuration() -> None:
     secret = "synthetic-browser-model-secret-32-bytes"
     connection = LiveKitConnection("wss://livekit.test", "test-key", secret)

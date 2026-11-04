@@ -23,7 +23,7 @@ const credential = {
 };
 let dom: JSDOM;
 
-async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 }), oneShot = false, storageFailure?: "getter" | "write") {
+async function mount(inputRequest: (body: { sequence: number; text: string }, signal: AbortSignal) => Promise<Response> = async () => Response.json({ version: 1 }), oneShot = false, storageFailure?: "getter" | "write", eventBatchVersion: 1 | 2 | 403 = 2) {
   vi.resetModules();
   media.rooms.length = 0;
   dom = new JSDOM(readFileSync(new URL("../index.html", import.meta.url), "utf8"), {
@@ -77,9 +77,13 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
       return Response.json({ version: 1 });
     }
     if (path === "/api/v1/voices") return Response.json({ version: 1, voices: [], selectedVoice: null });
-    if (path === "/api/v1/events") return new Promise<Response>((resolve) => {
-      emit = (events) => resolve(Response.json({ version: 1, events }));
-    });
+    if (path === "/api/v2/events") {
+      if (eventBatchVersion === 403) return Promise.resolve(new Response(null, { status: 403 }));
+      if (eventBatchVersion === 1) return Promise.resolve(Response.json({ version: 1, events: [] }));
+      return new Promise<Response>((resolve) => {
+        emit = (events) => resolve(Response.json({ version: eventBatchVersion, events }));
+      });
+    }
     if (path === "/api/v1/input") {
       const body = JSON.parse(options.body as string);
       requests.push(body);
@@ -91,7 +95,11 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
   await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLElement>("#local-model-picker")!.dataset.ready).toBe("true"));
   const toggle = dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")!;
   toggle.click();
-  await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+  if (eventBatchVersion !== 2) {
+    await vi.waitFor(() => expect(dom.window.document.querySelector<HTMLOutputElement>("#connection-recovery")!.textContent).toContain("Required v2 event updates were refused"));
+  } else {
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Disconnect"));
+  }
   async function event(kind: string, data: object) {
     await vi.waitFor(() => expect(emit).not.toBeNull());
     const dispatch = emit!;
@@ -147,6 +155,22 @@ afterEach(() => {
 });
 
 describe("mounted task controls", () => {
+  it.each([
+    { version: 1 as const, label: "legacy batch" },
+    { version: 403 as const, label: "legacy server refusal" },
+  ])("polls v2 and refuses $label without falling back to v1", async ({ version }) => {
+    const { toggle } = await mount(undefined, false, undefined, version);
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("error"));
+
+    const eventRequests = vi.mocked(fetch).mock.calls.map(([path]) => path)
+      .filter(path => path === "/api/v1/events" || path === "/api/v2/events");
+    expect(eventRequests[0]).toBe("/api/v2/events");
+    expect(eventRequests).not.toContain("/api/v1/events");
+    expect(dom.window.document.querySelector<HTMLButtonElement>("#session-toggle")?.textContent).toBe("Connect");
+    expect(dom.window.document.querySelector<HTMLOutputElement>("#connection-recovery")?.textContent).toContain("Required v2 event updates were refused");
+    expect(toggle.textContent).toBe("Connect");
+  });
+
   it("renders a compact task row and removes cancellation controls after settlement", async () => {
     const { task, taskResult, card } = await mount();
     await task("task_fixture", "active");

@@ -12,6 +12,11 @@ from types import MappingProxyType
 from typing import cast
 
 from hermes_realtime.evidence.models import ProjectionReservation
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
+    has_valid_result_unicode,
+)
 
 from .task_proposal_control import validate_proposal_event
 
@@ -409,7 +414,17 @@ class BrowserEventProjection:
                 raise ValueError("task result status is invalid")
             if type(task_id) is not str or _TASK_ID.fullmatch(task_id) is None:
                 raise ValueError("task result identity is invalid")
-            if type(text) is not str or not text.strip() or len(text) > 1024:
+            text_limit = (
+                MAX_COMPLETED_RESULT_CHARS
+                if status == "completed"
+                else MAX_LEGACY_RESULT_CHARS
+            )
+            if (
+                type(text) is not str
+                or not text.strip()
+                or len(text) > text_limit
+                or (status == "completed" and not has_valid_result_unicode(text))
+            ):
                 raise ValueError("task result text is invalid")
         if kind == "knowledge_timing":
             expected = {

@@ -109,7 +109,7 @@ function normalRequest(path: string): Response | Promise<Response> {
   if (path === "/api/v1/media" || path === "/api/v1/stop") return Response.json({ version: 1 });
   if (path === "/api/v1/voices") return Response.json({ version: 1, voices: [], selectedVoice: null });
   // Keep event polling pending; this fixture does not mint server conversation events.
-  if (path.startsWith("/api/v1/events")) return new Promise(() => {});
+  if (path.startsWith("/api/v2/events")) return new Promise(() => {});
   return new Response(null, { status: 503 });
 }
 
@@ -941,7 +941,7 @@ describe("mounted connection recovery", () => {
   it.each(["projection-resync", "poll-terminal"] as const)(
     "preserves an explicit retry failure while older %s cleanup settles", async (pathway) => {
       const { toggle, recovery, fetch } = await mount((path) => {
-        if (path.startsWith("/api/v1/events")) return Response.json({});
+        if (path.startsWith("/api/v2/events")) return Response.json({});
         if (path === "/api/v1/projection-resync") return pathway === "projection-resync"
           ? Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rotated.token" })
           : new Response(null, { status: 503 });
@@ -968,7 +968,7 @@ describe("mounted connection recovery", () => {
   it("ignores a resync answer superseded by worker departure before rotation", async () => {
     let answer!: () => void;
     const { toggle, recovery, fetch } = await mount((path) => {
-      if (path.startsWith("/api/v1/events")) return Response.json({});
+      if (path.startsWith("/api/v2/events")) return Response.json({});
       if (path === "/api/v1/projection-resync") return new Promise<Response>((resolve) => {
         answer = () => resolve(Response.json({ ...credential, participantIdentity: "browser_fedcba9876543210", token: "synthetic.rotated.token" }));
       });
@@ -990,7 +990,7 @@ describe("mounted connection recovery", () => {
     let failPoll!: () => void;
     let polls = 0;
     const { toggle, recovery, fetch } = await mount((path) => {
-      if (path === "/api/v1/events") {
+      if (path === "/api/v2/events") {
         if (++polls < 5) return Response.json({});
         return new Promise<Response>((_, reject) => { failPoll = () => reject(new Error("synthetic late poll failure")); });
       }
@@ -999,7 +999,7 @@ describe("mounted connection recovery", () => {
     });
     toggle.click();
     await vi.waitFor(() => expect(failPoll).toBeDefined(), { timeout: 4000 });
-    const oldSignal = fetch.mock.calls.filter(([path]) => path === "/api/v1/events").at(-1)![1]!.signal!;
+    const oldSignal = fetch.mock.calls.filter(([path]) => path === "/api/v2/events").at(-1)![1]!.signal!;
     media.rooms[0]!.emit("participantDisconnected", { identity: credential.workerIdentity });
     await vi.waitFor(() => expect(recovery.dataset.stage).toBe("worker"));
     failPoll();
@@ -1015,9 +1015,9 @@ describe("mounted connection recovery", () => {
     let answer!: () => void;
     let polls = 0;
     const { toggle, recovery } = await mount((path) => {
-      if (path === "/api/v1/events" && ++polls === 1) {
+      if (path === "/api/v2/events" && ++polls === 1) {
         const response = Response.json({});
-        response.json = () => new Promise((resolve) => { answer = () => resolve({ version: 1, events: [{ sequence: 1, kind: "typed_input_admitted", monotonicMs: 12500, data: { inputSequence: 1 } }] }); });
+        response.json = () => new Promise((resolve) => { answer = () => resolve({ version: 2, events: [{ sequence: 1, kind: "typed_input_admitted", monotonicMs: 12500, data: { inputSequence: 1 } }] }); });
         return response;
       }
       return normalRequest(path);
@@ -1045,7 +1045,7 @@ describe("mounted connection recovery", () => {
   it("ignores a resync rejection superseded by worker departure", async () => {
     let rejectResync!: () => void;
     const { toggle, recovery, fetch } = await mount((path) => {
-      if (path.startsWith("/api/v1/events")) return Response.json({});
+      if (path.startsWith("/api/v2/events")) return Response.json({});
       if (path === "/api/v1/projection-resync") return new Promise<Response>((_, reject) => {
         rejectResync = () => reject(new Error("synthetic resync failure"));
       });
@@ -1069,7 +1069,7 @@ describe("mounted connection recovery", () => {
 
   it("shows safe projection refusal after terminal polling recovery fails", async () => {
     const { toggle, recovery } = await mount((path) => {
-      if (path.startsWith("/api/v1/events")) return Response.json({});
+      if (path.startsWith("/api/v2/events")) return Response.json({});
       if (path === "/api/v1/projection-resync") return new Response(null, { status: 503 });
       return normalRequest(path);
     });

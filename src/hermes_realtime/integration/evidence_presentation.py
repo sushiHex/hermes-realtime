@@ -8,6 +8,11 @@ import secrets
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
+from hermes_realtime.result_limits import (
+    MAX_PRESENTATION_DETAIL_CHARS,
+    MAX_PRESENTATION_VOICE_CHARS,
+)
+
 # Native SDK responses are duck-typed; their validated fields remain dynamically typed.
 Passages = MappingProxyType[str, tuple[tuple[str, str], ...]]
 
@@ -41,8 +46,11 @@ PRESENTATION_SCHEMA = {
         "answer": {
             "type": "object",
             "properties": {
-                "lead": {"type": "string", "minLength": 1, "maxLength": 220},
-                "support": {"type": "string", "maxLength": 1800},
+                "lead": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": MAX_PRESENTATION_VOICE_CHARS,
+                },
+                "support": {"type": "string", "maxLength": MAX_PRESENTATION_DETAIL_CHARS},
             },
             "required": ["lead", "support"],
             "additionalProperties": False,
@@ -433,11 +441,11 @@ def render_presentation_response(
     if (
         type(lead) is not str
         or not lead.strip()
-        or len(lead) > 220
+        or len(lead) > MAX_PRESENTATION_VOICE_CHARS
         or "\n" in lead
         or "\r" in lead
         or type(support) is not str
-        or len(support) > 1800
+        or len(support) > MAX_PRESENTATION_DETAIL_CHARS
         or any(
             token in lead + support for token in ("<voice>", "</voice>", "<detail>", "</detail>")
         )
@@ -465,7 +473,7 @@ def render_presentation_response(
     if ids:
         detail += "\n\nSources:\n" + "\n".join(catalog[index] for index in ids)
     evidence["stage"] = "content"
-    if len(detail) > 1800:
+    if len(detail) > MAX_PRESENTATION_DETAIL_CHARS:
         raise ValueError("presentation-content")
     evidence["rendered_detail_length"] = len(detail)
     content = "<voice>" + lead + "</voice><detail>" + detail + "</detail>"

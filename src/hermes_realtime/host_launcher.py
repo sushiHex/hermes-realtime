@@ -1745,7 +1745,9 @@ class ProactiveCompletionUpdatePolicy:
             assert completion.reason is not None
             detail = completion.reason
         voice_detail, visual_detail = _completion_projections(detail)
-        browser_detail = _browser_safe_task_result(visual_detail)
+        browser_detail = _browser_safe_task_result(
+            visual_detail, completed=completion.status == "completed",
+        )
         self._projection.publish(
             "task_result",
             {

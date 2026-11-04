@@ -23,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 from hermes_realtime.protocol import (
     BRIDGE_CAPABILITIES,
     BRIDGE_PROTOCOL_VERSION,
+    COMPLETED_RESULT_CAPABILITY,
     MUTUAL_AUTH_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY,
@@ -53,6 +54,12 @@ from hermes_realtime.protocol import (
     WorkTerminalStatus,
     parse_event,
     parse_voice_event,
+)
+from hermes_realtime.result_limits import (
+    LEGACY_RESULT_NOTICE,
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
+    has_valid_result_unicode,
 )
 
 from .completion import HermesCompletionRouter
@@ -221,6 +228,7 @@ class _Connection:
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     event_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_sequence: int = -1
+    capabilities: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +300,7 @@ class LocalHermesBridgeServer:
             raise TypeError("runtime must be an exact RuntimeAttestation or None")
         self._runtime = runtime
         # Required, never merely offered: a hello without it is refused.
-        offered = {MUTUAL_AUTH_CAPABILITY}
+        offered = {MUTUAL_AUTH_CAPABILITY, COMPLETED_RESULT_CAPABILITY}
         if voice is not None:
             offered.add(VOICE_ARCHIVE_CAPABILITY)
             if interval is not None and callable(getattr(voice, "review", None)):
@@ -527,8 +535,8 @@ class LocalHermesBridgeServer:
     ) -> WorkCompletedEvent | None:
         """Record exact terminal evidence and emit it when a live route exists."""
 
-        summary = self._bound_completion_text(summary)
-        reason = self._bound_completion_text(reason)
+        self._validate_completion_text(summary, completed=True)
+        self._validate_completion_text(reason, completed=False)
         claimed, route = await self._claim_completion(
             run_id,
             status=status,
@@ -674,6 +682,7 @@ class LocalHermesBridgeServer:
 
         try:
             participant_id, negotiated = await self._authenticate(reader, connection)
+            connection.capabilities = negotiated
             while raw := await reader.readline():
                 kind = _event_type(raw)
                 if kind == "voice_memory":
@@ -957,6 +966,15 @@ class LocalHermesBridgeServer:
 
     async def _send_bound(self, route: _Route, event: ProtocolEvent) -> bool:
         async with route.connection.write_lock:
+            if (type(event) is WorkCompletedEvent
+                    and event.payload.status == WorkTerminalStatus.COMPLETED
+                    and event.payload.summary is not None
+                    and len(event.payload.summary) > MAX_LEGACY_RESULT_CHARS
+                    and COMPLETED_RESULT_CAPABILITY not in route.connection.capabilities):
+                # Project for this recipient; retained terminal evidence stays exact.
+                event = event.model_copy(update={"payload": event.payload.model_copy(
+                    update={"summary": LEGACY_RESULT_NOTICE},
+                )})
             if event.sequence <= route.connection.last_sequence:
                 event = await self._completions.resequence(
                     event,
@@ -992,9 +1010,21 @@ class LocalHermesBridgeServer:
             raise BridgeProtocolError("Hermes bridge event exceeds the line limit")
 
     @staticmethod
-    def _bound_completion_text(value: str | None) -> str | None:
-        # Two independently escaped fields must still fit one 64-KiB NDJSON line.
-        return None if value is None else value[:4096]
+    def _validate_completion_text(value: str | None, *, completed: bool) -> None:
+        if value is None:
+            return
+        refusal: str | None = "shape"
+        try:
+            if type(value) is not str:
+                raise TypeError("completion text must be an exact string")
+            limit = MAX_COMPLETED_RESULT_CHARS if completed else MAX_LEGACY_RESULT_CHARS
+            refusal = "completed_bound" if completed else "reason_bound"
+            if len(value) > limit or (completed and not has_valid_result_unicode(value)):
+                raise BridgeProtocolError("completion text exceeds the result bound")
+            refusal = None
+        finally:
+            if refusal is not None:
+                _marker("[hermes-bridge-result] ", refusal)
 
     async def _wait_writer_closed(self, writer: asyncio.StreamWriter) -> None:
         with suppress(asyncio.TimeoutError, ConnectionError):
