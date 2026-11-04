@@ -20,6 +20,7 @@ from hermes_realtime.evidence import (
     EvidenceAdmissionControllerV1,
     EvidenceAdmissionViewV1,
     EvidenceTurnLease,
+    InputSource,
     ProactiveTurnAuthorityV1,
     ReplayTurnAuthorityV1,
     ReservationError,
@@ -431,7 +432,14 @@ class ConversationUpdateExecutor:
                         "evidence final-input admission rejected: "
                         f"{final_disposition.value}"
                     )
-        coroutine = self._execute_response(turn_id, transcript, evidence_lease)
+        typed_input = None
+        if (evidence_lease is not None and authority is not None
+                and authority.source is InputSource.TYPED
+                and type(authority.typed_sequence) is int
+                and 1 <= authority.typed_sequence < (1 << 53)
+                and 1 <= authority.binding_generation < (1 << 53)):
+            typed_input = (authority.typed_sequence, authority.binding_generation)
+        coroutine = self._execute_response(turn_id, transcript, evidence_lease, typed_input)
         try:
             operation = asyncio.create_task(
                 coroutine,
@@ -648,6 +656,7 @@ class ConversationUpdateExecutor:
         turn_id: str,
         transcript: Transcript,
         evidence_lease: EvidenceTurnLease | None = None,
+        typed_input: tuple[int, int] | None = None,
     ) -> None:
         claims = self._director._claim_pending_mentions(
             self,
@@ -671,6 +680,7 @@ class ConversationUpdateExecutor:
                 transcript,
                 decisions,
                 evidence_lease,
+                typed_input=typed_input,
             )
         except asyncio.CancelledError:
             disposition = "superseded"

@@ -512,3 +512,24 @@ native refusal branches emit no presentation marker; their un-emitted reason
 remains unavailable. Absence of a retained event cannot establish that a formatter
 call occurred or identify the refusal's cause. A gateway configured with stdout
 discarded cannot recover markers from an earlier run.
+
+Foreground inference iteration/closure failures emit `[foreground-failure]` with a fixed version,
+component, exception-kind label and before/after-speech-text phase. Cancellation-only
+paths do not emit this failure marker. The existing child-output collector retains
+only fixed category counts and drain-observation times in
+`child_output_metadata.host.categories`; arbitrary exception text and extra marker
+fields are excluded. Scalar observations continue after the raw-storage cap, with
+the existing bounded line buffer and saturating counts. Normal stop retains that
+metadata before removing raw child logs.
+Failures outside those inference boundaries may have no classification; absence
+of a marker does not establish successful generation.
+
+The typed journey client can promptly refuse an interrupted turn before its first
+speech token when the terminal event matches both the admitted input sequence and
+session binding generation. These integers come from admitted input authority;
+the client does not infer a turn identity from event arrival order. An interruption
+can arrive before its admission event and is reconciled only after that exact
+admission arrives. Legacy or mismatched metadata remains unbound evidence. An
+interrupted turn is not proof of provider failure, and a tokenless completion
+cannot establish a successful response. An accepted task/run pair bound before
+the refusal remains available to the existing cleanup path.

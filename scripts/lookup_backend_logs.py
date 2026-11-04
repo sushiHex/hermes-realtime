@@ -1,11 +1,36 @@
 """Bounded private child output; delegates all process ownership to Processes."""
 
+import json
 import re
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("duplicate diagnostic field")
+    return value
+
+
+def _foreground_failure_category(raw: bytes) -> str:
+    value = json.loads(raw, object_pairs_hook=_unique_fields)
+    if (
+        type(value) is not dict
+        or set(value) != {"version", "stage", "failure_kind", "text_phase"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["stage"] != "producer"
+        or type(value["failure_kind"]) is not str
+        or value["failure_kind"] not in {"value", "type", "runtime", "timeout", "group", "other"}
+        or type(value["text_phase"]) is not str
+        or value["text_phase"] not in {"before_text", "after_text"}
+    ):
+        raise ValueError("invalid foreground diagnostic")
+    return f"foreground_producer_{value['failure_kind']}_{value['text_phase']}"
 
 
 class CappedCapture:
@@ -31,7 +56,9 @@ class CappedCapture:
             self.stored += len(kept)
         except OSError:
             self.read_failed = True
-        for byte in kept:
+        # Scalar observations remain useful after the raw-storage cap. Line
+        # buffering and category cardinality stay bounded independently.
+        for byte in chunk:
             if byte == 10:
                 if not self._dropping:
                     self._line(bytes(self._pending), now)
@@ -45,6 +72,16 @@ class CappedCapture:
                     self._pending.clear()
 
     def _line(self, raw: Any, now: Any) -> Any:
+        prefix = b"[foreground-failure] "
+        if raw.startswith(prefix):
+            try:
+                name = _foreground_failure_category(raw[len(prefix):])
+            except (ValueError, TypeError, RecursionError):
+                name = "foreground_failure_invalid"
+            item = self.categories.setdefault(name, {"count": 0, "first_ns": now, "last_ns": now})
+            item["count"] = min(1000000, item["count"] + 1)
+            item["last_ns"] = now
+            return
         for name, pattern in (
             ("listening", rb"listening on"),
             ("load_start", rb"loading model|starting llama server|starting runner|load request"),

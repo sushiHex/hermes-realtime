@@ -1461,7 +1461,7 @@ class BrowserSessionDirector:
             if admitted:
                 self._projection.publish(
                     "typed_input_admitted",
-                    {"inputSequence": sequence},
+                    {"inputSequence": sequence, "bindingGeneration": generation},
                 )
             self._last_input_sequence = sequence
             self._last_input_request = request

@@ -477,7 +477,16 @@ class StreamingSpeechLoop:
         )
         return outcome.context_committed
 
-    def _notify_completion_advisory(self, *, turn_id: str, turn_generation: int) -> None:
+    @staticmethod
+    def _typed_input_metadata(typed_input: tuple[int, int] | None) -> dict[str, int]:
+        if typed_input is None:
+            return {}
+        return {"inputSequence": typed_input[0], "bindingGeneration": typed_input[1]}
+
+    def _notify_completion_advisory(
+        self, *, turn_id: str, turn_generation: int,
+        typed_input: tuple[int, int] | None = None,
+    ) -> None:
         """Keep advisory projection failure outside authoritative settlement."""
 
         observer = self._observer
@@ -486,7 +495,8 @@ class StreamingSpeechLoop:
         try:
             observer(
                 "assistant_turn_completed",
-                {"turnId": turn_id, "turnGeneration": turn_generation},
+                {"turnId": turn_id, "turnGeneration": turn_generation,
+                 **self._typed_input_metadata(typed_input)},
             )
         except Exception:
             _LOGGER.warning("assistant completion observer failed", exc_info=True)
@@ -633,6 +643,7 @@ class StreamingSpeechLoop:
         transcript: Transcript,
         updates: tuple[UpdateDecision, ...],
         evidence_lease: EvidenceTurnLease | None = None,
+        *, typed_input: tuple[int, int] | None = None,
     ) -> None:
         self._require_update_authority(authority)
         self._require_update_operation(operation, turn_id)
@@ -649,6 +660,7 @@ class StreamingSpeechLoop:
                 updates=prompt_updates,
                 update_operation=operation,
                 evidence_lease=evidence_lease,
+                typed_input=typed_input,
                 replay_identity=(
                     None
                     if evidence_lease is None
@@ -840,6 +852,7 @@ class StreamingSpeechLoop:
         replay_identity: _ReplayIdentity | None = None,
         evidence_lease: EvidenceTurnLease | None = None,
         yield_to_live_speech: bool = False,
+        typed_input: tuple[int, int] | None = None,
     ) -> bool:
         if sum(value is not None for value in (transcript, announcement, segments)) != 1:
             raise ValueError("exactly one turn input must be present")
@@ -868,6 +881,7 @@ class StreamingSpeechLoop:
         terminal_evidence = _TerminalEvidenceState()
 
         async def producer(lease: ForegroundTurnLease) -> None:
+            text_seen = False
             def admit_generated(publication: ForegroundPublication) -> None:
                 if record_generation:
                     self._context.validate_assistant_generation(publication.text)
@@ -1004,6 +1018,7 @@ class StreamingSpeechLoop:
                             raise ValueError("inference segment character capacity exceeded")
                         if not segment.strip():
                             raise ValueError("inference segment must not be blank")
+                        text_seen = True
                         if segment_count == 1 and transcript is not None:
                             observer = self._observer
                             if observer is not None:
@@ -1071,6 +1086,7 @@ class StreamingSpeechLoop:
                     "inference iteration and close failed",
                     iteration_error,
                     close_error,
+                    producer_after_text=text_seen,
                 )
                 if automatic_proposal is not None and lease.is_current:
                     assert self._task_proposals is not None
@@ -1102,6 +1118,7 @@ class StreamingSpeechLoop:
                                         break
                                     if type(segment) is not str or not segment.strip():
                                         raise TypeError("acknowledgment must be nonblank text")
+                                    text_seen = True
                                     segment_count += 1
                                     if (segment_count > self._max_segments
                                             or len(segment) > self._max_segment_chars):
@@ -1117,6 +1134,7 @@ class StreamingSpeechLoop:
                             self._raise_iteration_or_close_error(
                                 "acknowledgment iteration and close failed",
                                 continuation_error, continuation_close_error,
+                                producer_after_text=text_seen,
                             )
             except asyncio.CancelledError:
                 producer_result.cancel()
@@ -1212,6 +1230,7 @@ class StreamingSpeechLoop:
                             terminal_evidence=terminal_evidence,
                             proposal_readback=proposal_readback,
                             proposal_confirmed_text=proposal_confirmed_text,
+                            typed_input=typed_input,
                         ),
                         name=f"foreground-speech:{turn_id}:{lease.generation}",
                     )
@@ -1510,6 +1529,7 @@ class StreamingSpeechLoop:
         terminal_evidence: _TerminalEvidenceState,
         proposal_readback: list[TaskProposal],
         proposal_confirmed_text: list[str],
+        typed_input: tuple[int, int] | None = None,
     ) -> None:
         first_playable_observed = False
         replay_lifecycle = replay_presentations.get(1)
@@ -1739,6 +1759,7 @@ class StreamingSpeechLoop:
             self._notify_completion_advisory(
                 turn_id=lifecycle_turn_id,
                 turn_generation=lifecycle_generation,
+                typed_input=typed_input,
             )
         except BaseException as error:
             if proposal_readback and self._task_proposals is not None:
@@ -1763,6 +1784,7 @@ class StreamingSpeechLoop:
                         {
                             "turnId": lifecycle_turn_id,
                             "turnGeneration": lifecycle_generation,
+                            **self._typed_input_metadata(typed_input),
                         },
                     )
                 except BaseException as candidate:
@@ -2464,13 +2486,41 @@ class StreamingSpeechLoop:
         message: str,
         iteration_error: BaseException | None,
         close_error: BaseException | None,
+        *, producer_after_text: bool | None = None,
     ) -> None:
-        if iteration_error is not None and close_error is not None:
-            raise BaseExceptionGroup(message, [iteration_error, close_error]) from None
-        if iteration_error is not None:
-            raise iteration_error
-        if close_error is not None:
-            raise close_error
+        try:
+            if iteration_error is not None and close_error is not None:
+                raise BaseExceptionGroup(message, [iteration_error, close_error]) from None
+            if iteration_error is not None:
+                raise iteration_error
+            if close_error is not None:
+                raise close_error
+        finally:
+            if producer_after_text is not None:
+                StreamingSpeechLoop._report_producer_failure(
+                    iteration_error, close_error, after_text=producer_after_text,
+                )
+
+    @staticmethod
+    def _report_producer_failure(
+        iteration: BaseException | None, close: BaseException | None, *, after_text: bool,
+    ) -> None:
+        errors = [error for error in (iteration, close) if error is not None]
+        if not errors or all(_is_cancellation_only(error) for error in errors):
+            return
+        error = errors[0]
+        if len(errors) > 1 or isinstance(error, BaseExceptionGroup):
+            kind = "group"
+        else:
+            kind = next((label for cls, label in (
+                (ValueError, "value"), (TypeError, "type"), (RuntimeError, "runtime"),
+                (TimeoutError, "timeout"),
+            ) if isinstance(error, cls)), "other")
+        with suppress(Exception):
+            print("[foreground-failure] " + json.dumps({
+                "version": 1, "stage": "producer", "failure_kind": kind,
+                "text_phase": "after_text" if after_text else "before_text",
+            }, separators=(",", ":")), flush=True)
 
     @staticmethod
     def _snapshot_speech_chunk(chunk: SpeechChunk) -> SpeechChunk:

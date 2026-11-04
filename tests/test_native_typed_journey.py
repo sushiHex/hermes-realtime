@@ -77,12 +77,13 @@ def test_conversation_binds_timing_without_admitting_work(tmp_path, monkeypatch,
             return {}
         assert route == "events"
         batch = [
-            event(1, "typed_input_admitted", inputSequence=1),
+            event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
             event(2, "transcript_final", role="user", text=text),
             event(3, "first_foreground_token", turnId="opaque_A", turnGeneration=1),
             event(4, "assistant_text_generated", turnId="opaque_A", turnGeneration=1),
             event(5, "first_playable_audio", turnId="opaque_A", turnGeneration=1),
-            event(6, "assistant_turn_completed", turnId="opaque_A", turnGeneration=1),
+            event(6, "assistant_turn_completed", turnId="opaque_A", turnGeneration=1,
+                  inputSequence=1, bindingGeneration=7),
         ]
         if unexpected == "task":
             batch.append(event(7, "task_state", taskId="task_unexpected", status="active"))
@@ -108,12 +109,162 @@ def event(sequence, kind, **data):
     return {"sequence": sequence, "kind": kind, "monotonicMs": 10.5 + sequence, "data": data}
 
 
+@pytest.mark.parametrize("terminal_first", [False, True])
+def test_pretext_interruption_requires_exact_admitted_input(terminal_first):
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic text")
+    admitted = event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7)
+    terminal = event(2, "assistant_turn_interrupted", turnId="actual_turn", turnGeneration=3,
+                     inputSequence=1, bindingGeneration=7)
+    rows = [terminal, admitted] if terminal_first else [admitted, terminal]
+    for index, row in enumerate(rows, 1):
+        row["sequence"] = index
+    tracker.consume(rows)
+    assert tracker.current["outcome"] == "interrupted"
+    assert tracker.current["firstTokenMs"] is None
+    assert tracker.pair == ("actual_turn", 3)
+    assert "actual_turn" not in json.dumps(tracker.receipt())
+
+
+@pytest.mark.parametrize("correlation", [
+    {}, {"inputSequence": 2, "bindingGeneration": 7},
+    {"inputSequence": 1, "bindingGeneration": 8},
+    {"inputSequence": True, "bindingGeneration": 7},
+    {"inputSequence": 1, "bindingGeneration": True},
+])
+def test_unbound_interruption_cannot_bind_current_input(correlation):
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic text")
+    tracker.consume([
+        event(1, "typed_input_admitted", inputSequence=1,
+              bindingGeneration=1 if type(correlation.get("bindingGeneration")) is bool else 7),
+        event(2, "assistant_turn_interrupted", turnId="foreign_turn", turnGeneration=1,
+              **correlation),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.pair is None
+    assert tracker.current["unboundTerminalEvents"] == 1
+
+
+def test_prior_turn_pair_cannot_bind_a_later_matching_input():
+    tracker = EventTracker()
+    tracker.begin("first", 1, "First input")
+    tracker.consume([event(1, "assistant_turn_interrupted", turnId="stale_turn", turnGeneration=1)])
+    tracker.begin("second", 2, "Second input")
+    tracker.consume([
+        event(2, "typed_input_admitted", inputSequence=2, bindingGeneration=7),
+        event(3, "assistant_turn_interrupted", turnId="stale_turn", turnGeneration=1,
+              inputSequence=2, bindingGeneration=7),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.pair is None
+
+
+def test_cross_turn_terminal_cannot_replace_current_token_binding():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([
+        event(1, "transcript_final", role="user", text="Synthetic input"),
+        event(2, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(3, "first_foreground_token", turnId="current_turn", turnGeneration=1),
+        event(4, "assistant_turn_interrupted", turnId="foreign_turn", turnGeneration=1,
+              inputSequence=1, bindingGeneration=7),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.pair == ("current_turn", 1)
+
+
+def test_missing_admission_binding_keeps_legacy_terminal_unbound():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([
+        event(1, "typed_input_admitted", inputSequence=1),
+        event(2, "assistant_turn_interrupted", turnId="legacy_turn", turnGeneration=1),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.current["unboundTerminalEvents"] == 1
+
+
+def test_correlated_completed_terminal_cannot_certify_silent_success():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([
+        event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(2, "assistant_turn_completed", turnId="actual_turn", turnGeneration=1,
+              inputSequence=1, bindingGeneration=7),
+    ])
+    assert tracker.current["outcome"] == "pending"
+    assert tracker.pair is None
+    tracker.consume([event(3, "transcript_final", role="user", text="Synthetic input"),
+                     event(4, "first_foreground_token", turnId="actual_turn", turnGeneration=1)])
+    assert tracker.current["outcome"] == "pending"
+
+
+def test_modern_admission_preserves_legacy_bound_completion():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([
+        event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(2, "transcript_final", role="user", text="Synthetic input"),
+        event(3, "first_foreground_token", turnId="actual_turn", turnGeneration=1),
+        event(4, "first_playable_audio", turnId="actual_turn", turnGeneration=1),
+        event(5, "assistant_turn_completed", turnId="actual_turn", turnGeneration=1),
+    ])
+    assert tracker.current["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_wait_refuses_matching_pretext_interruption_without_timeout(tmp_path):
+    journey = Journey(SimpleNamespace(preview_dir=tmp_path), {"expiresInSeconds": 3600}, "secret")
+
+    async def request(route, payload=None):
+        if route == "input":
+            return {}
+        return {"version": 1, "events": [
+            event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+            event(2, "assistant_turn_interrupted", turnId="actual_turn", turnGeneration=1,
+                  inputSequence=1, bindingGeneration=7),
+        ]}
+
+    journey.request = request
+    with pytest.raises(ValueError, match="journey_turn_interrupted"):
+        await asyncio.wait_for(journey.step({"kind": "dispatch", "label": "work",
+                                            "text": "Synthetic task", "wait": "accepted"}), 0.5)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_dispatch_keeps_real_accepted_task_bound_for_cleanup(
+    tmp_path, monkeypatch,
+):
+    import scripts.native_typed_journey as client
+
+    run = "run_" + "a" * 32
+    monkeypatch.setattr(client, "read_journal", lambda _: ({run}, 0))
+    journey = Journey(SimpleNamespace(preview_dir=tmp_path), {"expiresInSeconds": 3600}, "secret")
+
+    async def request(route, payload=None):
+        if route == "input":
+            return {}
+        return {"version": 1, "events": [
+            event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+            event(2, "task_state", taskId="task_accepted", status="active"),
+            event(3, "assistant_turn_interrupted", turnId="actual_turn", turnGeneration=1,
+                  inputSequence=1, bindingGeneration=7),
+        ]}
+
+    journey.request = request
+    with pytest.raises(ValueError, match="journey_turn_interrupted"):
+        await asyncio.wait_for(journey.step({"kind": "dispatch", "label": "work",
+                                            "text": "Synthetic task", "wait": "accepted"}), 0.5)
+    assert journey.bindings == {"work": ("task_accepted", run)}
+
+
 def test_public_lifecycle_events_and_float_clock_do_not_fail_or_claim_warm_audio():
     tracker = EventTracker()
     tracker.begin("synthetic", 1, "Synthetic text")
     tracker.consume(
         [
-            event(1, "typed_input_admitted", inputSequence=1),
+            event(1, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
             event(2, "transcript_final", role="user", text="Synthetic text"),
             event(
                 3,
@@ -137,7 +288,7 @@ def test_old_generation_and_background_mention_cannot_complete_current_turn():
     tracker.consume(
         [
             event(1, "transcript_final", role="user", text="Synthetic text"),
-            event(2, "typed_input_admitted", inputSequence=1),
+            event(2, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
             event(3, "first_foreground_token", turnId="opaque_A", turnGeneration=2),
             event(
                 4,
@@ -353,10 +504,11 @@ def test_fast_completed_work_then_status_does_not_require_a_second_dispatch(tmp_
             ],
             [
                 event(3, "transcript_final", role="user", text="Status please"),
-                event(4, "typed_input_admitted", inputSequence=2),
+                event(4, "typed_input_admitted", inputSequence=2, bindingGeneration=7),
                 event(5, "first_foreground_token", turnId="opaque_B", turnGeneration=2),
                 event(6, "assistant_text_generated", turnId="opaque_B", turnGeneration=2),
-                event(7, "assistant_turn_completed", turnId="opaque_B", turnGeneration=2),
+                event(7, "assistant_turn_completed", turnId="opaque_B", turnGeneration=2,
+                      inputSequence=2, bindingGeneration=7),
             ],
         ]
     )
