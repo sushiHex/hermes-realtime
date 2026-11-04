@@ -3744,6 +3744,7 @@ async def test_session_director_owns_typed_input_and_stop_authority() -> None:
         "approval_state",
         "session_stopped",
     ]
+    assert projection.events_after(0)[1].data == {"inputSequence": 1, "bindingGeneration": 9}
     assert director.active_generation is None
 
 

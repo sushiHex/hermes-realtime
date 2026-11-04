@@ -1470,16 +1470,16 @@ async def test_user_authority_reserves_exact_evidence_lease_before_response_spaw
     )
     lifecycle.activate_binding(
         binding_id=str(UUID(int=142, version=4)),
-        binding_generation=1,
+        binding_generation=7,
         consent_epoch_id=str(UUID(int=143, version=4)),
         logical_session_id=str(UUID(int=144, version=4)),
     )
     authority = lifecycle.decline_to_user(
         lifecycle.mint_final_input(
             source=InputSource.TYPED,
-            input_incarnation=1,
+            input_incarnation=3,
             media_incarnation=None,
-            typed_sequence=1,
+            typed_sequence=3,
         )
     )
     admission = object.__new__(EvidenceAdmissionControllerV1)
@@ -1520,8 +1520,10 @@ async def test_user_authority_reserves_exact_evidence_lease_before_response_spaw
         transcript: Transcript,
         updates: object,
         evidence_lease: EvidenceTurnLease | None = None,
+        *, typed_input: tuple[int, int] | None = None,
     ) -> None:
         del self, speech_authority, operation, turn_id, transcript, updates
+        assert typed_input == (3, 7)
         trace.append(("speech", evidence_lease))
 
     monkeypatch.setattr(EvidenceAdmissionControllerV1, "try_reserve_user_turn", reserve)
@@ -1635,8 +1637,10 @@ async def test_nonadmitted_evidence_result_continues_response_without_fake_lease
         transcript: Transcript,
         updates: object,
         evidence_lease: EvidenceTurnLease | None = None,
+        *, typed_input: tuple[int, int] | None = None,
     ) -> None:
         del self, speech_authority, operation, turn_id, transcript, updates
+        assert typed_input is None
         observed.append(evidence_lease)
 
     monkeypatch.setattr(EvidenceAdmissionControllerV1, "try_reserve_user_turn", reserve)

@@ -133,6 +133,9 @@ class EventTracker:
         self.text = ""
         self.user_seen = False
         self.admitted = False
+        self.admitted_input: tuple[int, int] | None = None
+        self.prior_seen: set[tuple[str, int]] = set()
+        self.interruptions: dict[tuple[str, int], tuple[int, int] | None] = {}
         self.started = 0.0
 
     def begin(self, label: str, sequence: int, text: str) -> None:
@@ -146,10 +149,35 @@ class EventTracker:
             "firstPlayableAudioMs": None,
             "tokenToPlayableMs": None,
             "deliveredSegments": 0,
+            "unboundTerminalEvents": 0,
         }
         self.turns.append(self.current)
         self.pair, self.text, self.user_seen, self.admitted = None, text, False, False
+        self.admitted_input = None
+        self.prior_seen = set(self.seen)
+        self.interruptions = {}
         self.started = time.monotonic() * 1000
+
+    @staticmethod
+    def _input_correlation(data: dict) -> tuple[int, int] | None:
+        sequence, binding = data.get("inputSequence"), data.get("bindingGeneration")
+        if (type(sequence) is int and type(binding) is int
+                and 1 <= sequence < (1 << 53) and 1 <= binding < (1 << 53)):
+            return sequence, binding
+        return None
+
+    def _reconcile_interruptions(self) -> None:
+        if (self.current is None or self.admitted_input is None
+                or self.current["outcome"] != "pending"):
+            return
+        for pair, correlation in self.interruptions.items():
+            if (correlation != self.admitted_input or pair in self.prior_seen
+                    or (self.pair is not None and pair != self.pair)):
+                continue
+            self.pair = pair
+            self.current["outcome"] = "interrupted"
+            self.current["unboundTerminalEvents"] -= 1
+            return
 
     def consume(self, batch: object) -> None:
         require(type(batch) is list and len(batch) <= 256, "journey_event_bound")
@@ -196,6 +224,8 @@ class EventTracker:
                     data.get("inputSequence") == self.current["inputSequence"],
                     "journey_input_sequence",
                 )
+                if not self.admitted:
+                    self.admitted_input = self._input_correlation(data)
                 self.admitted = True
             if kind in {"first_foreground_token", "first_playable_audio"} and valid_pair:
                 require(pair in self.markers or len(self.markers) < 128, "journey_marker_bound")
@@ -216,14 +246,25 @@ class EventTracker:
             }:
                 self.seen.add(pair)
                 require(len(self.seen) <= 128, "journey_identity_bound")
+            if kind in {"assistant_turn_completed", "assistant_turn_interrupted"}:
+                if valid_pair and pair == self.pair:
+                    if self.current["outcome"] == "pending":
+                        self.current["outcome"] = kind.removeprefix("assistant_turn_")
+                else:
+                    require(self.current["unboundTerminalEvents"] < 128,
+                            "journey_terminal_bound")
+                    self.current["unboundTerminalEvents"] += 1
+                    if valid_pair and kind == "assistant_turn_interrupted":
+                        require(pair in self.interruptions or len(self.interruptions) < 128,
+                                "journey_terminal_bound")
+                        self.interruptions.setdefault(pair, self._input_correlation(data))
+            self._reconcile_interruptions()
             if not valid_pair or pair != self.pair:
                 continue
             if kind == "assistant_text_generated":
                 self.current["assistantSegments"] += 1
             elif kind == "transcript_final" and data.get("role") == "assistant":
                 self.current["deliveredSegments"] += 1
-            elif kind in {"assistant_turn_completed", "assistant_turn_interrupted"}:
-                self.current["outcome"] = kind.removeprefix("assistant_turn_")
             for marker, key in (
                 ("first_foreground_token", "firstTokenMs"),
                 ("first_playable_audio", "firstPlayableAudioMs"),
@@ -363,13 +404,18 @@ class Journey:
         self.tracker.begin(label, self.sequence, text)
         await self.request("input", {"sequence": self.sequence, "text": text})
         if kind == "dispatch":
-            await self.wait(lambda: bool(set(self.tracker.tasks) - before_tasks))
+            await self.wait(lambda: bool(set(self.tracker.tasks) - before_tasks)
+                            or self.tracker.current["outcome"] == "interrupted")
             new_tasks, new_runs = (
                 set(self.tracker.tasks) - before_tasks,
                 self.admissions - before_runs,
             )
+            if not new_tasks:
+                require(self.tracker.current["outcome"] != "interrupted",
+                        "journey_turn_interrupted")
             require(len(new_tasks) == len(new_runs) == 1, "journey_admission_binding")
             self.bindings[label] = (next(iter(new_tasks)), next(iter(new_runs)))
+            require(self.tracker.current["outcome"] != "interrupted", "journey_turn_interrupted")
             if step.get("wait", "completed") == "completed":
                 await self.collect(label)
                 require(self.results[label]["terminal"] == "completed", "journey_task_failed")

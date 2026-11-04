@@ -33,6 +33,103 @@ from hermes_realtime.speech import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("after_text", [False, True])
+async def test_producer_failure_retains_typed_terminal_and_safe_marker(capsys, after_text):
+    class FailingInference:
+        async def stream(self, snapshot, *, turn_id):
+            if after_text:
+                yield "Synthetic visible text."
+            raise ValueError("PRIVATE_TRANSCRIPT https://private.invalid/?token=SECRET")
+
+        async def cancel(self, turn_id):
+            pass
+
+        async def close(self):
+            pass
+
+    events = []
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+        inference=FailingInference(), synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+        observer=lambda kind, data: events.append((kind, dict(data))),
+    )
+    try:
+        with pytest.raises(ValueError):
+            await loop._run_turn(
+                "synthetic_actual_turn", transcript=Transcript("Synthetic input", final=True),
+                announcement=None, updates=(), update_operation=None, typed_input=(3, 7),
+            )
+        terminals = [data for kind, data in events if kind == "assistant_turn_interrupted"]
+        assert len(terminals) == 1
+        assert terminals[0]["inputSequence"] == 3 and terminals[0]["bindingGeneration"] == 7
+        markers = [line.removeprefix("[foreground-failure] ")
+                   for line in capsys.readouterr().out.splitlines()
+                   if line.startswith("[foreground-failure] ")]
+        assert len(markers) == 1
+        assert json.loads(markers[0]) == {
+            "version": 1, "stage": "producer", "failure_kind": "value",
+            "text_phase": "after_text" if after_text else "before_text",
+        }
+        assert "PRIVATE" not in markers[0] and "SECRET" not in markers[0]
+    finally:
+        await loop.close()
+
+
+@pytest.mark.parametrize("error,kind", [
+    (ValueError("PRIVATE_MESSAGE"), "value"), (TypeError("PRIVATE_MESSAGE"), "type"),
+    (RuntimeError("PRIVATE_MESSAGE"), "runtime"), (TimeoutError("PRIVATE_MESSAGE"), "timeout"),
+    (ExceptionGroup("PRIVATE_MESSAGE", [ValueError("PRIVATE_CHILD")]), "group"),
+    (Exception("PRIVATE_MESSAGE"), "other"),
+    (type("PRIVATE_EXCEPTION_CLASS", (RuntimeError,), {})("PRIVATE_MESSAGE"), "runtime"),
+])
+def test_producer_failure_marker_has_only_fixed_categories(capsys, error, kind):
+    with pytest.raises(type(error)) as failure:
+        StreamingSpeechLoop._raise_iteration_or_close_error(
+            "private unused boundary message", None, error, producer_after_text=False,
+        )
+    assert failure.value is error
+    output = capsys.readouterr().out
+    assert "PRIVATE" not in output and "private" not in output
+    assert json.loads(output.removeprefix("[foreground-failure] ")) == {
+        "version": 1, "stage": "producer", "failure_kind": kind, "text_phase": "before_text",
+    }
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError(),
+                                  BaseExceptionGroup("cancel", [asyncio.CancelledError()])])
+def test_cancellation_only_has_no_producer_failure_marker(capsys, error):
+    with pytest.raises(BaseException) as failure:
+        StreamingSpeechLoop._raise_iteration_or_close_error(
+            "cancel", error, None, producer_after_text=False,
+        )
+    assert failure.value is error
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+async def test_typed_completion_preserves_source_correlation():
+    events = []
+    loop = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+        inference=RequestRecordingInference(), synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+        observer=lambda kind, data: events.append((kind, dict(data))),
+    )
+    try:
+        await loop._run_turn(
+            "synthetic_actual_turn", transcript=Transcript("Synthetic input", final=True),
+            announcement=None, updates=(), update_operation=None, typed_input=(3, 7),
+        )
+        assert [data for kind, data in events if kind == "assistant_turn_completed"] == [{
+            "turnId": "synthetic_actual_turn", "turnGeneration": 1,
+            "inputSequence": 3, "bindingGeneration": 7,
+        }]
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_turn_uses_latest_memory_without_persisting_it() -> None:
     context = ConversationContextStore()
     context.set_memory(BuiltinMemorySnapshot(memory="Prefers short replies.", user="Ari"))
@@ -1342,7 +1439,7 @@ async def test_assistant_partial_is_visible_before_delivery_confirmed_final() ->
 
 
 @pytest.mark.asyncio
-async def test_cancelled_assistant_turn_projects_exact_terminal_identity() -> None:
+async def test_cancelled_assistant_turn_projects_exact_terminal_identity(capsys) -> None:
     playback = PresentationBlockingPlayback()
     observed: list[tuple[str, dict[str, str | int | bool | None]]] = []
     loop = StreamingSpeechLoop(
@@ -1367,6 +1464,7 @@ async def test_cancelled_assistant_turn_projects_exact_terminal_identity() -> No
         "assistant_turn_interrupted",
         {"turnId": "turn_001", "turnGeneration": 1},
     )
+    assert "[foreground-failure]" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
