@@ -246,6 +246,37 @@ async def test_direct_native_extract_can_supply_requested_url_evidence() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_native_mixed_extract_preserves_bound_source_without_false_gap(reverse: bool) -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    observer = _observer()
+    _bind_run(observer, task)
+    missing = "https://example.com/missing"
+    items = [{"url": URL, "content": "Bound source text"},
+             {"url": "https://example.com/foreign", "content": "UNBOUND_TEXT"}]
+    raw = json.dumps({"results": list(reversed(items)) if reverse else items})
+    calls = 0
+
+    def native_effect(args: dict[str, Any]) -> str:
+        nonlocal calls
+        calls += 1
+        assert args == {"urls": [URL, missing]}
+        return raw
+
+    returned = observer.tool_execution(
+        tool_name="web_extract", args={"urls": [URL, missing]}, next_call=native_effect,
+    )
+
+    assert returned is raw and calls == 1
+    row = observer.rows[RUN_ID]
+    assert row["passages"][URL] == (("extract", "Bound source text"),)
+    assert row["passages"][missing] == (("extract-unavailable", ""),)
+    assert row["catalog_count"] == row["passage_count"] == 2
+    assert "UNBOUND_TEXT" not in repr(dict(row["passages"]))
+
+
+@pytest.mark.asyncio
 async def test_native_extract_does_not_capture_unrequested_result_url() -> None:
     task = asyncio.current_task()
     assert task is not None
