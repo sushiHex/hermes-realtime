@@ -131,6 +131,8 @@ import {
   type PreparedLocalModelSelection,
 } from "./local-model-selection";
 
+class RequiredEventsProtocolRefused extends Error {}
+
 function element<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
   if (!(value instanceof HTMLElement)) {
@@ -1920,7 +1922,7 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
     try {
       const activeCredential = credential;
       if (activeCredential === null) return;
-      const response = await fetch("/api/v1/events", {
+      const response = await fetch("/api/v2/events", {
         method: "POST",
         headers: {
           ...authorization(activeCredential.token),
@@ -1932,8 +1934,14 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
         referrerPolicy: "no-referrer",
         signal,
       });
-      if (!response.ok) throw new Error("public event projection rejected");
+      if (!response.ok) {
+        if ([403, 404, 405].includes(response.status)) {
+          throw new RequiredEventsProtocolRefused();
+        }
+        throw new Error("public event projection rejected");
+      }
       const batch = parseEventBatch(await response.json());
+      if (batch.version !== 2) throw new RequiredEventsProtocolRefused();
       if (signal.aborted) return;
       for (const event of batch.events) {
         if (event.sequence !== eventSequence + 1) {
@@ -1950,14 +1958,17 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
     } catch (error) {
       if (signal.aborted) return;
       consecutiveFailures += 1;
-      if (eventPollFailurePolicy.recordFailure() === "terminal") {
+      const protocolRefused = error instanceof RequiredEventsProtocolRefused;
+      if (protocolRefused || eventPollFailurePolicy.recordFailure() === "terminal") {
         if (controller.state === "stopping") return;
-        try {
-          await recoverProjectionResync(signal);
-          return;
-        } catch (resyncError) {
-          if (signal.aborted) return;
-          error = resyncError;
+        if (!protocolRefused) {
+          try {
+            await recoverProjectionResync(signal);
+            return;
+          } catch (resyncError) {
+            if (signal.aborted) return;
+            error = resyncError;
+          }
         }
         const failureGeneration = lifecycleAuthority.issue();
         const observedStopVersion = sessionStopVersion;
@@ -1974,9 +1985,17 @@ async function pollPublicEvents(signal: AbortSignal): Promise<void> {
             return;
           }
           if (observedStopVersion !== sessionStopVersion) return;
-          refused = { stage: "projection", category: connectionFailureCategory(error) };
+          refused = {
+            stage: "projection",
+            category: protocolRefused ? "request-refused" : connectionFailureCategory(error),
+          };
           connectionFailure = refused;
           controller.failed();
+          if (protocolRefused) {
+            addMarker("event_protocol_v2_refused");
+            connectionRecovery.textContent =
+              "Required v2 event updates were refused. Update the host or verify session authorization.";
+          }
           throw error;
         } finally {
           if (refused !== null) console.info(`[connection-recovery] ${JSON.stringify(refused)}`);

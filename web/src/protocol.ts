@@ -468,6 +468,8 @@ export function parseBootstrapCredential(value: unknown): BootstrapCredential {
 
 const EVENT_KEYS = ["data", "kind", "monotonicMs", "sequence"] as const;
 const EVENT_BATCH_KEYS = ["events", "version"] as const;
+export const MAX_COMPLETED_RESULT_CHARS = 4096;
+export const MAX_LEGACY_RESULT_CHARS = 1024;
 const EVENT_KINDS = new Set([
   "approval_state",
   "assistant_turn_completed",
@@ -551,11 +553,11 @@ export function parseTaskProposal(value: unknown): TaskProposal {
 }
 
 export interface EventBatch {
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly events: readonly PublicEvent[];
 }
 
-function parseEvent(value: unknown): PublicEvent {
+function parseEvent(value: unknown, batchVersion: 1 | 2): PublicEvent {
   if (!isPlainRecord(value) || !hasExactKeys(value, EVENT_KEYS)) {
     throw new TypeError("Public event shape is invalid");
   }
@@ -587,7 +589,17 @@ function parseEvent(value: unknown): PublicEvent {
     ) {
       throw new TypeError("Public event data primitive is invalid");
     }
-    if (typeof item === "string" && (item.length > 4096 || PRIVATE_HANDLE.test(item))) {
+    const isV2CompletedResultText =
+      value.kind === "task_result" &&
+      key === "text" &&
+      batchVersion === 2 &&
+      value.data.status === "completed";
+    if (
+      typeof item === "string" &&
+      ((isV2CompletedResultText && item.length > MAX_COMPLETED_RESULT_CHARS * 2) ||
+        (!isV2CompletedResultText && item.length > 4096) ||
+        PRIVATE_HANDLE.test(item))
+    ) {
       throw new TypeError("Public event data string is invalid");
     }
   }
@@ -636,18 +648,32 @@ function parseEvent(value: unknown): PublicEvent {
   ) {
     parseSpeechAuthority(value.data);
   }
-  if (
-    value.kind === "task_result" &&
-    (!hasExactKeys(value.data, ["status", "taskId", "text"]) ||
+  if (value.kind === "task_result") {
+    const text = value.data.text;
+    const completed = value.data.status === "completed";
+    const validUnicodeScalars = (input: string): boolean =>
+      Array.from(input).every((character) => {
+        const codePoint = character.codePointAt(0)!;
+        return codePoint < 0xd800 || codePoint > 0xdfff;
+      });
+    const validText =
+      typeof text === "string" &&
+      text.trim().length > 0 &&
+      (batchVersion === 2 && completed
+        ? text.length <= MAX_COMPLETED_RESULT_CHARS * 2 &&
+          Array.from(text).length <= MAX_COMPLETED_RESULT_CHARS &&
+          validUnicodeScalars(text)
+        : text.length <= MAX_LEGACY_RESULT_CHARS);
+    if (
+      !hasExactKeys(value.data, ["status", "taskId", "text"]) ||
       typeof value.data.status !== "string" ||
       !new Set(["completed", "failed", "interrupted"]).has(value.data.status) ||
       typeof value.data.taskId !== "string" ||
       !/^task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}$/.test(value.data.taskId) ||
-      typeof value.data.text !== "string" ||
-      value.data.text.trim().length < 1 ||
-      value.data.text.length > 1024)
-  ) {
-    throw new TypeError("Public task result is invalid");
+      !validText
+    ) {
+      throw new TypeError("Public task result is invalid");
+    }
   }
   if (value.kind === "knowledge_timing") {
     const data = value.data;
@@ -723,14 +749,18 @@ export function parseEventBatch(value: unknown): EventBatch {
   if (!isPlainRecord(value) || !hasExactKeys(value, EVENT_BATCH_KEYS)) {
     throw new TypeError("Event batch shape is invalid");
   }
-  if (value.version !== 1 || !Array.isArray(value.events) || value.events.length > 256) {
+  if (
+    (value.version !== 1 && value.version !== 2) ||
+    !Array.isArray(value.events) ||
+    value.events.length > 256
+  ) {
     throw new TypeError("Event batch is invalid");
   }
-  const events = value.events.map(parseEvent);
+  const events = value.events.map((event) => parseEvent(event, value.version as 1 | 2));
   for (let index = 1; index < events.length; index += 1) {
     if (events[index]!.sequence !== events[index - 1]!.sequence + 1) {
       throw new TypeError("Event batch sequence is not contiguous");
     }
   }
-  return { version: 1, events };
+  return { version: value.version as 1 | 2, events };
 }

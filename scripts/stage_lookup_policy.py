@@ -20,10 +20,13 @@ REVIEWED_SOURCES = {
 }
 REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "56699d1f92ebbf4b6ca2f8644c2238ffd179931e1dc7749690cece6aca9a4cdc",
+    "evidence_presentation": "21e799b93df28d288d8d8d39c6e10dd8854207ec2fc471b56431784d3e008bb3",
     "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
+    "result_limits": "cdb48e4dd7d001b00086a7d816f2d9821e4419ef0799f619f776e16a065adfdb",
 }
-REVIEWED_SHARED_SIZES = {"evidence_presentation": 23026, "presentation_transport": 16551}
+REVIEWED_SHARED_SIZES = {
+    "evidence_presentation": 23326, "presentation_transport": 16551, "result_limits": 833,
+}
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
 BOOTSTRAP = b"from .entrypoint import register\n"
@@ -55,7 +58,8 @@ def stage_lookup_policy(owned_profile: Path, reviewed_source: Path) -> dict[str,
         category = "reviewed-shared-source-mismatch"
         shared_root = Path(__file__).resolve().parents[1] / "src/hermes_realtime/integration"
         for name, expected in REVIEWED_SHARED_SOURCES.items():
-            with (shared_root / (name + ".py")).open("rb") as stream:
+            module_root = shared_root.parent if name == "result_limits" else shared_root
+            with (module_root / (name + ".py")).open("rb") as stream:
                 raw = stream.read(REVIEWED_SHARED_SIZES[name] + 1)
             if hashlib.sha256(raw).hexdigest() != expected:
                 raise StagingRefusal(category)

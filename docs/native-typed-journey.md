@@ -6,6 +6,11 @@ adds no executor. Use a preview owned by the operator, with no other participant
 or active task. The client joins its existing LiveKit room without subscribing
 to audio, sending microphone audio, or retaining PCM.
 
+The client requires the version 2 events endpoint and event-batch response from
+the matching updated preview. Other input and session operations retain their
+version 1 endpoints. An older preview is refused explicitly; the client does not
+downgrade or interpret a legacy display-limit notice as the full result.
+
 Provide an external JSON scenario and a **new** receipt filename. Preflight is
 offline by default; only `--execute` submits input or contacts the running host.
 

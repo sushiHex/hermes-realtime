@@ -69,8 +69,8 @@ async function mount(
     if (path === "/api/v1/media") return Response.json({ version: 1 });
     if (path === "/api/v1/stop") return stopRequest();
     if (path === "/api/v1/voices") return Response.json({ version: 1, voices: [], selectedVoice: null });
-    if (path === "/api/v1/events") return new Promise<Response>((resolve) => {
-      emit = (events) => resolve(Response.json({ version: 1, events }));
+    if (path === "/api/v2/events") return new Promise<Response>((resolve) => {
+      emit = (events) => resolve(Response.json({ version: 2, events }));
     });
     if (path === "/api/v1/approval") { decisions.push(JSON.parse(options.body as string)); return decide(); }
     if (path === "/api/v1/task-proposal-decision") {

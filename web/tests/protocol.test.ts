@@ -526,6 +526,43 @@ describe("public event protocol", () => {
       }),
     ).toThrow("Public task result is invalid");
   });
+
+  it("accepts a v2 completed result through 4096 Unicode scalars", () => {
+    const suffix = "\nSource: https://example.com/report\nUpdated 12:45 UTC";
+    const text = `${"😀".repeat(2000)}${"x".repeat(4096 - 2000 - suffix.length)}${suffix}`;
+    const batch = parseEventBatch({
+      version: 2,
+      events: [
+        {
+          sequence: 1,
+          kind: "task_result",
+          monotonicMs: 14000,
+          data: { status: "completed", taskId: "task_release_check", text },
+        },
+      ],
+    });
+    expect(batch.version).toBe(2);
+    expect(batch.events[0]?.data.text).toBe(text);
+    expect(Array.from(text)).toHaveLength(4096);
+  });
+
+  it("keeps legacy UTF-16 and noncompleted result bounds strict", () => {
+    const event = (version: number, status: string, text: string) => ({
+      version,
+      events: [{
+        sequence: 1,
+        kind: "task_result",
+        monotonicMs: 1,
+        data: { status, taskId: "task_release_check", text },
+      }],
+    });
+    expect(parseEventBatch(event(1, "completed", "x".repeat(1024))).version).toBe(1);
+    expect(() => parseEventBatch(event(1, "completed", "x".repeat(1025)))).toThrow();
+    expect(() => parseEventBatch(event(2, "completed", "x".repeat(4097)))).toThrow();
+    expect(() => parseEventBatch(event(2, "completed", "😀".repeat(4097)))).toThrow();
+    expect(() => parseEventBatch(event(2, "completed", `ok\ud800`))).toThrow();
+    expect(() => parseEventBatch(event(2, "failed", "x".repeat(1025)))).toThrow();
+  });
 });
 
 

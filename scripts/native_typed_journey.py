@@ -298,8 +298,9 @@ def request_json(
         def redirect_request(self, *args, **kwargs):
             return None
 
+    version = 2 if route == "events" else 1
     req = urllib.request.Request(
-        origin.rstrip("/") + "/api/v1/" + route, data=body, headers=headers, method="POST"
+        origin.rstrip("/") + f"/api/v{version}/" + route, data=body, headers=headers, method="POST"
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
@@ -361,7 +362,7 @@ class Journey:
         ids, _ = read_journal(self.journal)
         self.admissions.update(ids)
         require(len(self.admissions) <= 12, "journey_admission_bound")
-        require(value.get("version") == 1, "journey_event_version")
+        require(value.get("version") == 2, "journey_event_version")
         self.tracker.consume(value.get("events"))
 
     async def wait(self, predicate, seconds: int = 60) -> None:

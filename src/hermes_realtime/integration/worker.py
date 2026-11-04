@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 from pydantic_core import TzInfo
 
 from hermes_realtime.protocol import (
+    BRIDGE_CAPABILITIES,
+    COMPLETED_RESULT_CAPABILITY,
     CancelScope,
     ControlCancelAcknowledgedEvent,
     ControlCancelAcknowledgedPayload,
@@ -24,6 +26,11 @@ from hermes_realtime.protocol import (
     WorkDispatchRequestedEvent,
     WorkDispatchRequestedPayload,
     WorkTerminalStatus,
+)
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
+    has_valid_result_unicode,
 )
 
 from .bridge import BridgeProtocolError
@@ -43,10 +50,12 @@ def _require_exact_string(value: Any, field: str, *, max_chars: int) -> str:
     return value
 
 
-def _require_optional_text(value: Any, field: str) -> str | None:
+def _require_optional_text(
+    value: Any, field: str, *, max_chars: int = _MAX_TEXT_CHARS,
+) -> str | None:
     if value is None:
         return None
-    text = _require_exact_string(value, field, max_chars=_MAX_TEXT_CHARS)
+    text = _require_exact_string(value, field, max_chars=max_chars)
     if not text.strip():
         raise BridgeProtocolError(f"{field} must contain non-whitespace text")
     return text
@@ -135,6 +144,15 @@ class RealtimeHermesSession:
         if not 1 <= close_drain_timeout_ms <= 60_000:
             raise ValueError("close_drain_timeout_ms must be between 1 and 60000")
         self._client = client
+        capabilities = getattr(client, "capabilities", None)
+        self._completed_result_limit = (
+            MAX_COMPLETED_RESULT_CHARS
+            if (type(capabilities) is frozenset
+                and all(type(item) is str for item in capabilities)
+                and capabilities <= BRIDGE_CAPABILITIES
+                and COMPLETED_RESULT_CAPABILITY in capabilities)
+            else MAX_LEGACY_RESULT_CHARS
+        )
         self._session_id = _require_exact_string(
             session_id,
             "session_id",
@@ -619,8 +637,7 @@ class RealtimeHermesSession:
         if not payload.accepted and (run_ids or reason is None):
             raise BridgeProtocolError("rejected cancellation evidence is contradictory")
 
-    @staticmethod
-    def _validate_terminal(event: Any) -> None:
+    def _validate_terminal(self, event: Any) -> None:
         _require_exact_string(event.task_id, "task_id", max_chars=_MAX_IDENTIFIER_CHARS)
         _require_exact_string(event.run_id, "run_id", max_chars=_MAX_IDENTIFIER_CHARS)
         if type(event.payload) is not WorkCompletedPayload:
@@ -628,7 +645,11 @@ class RealtimeHermesSession:
         payload = event.payload
         if type(payload.status) is not WorkTerminalStatus:
             raise TypeError("terminal status must use the exact protocol enum")
-        summary = _require_optional_text(payload.summary, "terminal summary")
+        summary = _require_optional_text(
+            payload.summary, "terminal summary", max_chars=self._completed_result_limit,
+        )
+        if summary is not None and not has_valid_result_unicode(summary):
+            raise BridgeProtocolError("terminal summary exceeds the Unicode result bound")
         reason = _require_optional_text(payload.reason, "terminal reason")
         if payload.status is WorkTerminalStatus.COMPLETED:
             if summary is None or reason is not None:

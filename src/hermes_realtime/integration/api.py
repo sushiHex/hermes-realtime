@@ -38,6 +38,11 @@ from hermes_realtime.protocol import (
     WorkTerminalStatus,
 )
 from hermes_realtime.providers._speech_text import strip_markdown_emphasis_for_speech
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_PRESENTATION_DETAIL_CHARS,
+    MAX_PRESENTATION_VOICE_CHARS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +71,7 @@ _REQUIRED_ENDPOINTS = {
 }
 _MAX_HTTP_BODY_BYTES = 64 * 1024
 _MAX_SSE_LINE_BYTES = 32 * 1024
-_MAX_TERMINAL_TEXT_CHARS = 4096
+_MAX_TERMINAL_TEXT_CHARS = MAX_COMPLETED_RESULT_CHARS
 # The task controller bounds non-completed reasons tighter than completed summaries.
 _MAX_TERMINAL_REASON_CHARS = 1024
 _MAX_ACTIVE_RUNS = 8
@@ -1753,7 +1758,7 @@ class HermesApiTaskSession:
             category = "voice"
             if (
                 not _has_result_text(voice)
-                or len(voice) > 220
+                or len(voice) > MAX_PRESENTATION_VOICE_CHARS
                 or _has_result_controls(voice)
                 or voice.splitlines() != [voice]
                 or strip_markdown_emphasis_for_speech(voice) != voice
@@ -1763,7 +1768,7 @@ class HermesApiTaskSession:
             category = "detail"
             if (
                 not _has_result_text(detail)
-                or len(detail) > 1800
+                or len(detail) > MAX_PRESENTATION_DETAIL_CHARS
                 or _has_result_controls(detail, detail=True)
                 or _BACKGROUND_DETAIL_PROTOCOL_TAG.search(detail) is not None
             ):

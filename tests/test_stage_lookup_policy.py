@@ -60,6 +60,25 @@ def test_stage_refuses_unreviewed_shared_formatter_before_writing(tmp_path, monk
     }, raising=False)
     with pytest.raises(stage.StagingRefusal, match="reviewed-shared-source-mismatch"):
         stage.stage_lookup_policy(owned, FIXTURE)
+
+
+def test_stage_refuses_changed_shared_result_limits_before_writing(tmp_path, monkeypatch):
+    import io
+
+    owned = profile(tmp_path)
+    target = Path(__file__).parents[1] / "src/hermes_realtime/result_limits.py"
+    altered = target.read_bytes().replace(b"4096", b"4097", 1)
+    original = Path.open
+
+    def changed(path, mode="r", *args, **kwargs):
+        if path == target and mode == "rb":
+            return io.BytesIO(altered)
+        return original(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", changed)
+    with pytest.raises(stage.StagingRefusal, match="reviewed-shared-source-mismatch"):
+        stage.stage_lookup_policy(owned, FIXTURE)
+    assert list(owned.iterdir()) == []
     assert list(owned.iterdir()) == []
 
 

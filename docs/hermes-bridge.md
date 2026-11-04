@@ -55,7 +55,7 @@ bridge = create_local_bridge(bindings=bindings, token=token)
 await bridge.start()
 ```
 
-The server rejects non-loopback bind addresses, malformed participant identifiers, invalid tokens, and NDJSON lines larger than 64 KiB. It counts unauthenticated sockets toward the connection limit, requires authentication within the configured timeout, and bounds shutdown even if a connection or completion task stalls. Protocol free-text fields are limited to 8,192 characters. Hermes terminal summaries and reasons are each truncated to 4,096 characters before retention and delivery so that two maximally JSON-escaped fields still fit one wire line.
+The server rejects non-loopback bind addresses, malformed participant identifiers, invalid tokens, and NDJSON lines larger than 64 KiB. It counts unauthenticated sockets toward the connection limit, requires authentication within the configured timeout, and bounds shutdown even if a connection or completion task stalls. Protocol free-text fields are limited to 8,192 characters. Completed summaries have a separate 4,096-Unicode-scalar limit; reasons remain limited to 1,024 characters. Oversized completion fields are refused before claiming terminal authority, rather than sliced. The wire-line byte limit still applies.
 
 The default limits are `authentication_timeout=5.0`, `max_connections=32`, and `shutdown_timeout=5.0`. Override them through `LocalHermesBridgeServer` only when the local deployment requires different bounds. Completion-hook ingress is deduplicated by exact run ID and bounded by `max_pending_completions` before cross-thread loop scheduling. Call `await bridge.close()` during plugin shutdown. Closing is terminal for that bridge instance; construct a new bridge and service for a new lifecycle rather than restarting an instance whose routes and completion subscription were discarded.
 
@@ -528,6 +528,7 @@ client = await LocalHermesBridgeClient.connect(
     port=bridge.port,
     token=token,
     participant_id="participant_001",
+    capabilities=("completed_result_v1",),
 )
 
 async with client, RealtimeHermesSession(
@@ -539,6 +540,34 @@ async with client, RealtimeHermesSession(
 ```
 
 `RealtimeHermesSession` owns the single inbound reader, correlates dispatch and cancellation acknowledgments, enforces the bound session and strictly increasing incoming event sequences, and pushes terminal updates without polling. Its proactive terminal buffer is bounded (`max_pending_updates=256` by default); overflow terminates the session explicitly instead of dropping evidence or growing memory without limit.
+
+The optional `completed_result_v1` capability uses the existing authenticated
+bridge 0.3 negotiation. A negotiated worker accepts completed summaries up to
+4,096 Unicode scalar values; a worker without it keeps its 1,024-character
+limit. A legacy recipient receives a fixed display-limit notice for a longer
+completed result. That notice is a recipient-specific wire projection: the full
+canonical result and true terminal status remain intact for a capable recipient
+or replay. An older server that does not know the requested capability refuses
+the handshake; the client does not silently downgrade.
+
+The browser's `POST /api/v2/events` endpoint returns event-batch version 2 and
+preserves completed task-result text up to the same 4,096-scalar limit. Other
+event shapes, authentication, ordering, privacy filters, and failure limits are
+unchanged. The API's structured presentation retains its narrower limits:
+220 characters of voice and 1,800 of complete detail, including sources; its
+32 tag characters give a maximum 2,052-character terminal envelope. Accepted
+detail reaches the browser intact, including trailing source and time entries.
+Lone UTF-16 surrogates are not scalar values and are refused.
+
+`POST /api/v1/events` remains available for older browsers. Its completed result
+text stays within 1,024 UTF-16 code units; longer text becomes an explicit
+display-limit notice without changing the stored event, task identity, or
+completed status. The current browser requires version 2 and explicitly refuses
+an unsupported route or a legacy response rather than retrying with version 1.
+Private-handle redaction remains mandatory; if that projection cannot fit the
+completed-result contract, an explicit unusable-result notice replaces it.
+Foreground result references remain separately bounded to 1,024 characters;
+the richer browser contract does not expand conversational memory or speech.
 
 Retained acknowledgments and terminal evidence keep their semantic `event_id` but receive a fresh transport `sequence` whenever replaying the original sequence would regress on a connection. Terminal and dispatch-retry retention are coupled: after terminal evidence expires, a matching old retry receives an explicit rejected acknowledgment and must use a new `task_id`; the bridge never installs a live route for expired terminal work.
 

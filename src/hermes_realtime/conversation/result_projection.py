@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from urllib.parse import urlsplit
+
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    UNUSABLE_RESULT_NOTICE,
+    has_valid_result_unicode,
+)
 
 _COMPLETION_REFERENCE = re.compile(
     r"(?:\[([^\]]+)\]\()?(https?://[^\s<>]+)", re.IGNORECASE,
@@ -161,8 +169,23 @@ def _conversation_completion_text(status: str, voice_detail: str, visual_detail:
     return full_result
 
 
-def _browser_safe_task_result(detail: str) -> str:
-    return _bounded_result(_PRIVATE_RESULT_HANDLE.sub("private reference", detail))
+def _browser_safe_task_result(detail: str, *, completed: bool = False) -> str:
+    refusal: str | None = None
+    try:
+        safe = _PRIVATE_RESULT_HANDLE.sub("private reference", detail)
+        if completed:
+            if not has_valid_result_unicode(safe):
+                refusal = "unicode"
+            elif len(safe) > MAX_COMPLETED_RESULT_CHARS:
+                refusal = "bound"
+            if refusal is not None:
+                return UNUSABLE_RESULT_NOTICE
+            return safe
+        return _bounded_result(safe)
+    finally:
+        if refusal is not None:
+            with contextlib.suppress(OSError, ValueError):
+                print("[task-result-display] " + json.dumps({"version": 1, "category": refusal}))
 
 
 def _bounded_result(text: str) -> str:

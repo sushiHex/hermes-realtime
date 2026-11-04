@@ -299,6 +299,7 @@ def parse_event(data: str | bytes | dict[str, Any]) -> ProtocolEvent:
 # them with a category refusal rather than a dropped connection.
 
 BRIDGE_PROTOCOL_VERSION = "0.3"
+COMPLETED_RESULT_CAPABILITY = "completed_result_v1"
 VOICE_ARCHIVE_CAPABILITY = "voice_archive"
 VOICE_REVIEW_CAPABILITY = "voice_review"
 VOICE_MEMORY_CAPABILITY = "voice_memory"
@@ -308,6 +309,7 @@ RUNTIME_ATTESTATION_CAPABILITY = "runtime_attestation"
 # Required on every hello: both sides prove the shared token without sending it.
 MUTUAL_AUTH_CAPABILITY = "mutual_auth"
 BRIDGE_CAPABILITIES = frozenset({
+    COMPLETED_RESULT_CAPABILITY,
     VOICE_ARCHIVE_CAPABILITY, VOICE_REVIEW_CAPABILITY, VOICE_MEMORY_CAPABILITY,
     VOICE_FORGET_CAPABILITY,
     RUNTIME_ATTESTATION_CAPABILITY,
