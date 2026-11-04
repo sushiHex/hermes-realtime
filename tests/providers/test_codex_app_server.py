@@ -154,6 +154,8 @@ async def test_accepted_start_projects_only_accepted_objective_and_style(style) 
         assert "acceptance only" in instructions
         assert "natural conversational sentence" in instructions
         assert "not a one-word status label" in instructions
+        assert "Use one short sentence" in instructions
+        assert "Do not restate the full objective or list requested fields" in instructions
         assert "Use everyday language about the request" in instructions
         assert "avoid internal task or acceptance terminology" in instructions
         assert "Do not prescribe a fixed phrase" in instructions
