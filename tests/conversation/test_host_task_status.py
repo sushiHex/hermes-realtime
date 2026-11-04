@@ -194,6 +194,8 @@ async def test_loop_refuses_text_after_status_with_bounded_evidence(capsys):
     assert [row for row in context.snapshot().messages if row.role == "assistant"] == []
     assert capsys.readouterr().out == (
         '[host-speech] {"category":"after_terminal","kind":"task_status"}\n'
+        '[foreground-failure] {"version":1,"stage":"producer",'
+        '"failure_kind":"value","text_phase":"after_text"}\n'
     )
     await loop.close()
 
