@@ -1092,12 +1092,11 @@ async def test_mutated_private_controller_result_is_rejected_on_reconstruction()
         "private prefixdeleg_private_12345678",
     )
 
-    with pytest.raises(PrivateRunDisclosureError):
-        await surface.start_work(
-            objective="Inspect evidence",
-            invocation_id="private_result",
-        )
-    assert surface.health == "uncertain"
+    result = await surface.start_work(
+        objective="Inspect evidence", invocation_id="private_result",
+    )
+    assert result.reason == "Hermes rejected task dispatch"
+    assert surface.health == "open"
 
 
 @pytest.mark.asyncio
@@ -1283,4 +1282,24 @@ async def test_close_timeout_is_bounded_and_retryable() -> None:
     gate.set()
     await start
     async with asyncio.timeout(1):
+        await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_controller_accepted_rejection_text_does_not_latch_surface() -> None:
+    surface, controller, events = _surface(accepted=False)
+    # This is a valid controller outcome: the private namespace has a left boundary.
+    controller.dispatch_outcome = TaskDispatchOutcome(
+        task_id="task_public",
+        accepted=False,
+        reason="prefixdeleg_operational_option unavailable",
+    )
+    try:
+        result = await surface.start_work(
+            objective="Inspect evidence", invocation_id="ordinary_rejection"
+        )
+        assert not result.accepted
+        assert result.reason == "Hermes rejected task dispatch"
+        assert surface.health == "open"
+    finally:
         await surface.close()

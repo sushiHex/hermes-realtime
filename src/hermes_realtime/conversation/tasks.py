@@ -256,7 +256,7 @@ class ConversationTaskController:
         self._used_event_ids: set[str] = set()
         self._used_inbound_event_ids: set[str] = set()
         self._used_inbound_sequences: set[int] = set()
-        self._max_inbound_sequence = -1
+        self._max_inbound_sequences: dict[str, int] = {}
         self._terminal_sequences: dict[str, int] = {}
         self._owned_operations: set[asyncio.Task[TaskOperationOutcome]] = set()
         self._lock = asyncio.Lock()
@@ -733,6 +733,12 @@ class ConversationTaskController:
         self._fail_locked(error)
         return error
 
+    async def has_terminal(self, task_id: str) -> bool:
+        """Confirm this controller settled the exact accepted task."""
+        async with self._lock:
+            self._raise_if_unavailable()
+            return task_id in self._terminal_sequences
+
     def _raise_if_unavailable(self) -> None:
         if self._terminal_error is not None:
             raise self._terminal_error
@@ -751,13 +757,15 @@ class ConversationTaskController:
             raise self._failure_locked("inbound event identity was reused")
         if sequence in self._used_inbound_sequences:
             raise self._failure_locked("inbound event sequence was reused")
-        if sequence <= self._max_inbound_sequence and (
+        if sequence <= self._max_inbound_sequences.get(event.task_id, -1) and (
             reordered_after is None or sequence >= reordered_after
         ):
             raise self._failure_locked("inbound event sequence was stale")
         self._used_inbound_event_ids.add(event_id)
         self._used_inbound_sequences.add(sequence)
-        self._max_inbound_sequence = max(self._max_inbound_sequence, sequence)
+        self._max_inbound_sequences[event.task_id] = max(
+            self._max_inbound_sequences.get(event.task_id, -1), sequence
+        )
 
     def _claim_event_id_locked(self, event_id: str) -> None:
         if event_id in self._used_event_ids:

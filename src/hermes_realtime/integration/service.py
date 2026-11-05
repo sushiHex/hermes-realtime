@@ -322,7 +322,10 @@ class HermesIntegrationService:
             > self._max_retained_dispatches
         ):
             completed_key = next(
-                (key for key, task in self._dispatch_tasks.items() if task.done()),
+                (
+                    key for key, task in self._dispatch_tasks.items()
+                    if task.done() and key not in self._active_runs
+                ),
                 None,
             )
             if completed_key is None:
@@ -395,6 +398,14 @@ class HermesIntegrationService:
                 publisher(run_id)
         return acknowledgment
 
+    async def retained_run_for_task(self, binding: SessionBinding, task_id: str) -> str | None:
+        """Return only a settled acknowledgment belonging to the exact admitted binding."""
+        async with self._dispatch_lock:
+            task = self._dispatch_tasks.get((binding.session_id, binding.generation, task_id))
+            if task is None or not task.done() or task.cancelled() or task.exception() is not None:
+                return None
+            return task.result().payload.run_id
+
     async def binding_for_run(self, run_id: str) -> SessionBinding | None:
         """Return the immutable admitted binding that owns an active run."""
 
@@ -443,7 +454,9 @@ class HermesIntegrationService:
                 del self._active_runs[key]
                 if key not in self._dispatch_tasks:
                     self._run_bindings.pop(run_id, None)
+                    self._run_keys.pop(run_id, None)
             self._refresh_active_run_ids_snapshot()
+            self._prune_completed_dispatches()
 
     async def expire_terminal_replay(self, run_id: str) -> None:
         """Expire the matching dispatch retry entry with its terminal evidence."""

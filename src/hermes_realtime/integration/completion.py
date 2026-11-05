@@ -54,6 +54,14 @@ class HermesCompletionRouter:
 
         self._expiration_callback = callback
 
+    async def can_track(self, retained_run_id: str | None = None) -> bool:
+        """Check admission before dispatch while the bridge holds registration ownership."""
+        async with self._lock:
+            return (
+                retained_run_id in self._acknowledgments
+                or len(self._acknowledgments) < self._max_tracked_acknowledgments
+            )
+
     async def track(self, acknowledgment: WorkDispatchAcknowledgedEvent) -> None:
         """Track one accepted acknowledgment by its authoritative run ID."""
 

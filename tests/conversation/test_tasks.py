@@ -2043,3 +2043,40 @@ async def test_dispatch_projects_task_only_after_authoritative_acceptance() -> N
     assert session.requests[0].task_id == "task_task_001"
     assert "deleg_private_001" not in repr(outcome)
     assert "deleg_private_001" not in repr(context.snapshot())
+
+
+@pytest.mark.asyncio
+async def test_cross_task_ack_and_terminal_reordering_preserves_authority() -> None:
+    class Session(QueuedUpdateSession):
+        async def dispatch(
+            self, request: WorkDispatchRequestedEvent
+        ) -> WorkDispatchAcknowledgedEvent:
+            return WorkDispatchAcknowledgedEvent(
+                type="work.dispatch.acknowledged",
+                event_id="evt_ack_" + request.task_id,
+                session_id=request.session_id,
+                sequence=1 if request.task_id == "task_first" else 5,
+                timestamp=request.timestamp,
+                task_id=request.task_id,
+                payload={"accepted": True, "run_id": "deleg_" + request.task_id},
+            )
+
+    session = Session()
+    controller = ConversationTaskController(
+        context=ConversationContextStore(),
+        session=session,
+        session_id="session_001",
+        id_factory=iter(("first", "dispatch_first", "second", "dispatch_second")).__next__,
+    )
+    try:
+        await controller.dispatch(objective="first", utterance_id="utterance_first")
+        await controller.dispatch(objective="second", utterance_id="utterance_second")
+        await session.updates.put(
+            terminal_event(task_id="task_first", run_id="deleg_task_first", sequence=3)
+        )
+        assert (await controller.next_completion()).task_id == "task_first"
+        assert await controller.has_terminal("task_first")
+        assert not await controller.has_terminal("task_second")
+        assert not await controller.has_terminal("task_unknown")
+    finally:
+        await controller.close()
