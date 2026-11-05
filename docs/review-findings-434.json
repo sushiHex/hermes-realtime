@@ -260,9 +260,9 @@
       "id": "R2-15",
       "status": "fixed",
       "canonical_id": "R2-15",
-      "reason": "Retirement allocates above retained pending/outcome generations and at least retained live generation, with exhaustion refusal.",
-      "evidence": "Nine missing/corrupt/legacy x pending/outcome/live cases pass; exhaustion passes; four independent ordering/bound mutations killed alone; affected delete tests pass.",
-      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+      "reason": "Retirement allocates above retained pending/outcome generations and at least retained live generation, with exhaustion refusal. Completion-adjacent generations are reserved only for the exact predecessor across every retained pending/outcome binding; unrelated resets and delayed acknowledgments cannot inherit completion, including same-generation distinct identities. Subsequent actual deletes still complete.",
+      "evidence": "Initial generation-reset regression RED/GREEN. Existing unrelated-conversation launcher regression RED then GREEN; four reset forms x completed/pending records stay idle across restart, late acknowledgments stay scoped, exact known predecessor completes, subsequent actual delete completes. Final69 focused tests pass. Six isolated source/predecessor/overflow mutants killed in mutation-delete-scope-followup.json. Authority owner independently reviewed7a81296+2cf16ea GO, with independent original late-ack control retained in delete-scope-review-control-final.json.",
+      "commit": "96db6efc8961bc4b06a409bba0bd7aaab17a99a9"
     },
     {
       "id": "R2-16",
@@ -316,9 +316,9 @@
       "id": "R2-22",
       "status": "fixed",
       "canonical_id": "R2-22",
-      "reason": "Removed global PID-to-single-creation restriction. Full (pid, creationFiletime) identity remains globally unique; parent binding remains Job-scoped. Sequential Jobs may recycle PIDs.",
-      "evidence": "test_report_accepts_recycled_pid_in_sequential_jobs and retained controlled-descendant regressions.",
-      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+      "reason": "Allow PID reuse across independent completed scenario Jobs using distinct (PID, creationFiletime) identities, while enforcing unique PIDs within each Job. Per-Job uniqueness is required because processGroupId references carry only a PID and must remain unambiguous. Initial change 10a240c removed the global restriction; followup 14ead4d restores the correctly scoped guard.",
+      "evidence": "Existing test_report_rejects_unclosed_process_and_socket_topology[pid_reuse] reproduced RED before 14ead4d. Focused topology, equal-time-cycle and cross-Job recycled-PID checks: 20 passed. Isolated mutation removing the new per-Job PID uniqueness guard made that same target fail (exit 1); healthy restoration passed (exit 0). Receipt job_pid_uniqueness is retained in mutation-storage_proofs.json.",
+      "commit": "9a082ab74d0bff229a2fba383cb06810216ece9f"
     },
     {
       "id": "R2-23",
@@ -769,7 +769,7 @@
       "canonical_id": "R2-15",
       "reason": "Same mechanism and disposition as R2-15",
       "evidence": "See canonical disposition.",
-      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+      "commit": "96db6efc8961bc4b06a409bba0bd7aaab17a99a9"
     },
     {
       "id": "R3-11",
