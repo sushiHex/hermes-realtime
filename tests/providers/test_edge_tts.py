@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
 
 import pytest
 
@@ -267,3 +269,82 @@ async def test_edge_tts_closed_owner_refuses_late_synthesis() -> None:
         await anext(iterator)
     assert calls == []
     assert tts._operations == {}
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_refuses_overflow_instead_of_clipping_success(monkeypatch):
+    # Model-free decoder witness: ffmpeg emits min(source duration, requested cap).
+    decoded = b"\x01\x00" * 32000
+
+    class Process:
+        stdin = stdout = stderr = object()
+        returncode = 0
+
+        def __init__(self, duration):
+            self.duration = duration
+
+        async def communicate(self, payload):
+            return decoded[:round(self.duration * 32000)], b""
+
+    async def create(*args, **kwargs):
+        return Process(float(args[args.index("-t") + 1]))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr("hermes_realtime.providers.edge_tts.shutil.which", lambda path: path)
+    tts = EdgeTtsSynthesizer(sample_rate_hz=16000, max_pcm_bytes=32000)
+    with pytest.raises(ValueError, match="PCM output exceeds"):
+        await tts._ffmpeg_decode(b"synthetic-mp3")
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_accepts_exact_pcm_bound(monkeypatch):
+    decoded = b"\x01\x00" * 16000
+
+    class Process:
+        stdin = stdout = stderr = object()
+        returncode = 0
+
+        async def communicate(self, payload):
+            return decoded, b""
+
+    async def create(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr("hermes_realtime.providers.edge_tts.shutil.which", lambda path: path)
+    tts = EdgeTtsSynthesizer(sample_rate_hz=16000, max_pcm_bytes=len(decoded))
+    assert await tts._ffmpeg_decode(b"synthetic-mp3") == decoded
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="native FFmpeg unavailable")
+@pytest.mark.asyncio
+async def test_native_ffmpeg_exact_bound_and_overflow_reach_chunk_boundary():
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg is not None
+    mp3 = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+         "anullsrc=r=16000:cl=mono", "-t", "0.15", "-f", "mp3", "pipe:1"],
+        check=True, capture_output=True, timeout=10,
+    ).stdout
+    full_pcm = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "mp3", "-i", "pipe:0",
+         "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"],
+        input=mp3, check=True, capture_output=True, timeout=10,
+    ).stdout
+
+    async def synthesize(_text, _voice):
+        return mp3
+
+    exact = EdgeTtsSynthesizer(sample_rate_hz=16000, max_pcm_bytes=len(full_pcm))
+    limited = EdgeTtsSynthesizer(
+        sample_rate_hz=16000, max_pcm_bytes=3200,  # Exactly 100 milliseconds.
+        synthesize_mp3=synthesize,
+    )
+    try:
+        assert await exact._ffmpeg_decode(mp3) == full_pcm
+        with pytest.raises(ValueError, match="PCM output exceeds"):
+            await anext(limited.synthesize("Synthetic decoder boundary.", "turn_overflow"))
+        assert limited._operations == {}
+    finally:
+        await exact.close()
+        await limited.close()
