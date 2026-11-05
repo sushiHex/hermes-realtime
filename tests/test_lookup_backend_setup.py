@@ -573,9 +573,29 @@ def test_owned_runner_capture_mode_refuses_before_model_start(
     assert "PRIVATE_INVALID_MODE" not in marker
 
 
-@pytest.mark.parametrize("mode", ["off", "metadata", "controlled-public"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "off",
+        pytest.param(
+            "metadata",
+            marks=pytest.mark.skipif(
+                __import__("os").name != "nt", reason="Windows capture composition"
+            ),
+        ),
+        pytest.param(
+            "controlled-public",
+            marks=pytest.mark.skipif(
+                __import__("os").name != "nt", reason="Windows capture composition"
+            ),
+        ),
+    ],
+)
 def test_owned_runner_passes_explicit_capture_mode_to_gateway(
-    owned_runner_before_gateway, monkeypatch, tmp_path, mode,
+    owned_runner_before_gateway,
+    monkeypatch,
+    tmp_path,
+    mode,
 ):
     import scripts
     from tests.test_lookup_model_capture import config

@@ -11,6 +11,7 @@ import re
 import tarfile
 import tomllib
 import zipfile
+import zlib
 from collections import Counter
 from dataclasses import dataclass
 from email.parser import BytesParser
@@ -64,7 +65,7 @@ def _inspect_wheel(raw: bytes, expected: dict[str, tuple[int, str]]) -> dict[str
                 "candidate wheel expansion exceeds its bound",
             )
             members = {entry.filename: wheel.read(entry) for entry in entries}
-    except (zipfile.BadZipFile, RuntimeError) as error:
+    except (zipfile.BadZipFile, RuntimeError, zlib.error) as error:
         raise ValueError("candidate wheel is unreadable") from error
     for name, (size, digest) in expected.items():
         value = members[name]

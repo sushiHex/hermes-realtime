@@ -104,6 +104,26 @@ def test_wheel_inspection_binds_every_runtime_blob_and_closed_metadata() -> None
     assert {name for name in members if name.startswith("hermes_realtime/")} == set(expected)
 
 
+def test_wheel_corrupt_deflate_member_is_a_typed_refusal() -> None:
+    from scripts.candidate_wheel import _inspect_wheel
+
+    raw, expected = _wheel_bytes()
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(raw)) as original,
+        zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive,
+    ):
+        for name in original.namelist():
+            archive.writestr(name, original.read(name))
+    damaged = bytearray(output.getvalue())
+    with zipfile.ZipFile(output) as archive:
+        first = archive.infolist()[0]
+        offset = first.header_offset + 30 + len(first.filename.encode()) + len(first.extra)
+    damaged[offset] = 0x07  # reserved DEFLATE block type
+    with pytest.raises(ValueError, match="unreadable"):
+        _inspect_wheel(bytes(damaged), expected)
+
+
 @pytest.mark.parametrize(
     "change",
     [
