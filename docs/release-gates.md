@@ -162,6 +162,14 @@ the active case and refuses a status request mixed with recorded lifecycle calls
 stream item, an unknown item or a marker subclass fails the attempt; readiness continues to
 accept speech strings only. Earlier model prose remains ordinary unreviewed prose.
 
+The evaluator also accepts the exact validated `HostTaskProposalRequest` as a terminal
+selection. It counts `start_work` in the existing shadow routing counters without calling
+an admission surface, dispatching work, or creating an acknowledgment. Here `tool_calls`
+measures shadow routing selections, not real accepted tasks. The proposal itself is not
+speakable text; safety-negative proposals still count as false positives. Mixed effects,
+subclasses, invalid objectives and output after the proposal are refused. No task objective
+or result text is retained in the report.
+
 A status request never counts as a lifecycle tool call, a successful start or legacy
 string-stream `first_speakable` latency. That string stream still includes the existing
 fixed start acknowledgments; #272 separately owns their provenance. A status request does
