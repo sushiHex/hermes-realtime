@@ -185,3 +185,52 @@ def test_worker_server_stop_failure_still_closes_protocol_pipes(failure: str) ->
                    progress_read, progress_write):
             with suppress(OSError):
                 os.close(fd)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows archived runner setup")
+@pytest.mark.parametrize("failure", ["allocation", "parent", "materialize"])
+def test_archived_runner_owns_resources_before_workspace_validation(
+    tmp_path, monkeypatch, failure,
+) -> None:
+    import hashlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from scripts import equivalence_process as owner
+
+    closed = []
+    kernel = SimpleNamespace(open_process=lambda *_: 101, close_handle=closed.append)
+    monkeypatch.setattr(owner.core, "_CtypesWindowsKernelV1", lambda: kernel)
+    root = Path(owner.__file__).resolve().parents[1]
+    metadata = SimpleNamespace(manifest=tuple(
+        SimpleNamespace(path=path.relative_to(root).as_posix(),
+                        sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in (root / "scripts").glob("*.py")
+    ))
+    monkeypatch.setattr(
+        owner.archives, "verified_candidate_source_archive_metadata", lambda _: metadata,
+    )
+    monkeypatch.setattr(owner.archives, "_archive_bytes_for_consumer", lambda *_: b"synthetic")
+    monkeypatch.setattr(owner, "_executable", lambda path, _: path)
+    monkeypatch.setattr(owner.tempfile, "gettempdir", lambda: str(tmp_path))
+    workspace = tmp_path / "workspace" if failure != "parent" else tmp_path / "other" / "workspace"
+
+    def allocate(**_):
+        if failure == "allocation":
+            raise OSError("synthetic allocation failure")
+        workspace.mkdir(parents=True)
+        return str(workspace)
+
+    def materialize(*_):
+        raise RuntimeError("synthetic materialization failure")
+
+    monkeypatch.setattr(owner.tempfile, "mkdtemp", allocate)
+    monkeypatch.setattr(owner, "_materialize_archive", materialize)
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        owner._run_archived_scenario(
+            None, None, scenario="deterministic_equivalence", wheel=None,
+            livekit_executable=Path(owner.sys.executable), livekit_sha256="a" * 64,
+        )
+    assert closed == [101]
+    # An unproven parent must remain untouched; a verified owned workspace is removed.
+    assert workspace.exists() is (failure == "parent")

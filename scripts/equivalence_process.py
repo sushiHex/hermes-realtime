@@ -278,18 +278,20 @@ def _run_archived_scenario(
     console_host = Path(os.environ["SYSTEMROOT"]) / "System32" / "conhost.exe"
     console_hash = hashlib.sha256(console_host.read_bytes()).hexdigest()
     kernel = core._CtypesWindowsKernelV1()
+    expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    workspace: Path | None = None
+    job: core._WindowsScenarioJobV1 | None = None
+    finalized = False
     runner_handle = kernel.open_process(
         os.getpid(), core._SYNCHRONIZE | core._PROCESS_QUERY_LIMITED_INFORMATION
     )
-    workspace = Path(tempfile.mkdtemp(prefix="hermes-equivalence-")).resolve(strict=True)
-    expected_parent = Path(tempfile.gettempdir()).resolve(strict=True)
-    _require(
-        workspace.parent == expected_parent,
-        "scenario workspace is outside its owned temporary parent",
-    )
-    job: core._WindowsScenarioJobV1 | None = None
-    finalized = False
     try:
+        workspace = Path(tempfile.mkdtemp(prefix="hermes-equivalence-"))
+        workspace = workspace.resolve(strict=True)
+        _require(
+            workspace.parent == expected_parent,
+            "scenario workspace is outside its owned temporary parent",
+        )
         root = _materialize_archive(workspace, payload, metadata)
         _verify_tree(root, metadata)
         package_root = root / "src"
@@ -533,7 +535,7 @@ def _run_archived_scenario(
         # Never remove a running scenario's files. The known, fresh temporary
         # directory is the only recursive cleanup target.
         completed_cleanup = job.last_finalization if job is not None else None
-        if (
+        if workspace is not None and (
             job is None
             or finalized
             or (
@@ -543,9 +545,15 @@ def _run_archived_scenario(
                 and not completed_cleanup.failures
             )
         ):
-            _require(
-                workspace.resolve(strict=True).parent == expected_parent
-                and not workspace.is_symlink(),
-                "scenario cleanup target changed",
-            )
+            try:
+                _require(
+                    workspace.resolve(strict=True).parent == expected_parent
+                    and not workspace.is_symlink(),
+                    "scenario cleanup target changed",
+                )
+            except BaseException:
+                print("[archived-workspace] " + json.dumps({
+                    "refusal": "cleanup_target", "version": 1,
+                }), flush=True)
+                raise
             shutil.rmtree(workspace)
