@@ -1,0 +1,947 @@
+{
+  "owning_issue": 434,
+  "base_commit": "eebd389f0711f199570a026c244140d4566d1da4",
+  "scope": "105 individual claims from three completed review runs; duplicates are retained explicitly. Reviews are allegations, not authority.",
+  "validation": "Focused RED/GREEN regressions, isolated consequential guard mutations and independent boundary review. Broad exact-candidate results are recorded in the pull request.",
+  "remaining": [
+    {
+      "id": "R2-61",
+      "issue": 435,
+      "blocker": "Native Swift/Xcode build and capture/export proof unavailable in the current Windows lane."
+    }
+  ],
+  "dispositions": [
+    {
+      "id": "R1-01",
+      "status": "fixed",
+      "canonical_id": "R1-01",
+      "reason": "Authoritative FAILED terminals now survive missing, empty, oversized, private-handle-bearing and lone-surrogate error text using a fixed bounded notice; sanitized refusal evidence cannot prevent settlement.",
+      "evidence": [
+        "test_unusable_error_still_settles_failed_run (five variants)",
+        "test_event_stream_failure_settles_run_that_failed_before_its_stop (two existing stream variants)"
+      ],
+      "commit": "b78de55af5d5ac7987b1598486d16568487c0fe4"
+    },
+    {
+      "id": "R1-02",
+      "status": "accepted_limit",
+      "canonical_id": "R1-02",
+      "reason": "The API result is an exact-envelope contract. Leading and trailing text including whitespace is explicitly refused; stripping before envelope parsing would repair model text contrary to the established strict contract.",
+      "evidence": [
+        "api.py _completed_result_text docstring: accept envelope, never repair model text",
+        "test_invalid_api_result_is_never_presented[leading_text]",
+        "test_invalid_api_result_is_never_presented[trailing_text]"
+      ],
+      "commit": null
+    },
+    {
+      "id": "R1-03",
+      "status": "fixed",
+      "canonical_id": "R1-03",
+      "reason": "Plugin terminal ingress validates both scalar length and Unicode before the strict bridge; unusable completed summaries or failed/interrupted reasons receive fixed notices while original terminal status survives.",
+      "evidence": [
+        "test_unusable_hook_text_preserves_terminal (failed, interrupted and completed variants)"
+      ],
+      "commit": "b78de55af5d5ac7987b1598486d16568487c0fe4"
+    },
+    {
+      "id": "R1-04",
+      "status": "fixed",
+      "canonical_id": "R1-03",
+      "reason": "Bridge refuses surrogate-bearing reasons at its existing strict boundary, and plugin ingress supplies a safe reason instead of losing the terminal. No Unicode or envelope contract was weakened.",
+      "evidence": [
+        "test_completion_reason_refuses_lone_surrogate",
+        "test_unusable_hook_text_preserves_terminal"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R1-05",
+      "status": "fixed",
+      "canonical_id": "R1-05",
+      "reason": "Receipts are fully written and fsynced before atomic no-clobber hard-link publication; competing writers cannot replace an existing receipt.",
+      "evidence": "test_receipt_is_invisible_until_fsynced_and_never_overwrites; test_receipt_publication_cannot_replace_a_competing_writer",
+      "commit": "dc9e2994c414b2e4ceb7310a6e44662786c82400"
+    },
+    {
+      "id": "R1-06",
+      "status": "fixed",
+      "canonical_id": "R1-06",
+      "reason": "All profile checks receive the staged home; host-mode configuration is read from that home rather than the mutable original.",
+      "evidence": "test_preflight_passes_the_staged_home_to_every_profile_check; staged config/origin negative controls",
+      "commit": "dc9e2994c414b2e4ceb7310a6e44662786c82400"
+    },
+    {
+      "id": "R1-07",
+      "status": "fixed",
+      "canonical_id": "R1-07",
+      "reason": "Selected source IDs require nonempty supplied search/extract evidence; missing passages and extract-unavailable notices cannot be cited. Both native and selected-policy callers pass their frozen evidence snapshot.",
+      "evidence": "test_presentation_cannot_cite_a_source_without_supplied_evidence; native and selected formatter checks",
+      "commit": "dc9e2994c414b2e4ceb7310a6e44662786c82400"
+    },
+    {
+      "id": "R1-08",
+      "status": "accepted_limit",
+      "canonical_id": "R1-08",
+      "reason": "Allegation conflates independent worker-bridge and browser HTTP contracts. result_limits.py defines these limits as Unicode scalars; docs/hermes-bridge.md546 and RealtimeHermesSession._validate_terminal retain the worker bridge 1024-character scalar envelope. Only browser /api/v1/events uses the separate 1024 UTF-16-unit limit documented at line563 and implemented in client/http.py665. Root/independent source review corrected the initial speculative bridge-width patch; scalar behavior is preserved with explicit astral boundary controls. Surrogate refusal and other authority fixes remain intact.",
+      "evidence": [
+        "result_limits.py scalar contract",
+        "integration/worker.py _completed_result_limit + _require_optional_text use Python scalar len",
+        "docs/hermes-bridge.md546 versus separate browser contract at563",
+        "test_legacy_bridge_projection_counts_scalars[513/1024/1025]",
+        "legacy_bridge_scalar_contract mutant killed and healthy restored in mutations-authority-boundary-followup.json"
+      ],
+      "commit": "76b221edcbd6fe6727b8884548845455e590074f"
+    },
+    {
+      "id": "R1-09",
+      "status": "fixed",
+      "canonical_id": "R1-09",
+      "reason": "Keep the stricter public privacy guard. Reconstruct a controller rejection, then replace reason text that the public surface cannot expose with a fixed clean-rejection reason. Valid rejected dispatches no longer poison work-control health.",
+      "evidence": [
+        "test_controller_accepted_rejection_text_does_not_latch_surface",
+        "test_mutated_private_controller_result_is_rejected_on_reconstruction (updated safe fallback expectation)",
+        "test_results_are_frozen_exact_and_private_safe"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R1-10",
+      "status": "fixed",
+      "canonical_id": "R1-10",
+      "reason": "Scope monotonic inbound ordering to the exact task while preserving global event-ID and sequence uniqueness, per-task request/ack ordering, preack exceptions, and same-task stale refusal.",
+      "evidence": [
+        "test_cross_task_ack_and_terminal_reordering_preserves_authority",
+        "test_stale_or_reused_inbound_terminal_cannot_retire_active_authority"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R1-11",
+      "status": "fixed",
+      "canonical_id": "R1-11",
+      "reason": "Retry only bounded 502/503/504 health failures within the original deadline; authentication, schema and ownership refusals remain fatal.",
+      "evidence": "test_dev_serve_retries_transient_health_without_bypassing_ownership; auth and owner negative controls",
+      "commit": "af1f9d14022a7cbba92b14301b4ad92c6fa41e67"
+    },
+    {
+      "id": "R2-01",
+      "status": "fixed",
+      "canonical_id": "R2-01",
+      "reason": "Completed dispatch futures for still-active runs are no longer pruned; their active and cancel ownership stays intact and exact retry returns the same acknowledgment. Terminal settlement triggers pruning.",
+      "evidence": [
+        "test_completed_dispatch_idempotency_cache_is_bounded (now asserts no duplicate dispatch)",
+        "test_completed_retention_is_trimmed_without_later_admission (marks actual terminal first)",
+        "test_active_run_remains_cancellable_after_retry_cache_pruning (also asserts run-key cleanup)"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R2-02",
+      "status": "fixed",
+      "canonical_id": "R2-02",
+      "reason": "Current-participant approval request failure retires the uncertain input credential and disconnects before another decision; old-participant failures cannot retire a successor.",
+      "evidence": "Supported Node22.22.2 targeted RED lost-ack regression then GREEN; 67 focused DOM tests pass; three independent retirement/disconnect/successor mutations killed with isolated green controls; tsc --noEmit passes.",
+      "commit": "a660b6a042054d6b1e21ccce8a884c98fdedaa8c"
+    },
+    {
+      "id": "R2-03",
+      "status": "fixed_with_accepted_limit",
+      "canonical_id": "R2-03",
+      "reason": "Task-result sanitizer now covers the projection subagent namespace before publishing a terminal result. Direct events still intentionally reject reserved private namespaces; this patch does not weaken that contract to interpret ordinary-looking handle text.",
+      "evidence": "test_completed_result_redacts_every_projection_private_namespace_before_publish; existing projection privacy negatives",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R2-04",
+      "status": "fixed",
+      "canonical_id": "R2-04",
+      "reason": "Unknown effective ACE types, including callback and compound allows, now invalidate owner-only DACL proof; only understood allow layouts and known deny layouts are admitted.",
+      "evidence": "test_unhandled_effective_ace_fails_closed[9]; dacl_unknown isolated mutation fails then restored test passes.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R2-05",
+      "status": "fixed",
+      "canonical_id": "R2-05",
+      "reason": "Malformed/mismatched post-dispatch responses now raise uncertainty rather than clean rejection, latch further starts, and retain reserved hook authority until exact terminal callback. An exception/cancellation while awaiting the thread also preserves authority and latches starts. The alleged normal post-return reservation leak is disproved: normal publication releases it and uuid4 reserved IDs cannot hit reused-ID path in the supported dispatcher. Limit: malformed backend responses cannot establish accepted acknowledgment; synthetic evidence makes no live backend success claim. Independent boundary review also identified JSON RecursionError and UnicodeDecodeError gaps; the followup catches ValueError (including malformed JSON, invalid decoding and integer bounds) and RecursionError before the uncertainty latch can be bypassed.",
+      "evidence": [
+        "test_uncertain_dispatch_retains_authority_and_refuses_retries",
+        "test_plugin_dispatcher_rejects_invalid_json",
+        "test_plugin_dispatcher_rejects_responses_without_live_handle",
+        "plugin.py and service.py normal publication path inspection",
+        "test_postdispatch_parser_failure_latches_uncertainty_and_retains_authority (deep JSON, invalid UTF-8, integer parser bound); three isolated parser mutants killed and healthy restored"
+      ],
+      "commit": "3c89fb173a35b6b18c6ca65cba716117aca3c38b"
+    },
+    {
+      "id": "R2-06",
+      "status": "accepted_limit",
+      "canonical_id": "R2-06",
+      "reason": "Every append validates complete lineage. Work is bounded by 9,216 events and 40 MiB per session; no append latency/complexity acceptance limit is asserted by this contract. Retain the correctness-first implementation; linear bounded work is acknowledged, not benchmark-qualified.",
+      "evidence": "sqlite_spool schema session_event_count_in_range/session_canonical_bytes_in_range and _plan_append validate_event_sequence.",
+      "commit": null
+    },
+    {
+      "id": "R2-07",
+      "status": "fixed",
+      "canonical_id": "R2-07",
+      "reason": "Durable history/hash parsing failures during seal become sticky STORE_CORRUPT/FAULTED, while invalid incoming state remains an ordinary refusal.",
+      "evidence": "test_task_5c_seal_revalidates_the_stored_hash_chain_in_its_transaction; seal_corruption isolated mutation.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R2-08",
+      "status": "fixed",
+      "canonical_id": "R2-08",
+      "reason": "Finished callbacks cancel the timer; expiry also requires a still-accepted outcome.",
+      "evidence": "test_finished_review_disarms_watchdog_without_explicit_join; review_disarm and review_expiry_terminal_guard mutations killed individually.",
+      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+    },
+    {
+      "id": "R2-09",
+      "status": "rejected",
+      "canonical_id": "R2-09",
+      "reason": "Historical accepted admission is idempotent even after cancellation; the published contract explicitly distinguishes admission from completion. Re-running the same identity would change admission semantics and risks duplicate memory effects. No requirement or safe replay/retry contract was supplied.",
+      "evidence": "docs/hermes-bridge.md Voice review; review.py _review previous outcome path; store durable review identity; test_busy_keeps_coverage_and_replay_does_not_spawn_twice.",
+      "commit": null
+    },
+    {
+      "id": "R2-10",
+      "status": "fixed",
+      "canonical_id": "R2-10",
+      "reason": "Revoked or closed speculative lookup returns None; explicit consumer cancellation still propagates. Finally releases settled/failed operation entries.",
+      "evidence": "Both shutdown variants RED then GREEN; existing explicit consumer cancellation passes; knowledge_revocation_cancellation mutant killed alone.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R2-11",
+      "status": "fixed",
+      "canonical_id": "R2-11",
+      "reason": "STT cancellation joins the owned operation without stealing its backend exception from finish_utterance.",
+      "evidence": "Injected threaded backend failure RED then GREEN; affected faster-whisper tests pass.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R2-12",
+      "status": "fixed",
+      "canonical_id": "R2-12",
+      "reason": "Verified binding-local STT failure could keep re-raising the same historical operation error after all cleanup completed. Binding cleanup now records settlement separately and keeps its terminal error. First close still reports that original error; a later authenticated close/rebind retry accepts only the completed close task whose exact exception is the historical error and whose foreground/STT/response cleanup actually succeeded. A fresh generation still invokes shared actions.start(), preserving closed or terminal shared-executor refusal. Pending, timed-out, failed, early/incomplete cleanup and a different close/evidence failure retain the binding. No terminal latch is blindly cleared; no live provider integration success is claimed. Required close-stage evidence must succeed before cleanup settlement is published; even an evidence failure reusing the exact historical exception retains the failed binding.",
+      "evidence": [
+        "96 tests/conversation/test_worker.py regressions passed",
+        "test_settled_binding_failure_is_reported_then_allows_a_fresh_generation",
+        "test_replacing_settled_stt_failure_cannot_clear_shared_executor_failure (actual ConversationUpdateExecutor.start check)",
+        "test_binding_operation_failure_cannot_bypass_unsettled_cleanup (pending and failed cleanup)",
+        "test_same_historical_exception_does_not_prove_early_cleanup_settled",
+        "test_settled_cleanup_does_not_hide_a_different_close_failure",
+        "Four isolated guard mutants killed individually with healthy restoration in mutations-authority-binding.json",
+        "Focused Ruff, mypy and diff check passed",
+        "test_settled_cleanup_does_not_hide_a_different_close_failure[same-error]; premature-settlement mutant killed and healthy restored in mutations-authority-boundary-followup.json"
+      ],
+      "commit": "d9424b7557f6183731df4500fac2bab6f71ed805"
+    },
+    {
+      "id": "R2-13",
+      "status": "fixed",
+      "canonical_id": "R2-13",
+      "reason": "A candidate captures the exact speech owner, lifecycle revision and consumer task at onset. A false conditional cancellation preserves input only after that exact consumer naturally succeeds with unchanged revision. Explicit stop, completed successor, failed/cancelled consumer, foreign source and stale candidate remain refused; token is cleared with candidate state.",
+      "evidence": "Actual StreamingSpeechLoop with synthetic inference/synthesis/playback: natural case RED; eight immediate/echo x natural/stop/successor/failure journeys GREEN; two error/cancelled consumers before cleanup revision GREEN; 10 isolated authority/lifetime mutations killed; worker affected checks96 pass and streaming related9 pass. Authority owner independently reviewed exact1d44312 source + mutation evidence GO; no findings.",
+      "commit": "03b60392eaf8b34d3f64768effb4ae1c0762e1e2"
+    },
+    {
+      "id": "R2-14",
+      "status": "accepted_limit",
+      "canonical_id": "R2-14",
+      "reason": "Short final-only responses within retained echo playback are deliberately refused when streaming evidence has fewer than three alphanumerics. This is the implemented echo false-positive/false-negative policy, not an accidental missing branch; changing it alters the excluded acceptance gate.",
+      "evidence": "worker.py _with_playback_authority; tests/conversation/test_worker.py retained echo tail and post-foreground streaming evidence tests.",
+      "commit": null
+    },
+    {
+      "id": "R2-15",
+      "status": "fixed",
+      "canonical_id": "R2-15",
+      "reason": "Retirement allocates above retained pending/outcome generations and at least retained live generation, with exhaustion refusal.",
+      "evidence": "Nine missing/corrupt/legacy x pending/outcome/live cases pass; exhaustion passes; four independent ordering/bound mutations killed alone; affected delete tests pass.",
+      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+    },
+    {
+      "id": "R2-16",
+      "status": "fixed",
+      "canonical_id": "R2-16",
+      "reason": "POSIX SIGTERM requests ordered asynchronous shutdown in both CLIs, preserves handlers through close, then restores them. Windows SIGBREAK qualification behavior remains intact.",
+      "evidence": "host SIGTERM and local CLI ordered-close tests",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R2-17",
+      "status": "fixed",
+      "canonical_id": "R2-17",
+      "reason": "Later chunks retain the committed context flag; only a closed incarnation resets it.",
+      "evidence": "Later chunk regression RED then GREEN; closed-incarnation control; delivery_context_preservation mutant killed alone.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R2-18",
+      "status": "fixed",
+      "canonical_id": "R2-18",
+      "reason": "Probe gate scans every Swift file recursively under compiled Sources instead of a fixed file list.",
+      "evidence": "test_probe_gate_rejects_uncompiled_evidence[extra_source]; probe_sources isolated mutation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-19",
+      "status": "fixed",
+      "canonical_id": "R2-19",
+      "reason": "Probe checks active anchored YAML setting values and Swift code with comments removed; README/comments cannot supply API evidence. This remains a structural lexical gate, not a Swift/YAML compiler or full semantic verifier.",
+      "evidence": "test_probe_gate_rejects_uncompiled_evidence[comment_version|comment_target|comment_api]; three isolated mutations.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-20",
+      "status": "accepted_limit",
+      "canonical_id": "R2-20",
+      "reason": "The 1 GiB ceiling is an admission bound, not a completion-time guarantee. CRC32C remains dependency-free and bounded; 600 s owner timeout can refuse a large or slow acquisition without accepting unverified resources. No provider/resource acquisition or performance qualification was authorized/run. This retains an explicit availability/performance limit; it does not claim maximum-size completion.",
+      "evidence": "qualification_moonshine_catalog._MAX_TOTAL_BYTES; qualification_moonshine_preparation timeout_milliseconds=600_000; qualification_moonshine_worker._crc32c/_download_resource exact size+CRC checks.",
+      "commit": null
+    },
+    {
+      "id": "R2-21",
+      "status": "fixed",
+      "canonical_id": "R2-21",
+      "reason": "Both retained-tree snapshot and embedded enable-child tree walk propagate scandir errors; unreadable subtree cannot become unchanged proof.",
+      "evidence": "test_protected_snapshot_refuses_unreadable_subtree[False|True]; walk_parent/walk_child isolated mutations.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-22",
+      "status": "fixed",
+      "canonical_id": "R2-22",
+      "reason": "Removed global PID-to-single-creation restriction. Full (pid, creationFiletime) identity remains globally unique; parent binding remains Job-scoped. Sequential Jobs may recycle PIDs.",
+      "evidence": "test_report_accepts_recycled_pid_in_sequential_jobs and retained controlled-descendant regressions.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-23",
+      "status": "fixed",
+      "canonical_id": "R2-23",
+      "reason": "The rejected chmod command now targets an owned, initially read-only temporary file. The gate compares exact permission mode after rejection, detecting execution rather than relying on nonexistent-file existence. Cleanup restores writable mode and removes its own temporary directory even on refusal. No real Hermes/model/provider execution was performed or claimed.",
+      "evidence": [
+        "test_approval_rejection_oracle_discriminates_actual_command_execution (real filesystem chmod effect through synthetic task session)",
+        "test_the_gate_qualifies_the_installed_runtime_and_prints_nothing_itself (synthetic API happy path)",
+        "approval_effect_oracle isolated mutant killed; healthy restoration passed"
+      ],
+      "commit": "d7a96f7e9cd0bc215040dc50c17a03e9b9336303"
+    },
+    {
+      "id": "R2-24",
+      "status": "fixed",
+      "canonical_id": "R2-24",
+      "reason": "Privacy scans propagate SQLite query failures instead of treating an unreadable table/index as zero matches.",
+      "evidence": "test_database_scan_refuses_an_unreadable_table_instead_of_reporting_zero; contentless FTS control",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-25",
+      "status": "fixed",
+      "canonical_id": "R2-25",
+      "reason": "Self-test now executes under pytest; focused behavioral negative tests pin executable hash, exact listener ownership, artifact count, forbidden paths, source parity, config isolation and revision binding. This does not assert exhaustive path coverage.",
+      "evidence": "tests/test_release_integrity_regressions.py; livekit_hash/livekit_pid/artifact_count isolated mutations; automated self_test passes.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R2-26",
+      "status": "fixed",
+      "canonical_id": "R2-26",
+      "reason": "Production active-task evidence guards were already correct. Added explicit foreign-active and multiple-active refusals, plus matching-active and already-terminal positive controls; no production guard weakening or speculative change.",
+      "evidence": [
+        "test_completion_requires_exact_active_task_evidence[foreign]",
+        "test_completion_requires_exact_active_task_evidence[multiple]",
+        "test_completion_accepts_only_matching_or_already_settled_active_evidence",
+        "Two isolated active-equality/multiplicity mutants killed by individually selected regressions; healthy restoration passed"
+      ],
+      "commit": "d7a96f7e9cd0bc215040dc50c17a03e9b9336303"
+    },
+    {
+      "id": "R2-27",
+      "status": "fixed",
+      "canonical_id": "R2-27",
+      "reason": "Rebuilt sdist wheel must carry exactly all source package file paths and bytes (excluding bytecode caches), and its installed distribution is checked as well as checkout-built wheel.",
+      "evidence": "test_rebuilt_wheel_requires_all_package_bytes[bytes|missing|extra]; rebuilt_bytes/rebuilt_paths isolated mutations.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R2-28",
+      "status": "fixed",
+      "canonical_id": "R2-28",
+      "reason": "Candidate identity refuses skip-worktree and assume-unchanged index flags before/after capture, preserving exact tracked source identity.",
+      "evidence": "test_candidate_refuses_hidden_index_flags[--skip-worktree|--assume-unchanged]; index_flags isolated mutation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-29",
+      "status": "fixed",
+      "canonical_id": "R2-29",
+      "reason": "Modified Enter remains an editor keyboard action; unmodified Enter retains submission behavior.",
+      "evidence": "Four modifiers independently RED then GREEN; typed composer tests pass.",
+      "commit": "507151ace478ad5aa73648e70441eb2a0b35d940"
+    },
+    {
+      "id": "R2-30",
+      "status": "fixed",
+      "canonical_id": "R2-30",
+      "reason": "Failed status refresh schedules recovery even before pending is known; retry intent clears on successful status or reset.",
+      "evidence": "Lost delete acknowledgment followed by status outage RED then GREEN; delete-controls tests pass; combined focused 67 tests pass.",
+      "commit": "507151ace478ad5aa73648e70441eb2a0b35d940"
+    },
+    {
+      "id": "R2-31",
+      "status": "fixed",
+      "canonical_id": "R2-31",
+      "reason": "The bridge holds registration ownership across a capacity check, dispatch, and router tracking. Capacity refusal occurs before dispatcher invocation; an exact retained same-binding retry remains usable at the bound.",
+      "evidence": [
+        "test_bridge_refuses_tracking_capacity_before_dispatch (real socket bridge + service + router; exact retry and no second backend call)"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R2-32",
+      "status": "fixed",
+      "canonical_id": "R2-32",
+      "reason": "Native readiness HTTP attempts now have the documented two-second timeout.",
+      "evidence": "workflow inspection; release workflow tests",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-33",
+      "status": "fixed_with_accepted_limit",
+      "canonical_id": "R2-33",
+      "reason": "Whitespace/control bytes are rejected before the platform numeric parser. Supported historical numeric aliases remain canonicalized and loopback aliases remain refused.",
+      "evidence": "test_remote_hostname_refuses_whitespace_before_platform_parser; existing remote-origin negatives",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R2-34",
+      "status": "fixed",
+      "canonical_id": "R2-34",
+      "reason": "Explicit IPv6 loopback HTTP bootstrap origins are accepted consistently with the server; non-loopback HTTP stays refused.",
+      "evidence": "test_bootstrap_accepts_explicit_ipv6_loopback_http_origin; HTTP server suite",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R2-35",
+      "status": "accepted_limit_with_diagnostics",
+      "canonical_id": "R2-35",
+      "reason": "Partial CUDA environments remain intentionally preserved for inspection and existing targets are never replaced. Failure marker, explicit rerun instructions, and local-LiveKit guide now explain using a new absent target or moving the inspected partial environment aside. No recursive auto-delete or GPU execution introduced.",
+      "evidence": "Git Bash syntax check; synthetic exported uv stub venv succeeds/install exits17, partial retained, rerun exits2 with recovery guidance; existing hashed-closure install check passes. cuda-setup-recovery.json retains bounded proof.",
+      "commit": "8d44dfae3ecd640a58c3a787f94b3351fcb02bc7"
+    },
+    {
+      "id": "R2-36",
+      "status": "fixed",
+      "canonical_id": "R2-36",
+      "reason": "Review service emits bounded categories in finally for every handled refusal/failure.",
+      "evidence": "not_ready and backend diagnostic cases RED then GREEN; companion-host tests pass.",
+      "commit": "f1cbce077390624334fe12ce439a1d8e7639d046"
+    },
+    {
+      "id": "R2-37",
+      "status": "accepted_limit",
+      "canonical_id": "R2-37",
+      "reason": "SQLite bookkeeping is explicitly best effort after the authoritative sentinel-first durable rollback latch. An open transaction can prevent the redundant producer_installation update, but the already-fsynced CLOCK_ROLLBACK_PURGE_PENDING sentinel refuses further work and drives full-store recovery purge. Retain this fail-closed ordering rather than weakening caller transaction ownership.",
+      "evidence": "_latch_clock_rollback sentinel transition precedes BEGIN; focused tests test_clock_rollback_latches_the_sentinel_before_any_sqlite_work and test_clock_rollback_latches_the_sentinel_even_when_sqlite_cannot_record_it pass.",
+      "commit": null
+    },
+    {
+      "id": "R2-38",
+      "status": "fixed",
+      "canonical_id": "R2-38",
+      "reason": "Fatal BaseException marks the current writer job failed and latches before worker exit; waiting caller gets typed FAULTED, and owner cleanup still settles.",
+      "evidence": "test_writer_daemon_marks_fatal_worker_exit_as_failed; fatal_worker isolated mutation.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R2-39",
+      "status": "fixed",
+      "canonical_id": "R2-39",
+      "reason": "Lease expiry errors emit one marker per stage episode; server close errors retry with retained expiry intent. Diagnostic sink OSError/ValueError cannot terminate the lease watchdog.",
+      "evidence": "Synthetic two expiry failures then two close failures RED then GREEN; lease_close_retry mutant killed alone; runtime tests pass. Two failing-sink regressions RED/GREEN and two isolated mutants killed; authority owner independently reviewed e60c333 GO.",
+      "commit": "c2719e1f804d7d125f65b5a8c4913daaa11d82d8"
+    },
+    {
+      "id": "R2-40",
+      "status": "fixed",
+      "canonical_id": "R2-40",
+      "reason": "Missing capability emits once until a capability-bearing connection ends the episode.",
+      "evidence": "Two attempts, recovery, new episode RED then GREEN; archive-sender tests pass.",
+      "commit": "f1cbce077390624334fe12ce439a1d8e7639d046"
+    },
+    {
+      "id": "R2-41",
+      "status": "fixed_with_limit",
+      "canonical_id": "R2-41",
+      "reason": "Failed operation entries now release in finally and close explicitly clears revoked tickets. Retaining revoked identities until close is required to refuse a stale ticket replay; arbitrary pruning would restore revoked lookup authority. Long-lived sessions still retain small revoked identity tombstones until close; changing this needs a bounded monotonic ticket contract.",
+      "evidence": "0de297a; test_failed_speculative_operation_is_released_after_consumption passes; original consume lacked finally; revoke and observe_partial refuse retained tickets.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R2-42",
+      "status": "fixed",
+      "canonical_id": "R2-42",
+      "reason": "Closed Edge TTS owner refuses admission under the same lock used to collect operations.",
+      "evidence": "Late iterator admitted after close RED then GREEN with injected synthesis/decode; edge_closed_admission mutant killed alone.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R2-43",
+      "status": "accepted_limit",
+      "canonical_id": "R2-43",
+      "reason": "Exact SAN coverage is an explicit documented lean-tracer limitation in docs/local-livekit.md. Python is pinned to 3.11; a hypothetical private-helper change does not establish a current failure. Supporting wildcard SANs would change the accepted transport scope.",
+      "evidence": "docs/local-livekit.md remote-mode exact SAN policy; existing generated certificate tests",
+      "commit": null
+    },
+    {
+      "id": "R2-44",
+      "status": "fixed",
+      "canonical_id": "R2-44",
+      "reason": "Untracked source paths use NUL-delimited git output and filesystem decoding so Unicode/quoted names contribute to the candidate digest.",
+      "evidence": "test_candidate_identity_includes_unicode_untracked_files",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-45",
+      "status": "fixed",
+      "canonical_id": "R2-45",
+      "reason": "All backend closes settle with return_exceptions; a completed report survives cleanup failure and records only a bounded failure count. Primary run failures still propagate.",
+      "evidence": "test_completed_report_survives_cleanup_failure_and_all_closes_settle",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-46",
+      "status": "fixed",
+      "canonical_id": "R2-46",
+      "reason": "The final bounded unterminated child-output line is processed at finish, exactly once; the drainer no longer discards it.",
+      "evidence": "test_unterminated_final_marker_is_counted_exactly_once",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-47",
+      "status": "fixed_with_limit",
+      "canonical_id": "R2-47",
+      "reason": "Runner handle is now owned by try/finally before workspace allocation or parent validation. Verified owned workspace is removed after early materialization failure. A rejected/unproven parent is deliberately retained, with bounded cleanup_target evidence, because recursive deletion would violate the cleanup authority boundary.",
+      "evidence": "Allocation and parent cases RED then GREEN, materialization control GREEN; 80 focused equivalence/setup tests pass; isolated allocation scope, handle settlement, parent cleanup guard mutations killed individually.",
+      "commit": "27f82d7670d73fbd390d65dcd12d4e80f82337cc"
+    },
+    {
+      "id": "R2-48",
+      "status": "fixed",
+      "canonical_id": "R2-48",
+      "reason": "The foreground LiveKit owner escalates a timed-out terminate to kill and bounded reap.",
+      "evidence": "test_serve_kills_and_reaps_child_if_termination_times_out",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R2-49",
+      "status": "fixed",
+      "canonical_id": "R2-49",
+      "reason": "Native run witness now requires an exact string tool name before set membership. Unhashable model-controlled JSON values retain the existing ValueError refusal category and bounded marker.",
+      "evidence": [
+        "test_unhashable_native_tool_name_retains_refusal_category (list and object native SQLite witness variants)",
+        "native_tool_name_type isolated mutant killed; healthy restoration passed"
+      ],
+      "commit": "d7a96f7e9cd0bc215040dc50c17a03e9b9336303"
+    },
+    {
+      "id": "R2-50",
+      "status": "fixed",
+      "canonical_id": "R2-50",
+      "reason": "Non-dictionary model/presentation sections receive the uniform capture_route refusal before mapping access.",
+      "evidence": "test_capture_route_refuses_non_mapping_sections",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-51",
+      "status": "fixed",
+      "canonical_id": "R2-51",
+      "reason": "New tests/test_ios_probe_gate.py invokes the actual committed structural gate and mutation fixtures under ordinary pytest collection. Workflow files unchanged.",
+      "evidence": "5 probe tests pass, including actual committed baseline gate invocation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-52",
+      "status": "fixed",
+      "canonical_id": "R2-52",
+      "reason": "Delete worker records imported hermes_cli.__version__; parent identity reads that observation instead of asserting a version literal.",
+      "evidence": "test_delete_worker_records_observed_hermes_version uses a fake imported module version; parent source read inspected.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-53",
+      "status": "fixed",
+      "canonical_id": "R2-53",
+      "reason": "Descendant ancestry must reach the retained runner; equal-time disconnected cycles are rejected independently of parent timestamp monotonicity.",
+      "evidence": "test_report_rejects_equal_time_descendant_cycle; ancestry isolated mutation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-54",
+      "status": "fixed",
+      "canonical_id": "R2-54",
+      "reason": "Forbidden archive rules match bounded full path component sequences, so nested web/tmp is rejected in both wheel and sdist scans.",
+      "evidence": "test_release_rejects_nested_forbidden_archive_path with otherwise valid source-shaped wheel/sdist; forbidden_path isolated mutation.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R2-55",
+      "status": "fixed",
+      "canonical_id": "R2-55",
+      "reason": "Confinement whitelist capture is cleared immediately before each individual review, preventing reuse from previous cases.",
+      "evidence": "test_confinement_witness_belongs_to_each_review; whitelist_case isolated mutation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-56",
+      "status": "fixed",
+      "canonical_id": "R2-56",
+      "reason": "proposal_boundary is now required typed acceptance evidence with exact preconfirmation zero-effect counts. Accepted evidence limit: next and restart use one subsequent-conversation readback performed after process restart; this witnesses both predicates but is not two independent experiments. No new provider qualification was run.",
+      "evidence": "test_memory_gate_requires_proposal_boundary[dispatches_before_confirmation|cancellations_before_confirmation]; memory_boundary isolated mutation. All 248 voice gate unit checks pass.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R2-57",
+      "status": "fixed",
+      "canonical_id": "R2-57",
+      "reason": "Each completion, approval and cancellation terminal must match both exact task ID and private run ID in its accepted dispatch acknowledgment, in addition to terminal status.",
+      "evidence": [
+        "test_each_behavior_terminal_is_bound_to_exact_dispatch (task/run drift independently for all three phases)",
+        "Six isolated task/run identity mutants killed by individually selected phase/field regression; healthy restoration passed"
+      ],
+      "commit": "d7a96f7e9cd0bc215040dc50c17a03e9b9336303"
+    },
+    {
+      "id": "R2-58",
+      "status": "fixed",
+      "canonical_id": "R2-58",
+      "reason": "Six Windows rehearsal cases and two capture-composition modes skip off Windows; off mode and all portable cases remain active.",
+      "evidence": "Nine targeted Windows cases pass; narrow parameter decorators inspected. No POSIX runtime available in this lane.",
+      "commit": "1466cee52648d091445cb23af90fc1a52f5a49bc"
+    },
+    {
+      "id": "R2-59",
+      "status": "fixed",
+      "canonical_id": "R2-59",
+      "reason": "The public marker retains fixed source-owned setup refusal categories through a closed allowlist, while arbitrary ValueError text remains validation_refused. Existing shared require() exception type is unchanged.",
+      "evidence": "manifest_fields/candidate_dirty/wheel_digest/output_scope RED then GREEN; model fixed-category and native private-error tests pass; diagnostic privacy mutation killed alone; focused Ruff clean.",
+      "commit": "9727c23f505f31d86afcc33170da5184c04b196c"
+    },
+    {
+      "id": "R2-60",
+      "status": "fixed",
+      "canonical_id": "R2-60",
+      "reason": "Recovery test table now includes worker/projection stages and every HTTP status case for ReloadRebindRefused.",
+      "evidence": "Test-only coverage extension; connection recovery DOM tests pass on supported Node22.22.2.",
+      "commit": "507151ace478ad5aa73648e70441eb2a0b35d940"
+    },
+    {
+      "id": "R2-61",
+      "status": "evidence_gap",
+      "canonical_id": "R2-61",
+      "reason": "Static allegation confirmed: unconditional removeFirst after 2000 samples allows 500ms periodic rows to evict connect/transition evidence. No Swift compiler, macOS, Xcode or physical iOS lane is available here. Changing retention/export acceptance without compiling/exercising the actual Swift path would leave an unproved consequential qualification guard, so no uncompiled Swift redesign was committed.",
+      "evidence": "ProbeModel.swift captureSample appends and drops prefix at 2000; periodic loop samples every500ms. Native owner next action: prove minimal periodic-first eviction with fail-closed event-capacity overflow in required Xcode16.3/Swift6.1 lane; retain physical acoustic limits separately.",
+      "commit": null
+    },
+    {
+      "id": "R2-62",
+      "status": "fixed",
+      "canonical_id": "R2-62",
+      "reason": "Deep JSON recursion in either log form yields a fixed redaction marker and retains later useful diagnostics.",
+      "evidence": "test_deep_console_json_is_redacted_without_losing_later_lines",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-63",
+      "status": "fixed",
+      "canonical_id": "R2-63",
+      "reason": "Added focused negative coverage for cursor/batch bounds, exact sequence types, kind and data shape; production diagnostic contract unchanged.",
+      "evidence": "test_ingress_observation_rejects_invalid_bounds_and_event_types",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R2-64",
+      "status": "duplicate",
+      "canonical_id": "R2-01",
+      "reason": "The leak depends on pruning still-active authority, removed by R2-01. Terminal/pruning regression also asserts both binding and run-key release; defensive terminal cleanup releases both maps if cache is already absent.",
+      "evidence": [
+        "test_active_run_remains_cancellable_after_retry_cache_pruning"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R2-65",
+      "status": "fixed",
+      "canonical_id": "R2-65",
+      "reason": "The four producer guides now consistently state twelve unavailable governed producers.",
+      "evidence": "registry and implementation-status comparison",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R3-01",
+      "status": "duplicate",
+      "canonical_id": "R2-01",
+      "reason": "Same active retry-cache eviction defect, fixed by preserving active keys and pruning only after terminal.",
+      "evidence": [
+        "test_completed_dispatch_idempotency_cache_is_bounded"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R3-02",
+      "status": "duplicate",
+      "canonical_id": "R1-03",
+      "reason": "Same unusable plugin terminal text defect, including oversized completed summaries and reason Unicode; ingress fallback preserves exact terminal status while strict bridge guards remain.",
+      "evidence": [
+        "test_unusable_hook_text_preserves_terminal",
+        "test_completion_reason_refuses_lone_surrogate"
+      ],
+      "commit": "b78de55af5d5ac7987b1598486d16568487c0fe4"
+    },
+    {
+      "id": "R3-03",
+      "status": "duplicate",
+      "canonical_id": "R2-05",
+      "reason": "Same uncertain plugin response defect. Unverifiable post-dispatch result cannot become a clean rejection or release reserved completion authority. Independent boundary review also identified JSON RecursionError and UnicodeDecodeError gaps; the followup catches ValueError (including malformed JSON, invalid decoding and integer bounds) and RecursionError before the uncertainty latch can be bypassed.",
+      "evidence": [
+        "test_uncertain_dispatch_retains_authority_and_refuses_retries",
+        "test_postdispatch_parser_failure_latches_uncertainty_and_retains_authority (deep JSON, invalid UTF-8, integer parser bound); three isolated parser mutants killed and healthy restored"
+      ],
+      "commit": "3c89fb173a35b6b18c6ca65cba716117aca3c38b"
+    },
+    {
+      "id": "R3-04",
+      "status": "duplicate",
+      "canonical_id": "R2-07",
+      "reason": "Same reachable defect as R2-07. Durable history/hash parsing failures during seal become sticky STORE_CORRUPT/FAULTED, while invalid incoming state remains an ordinary refusal.",
+      "evidence": "test_task_5c_seal_revalidates_the_stored_hash_chain_in_its_transaction; seal_corruption isolated mutation.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R3-05",
+      "status": "duplicate",
+      "canonical_id": "R2-28",
+      "reason": "Same reachable defect as R2-28. Candidate identity refuses skip-worktree and assume-unchanged index flags before/after capture, preserving exact tracked source identity.",
+      "evidence": "test_candidate_refuses_hidden_index_flags[--skip-worktree|--assume-unchanged]; index_flags isolated mutation.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R3-06",
+      "status": "duplicate",
+      "canonical_id": "R2-03",
+      "reason": "Task-result sanitizer now covers the projection subagent namespace before publishing a terminal result. Direct events still intentionally reject reserved private namespaces; this patch does not weaken that contract to interpret ordinary-looking handle text.",
+      "evidence": "test_completed_result_redacts_every_projection_private_namespace_before_publish; existing projection privacy negatives",
+      "commit": "65928f290fa138df0e3bfbf170e6bf4aae0ae036"
+    },
+    {
+      "id": "R3-07",
+      "status": "duplicate",
+      "canonical_id": "R2-30",
+      "reason": "Same unknown-outcome status reconciliation mechanism.",
+      "evidence": "See R2-30.",
+      "commit": "507151ace478ad5aa73648e70441eb2a0b35d940"
+    },
+    {
+      "id": "R3-08",
+      "status": "duplicate",
+      "canonical_id": "R2-11",
+      "reason": "Same mechanism and disposition as R2-11",
+      "evidence": "See canonical disposition.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R3-09",
+      "status": "duplicate",
+      "canonical_id": "R2-08",
+      "reason": "Same mechanism and disposition as R2-08",
+      "evidence": "See canonical disposition.",
+      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+    },
+    {
+      "id": "R3-10",
+      "status": "duplicate",
+      "canonical_id": "R2-15",
+      "reason": "Same mechanism and disposition as R2-15",
+      "evidence": "See canonical disposition.",
+      "commit": "bafbe7a44fc96753d98f8d6ecf8843a4590dba82"
+    },
+    {
+      "id": "R3-11",
+      "status": "duplicate",
+      "canonical_id": "R2-21",
+      "reason": "Same reachable defect as R2-21. Both retained-tree snapshot and embedded enable-child tree walk propagate scandir errors; unreadable subtree cannot become unchanged proof.",
+      "evidence": "test_protected_snapshot_refuses_unreadable_subtree[False|True]; walk_parent/walk_child isolated mutations.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R3-12",
+      "status": "fixed",
+      "canonical_id": "R3-12",
+      "reason": "Canonical Git operations isolate global/system config, neutralize external attributes, reject local info attributes and bind committed attribute source. Diff options normalize prefixes, algorithm, context, interhunk context, suppressed blank lines and ordering. Archive neutralizes external attributes. Tests cover real root/parent config changes; no generic Git framework added. Followup 32499db pins quotePath=true and explicit nonrelative/default patch indicators; scope is these explicit canonical rendering semantics, not a universal assertion about arbitrary future Git configuration.",
+      "evidence": "tests/test_release_integrity_regressions.py config/attribute/order/interhunk regressions and isolated mutation-storage_proofs.json receipts; independent reviewer followup requested through integration owner. 9f903ef adds direct archive external-attribute control; 32499db reproduces and mutation-proves root/parent Unicode path spelling.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R3-13",
+      "status": "duplicate",
+      "canonical_id": "R2-25",
+      "reason": "Same reachable defect as R2-25. Self-test now executes under pytest; focused behavioral negative tests pin executable hash, exact listener ownership, artifact count, forbidden paths, source parity, config isolation and revision binding. This does not assert exhaustive path coverage.",
+      "evidence": "tests/test_release_integrity_regressions.py; livekit_hash/livekit_pid/artifact_count isolated mutations; automated self_test passes.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R3-14",
+      "status": "duplicate",
+      "canonical_id": "R1-05",
+      "reason": "Receipts are fully written and fsynced before atomic no-clobber hard-link publication; competing writers cannot replace an existing receipt.",
+      "evidence": "test_receipt_is_invisible_until_fsynced_and_never_overwrites; test_receipt_publication_cannot_replace_a_competing_writer",
+      "commit": "dc9e2994c414b2e4ceb7310a6e44662786c82400"
+    },
+    {
+      "id": "R3-15",
+      "status": "duplicate",
+      "canonical_id": "R1-01",
+      "reason": "Same FAILED-terminal presentation failure in API event consumption and stream settlement.",
+      "evidence": [
+        "test_unusable_error_still_settles_failed_run"
+      ],
+      "commit": "b78de55af5d5ac7987b1598486d16568487c0fe4"
+    },
+    {
+      "id": "R3-16",
+      "status": "duplicate",
+      "canonical_id": "R1-07",
+      "reason": "Selected source IDs require nonempty supplied search/extract evidence; missing passages and extract-unavailable notices cannot be cited. Both native and selected-policy callers pass their frozen evidence snapshot.",
+      "evidence": "test_presentation_cannot_cite_a_source_without_supplied_evidence; native and selected formatter checks",
+      "commit": "dc9e2994c414b2e4ceb7310a6e44662786c82400"
+    },
+    {
+      "id": "R3-17",
+      "status": "fixed",
+      "canonical_id": "R3-17",
+      "reason": "A start acknowledgment remains accepted after its exact task already settled. The surface suppresses stale active projection only when the real controller confirms exact terminal evidence; it neither rolls back finished work nor latches uncertainty. Missing/mismatched task evidence remains refused.",
+      "evidence": [
+        "test_terminal_arrives_while_confirmed_dispatch_operation_is_unsettled",
+        "test_completion_before_projection_rolls_back_without_stale_active_state",
+        "test_cross_task_ack_and_terminal_reordering_preserves_authority (terminal identity positive/negative controls)"
+      ],
+      "commit": "b59b9ceb160a9b0107fdba485115f4dca83944bb"
+    },
+    {
+      "id": "R3-18",
+      "status": "duplicate",
+      "canonical_id": "R2-17",
+      "reason": "Same mechanism and disposition as R2-17",
+      "evidence": "See canonical disposition.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R3-19",
+      "status": "duplicate",
+      "canonical_id": "R2-12",
+      "reason": "Same historical binding error/reconnect liveness defect, repaired by source-bound cleanup settlement and exact historical error acknowledgment on authenticated retry. Verified binding-local STT failure could keep re-raising the same historical operation error after all cleanup completed. Binding cleanup now records settlement separately and keeps its terminal error. First close still reports that original error; a later authenticated close/rebind retry accepts only the completed close task whose exact exception is the historical error and whose foreground/STT/response cleanup actually succeeded. A fresh generation still invokes shared actions.start(), preserving closed or terminal shared-executor refusal. Pending, timed-out, failed, early/incomplete cleanup and a different close/evidence failure retain the binding. No terminal latch is blindly cleared; no live provider integration success is claimed. Required close-stage evidence must succeed before cleanup settlement is published; even an evidence failure reusing the exact historical exception retains the failed binding.",
+      "evidence": [
+        "96 tests/conversation/test_worker.py regressions passed",
+        "test_settled_binding_failure_is_reported_then_allows_a_fresh_generation",
+        "test_replacing_settled_stt_failure_cannot_clear_shared_executor_failure (actual ConversationUpdateExecutor.start check)",
+        "test_binding_operation_failure_cannot_bypass_unsettled_cleanup (pending and failed cleanup)",
+        "test_same_historical_exception_does_not_prove_early_cleanup_settled",
+        "test_settled_cleanup_does_not_hide_a_different_close_failure",
+        "Four isolated guard mutants killed individually with healthy restoration in mutations-authority-binding.json",
+        "Focused Ruff, mypy and diff check passed",
+        "test_settled_cleanup_does_not_hide_a_different_close_failure[same-error]; premature-settlement mutant killed and healthy restored in mutations-authority-boundary-followup.json"
+      ],
+      "commit": "d9424b7557f6183731df4500fac2bab6f71ed805"
+    },
+    {
+      "id": "R3-20",
+      "status": "fixed",
+      "canonical_id": "R3-20",
+      "reason": "Durable event validation accepts ordered nonoverlapping exact chunk substrings from generated segment text, matching streaming chunk semantics. Foreign, overlapping and backwards chunks remain refused.",
+      "evidence": "test_segment_confirmations_are_ordered_nonoverlapping_chunks; chunk_source/chunk_cursor isolated mutations; focused evidence mypy clean.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R3-21",
+      "status": "duplicate",
+      "canonical_id": "R2-04",
+      "reason": "Same reachable defect as R2-04. Unknown effective ACE types, including callback and compound allows, now invalidate owner-only DACL proof; only understood allow layouts and known deny layouts are admitted.",
+      "evidence": "test_unhandled_effective_ace_fails_closed[9]; dacl_unknown isolated mutation fails then restored test passes.",
+      "commit": "43ffede60b1d3d5c97c1cd36b5970790bec12c76"
+    },
+    {
+      "id": "R3-22",
+      "status": "duplicate",
+      "canonical_id": "R2-29",
+      "reason": "Same modified Enter mechanism.",
+      "evidence": "See R2-29.",
+      "commit": "507151ace478ad5aa73648e70441eb2a0b35d940"
+    },
+    {
+      "id": "R3-23",
+      "status": "duplicate",
+      "canonical_id": "R2-10",
+      "reason": "Same mechanism and disposition as R2-10",
+      "evidence": "See canonical disposition.",
+      "commit": "c8058234ba65052201a52b958de3d379e6354375"
+    },
+    {
+      "id": "R3-24",
+      "status": "fixed",
+      "canonical_id": "R3-24",
+      "reason": "Resolved full revision now feeds digest, blob scan and archive; symbolic HEAD changes cannot switch the scanned/digested revision.",
+      "evidence": "test_gate_binds_scan_and_digest_to_resolved_revision; revision_digest/revision_scan isolated mutations.",
+      "commit": "dc0b154885dd86df47ec7322241ab64d9f38d854"
+    },
+    {
+      "id": "R3-25",
+      "status": "duplicate",
+      "canonical_id": "R2-32",
+      "reason": "Native readiness HTTP attempts now have the documented two-second timeout.",
+      "evidence": "workflow inspection; release workflow tests",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R3-26",
+      "status": "fixed",
+      "canonical_id": "R3-26",
+      "reason": "Both wheel ZIP and sdist GZIP corrupt DEFLATE errors now become documented ValueError refusals.",
+      "evidence": "Real compressed-byte mutations fail RED before catches and pass GREEN afterwards: test_wheel_corrupt_deflate_member_is_a_typed_refusal/test_sdist_corrupt_deflate_member_is_a_typed_refusal.",
+      "commit": "1466cee52648d091445cb23af90fc1a52f5a49bc"
+    },
+    {
+      "id": "R3-27",
+      "status": "fixed",
+      "canonical_id": "R3-27",
+      "reason": "Exactly five reported native retained-ownership tests skip off Windows; portable snapshot/semantic tests remain active.",
+      "evidence": "Five affected Windows tests pass on native Windows; decorator conditions inspected. No POSIX runtime available in this lane.",
+      "commit": "bcf30746007421047fab36043c1de704e6bcf056"
+    },
+    {
+      "id": "R3-28",
+      "status": "fixed",
+      "canonical_id": "R3-28",
+      "reason": "CI log rendering sanitizes plural identity fields and indented JSON, generated browser identifiers in free text, and bare Bearer values.",
+      "evidence": "test_plural_identity_fields_and_indented_json_are_redacted; existing sanitizer suite",
+      "commit": "c8ef5169e236582c98c69d8319d0dbf7d09dc53d"
+    },
+    {
+      "id": "R3-29",
+      "status": "accepted_limit",
+      "canonical_id": "R3-29",
+      "reason": "Existing privacy contract deliberately refuses embedded and nonhex run_-like tokens and the deleg_ namespace. This is a conservative presentation limit with a fixed notice, not loss of authoritative completion. Narrowing to exact hexadecimal IDs or word boundaries would violate explicit existing privacy regressions; no speculative weakening made.",
+      "evidence": [
+        "test_invalid_api_result_is_never_presented[embedded_private_authority]",
+        "test_invalid_api_result_is_never_presented[nonhex_private_authority]",
+        "test_sse_unusable_completion_does_not_enter_settlement"
+      ],
+      "commit": null
+    }
+  ]
+}
