@@ -113,6 +113,42 @@ def test_release_digest_normalizes_interhunk_context(tmp_path: Path) -> None:
     assert gate.canonical_candidate_diff_sha256(root, baseline) == expected
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("core.bigFileThreshold", "1"),
+        ("core.quotePath", "false"),
+        ("diff.outputIndicatorNew", "@"),
+        ("diff.outputIndicatorOld", "%"),
+        ("diff.outputIndicatorContext", "!"),
+    ],
+)
+def test_release_digest_normalizes_binary_path_and_patch_rendering(tmp_path, key, value) -> None:
+    root = _repo(tmp_path)
+    unicode_path = root / "\u03bb.py"
+    unicode_path.write_bytes(b"a\n\nb\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "baseline")
+    baseline = _git(root, "rev-parse", "HEAD")
+    for path in (unicode_path, root / "keep.py"):
+        path.write_bytes(b"a\n\nc\n")
+    _git(root, "commit", "-qam", "candidate")
+    expected = gate.canonical_candidate_diff_sha256(root, baseline)
+    _git(root, "config", key, value)
+    assert gate.canonical_candidate_diff_sha256(root, baseline) == expected
+
+
+def test_release_root_digest_normalizes_path_spelling(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _git(root, "checkout", "--orphan", "single-root")
+    (root / "\u03bb.py").write_bytes(b"candidate\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "single root")
+    expected = gate.canonical_candidate_diff_sha256(root, None)
+    _git(root, "config", "core.quotePath", "false")
+    assert gate.canonical_candidate_diff_sha256(root, None) == expected
+
+
 @pytest.mark.parametrize("root_commit", [False, True])
 def test_release_digest_ignores_local_order_file(tmp_path: Path, root_commit) -> None:
     root = _repo(tmp_path)
