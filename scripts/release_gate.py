@@ -185,6 +185,9 @@ def clean_git_environment() -> dict[str, str]:
         if name.upper().startswith("GIT_"):
             environment.pop(name)
     environment["LC_ALL"] = "C"
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_ATTR_NOSYSTEM"] = "1"
     return environment
 
 
@@ -200,10 +203,14 @@ def _resolved_commit_oid(source: Path, revision: str, *, label: str) -> str:
     return resolved.stdout[:-1].decode("ascii")
 
 
-def canonical_candidate_diff_sha256(source: Path, baseline_commit: str | None) -> str:
+def canonical_candidate_diff_sha256(
+    source: Path, baseline_commit: str | None, *, revision: str = "HEAD"
+) -> str:
     """Return the SHA-256 of the candidate's canonical raw binary diff."""
 
-    head_oid = _resolved_commit_oid(source, "HEAD", label="candidate HEAD")
+    head_oid = _resolved_commit_oid(source, revision, label="candidate HEAD")
+    _require_no_local_attributes(source)
+    diff_environment = clean_git_environment() | {"GIT_ATTR_SOURCE": head_oid}
     if baseline_commit is None:
         parents = subprocess.run(
             ("git", "rev-list", "--parents", "-n", "1", head_oid),
@@ -217,18 +224,29 @@ def canonical_candidate_diff_sha256(source: Path, baseline_commit: str | None) -
             diff = subprocess.run(
                 (
                     "git",
+                    "-c", f"core.attributesFile={os.devnull}",
+                    "-c", "diff.suppressBlankEmpty=false",
                     "diff-tree",
                     "--root",
                     "--binary",
                     "--full-index",
                     "--no-renames",
                     "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "--diff-algorithm=myers",
+                    "--unified=3",
+                    "--inter-hunk-context=0",
+                    "--indent-heuristic",
+                    "-O", os.devnull,
                     "--no-commit-id",
                     "-r",
                     head_oid,
                 ),
                 cwd=source,
-                env=clean_git_environment(),
+                env=diff_environment,
                 capture_output=True,
                 check=True,
             ).stdout
@@ -249,19 +267,40 @@ def canonical_candidate_diff_sha256(source: Path, baseline_commit: str | None) -
     diff = subprocess.run(
         (
             "git",
+            "-c", f"core.attributesFile={os.devnull}",
+            "-c", "diff.suppressBlankEmpty=false",
             "diff",
             "--binary",
             "--full-index",
             "--no-renames",
             "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--diff-algorithm=myers",
+            "--unified=3",
+            "--inter-hunk-context=0",
+            "--indent-heuristic",
+            "-O", os.devnull,
             f"{baseline_oid}..{head_oid}",
         ),
         cwd=source,
-        env=clean_git_environment(),
+        env=diff_environment,
         capture_output=True,
         check=True,
     ).stdout
     return hashlib.sha256(diff).hexdigest()
+
+
+def _require_no_local_attributes(source: Path) -> None:
+    attributes = subprocess.run(
+        ("git", "rev-parse", "--git-path", "info/attributes"), cwd=source,
+        env=clean_git_environment(), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    attributes_path = source / attributes
+    if attributes_path.exists() and attributes_path.stat().st_size:
+        fail("candidate source proof refuses local info attributes")
 
 
 def git_archive(source: Path, destination: Path, *, revision: str) -> None:
@@ -269,6 +308,7 @@ def git_archive(source: Path, destination: Path, *, revision: str) -> None:
 
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         fail("archived revision must be a full lowercase Git commit OID")
+    _require_no_local_attributes(source)
     probe = subprocess.run(
         ("git", "rev-parse", "--is-inside-work-tree"),
         cwd=source,
@@ -279,7 +319,7 @@ def git_archive(source: Path, destination: Path, *, revision: str) -> None:
     if probe.returncode != 0 or probe.stdout.strip() != "true":
         fail(f"candidate must be a Git checkout: {source}")
     archive = subprocess.run(
-        ("git", "archive", "--format=tar", revision),
+        ("git", "-c", f"core.attributesFile={os.devnull}", "archive", "--format=tar", revision),
         cwd=source,
         env=clean_git_environment(),
         capture_output=True,
@@ -341,10 +381,10 @@ def canonical_baseline_diff_sha256(source: Path, baseline_commit: str) -> str:
     return canonical_candidate_diff_sha256(source, baseline_commit)
 
 
-def scan_git_blobs(source: Path) -> None:
+def scan_git_blobs(source: Path, *, revision: str = "HEAD") -> None:
     """Scan every committed blob in HEAD, including paths hidden by export-ignore."""
     tree = subprocess.run(
-        ("git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"),
+        ("git", "ls-tree", "-r", "-z", "--full-tree", revision),
         cwd=source,
         env=clean_git_environment(),
         capture_output=True,
@@ -479,6 +519,10 @@ def required_sdist_paths() -> frozenset[str]:
     )
 
 
+def _forbidden_archive_path(name: str) -> bool:
+    return any(f"/{rule}/" in f"/{name}/" for rule in FORBIDDEN_ARCHIVE_PARTS)
+
+
 def check_artifacts(root: Path, artifacts: Path) -> Path:
     wheels = list(artifacts.glob("*.whl"))
     sdists = list(artifacts.glob("*.tar.gz"))
@@ -508,7 +552,7 @@ def check_artifacts(root: Path, artifacts: Path) -> Path:
         forbidden = [
             name
             for name in wheel_names
-            if any(part in FORBIDDEN_ARCHIVE_PARTS for part in name.split("/"))
+            if _forbidden_archive_path(name)
         ]
         if forbidden:
             fail("wheel contains forbidden path(s): " + ", ".join(sorted(forbidden)))
@@ -540,7 +584,7 @@ def check_artifacts(root: Path, artifacts: Path) -> Path:
     forbidden = [
         name
         for name in sdist_names
-        if any(part in FORBIDDEN_ARCHIVE_PARTS for part in name.split("/"))
+        if _forbidden_archive_path(name)
     ]
     if unexpected or forbidden:
         fail("sdist manifest violation: " + ", ".join(sorted(set(unexpected + forbidden))))
@@ -572,12 +616,15 @@ def check_sdist_built_wheel_disclosure_parity(root: Path, wheel: Path) -> None:
     """Verify the sdist's rebuilt wheel carries the canonical browser disclosure."""
 
     expected_paths = {
-        *REQUIRED_STATIC,
-        "hermes_realtime/evidence/disclosure_v1.txt",
-        "hermes_realtime/evidence/disclosure_manifest_v1.json",
+        path.relative_to(root / "src").as_posix()
+        for path in (root / "src" / "hermes_realtime").rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        package_names = {name for name in names if name.startswith("hermes_realtime/") and not name.endswith("/")}
+        if package_names != expected_paths:
+            fail("sdist-built wheel package paths differ from source")
         missing = sorted(expected_paths - names)
         if missing:
             fail("sdist-built wheel is missing disclosure resource(s): " + ", ".join(missing))
@@ -888,6 +935,7 @@ def gate_materialized_candidate(
     sdist_built_wheel = build_sdist_wheel(root, sdist, environment)
     check_sdist_built_wheel_disclosure_parity(root, sdist_built_wheel)
     check_installed_wheel(root, wheel, environment)
+    check_installed_wheel(root, sdist_built_wheel, environment)
 
 
 def gate(
@@ -902,12 +950,12 @@ def gate(
     # archived revision by construction rather than by two reads agreeing.
     revision = _resolved_commit_oid(source, "HEAD", label="candidate HEAD")
     print(f"archived revision: {revision}", flush=True)
-    diff_sha256 = canonical_candidate_diff_sha256(source, None)
+    diff_sha256 = canonical_candidate_diff_sha256(source, None, revision=revision)
     print(f"canonical candidate diff SHA-256: {diff_sha256}", flush=True)
     with tempfile.TemporaryDirectory(prefix="hermes-realtime-release-") as temporary:
         root = Path(temporary) / "candidate"
         root.mkdir()
-        scan_git_blobs(source)
+        scan_git_blobs(source, revision=revision)
         git_archive(source, root, revision=revision)
         gate_materialized_candidate(
             root,
