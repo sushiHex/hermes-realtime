@@ -4924,7 +4924,7 @@ def test_task_5c_physical_allocation_above_ceiling_fails_closed(tmp_path: Path) 
 def test_task_5c_seal_revalidates_the_stored_hash_chain_in_its_transaction(
     tmp_path: Path,
 ) -> None:
-    from hermes_realtime.evidence.models import StoreDisposition
+    from hermes_realtime.evidence.models import StoreDisposition, WriterFault
 
     owned = make_spool(tmp_path)
     try:
@@ -4949,9 +4949,9 @@ def test_task_5c_seal_revalidates_the_stored_hash_chain_in_its_transaction(
         owned.connection.execute(trigger_sql)
         owned.connection.commit()
 
-        assert owned.seal_epoch(make_seal_command()) is StoreDisposition.REJECTED_STATE
+        assert owned.seal_epoch(make_seal_command()) is StoreDisposition.FAULTED
         assert rows(owned, "SELECT state, event_count FROM evidence_sessions") == [("open", 3)]
-        assert owned.diagnostics().sticky_fault is None
+        assert owned.diagnostics().sticky_fault is WriterFault.STORE_CORRUPT
     finally:
         owned.close()
 
@@ -8779,6 +8779,29 @@ def test_writer_daemon_isolates_unexpected_worker_exceptions(tmp_path: Path) -> 
         RecordingSpool.reset()
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_writer_daemon_marks_fatal_worker_exit_as_failed(tmp_path: Path, monkeypatch) -> None:
+    from hermes_realtime.evidence.models import StoreDisposition
+
+    class FatalExit(BaseException):
+        pass
+
+    def fatal(self, command):
+        raise FatalExit()
+
+    RecordingSpool.reset()
+    daemon = make_daemon(tmp_path)
+    try:
+        assert daemon.create_epoch(make_create_epoch()) is StoreDisposition.COMMITTED
+        monkeypatch.setattr(RecordingSpool, "append_record", fatal)
+        result = daemon.append_record(ordinary_record(turn_opened_snapshot(3, event_index=10), 3))
+        assert result is StoreDisposition.FAULTED
+        assert daemon.join(10) is True
+    finally:
+        daemon.drain_and_close(stop_command())
+        RecordingSpool.reset()
+
+
 def test_writer_daemon_leaks_no_thread_when_the_spool_cannot_be_created(
     tmp_path: Path,
 ) -> None:
@@ -9844,6 +9867,29 @@ def test_object_ace_sid_offset_accounts_for_its_conditional_guids() -> None:
             )
             == expected
         )
+
+
+@pytest.mark.parametrize("ace_type", [0x04, 0x09, 0x0B, 0x7F])
+def test_unhandled_effective_ace_fails_closed(monkeypatch, ace_type) -> None:
+    import ctypes
+
+    from hermes_realtime.evidence import storage_security as security
+
+    header = security._AceHeader(ace_type, 0, 32)
+
+    class AclApi:
+        def GetAclInformation(self, dacl, output, size, kind):
+            ctypes.cast(output, ctypes.POINTER(security._AclSizeInformation)).contents.AceCount = 1
+            return True
+
+        def GetAce(self, dacl, index, output):
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p)).contents.value = ctypes.addressof(
+                header
+            )
+            return True
+
+    monkeypatch.setattr(security, "_advapi32", lambda: AclApi())
+    assert security._granted_sids(ctypes.c_void_p(1)) == ("",)
 
 
 def test_unknown_ace_type_has_no_readable_sid_offset() -> None:

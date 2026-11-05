@@ -1278,6 +1278,7 @@ class _TurnHistory:
     next_segment_ordinal: int = 1
     next_chunk_ordinal: int = 1
     segments: dict[str, str] | None = None
+    segment_cursors: dict[str, int] | None = None
     snapshot: TurnSnapshotPayloadV1 | None = None
     settlement: TurnSettledPayloadV1 | None = None
     active_replay_turn_id: str | None = None
@@ -1287,6 +1288,8 @@ class _TurnHistory:
     def __post_init__(self) -> None:
         if self.segments is None:
             self.segments = {}
+        if self.segment_cursors is None:
+            self.segment_cursors = {}
 
 
 def _turn_for_event(
@@ -1515,10 +1518,16 @@ def validate_event_sequence(events: tuple[EvidenceSnapshotV1, ...]) -> None:
                 raise _EvidenceValueError("chunk identity is reused")
             if turn.kind is TurnKind.USER_RESPONSE:
                 if confirmed.evidence_segment_id is None or confirmed.text is None:
-                    raise _EvidenceValueError("user confirmation must carry exact segment text")
+                    raise _EvidenceValueError("user confirmation must carry exact chunk text")
                 segments = cast(dict[str, str], turn.segments)
-                if segments.get(confirmed.evidence_segment_id) != confirmed.text:
+                cursors = cast(dict[str, int], turn.segment_cursors)
+                segment = segments.get(confirmed.evidence_segment_id)
+                start = -1 if segment is None else segment.find(
+                    confirmed.text, cursors.get(confirmed.evidence_segment_id, 0)
+                )
+                if start < 0:
                     raise _EvidenceValueError("confirmed text does not match its segment")
+                cursors[confirmed.evidence_segment_id] = start + len(confirmed.text)
             elif confirmed.evidence_segment_id is not None or confirmed.text is not None:
                 raise _EvidenceValueError("non-user confirmation must be content-free")
             chunk_ids.add(confirmed.evidence_chunk_id)

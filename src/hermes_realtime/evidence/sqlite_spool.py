@@ -2965,9 +2965,11 @@ class SQLiteEvidenceSpool:
             ):
                 connection.rollback()
                 return StoreDisposition.REJECTED_STATE
-            validate_event_sequence(
-                (*self._validated_session_history(command.logical_session_id), command.snapshot)
-            )
+            try:
+                history = self._validated_session_history(command.logical_session_id)
+            except (EvidenceModelError, EvidenceFrameError, TypeError, ValueError) as exc:
+                raise _store_corrupt("stored evidence history is invalid") from exc
+            validate_event_sequence((*history, command.snapshot))
             self._check_quotas(
                 event_count=int(current[1]),
                 canonical_bytes=int(current[2]),
@@ -2989,6 +2991,10 @@ class SQLiteEvidenceSpool:
         except _Refused as refusal:
             self._rollback()
             return refusal.disposition
+        except EvidenceStorageError as exc:
+            self._rollback()
+            self._latch(exc.fault)
+            return StoreDisposition.FAULTED
         except (EvidenceModelError, EvidenceFrameError, TypeError, ValueError):
             self._rollback()
             return StoreDisposition.REJECTED_STATE
@@ -4414,12 +4420,14 @@ class SQLiteEvidenceWriterDaemonV1:
                 raise _store_corrupt("the writer daemon owns no spool")
             method = getattr(spool, job.method)
             job.result = method() if job.argument is None else method(job.argument)
-        except Exception:
+        except BaseException as exc:
             # Content-free isolation: the caller receives its typed failure result and
-            # the owner latches a sticky fault. KeyboardInterrupt/SystemExit propagate.
+            # the owner latches a sticky fault, even when the worker must exit.
             job.failed = True
             if self._sticky_fault is None:
                 self._sticky_fault = WriterFault.STORE_CORRUPT
+            if not isinstance(exc, Exception):
+                raise
 
     def _shutdown(self) -> None:
         """Idempotently stop dispatch, close the spool, and signal every waiter."""
