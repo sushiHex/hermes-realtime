@@ -3747,3 +3747,152 @@ async def test_capture_keeps_only_naturally_settled_exact_speech_authority(
         await worker.close()
         await speech.close()
         await asyncio.gather(speaking, return_exceptions=True)
+
+
+async def _failed_stt_reconnect_binding(*, cleanup=None):
+    executor, _, _ = action_executor_probe()
+    # Use the actual executor admission check, including its shared terminal latch.
+    executor.start = MethodType(ConversationUpdateExecutor.start, executor)
+    original = ConnectionError("synthetic STT operation failed")
+    release = asyncio.Event()
+    bindings = []
+
+    class Transcriber(NoSpeechTranscriber):
+        async def push(self, frame):
+            raise original
+
+        async def cancel(self):
+            if cleanup == "pending":
+                await release.wait()
+            elif cleanup == "failed" and not release.is_set():
+                raise OSError("synthetic cleanup failed")
+
+    def factory(participant, generation, actions):
+        binding = ConversationSessionWorker(
+            participant_identity=participant,
+            session_generation=generation,
+            vad=ScriptedVad(),
+            actions=actions,
+            stt=Transcriber() if generation == 1 else NoSpeechTranscriber(),
+            cleanup_timeout_seconds=0.01,
+        )
+        bindings.append(binding)
+        return binding
+
+    supervisor = ReconnectSafeConversationWorker(actions=executor, binding_factory=factory)
+    await supervisor.bind("browser_user")
+    frame = AudioFrame(pcm=b"\x01\x00" * 160, sample_rate_hz=16_000, channels=1)
+    with pytest.raises(ConnectionError) as raised:
+        await supervisor.receive_audio("browser_user", 1, frame)
+    assert raised.value is original
+    return supervisor, executor, bindings, original, release
+
+
+@pytest.mark.asyncio
+async def test_settled_binding_failure_is_reported_then_allows_a_fresh_generation():
+    supervisor, executor, bindings, original, _ = await _failed_stt_reconnect_binding()
+    try:
+        with pytest.raises(ConnectionError) as raised:
+            await supervisor.bind("browser_user")
+        assert raised.value is original
+        assert supervisor.active_generation == 1
+        assert await supervisor.bind("browser_user") == 2
+        assert supervisor.active_generation == 2
+        assert bindings[1]._actions is executor
+        with pytest.raises(ConnectionError) as historical:
+            await bindings[0].wait_for_responses()
+        assert historical.value is original
+    finally:
+        with contextlib.suppress(ConnectionError):
+            await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_replacing_settled_stt_failure_cannot_clear_shared_executor_failure():
+    supervisor, executor, _, original, _ = await _failed_stt_reconnect_binding()
+    shared = RuntimeError("synthetic shared action failure")
+    try:
+        with pytest.raises(ConnectionError):
+            await supervisor.bind("browser_user")
+        executor._terminal_error = shared
+        with pytest.raises(RuntimeError) as raised:
+            await supervisor.bind("browser_user")
+        assert raised.value is shared
+        assert executor._terminal_error is shared
+        assert supervisor.active_generation is None
+    finally:
+        with contextlib.suppress(ConnectionError):
+            await supervisor.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["pending", "failed"])
+async def test_binding_operation_failure_cannot_bypass_unsettled_cleanup(cleanup):
+    supervisor, _, bindings, original, release = await _failed_stt_reconnect_binding(
+        cleanup=cleanup
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(TimeoutError if cleanup == "pending" else BaseExceptionGroup):
+                await supervisor.bind("browser_user")
+            assert supervisor.active_generation == 1
+            assert len(bindings) == 1
+        release.set()
+        with pytest.raises(ConnectionError) as reported:
+            await supervisor.bind("browser_user")
+        assert reported.value is original
+        assert await supervisor.bind("browser_user") == 2
+    finally:
+        release.set()
+        with contextlib.suppress(ConnectionError):
+            await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_same_historical_exception_does_not_prove_early_cleanup_settled():
+    from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
+
+    supervisor, _, bindings, original, _ = await _failed_stt_reconnect_binding()
+    coordinator = object.__new__(KnowledgePrefetchCoordinator)
+
+    async def failed_knowledge_close(*args):
+        raise original
+
+    coordinator.close_binding = failed_knowledge_close
+    bindings[0]._knowledge_coordinator = coordinator
+    try:
+        for _ in range(2):
+            with pytest.raises(ConnectionError) as raised:
+                await supervisor.bind("browser_user")
+            assert raised.value is original
+            assert supervisor.active_generation == 1
+            assert len(bindings) == 1
+        assert bindings[0]._foreground_cleanup_task is None
+        assert bindings[0]._stt_cleanup_task is None
+    finally:
+        with contextlib.suppress(ConnectionError):
+            await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_settled_cleanup_does_not_hide_a_different_close_failure():
+    supervisor, _, bindings, original, _ = await _failed_stt_reconnect_binding()
+    diagnostic = OSError("synthetic required close evidence failure")
+
+    def record_close_stage(**kwargs):
+        raise diagnostic
+
+    bindings[0]._production_observation_recorder = SimpleNamespace(
+        record_close_stage=record_close_stage
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(OSError) as raised:
+                await supervisor.bind("browser_user")
+            assert raised.value is diagnostic
+            assert supervisor.active_generation == 1
+            assert len(bindings) == 1
+        assert bindings[0]._terminal_error is original
+    finally:
+        with contextlib.suppress(OSError):
+            await supervisor.close()

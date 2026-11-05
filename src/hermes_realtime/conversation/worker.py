@@ -289,6 +289,7 @@ class ConversationSessionWorker:
         self._response_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._binding_cleanup_timed_out = False
         self._binding_cleanup_needs_retry = False
+        self._binding_cleanup_settled = False
         self._audio_lock = asyncio.Lock()
         self._terminal_error: BaseException | None = None
         self._binding_close_operation: asyncio.Task[None] | None = None
@@ -925,7 +926,19 @@ class ConversationSessionWorker:
     async def close_binding(self) -> None:
         """Stop only this media/STT generation for an authenticated reconnect."""
 
-        await asyncio.shield(self._ensure_binding_close())
+        operation = self._ensure_binding_close()
+        if (
+            self._binding_cleanup_settled
+            and operation.done()
+            and not operation.cancelled()
+            and self._terminal_error is not None
+            and operation.exception() is self._terminal_error
+        ):
+            # The first close reported this exact historical operation failure.
+            # Its resources have settled; the old generation keeps its error,
+            # while a fresh binding must still pass the shared executor's start.
+            return
+        await asyncio.shield(operation)
 
     async def _close_owned(self) -> None:
         errors: list[BaseException] = []
@@ -967,6 +980,7 @@ class ConversationSessionWorker:
         return operation
 
     async def _close_binding_owned(self) -> None:
+        self._binding_cleanup_settled = False
         recorder = self._production_observation_recorder
         coordinator = self._knowledge_coordinator
         if coordinator is not None:
@@ -1033,6 +1047,7 @@ class ConversationSessionWorker:
         self._binding_cleanup_needs_retry = _operation_failed(
             foreground_cleanup
         ) or _operation_failed(stt_cleanup)
+        self._binding_cleanup_settled = not errors and not self._binding_cleanup_needs_retry
         if self._terminal_error is not None:
             errors.append(self._terminal_error)
         if errors:
