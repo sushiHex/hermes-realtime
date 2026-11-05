@@ -3225,8 +3225,13 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             checkpoint_channel.close()
         raise
     previous_sigbreak_handler: object | None = None
+    previous_sigterm_handler: object | None = None
     host_error: BaseException | None = None
     try:
+        if sys.platform != "win32":
+            loop = asyncio.get_running_loop()
+            previous_sigterm_handler = signal.signal(
+                signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown_requested.set))
         if qualification_no_hermes_tasks:
             loop = asyncio.get_running_loop()
 
@@ -3265,10 +3270,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             flush=True,
         )
         print(launch_url, flush=True)
-        if qualification_no_hermes_tasks:
-            await shutdown_requested.wait()
-        else:
-            await asyncio.Event().wait()
+        await shutdown_requested.wait()
     except BaseException as error:
         host_error = error
         raise
@@ -3290,6 +3292,8 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
         except BaseException as error:
             cleanup_failures.append(("launcher_close", error))
         try:
+            if previous_sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, cast(signal.Handlers, previous_sigterm_handler))
             if previous_sigbreak_handler is not None:
                 signal.signal(
                     signal.SIGBREAK,

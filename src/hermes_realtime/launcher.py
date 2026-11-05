@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
+import sys
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -496,7 +498,13 @@ async def _run_local_cli(args: argparse.Namespace) -> None:
         whisper_model=args.whisper_model,
         edge_voice=args.edge_voice,
     )
+    shutdown_requested = asyncio.Event()
+    previous_sigterm_handler = None
     try:
+        if sys.platform != "win32":
+            loop = asyncio.get_running_loop()
+            previous_sigterm_handler = signal.signal(
+                signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown_requested.set))
         launch_url = await launcher.start()
         print(
             "Conversation-only local profile: task dispatch and approvals are disabled.",
@@ -504,9 +512,13 @@ async def _run_local_cli(args: argparse.Namespace) -> None:
         )
         print("Open this one-use URL in one local browser:", flush=True)
         print(launch_url, flush=True)
-        await asyncio.Event().wait()
+        await shutdown_requested.wait()
     finally:
-        await launcher.close()
+        try:
+            await launcher.close()
+        finally:
+            if previous_sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def main() -> int:

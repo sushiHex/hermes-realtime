@@ -51,6 +51,20 @@ async def _raw_request(port: int, request: bytes) -> bytes:
     return response
 
 
+def test_bootstrap_accepts_explicit_ipv6_loopback_http_origin():
+    connection = LiveKitConnection("wss://livekit.test", "test-key", "s" * 32)
+    async def provision(identity):
+        return 1
+    BrowserBootstrapApplication(
+        sessions=BrowserSessionDirector(
+            issuer=BrowserTokenIssuer(connection=connection, room_name="room"),
+            provision=provision, submit=_submit, stop=_stop, approval=_approval,
+            projection=BrowserEventProjection()),
+        verifier=BrowserTokenVerifier(connection=connection, room_name="room"),
+        capability=OneTimeBootstrapCapability(token_factory=lambda: "d" * 43),
+        allowed_origin="http://[::1]:8765", worker_identity="worker_hermes_browser")
+
+
 @pytest.mark.asyncio
 async def test_server_serves_only_allowlisted_shell_with_security_headers(
     tmp_path: Path,

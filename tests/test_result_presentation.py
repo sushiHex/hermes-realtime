@@ -11,6 +11,16 @@ from hermes_realtime.host_launcher import (
 
 
 @pytest.mark.asyncio
+async def test_completed_result_redacts_every_projection_private_namespace_before_publish():
+    projection = BrowserEventProjection()
+    policy = ProactiveCompletionUpdatePolicy(projection=projection)
+    await policy.decide(UpdatePolicyInput(sequence=1, completion=TaskTerminalOutcome(
+        task_id="task_private_result", status="completed", summary="Registered subagent_stop hook.",
+    ), context=ConversationContextStore().snapshot()))
+    assert projection.events_after(0)[-1].data["text"] == "Registered private reference hook."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("idle", [False, True])
 async def test_result_preserves_visual_sources_and_observation_time_in_each_projection(idle):
     voice = "The monitor counted 12 sessions at 07:53 UTC, per https://monitor.example.invalid/status."
