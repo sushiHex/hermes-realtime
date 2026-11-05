@@ -225,7 +225,10 @@ class NativeRunWitness:
                         arguments = arguments.get("arguments", {})
                         if type(arguments) is str:
                             arguments = object_json(arguments)
-                    require(name in KNOWN and type(arguments) is dict, "witness_tool_identity")
+                    require(
+                        type(name) is str and name in KNOWN and type(arguments) is dict,
+                        "witness_tool_identity",
+                    )
                     pending[identity] = (name, arguments)
                     require(len(pending) <= 128, "witness_pending_bound")
                     record_count += 1
