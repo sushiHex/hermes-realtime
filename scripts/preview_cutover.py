@@ -388,20 +388,6 @@ def load_plan(path: Path) -> PreviewPlanV1:
     )
 
 
-def _git(path: Path, *arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(path), *arguments],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=20,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    require(completed.returncode == 0 and len(completed.stdout) <= 256, "git_identity_unavailable")
-    return completed.stdout.strip()
-
-
 def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
     """Bind current source, wheel and installed payload through existing verifiers."""
     require(
@@ -444,7 +430,7 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
     hermes_identity = installed_hermes_identity("", plan.hermes_source)
     require(
         hermes_identity["commit"] == plan.hermes_revision
-        and _git(plan.hermes_source, "rev-parse", "HEAD^{tree}") == plan.hermes_tree,
+        and setup.git(plan.hermes_source, "rev-parse", "HEAD^{tree}") == plan.hermes_tree,
         "hermes_source_binding",
     )
     require(
