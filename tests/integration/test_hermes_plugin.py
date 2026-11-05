@@ -328,3 +328,39 @@ async def test_uncertain_dispatch_retains_authority_and_refuses_retries() -> Non
     callback(delegation_id=reserved, child_status="failed", child_summary="Failed")
     assert completions[0].authoritative
     assert reserved not in runtime._reserved_run_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    ["[" * 1100 + "]" * 1100, b"\xff", "1" * 5000],
+    ids=["deep-json", "invalid-utf8", "integer-bound"],
+)
+async def test_postdispatch_parser_failure_latches_uncertainty_and_retains_authority(raw) -> None:
+    class Context(RecordingPluginContext):
+        def dispatch_reserved_delegation(self, args, delegation_id):
+            self.reserved_ids.append(delegation_id)
+            return raw
+
+    context = Context({})
+    runtime = HermesPluginRuntime(context)
+    command = HermesDispatchCommand(
+        session_id="session_001",
+        task_id="task_001",
+        objective="Inspect",
+        durability=Durability.EPHEMERAL,
+    )
+    completions = []
+    runtime.subscribe_completion(completions.append)
+    with pytest.raises(RuntimeError, match="invalid dispatch response; authority uncertain"):
+        await runtime.dispatcher.dispatch(command)
+    reserved = context.reserved_ids[0]
+    assert reserved in runtime._reserved_run_ids
+    with pytest.raises(RuntimeError, match="authority is uncertain"):
+        await runtime.dispatcher.dispatch(command)
+    assert context.reserved_ids == [reserved]
+    callback = context.hooks["subagent_stop"]
+    assert callable(callback)
+    callback(delegation_id=reserved, child_status="failed", child_summary="Failed")
+    assert completions[0].authoritative
+    assert reserved not in runtime._reserved_run_ids

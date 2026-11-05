@@ -251,7 +251,7 @@ class HermesPluginDispatcher:
             raise
         try:
             payload = json.loads(raw_result)
-        except (TypeError, json.JSONDecodeError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             self._uncertain = True
             logger.warning('[hermes-plugin-dispatch] {"refusal":"uncertain","version":1}')
             raise RuntimeError(
