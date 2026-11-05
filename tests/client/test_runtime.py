@@ -693,3 +693,42 @@ async def test_lease_watchdog_reports_once_per_failure_episode_and_retries_serve
         {"failure": "RuntimeError", "stage": "expiry", "version": 1},
         {"failure": "OSError", "stage": "server_close", "version": 1},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+async def test_lease_diagnostic_transport_failure_cannot_stop_expiry_cleanup(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+) -> None:
+    from hermes_realtime.client import runtime as runtime_module
+
+    class Sessions:
+        calls = 0
+
+        async def expire_if_inactive(self) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic expiry failure")
+            return True
+
+    class Server:
+        closes = 0
+
+        async def close(self) -> None:
+            self.closes += 1
+
+    def broken_print(*_args: object, **_kwargs: object) -> None:
+        raise error_type("synthetic diagnostic transport failure")
+
+    monkeypatch.setattr(runtime_module, "print", broken_print, raising=False)
+    runtime = object.__new__(BrowserClientRuntime)
+    sessions, server = Sessions(), Server()
+    runtime._sessions = sessions  # type: ignore[assignment]
+    runtime._server = server  # type: ignore[assignment]
+    runtime._lease_check_interval = 0.001
+    runtime._persistent_mode = False
+    runtime._started = True
+    await asyncio.wait_for(runtime._watch_browser_lease(), 0.3)
+    assert sessions.calls == 2
+    assert server.closes == 1
+    assert runtime._started is False

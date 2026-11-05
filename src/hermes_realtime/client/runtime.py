@@ -8,6 +8,7 @@ import math
 import re
 import ssl
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -396,7 +397,8 @@ class BrowserClientRuntime:
                 failed_stage = stage
             finally:
                 if evidence is not None:
-                    print("[browser-lease] " + json.dumps(evidence, sort_keys=True), flush=True)
+                    with suppress(OSError, ValueError):
+                        print("[browser-lease] " + json.dumps(evidence, sort_keys=True), flush=True)
 
     async def close(self) -> None:
         """Close browser ingress before closing conversation authority."""
