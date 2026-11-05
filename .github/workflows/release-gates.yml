@@ -169,6 +169,9 @@ jobs:
           version: "0.11.28"
           enable-cache: true
           prune-cache: true
+      - name: Check case-sensitive source identity
+        shell: bash
+        run: uv run --frozen --group dev pytest -q tests/test_real_gate_support.py::test_case_sensitive_checkout_does_not_exempt_separate_edited_nonpython_file
       - name: Build hash-identified offline candidate closure
         shell: bash
         run: |

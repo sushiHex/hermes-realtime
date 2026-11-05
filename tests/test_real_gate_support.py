@@ -206,3 +206,73 @@ def test_identity_preserves_absent_sparse_website(checkout: Path) -> None:
 def test_identity_ignores_foreign_git_selection(checkout: Path, monkeypatch) -> None:
     monkeypatch.setenv("GIT_DIR", str(checkout / "not-a-repository"))
     assert installed_hermes_identity("0.21.0", checkout)["commit"]
+
+
+@pytest.mark.parametrize("fault", ["non_alias", "missing", "symlink", "stat_error"])
+def test_case_exemption_requires_physical_regular_aliases(
+    case_colliding_checkout: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    _git(case_colliding_checkout, "config", "core.ignorecase", "true")
+    original_file = Path.is_file
+    original_link = Path.is_symlink
+
+    def samefile(path: Path, other: Path) -> bool:
+        if fault == "stat_error":
+            raise OSError("synthetic identity observation unavailable")
+        return str(path) == str(other) if fault == "non_alias" else True
+
+    monkeypatch.setattr(Path, "samefile", samefile)
+    if fault == "missing":
+        monkeypatch.setattr(Path, "is_file", lambda path:
+                            False if path.name == "hermes.py" else original_file(path))
+    elif fault == "symlink":
+        monkeypatch.setattr(Path, "is_symlink", lambda path:
+                            True if path.name == "hermes.py" else original_link(path))
+    assert _SUPPORT._unrepresentable_paths(case_colliding_checkout) == set()
+
+
+def test_case_sensitive_checkout_does_not_exempt_separate_edited_nonpython_file(
+    checkout: Path,
+) -> None:
+    upper, lower = checkout / "Config.json", checkout / "config.json"
+    upper.write_text('{"value":1}\n', encoding="utf-8")
+    _git(checkout, "add", "Config.json")
+    spare = checkout / "variant.tmp"
+    spare.write_text('{"value":2}\n', encoding="utf-8")
+    blob = _git(checkout, "hash-object", "-w", str(spare))
+    spare.unlink()
+    _git(checkout, "update-index", "--add", "--cacheinfo", f"100644,{blob},config.json")
+    _git(checkout, "-c", "user.name=t", "-c", "user.email=t@t",
+         "commit", "-qm", "case variants")
+    _git(checkout, "checkout", "-q", "-f", "HEAD")
+    if upper.samefile(lower):
+        pytest.skip("physical case-sensitive filesystem required for this control")
+    _git(checkout, "config", "core.ignorecase", "true")
+    lower.write_text('{"value":99}\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="no commit describes"):
+        installed_hermes_identity("0.21.0", checkout)
+
+
+def test_case_exemption_refuses_multiple_physical_directory_entries(
+    case_colliding_checkout: Path,
+) -> None:
+    checkout = case_colliding_checkout
+    _git(checkout, "config", "core.ignorecase", "true")
+    first, second = checkout / "HERMES.py", checkout / "hermes.py"
+    extra = checkout.parent / (checkout.name + "-extra-link")
+    try:
+        if first.samefile(second):
+            # Windows case aliases share one directory entry. Add a distinct
+            # hardlink outside the checkout to make the link count observable.
+            os.link(first, extra)
+        else:
+            # A case-sensitive checkout can hold distinct entries whose content
+            # nevertheless shares a file identity through an added hardlink.
+            second.unlink()
+            os.link(first, second)
+        assert first.samefile(second) and first.stat().st_nlink == 2
+        with pytest.raises(RuntimeError, match="no commit describes"):
+            installed_hermes_identity("0.21.0", checkout)
+    finally:
+        if extra.exists():
+            extra.unlink()

@@ -955,9 +955,11 @@ def test_preview_runtime_uses_scoped_comparator_without_release_archive(
         return {"recordSha256": "0" * 64 if drift == "record" else plan.runtime_record_sha256,
                 "packageFiles": 114}
     monkeypatch.setattr("scripts.setup_lookup_backend.verify_runtime", compare)
-    monkeypatch.setattr(preview_cutover, "_git", lambda path, *args:
+    monkeypatch.setattr("scripts.setup_lookup_backend.git", lambda path, *args:
                         plan.hermes_revision if args[-1] == "HEAD^{commit}" else
                         plan.hermes_tree if args[-1] == "HEAD^{tree}" else "")
+    monkeypatch.setattr("scripts.real_gate_support.installed_hermes_identity",
+                        lambda *_: {"commit": plan.hermes_revision})
     for path in (*plan.executables.values(), plan.hermes_python):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -1179,3 +1181,114 @@ def test_dev_refusal_keeps_its_bounded_category():
         "category": "refused", "failure_kind": "ValueError",
         "failure_category": "tcp_observation_unavailable",
     }
+
+
+def _runtime_plan_with_real_hermes_checkout(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    checkout = tmp_path / "hermes-checkout"
+    checkout.mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ("git", *arguments), cwd=checkout, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (checkout / "entry.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git("add", "entry.py")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "source")
+    (checkout / "spare.txt").write_text("VALUE = 2\n", encoding="utf-8")
+    other_blob = git("hash-object", "-w", "spare.txt")
+    (checkout / "spare.txt").unlink()
+    git("update-index", "--add", "--cacheinfo", f"100644,{other_blob},ENTRY.py")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "case collision")
+    git("checkout", "-q", "-f", "HEAD")
+    plan = replace(
+        plan, realtime_source=preview_cutover.ROOT, hermes_source=checkout,
+        hermes_revision=git("rev-parse", "HEAD"), hermes_tree=git("rev-parse", "HEAD^{tree}"),
+    )
+    identity = SimpleNamespace(
+        candidate_head_oid=plan.realtime_revision, candidate_tree_oid=plan.realtime_tree,
+    )
+    monkeypatch.setattr("scripts.task13_artifact_orchestrator.verify_clean_tracked_candidate",
+                        lambda _: identity)
+    monkeypatch.setattr("scripts.setup_lookup_backend.verify_runtime",
+                        lambda *_, **__: {"recordSha256": plan.runtime_record_sha256,
+                                          "packageFiles": 114})
+    for executable in (*plan.executables.values(), plan.hermes_python):
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.touch()
+    return plan, checkout, git
+
+
+def test_preview_source_accepts_committed_case_aliases(tmp_path, monkeypatch):
+    plan, checkout, git = _runtime_plan_with_real_hermes_checkout(tmp_path, monkeypatch)
+    # The fixture uses a real two-spelling Git tree. On Windows one on-disk
+    # file aliases both paths; its bytes still match exactly one committed blob.
+    assert "ENTRY.py" in git("ls-tree", "-r", "--name-only", "HEAD")
+    assert "entry.py" in git("ls-tree", "-r", "--name-only", "HEAD")
+    assert preview_cutover.verify_realtime_runtime(plan)["package_files"] == 114
+
+
+@pytest.mark.parametrize("fault", ["edited_bytes", "hidden_edit", "revision", "tree"])
+def test_preview_source_case_aliases_never_hide_drift(tmp_path, monkeypatch, fault):
+    from dataclasses import replace
+
+    plan, checkout, git = _runtime_plan_with_real_hermes_checkout(tmp_path, monkeypatch)
+    if fault in {"edited_bytes", "hidden_edit"}:
+        if fault == "hidden_edit":
+            git("update-index", "--assume-unchanged", "entry.py")
+        (checkout / "entry.py").write_text("VALUE = 99\n", encoding="utf-8")
+    elif fault == "revision":
+        plan = replace(plan, hermes_revision="0" * 40)
+    else:
+        plan = replace(plan, hermes_tree="0" * 40)
+    with pytest.raises((ValueError, RuntimeError)):
+        preview_cutover.verify_realtime_runtime(plan)
+
+
+@pytest.mark.parametrize("selector", ["environment", "replacement"])
+@pytest.mark.parametrize("binding", ["actual", "foreign"])
+def test_preview_source_tree_ignores_foreign_git_selection(
+    tmp_path, monkeypatch, binding, selector,
+):
+    from dataclasses import replace
+
+    plan, checkout, source_git = _runtime_plan_with_real_hermes_checkout(tmp_path, monkeypatch)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ("git", *arguments), cwd=foreign, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (foreign / "foreign.py").write_text("FOREIGN = True\n", encoding="utf-8")
+    git("add", ".")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "foreign source")
+    foreign_tree = git("rev-parse", "HEAD^{tree}")
+    if selector == "environment":
+        monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    else:
+        (checkout / "extra.py").write_text("EXTRA = True\n", encoding="utf-8")
+        source_git("add", "extra.py")
+        source_git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                   "commit", "-qm", "replacement source")
+        replacement = source_git("rev-parse", "HEAD")
+        foreign_tree = source_git("rev-parse", "HEAD^{tree}")
+        source_git("reset", "--hard", plan.hermes_revision)
+        source_git("replace", plan.hermes_revision, replacement)
+    assert foreign_tree != plan.hermes_tree
+    if binding == "foreign":
+        plan = replace(plan, hermes_tree=foreign_tree)
+        with pytest.raises(ValueError, match="hermes_source_binding"):
+            preview_cutover.verify_realtime_runtime(plan)
+    else:
+        assert preview_cutover.verify_realtime_runtime(plan)["package_files"] == 114

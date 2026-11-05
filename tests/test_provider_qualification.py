@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from hermes_realtime.conversation.context import PrivateRunDisclosureError
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.providers.ollama import OllamaStreamingInference
@@ -988,3 +989,198 @@ async def test_direct_caller_cannot_relabel_override_as_production_default(
             model="synthetic:latest", effort="low", codex_executable=None,
             ollama_base_url="http://127.0.0.1:11434", ollama_num_ctx=None,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "ollama"])
+@pytest.mark.parametrize("category", ["positive_start", "negative"])
+async def test_evaluator_counts_terminal_proposal_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    category: str,
+) -> None:
+    class Proposal(_Inference):
+        async def stream(self, snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+            else:
+                yield HostTaskProposalRequest("Inspect synthetic release evidence")
+
+    instance = Proposal()
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: instance)
+    monkeypatch.setattr(evaluator, "_resolve_codex_executable", lambda _value: "synthetic")
+    monkeypatch.setattr(evaluator, "_codex_version", lambda _value: "1.0.0")
+
+    async def forbidden_dispatch(*_args, **_kwargs):
+        pytest.fail("proposal observation attempted host execution")
+
+    monkeypatch.setattr(evaluator.ShadowWorkHandler, "start_work", forbidden_dispatch)
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    case = next(case for case in corpus.cases if case.category == category)
+    report = await evaluator.run_evaluation(
+        corpus=dataclasses.replace(corpus, cases=(case,)),
+        provider=provider,
+        model="synthetic:latest",
+        effort="low",
+        codex_executable=None,
+    )
+    assert report["tool_calls"]["total"] == 1
+    assert report["tool_calls"]["by_tool"]["start_work"] == 1
+    assert report["metrics"]["positive_start"]["correct"] == int(category == "positive_start")
+    assert report["metrics"]["safety_negative"]["false_positives"] == int(category == "negative")
+    assert report["latency_ms"]["tool_call"]["count"] == 1
+    assert report["latency_ms"]["first_speakable"]["count"] == 0
+    assert report["host_status_requests"]["count"] == 0
+    assert report["semantic_review"]["status"] == "pending"
+    assert report["status"] == "failed"
+    assert "Inspect synthetic release evidence" not in str(report)
+    assert instance.events[-1] == ("close", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "later", [HostTaskProposalRequest("Other work"), HostSpeechRequest(), "Later prose.", object()]
+)
+async def test_proposal_request_is_terminal_for_evaluator_output(monkeypatch, later):
+    class Proposal(_Inference):
+        async def stream(self, snapshot, *, turn_id):
+            if turn_id == "turn_preflight":
+                yield "Ready."
+            else:
+                yield HostTaskProposalRequest("Inspect synthetic release evidence")
+                yield later
+
+    instance = Proposal()
+    monkeypatch.setattr(evaluator, "_build_streaming_inference", lambda **_options: instance)
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    with pytest.raises(evaluator.EvaluationFailure) as failure:
+        await evaluator.run_evaluation(
+            corpus=dataclasses.replace(corpus, cases=corpus.cases[:1]),
+            provider="ollama",
+            model="synthetic:latest",
+            effort="low",
+            codex_executable=None,
+        )
+    assert str(failure.value.__cause__) == "qualification output followed terminal proposal request"
+    assert failure.value.public_error()["completed_cases"] == 0
+    assert instance.events[-1] == ("close", None)
+
+
+@pytest.mark.parametrize("objective", ["", "x" * 1025, "deleg_synthetic", 1])
+def test_proposal_observation_revalidates_request_before_counting(objective):
+    request = object.__new__(HostTaskProposalRequest)
+    object.__setattr__(request, "objective", objective)
+    handler = evaluator.ShadowWorkHandler(can_cancel_work=False)
+    handler.begin_case("nw-001", started_at=time.perf_counter())
+    with pytest.raises((ValueError, TypeError, PrivateRunDisclosureError)):
+        handler.observe_host_task_proposal(request)
+    assert handler.finish_case(first_speakable_latency_ms=None).observed_tools == ()
+
+
+def test_proposal_observation_requires_owned_case_and_no_mixed_effects():
+    handler = evaluator.ShadowWorkHandler(can_cancel_work=False)
+    request = HostTaskProposalRequest("Inspect synthetic release evidence")
+    with pytest.raises(RuntimeError, match="active case"):
+        handler.observe_host_task_proposal(request)
+    handler.begin_case("nw-001", started_at=time.perf_counter())
+    handler._record("start_work", "tool_" + "a" * 32)
+    with pytest.raises(RuntimeError, match="share lifecycle"):
+        handler.observe_host_task_proposal(request)
+    handler.abandon_case()
+    handler.begin_case("nw-002", started_at=time.perf_counter())
+    handler.observe_host_status_request()
+    with pytest.raises(RuntimeError, match="terminal status"):
+        handler.observe_host_task_proposal(request)
+
+
+def test_proposal_source_binding_is_exact(monkeypatch):
+    from hermes_realtime.conversation import task_proposals
+
+    evaluator._verify_controller_source()
+    monkeypatch.setattr(task_proposals, "__file__", __file__)
+    with pytest.raises(ValueError, match="evaluator_source_binding"):
+        evaluator._verify_controller_source()
+
+
+@pytest.mark.asyncio
+async def test_proposal_seals_shadow_handler_until_next_case():
+    handler = evaluator.ShadowWorkHandler(can_cancel_work=False)
+    handler.begin_case("nw-001", started_at=time.perf_counter())
+    handler.observe_host_task_proposal(HostTaskProposalRequest("Inspect synthetic evidence"))
+    with pytest.raises(RuntimeError, match="terminal proposal"):
+        await handler.start_work(objective="Other work", invocation_id="tool_" + "a" * 32)
+    with pytest.raises(RuntimeError, match="terminal proposal"):
+        await handler.cancel_active_work(invocation_id="tool_" + "b" * 32)
+    assert handler.finish_case(first_speakable_latency_ms=None).observed_tools == ("start_work",)
+    handler.begin_case("nw-002", started_at=time.perf_counter())
+    assert (
+        await handler.start_work(objective="Other work", invocation_id="tool_" + "a" * 32)
+    ).accepted
+    handler.abandon_case()
+    handler.begin_case("nw-003", started_at=time.perf_counter())
+    handler.observe_host_task_proposal(HostTaskProposalRequest("Inspect synthetic evidence"))
+    handler.abandon_case()
+    handler.begin_case("nw-004", started_at=time.perf_counter())
+    assert (
+        await handler.start_work(objective="Other work", invocation_id="tool_" + "a" * 32)
+    ).accepted
+
+
+def test_proposal_marker_subclass_and_class_source_binding_refused(monkeypatch):
+    class Untrusted(HostTaskProposalRequest):
+        pass
+
+    handler = evaluator.ShadowWorkHandler(can_cancel_work=False)
+    handler.begin_case("nw-001", started_at=time.perf_counter())
+    with pytest.raises(TypeError, match="exact request type"):
+        handler.observe_host_task_proposal(Untrusted("Inspect synthetic evidence"))
+    assert handler.finish_case(first_speakable_latency_ms=None).observed_tools == ()
+    monkeypatch.setattr(evaluator, "HostTaskProposalRequest", type("Other", (), {}))
+    with pytest.raises(ValueError, match="evaluator_script_binding"):
+        evaluator._verify_controller_source()
+
+
+@pytest.mark.asyncio
+async def test_real_codex_transport_proposal_is_counted_without_dispatch(monkeypatch):
+    from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
+    from tests.providers.test_codex_app_server import DynamicStartCodexTransport, FakeCodexTransport
+
+    class ReadyThenProposal(DynamicStartCodexTransport):
+        def __init__(self):
+            super().__init__(arguments={"objective": "Inspect synthetic release evidence"})
+            self.turns = 0
+
+        async def send(self, message):
+            if message.get("method") == "turn/start":
+                self.turns += 1
+                if self.turns == 1:
+                    await FakeCodexTransport.send(self, message)
+                    return
+            await super().send(message)
+
+    async def forbidden_dispatch(*_args, **_kwargs):
+        pytest.fail("proposal observation attempted host execution")
+
+    transport = ReadyThenProposal()
+    monkeypatch.setattr(evaluator.ShadowWorkHandler, "start_work", forbidden_dispatch)
+    monkeypatch.setattr(evaluator, "_resolve_codex_executable", lambda _value: "synthetic")
+    monkeypatch.setattr(evaluator, "_codex_version", lambda _value: "1.0.0")
+    monkeypatch.setattr(
+        evaluator,
+        "_build_streaming_inference",
+        lambda **_options: CodexAppServerStreamingInference(
+            model="synthetic", effort="low", transport_factory=lambda: transport
+        ),
+    )
+    corpus = evaluator.load_corpus(evaluator._DEFAULT_CORPUS)
+    report = await evaluator.run_evaluation(
+        corpus=dataclasses.replace(corpus, cases=corpus.cases[:1]),
+        provider="codex",
+        model="synthetic",
+        effort="low",
+        codex_executable=None,
+    )
+    assert report["tool_calls"]["by_tool"]["start_work"] == 1
+    assert report["metrics"]["positive_start"]["correct"] == 1
+    assert report["latency_ms"]["first_speakable"]["count"] == 0
+    assert transport.closed is True

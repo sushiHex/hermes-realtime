@@ -27,6 +27,7 @@ from hermes_realtime.conversation.context import (
     ConversationMessage,
 )
 from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.work_tools import WorkCancelResult, WorkStartResult
 from hermes_realtime.host_launcher import (
@@ -613,6 +614,7 @@ class ShadowWorkHandler:
         self._tools: list[str] = []
         self._latencies_ms: list[float] = []
         self._host_status_request_latency_ms: float | None = None
+        self._host_task_proposal_seen = False
 
     @property
     def has_recorded_tools(self) -> bool:
@@ -630,6 +632,7 @@ class ShadowWorkHandler:
         self._tools.clear()
         self._latencies_ms.clear()
         self._host_status_request_latency_ms = None
+        self._host_task_proposal_seen = False
 
     def observe_host_status_request(self) -> None:
         """Record selection only, without rendering or asserting any real task state."""
@@ -640,6 +643,21 @@ class ShadowWorkHandler:
         if self._tools:
             raise RuntimeError("host status request cannot share lifecycle effects")
         self._host_status_request_latency_ms = (time.perf_counter() - self._started_at) * 1000
+
+    def observe_host_task_proposal(self, request: HostTaskProposalRequest) -> None:
+        """Count a validated terminal routing selection, never admit or dispatch it."""
+        if type(request) is not HostTaskProposalRequest:
+            raise TypeError("shadow task proposal must have the exact request type")
+        HostTaskProposalRequest(objective=request.objective)
+        if self._case_id is None or self._started_at is None:
+            raise RuntimeError("host task proposal arrived outside an active case")
+        if self._host_status_request_latency_ms is not None:
+            raise RuntimeError("host task proposal followed terminal status request")
+        if self._tools:
+            raise RuntimeError("host task proposal cannot share lifecycle effects")
+        self._tools.append("start_work")
+        self._latencies_ms.append((time.perf_counter() - self._started_at) * 1000)
+        self._host_task_proposal_seen = True
 
     async def start_work(self, *, objective: str, invocation_id: str) -> WorkStartResult:
         if (
@@ -698,6 +716,7 @@ class ShadowWorkHandler:
         self._tools.clear()
         self._latencies_ms.clear()
         self._host_status_request_latency_ms = None
+        self._host_task_proposal_seen = False
         return observation
 
     def abandon_case(self) -> None:
@@ -706,12 +725,15 @@ class ShadowWorkHandler:
         self._tools.clear()
         self._latencies_ms.clear()
         self._host_status_request_latency_ms = None
+        self._host_task_proposal_seen = False
 
     def _record(self, tool: str, invocation_id: str) -> None:
         if self._case_id is None or self._started_at is None:
             raise RuntimeError("shadow tool call arrived outside an active case")
         if self._host_status_request_latency_ms is not None:
             raise RuntimeError("lifecycle effect followed terminal status request")
+        if self._host_task_proposal_seen:
+            raise RuntimeError("lifecycle effect followed terminal proposal request")
         if type(invocation_id) is not str or _INVOCATION_ID.fullmatch(invocation_id) is None:
             raise ValueError("shadow invocation_id is invalid")
         if tool not in _TOOLS:
@@ -891,6 +913,7 @@ async def run_evaluation(
         handler.begin_case(case.case_id, started_at=started_at)
         first_speakable: float | None = None
         status_requested = False
+        proposal_requested = False
         attempt_error: Exception | None = None
         try:
             async with asyncio.timeout_at(
@@ -899,8 +922,15 @@ async def run_evaluation(
                 async for segment in inference.stream(
                     snapshot, turn_id=f"turn_eval_{case.case_id.replace('-', '_')}_1",
                 ):
-                    if status_requested:
-                        raise RuntimeError("qualification output followed terminal status request")
+                    if status_requested or proposal_requested:
+                        selection = "proposal" if proposal_requested else "status"
+                        raise RuntimeError(
+                            f"qualification output followed terminal {selection} request"
+                        )
+                    if type(segment) is HostTaskProposalRequest:
+                        handler.observe_host_task_proposal(segment)
+                        proposal_requested = True
+                        continue
                     if type(segment) is HostSpeechRequest:
                         handler.observe_host_status_request()
                         status_requested = True
@@ -1100,7 +1130,13 @@ def _verify_controller_source() -> None:
     import scripts
     from hermes_realtime import __file__ as package_file
     from hermes_realtime import host_launcher
-    from hermes_realtime.conversation import context, streaming, task_status, work_tools
+    from hermes_realtime.conversation import (
+        context,
+        streaming,
+        task_proposals,
+        task_status,
+        work_tools,
+    )
     from hermes_realtime.providers import codex_app_server, ollama
     from scripts import qualification_launch
 
@@ -1110,6 +1146,7 @@ def _verify_controller_source() -> None:
         (work_tools.__file__, "conversation/work_tools.py"),
         (streaming.__file__, "conversation/streaming.py"),
         (task_status.__file__, "conversation/task_status.py"),
+        (task_proposals.__file__, "conversation/task_proposals.py"),
         (codex_app_server.__file__, "providers/codex_app_server.py"),
         (ollama.__file__, "providers/ollama.py"),
         (host_launcher.__file__, "host_launcher.py"),
@@ -1129,6 +1166,7 @@ def _verify_controller_source() -> None:
         or CodexAppServerStreamingInference is not codex_app_server.CodexAppServerStreamingInference
         or OllamaStreamingInference is not ollama.OllamaStreamingInference
         or HostSpeechRequest is not task_status.HostSpeechRequest
+        or HostTaskProposalRequest is not task_proposals.HostTaskProposalRequest
     ):
         raise ValueError("evaluator_script_binding")
 
