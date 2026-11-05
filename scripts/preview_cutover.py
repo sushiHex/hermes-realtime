@@ -409,6 +409,7 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
         "realtime_source_root",
     )
     from scripts import setup_lookup_backend as setup
+    from scripts.real_gate_support import installed_hermes_identity
     from scripts.task13_artifact_orchestrator import verify_clean_tracked_candidate
 
     identity = verify_clean_tracked_candidate(plan.realtime_source)
@@ -438,10 +439,12 @@ def verify_realtime_runtime(plan: PreviewPlanV1) -> dict[str, Any]:
         and after.candidate_tree_oid == identity.candidate_tree_oid,
         "realtime_source_changed",
     )
+    # The plan carries no upstream version; only the verified commit is used.
+    # Reuse the all-tracked verifier's exact blob proof for Windows case aliases.
+    hermes_identity = installed_hermes_identity("", plan.hermes_source)
     require(
-        _git(plan.hermes_source, "rev-parse", "HEAD^{commit}") == plan.hermes_revision
-        and _git(plan.hermes_source, "rev-parse", "HEAD^{tree}") == plan.hermes_tree
-        and not _git(plan.hermes_source, "status", "--porcelain=v1"),
+        hermes_identity["commit"] == plan.hermes_revision
+        and _git(plan.hermes_source, "rev-parse", "HEAD^{tree}") == plan.hermes_tree,
         "hermes_source_binding",
     )
     require(
