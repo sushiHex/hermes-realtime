@@ -52,7 +52,8 @@ def test_probe_gate_rejects_uncompiled_evidence(tmp_path: Path, change: str) -> 
 def test_probe_gate_comments_cannot_hide_live_forbidden_api(tmp_path: Path, comment: str) -> None:
     probe, gate = _gate(tmp_path)
     (probe / "Sources" / "Extra.swift").write_text(
-        comment + '\nAVAudioEngine()\n/* " */', encoding="utf-8"
+        "import AVFAudio\nfunc makeEngine() {\n" + comment + '\n_ = AVAudioEngine()\n/* " */\n}\n',
+        encoding="utf-8",
     )
     with pytest.raises(AssertionError, match="forbidden parallel/session-owner API"):
         gate()
