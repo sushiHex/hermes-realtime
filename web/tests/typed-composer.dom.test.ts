@@ -44,6 +44,18 @@ describe("mounted typed composer", () => {
     unmount();
   });
 
+  it.each(["shiftKey", "ctrlKey", "altKey", "metaKey"])("leaves modified Enter (%s) to the editor", (modifier) => {
+    const { dom, input, submissions, unmount } = mountedComposer();
+    const event = new dom.window.KeyboardEvent("keydown", {
+      key: "Enter", [modifier]: true, bubbles: true, cancelable: true,
+    });
+    input.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(submissions()).toBe(0);
+    unmount();
+    dom.window.close();
+  });
+
   it("does not resubmit text for a repeated Enter keydown", () => {
     const { dom, input, submissions, unmount } = mountedComposer();
     input.value = "Send once";
