@@ -1047,7 +1047,7 @@ class ConversationSessionWorker:
         self._binding_cleanup_needs_retry = _operation_failed(
             foreground_cleanup
         ) or _operation_failed(stt_cleanup)
-        self._binding_cleanup_settled = not errors and not self._binding_cleanup_needs_retry
+        cleanup_settled = not errors and not self._binding_cleanup_needs_retry
         if self._terminal_error is not None:
             errors.append(self._terminal_error)
         if errors:
@@ -1056,6 +1056,9 @@ class ConversationSessionWorker:
                     stage=CloseStageV1.BINDING_CLEANUP,
                     result=CloseResultV1.FAILED,
                 )
+            # Required close evidence must settle too, even when its failure
+            # aliases the historical operation exception.
+            self._binding_cleanup_settled = cleanup_settled
             if len(errors) == 1:
                 raise errors[0]
             raise BaseExceptionGroup("conversation session worker close failed", errors)
@@ -1064,6 +1067,7 @@ class ConversationSessionWorker:
                 stage=CloseStageV1.BINDING_CLEANUP,
                 result=CloseResultV1.SUCCEEDED,
             )
+        self._binding_cleanup_settled = cleanup_settled
 
     @staticmethod
     def _consume_cleanup_result(operation: asyncio.Task[None]) -> None:

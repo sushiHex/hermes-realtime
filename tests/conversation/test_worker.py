@@ -3875,9 +3875,10 @@ async def test_same_historical_exception_does_not_prove_early_cleanup_settled():
 
 
 @pytest.mark.asyncio
-async def test_settled_cleanup_does_not_hide_a_different_close_failure():
+@pytest.mark.parametrize("alias", [False, True], ids=["distinct-error", "same-error"])
+async def test_settled_cleanup_does_not_hide_a_different_close_failure(alias):
     supervisor, _, bindings, original, _ = await _failed_stt_reconnect_binding()
-    diagnostic = OSError("synthetic required close evidence failure")
+    diagnostic = original if alias else OSError("synthetic required close evidence failure")
 
     def record_close_stage(**kwargs):
         raise diagnostic
@@ -3887,12 +3888,12 @@ async def test_settled_cleanup_does_not_hide_a_different_close_failure():
     )
     try:
         for _ in range(2):
-            with pytest.raises(OSError) as raised:
+            with pytest.raises(ConnectionError if alias else OSError) as raised:
                 await supervisor.bind("browser_user")
             assert raised.value is diagnostic
             assert supervisor.active_generation == 1
             assert len(bindings) == 1
         assert bindings[0]._terminal_error is original
     finally:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, ConnectionError):
             await supervisor.close()
