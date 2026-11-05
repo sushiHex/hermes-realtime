@@ -994,3 +994,47 @@ async def test_review_refusal_records_bounded_category_evidence(
         assert markers == [{key: category, "version": 1}]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("failure", ["open_port", "service_start", "bridge_start"])
+def test_failed_start_releases_profile_and_process_owner_without_unload(
+    tmp_path: Path, failure: str,
+) -> None:
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    hermes = FakeHermes()
+    if failure == "service_start":
+        hermes.compat_failures = ("missing:SessionDB",)
+    host = _host(tmp_path, hermes, [])
+    if failure == "open_port":
+        def fail_open() -> FakeHermes:
+            raise RuntimeError("open failed")
+        host._open_port = fail_open
+    elif failure == "bridge_start":
+        class FailedBridge(_Bridge):
+            async def start(self) -> None:
+                raise RuntimeError("bridge failed")
+        host._bridge_factory = lambda voice: FailedBridge(voice, [])
+    successor = _host(tmp_path, FakeHermes(), [])
+    contender = _host(tmp_path, FakeHermes(), [])
+    try:
+        host.start()
+        assert host._thread is not None
+        host._thread.join(5)
+        assert not host._thread.is_alive()
+        assert host.wait_ready(0) is False
+        descriptor = lock_run_record(tmp_path / "companion.db")
+        assert descriptor is not None
+        unlock_run_record(descriptor)
+        assert successor.start()
+        assert successor.wait_ready(5)
+        # A late unload from the failed predecessor must preserve the successor.
+        host.close()
+        assert lock_run_record(tmp_path / "companion.db") is None
+        assert successor.service is not None
+        with pytest.raises(RuntimeError, match="multiplex"):
+            contender.start()
+    finally:
+        host.close()
+        successor.close()
+        contender.close()

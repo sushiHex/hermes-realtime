@@ -586,7 +586,6 @@ class VoiceCompanionHost:
     def close(self) -> None:
         """Stop the bridge, release every lease, close the store; bounded."""
 
-        global _owner
         thread = self._thread
         if thread is None:
             return
@@ -600,17 +599,26 @@ class VoiceCompanionHost:
         if thread.is_alive():
             _marker({"failure": "close_timeout", "version": 1})
             raise RuntimeError("the companion did not stop before the close timeout")
+        self._release_ownership()
+
+    def _release_ownership(self) -> None:
+        global _owner
         with _owner_lock:
             profile_lock, self._profile_lock = self._profile_lock, None
             if profile_lock is not None:
-                unlock_run_record(profile_lock)  # Last: every lease is released by now.
+                unlock_run_record(profile_lock)
             if _owner is self:
                 _owner = None
 
     def _run(self) -> None:
-        # The marker already carries the evidence; a thread has nobody to raise to.
-        with contextlib.suppress(BaseException):
-            asyncio.run(self._main())
+        try:
+            # The marker already carries the evidence; a thread has nobody to raise to.
+            with contextlib.suppress(BaseException):
+                asyncio.run(self._main())
+        finally:
+            # asyncio.run has settled owned tasks and its executor before handoff,
+            # even when startup fails and Hermes never calls the unload hook.
+            self._release_ownership()
 
     async def _main(self) -> None:
         stop = asyncio.Event()
