@@ -979,7 +979,7 @@ class LocalHermesBridgeServer:
                 type(event) is WorkCompletedEvent
                 and event.payload.status == WorkTerminalStatus.COMPLETED
                 and event.payload.summary is not None
-                and len(event.payload.summary.encode("utf-16-le")) // 2 > MAX_LEGACY_RESULT_CHARS
+                and len(event.payload.summary) > MAX_LEGACY_RESULT_CHARS
                 and COMPLETED_RESULT_CAPABILITY not in route.connection.capabilities
             ):
                 # Project for this recipient; retained terminal evidence stays exact.

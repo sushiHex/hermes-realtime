@@ -1266,7 +1266,8 @@ async def test_bridge_refuses_tracking_capacity_before_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_bridge_projection_counts_utf16_units() -> None:
+@pytest.mark.parametrize("characters", [513, 1024, 1025])
+async def test_legacy_bridge_projection_counts_scalars(characters: int) -> None:
     from hermes_realtime.result_limits import LEGACY_RESULT_NOTICE
 
     service, completions = bridge_components()
@@ -1284,11 +1285,12 @@ async def test_legacy_bridge_projection_counts_utf16_units() -> None:
             writer.write(request().model_dump_json().encode("utf-8") + b"\n")
             await writer.drain()
             await reader.readline()
-            text = "\U0001f642" * 513
+            text = "\U0001f642" * characters
             await server.complete("deleg_task_001", status="completed", summary=text)
             terminal = parse_event(await reader.readline())
             assert isinstance(terminal, WorkCompletedEvent)
-            assert terminal.payload.summary == LEGACY_RESULT_NOTICE
+            expected = text if characters <= 1024 else LEGACY_RESULT_NOTICE
+            assert terminal.payload.summary == expected
             retained = await completions.completed("deleg_task_001")
             assert retained is not None and retained.payload.summary == text
         finally:
