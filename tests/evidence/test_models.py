@@ -1378,6 +1378,40 @@ def _valid_event_path(m: ModuleType) -> tuple[Any, ...]:
     return tuple(snapshots)
 
 
+@pytest.mark.parametrize(
+    "texts", [("First.", " Second."), ("Second.", "First."), ("First.", "First."), ("foreign",)]
+)
+def test_segment_confirmations_are_ordered_nonoverlapping_chunks(texts) -> None:
+    m = _models()
+    events = list(_valid_event_path(m)[:5])
+    events[4] = _snapshot(
+        m,
+        m.EventKind.ASSISTANT_SEGMENT_GENERATED,
+        sequence=5,
+        payload=_payload(m, m.EventKind.ASSISTANT_SEGMENT_GENERATED, text="First. Second."),
+    )
+    for ordinal, text in enumerate(texts, 1):
+        events.append(
+            _snapshot(
+                m,
+                m.EventKind.ASSISTANT_CHUNK_TRANSPORT_CONFIRMED_FULL,
+                sequence=5 + ordinal,
+                payload=_payload(
+                    m,
+                    m.EventKind.ASSISTANT_CHUNK_TRANSPORT_CONFIRMED_FULL,
+                    text=text,
+                    chunk_ordinal=ordinal,
+                    evidence_chunk_id=_uuid(80 + ordinal),
+                ),
+            )
+        )
+    if texts == ("First.", " Second."):
+        assert m.validate_event_sequence(tuple(events)) is None
+    else:
+        with pytest.raises(m.EvidenceModelError, match="segment"):
+            m.validate_event_sequence(tuple(events))
+
+
 def _opening_events(
     m: ModuleType,
     *,

@@ -500,3 +500,17 @@ describe("durable mounted approval identity", () => {
     expect(decisions.map((value: any) => value.sequence)).toEqual([1, 1]);
   });
 });
+
+
+it("retires the current input lease after a lost approval acknowledgment", async () => {
+  const view = await mount(async () => { throw new Error("synthetic lost acknowledgment"); });
+  view.approve().click();
+  await vi.waitFor(() => expect(view.decisions).toHaveLength(1));
+  await vi.waitFor(() => expect(view.toggle.textContent).toBe("Connect"));
+  expect(view.approve().disabled).toBe(true);
+  expect(view.card().querySelector<HTMLButtonElement>(".approval-controls .secondary")!.disabled).toBe(true);
+  view.approve().click();
+  view.card().querySelector<HTMLButtonElement>(".approval-controls .secondary")!.click();
+  expect(view.decisions).toHaveLength(1);
+  expect(dom.window.document.body.textContent).toContain("Input acknowledgment was lost.");
+});

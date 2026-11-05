@@ -988,10 +988,15 @@ def _granted_sids(dacl: ctypes.c_void_p) -> tuple[str, ...]:
         if not advapi.GetAce(dacl, index, ctypes.byref(ace)):
             return ("",)
         header = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents
-        if header.AceType not in (_ACCESS_ALLOWED_ACE_TYPE, _ACCESS_ALLOWED_OBJECT_ACE_TYPE):
-            continue
         if header.AceFlags & _INHERIT_ONLY_ACE:
             continue
+        # Only the two parsed allow layouts and the known deny layouts are
+        # understood. Conditional/compound or future effective ACEs must not
+        # disappear from an owner-only proof.
+        if header.AceType in (0x01, 0x06, 0x0A, 0x0C):
+            continue
+        if header.AceType not in (_ACCESS_ALLOWED_ACE_TYPE, _ACCESS_ALLOWED_OBJECT_ACE_TYPE):
+            return ("",)
         offset = _ace_sid_offset(ace, header.AceType)
         if offset is None:
             return ("",)

@@ -392,6 +392,7 @@ def captured_passages(
 
 def render_presentation_response(
     formatted: Any, catalog: tuple[str, ...], api_mode: str, evidence: dict[str, Any],
+    *, passages: Passages,
 ) -> str:
     evidence["stage"] = "response-envelope"
     evidence.update(response_facts(formatted, "response", api_mode))
@@ -464,6 +465,10 @@ def render_presentation_response(
     evidence["stage"] = "source-id-unique"
     if len(ids) != len(set(ids)):
         raise ValueError("presentation-source-id-duplicate")
+    evidence["stage"] = "source-evidence"
+    if any(not any(kind in {"search", "extract"} and bool(text)
+                   for kind, text in passages[catalog[index]]) for index in ids):
+        raise ValueError("presentation-source-without-evidence")
     evidence["selected_source_count"] = len(ids)
     evidence["stage"] = "inline-links"
     if any(marker in (lead + "\n\n" + support).casefold()

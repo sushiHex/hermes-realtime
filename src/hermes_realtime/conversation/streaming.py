@@ -177,6 +177,13 @@ class _ReplayIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class _ForegroundInterruptionAuthority:
+    owner: object
+    revision: int
+    consumer: asyncio.Task[None]
+
+
+@dataclass(frozen=True, slots=True)
 class _RevokedForegroundOwner:
     consumer: asyncio.Task[None]
     lease: ForegroundTurnLease
@@ -432,6 +439,30 @@ class StreamingSpeechLoop:
     @property
     def active_turn_id(self) -> str | None:
         return self._active_turn_id
+
+    def _capture_interruption_authority(
+        self, turn_id: str,
+    ) -> _ForegroundInterruptionAuthority | None:
+        consumer = self._active_consumer
+        if (
+            self._closed or self._active_turn_id != turn_id
+            or consumer is None or consumer.done()
+        ):
+            return None
+        return _ForegroundInterruptionAuthority(self, self._authority_revision, consumer)
+
+    def _interruption_settled_naturally(self, authority: object) -> bool:
+        # Successful consumption includes producer, playback and ledger settlement.
+        # Every stop, replacement and failure invalidates the captured revision.
+        return (
+            type(authority) is _ForegroundInterruptionAuthority
+            and authority.owner is self
+            and not self._closed
+            and authority.revision == self._authority_revision
+            and authority.consumer.done()
+            and not authority.consumer.cancelled()
+            and authority.consumer.exception() is None
+        )
 
     def _resolve_evidence_admission(
         self,

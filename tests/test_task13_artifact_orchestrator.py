@@ -162,6 +162,16 @@ def test_verify_clean_tracked_candidate_rejects_unstaged_tracked_drift(tmp_path:
         orchestrator["verify_clean_tracked_candidate"](repository, baseline)
 
 
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_candidate_refuses_hidden_index_flags(tmp_path: Path, flag: str) -> None:
+    repository = _repository(tmp_path)
+    _git(repository, "update-index", flag, "payload.bin")
+    (repository / "payload.bin").write_bytes(b"hidden drift")
+    module = _orchestrator()
+    with pytest.raises(module["ArtifactOrchestrationError"], match="index flags"):
+        module["verify_clean_tracked_candidate"](repository)
+
+
 def test_verify_clean_tracked_candidate_ignores_untracked_artifact_paths(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     baseline = _git(repository, "rev-parse", "HEAD~1").decode("ascii").strip()

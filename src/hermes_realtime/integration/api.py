@@ -1262,7 +1262,20 @@ class HermesApiTaskSession:
             status = WorkTerminalStatus.COMPLETED
             terminal_payload = WorkCompletedPayload(status=status, summary=output)
         elif event == "run.failed":
-            reason = self._bounded_terminal_text(payload.get("error"), "reason")
+            refused_reason = False
+            try:
+                reason = self._bounded_terminal_text(payload.get("error"), "reason")
+            except RuntimeError:
+                # The authoritative terminal survives unusable presentation text.
+                refused_reason = True
+                reason = "Hermes run failed; error details could not be displayed"
+            finally:
+                if refused_reason:
+                    with contextlib.suppress(OSError, ValueError):
+                        print(
+                            '[hermes-result-refusal] {"category":"reason","version":1}',
+                            flush=True,
+                        )
             if len(reason) > _MAX_TERMINAL_REASON_CHARS:
                 # Privacy checks above ran on the full text; shorten only for presentation.
                 reason = reason[: _MAX_TERMINAL_REASON_CHARS - 1].rstrip() + "…"
@@ -1796,6 +1809,8 @@ class HermesApiTaskSession:
         if type(value) is not str or not value.strip():
             raise RuntimeError(f"Hermes API terminal {field_name} is missing")
         text = value.strip()
+        if field_name == "reason" and any(0xD800 <= ord(character) <= 0xDFFF for character in text):
+            raise RuntimeError(f"Hermes API terminal {field_name} contains invalid Unicode")
         if len(text) > _MAX_TERMINAL_TEXT_CHARS:
             raise RuntimeError(f"Hermes API terminal {field_name} exceeds the bound")
         if "deleg_" in text or _RUN_ID_DISCLOSURE.search(text) is not None:

@@ -316,9 +316,18 @@ class KnowledgePrefetchCoordinator:
         operation = self._operations.get(ticket)
         final_hash = _transcript_hash(normalized)
         if operation is not None and operation.transcript_hash == final_hash:
-            result = await self._await_with_budget(operation.task, budget)
-            if self._operations.get(ticket) is operation:
-                self._operations.pop(ticket, None)
+            try:
+                result = await self._await_with_budget(operation.task, budget)
+            except asyncio.CancelledError:
+                caller = asyncio.current_task()
+                if caller is not None and caller.cancelling():
+                    raise
+                if self._closed or ticket in self._revoked:
+                    return None
+                raise
+            finally:
+                if self._operations.get(ticket) is operation:
+                    self._operations.pop(ticket, None)
             if (
                 _timing_phases is not None
                 and operation.started_at[0] is not None
@@ -501,6 +510,7 @@ class KnowledgePrefetchCoordinator:
         self._operations.clear()
         self._partials.clear()
         self._admitted_turns.clear()
+        self._revoked.clear()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._owns_lookup:

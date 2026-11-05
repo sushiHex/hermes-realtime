@@ -124,7 +124,7 @@ the exact source commit, tree, archive/wheel/observation digests, process count,
 and derived assertions. Native CI runs this producer after source equivalence,
 revocation, and rollover, consuming the same Pure candidate wheel.
 
-Sixteen governed producers and the remaining installed and human-assisted
+Twelve governed producers and the remaining installed and human-assisted
 prerequisites remain unavailable or unqualified. These results cannot establish
 an accepted full `qualification-report-v1`, offline installed dependency closure,
 physical audibility, or general browser readiness.

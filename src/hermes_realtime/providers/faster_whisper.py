@@ -149,7 +149,8 @@ class FasterWhisperTranscriber:
             self._buffer.clear()
             operation = self._operation
         if operation is not None:
-            await asyncio.shield(operation)
+            # The transcription caller owns backend failures; cancellation owns settlement.
+            await asyncio.shield(asyncio.gather(operation, return_exceptions=True))
             async with self._lock:
                 if self._operation is operation:
                     self._operation = None

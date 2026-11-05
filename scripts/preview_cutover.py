@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -737,7 +738,7 @@ def native_web_evidence_contract(config: dict[str, Any]) -> str | None:
     return "hermes.web-evidence/v1" if web_evidence_selected(config) else None
 
 
-def verify_host_profile_mode(plan: PreviewPlanV1) -> None:
+def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> None:
     import importlib
     import inspect
 
@@ -750,7 +751,8 @@ def verify_host_profile_mode(plan: PreviewPlanV1) -> None:
         parameters = inspect.signature(module.build_local_host_launcher).parameters
         if plan.policy_mode == "native":
             require("hermes_discover_tools" in parameters, "native_discovery_unavailable")
-            config = _profile_config(_read(plan.profile_source / "config.yaml", _JSON_LIMIT))
+            config = _profile_config(
+                _read((home or plan.profile_source) / "config.yaml", _JSON_LIMIT))
             if native_web_evidence_contract(config) is not None:
                 require(
                     "hermes_web_evidence_contract" in parameters,
@@ -782,7 +784,7 @@ def preflight(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, Any]:
     verify_realtime_runtime(plan)
     verify_profile(plan, home or plan.profile_source)
     verify_cpu_speech(plan)
-    verify_host_profile_mode(plan)
+    verify_host_profile_mode(plan, home or plan.profile_source)
     verify_speech_assets(plan, home or plan.profile_source)
     return {
         "category": "preflight_ready",
@@ -1490,10 +1492,20 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> None:
         len(encoded) <= _JSON_LIMIT and not path.exists() and not path.is_symlink(),
         "output_receipt_refused",
     )
-    with path.open("xb") as stream:
-        stream.write(encoded)
-        stream.flush()
-        os.fsync(stream.fileno())
+    fd, temporary_name = tempfile.mkstemp(prefix=".receipt-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish a complete inode without replacing a receipt another writer owns.
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise PreviewRefusal("output_receipt_refused") from None
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _runtime_modules(plan: PreviewPlanV1) -> tuple[Any, Any]:
@@ -1810,8 +1822,9 @@ def serve(active_path: Path) -> int:
                     require(livekit_process.pid in members, "livekit_process_owner")
                     try:
                         health = request_json(base_url + "/health/detailed", token, timeout=3)
-                    except HTTPError:
-                        raise PreviewRefusal("gateway_health_refused") from None
+                    except HTTPError as error:
+                        if error.code not in {502, 503, 504}:
+                            raise PreviewRefusal("gateway_health_refused") from None
                     except ValueError:
                         raise PreviewRefusal("gateway_health_invalid") from None
                     except (OSError, TimeoutError):

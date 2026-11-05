@@ -380,6 +380,8 @@ async def test_a_tail_the_record_knows_as_deleted_is_never_restored(
         assert reopened.pending_deletes == () and reopened.deleted_previous is True
     else:
         assert reopened.pending_deletes == (("old", 0),)
+        assert reopened.acknowledge_forget(("old", 0))
+        assert reopened.deleted_previous
     await reopened.close()
     assert b"a deleted phrase" not in path.read_bytes()
 
@@ -498,7 +500,8 @@ async def test_a_version_1_tail_is_never_restored_once_a_delete_is_recorded(
     reopened, reopened_store = await _open(path, "fresh")
 
     assert reopened_store.snapshot().messages == ()
-    assert reopened.binding == ("fresh", 0)
+    assert reopened.binding == ("fresh", 2)
+    assert not reopened.deleted_previous
     await reopened.close()
     assert b"a deleted phrase" not in path.read_bytes()
 
@@ -565,7 +568,8 @@ async def test_a_stale_tail_of_any_earlier_deleted_conversation_is_never_restore
     reopened, reopened_store = await _open(path, "fresh")
 
     assert reopened_store.snapshot().messages == ()
-    assert reopened.binding == ("fresh", 1)
+    assert reopened.binding == ("fresh", 3)
+    assert not reopened.deleted_previous
     await reopened.close()
 
 
@@ -633,3 +637,118 @@ async def test_a_delete_of_a_conversation_no_batch_ever_left_completes_locally(
     assert writer.deleted_previous is True
     await writer.close()
     assert _recorded(path) == VoiceDeletes(outcome=("a", 0), live=("b", 1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["missing", "corrupt", "legacy"])
+@pytest.mark.parametrize("newest", ["outcome", "pending", "live"])
+async def test_reset_tail_delete_completion_supersedes_recorded_outcome(
+    tmp_path: Path, tail: str, newest: str,
+) -> None:
+    path = tmp_path / "tail.json"
+    pending = ("older", 9 if newest == "pending" else 7)
+    record = VoiceDeletes(
+        outcome=("previous", 9 if newest == "outcome" else 5),
+        live=("lost", 10 if newest == "live" else 6), pending=(pending,),
+    )
+    _deletes_path(path).write_bytes(voice_deletes_bytes(record))
+    if tail == "corrupt":
+        path.write_bytes(b"{malformed")
+    elif tail == "legacy":
+        _version_1_tail(path, "synthetic history")
+    writer, store = await _open(path, "fresh", "next")
+    try:
+        assert writer.binding == ("fresh", 10 if newest == "live" else 11)
+        old = await _forget(writer, store)
+        assert writer.acknowledge_forget(old)
+        assert writer.delete_outcome == old
+        assert writer.deleted_previous
+        assert writer.acknowledge_forget(pending)
+        assert writer.delete_outcome == old
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [0, 1])
+async def test_reset_tail_refuses_exhausted_retained_delete_generation(
+    tmp_path: Path, offset: int,
+) -> None:
+    from hermes_realtime.integration.voice_tail import MAX_IDENTITY
+
+    path = tmp_path / "tail.json"
+    _deletes_path(path).write_bytes(voice_deletes_bytes(
+        VoiceDeletes(outcome=("previous", MAX_IDENTITY - offset))
+    ))
+    with pytest.raises(RuntimeError, match="generation capacity"):
+        await _open(path, "fresh")
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["missing", "corrupt", "legacy", "unrelated"])
+@pytest.mark.parametrize("retained", ["outcome", "pending"])
+async def test_reset_does_not_attribute_an_unrelated_delete_outcome(
+    tmp_path: Path, tail: str, retained: str,
+) -> None:
+    path = tmp_path / "tail.json"
+    if tail == "corrupt":
+        path.write_bytes(b"{malformed")
+    elif tail == "legacy":
+        _version_1_tail(path, "synthetic unrelated history")
+    elif tail == "unrelated":
+        writer, store = await _open(path, "unrelated")
+        store.record_user_transcript(Transcript("synthetic unrelated history", final=True))
+        await writer.close()
+        document = json.loads(path.read_bytes())
+        document["archive"]["generation"] = 5
+        path.write_bytes(json.dumps(document).encode())
+    _deletes_path(path).write_bytes(voice_deletes_bytes(
+        VoiceDeletes(
+            outcome=("old", 5) if retained == "outcome" else None,
+            pending=(("old", 5),) if retained == "pending" else (),
+            live=("lost", 6),
+        )
+    ))
+    writer, store = await _open(path, "fresh", "next")
+    try:
+        assert not writer.deleted_previous
+        if retained == "pending":
+            assert writer.acknowledge_forget(("old", 5))
+            assert not writer.deleted_previous
+        assert writer.binding == ("fresh", 7)
+        await writer.close()
+        writer, store = await _open(path, "next")
+        assert writer.binding == ("fresh", 7)
+        assert not writer.deleted_previous
+        old = await _forget(writer, store)
+        assert writer.acknowledge_forget(old)
+        assert writer.delete_outcome == old
+        assert writer.deleted_previous
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_same_generation_foreign_pending_delete_cannot_claim_predecessor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tail.json"
+    writer, store = await _open(path, "old")
+    store.record_user_transcript(Transcript("synthetic history", final=True))
+    await writer.close()
+    _deletes_path(path).write_bytes(voice_deletes_bytes(
+        VoiceDeletes(pending=(("old", 0), ("other", 0)), live=("lost", 1))
+    ))
+    writer, store = await _open(path, "fresh", "next")
+    try:
+        assert writer.binding == ("fresh", 2)
+        assert writer.acknowledge_forget(("other", 0))
+        assert not writer.deleted_previous
+        assert writer.acknowledge_forget(("old", 0))
+        assert not writer.deleted_previous
+        old = await _forget(writer, store)
+        assert writer.acknowledge_forget(old)
+        assert writer.deleted_previous
+    finally:
+        await writer.close()

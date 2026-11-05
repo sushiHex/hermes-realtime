@@ -33,20 +33,33 @@ _BASELINE = {
 def _good() -> dict[str, object]:
     return {
         "recall": {
-            "review_finished": 1, "next": 1, "restart": 1, "gap_hours": 25, "gap": 1,
-            "non_ascii_over_cap": 1, "newest_correction": 1,
+            "review_finished": 1,
+            "next": 1,
+            "restart": 1,
+            "gap_hours": 25,
+            "gap": 1,
+            "non_ascii_over_cap": 1,
+            "newest_correction": 1,
         },
         "freshness": {
-            "finished_before_open": 2, "visible_at_open": 2,
-            "post_review_refresh": 1, "reads_turn": 0,
+            "finished_before_open": 2,
+            "visible_at_open": 2,
+            "post_review_refresh": 1,
+            "reads_turn": 0,
         },
         "isolation": {"bound": 1, "foreign": 0},
         "fail_closed": {
-            "absent": 1, "not_ready": 1, "quarantined": 1, "rebound": 1,
+            "absent": 1,
+            "not_ready": 1,
+            "quarantined": 1,
+            "rebound": 1,
         },
         "latency": {
-            "samples": 100, "p95_baseline_us": 100, "p95_memory_us": 120,
-            "p95_delta_us": 20, "reads_turn": 0,
+            "samples": 100,
+            "p95_baseline_us": 100,
+            "p95_memory_us": 120,
+            "p95_delta_us": 20,
+            "reads_turn": 0,
         },
         "authority": {
             "data_only": 1,
@@ -65,12 +78,22 @@ def _good() -> dict[str, object]:
             "refresh_notifications": 0,
         },
         "bounds": {
-            "memory_bytes": 4096, "user_bytes": 4096, "truncated": 1,
-            "deterministic": 1, "model_requests": 0,
+            "memory_bytes": 4096,
+            "user_bytes": 4096,
+            "truncated": 1,
+            "deterministic": 1,
+            "model_requests": 0,
         },
         "capability": {"unknown": 1, "partial": 1, "voice_continues": 1},
         "review_model_calls": 6,
         "unattributed": 0,
+        "proposal_boundary": {
+            "confirmation_attempts": 3,
+            "proposals_before_confirmation": 3,
+            "dispatches_before_confirmation": 0,
+            "cancellations_before_confirmation": 0,
+            "accepted_after_confirmation": 3,
+        },
     }
 
 
@@ -78,6 +101,16 @@ def test_exact_pinned_complete_witness_passes() -> None:
     assert _SCRIPT._passed(_good(), _BASELINE)
     assert not _SCRIPT._passed(_good(), _BASELINE | {"baseline": False})
     assert not _SCRIPT._passed(_good(), _BASELINE | {"commit": "another"})
+
+
+@pytest.mark.parametrize(
+    "field", ["dispatches_before_confirmation", "cancellations_before_confirmation"]
+)
+def test_memory_gate_requires_proposal_boundary(field) -> None:
+    observed = _good()
+    assert _SCRIPT._passed(observed, _BASELINE)
+    observed["proposal_boundary"][field] = 1
+    assert not _SCRIPT._passed(observed, _BASELINE)
 
 
 def test_faster_memory_turn_has_valid_negative_delta() -> None:

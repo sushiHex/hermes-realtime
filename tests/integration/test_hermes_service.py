@@ -298,8 +298,9 @@ async def test_completed_dispatch_idempotency_cache_is_bounded() -> None:
     await service.dispatch("participant_001", request("task_002", 3))
     repeated = await service.dispatch("participant_001", request("task_001", 5))
 
-    assert len(dispatcher.commands) == 3
-    assert repeated.payload.run_id == "run_003"
+    assert len(dispatcher.commands) == 2
+    assert repeated.payload.run_id == "run_001"
+    assert await service.active_run_ids() == frozenset({"run_001", "run_002"})
 
 
 @pytest.mark.asyncio
@@ -558,7 +559,10 @@ async def test_completed_retention_is_trimmed_without_later_admission() -> None:
     while len(dispatcher.commands) < 3:
         await asyncio.sleep(0)
     dispatcher.release.set()
-    await asyncio.gather(*pending)
+    acknowledgments = await asyncio.gather(*pending)
+    for acknowledgment in acknowledgments:
+        assert acknowledgment.payload.run_id is not None
+        await service.mark_terminal(acknowledgment.payload.run_id)
     await asyncio.sleep(0)
 
     assert len(service._dispatch_tasks) == 1
@@ -751,6 +755,7 @@ async def test_active_run_remains_cancellable_after_retry_cache_pruning() -> Non
     await service.mark_terminal("run_001")
 
     assert "run_001" not in service._run_bindings
+    assert "run_001" not in service._run_keys
 
 
 @pytest.mark.asyncio

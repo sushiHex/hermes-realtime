@@ -1199,3 +1199,100 @@ async def test_pending_terminal_survives_acknowledgment_transport_failure() -> N
         assert await service.active_run_ids() == frozenset()
     finally:
         await server.close()
+
+
+def test_completion_reason_refuses_lone_surrogate() -> None:
+    with pytest.raises(BridgeProtocolError):
+        LocalHermesBridgeServer._validate_completion_text("a\ud800b", completed=False)
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_tracking_capacity_before_dispatch() -> None:
+    from uuid import uuid4
+
+    class Dispatcher:
+        def __init__(self) -> None:
+            self.commands = []
+
+        async def dispatch(self, command: HermesDispatchCommand) -> str:
+            self.commands.append(command)
+            return "deleg_" + command.task_id
+
+    bindings = SessionBindings()
+    bindings.bind("participant_001", "session_001")
+    dispatcher = Dispatcher()
+    sequencer = EventSequencer()
+    service = HermesIntegrationService(
+        bindings=bindings,
+        dispatcher=dispatcher,
+        sequencer=sequencer,
+        event_id_factory=lambda: "evt_" + uuid4().hex,
+        clock=lambda: datetime.now(UTC),
+    )
+    completions = HermesCompletionRouter(
+        sequencer=sequencer,
+        max_retained_completions=1,
+        max_tracked_acknowledgments=1,
+        event_id_factory=lambda: "evt_" + uuid4().hex,
+        clock=lambda: datetime.now(UTC),
+    )
+    async with (
+        LocalHermesBridgeServer(
+            service=service, completions=completions, token="test-token-with-sufficient-entropy"
+        ) as server,
+        await LocalHermesBridgeClient.connect(
+            host=server.host,
+            port=server.port,
+            token="test-token-with-sufficient-entropy",
+            participant_id="participant_001",
+        ) as client,
+    ):
+        await client.send(request())
+        assert isinstance(await client.receive(), WorkDispatchAcknowledgedEvent)
+        # Full retention still permits an exact retry of the already tracked task.
+        await client.send(request())
+        replay = await client.receive()
+        assert isinstance(replay, WorkDispatchAcknowledgedEvent)
+        assert replay.payload.run_id == "deleg_task_001"
+        await client.send(
+            request().model_copy(
+                update={"task_id": "task_002", "event_id": "evt_request_002", "sequence": 8}
+            )
+        )
+        with pytest.raises(BridgeProtocolError):
+            await asyncio.wait_for(client.receive(), timeout=1)
+        assert len(dispatcher.commands) == 1
+        assert await service.active_run_ids() == frozenset({"deleg_task_001"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("characters", [513, 1024, 1025])
+async def test_legacy_bridge_projection_counts_scalars(characters: int) -> None:
+    from hermes_realtime.result_limits import LEGACY_RESULT_NOTICE
+
+    service, completions = bridge_components()
+    async with LocalHermesBridgeServer(
+        service=service, completions=completions, token="test-token-with-sufficient-entropy"
+    ) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        try:
+            await bridge_hello.authenticate(
+                reader,
+                writer,
+                "test-token-with-sufficient-entropy",
+                bridge_hello.hello("participant_001", ()),
+            )
+            writer.write(request().model_dump_json().encode("utf-8") + b"\n")
+            await writer.drain()
+            await reader.readline()
+            text = "\U0001f642" * characters
+            await server.complete("deleg_task_001", status="completed", summary=text)
+            terminal = parse_event(await reader.readline())
+            assert isinstance(terminal, WorkCompletedEvent)
+            expected = text if characters <= 1024 else LEGACY_RESULT_NOTICE
+            assert terminal.payload.summary == expected
+            retained = await completions.completed("deleg_task_001")
+            assert retained is not None and retained.payload.summary == text
+        finally:
+            writer.close()
+            await writer.wait_closed()

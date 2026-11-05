@@ -929,17 +929,24 @@ def test_host_parser_exposes_bounded_default_off_knowledge_controls() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", ["cancel", "sigterm"])
 async def test_host_cli_passes_moonshine_tier_to_host_builder(
     monkeypatch: pytest.MonkeyPatch,
+    shutdown: str,
 ) -> None:
     captured: dict[str, object] = {}
+    handlers = {}
+    if shutdown == "sigterm":
+        monkeypatch.setattr(host_launcher_module.sys, "platform", "linux")
+        monkeypatch.setattr(host_launcher_module.signal, "signal",
+                            lambda signum, callback: handlers.setdefault(signum, callback))
 
     class LauncherStub:
         async def start(self) -> str:
             return "http://127.0.0.1:8765/#bootstrap=private"
 
         async def close(self) -> None:
-            return None
+            captured["closed"] = True
 
     monkeypatch.setattr(host_launcher_module, "_load_tailnet_authorizer", lambda **_kwargs: None)
     monkeypatch.setattr(host_launcher_module, "_load_api_bearer", lambda _path: "b" * 32)
@@ -970,9 +977,20 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
     )
     running = asyncio.create_task(host_launcher_module._run_host_cli(args))
     await asyncio.sleep(0)
-    running.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    if shutdown == "cancel":
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+    else:
+        try:
+            assert host_launcher_module.signal.SIGTERM in handlers
+            handlers[host_launcher_module.signal.SIGTERM](host_launcher_module.signal.SIGTERM, None)
+            await asyncio.wait_for(running, timeout=1)
+        finally:
+            if not running.done():
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+    assert captured["closed"] is True
 
     assert captured["moonshine_model_tier"] == "small"
     assert captured["ollama_num_gpu"] == 0
@@ -989,6 +1007,40 @@ async def test_host_cli_passes_moonshine_tier_to_host_builder(
     assert captured["voice_tail"] == Path(
         r"C:\Users\owner\AppData\Local\HermesRealtime\state\voice-tail-v1.json"
     )
+
+
+@pytest.mark.asyncio
+async def test_local_cli_sigterm_closes_before_restoring_handler(monkeypatch):
+    handlers, events = {}, []
+    class Launcher:
+        async def start(self):
+            events.append("start")
+            return "http://127.0.0.1:8765"
+        async def close(self):
+            events.append("close")
+    def register(signum, callback):
+        if signum in handlers:
+            events.append("restore")
+            return handlers[signum]
+        handlers[signum] = callback
+        return 0
+    monkeypatch.setattr(launcher_module.sys, "platform", "linux")
+    monkeypatch.setattr(launcher_module.signal, "signal", register)
+    monkeypatch.setattr(launcher_module, "build_local_conversation_launcher",
+                        lambda **kwargs: Launcher())
+    from argparse import Namespace
+    args = Namespace(room="fixture", worker_identity="worker_fixture", port=8765,
+                     ollama_model="fixture", whisper_model="fixture", edge_voice="fixture")
+    running = asyncio.create_task(launcher_module._run_local_cli(args))
+    await asyncio.sleep(0)
+    try:
+        handlers[launcher_module.signal.SIGTERM](launcher_module.signal.SIGTERM, None)
+        await asyncio.wait_for(running, timeout=1)
+    finally:
+        if not running.done():
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+    assert events == ["start", "close", "restore"]
 
 
 def test_host_parser_accepts_bounded_repeatable_kokoro_pronunciations() -> None:

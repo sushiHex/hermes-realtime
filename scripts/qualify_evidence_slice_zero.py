@@ -1554,7 +1554,6 @@ def _validate_topology_semantics_v1(
 
     runner_identity = (topology["runnerPid"], topology["runnerCreationFiletime"])
     seen_identities: set[tuple[int, int]] = set()
-    creation_by_pid: dict[int, int] = {}
     artifact_roles = {
         "chrome_owned_descendant": "chrome_executable",
         "livekit_owned_descendant": "livekit_executable",
@@ -1588,6 +1587,10 @@ def _validate_topology_semantics_v1(
         job_identities = set(process_keys)
         if len(job_identities) != len(processes):
             _fail("qualification report: duplicate process identity")
+        # Process-group references within a Job carry only a PID. Keep that
+        # namespace unambiguous while allowing recycling across scenario Jobs.
+        if len({process["pid"] for process in processes}) != len(processes):
+            _fail("qualification report: PID is ambiguous within its scenario Job")
         process_by_identity = {
             (process["pid"], process["creationFiletime"]): process for process in processes
         }
@@ -1608,11 +1611,6 @@ def _validate_topology_semantics_v1(
             if identity in seen_identities:
                 _fail("qualification report: process identity appears in multiple records")
             seen_identities.add(identity)
-            previous_creation = creation_by_pid.setdefault(
-                process["pid"], process["creationFiletime"]
-            )
-            if previous_creation != process["creationFiletime"]:
-                _fail("qualification report: PID was reused with a different creation identity")
             parent_identity = (
                 process["parentPid"],
                 process["parentCreationFiletime"],
@@ -1635,6 +1633,14 @@ def _validate_topology_semantics_v1(
                 parent = process_by_identity[parent_identity]
                 if parent["creationFiletime"] > process["creationFiletime"]:
                     _fail("qualification report: child predates its retained parent identity")
+                ancestors = {identity}
+                ancestor = parent_identity
+                while ancestor != runner_identity:
+                    if ancestor in ancestors or ancestor not in process_by_identity:
+                        _fail("qualification report: descendant ancestry does not reach runner")
+                    ancestors.add(ancestor)
+                    retained = process_by_identity[ancestor]
+                    ancestor = (retained["parentPid"], retained["parentCreationFiletime"])
             if (
                 process["imageBasename"] != reference["basename"]
                 or process["imageSha256"] != reference["sha256"]

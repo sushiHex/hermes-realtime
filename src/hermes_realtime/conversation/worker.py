@@ -37,6 +37,7 @@ from hermes_realtime.speech import (
 from .actions import ConversationUpdateExecutor
 from .ingress import BoundedPcmIngress, IngressRecord
 from .knowledge import KnowledgePrefetchCoordinator
+from .streaming import _ForegroundInterruptionAuthority
 from .task_proposals import ConversationTaskProposals
 from .telemetry import KnowledgeTurnBudget, UtteranceTicket
 from .updates import _operation_failed
@@ -281,12 +282,14 @@ class ConversationSessionWorker:
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
+        self._interruption_authority: _ForegroundInterruptionAuthority | None = None
         self._response_operations: set[asyncio.Task[None]] = set()
         self._foreground_cleanup_task: asyncio.Task[None] | None = None
         self._stt_cleanup_task: asyncio.Task[None] | None = None
         self._response_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._binding_cleanup_timed_out = False
         self._binding_cleanup_needs_retry = False
+        self._binding_cleanup_settled = False
         self._audio_lock = asyncio.Lock()
         self._terminal_error: BaseException | None = None
         self._binding_close_operation: asyncio.Task[None] | None = None
@@ -371,6 +374,11 @@ class ConversationSessionWorker:
                     self._interruption_foreground_turn_id = (
                         self._actions.foreground_turn_id if interrupting else None
                     )
+                    self._interruption_authority = (
+                        self._actions._capture_foreground_interruption(
+                            self._interruption_foreground_turn_id
+                        ) if self._interruption_foreground_turn_id is not None else None
+                    )
                     self._interruption_committed = False
                     self._utterance_has_final_transcript = False
                     self._preliminary_final_transcript = None
@@ -413,7 +421,9 @@ class ConversationSessionWorker:
                             cancelled = await self._cancel_foreground_for_echo_promotion(
                                 turn_id
                             )
-                            if not cancelled:
+                            if not cancelled and not self._actions._foreground_settled_naturally(
+                                self._interruption_authority
+                            ):
                                 self._playback_candidate_authority_revoked = True
                         if cancelled and observer is not None:
                             observer("interrupt_requested", {"turnId": turn_id})
@@ -642,6 +652,7 @@ class ConversationSessionWorker:
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
+        self._interruption_authority = None
 
     async def _cancel_foreground_for_echo_promotion(self, turn_id: str) -> bool:
         try:
@@ -668,7 +679,8 @@ class ConversationSessionWorker:
             return
         cancelled = await self._cancel_foreground_for_echo_promotion(turn_id)
         if not cancelled:
-            self._playback_candidate_authority_revoked = True
+            if not self._actions._foreground_settled_naturally(self._interruption_authority):
+                self._playback_candidate_authority_revoked = True
             return
         observer = self._observer
         if observer is not None:
@@ -914,7 +926,19 @@ class ConversationSessionWorker:
     async def close_binding(self) -> None:
         """Stop only this media/STT generation for an authenticated reconnect."""
 
-        await asyncio.shield(self._ensure_binding_close())
+        operation = self._ensure_binding_close()
+        if (
+            self._binding_cleanup_settled
+            and operation.done()
+            and not operation.cancelled()
+            and self._terminal_error is not None
+            and operation.exception() is self._terminal_error
+        ):
+            # The first close reported this exact historical operation failure.
+            # Its resources have settled; the old generation keeps its error,
+            # while a fresh binding must still pass the shared executor's start.
+            return
+        await asyncio.shield(operation)
 
     async def _close_owned(self) -> None:
         errors: list[BaseException] = []
@@ -956,6 +980,7 @@ class ConversationSessionWorker:
         return operation
 
     async def _close_binding_owned(self) -> None:
+        self._binding_cleanup_settled = False
         recorder = self._production_observation_recorder
         coordinator = self._knowledge_coordinator
         if coordinator is not None:
@@ -1022,6 +1047,7 @@ class ConversationSessionWorker:
         self._binding_cleanup_needs_retry = _operation_failed(
             foreground_cleanup
         ) or _operation_failed(stt_cleanup)
+        cleanup_settled = not errors and not self._binding_cleanup_needs_retry
         if self._terminal_error is not None:
             errors.append(self._terminal_error)
         if errors:
@@ -1030,6 +1056,9 @@ class ConversationSessionWorker:
                     stage=CloseStageV1.BINDING_CLEANUP,
                     result=CloseResultV1.FAILED,
                 )
+            # Required close evidence must settle too, even when its failure
+            # aliases the historical operation exception.
+            self._binding_cleanup_settled = cleanup_settled
             if len(errors) == 1:
                 raise errors[0]
             raise BaseExceptionGroup("conversation session worker close failed", errors)
@@ -1038,6 +1067,7 @@ class ConversationSessionWorker:
                 stage=CloseStageV1.BINDING_CLEANUP,
                 result=CloseResultV1.SUCCEEDED,
             )
+        self._binding_cleanup_settled = cleanup_settled
 
     @staticmethod
     def _consume_cleanup_result(operation: asyncio.Task[None]) -> None:

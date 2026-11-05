@@ -344,6 +344,21 @@ def test_sdist_requires_exact_selected_source_blobs_and_wheel_metadata(source, c
             inspect_candidate_sdist(archive, identity, bound_wheel, raw)
 
 
+def test_sdist_corrupt_deflate_member_is_a_typed_refusal(source):
+    from scripts import candidate_wheel
+    from scripts.qualification_sdist import inspect_candidate_sdist
+
+    _, archive, identity, wheel = source
+    bound_wheel = candidate_wheel._verify_candidate_wheel_bytes_v1(
+        archive, identity, wheel, hashlib.sha256(wheel).hexdigest()
+    )
+    raw = bytearray(_sdist(source))
+    assert raw[3] == 0
+    raw[10] = 0x07
+    with pytest.raises(ValueError, match="bounded source profile"):
+        inspect_candidate_sdist(archive, identity, bound_wheel, bytes(raw))
+
+
 @pytest.fixture
 def dependency_graph(bound_graph):
     from scripts import qualify_evidence_slice_zero as core

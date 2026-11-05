@@ -136,7 +136,11 @@ def test_native_and_provider_contract_checks_precede_full_pytest_matrix(
 
 
 def _run(*command: str, cwd: Path) -> bytes:
-    return subprocess.run(command, cwd=cwd, check=True, capture_output=True).stdout
+    from scripts.release_gate import clean_git_environment
+
+    return subprocess.run(
+        command, cwd=cwd, env=clean_git_environment(), check=True, capture_output=True
+    ).stdout
 
 
 def test_public_release_gate_hashes_root_commit_against_empty_tree(tmp_path: Path) -> None:
@@ -288,12 +292,12 @@ def test_public_gate_has_no_private_history_baseline(
     monkeypatch.setitem(
         gate.__globals__,
         "canonical_candidate_diff_sha256",
-        lambda source, baseline: events.append(("diff", source, baseline)) or "0" * 64,
+        lambda source, baseline, **kwargs: events.append(("diff", source, baseline)) or "0" * 64,
     )
     monkeypatch.setitem(
         gate.__globals__,
         "scan_git_blobs",
-        lambda source: events.append(("scan", source)),
+        lambda source, **kwargs: events.append(("scan", source)),
     )
     monkeypatch.setitem(
         gate.__globals__,
@@ -416,9 +420,11 @@ def test_release_gate_prints_the_one_revision_it_archives(
 
     monkeypatch.setitem(gate.__globals__, "_resolved_commit_oid", observed_resolve)
     monkeypatch.setitem(
-        gate.__globals__, "canonical_candidate_diff_sha256", lambda source, baseline: digest
+        gate.__globals__,
+        "canonical_candidate_diff_sha256",
+        lambda source, baseline, **kwargs: digest,
     )
-    monkeypatch.setitem(gate.__globals__, "scan_git_blobs", lambda source: None)
+    monkeypatch.setitem(gate.__globals__, "scan_git_blobs", lambda source, **kwargs: None)
     monkeypatch.setitem(
         gate.__globals__,
         "git_archive",

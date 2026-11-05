@@ -1,5 +1,6 @@
 import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
+import { ReloadRebindRefused } from "../src/controller";
 import { connectionFailureCategory, ConnectionRequestRejected, renderConnectionRecovery } from "../src/connection-recovery";
 
 describe("connection recovery guidance", () => {
@@ -11,6 +12,8 @@ describe("connection recovery guidance", () => {
     activation: "Session activation failed",
     configuration: "Session configuration failed",
     stop: "Session disconnect was not confirmed",
+    worker: "Speech worker disconnected",
+    projection: "Conversation updates unavailable",
   } as const;
 
   it.each(Object.entries(messages))("renders fixed %s guidance beside populated history", (stage, title) => {
@@ -33,6 +36,7 @@ describe("connection recovery guidance", () => {
     [409, "request-refused"], [503, "service-unavailable"], [500, "request-refused"],
   ] as const)("classifies HTTP %s without response content", (status, category) => {
     expect(connectionFailureCategory(new ConnectionRequestRejected(status))).toBe(category);
+    expect(connectionFailureCategory(new ReloadRebindRefused(status))).toBe(category);
   });
 
   it("does not display exception text or infer a cause from it", () => {

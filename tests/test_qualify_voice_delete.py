@@ -12,6 +12,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import qualify_voice_delete as m3  # noqa: E402
 
 
+@pytest.mark.asyncio
+async def test_delete_worker_records_observed_hermes_version(tmp_path, monkeypatch) -> None:
+    from types import ModuleType
+
+    hermes = ModuleType("hermes_cli")
+    hermes.__version__ = "observed-fixture-version"
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes)
+
+    async def core(home):
+        return {}
+
+    monkeypatch.setattr(m3, "_core", core)
+    await m3._run_worker("core", tmp_path)
+    assert (tmp_path / "hermes-version.txt").read_text(encoding="utf-8") == hermes.__version__
+
+
 def _good() -> dict[str, object]:
     return copy.deepcopy(m3._EXPECTED)
 

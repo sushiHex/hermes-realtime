@@ -734,6 +734,26 @@ def test_the_database_scan_reads_every_table_and_full_text_index(tmp_path: Path)
         rehearsal.phrase_in_database(tmp_path / "missing.db", "hoopoe")
 
 
+def test_database_scan_refuses_an_unreadable_table_instead_of_reporting_zero(tmp_path, monkeypatch):
+    database = tmp_path / "state.db"
+    database.touch()
+    class Query:
+        def fetchall(self):
+            return [("messages", "CREATE TABLE messages (body TEXT)")]
+    class Connection:
+        def execute(self, query, *args):
+            if query.startswith("SELECT name"):
+                return Query()
+            if query.startswith("PRAGMA"):
+                return type("Columns", (), {"fetchall": lambda self: [(0, "body")]})()
+            raise sqlite3.DatabaseError("synthetic unreadable table")
+        def close(self):
+            pass
+    monkeypatch.setattr(rehearsal.sqlite3, "connect", lambda *args, **kwargs: Connection())
+    with pytest.raises(sqlite3.DatabaseError):
+        rehearsal.phrase_in_database(database, "fixture")
+
+
 def test_the_file_scan_reads_every_file_and_refuses_a_missing_directory(tmp_path: Path) -> None:
     (tmp_path / "sessions" / "nested").mkdir(parents=True)
     (tmp_path / "sessions" / "a.json").write_text('{"t":"x"}', encoding="utf-8")
@@ -744,6 +764,7 @@ def test_the_file_scan_reads_every_file_and_refuses_a_missing_directory(tmp_path
         rehearsal.phrase_in_files(tmp_path / "memories", "hoopoe")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows rehearsal Git process/path policy")
 def test_the_harness_matches_head_only_when_tracked_and_unchanged(tmp_path: Path) -> None:
     import subprocess
 
@@ -1021,6 +1042,7 @@ def _pinned_source(root: Path, paths: tuple[str, ...]) -> str:
 
 
 @pytest.mark.parametrize(("spare", "refused"), [(0, True), (1, False)])
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows rehearsal Git process/path policy")
 def test_a_run_directory_too_long_for_the_pinned_checkout_is_refused_before_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spare: int, refused: bool
 ) -> None:
@@ -1341,6 +1363,7 @@ def test_a_lock_directory_that_cannot_be_made_is_refused_with_its_own_category(
 
 
 @pytest.mark.parametrize(("spare", "refused"), [(0, True), (1, False)])
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows rehearsal Git process/path policy")
 def test_a_long_directory_needs_room_for_a_short_name_inside_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spare: int, refused: bool
 ) -> None:
@@ -1363,6 +1386,7 @@ def test_a_long_directory_needs_room_for_a_short_name_inside_it(
         assert (checkout / directory / "a.py").exists()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows rehearsal Git process/path policy")
 def test_path_lengths_count_utf16_units_as_windows_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

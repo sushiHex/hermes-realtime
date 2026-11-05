@@ -9,6 +9,8 @@ import socket
 def canonical_remote_hostname(value: str, *, boundary: str) -> str:
     """Return a canonical ASCII hostname that is not a loopback/unspecified alias."""
 
+    if not value or any(ord(character) <= 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{boundary} hostname is invalid")
     try:
         value.encode("ascii")
     except UnicodeEncodeError:

@@ -48,6 +48,47 @@ FIELDS = frozenset(
 )
 
 
+_SETUP_REFUSALS = frozenset({
+    "candidate_binding",
+    "candidate_dirty",
+    "hermes_binding",
+    "hermes_untracked_python",
+    "json_bound",
+    "json_duplicate",
+    "local_key_required",
+    "manifest_digest",
+    "manifest_fields",
+    "manifest_key_name",
+    "manifest_model",
+    "manifest_objective",
+    "manifest_path",
+    "manifest_ports",
+    "manifest_version",
+    "member_name",
+    "member_path",
+    "output_scope",
+    "path_link",
+    "private_directory_handle",
+    "record_bound",
+    "record_bytes",
+    "record_self",
+    "record_set",
+    "source_wheel",
+    "target_bound",
+    "target_bytes",
+    "target_file",
+    "target_link",
+    "target_origin",
+    "target_set",
+    "wheel_bound",
+    "wheel_digest",
+    "wheel_distribution",
+    "wheel_names",
+    "wheel_namespace",
+    "windows_required",
+})
+
+
 def require(value: Any, category: Any) -> Any:
     if not value:
         raise ValueError(category)
@@ -438,7 +479,7 @@ def main(argv: Any = None) -> Any:
         # Preserve only the model helper's existing fixed, source-owned enum.
         # Arbitrary native ValueError text must never become public output.
         model_module = sys.modules.get("scripts.lookup_backend_model")
-        allowed: frozenset[str] = getattr(model_module, "_REFUSALS", frozenset())
+        allowed = _SETUP_REFUSALS | getattr(model_module, "_REFUSALS", frozenset())
         if (
             type(error) in {ValueError, RuntimeError, TimeoutError}
             and len(error.args) == 1

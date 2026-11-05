@@ -681,6 +681,29 @@ def test_validators_revalidate_schema_and_input_paths_before_return(
         _release_validate(context)
 
 
+def test_report_accepts_recycled_pid_in_sequential_jobs(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    report = deepcopy(context["report"])
+    first, second = report["topology"]["jobs"][:2]
+    root = second["processes"][0]
+    root["pid"] = first["processes"][0]["pid"]
+    root["processGroupId"] = root["pid"]
+    assert _report_validate(context, _canonical(report))["passed"] is True
+
+
+def test_report_rejects_equal_time_descendant_cycle(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    report = deepcopy(context["report"])
+    root = report["topology"]["jobs"][0]["processes"][0]
+    for pid, parent in ((50000, 50001), (50001, 50000)):
+        child = deepcopy(root)
+        child.update(pid=pid, parentPid=parent, creationFiletime=20000,
+                     parentCreationFiletime=20000, processGroupId=root["pid"], role="host_runtime")
+        report["topology"]["jobs"][0]["processes"].append(child)
+    with pytest.raises(context["runner"].QualificationInputError, match="ancestry"):
+        _report_validate(context, _canonical(report))
+
+
 def _controlled_descendant(report: dict[str, Any], role: str, basename: str, digest: str) -> None:
     root = report["topology"]["jobs"][0]["processes"][0]
     child = deepcopy(root)

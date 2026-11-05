@@ -399,3 +399,23 @@ async def test_diagnostic_sink_failure_does_not_reopen_completed_authority(
         assert session._runs_by_task == session._runs_by_api == {}
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [None, "", "x" * 5000, "failure at run_0123456789abcdef", "a\ud800b"],
+    ids=["missing", "empty", "oversize", "private", "surrogate"],
+)
+async def test_unusable_error_still_settles_failed_run(error: object) -> None:
+    session, authority = _session()
+    try:
+        await session._consume_event(
+            authority, {"event": "run.failed", "run_id": _RUN_ID, "error": error}
+        )
+        terminal = await session.next_update()
+        assert terminal.payload.status is WorkTerminalStatus.FAILED
+        assert terminal.payload.reason == "Hermes run failed; error details could not be displayed"
+        assert authority.terminal
+    finally:
+        await session.close()

@@ -230,6 +230,30 @@ describe("voice conversation deletion control", () => {
     dom.window.close();
   });
 
+  it("reconciles a lost delete acknowledgment after the first status request also fails", async () => {
+    let statusCalls = 0;
+    const { dom, status, controls } = mount({
+      confirm: () => true,
+      request: async (path) => {
+        if (path === "/api/v1/delete-voice-conversation") throw new Error("lost response");
+        statusCalls += 1;
+        if (statusCalls === 2) throw new Error("temporary status outage");
+        return response(statusCalls === 1 ? "idle" : "complete");
+      },
+      clear: () => undefined,
+      pollIntervalMs: 5,
+    });
+    try {
+      await controls.refresh();
+      await controls.delete();
+      await vi.waitFor(() => expect(status.textContent).toBe("Voice conversation deleted."));
+      expect(statusCalls).toBe(3);
+    } finally {
+      controls.reset();
+      dom.window.close();
+    }
+  });
+
   it("does not poll an unavailable host it never saw a delete pending on", async () => {
     const { dom, controls } = mount({
       confirm: () => true,

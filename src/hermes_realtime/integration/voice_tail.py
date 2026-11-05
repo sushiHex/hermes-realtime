@@ -902,8 +902,8 @@ class VoiceTailWriter:
     def deleted_previous(self) -> bool:
         """Whether the last completed delete retired the conversation before this one.
 
-        A delete always replaces its conversation with the next generation, so the
-        completed binding is the immediate predecessor exactly when its generation is.
+        Retirement reserves the adjacent generation only for the exact predecessor
+        binding. An unrelated reset skips it rather than claiming that completion.
         """
         outcome = self._deletes.outcome
         return type(outcome) is tuple and outcome[1] + 1 == self._generation
@@ -944,7 +944,7 @@ class VoiceTailWriter:
         offered = self._cursor is not None or self._frozen > 0
         # All changes before the first suspension run on the event loop as one transition.
         store.clear_voice_history()
-        self._retire(new_id, old[1] + 1)
+        self._retire(new_id, old[1] + 1, previous=old)
         if offered:
             self._deletes = replace(self._deletes, pending=(*self._deletes.pending, old))
         else:
@@ -957,8 +957,23 @@ class VoiceTailWriter:
             await self._tick.wait()
         return old
 
-    def _retire(self, new_id: str, generation: int) -> None:
+    def _retire(
+        self, new_id: str, generation: int, *, previous: tuple[str, int] | None = None,
+    ) -> None:
         """Start the next binding with an empty outbox and fresh review progress."""
+        # A reset tail must not restart the ordering of retained delete outcomes.
+        recorded = (*self._deletes.pending, self._deletes.outcome)
+        generation = max(generation, max((item[1] + 1 for item in recorded if item), default=0))
+        if self._deletes.live is not None:
+            generation = max(generation, self._deletes.live[1])
+        if any(
+            binding is not None and generation == binding[1] + 1 and previous != binding
+            for binding in recorded
+        ):
+            # A pending delete may later become the outcome; reserve its scope too.
+            generation += 1
+        if generation > MAX_IDENTITY:
+            raise RuntimeError("voice generation capacity is exhausted")
         self._conversation_id = new_id
         self._generation = generation
         # The record names the live binding before any tail carries it.
@@ -1419,7 +1434,8 @@ class VoiceTailWriter:
                     self._deletes = replace(self._deletes, pending=pending)
                 if unproven:
                     self._retire(
-                        self._new_id(), 0 if binding is None else binding[1] + 1
+                        self._new_id(), 0 if binding is None else binding[1] + 1,
+                        previous=binding,
                     )
                     evidence = {"retired": 1, "version": 1}
                     return

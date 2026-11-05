@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import ssl
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -373,16 +375,30 @@ class BrowserClientRuntime:
         return f"{self._origin}/#bootstrap={self._capability.token}"
 
     async def _watch_browser_lease(self) -> None:
+        close_pending = False
+        failed_stage: str | None = None
         while True:
             await asyncio.sleep(self._lease_check_interval)
+            stage = "server_close" if close_pending else "expiry"
+            evidence = None
             try:
-                expired = await self._sessions.expire_if_inactive()
-            except Exception:
-                continue
-            if expired and not self._persistent_mode:
-                await self._server.close()
-                self._started = False
-                return
+                if not close_pending:
+                    expired = await self._sessions.expire_if_inactive()
+                    close_pending = expired and not self._persistent_mode
+                    failed_stage = None
+                if close_pending:
+                    stage = "server_close"
+                    await self._server.close()
+                    self._started = False
+                    return
+            except Exception as error:
+                if failed_stage != stage:
+                    evidence = {"failure": type(error).__name__, "stage": stage, "version": 1}
+                failed_stage = stage
+            finally:
+                if evidence is not None:
+                    with suppress(OSError, ValueError):
+                        print("[browser-lease] " + json.dumps(evidence, sort_keys=True), flush=True)
 
     async def close(self) -> None:
         """Close browser ingress before closing conversation authority."""

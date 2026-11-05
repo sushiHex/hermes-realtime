@@ -121,7 +121,7 @@ class BrowserBootstrapApplication:
             or parsed.fragment
         ):
             raise ValueError("allowed_origin must be an exact HTTP origin")
-        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost"}:
+        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("non-loopback browser origins require HTTPS")
 
         self._sessions = sessions

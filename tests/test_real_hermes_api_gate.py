@@ -1127,3 +1127,83 @@ async def test_the_command_refuses_an_interpreter_that_cannot_import_it(tmp_path
         "stage": "import",
         "version": 1,
     }
+
+
+class _BehaviorSession:
+    def __init__(self, witness, *, drift=None, execute_rejected=False):
+        self.witness = witness
+        self.drift = drift
+        self.execute_rejected = execute_rejected
+        self.decided = asyncio.Event()
+        self.phase = 0
+        self.probe = None
+
+    async def start(self):
+        pass
+
+    async def dispatch(self, request):
+        import shlex
+        from types import SimpleNamespace
+
+        self.phase += 1
+        self.request = request
+        if self.phase == 2:
+            command = request.payload.objective.split("alternative: ", 1)[1].split(
+                ". If approval", 1
+            )[0]
+            self.probe = Path(shlex.split(command)[-1])
+            self.witness({"actionable": True, "approvalId": "approval_synthetic"})
+        return SimpleNamespace(
+            task_id=request.task_id,
+            payload=SimpleNamespace(accepted=True, run_id=f"deleg_phase{self.phase}"),
+        )
+
+    async def next_update(self):
+        from types import SimpleNamespace
+
+        if self.phase == 2:
+            await self.decided.wait()
+        task_id, run_id = self.request.task_id, f"deleg_phase{self.phase}"
+        if self.drift == (self.phase, "task"):
+            task_id = "task_other"
+        if self.drift == (self.phase, "run"):
+            run_id = "deleg_other"
+        status = (
+            _GATE.WorkTerminalStatus.INTERRUPTED
+            if self.phase == 3
+            else _GATE.WorkTerminalStatus.COMPLETED
+        )
+        return SimpleNamespace(
+            task_id=task_id, run_id=run_id, payload=SimpleNamespace(status=status)
+        )
+
+    async def decide_approval(self, **kwargs):
+        assert kwargs["decision"] == "reject"
+        if self.execute_rejected and self.probe.exists():
+            # Reproduce the effect of the exact chmod command without a shell or model.
+            self.probe.chmod(0o777)
+        self.decided.set()
+
+    async def cancel(self, request):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(payload=SimpleNamespace(accepted=True))
+
+
+@pytest.mark.asyncio
+async def test_approval_rejection_oracle_discriminates_actual_command_execution():
+    witness = _GATE._ApprovalWitness()
+    session = _BehaviorSession(witness, execute_rejected=True)
+    with pytest.raises(Refusal):
+        await _GATE._behaviors(session, witness, {})
+    assert session.probe is not None and not session.probe.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [1, 2, 3])
+@pytest.mark.parametrize("field", ["task", "run"])
+async def test_each_behavior_terminal_is_bound_to_exact_dispatch(phase, field):
+    witness = _GATE._ApprovalWitness()
+    session = _BehaviorSession(witness, drift=(phase, field))
+    with pytest.raises(Refusal):
+        await _GATE._behaviors(session, witness, {})

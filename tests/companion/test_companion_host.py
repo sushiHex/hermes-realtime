@@ -965,3 +965,32 @@ def test_submit_requires_a_ready_host(tmp_path: Path) -> None:
         host.submit(coroutine)
     coroutine.close()
     asyncio.run(asyncio.sleep(0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["not_ready", "backend"])
+async def test_review_refusal_records_bounded_category_evidence(
+    tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    service, store = _service(tmp_path, FakeHermes())
+    if failure == "backend":
+        service._review = _AcceptingReview()  # type: ignore[assignment]
+        def broken(_conversation_id: str) -> None:
+            raise OSError("synthetic private detail")
+        store.deletion = broken  # type: ignore[method-assign]
+    try:
+        response = await service.review(_review_event("conv"))
+        if failure == "not_ready":
+            assert type(response) is VoiceReviewRefusedEvent
+        else:
+            assert response is None
+        output = capsys.readouterr().out
+        assert "synthetic private detail" not in output
+        markers = [json.loads(line.removeprefix(_HOST_MARKER))
+                   for line in output.splitlines() if line.startswith(_HOST_MARKER)]
+        key, category = (
+            ("refusal", "not_ready") if failure == "not_ready" else ("failure", "OSError")
+        )
+        assert markers == [{key: category, "version": 1}]
+    finally:
+        store.close()

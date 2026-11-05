@@ -75,7 +75,10 @@ async def test_native_preview_forwards_evidence_contract_to_actual_launcher(tmp_
 
 
 @pytest.mark.parametrize("fault", [None, "origin", "config"])
-def test_presentation_validation_binds_verified_runtime_before_use(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("staged", [False, True])
+def test_presentation_validation_binds_verified_runtime_before_use(
+    tmp_path, monkeypatch, fault, staged,
+):
     from hermes_realtime.integration.presentation_transport import Presentation
 
     plan_path, profile = _plan(tmp_path)
@@ -93,6 +96,13 @@ def test_presentation_validation_binds_verified_runtime_before_use(tmp_path, mon
         web_evidence=True, presentation=route
     )
     config_path.write_text(json.dumps(config))
+    home = profile
+    if staged:
+        home = tmp_path / "staged-profile"
+        home.mkdir()
+        (home / "config.yaml").write_text(json.dumps(config))
+        config["plugins"]["entries"]["hermes-realtime"]["settings"]["web_evidence"] = False
+        config_path.write_text(json.dumps(config))
 
     def build(*, hermes_discover_tools=False, hermes_web_evidence_contract=None):
         pass
@@ -111,10 +121,10 @@ def test_presentation_validation_binds_verified_runtime_before_use(tmp_path, mon
         lambda name: host if name.endswith("host_launcher") else presentation,
     )
     if fault is None:
-        preview_cutover.verify_host_profile_mode(plan)
+        preview_cutover.verify_host_profile_mode(plan, home)
     else:
         with pytest.raises(ValueError, match="native_web_presentation_" + fault):
-            preview_cutover.verify_host_profile_mode(plan)
+            preview_cutover.verify_host_profile_mode(plan, home)
 
 
 
@@ -125,6 +135,52 @@ def test_failure_metadata_keeps_operator_category_without_echoing_dependency_err
         assert preview_cutover._failure_status(error)["failure_category"] == "runtime_import_origin"
     private = "synthetic_private_exception_value"
     assert private not in json.dumps(preview_cutover._failure_status(ValueError(private)))
+
+
+def test_receipt_is_invisible_until_fsynced_and_never_overwrites(tmp_path, monkeypatch):
+    path = tmp_path / "ready.json"
+    observed = []
+    fsync = preview_cutover.os.fsync
+
+    def inspect_before_publish(fd):
+        observed.append(path.exists())
+        fsync(fd)
+
+    monkeypatch.setattr(preview_cutover.os, "fsync", inspect_before_publish)
+    preview_cutover._write_new(path, {"ready": True})
+    assert observed == [False]
+    assert json.loads(path.read_text()) == {"ready": True}
+    with pytest.raises(ValueError, match="output_receipt_refused"):
+        preview_cutover._write_new(path, {"ready": False})
+    assert json.loads(path.read_text()) == {"ready": True}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_receipt_publication_cannot_replace_a_competing_writer(tmp_path, monkeypatch):
+    path = tmp_path / "ready.json"
+    fdopen = preview_cutover.os.fdopen
+    def competitor(*args, **kwargs):
+        path.write_text('{"owner":"other"}')
+        return fdopen(*args, **kwargs)
+    monkeypatch.setattr(preview_cutover.os, "fdopen", competitor)
+    with pytest.raises(ValueError, match="output_receipt_refused"):
+        preview_cutover._write_new(path, {"owner": "this"})
+    assert json.loads(path.read_text()) == {"owner": "other"}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_preflight_passes_the_staged_home_to_every_profile_check(tmp_path, monkeypatch):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    home = tmp_path / "staged"
+    called = []
+    monkeypatch.setattr(preview_cutover, "verify_realtime_runtime", lambda p: None)
+    monkeypatch.setattr(preview_cutover, "verify_cpu_speech", lambda p: None)
+    for name in ("verify_profile", "verify_host_profile_mode", "verify_speech_assets"):
+        monkeypatch.setattr(preview_cutover, name, lambda p, h, name=name: called.append((name, h)))
+    preview_cutover.preflight(plan, home)
+    assert called == [(name, home) for name in (
+        "verify_profile", "verify_host_profile_mode", "verify_speech_assets")]
 
 
 def test_base_environment_preserves_programfiles_without_passing_credentials(monkeypatch):

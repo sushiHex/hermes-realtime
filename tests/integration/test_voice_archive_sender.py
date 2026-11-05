@@ -380,3 +380,30 @@ def test_the_sender_options_are_bounded() -> None:
             VoiceArchiveSender(writer, connect, **options)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         VoiceArchiveSender(object(), connect)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_missing_capability_marker_is_once_per_episode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    companion = _Companion(frozenset())
+    writer = VoiceTailWriter(tmp_path / "tail.json", conversation_ids=lambda: "conv")
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    sender = VoiceArchiveSender(writer, companion.connect)
+    try:
+        _say(store, "synthetic row")
+        from hermes_realtime.integration.voice_archive import archive_event
+        event = archive_event(await writer.next_batch())
+        assert await sender._exchange(event, resend=False) == "unknown"
+        assert await sender._exchange(event, resend=True) == "unknown"
+        assert _markers(capsys.readouterr().out) == [{"refusal": "capability", "version": 1}]
+        companion.capabilities = frozenset({"voice_archive"})
+        assert await sender._exchange(event, resend=True) == "acknowledged"
+        await sender._drop()
+        companion.capabilities = frozenset()
+        assert await sender._exchange(event, resend=False) == "unknown"
+        assert _markers(capsys.readouterr().out) == [{"refusal": "capability", "version": 1}]
+    finally:
+        await sender.close()
+        await writer.close()

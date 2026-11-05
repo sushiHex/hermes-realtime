@@ -13,19 +13,19 @@ import hashlib
 import json
 from pathlib import Path
 
-REVIEWED_REVISION = "b2656f2ee1d49eb343c689e78bc3aab112145ab5"
+REVIEWED_REVISION = "dc9e2994c414b2e4ceb7310a6e44662786c82400"
 REVIEWED_SOURCES = {
     "entrypoint.py": "484ff3b2743e824abe22d3c6a87d3af26912ccc07f891286f088a6971d32ae50",
-    "policy.py": "b50974099c20f4d3e3d1a89a0b77171fdd3a4cf73c9285b6ab2b3069c68b9e09",
+    "policy.py": "ed4d13e39b6ef01557b36bac5a0fbc577ae75f2c62dd4c14d3dcd8e12897a9b9",
 }
-REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53703}
+REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53739}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "21e799b93df28d288d8d8d39c6e10dd8854207ec2fc471b56431784d3e008bb3",
+    "evidence_presentation": "b6e5d2d065179d030fd30926ed1c3805d0a3b3be77bdbe55ba50a1c51639a462",
     "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
     "result_limits": "cdb48e4dd7d001b00086a7d816f2d9821e4419ef0799f619f776e16a065adfdb",
 }
 REVIEWED_SHARED_SIZES = {
-    "evidence_presentation": 23326, "presentation_transport": 16551, "result_limits": 833,
+    "evidence_presentation": 23606, "presentation_transport": 16551, "result_limits": 833,
 }
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"

@@ -173,6 +173,8 @@ class WorkCancelResult:
 
 
 class _TaskController(Protocol):
+    async def has_terminal(self, task_id: str) -> bool: ...
+
     async def dispatch(self, *, objective: str, utterance_id: str) -> TaskDispatchOutcome: ...
 
     async def request_cancel(
@@ -676,11 +678,18 @@ class ConversationWorkControlSurface:
             raise
         try:
             if not dispatch.accepted:
+                # Reconstruct controller data before applying the narrower public view.
+                dispatch = TaskDispatchOutcome(
+                    task_id=dispatch.task_id, accepted=dispatch.accepted, reason=dispatch.reason,
+                )
+                public_reason = dispatch.reason or "Hermes rejected task dispatch"
+                if _PRIVATE_AUTHORITY.search(public_reason) is not None:
+                    public_reason = "Hermes rejected task dispatch"
                 start_result = WorkStartResult(
                     accepted=False,
                     state="rejected",
                     task_id=dispatch.task_id,
-                    reason=dispatch.reason or "Hermes rejected task dispatch",
+                    reason=public_reason,
                 )
                 self._settle_pending_cancel_result(
                     pending,
@@ -688,7 +697,7 @@ class ConversationWorkControlSurface:
                         accepted=False,
                         state="rejected",
                         task_id=dispatch.task_id,
-                        reason=dispatch.reason or "Hermes rejected task dispatch",
+                        reason=public_reason,
                     ),
                 )
                 return await self._project_start(start_result)
@@ -839,6 +848,12 @@ class ConversationWorkControlSurface:
             await gate(self._copy_start(copied))
         if copied.accepted and copied.state == "active":
             active_tasks = self._context.snapshot().active_tasks
+            if copied.task_id not in {task.task_id for task in active_tasks}:
+                assert copied.task_id is not None
+                if await self._controller.has_terminal(copied.task_id):
+                    # Its accepted acknowledgment remains true; the terminal observer
+                    # already owns presentation. Never resurrect an active card.
+                    return self._copy_start(copied)
             if not active_tasks:
                 raise ActiveTaskIdentityError(
                     "task reached terminal state before active projection"

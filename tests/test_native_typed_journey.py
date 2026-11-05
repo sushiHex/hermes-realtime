@@ -840,3 +840,19 @@ def test_client_uses_versioned_events_without_changing_other_routes(monkeypatch,
     )
     assert client.request_json("http://127.0.0.1:1", route) == (200, {})
     assert requests == [f"http://127.0.0.1:1/api/v{version}/{route}"]
+
+
+@pytest.mark.parametrize("name", [[], {}], ids=["list", "object"])
+def test_unhashable_native_tool_name_retains_refusal_category(tmp_path, capsys, name):
+    subject = witness(tmp_path)
+    calls = [
+        {
+            "id": "call_one",
+            "function": {"name": "tool_call", "arguments": json.dumps({"name": name})},
+        }
+    ]
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute("UPDATE messages SET tool_calls=? WHERE id=1", (json.dumps(calls),))
+    with pytest.raises(ValueError, match="witness_tool_identity"):
+        subject.read()
+    assert "witness_tool_identity" in capsys.readouterr().out

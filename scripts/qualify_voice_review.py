@@ -985,6 +985,7 @@ async def _confinement(worker: _Worker) -> dict[str, object]:
             for ordering in _ORDERINGS:
                 case = f"m2case-{route}_{ordering}"
                 await worker.archive_rows(case, 0, 2)
+                captured.clear()
                 admitted, outcome = await worker.one_review(case, 0, 2, True)
                 whitelist = captured[-1] if captured else set()
                 result[f"{route}_{ordering}"] = {

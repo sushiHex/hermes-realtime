@@ -17,7 +17,9 @@ _COMPLETION_REFERENCE = re.compile(
     r"(?:\[([^\]]+)\]\()?(https?://[^\s<>]+)", re.IGNORECASE,
 )
 _COMPLETION_MACHINE_TOKEN = re.compile(r"\b(?:task_|run_|deleg_)[A-Za-z0-9_.:-]+")
-_PRIVATE_RESULT_HANDLE = re.compile(r"(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,})")
+_PRIVATE_RESULT_HANDLE = re.compile(
+    r"(?:deleg_[A-Za-z0-9_-]*|run_[A-Za-z0-9_-]{8,}|subagent_[A-Za-z0-9_-]+)"
+)
 _TAGGED_COMPLETION = re.compile(
     r"\A<voice>(?P<voice>[\s\S]*?)</voice>\s*"
     r"<detail>(?P<detail>[\s\S]*?)</detail>\Z"

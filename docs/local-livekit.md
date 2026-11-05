@@ -708,6 +708,12 @@ install and its import check, and the Hermes clone, sync and wheel install.
 
 ### Launch
 
+The CUDA setup command refuses an existing target and preserves a partial environment
+if installation or validation fails. Inspect that environment before retrying. Pass a new
+absent directory as the script's first argument, or move the inspected failed environment
+aside; the script never replaces or removes it automatically. A failed setup is not a
+validated CUDA worker.
+
 1. In terminal A, start the pinned local LiveKit server and leave it running:
 
    ```bash

@@ -13,6 +13,12 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from hermes_realtime.protocol import Durability
+from hermes_realtime.result_limits import (
+    MAX_COMPLETED_RESULT_CHARS,
+    MAX_LEGACY_RESULT_CHARS,
+    UNUSABLE_RESULT_NOTICE,
+    has_valid_result_unicode,
+)
 
 from .service import HermesDispatchCommand, HermesDispatchRejected
 
@@ -154,6 +160,16 @@ class HermesPluginRuntime:
         else:
             status = "failed"
             reason = raw_summary or f"Hermes delegation ended with status {raw_status or 'unknown'}"
+        # Child text is presentation data, never evidence of whether the run ended.
+        # Keep exact terminal status even when its text cannot cross the strict bridge.
+        text = summary if summary is not None else reason
+        limit = MAX_COMPLETED_RESULT_CHARS if summary is not None else MAX_LEGACY_RESULT_CHARS
+        if text is not None and (len(text) > limit or not has_valid_result_unicode(text)):
+            logger.warning('[hermes-plugin-result] {"refusal":"terminal_text","version":1}')
+            if summary is not None:
+                summary = UNUSABLE_RESULT_NOTICE
+            else:
+                reason = "Hermes delegation ended; error details could not be displayed"
         completion = HermesRunCompletion(
             run_id=delegation_id,
             status=status,
@@ -168,6 +184,8 @@ class HermesPluginRuntime:
                 listener(completion)
             except Exception:  # noqa: BLE001 - observer failures must not break Hermes
                 logger.exception("Hermes realtime completion listener failed")
+        if authoritative:
+            self._publish(delegation_id)
 
 
 class HermesPluginDispatcher:
@@ -185,6 +203,7 @@ class HermesPluginDispatcher:
         self._reserve = reserve or (lambda _: None)
         self._publish = publish or (lambda _: None)
         self._unavailable_reason = unavailable_reason
+        self._uncertain = False
 
     def publish(self, run_id: str) -> None:
         """Release a reservation after the service publishes active ownership."""
@@ -199,6 +218,8 @@ class HermesPluginDispatcher:
         return await asyncio.to_thread(self._context.interrupt_delegation, run_id)
 
     async def dispatch(self, command: HermesDispatchCommand) -> str:
+        if self._uncertain:
+            raise RuntimeError("Hermes dispatch authority is uncertain; restart required")
         if self._context is None:
             raise HermesDispatchRejected(
                 self._unavailable_reason or "Hermes plugin dispatch is unavailable"
@@ -225,19 +246,29 @@ class HermesPluginDispatcher:
                 reserved_run_id,
             )
         except BaseException:
-            self._publish(reserved_run_id)
+            self._uncertain = True
+            logger.warning('[hermes-plugin-dispatch] {"refusal":"uncertain","version":1}')
             raise
         try:
             payload = json.loads(raw_result)
-        except (TypeError, json.JSONDecodeError) as exc:
-            self._publish(reserved_run_id)
-            raise HermesDispatchRejected("Hermes returned an invalid dispatch response") from exc
+        except (TypeError, ValueError, RecursionError) as exc:
+            self._uncertain = True
+            logger.warning('[hermes-plugin-dispatch] {"refusal":"uncertain","version":1}')
+            raise RuntimeError(
+                "Hermes returned an invalid dispatch response; authority uncertain"
+            ) from exc
 
         if not isinstance(payload, dict) or payload.get("status") != "dispatched":
-            self._publish(reserved_run_id)
-            raise HermesDispatchRejected("Hermes did not accept background dispatch")
+            self._uncertain = True
+            logger.warning('[hermes-plugin-dispatch] {"refusal":"uncertain","version":1}')
+            raise RuntimeError(
+                "Hermes did not accept a verifiable background dispatch; authority uncertain"
+            )
         delegation_id = payload.get("delegation_id")
         if not isinstance(delegation_id, str) or delegation_id != reserved_run_id:
-            self._publish(reserved_run_id)
-            raise HermesDispatchRejected("Hermes accepted dispatch without a delegation ID")
+            self._uncertain = True
+            logger.warning('[hermes-plugin-dispatch] {"refusal":"uncertain","version":1}')
+            raise RuntimeError(
+                "Hermes accepted dispatch without a delegation ID; authority uncertain"
+            )
         return delegation_id

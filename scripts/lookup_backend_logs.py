@@ -100,6 +100,9 @@ class CappedCapture:
                 item["last_ns"] = now
 
     def finish(self) -> Any:
+        if self._pending and not self._dropping:
+            self._line(bytes(self._pending), self.last_bytes_ns or time.monotonic_ns())
+        self._pending.clear()
         try:
             self.stream.close()
         except OSError:
@@ -160,8 +163,6 @@ class CappedProcesses:
                     witness.feed(chunk)
             except BaseException:
                 witness.read_failed = True
-            finally:
-                witness._pending.clear()
 
         thread = threading.Thread(target=drain, daemon=True, name="lookup-output-drain")
         self._drainers.append(thread)

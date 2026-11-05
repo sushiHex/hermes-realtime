@@ -816,11 +816,13 @@ def test_canonical_baseline_diff_uses_exact_no_ext_diff_argv(
 
     def observe(command: tuple[str, ...], **_: object) -> Result:
         calls.append(command)
+        if command[1:4] == ("rev-parse", "--git-path", "info/attributes"):
+            return Result(".git/info/attributes")
         if command[1:3] == ("rev-parse", "--verify"):
             return Result((head if command[3] == "HEAD^{commit}" else baseline).encode() + b"\n")
         if command[1] == "merge-base":
             return Result()
-        if command[1] == "diff":
+        if "diff" in command:
             return Result(b"canonical patch")
         raise AssertionError(command)
 
@@ -829,10 +831,26 @@ def test_canonical_baseline_diff_uses_exact_no_ext_diff_argv(
 
     assert calls[-1] == (
         "git",
+        "-c", f"core.attributesFile={__import__('os').devnull}",
+        "-c", "diff.suppressBlankEmpty=false",
+        "-c", "core.quotePath=true",
         "diff",
         "--binary",
         "--full-index",
         "--no-renames",
         "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-relative",
+        "--output-indicator-new=+",
+        "--output-indicator-old=-",
+        "--output-indicator-context= ",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--diff-algorithm=myers",
+        "--unified=3",
+        "--inter-hunk-context=0",
+        "--indent-heuristic",
+        "-O", __import__('os').devnull,
         f"{baseline}..{head}",
     )

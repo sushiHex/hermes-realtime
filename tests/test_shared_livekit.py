@@ -262,6 +262,27 @@ class _Launched:
         return 0
 
 
+def test_serve_kills_and_reaps_child_if_termination_times_out(monkeypatch):
+    calls = []
+    class Stuck:
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            if timeout is None:
+                raise KeyboardInterrupt
+            if timeout == 10:
+                raise subprocess.TimeoutExpired("fixture", 10)
+            return 0
+        def terminate(self):
+            calls.append("terminate")
+        def kill(self):
+            calls.append("kill")
+    child = Stuck()
+    monkeypatch.setattr(local_livekit, "verified_server", lambda _: Path("fixture"))
+    monkeypatch.setattr(local_livekit.subprocess, "Popen", lambda *args, **kwargs: child)
+    assert local_livekit.serve({}) == 0
+    assert calls == [("wait", None), "terminate", ("wait", 10), "kill", ("wait", 5)]
+
+
 def test_serve_launches_the_verified_server_with_the_development_keys(
     tmp_path: Path, release: tuple[bytes, bytes], monkeypatch: pytest.MonkeyPatch
 ) -> None:

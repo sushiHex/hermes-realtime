@@ -780,6 +780,9 @@ async def _runtime(
     cancel_attempts: list[tuple[str, str | None]] = []
 
     class RecordingController:
+        async def has_terminal(self, task_id: str) -> bool:
+            return await controller.has_terminal(task_id)
+
         async def dispatch(self, *, objective: str, utterance_id: str) -> Any:
             return await controller.dispatch(
                 objective=objective,
@@ -1224,12 +1227,9 @@ async def test_terminal_arrives_while_confirmed_dispatch_operation_is_unsettled(
         assert not operation.done()
         assert runtime.context.snapshot().active_tasks == ()
         gate.release.set()
-        with pytest.raises(RuntimeError, match="terminal state before active projection"):
-            await runtime.settle(proposal)
+        await runtime.settle(proposal)
         assert operation.done()
-        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
-            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
-        ]
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == []
         assert runtime.context.snapshot().active_tasks == ()
         assert len(runtime.stub.posts) == 1 and runtime.stub.stop_calls == 0
         _assert_model_visible_values_are_private_token_free(
@@ -1269,15 +1269,12 @@ async def test_completion_before_projection_rolls_back_without_stale_active_stat
         assert terminal.task_id == "task_cross1" and terminal.status == "completed"
         assert runtime.context.snapshot().active_tasks == ()
         gate.release.set()
-        with pytest.raises(RuntimeError, match="terminal state before active projection"):
-            await runtime.settle()
-        assert runtime.cancel_attempts == [("task_cross1", "task state projection failed")]
+        await runtime.settle()
+        assert runtime.cancel_attempts == []
         assert runtime.stub.stop_calls == 0
-        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
-            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
-        ]
+        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == []
         assert runtime.context.snapshot().active_tasks == ()
-        assert runtime.surface.health == "uncertain"
+        assert runtime.surface.health == "open"
         _assert_model_visible_values_are_private_token_free(
             parts, transport.sent, transport.tool_responses, terminal,
             runtime.context.snapshot(), runtime.browser_events,

@@ -645,3 +645,90 @@ def test_runtime_rejects_unusable_remote_browser_origins(configured: str) -> Non
             ssl_context=ssl.create_default_context(),
             configured=configured,
         )
+
+
+@pytest.mark.asyncio
+async def test_lease_watchdog_reports_once_per_failure_episode_and_retries_server_close(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Sessions:
+        calls = 0
+
+        async def expire_if_inactive(self) -> bool:
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("synthetic private detail")
+            return self.calls == 3
+
+    class Server:
+        calls = 0
+
+        async def close(self) -> None:
+            self.calls += 1
+            if self.calls <= 2:
+                raise OSError("synthetic private detail")
+
+    runtime = object.__new__(BrowserClientRuntime)
+    sessions = Sessions()
+    server = Server()
+    runtime._sessions = sessions  # type: ignore[assignment]
+    runtime._server = server  # type: ignore[assignment]
+    runtime._lease_check_interval = 0.001
+    runtime._persistent_mode = False
+    runtime._started = True
+    watchdog = asyncio.create_task(runtime._watch_browser_lease())
+    try:
+        await asyncio.wait_for(asyncio.shield(watchdog), 0.3)
+    finally:
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
+    assert server.calls == 3
+    assert sessions.calls == 3
+    assert runtime._started is False
+    output = capsys.readouterr().out
+    assert "synthetic private detail" not in output
+    markers = [json.loads(line.split("] ", 1)[1]) for line in output.splitlines()
+               if line.startswith("[browser-lease] ")]
+    assert markers == [
+        {"failure": "RuntimeError", "stage": "expiry", "version": 1},
+        {"failure": "OSError", "stage": "server_close", "version": 1},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+async def test_lease_diagnostic_transport_failure_cannot_stop_expiry_cleanup(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+) -> None:
+    from hermes_realtime.client import runtime as runtime_module
+
+    class Sessions:
+        calls = 0
+
+        async def expire_if_inactive(self) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic expiry failure")
+            return True
+
+    class Server:
+        closes = 0
+
+        async def close(self) -> None:
+            self.closes += 1
+
+    def broken_print(*_args: object, **_kwargs: object) -> None:
+        raise error_type("synthetic diagnostic transport failure")
+
+    monkeypatch.setattr(runtime_module, "print", broken_print, raising=False)
+    runtime = object.__new__(BrowserClientRuntime)
+    sessions, server = Sessions(), Server()
+    runtime._sessions = sessions  # type: ignore[assignment]
+    runtime._server = server  # type: ignore[assignment]
+    runtime._lease_check_interval = 0.001
+    runtime._persistent_mode = False
+    runtime._started = True
+    await asyncio.wait_for(runtime._watch_browser_lease(), 0.3)
+    assert sessions.calls == 2
+    assert server.closes == 1
+    assert runtime._started is False

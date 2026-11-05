@@ -709,11 +709,20 @@ class LocalHermesBridgeServer:
                         raise BridgeProtocolError(
                             "bridge accepts only dispatch or cancellation requests"
                         )
-                    acknowledgment = await self._service.dispatch(participant_id, event)
-                    retained_terminal = None
-                    run_id = acknowledgment.payload.run_id
-                    if acknowledgment.payload.accepted and run_id is not None:
-                        async with self._registration_lock:
+                    async with self._registration_lock:
+                        retained_run_id = await self._service.retained_run_for_task(
+                            request_binding,
+                            event.task_id,
+                        )
+                        if not await self._completions.can_track(retained_run_id):
+                            _marker("[hermes-bridge-dispatch] ", "acknowledgment_capacity")
+                            raise BridgeProtocolError(
+                                "acknowledgment retention capacity was exceeded"
+                            )
+                        acknowledgment = await self._service.dispatch(participant_id, event)
+                        retained_terminal = None
+                        run_id = acknowledgment.payload.run_id
+                        if acknowledgment.payload.accepted and run_id is not None:
                             await self._completions.track(acknowledgment)
                             binding = await self._service.binding_for_run(run_id)
                             if binding is None:
@@ -966,15 +975,21 @@ class LocalHermesBridgeServer:
 
     async def _send_bound(self, route: _Route, event: ProtocolEvent) -> bool:
         async with route.connection.write_lock:
-            if (type(event) is WorkCompletedEvent
-                    and event.payload.status == WorkTerminalStatus.COMPLETED
-                    and event.payload.summary is not None
-                    and len(event.payload.summary) > MAX_LEGACY_RESULT_CHARS
-                    and COMPLETED_RESULT_CAPABILITY not in route.connection.capabilities):
+            if (
+                type(event) is WorkCompletedEvent
+                and event.payload.status == WorkTerminalStatus.COMPLETED
+                and event.payload.summary is not None
+                and len(event.payload.summary) > MAX_LEGACY_RESULT_CHARS
+                and COMPLETED_RESULT_CAPABILITY not in route.connection.capabilities
+            ):
                 # Project for this recipient; retained terminal evidence stays exact.
-                event = event.model_copy(update={"payload": event.payload.model_copy(
-                    update={"summary": LEGACY_RESULT_NOTICE},
-                )})
+                event = event.model_copy(
+                    update={
+                        "payload": event.payload.model_copy(
+                            update={"summary": LEGACY_RESULT_NOTICE},
+                        )
+                    }
+                )
             if event.sequence <= route.connection.last_sequence:
                 event = await self._completions.resequence(
                     event,
@@ -1019,7 +1034,7 @@ class LocalHermesBridgeServer:
                 raise TypeError("completion text must be an exact string")
             limit = MAX_COMPLETED_RESULT_CHARS if completed else MAX_LEGACY_RESULT_CHARS
             refusal = "completed_bound" if completed else "reason_bound"
-            if len(value) > limit or (completed and not has_valid_result_unicode(value)):
+            if len(value) > limit or not has_valid_result_unicode(value):
                 raise BridgeProtocolError("completion text exceeds the result bound")
             refusal = None
         finally:

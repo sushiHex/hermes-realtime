@@ -11,6 +11,7 @@ import hashlib
 import io
 import tarfile
 import tomllib
+import zlib
 from dataclasses import dataclass
 
 from packaging.metadata import parse_email
@@ -167,7 +168,10 @@ def _candidate_sdist_files(
             == wheels._normalized_metadata(expected_info),
             "sdist metadata differs from its source-bound wheel",
         )
-    except (OSError, EOFError, tarfile.TarError, KeyError, TypeError, ValueError, ExceptionGroup):
+    except (
+        OSError, EOFError, tarfile.TarError, KeyError, TypeError,
+        ValueError, ExceptionGroup, zlib.error,
+    ):
         raise ValueError("sdist does not match its bounded source profile") from None
     return CandidateSdistMetadataV1(
         hashlib.sha256(raw).hexdigest(),

@@ -145,7 +145,11 @@ def serve(environ: Mapping[str, str] | None = None) -> int:
         return process.wait()
     except KeyboardInterrupt:
         process.terminate()
-        return process.wait(timeout=10)
+        try:
+            return process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait(timeout=5)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

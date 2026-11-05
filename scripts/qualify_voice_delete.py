@@ -308,7 +308,10 @@ async def _qualify(python: Path) -> None:
                 "scope": core["scope"],
                 "unattributed": model.unattributed,
             }
-            identity = installed_hermes_identity("0.21.0", PINNED_HERMES / "source")
+            identity = installed_hermes_identity(
+                (home / "hermes-version.txt").read_text(encoding="utf-8"),
+                PINNED_HERMES / "source",
+            )
             evidence["hermes"] = identity
             evidence["observed"] = observed
             evidence["residue"] = core["residue"]
@@ -325,6 +328,9 @@ async def _qualify(python: Path) -> None:
 
 
 async def _run_worker(scenario: str, home: Path) -> None:
+    import hermes_cli  # type: ignore[import-not-found]
+
+    (home / "hermes-version.txt").write_text(hermes_cli.__version__, encoding="utf-8")
     if scenario == "core":
         result = await _core(home)
     elif scenario == "running":

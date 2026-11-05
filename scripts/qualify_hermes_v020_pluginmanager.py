@@ -241,7 +241,10 @@ def snapshot_regular_tree(root: Path) -> dict[str, tuple[object, ...]]:
     directory_identities: dict[Path, tuple[int, int]] = {root: root_identity}
     seen: set[str] = set()
     tree_bytes = 0
-    for current, directory_names, file_names in os.walk(root, followlinks=False):
+    def walk_error(error: OSError) -> NoReturn:
+        raise error
+
+    for current, directory_names, file_names in os.walk(root, followlinks=False, onerror=walk_error):
         current_path = Path(current)
         expected_current = directory_identities.get(current_path)
         current_lstat = current_path.lstat()
@@ -1563,7 +1566,8 @@ stdin_closed=sys.stdin is None or sys.stdin.read(1)==""
 if not stdin_closed: raise RuntimeError("stdin not EOF")
 def tree():
  result={}; seen=set()
- for base,dirs,files in os.walk(profile,followlinks=False):
+ def walk_error(error): raise error
+ for base,dirs,files in os.walk(profile,followlinks=False,onerror=walk_error):
   for name in dirs+files:
    p=pathlib.Path(base)/name
    if ":" in name or p.is_symlink(): raise RuntimeError("unsafe profile tree")

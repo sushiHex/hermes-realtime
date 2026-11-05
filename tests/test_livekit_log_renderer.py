@@ -37,6 +37,30 @@ def _renderer() -> dict[str, object]:
     return run_path(str(path))
 
 
+def test_deep_console_json_is_redacted_without_losing_later_lines(tmp_path):
+    module = _renderer()
+    log = tmp_path / "livekit.log"
+    log.write_text("now\tERROR\tmessage\t" + '{"a":' * 600 + '"private"' + '}' * 600
+                   + "\nnext\tERROR\tstill useful\n")
+    rendered = module["render_log"](log)
+    assert "still useful" in rendered
+    assert "private" not in rendered
+
+
+def test_plural_identity_fields_and_indented_json_are_redacted():
+    sanitize = _renderer()["_sanitize_line"]
+    for raw in (
+        ' {"participants":["browser_fixture"],"rooms":["room_fixture"]}',
+        'participant browser_fixture joined room browser-acceptance-deadbeef00',
+        'Bearer synthetic-secret-value',
+    ):
+        result = sanitize(raw)
+        assert "browser_fixture" not in result
+        assert "room_fixture" not in result
+        assert "browser-acceptance-deadbeef00" not in result
+        assert "synthetic-secret-value" not in result
+
+
 def test_livekit_log_renderer_redacts_identifiers_credentials_and_private_urls(
     tmp_path: Path,
 ) -> None:

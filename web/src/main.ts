@@ -447,18 +447,32 @@ const approvalController = new ApprovalDecisionController(
         console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "connection_changed" })}`);
       }
     }
-    const response = await fetch("/api/v1/approval", {
-      method: "POST",
-      headers: {
-        ...authorization(activeCredential!.token),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ approvalId, decision, sequence }),
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-    });
-    if (!response.ok) throw new Error("approval decision rejected");
+    try {
+      const response = await fetch("/api/v1/approval", {
+        method: "POST",
+        headers: {
+          ...authorization(activeCredential!.token),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ approvalId, decision, sequence }),
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+      });
+      if (!response.ok) throw new Error("approval decision rejected");
+    } catch (error) {
+      // The server may have acted before the response was lost. A replacement
+      // participant owns a different input lease and must survive an old failure.
+      if (credential?.participantIdentity === activeCredential!.participantIdentity) {
+        try {
+          retireUncertainInputCredential();
+          await disconnectLocal();
+        } finally {
+          console.info(`[approval-decision-refused] ${JSON.stringify({ count: 1, category: "acknowledgment_uncertain" })}`);
+        }
+      }
+      throw error;
+    }
   },
 );
 const launchStarted = performance.now();

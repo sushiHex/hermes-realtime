@@ -25,6 +25,7 @@ export function parseVoiceDeleteState(value: unknown): VoiceDeleteState {
 export class VoiceDeleteControls {
   private available = false;
   private pending = false;
+  private retryStatus = false;
   private inFlight = false;
   private timer: number | null = null;
   private epoch = 0;
@@ -56,6 +57,7 @@ export class VoiceDeleteControls {
     this.timer = null;
     this.available = false;
     this.pending = false;
+    this.retryStatus = false;
     this.inFlight = false;
     this.status.textContent = "Connect to delete this voice conversation.";
     this.render();
@@ -110,7 +112,8 @@ export class VoiceDeleteControls {
     } catch {
       if (this.superseded(epoch, credential)) return;
       this.status.textContent = "Deletion status unavailable. Checking again.";
-      if (this.pending) this.schedule(credential.participantIdentity);
+      this.retryStatus = true;
+      this.schedule(credential.participantIdentity);
     }
   }
 
@@ -123,6 +126,7 @@ export class VoiceDeleteControls {
   }
 
   private present(state: VoiceDeleteState): void {
+    this.retryStatus = false;
     this.available = state !== "unavailable";
     // A delete this page saw pending is still polled while the companion is away.
     this.pending = state === "pending" || (state === "unavailable" && this.pending);
@@ -143,7 +147,7 @@ export class VoiceDeleteControls {
     if (this.timer !== null) window.clearTimeout(this.timer);
     this.timer = window.setTimeout(() => {
       this.timer = null;
-      if (this.pending && this.options.credential()?.participantIdentity === identity) {
+      if ((this.pending || this.retryStatus) && this.options.credential()?.participantIdentity === identity) {
         void this.refresh();
       }
     }, this.options.pollIntervalMs ?? 1500);

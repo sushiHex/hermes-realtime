@@ -1529,3 +1529,23 @@ def test_main_emits_static_phase_without_wrapped_exception_text(
     }
     assert captured.err == "execution_failed\n"
     assert "private provider diagnostic" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "active", [("task_other",), ("task_public", "task_other")], ids=["foreign", "multiple"]
+)
+def test_completion_requires_exact_active_task_evidence(active):
+    expected = (
+        "multiple active tasks" if len(active) > 1 else "accepted task did not match active task"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        _validate_completion_task_evidence(
+            accepted_task_id="task_public", active_task_ids=active, terminal_task_id="task_public"
+        )
+
+
+@pytest.mark.parametrize("active", [(), ("task_public",)], ids=["already_terminal", "matching"])
+def test_completion_accepts_only_matching_or_already_settled_active_evidence(active):
+    _validate_completion_task_evidence(
+        accepted_task_id="task_public", active_task_ids=active, terminal_task_id="task_public"
+    )
