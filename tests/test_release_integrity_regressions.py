@@ -163,6 +163,20 @@ def test_release_archive_refuses_local_info_attributes(tmp_path: Path) -> None:
         gate.git_archive(root, output, revision=_git(root, "rev-parse", "HEAD"))
 
 
+def test_release_archive_ignores_external_attributes(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    (root / "retained.py").write_bytes(b"retained\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "retained archive member")
+    attributes = tmp_path / "external.attributes"
+    attributes.write_text("keep.py export-ignore\n", encoding="utf-8")
+    _git(root, "config", "core.attributesFile", str(attributes))
+    output = tmp_path / "output"
+    output.mkdir()
+    gate.git_archive(root, output, revision=_git(root, "rev-parse", "HEAD"))
+    assert (output / "keep.py").read_bytes() == (root / "keep.py").read_bytes()
+
+
 @pytest.mark.parametrize("guard", ["hash", "pid"])
 def test_native_livekit_rejects_foreign_identity_before_network(
     tmp_path: Path, monkeypatch, guard
