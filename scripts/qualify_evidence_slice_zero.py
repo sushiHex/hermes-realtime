@@ -1587,6 +1587,10 @@ def _validate_topology_semantics_v1(
         job_identities = set(process_keys)
         if len(job_identities) != len(processes):
             _fail("qualification report: duplicate process identity")
+        # Process-group references within a Job carry only a PID. Keep that
+        # namespace unambiguous while allowing recycling across scenario Jobs.
+        if len({process["pid"] for process in processes}) != len(processes):
+            _fail("qualification report: PID is ambiguous within its scenario Job")
         process_by_identity = {
             (process["pid"], process["creationFiletime"]): process for process in processes
         }
