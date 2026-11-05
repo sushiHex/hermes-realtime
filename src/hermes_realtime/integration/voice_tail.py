@@ -966,9 +966,11 @@ class VoiceTailWriter:
         generation = max(generation, max((item[1] + 1 for item in recorded if item), default=0))
         if self._deletes.live is not None:
             generation = max(generation, self._deletes.live[1])
-        outcome = self._deletes.outcome
-        if outcome is not None and generation == outcome[1] + 1 and previous != outcome:
-            # Numeric ordering alone cannot prove a reset replaced that exact binding.
+        if any(
+            binding is not None and generation == binding[1] + 1 and previous != binding
+            for binding in recorded
+        ):
+            # A pending delete may later become the outcome; reserve its scope too.
             generation += 1
         if generation > MAX_IDENTITY:
             raise RuntimeError("voice generation capacity is exhausted")
