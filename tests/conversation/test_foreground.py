@@ -339,36 +339,38 @@ async def test_stubborn_owner_times_out_without_admitting_replacement() -> None:
     lease = await coordinator.start("turn_001", stubborn)
     await asyncio.wait_for(started.wait(), timeout=1)
 
-    with pytest.raises(
-        ForegroundTurnDrainTimeout, match="turn_001"
-    ) as first_timeout:
-        await coordinator.cancel()
-    assert first_timeout.value.turn_id == "turn_001"
+    try:
+        with pytest.raises(
+            ForegroundTurnDrainTimeout, match="turn_001"
+        ) as first_timeout:
+            await coordinator.cancel()
+        assert first_timeout.value.turn_id == "turn_001"
 
-    assert cancellation_seen.is_set()
-    assert lease.is_current is False
-    assert coordinator.active_turn_id is None
-    assert coordinator.active_task_count == 1
+        assert cancellation_seen.is_set()
+        assert lease.is_current is False
+        assert coordinator.active_turn_id is None
+        assert coordinator.active_task_count == 1
 
-    replacement_started = False
+        replacement_started = False
 
-    async def replacement(_: ForegroundTurnLease) -> None:
-        nonlocal replacement_started
-        replacement_started = True
+        async def replacement(_: ForegroundTurnLease) -> None:
+            nonlocal replacement_started
+            replacement_started = True
 
-    with pytest.raises(
-        ForegroundTurnDrainTimeout, match="turn_001"
-    ) as replacement_timeout:
-        await coordinator.start("turn_002", replacement)
-    assert replacement_timeout.value.turn_id == "turn_001"
-    assert replacement_started is False
-    assert coordinator.active_task_count == 1
+        with pytest.raises(
+            ForegroundTurnDrainTimeout, match="turn_001"
+        ) as replacement_timeout:
+            await coordinator.start("turn_002", replacement)
+        assert replacement_timeout.value.turn_id == "turn_001"
+        assert replacement_started is False
+        assert coordinator.active_task_count == 1
 
-    release.set()
-    deadline = asyncio.get_running_loop().time() + 1
-    while coordinator.active_task_count and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0)
-    assert coordinator.active_task_count == 0
+    finally:
+        release.set()
+        deadline = asyncio.get_running_loop().time() + 1
+        while coordinator.active_task_count and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0)
+        assert coordinator.active_task_count == 0
 
 
 @pytest.mark.asyncio
@@ -444,3 +446,34 @@ async def test_close_is_idempotent_and_rejects_new_turns() -> None:
 
     with pytest.raises(RuntimeError, match="closed"):
         await coordinator.start("turn_001", runner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "replace", "close"])
+async def test_settled_owner_timeout_is_not_a_drain_deadline(action: str) -> None:
+    started = asyncio.Event()
+
+    async def runner(_: ForegroundTurnLease) -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise TimeoutError("provider timed out during cancellation") from None
+
+    coordinator = ForegroundTurnCoordinator()
+    await coordinator.start("turn_001", runner)
+    await started.wait()
+    if action == "cancel":
+        await coordinator.cancel()
+    elif action == "replace":
+        replacement_started = asyncio.Event()
+
+        async def replacement(_: ForegroundTurnLease) -> None:
+            replacement_started.set()
+
+        await coordinator.start("turn_002", replacement)
+        await replacement_started.wait()
+    else:
+        await coordinator.close()
+    await coordinator.close()
+    assert coordinator.active_task_count == 0

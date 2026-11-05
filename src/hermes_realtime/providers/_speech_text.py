@@ -36,6 +36,7 @@ _TEMPERATURE = re.compile(
     r"(?P<unit>°[ \t]*[FC]|[℉℃])(?!\w)",
 )
 _TEMPERATURE_UNITS = {"F": "Fahrenheit", "C": "Celsius", "℉": "Fahrenheit", "℃": "Celsius"}
+_BACKTICKS = re.compile(r"`+")
 
 
 def _temperature_value(match: re.Match[str]) -> str:
@@ -109,8 +110,20 @@ def _scan_markdown_emphasis(text: str) -> tuple[bytearray, bool]:
 
     removed = bytearray(len(text))
     openings: dict[tuple[str, int], list[tuple[int, int]]] = {}
+    # Index equal-length closing backtick runs once; unmatched runs must not
+    # cause repeated suffix searches on the streaming segmentation path.
+    code_ends: dict[int, int] = {}
+    next_ticks: dict[int, int] = {}
+    for ticks in reversed(tuple(_BACKTICKS.finditer(text))):
+        length = ticks.end() - ticks.start()
+        if length in next_ticks:
+            code_ends[ticks.start()] = next_ticks[length]
+        next_ticks[length] = ticks.end()
     index = 0
     while index < len(text):
+        if index in code_ends:
+            index = code_ends[index]
+            continue
         marker = text[index]
         if marker not in {"*", "_"}:
             index += 1
@@ -142,8 +155,14 @@ def _scan_markdown_emphasis(text: str) -> tuple[bytearray, bool]:
             can_open = left_flanking and (not right_flanking or _is_punctuation(previous))
             can_close = right_flanking and (not left_flanking or _is_punctuation(following))
         else:
-            can_open = left_flanking
-            can_close = right_flanking
+            # Prefer preserving literal operators/paths over guessing intraword
+            # emphasis. Speech must not silently turn 2*3*4 into 234.
+            can_open = left_flanking and (
+                previous is None or not (previous.isalnum() or previous in "_/\\")
+            )
+            can_close = right_flanking and (
+                following is None or not (following.isalnum() or following in "_/\\")
+            )
 
         key = (marker, run_length)
         candidates = openings.get(key)

@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "issue": "https://github.com/sushiHex/hermes-realtime/issues/437",
+  "baseline": "c4d0c6c3c3a1e1f1635b3736bd140a4bcc907018",
+  "scope": "Consequential lifecycle, speech correctness, diagnostic privacy and source-integrity repairs. Native iOS retention issue 435 remains separate.",
+  "findings": [
+    {
+      "id": "W01",
+      "file": "src/hermes_realtime/companion/host.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "0f4217e1fdf24197b7c1cb17e4f8d4753971e012",
+      "evidence": "Startup failure releases ownership only after async-loop settlement; real OS-lock and successor-isolation tests."
+    },
+    {
+      "id": "W02",
+      "file": "src/hermes_realtime/integration/completion.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W03",
+      "file": "src/hermes_realtime/conversation/telemetry.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W04",
+      "file": "src/hermes_realtime/conversation/foreground.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "0f4217e1fdf24197b7c1cb17e4f8d4753971e012",
+      "evidence": "Settled owner TimeoutError is distinct from live-owner drain deadline; cancel/replace/close regressions."
+    },
+    {
+      "id": "W05",
+      "file": "src/hermes_realtime/providers/_speech_text.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "5bd837831cbbdf284d84182ddf5c7aa0679b1924",
+      "evidence": "Preserve literal arithmetic, paths and matched code spans while stripping ordinary emphasis."
+    },
+    {
+      "id": "W06",
+      "file": "src/hermes_realtime/providers/edge_tts.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "5bd837831cbbdf284d84182ddf5c7aa0679b1924",
+      "evidence": "Decode a bounded overflow witness and refuse over-limit PCM rather than publish clipped-success; native FFmpeg exact-bound test."
+    },
+    {
+      "id": "W07",
+      "file": "src/hermes_realtime/host_launcher.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W08",
+      "file": "src/hermes_realtime/providers/kokoro.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W09",
+      "file": "scripts/profile_summary.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "91f77a8ed1540d681b21d9b44569f51ece2dfeb5",
+      "evidence": "Version 2 diagnostic emits presence/equality booleans only; no raw configuration value can be echoed."
+    },
+    {
+      "id": "W10",
+      "file": "src/hermes_realtime/providers/current_facts.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W11",
+      "file": "src/hermes_realtime/testing/harness.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W12",
+      "file": "scripts/qualification_linux_producer.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "95f6c8181082507466800ff5107014bf661479f4",
+      "evidence": "Linux archive refuses local info attributes, pins external attributes and tar mode, and ignores ambient Git selectors/replacements. Worker binds shared Git-policy helper bytes to candidate archive."
+    },
+    {
+      "id": "W13",
+      "file": "scripts/qualification_cpu_readiness.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W14",
+      "file": "scripts/real_gate_support.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "95f6c8181082507466800ff5107014bf661479f4",
+      "evidence": "Installed identity refuses hidden tracked index state, retaining only the documented absent upstream website exception; isolates Git selection/configuration while preserving validated autocrlf."
+    },
+    {
+      "id": "W15",
+      "file": "ios-probe/scripts/validate_probe.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "91f77a8ed1540d681b21d9b44569f51ece2dfeb5",
+      "evidence": "Inside Swift block comments tokenize only nested comment delimiters; preserve token separation and ordinary string URLs."
+    },
+    {
+      "id": "W16",
+      "file": "scripts/release_gate.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "95f6c8181082507466800ff5107014bf661479f4",
+      "evidence": "Shared artifact environment disables Git replacement objects for archive, canonical diff and blob scans. Three independent scratch-commit consumer regressions."
+    },
+    {
+      "id": "W17",
+      "file": "scripts/setup_lookup_backend.py",
+      "reported_severity": "should-fix",
+      "disposition": "fixed",
+      "commit": "95f6c8181082507466800ff5107014bf661479f4",
+      "evidence": "Runtime verification refuses hidden index state for both candidate and Hermes, explicitly includes untracked candidate files, and isolates source selection and cleaning policy."
+    },
+    {
+      "id": "W18",
+      "file": "scripts/task13_artifact_orchestrator.py",
+      "reported_severity": "should-fix",
+      "disposition": "accepted_platform_limit",
+      "evidence": "Reported mode-only reproduction uses POSIX executable-bit semantics. The owning orchestrator is Windows-specific, where core.fileMode=false is required for ordinary NTFS checkouts; no supported Windows byte-drift bypass was demonstrated. Hidden source-index state in the changed identity consumers is refused separately."
+    },
+    {
+      "id": "W19",
+      "file": "scripts/task13_artifact_orchestrator.py",
+      "reported_severity": "nit",
+      "disposition": "deferred",
+      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+    },
+    {
+      "id": "W20",
+      "file": "tests/test_release_integrity_regressions.py",
+      "reported_severity": "should-fix",
+      "disposition": "deferred_compatibility",
+      "evidence": "Git 2.43 argv incompatibility was reported, not disproved. Not observed on native Git 2.53 or the admitted Windows Git 2.55 toolchain. No global minimum Git version is inferred; older-toolchain compatibility remains tracked in issue 437."
+    },
+    {
+      "id": "W21",
+      "file": "docs/review-findings-434.json",
+      "reported_severity": "nit",
+      "disposition": "rejected",
+      "evidence": "All 26 cited fix commits resolve through the public GitHub API. Missing objects in a review clone do not establish missing published evidence."
+    }
+  ],
+  "validation": {
+    "red_green": "Focused regressions failed before their corresponding production repairs and passed afterward.",
+    "mutation_proofs": {
+      "diagnostic_privacy_and_swift": 3,
+      "lifecycle_ownership": 5,
+      "edge_decode_native": 1,
+      "source_integrity": 20
+    },
+    "independent_review": "Privacy/Swift and lifecycle/speech independently reviewed; final source-integrity review tracked in issue/PR.",
+    "limits": "Python structural Swift checks are not native Swift compilation. Native iOS retention proof remains issue 435. Deferred review nits and older Git compatibility are not marked fixed."
+  }
+}

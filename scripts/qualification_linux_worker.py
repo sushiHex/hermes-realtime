@@ -164,7 +164,7 @@ def _source_binding(input_root: Path) -> tuple[str, str, str]:
         names = bundle.getnames()
         _require(len(names) == len(set(names)), "Linux source archive is ambiguous")
         values = []
-        for relative in (_SELF, _PRODUCER, _WORKFLOW, "uv.lock"):
+        for relative in (_SELF, _PRODUCER, "scripts/release_gate.py", _WORKFLOW, "uv.lock"):
             member = bundle.getmember(_PREFIX + relative)
             _require(
                 member.isfile() and 0 < member.size <= 4 * 1024**2,
@@ -175,10 +175,11 @@ def _source_binding(input_root: Path) -> tuple[str, str, str]:
             assert stream is not None
             with stream:
                 values.append(stream.read(4 * 1024**2 + 1))
-    own, producer, workflow, lock = values
+    own, producer, git_policy, workflow, lock = values
     _require(
         own == Path(__file__).read_bytes()
-        and producer == Path(__file__).with_name("qualification_linux_producer.py").read_bytes(),
+        and producer == Path(__file__).with_name("qualification_linux_producer.py").read_bytes()
+        and git_policy == Path(__file__).with_name("release_gate.py").read_bytes(),
         "Linux producer or worker differs from candidate archive",
     )
     return _sha(archive), _sha(workflow), _sha(lock)

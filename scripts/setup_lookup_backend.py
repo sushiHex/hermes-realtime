@@ -21,6 +21,13 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+try:
+    import release_gate
+except ModuleNotFoundError as error:
+    if error.name != "release_gate":
+        raise
+    from scripts import release_gate
+
 ROOT = Path(__file__).resolve().parents[1]
 PIN = "29112bef099274229cadff79cdff7bf7b99c4b77"
 FIELDS = frozenset(
@@ -171,12 +178,13 @@ def digest(path: Any) -> Any:
 
 def git(path: Any, *args: Any) -> Any:
     return subprocess.run(
-        ["git", "-C", str(path), *args],
+        ["git", "-C", str(path), "-c", "core.fsmonitor=false", *args],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=True,
         timeout=20,
+        env=release_gate.worktree_git_environment(Path(path)),
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     ).stdout.strip()
 
@@ -257,7 +265,23 @@ def verify_runtime(
         and git(candidate_root, "rev-parse", "HEAD^{tree}") == m["tree"],
         "candidate_binding",
     )
-    require(not git(candidate_root, "status", "--porcelain=v1"), "candidate_dirty")
+    require(
+        not release_gate.has_hidden_index_entries(
+            candidate_root, git(candidate_root, "ls-files", "-v", "-z"),
+        ),
+        "candidate_dirty",
+    )
+    require(
+        not git(candidate_root, "status", "--porcelain=v1", "--untracked-files=all"),
+        "candidate_dirty",
+    )
+    require(
+        not release_gate.has_hidden_index_entries(
+            Path(m["hermes_source"]), git(m["hermes_source"], "ls-files", "-v", "-z"),
+            allow_sparse_website=True,
+        ),
+        "hermes_binding",
+    )
     require(
         git(m["hermes_source"], "rev-parse", "HEAD") == expected_hermes_revision
         and not git(m["hermes_source"], "diff", "--name-only", "HEAD", "--", "*.py"),

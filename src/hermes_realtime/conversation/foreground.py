@@ -374,6 +374,8 @@ class ForegroundTurnCoordinator:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
             except TimeoutError:
+                if task.done():
+                    break  # The owner raised TimeoutError; it has still drained.
                 if caller_cancellation is not None:
                     logger.error(
                         "foreground owner drain timed out after caller cancellation",

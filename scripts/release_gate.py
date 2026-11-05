@@ -179,16 +179,70 @@ def clean_environment() -> dict[str, str]:
     return environment
 
 
-def clean_git_environment() -> dict[str, str]:
+def clean_git_selection_environment() -> dict[str, str]:
+    """Keep worktree normalization, but remove ambient repository selectors."""
     environment = os.environ.copy()
     for name in tuple(environment):
         if name.upper().startswith("GIT_"):
             environment.pop(name)
     environment["LC_ALL"] = "C"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
+def clean_git_environment() -> dict[str, str]:
+    environment = clean_git_selection_environment()
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
     environment["GIT_ATTR_NOSYSTEM"] = "1"
     return environment
+
+
+def worktree_git_environment(source: Path) -> dict[str, str]:
+    """Isolate identity reads while retaining only the checkout's line-ending mode."""
+    autocrlf = subprocess.run(
+        ("git", "config", "--type=bool-or-str", "--get", "core.autocrlf"),
+        env=clean_git_selection_environment(),
+        cwd=source, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=20, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if autocrlf.returncode not in {0, 1}:
+        fail("could not read worktree line-ending mode")
+    line_endings = autocrlf.stdout.strip().lower() if autocrlf.returncode == 0 else "false"
+    if line_endings not in {"true", "false", "input"}:
+        fail("unsupported worktree line-ending mode")
+    environment = clean_git_environment()
+    filters = subprocess.run(
+        ("git", "config", "--name-only", "--get-regexp", r"^filter\..*\.(clean|process)$"),
+        env=environment,
+        cwd=source, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=20, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if filters.returncode not in {0, 1} or filters.stdout:
+        fail("source identity refuses configured clean filters")
+    _require_no_local_attributes(source)
+    environment.update(
+        GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="core.autocrlf", GIT_CONFIG_VALUE_0=line_endings,
+        GIT_CONFIG_KEY_1="core.attributesFile", GIT_CONFIG_VALUE_1=os.devnull,
+    )
+    return environment
+
+
+def has_hidden_index_entries(
+    source: Path, entries: str, *, allow_sparse_website: bool = False,
+) -> bool:
+    """Identify index flags that can hide source bytes from status/diff."""
+    for row in entries.split("\0"):
+        if not row or not (row[0].islower() or row[0] == "S"):
+            continue
+        path = source / row[2:]
+        if (
+            allow_sparse_website and row.startswith("S website/")
+            and not path.exists() and not path.is_symlink()
+        ):
+            continue
+        return True
+    return False
 
 
 def _resolved_commit_oid(source: Path, revision: str, *, label: str) -> str:

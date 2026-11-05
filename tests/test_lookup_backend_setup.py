@@ -312,7 +312,7 @@ def test_untracked_python_refused_before_wheel_read(monkeypatch, tmp_path):
             return ""
         if args == ("rev-parse", "HEAD"):
             return setup.PIN
-        if args[0] == "ls-files":
+        if args == ("ls-files", "--others", "--exclude-standard", "--", "*.py"):
             return "unexpected.py"
         return ""
 
@@ -806,3 +806,61 @@ def test_setup_retains_only_fixed_source_owned_refusal_categories(
     assert setup.main(["--manifest", str(manifest_path), "--output", str(tmp_path / "output")]) == 1
     output = capsys.readouterr().out
     assert json.loads(output.split("] ", 1)[1])["failure_category"] == category
+
+
+@pytest.mark.parametrize("hidden", ["--assume-unchanged", "--skip-worktree", "untracked"])
+def test_runtime_refuses_candidate_drift_hidden_by_local_git_state(tmp_path, monkeypatch, hidden):
+    import subprocess
+    setup, value, root, hermes_revision, _, fixture_git, _ = _runtime_comparator_fixture(
+        tmp_path, b"source package bytes"
+    )
+    original_git = setup.git
+    def command(*arguments):
+        return subprocess.run(["git", "-C", str(root), *arguments], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    command("init", "-q")
+    (root / "README.md").write_text("candidate documentation\n")
+    command("add", ".")
+    command("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "candidate")
+    value["candidate"] = command("rev-parse", "HEAD")
+    value["tree"] = command("rev-parse", "HEAD^{tree}")
+    if hidden == "untracked":
+        command("config", "status.showUntrackedFiles", "no")
+        (root / "foreign.py").write_text("unexpected import source\n")
+    else:
+        command("update-index", hidden, "README.md")
+        (root / "README.md").write_bytes(b"modified")
+    def selected_git(path, *arguments):
+        if Path(path) == root:
+            return original_git(path, *arguments)
+        return fixture_git(path, *arguments)
+    monkeypatch.setattr(setup, "git", selected_git)
+    with pytest.raises(ValueError, match="candidate_(dirty|hidden_index)"):
+        setup.verify_runtime(value, source_root=root, hermes_revision=hermes_revision)
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_runtime_refuses_hidden_hermes_python_drift(tmp_path, monkeypatch, flag):
+    import subprocess
+    setup, value, root, _, _, fixture_git, _ = _runtime_comparator_fixture(
+        tmp_path, b"source package bytes"
+    )
+    hermes = Path(value["hermes_source"])
+    original_git = setup.git
+    def command(*arguments):
+        return subprocess.run(["git", "-C", str(hermes), *arguments], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    command("init", "-q")
+    (hermes / "agent.py").write_text("VERSION = 1\n")
+    command("add", ".")
+    command("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "hermes")
+    revision = command("rev-parse", "HEAD")
+    command("update-index", flag, "agent.py")
+    (hermes / "agent.py").write_text("VERSION = 99\n")
+    def selected_git(path, *arguments):
+        if Path(path) == hermes:
+            return original_git(path, *arguments)
+        return fixture_git(path, *arguments)
+    monkeypatch.setattr(setup, "git", selected_git)
+    with pytest.raises(ValueError, match="hermes_binding"):
+        setup.verify_runtime(value, source_root=root, hermes_revision=revision)

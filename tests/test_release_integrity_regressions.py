@@ -322,3 +322,108 @@ def test_rebuilt_wheel_requires_all_package_bytes(tmp_path: Path, change) -> Non
             archive.writestr("hermes_realtime/foreign.py", b"foreign")
     with pytest.raises(RuntimeError, match="differ.*from source"):
         gate.check_sdist_built_wheel_disclosure_parity(tmp_path, wheel)
+
+
+@pytest.mark.parametrize("consumer", ["archive", "digest", "scan"])
+def test_release_source_readers_ignore_local_replacement_objects(tmp_path: Path, consumer) -> None:
+    root = _repo(tmp_path)
+    original = _git(root, "rev-parse", "HEAD")
+    original_digest = gate.canonical_candidate_diff_sha256(root, None, revision=original)
+    (root / "keep.py").write_bytes(b"replacement\n")
+    _git(root, "commit", "-qam", "replacement")
+    replacement = _git(root, "rev-parse", "HEAD")
+    _git(root, "replace", original, replacement)
+    if consumer == "archive":
+        output = tmp_path / "output"
+        output.mkdir()
+        gate.git_archive(root, output, revision=original)
+        assert (output / "keep.py").read_bytes() == b"a\n\nb\n"
+    elif consumer == "digest":
+        actual_digest = gate.canonical_candidate_diff_sha256(root, None, revision=original)
+        assert actual_digest == original_digest
+    else:
+        # A replacement must not hide a forbidden path in the selected commit.
+        _git(root, "replace", "-d", original)
+        (root / "research").mkdir()
+        (root / "research" / "secret.py").write_bytes(b"ghp_" + b"x" * 40)
+        _git(root, "add", ".")
+        _git(root, "commit", "-qm", "forbidden")
+        forbidden = _git(root, "rev-parse", "HEAD")
+        _git(root, "replace", forbidden, original)
+        with pytest.raises(RuntimeError, match="research"):
+            gate.scan_git_blobs(root, revision=forbidden)
+
+
+def test_linux_archive_refuses_local_attributes(tmp_path: Path) -> None:
+    from scripts import qualification_linux_producer as producer
+    root = _repo(tmp_path)
+    (root / ".git" / "info" / "attributes").write_text("keep.py export-ignore\n")
+    with pytest.raises(RuntimeError, match="local info attributes"):
+        producer._git_archive(root)
+
+
+def test_linux_archive_ignores_ambient_archive_configuration(tmp_path: Path, monkeypatch) -> None:
+    from scripts import qualification_linux_producer as producer
+    root = _repo(tmp_path)
+    original = producer._git_archive(root)
+    attrs = tmp_path / "attrs"
+    attrs.write_text("keep.py export-ignore\n")
+    _git(root, "config", "core.attributesFile", str(attrs))
+    _git(root, "config", "tar.umask", "0077")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "foreign"))
+    assert producer._git_archive(root) == original
+
+
+@pytest.mark.parametrize("setting", ["local_filter", "local_attributes"])
+def test_worktree_identity_refuses_untrusted_cleaning_rules(tmp_path: Path, setting) -> None:
+    from scripts import real_gate_support as support
+    root = _repo(tmp_path)
+    if setting == "local_filter":
+        _git(root, "config", "filter.mask.clean", "echo stable")
+    else:
+        (root / ".git" / "info" / "attributes").write_text("*.py -text\n")
+    with pytest.raises(RuntimeError, match="(clean filters|local info attributes)"):
+        support.installed_hermes_identity("fixture", root)
+
+
+def test_worktree_identity_ignores_global_status_configuration(tmp_path: Path, monkeypatch) -> None:
+    from scripts import real_gate_support as support
+    root = _repo(tmp_path)
+    configuration = tmp_path / "global-config"
+    configuration.write_text("[core]\n fsmonitor = false\n[status]\n showUntrackedFiles = no\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(configuration))
+    environment = gate.worktree_git_environment(root)
+    assert environment["GIT_CONFIG_GLOBAL"] == gate.os.devnull
+    assert support.installed_hermes_identity("fixture", root)["commit"]
+
+
+
+def test_worktree_identity_ignores_external_attributes(tmp_path: Path) -> None:
+    from scripts import real_gate_support as support
+    root = _repo(tmp_path)
+    attrs = tmp_path / "attrs"
+    attrs.write_text("keep.py -text\n")
+    _git(root, "config", "core.attributesFile", str(attrs))
+    environment = gate.worktree_git_environment(root)
+    result = subprocess.run(
+        ("git", "check-attr", "text", "--", "keep.py"), cwd=root,
+        env=environment, capture_output=True, check=True, text=True,
+    )
+    assert result.stdout.strip() == "keep.py: text: unspecified"
+    assert support.installed_hermes_identity("fixture", root)["commit"]
+
+
+@pytest.mark.parametrize("mode", ["yes", "1", "on", "no", "0", "off", "input"])
+def test_worktree_identity_accepts_git_line_ending_aliases(tmp_path: Path, mode) -> None:
+    from scripts import real_gate_support as support
+    root = _repo(tmp_path)
+    _git(root, "config", "core.autocrlf", mode)
+    assert support.installed_hermes_identity("fixture", root)["commit"]
+
+
+
+def test_worktree_identity_refuses_unknown_line_ending_mode(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _git(root, "config", "core.autocrlf", "unsupported-value")
+    with pytest.raises(RuntimeError, match="unsupported worktree line-ending mode"):
+        gate.worktree_git_environment(root)

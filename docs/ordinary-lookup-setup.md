@@ -260,8 +260,9 @@ credential fallback. Companion credentials and port, if used, are separately
 generated and isolated. Keep raw config, environment and gateway logs private.
 
 For operator review, run `python scripts/profile_summary.py <profile>/config.yaml`
-with the Hermes Python environment. It prints only the selected native and
-presentation model/provider/mode labels and equality checks. It never prints the
+with the Hermes Python environment. Its version 2 output reports whether native and
+presentation model/provider/mode values are configured, plus equality checks.
+It never echoes configuration values, even in routing fields, or prints the
 input path, other configuration fields, environment values or parse errors. Do
 not use raw `Get-Content`, `rg`, or configuration dumps for profile diagnostics.
 

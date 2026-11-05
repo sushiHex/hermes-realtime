@@ -170,3 +170,17 @@ async def test_explicit_temperature_units_are_spoken_without_guessing(source, ex
 def test_temperature_expansion_keeps_existing_speech_bound():
     with pytest.raises(ValueError, match="projected speech text"):
         EdgeTtsSynthesizer.project_spoken_text("80°F " * 500)
+
+
+@pytest.mark.parametrize("source", [
+    "Compute 2*3*4.",
+    "Read `a*b*c` and `**literal**`.",
+    "Read ``a`**literal**`b``.",
+    "Use src/*/test_*.py.",
+])
+def test_speech_emphasis_preserves_arithmetic_code_and_globs(source):
+    assert _speech_text.project_speech_text(source) == source
+
+
+def test_speech_emphasis_keeps_real_markup_around_code():
+    assert _speech_text.project_speech_text("**Use `a*b*c` now.**") == "Use `a*b*c` now."

@@ -193,6 +193,9 @@ class EdgeTtsSynthesizer:
         max_duration_seconds = self._max_pcm_bytes / (
             self._sample_rate_hz * self._channels * 2
         )
+        # Decode one extra transport interval as an overflow witness. Capping
+        # exactly at the accepted size would hide a longer, truncated utterance.
+        max_duration_seconds += 0.01
         process = await asyncio.create_subprocess_exec(
             self._ffmpeg_path,
             "-hide_banner",
