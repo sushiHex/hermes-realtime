@@ -35,7 +35,11 @@ from hermes_realtime.production_observation import (
 from hermes_realtime.speech import Transcript
 
 from .context import ConversationMessage, ConversationRole
-from .streaming import StreamingSpeechLoop, _UpdateSpeechAuthority
+from .streaming import (
+    StreamingSpeechLoop,
+    _ForegroundInterruptionAuthority,
+    _UpdateSpeechAuthority,
+)
 from .updates import (
     ConversationUpdateDirector,
     UpdateDecision,
@@ -493,6 +497,17 @@ class ConversationUpdateExecutor:
         """Return the exact current speech owner, if one exists."""
 
         return self._speech.active_turn_id
+
+    def _capture_foreground_interruption(
+        self, turn_id: str,
+    ) -> _ForegroundInterruptionAuthority | None:
+        return self._speech._capture_interruption_authority(turn_id)
+
+    def _foreground_settled_naturally(self, authority: object) -> bool:
+        return (
+            not self._closed and self._terminal_error is None
+            and self._speech._interruption_settled_naturally(authority)
+        )
 
     async def cancel_foreground_if(self, turn_id: str) -> bool:
         """Cancel foreground only if ``turn_id`` still owns it."""

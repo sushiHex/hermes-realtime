@@ -307,6 +307,8 @@ def action_executor_probe() -> tuple[
         foreground_active=True,
         active_turn_id="foreground_1",
         resume_count=0,
+        _capture_interruption_authority=lambda _: None,
+        _interruption_settled_naturally=lambda _: False,
     )
     object.__setattr__(executor, "_speech", foreground)
     object.__setattr__(
@@ -3639,3 +3641,109 @@ async def test_a_page_rebinds_at_once_while_its_readiness_cue_is_still_playing()
     assert events.index("cancel:first:finish_word=False") < events.index("disconnect:first")
     assert "finish:first" not in events
     await livekit.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["natural", "stop", "successor", "failure"])
+@pytest.mark.parametrize("echo", [True, False], ids=["echo-confirmation", "immediate"])
+async def test_capture_keeps_only_naturally_settled_exact_speech_authority(
+    settlement: str, echo: bool,
+) -> None:
+    from hermes_realtime.conversation import (
+        ConversationContextStore,
+        ForegroundTurnCoordinator,
+        StreamingSpeechLoop,
+    )
+    from hermes_realtime.speech import DeliveredSpeechLedger
+    from tests.conversation.test_streaming import (
+        EagerOneSegmentInference,
+        RecordingPlayback,
+        SegmentSynthesizer,
+    )
+
+    class Playback(RecordingPlayback):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def play(self, chunk, *, is_valid):
+            self.entered.set()
+            await self.release.wait()
+            if settlement == "failure":
+                raise RuntimeError("synthetic playback failure")
+            await super().play(chunk, is_valid=is_valid)
+
+    playback = Playback()
+    speech = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+        inference=EagerOneSegmentInference(), synthesizer=SegmentSynthesizer(),
+        playback=playback, ledger=DeliveredSpeechLedger(),
+    )
+    executor, _, responses = action_executor_probe()
+    executor._speech = speech
+    executor.cancel_foreground_if = MethodType(
+        ConversationUpdateExecutor.cancel_foreground_if, executor,
+    )
+    async def settle() -> None:
+        if settlement == "stop":
+            await speech.cancel()
+        playback.release.set()
+        await asyncio.gather(speaking, return_exceptions=True)
+        if settlement == "successor":
+            await speech.respond("successor_speech", Transcript("Synthetic next", final=True))
+
+    if not echo:
+        async def settle_before_cancel(self, turn_id):
+            await settle()
+            return await ConversationUpdateExecutor.cancel_foreground_if(self, turn_id)
+        executor.cancel_foreground_if = MethodType(settle_before_cancel, executor)
+    transcriber = CapturingPartialThenFinalTranscriber()
+    worker = ConversationSessionWorker(
+        participant_identity="browser_user", session_generation=1,
+        vad=ScriptedVad(VoiceActivity.SPEECH_STARTED, VoiceActivity.SPEECH_CONTINUED,
+                        VoiceActivity.SPEECH_ENDED),
+        stt=transcriber, actions=executor,
+        echo_guard=ScriptedEchoGuard(False, False) if echo else None,
+        speech_presence_verifier=ScriptedSpeechPresenceVerifier(SpeechPresence.CONFIRMED_SPEECH),
+        echo_recheck_frames=1, echo_promotion_checks=2,
+    )
+    worker.start()
+    speaking = asyncio.create_task(
+        speech.respond("old_speech", Transcript("Synthetic", final=True))
+    )
+    frame = AudioFrame(pcm=b"\x01\x00" * 480, sample_rate_hz=48_000, channels=1)
+    try:
+        await asyncio.wait_for(playback.entered.wait(), 1)
+        assert speech._capture_interruption_authority("unrelated_speech") is None
+        await worker.receive_audio("browser_user", 1, frame)
+        authority = worker._interruption_authority
+        assert authority is not None
+        assert speech._interruption_settled_naturally(authority) is (
+            not echo and settlement == "natural"
+        )
+        assert not speech._interruption_settled_naturally(None)
+        if echo:
+            await settle()
+        assert not speech.foreground_active
+        foreign = StreamingSpeechLoop(
+            context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+            inference=EagerOneSegmentInference(), synthesizer=SegmentSynthesizer(),
+            playback=RecordingPlayback(), ledger=DeliveredSpeechLedger(),
+        )
+        try:
+            await foreign.respond("foreign_speech", Transcript("Synthetic", final=True))
+            assert not foreign._interruption_settled_naturally(authority)
+        finally:
+            await foreign.close()
+        await worker.receive_audio("browser_user", 1, frame)
+        await worker.receive_audio("browser_user", 1, frame)
+        await worker.wait_for_responses()
+        assert bool(responses) is (settlement == "natural")
+        assert worker._interruption_authority is None
+        assert playback.finish_word_turns == []
+    finally:
+        playback.release.set()
+        await worker.close()
+        await speech.close()
+        await asyncio.gather(speaking, return_exceptions=True)

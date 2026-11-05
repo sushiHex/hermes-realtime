@@ -37,6 +37,7 @@ from hermes_realtime.speech import (
 from .actions import ConversationUpdateExecutor
 from .ingress import BoundedPcmIngress, IngressRecord
 from .knowledge import KnowledgePrefetchCoordinator
+from .streaming import _ForegroundInterruptionAuthority
 from .task_proposals import ConversationTaskProposals
 from .telemetry import KnowledgeTurnBudget, UtteranceTicket
 from .updates import _operation_failed
@@ -281,6 +282,7 @@ class ConversationSessionWorker:
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id: str | None = None
+        self._interruption_authority: _ForegroundInterruptionAuthority | None = None
         self._response_operations: set[asyncio.Task[None]] = set()
         self._foreground_cleanup_task: asyncio.Task[None] | None = None
         self._stt_cleanup_task: asyncio.Task[None] | None = None
@@ -371,6 +373,11 @@ class ConversationSessionWorker:
                     self._interruption_foreground_turn_id = (
                         self._actions.foreground_turn_id if interrupting else None
                     )
+                    self._interruption_authority = (
+                        self._actions._capture_foreground_interruption(
+                            self._interruption_foreground_turn_id
+                        ) if self._interruption_foreground_turn_id is not None else None
+                    )
                     self._interruption_committed = False
                     self._utterance_has_final_transcript = False
                     self._preliminary_final_transcript = None
@@ -413,7 +420,9 @@ class ConversationSessionWorker:
                             cancelled = await self._cancel_foreground_for_echo_promotion(
                                 turn_id
                             )
-                            if not cancelled:
+                            if not cancelled and not self._actions._foreground_settled_naturally(
+                                self._interruption_authority
+                            ):
                                 self._playback_candidate_authority_revoked = True
                         if cancelled and observer is not None:
                             observer("interrupt_requested", {"turnId": turn_id})
@@ -642,6 +651,7 @@ class ConversationSessionWorker:
         self._playback_candidate_streaming_evidence = False
         self._playback_candidate_authority_revoked = False
         self._interruption_foreground_turn_id = None
+        self._interruption_authority = None
 
     async def _cancel_foreground_for_echo_promotion(self, turn_id: str) -> bool:
         try:
@@ -668,7 +678,8 @@ class ConversationSessionWorker:
             return
         cancelled = await self._cancel_foreground_for_echo_promotion(turn_id)
         if not cancelled:
-            self._playback_candidate_authority_revoked = True
+            if not self._actions._foreground_settled_naturally(self._interruption_authority):
+                self._playback_candidate_authority_revoked = True
             return
         observer = self._observer
         if observer is not None:

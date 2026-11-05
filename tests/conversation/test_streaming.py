@@ -5317,3 +5317,50 @@ async def test_a_failure_after_completion_never_flags_the_closed_row() -> None:
         ("user", "Question?", False),
         ("assistant", "Whole answer.", False),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancelled"])
+async def test_interruption_authority_rejects_consumer_failure_before_cleanup_revision(
+    failure: str,
+) -> None:
+    class Playback(RecordingPlayback):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def play(self, chunk, *, is_valid):
+            self.entered.set()
+            await self.release.wait()
+            raise RuntimeError("synthetic playback failure")
+
+    playback = Playback()
+    speech = StreamingSpeechLoop(
+        context=ConversationContextStore(), foreground=ForegroundTurnCoordinator(),
+        inference=EagerOneSegmentInference(), synthesizer=SegmentSynthesizer(),
+        playback=playback, ledger=DeliveredSpeechLedger(),
+    )
+    speaking = asyncio.create_task(
+        speech.respond("old_speech", Transcript("Synthetic", final=True))
+    )
+    try:
+        await asyncio.wait_for(playback.entered.wait(), 1)
+        authority = speech._capture_interruption_authority("old_speech")
+        assert authority is not None
+        async with speech._lifecycle_lock:
+            if failure == "cancelled":
+                authority.consumer.cancel()
+            else:
+                playback.release.set()
+            for _ in range(100):
+                if authority.consumer.done():
+                    break
+                await asyncio.sleep(0.001)
+            assert authority.consumer.done()
+            assert speech._authority_revision == authority.revision
+            assert not speech._interruption_settled_naturally(authority)
+    finally:
+        playback.release.set()
+        await asyncio.gather(speaking, return_exceptions=True)
+        await speech.close()
