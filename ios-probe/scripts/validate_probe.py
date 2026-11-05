@@ -51,21 +51,26 @@ def fail(message: str) -> None:
 
 
 def _swift_without_comments(source: str) -> str:
-    # Retain strings (including URLs), but never accept API evidence in comments.
+    # String syntax is meaningful only outside comments. A quote or // inside
+    # a nested block comment must not swallow its closing delimiter or live code.
     tokens = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*|\*/', re.DOTALL)
+    block_tokens = re.compile(r"/\*|\*/")
     pieces: list[str] = []
     depth = 0
     cursor = 0
-    for match in tokens.finditer(source):
+    while match := (block_tokens if depth else tokens).search(source, cursor):
+        token = match.group()
         if depth == 0:
             pieces.append(source[cursor:match.start()])
-        token = match.group()
+            if token.startswith('"') or token == "*/":
+                pieces.append(token)
+            else:
+                # Comments separate tokens; removing them must not join names.
+                pieces.append(" ")
         if token == "/*":
             depth += 1
         elif token == "*/" and depth:
             depth -= 1
-        elif depth == 0 and token.startswith('"'):
-            pieces.append(token)
         cursor = match.end()
     if depth:
         fail("unterminated Swift block comment")

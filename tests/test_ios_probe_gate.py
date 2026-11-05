@@ -46,3 +46,22 @@ def test_probe_gate_rejects_uncompiled_evidence(tmp_path: Path, change: str) -> 
         path.write_text(text.replace(old, new) + "\n# " + old + "\n", encoding="utf-8")
     with pytest.raises(AssertionError):
         gate()
+
+
+@pytest.mark.parametrize("comment", ['/* " */', '/* // " */', '/* outer /* " */ inner */'])
+def test_probe_gate_comments_cannot_hide_live_forbidden_api(tmp_path: Path, comment: str) -> None:
+    probe, gate = _gate(tmp_path)
+    (probe / "Sources" / "Extra.swift").write_text(
+        comment + '\nAVAudioEngine()\n/* " */', encoding="utf-8"
+    )
+    with pytest.raises(AssertionError, match="forbidden parallel/session-owner API"):
+        gate()
+
+
+def test_probe_comment_removal_preserves_token_boundaries_and_urls() -> None:
+    strip = runpy.run_path(str(ROOT / "ios-probe/scripts/validate_probe.py"))[
+        "_swift_without_comments"
+    ]
+    assert "AVAudioEngine" not in strip("AVAudio/* comment */Engine()")
+    assert "https://example.invalid" in strip('let url = "https://example.invalid" // note')
+    assert "live" in strip('/* outer /* " */ inner */ live')
