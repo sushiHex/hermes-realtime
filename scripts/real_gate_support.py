@@ -173,8 +173,9 @@ def installed_hermes_identity(version: str, checkout: Path) -> dict[str, object]
 def _unrepresentable_paths(checkout: Path) -> set[str]:
     """Committed paths a case-insensitive checkout cannot hold apart, left exactly as committed.
 
-    Such spellings share one file on disk, so git reports all but one as changed. They are
-    unchanged when that one file is byte-identical to one of their committed versions.
+    Exempt only one physical directory entry: core.ignorecase can be copied to
+    a case-sensitive filesystem, and separate hardlinks can share file identity.
+    Single-link regular aliases must equal a committed variant too.
     """
 
     ignorecase = _git(checkout, "config", "--type=bool", "--default=false", "core.ignorecase")
@@ -188,6 +189,16 @@ def _unrepresentable_paths(checkout: Path) -> set[str]:
     exempt: set[str] = set()
     for committed in spellings.values():
         if len(committed) > 1:
+            paths = [checkout / name for name in committed]
+            try:
+                if any(
+                    path.is_symlink() or not path.is_file()
+                    or path.stat().st_nlink != 1 or not path.samefile(paths[0])
+                    for path in paths
+                ):
+                    continue
+            except OSError:
+                continue
             on_disk = _git(checkout, "hash-object", "--", next(iter(committed))).strip()
             if on_disk in committed.values():
                 exempt.update(committed)
