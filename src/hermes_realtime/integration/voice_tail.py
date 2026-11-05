@@ -959,6 +959,13 @@ class VoiceTailWriter:
 
     def _retire(self, new_id: str, generation: int) -> None:
         """Start the next binding with an empty outbox and fresh review progress."""
+        # A reset tail must not restart the ordering of retained delete outcomes.
+        recorded = (*self._deletes.pending, self._deletes.outcome)
+        generation = max(generation, max((item[1] + 1 for item in recorded if item), default=0))
+        if self._deletes.live is not None:
+            generation = max(generation, self._deletes.live[1])
+        if generation > MAX_IDENTITY:
+            raise RuntimeError("voice generation capacity is exhausted")
         self._conversation_id = new_id
         self._generation = generation
         # The record names the live binding before any tail carries it.

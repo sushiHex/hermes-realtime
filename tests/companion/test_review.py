@@ -1340,3 +1340,35 @@ async def test_ledger_accept_rechecks_tombstone_but_outcome_can_settle_after_it(
     finally:
         await archive.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_finished_review_disarms_watchdog_without_explicit_join(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.db")
+    archive = VoiceArchive(store, FakeHermes())
+    port = FakeReviewPort()
+    port.started._loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    review = VoiceReviewCoordinator(archive, store, port, lambda _: type("Parent", (), {})())
+    try:
+        await review.start()
+        await archive.open("conv")
+        await archive.archive("conv", _batch())
+        admitted = await review.review(ReviewRequest("conv", 0, 0, 0, True, True, False))
+        await asyncio.wait_for(port.started.wait(), 5)
+        running = review._active["conv"]
+        watchdog = running.watchdog
+        assert watchdog is not None
+        port.release.set()
+        for _ in range(100):
+            if review.outcome("conv", admitted.review_id) == "finished":
+                break
+            await asyncio.sleep(0.01)
+        assert review.outcome("conv", admitted.review_id) == "finished"
+        assert watchdog.cancelled()
+        await review._expire("conv", admitted.review_id)
+        assert port.cancel_calls == 0
+    finally:
+        port.release.set()
+        await review.close()
+        await archive.close()
+        store.close()

@@ -375,6 +375,8 @@ class VoiceReviewCoordinator:
         running = self._active.get(conversation_id)
         if running is None or running.review_id != review_id:
             return
+        if running.watchdog is not None:
+            running.watchdog.cancel()
         if self._store.review_outcome(conversation_id, review_id) != "accepted":
             return
         outcome = "cancelled" if running.cancelled else "failed" if running.failure else "finished"
@@ -458,7 +460,10 @@ class VoiceReviewCoordinator:
 
     async def _expire(self, conversation_id: str, review_id: str) -> None:
         active = self._active.get(conversation_id)
-        if active is not None and active.review_id == review_id:
+        if (
+            active is not None and active.review_id == review_id
+            and self._store.review_outcome(conversation_id, review_id) == "accepted"
+        ):
             _marker({"refusal": "wall_timeout", "version": 1})
             await self.cancel_and_join(conversation_id, _CLOSE_JOIN_SECONDS)
 
