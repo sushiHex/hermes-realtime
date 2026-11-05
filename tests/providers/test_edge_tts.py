@@ -247,3 +247,23 @@ async def test_ffmpeg_kill_race_retains_original_decode_failure(
 
     assert any(isinstance(error, ValueError) for error in caught.value.exceptions)
     assert any(isinstance(error, ProcessLookupError) for error in caught.value.exceptions)
+
+
+@pytest.mark.asyncio
+async def test_edge_tts_closed_owner_refuses_late_synthesis() -> None:
+    calls = []
+
+    async def synthesize(text: str, voice: str) -> bytes:
+        calls.append((text, voice))
+        return b"synthetic"
+
+    async def decode(_payload: bytes) -> bytes:
+        return b"\x00\x00" * 480
+
+    tts = EdgeTtsSynthesizer(synthesize_mp3=synthesize, decode_mp3=decode)
+    iterator = tts.synthesize("late", "turn_late")
+    await tts.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await anext(iterator)
+    assert calls == []
+    assert tts._operations == {}

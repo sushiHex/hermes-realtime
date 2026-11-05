@@ -77,11 +77,14 @@ class EdgeTtsSynthesizer:
         self._decode_mp3 = decode_mp3 or self._ffmpeg_decode
         self._operations: dict[str, asyncio.Task[SpeechChunk]] = {}
         self._lock = asyncio.Lock()
+        self._closed = False
 
     async def synthesize(self, text: str, turn_id: str) -> AsyncIterator[SpeechChunk]:
         self._validate_text(text)
         self._validate_turn_id(turn_id)
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("Edge TTS synthesizer is closed")
             if turn_id in self._operations:
                 raise RuntimeError("turn already owns an Edge TTS operation")
             if len(self._operations) >= self._max_active_turns:
@@ -117,6 +120,7 @@ class EdgeTtsSynthesizer:
 
     async def close(self) -> None:
         async with self._lock:
+            self._closed = True
             operations = tuple(self._operations.values())
         for operation in operations:
             operation.cancel()

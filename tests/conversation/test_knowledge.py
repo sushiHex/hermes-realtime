@@ -558,3 +558,49 @@ async def test_recovery_preserves_and_marks_conflicting_evidence() -> None:
     assert type(rendered) is list
     assert [source["backend"] for source in rendered] == ["primary", "recovery"]
     await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", ["revoke", "close"])
+async def test_revoking_lookup_returns_none_without_cancelling_consumer(shutdown: str) -> None:
+    lookup = BlockingLookup()
+    coordinator = KnowledgePrefetchCoordinator(
+        lookup=lookup, enabled=True, debounce_seconds=0.0,
+        min_stable_prefix_chars=20, min_alphanumeric_chars=24,
+    )
+    ticket = UtteranceTicket(3, 1, 7)
+    final = "What is the latest stable Python release right now?"
+    await coordinator.observe_partial(ticket, "What is the latest stable Python release")
+    await coordinator.observe_partial(ticket, final)
+    await lookup.started.wait()
+    consumer = asyncio.create_task(coordinator.consume(ticket, final, budget(ticket)))
+    await asyncio.sleep(0)
+    if shutdown == "revoke":
+        await coordinator.revoke(ticket, "barge_in")
+    else:
+        await coordinator.close()
+    assert await consumer is None
+    assert not consumer.cancelled()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_speculative_operation_is_released_after_consumption() -> None:
+    class FailedLookup(RecordingLookup):
+        async def lookup(self, query: str) -> CurrentFactEvidence:
+            raise OSError("synthetic failure")
+
+    coordinator = KnowledgePrefetchCoordinator(
+        lookup=FailedLookup(), enabled=True, debounce_seconds=0.0,
+        min_stable_prefix_chars=20, min_alphanumeric_chars=24,
+    )
+    ticket = UtteranceTicket(3, 1, 7)
+    final = "What is the latest stable Python release right now?"
+    await coordinator.observe_partial(ticket, "What is the latest stable Python release")
+    await coordinator.observe_partial(ticket, final)
+    try:
+        with pytest.raises(OSError, match="synthetic failure"):
+            await coordinator.consume(ticket, final, budget(ticket))
+        assert ticket not in coordinator._operations
+    finally:
+        await coordinator.close()

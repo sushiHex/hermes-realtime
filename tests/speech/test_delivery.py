@@ -524,3 +524,19 @@ def test_ledger_releases_started_receipts_after_delivery() -> None:
     del receipt
     gc.collect()
     assert observer() is None
+
+
+def test_later_streamed_chunk_preserves_committed_context_flag() -> None:
+    ledger = DeliveredSpeechLedger()
+    first = chunk("chunk_first", "first")
+    admission = SpeechDeliveryAdmission()
+    ledger.queue(first, admission=admission)
+    receipt = ledger.mark_started(first.turn_id, first.chunk_id)
+    confirmation = ledger.mark_delivered_confirmed(receipt)
+    ledger.consume_delivery_confirmation(confirmation, admission)
+    ledger.queue(chunk("chunk_later", "later"))
+    assert ledger.snapshot_turn_counts(first.turn_id).assistant_delivery_context_recorded
+    ledger.cancel_pending(first.turn_id)
+    ledger.close_turn(first.turn_id)
+    ledger.queue(chunk("chunk_new", "new incarnation"))
+    assert not ledger.snapshot_turn_counts(first.turn_id).assistant_delivery_context_recorded

@@ -234,7 +234,7 @@ class DeliveredSpeechLedger:
         self._validate_lookup_identifier(turn_id, "turn_id")
         if turn_id in self._closed_turns:
             self._evict_closed_turn(turn_id)
-        self._delivery_context_recorded_turns.discard(turn_id)
+            self._delivery_context_recorded_turns.discard(turn_id)
 
     def mark_delivered(self, receipt: PlaybackReceipt) -> SpeechChunk:
         receipt_id, key = self._authoritative_receipt_key(receipt)

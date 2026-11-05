@@ -77,3 +77,26 @@ async def test_faster_whisper_cancel_joins_owned_transcription_and_discards_resu
 
     with pytest.raises(RuntimeError, match="no buffered audio"):
         await stt.finish_utterance()
+
+
+@pytest.mark.asyncio
+async def test_cancel_settles_failed_transcription_without_stealing_backend_error() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def transcribe(_payload: bytes) -> str:
+        started.set()
+        assert release.wait(5)
+        raise OSError("synthetic backend failure")
+
+    stt = FasterWhisperTranscriber(transcribe_wav=transcribe)
+    await stt.push(_frame())
+    finishing = asyncio.create_task(stt.finish_utterance())
+    assert await asyncio.to_thread(started.wait, 1)
+    cancelling = asyncio.create_task(stt.cancel())
+    await asyncio.sleep(0)
+    release.set()
+    await cancelling
+    with pytest.raises(OSError, match="synthetic backend failure"):
+        await finishing
+    assert stt._operation is None
