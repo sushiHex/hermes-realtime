@@ -77,6 +77,8 @@ def _input(tmp_path: Path) -> Path:
         "scripts/qualification_linux_producer.py": Path(worker.__file__)
         .with_name("qualification_linux_producer.py")
         .read_bytes(),
+        "scripts/release_gate.py": Path(__file__).resolve().parents[1]
+        .joinpath("scripts/release_gate.py").read_bytes(),
         ".github/workflows/release-gates.yml": b"name: release-gates\n",
         "uv.lock": b"version = 1\n",
     }
@@ -1190,7 +1192,9 @@ def test_prepare_inputs_writes_runtime_only_manifest_and_source_archive(tmp_path
         sources = {
             "scripts/qualification_linux_worker.py": Path(producer.worker.__file__).read_bytes(),
             "scripts/qualification_linux_producer.py": Path(producer.__file__).read_bytes(),
-            ".github/workflows/release-gates.yml": b"name: release-gates\n",
+            "scripts/release_gate.py": Path(__file__).resolve().parents[1]
+        .joinpath("scripts/release_gate.py").read_bytes(),
+        ".github/workflows/release-gates.yml": b"name: release-gates\n",
             "uv.lock": b"version = 1\n",
         }
         with tarfile.open(fileobj=stream, mode="w:") as bundle:

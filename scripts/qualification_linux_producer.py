@@ -29,6 +29,7 @@ from typing import Any, cast
 from scripts import qualification_linux_image as images
 from scripts import qualification_linux_receipt as payloads
 from scripts import qualification_linux_worker as worker
+from scripts import release_gate
 
 _REGISTRY = "https://registry-1.docker.io"
 _TOKEN = (
@@ -939,13 +940,14 @@ def _git(source_root: Path, *arguments: str) -> str:
         check=False,
         text=True,
         timeout=30,
-        env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1"},
+        env=release_gate.clean_git_environment(),
     )
     _require(result.returncode == 0, "Linux producer source identity failed")
     return result.stdout.strip()
 
 
 def _git_archive(source_root: Path) -> bytes:
+    release_gate._require_no_local_attributes(source_root)
     command = (
         "git",
         "-C",
@@ -954,6 +956,10 @@ def _git_archive(source_root: Path) -> bytes:
         "core.hooksPath=/dev/null",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        "tar.umask=0002",
         "archive",
         "--format=tar",
         "--prefix=hermes-realtime-0.0.3/",
@@ -967,7 +973,7 @@ def _git_archive(source_root: Path) -> bytes:
             capture_output=True,
             check=False,
             timeout=60,
-            env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1"},
+            env=release_gate.clean_git_environment(),
         )
         _require(
             result.returncode == 0 and 0 < len(result.stdout) <= 32 * 1024**2,

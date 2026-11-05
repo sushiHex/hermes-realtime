@@ -225,7 +225,8 @@ def test_observe_propagates_dependency_import_stage_without_global_state(tmp_pat
     assert failure.read_bytes() == b'{"stage":"dependency_imports","version":1}\n'
 
 
-def test_worker_is_bound_to_its_candidate_archive_member(tmp_path):
+@pytest.mark.parametrize("altered", ["qualification_linux_worker.py", "release_gate.py"])
+def test_worker_is_bound_to_its_candidate_archive_member(tmp_path, altered):
     from scripts import qualification_linux_worker as worker
 
     root = tmp_path / "input"
@@ -237,6 +238,8 @@ def test_worker_is_bound_to_its_candidate_archive_member(tmp_path):
         "scripts/qualification_linux_producer.py": Path(worker.__file__)
         .with_name("qualification_linux_producer.py")
         .read_bytes(),
+        "scripts/release_gate.py": Path(__file__).resolve().parents[1]
+        .joinpath("scripts/release_gate.py").read_bytes(),
         ".github/workflows/release-gates.yml": b"name: release-gates\n",
         "uv.lock": b"version = 1\n",
     }
@@ -251,7 +254,7 @@ def test_worker_is_bound_to_its_candidate_archive_member(tmp_path):
     assert workflow == _sha(values[".github/workflows/release-gates.yml"])
     assert lock == _sha(values["uv.lock"])
 
-    values["scripts/qualification_linux_worker.py"] = b"foreign"
+    values["scripts/" + altered] = b"foreign"
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w:") as archive:
         for relative, raw in values.items():
@@ -259,5 +262,5 @@ def test_worker_is_bound_to_its_candidate_archive_member(tmp_path):
             info.size = len(raw)
             archive.addfile(info, io.BytesIO(raw))
     archive_path.write_bytes(stream.getvalue())
-    with pytest.raises(ValueError, match="worker differs"):
+    with pytest.raises(ValueError, match="differs from candidate archive"):
         worker._source_binding(root)

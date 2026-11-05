@@ -29,6 +29,9 @@ def test_setup_runner_uses_noninteractive_windowless_process_contract(
 
     def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         observed.update(kwargs)
+        if "config" in argv:
+            value = "false" if argv[-1] == "core.autocrlf" else ""
+            return subprocess.CompletedProcess(argv, 0, value, "")
         return subprocess.CompletedProcess(argv, 0, "ready", "")
 
     monkeypatch.setattr(_SUPPORT.subprocess, "run", run)
@@ -178,3 +181,28 @@ def test_available_port_returns_a_bindable_loopback_port() -> None:
     assert 1 <= port <= 65535
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", port))
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_identity_refuses_hidden_tracked_edits(checkout: Path, flag: str) -> None:
+    _git(checkout, "update-index", flag, "hermes.py")
+    (checkout / "hermes.py").write_text("VERSION = 99\n")
+    with pytest.raises(RuntimeError, match="no commit describes"):
+        installed_hermes_identity("0.21.0", checkout)
+
+
+def test_identity_preserves_absent_sparse_website(checkout: Path) -> None:
+    (checkout / "website").mkdir()
+    page = checkout / "website" / "page.md"
+    page.write_text("upstream documentation\n")
+    _git(checkout, "add", ".")
+    _git(checkout, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "website")
+    _git(checkout, "update-index", "--skip-worktree", "website/page.md")
+    page.unlink()
+    expected = _git(checkout, "rev-parse", "HEAD")
+    assert installed_hermes_identity("0.21.0", checkout)["commit"] == expected
+
+
+def test_identity_ignores_foreign_git_selection(checkout: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GIT_DIR", str(checkout / "not-a-repository"))
+    assert installed_hermes_identity("0.21.0", checkout)["commit"]

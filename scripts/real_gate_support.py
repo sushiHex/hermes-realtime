@@ -11,6 +11,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
+try:
+    import release_gate
+except ModuleNotFoundError as error:
+    if error.name != "release_gate":
+        raise
+    from scripts import release_gate
+
 # The owner-selected qualification baseline (#67, #159): a reference, not a version ceiling.
 HERMES_BASELINE = {"version": "0.21.0", "commit": "29112bef099274229cadff79cdff7bf7b99c4b77"}
 _UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
@@ -142,6 +149,10 @@ def installed_hermes_identity(version: str, checkout: Path) -> dict[str, object]
     try:
         commit = _git(checkout, "rev-parse", "HEAD").strip()
         refusal = "modified"
+        if release_gate.has_hidden_index_entries(
+            checkout, _git(checkout, "ls-files", "-v", "-z"), allow_sparse_website=True,
+        ):
+            raise RuntimeError("installed Hermes has hidden changes that no commit describes")
         status = _git(checkout, "status", "--porcelain", "-z", "--untracked-files=no")
         changed = {entry[3:] for entry in status.split("\0") if entry}
         if changed - _unrepresentable_paths(checkout):
@@ -185,7 +196,8 @@ def _unrepresentable_paths(checkout: Path) -> set[str]:
 
 def _git(checkout: Path, *arguments: str) -> str:
     return _checked_run(
-        "hermes_identity", ["git", *arguments], cwd=checkout, timeout=60,
+        "hermes_identity", ["git", "-c", "core.fsmonitor=false", *arguments],
+        cwd=checkout, timeout=60, env=release_gate.worktree_git_environment(checkout),
     ).stdout
 
 
