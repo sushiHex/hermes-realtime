@@ -867,7 +867,8 @@ class Generation:
             evidence["stage"] = "provider"
             formatted = asyncio.run(self.presentation.complete(
                 self, run_id, row, source_input, evidence))
-            content = render_presentation_response(formatted, catalog, api_mode, evidence)
+            content = render_presentation_response(
+                formatted, catalog, api_mode, evidence, passages=passages)
             evidence["stage"] = "publication"
             with self.lock:
                 _, current = self.scope()

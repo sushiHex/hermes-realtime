@@ -593,7 +593,8 @@ class NativeWebEvidence:
                 "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
             formatted = await self.presentation.complete(self, run_id, row, source_input, evidence)
-            rendered = render_presentation_response(formatted, catalog, api_mode, evidence)
+            rendered = render_presentation_response(
+                formatted, catalog, api_mode, evidence, passages=passages)
             with self.lock:
                 self._assert_current(run_id, row, enforce_deadline=True)
                 if row["urls"] != set(catalog) or row["passages"] is not passages:

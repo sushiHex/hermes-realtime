@@ -69,6 +69,26 @@ def completion(content, *, reason="stop", calls=None):
     )
 
 
+@pytest.mark.parametrize("selected, allowed", [([0], True), ([1], False), ([2], False)])
+def test_presentation_cannot_cite_a_source_without_supplied_evidence(selected, allowed):
+    from hermes_realtime.integration.evidence_presentation import render_presentation_response
+
+    catalog = ("https://example.invalid/evidence", "https://example.invalid/empty",
+               "https://example.invalid/gap")
+    passages = MappingProxyType({catalog[0]: (("search", "Supplied evidence."),),
+                                catalog[1]: (),
+                                catalog[2]: (("extract-unavailable", "Unavailable."),)})
+    response = completion(json.dumps({"answer": {"lead": "A result.", "support": ""},
+                                      "source_ids": selected}))
+    if allowed:
+        assert catalog[0] in render_presentation_response(
+            response, catalog, "chat_completions", {}, passages=passages)
+    else:
+        with pytest.raises(ValueError, match="presentation-source-without-evidence"):
+            render_presentation_response(
+                response, catalog, "chat_completions", {}, passages=passages)
+
+
 def retrieve(generation, result, before_result=None):
     """Admit one search through the real model/tool/effect ticket chain."""
     args = {"query": "synthetic lookup"}
@@ -154,7 +174,8 @@ def retrieve_batch(generation, results_by_attempt, *, primary_count):
 @pytest.fixture
 def setup(monkeypatch, request):
     retrieval = getattr(request, "param", {
-        "success": True, "data": {"web": [{"url": "https://example.invalid/source"}]},
+        "success": True, "data": {"web": [{"url": "https://example.invalid/source",
+                                               "description": "Supplied evidence."}]},
     })
     session = {"run": "selected"}
     for name in ("tools", "tools.approval", "tools.registry", "agent", "agent.codex_headers"):
@@ -339,9 +360,9 @@ def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     assert set(payload) == {"objective", "sources", "evidence", "missing_source_ids"}
     assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
     assert payload["objective"] == "synthetic lookup"
-    assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "",
-                                    "original_bytes": 0, "truncated": False}]
-    assert payload["missing_source_ids"] == [0]
+    assert payload["evidence"] == [{"source_id": 0, "kind": "search", "text": "Supplied evidence.",
+                                    "original_bytes": 18, "truncated": False}]
+    assert payload["missing_source_ids"] == []
     schema = body["response_format"]["json_schema"]["schema"]
     assert schema["properties"]["source_ids"]["minItems"] == 0
     assert set(schema["properties"]) == {"answer", "source_ids"}
@@ -1258,7 +1279,7 @@ async def test_admitted_extraction_retains_same_url_content_as_immutable_snapsho
         "title": "Observation", "content": "Published October 21; available early 2027."}]})
     assert await extract_passage(s, result) == result
     assert s.row["passages"] is not before
-    assert before["https://example.invalid/source"] == (("search", ""),)
+    assert before["https://example.invalid/source"] == (("search", "Supplied evidence."),)
     assert await asyncio.to_thread(s.run) is not s.refused
     payload = json.loads(s.captured["requests"][0]["messages"][-1]["content"])
     assert payload["missing_source_ids"] == []
@@ -1379,7 +1400,8 @@ def test_attribution_renders_selected_admitted_url_and_preserves_answer(setup):
 
 
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
-    {"url": "https://example.invalid/z"}, {"url": "https://example.invalid/a"}]}}], indirect=True)
+    {"url": "https://example.invalid/z", "description": "Z evidence."},
+    {"url": "https://example.invalid/a", "description": "A evidence."}]}}], indirect=True)
 def test_attribution_selects_subset_from_whole_frozen_catalog_without_url_rewrite(setup):
     s = setup
     s.captured["response"] = completion(
@@ -1448,7 +1470,7 @@ def test_attribution_refuses_whole_catalog_over_input_bound_without_call(setup):
 
 
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
-    {"url": "https://example.invalid/" + "x" * 1790}]}}], indirect=True)
+    {"url": "https://example.invalid/" + "x" * 1790, "description": "Evidence."}]}}], indirect=True)
 def test_attribution_refuses_rendered_detail_over_1800_without_clipping(setup):
     setup.captured["response"] = completion(
         json.dumps({
@@ -1460,7 +1482,7 @@ def test_attribution_refuses_rendered_detail_over_1800_without_clipping(setup):
 
 
 @pytest.mark.parametrize("setup", [{"success": True, "data": {"web": [
-    {"url": "https://example.invalid/</detail>"}]}}], indirect=True)
+    {"url": "https://example.invalid/</detail>", "description": "Evidence."}]}}], indirect=True)
 def test_attribution_rendered_urls_still_pass_reserved_markup_validation(setup):
     setup.captured["response"] = completion(
         json.dumps({
