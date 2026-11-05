@@ -390,7 +390,6 @@ class VoiceCompanionService:
             if self._store.deletion(event.conversation_id) is not None:
                 raise ArchiveRefusal("tombstoned")
             if self._store.read(event.conversation_id) is None:
-                evidence = {"refusal": "unbound", "version": 1}
                 raise ArchiveRefusal("unbound")
             await self._ensure_open(event.conversation_id)
             result = await self._review.review(
@@ -400,13 +399,15 @@ class VoiceCompanionService:
                 )
             )
         except ArchiveRefusal as refusal:
+            evidence = {"refusal": refusal.category, "version": 1}
             return VoiceReviewRefusedEvent(
                 protocol_version="0.3", type="voice_review_refused",
                 conversation_id=event.conversation_id, generation=event.generation,
                 seq_from=event.seq_from, seq_through=event.seq_through,
                 closing=event.closing, category=refusal.category,
             )
-        except Exception:
+        except Exception as error:
+            evidence = {"failure": type(error).__name__, "version": 1}
             return None
         finally:
             if evidence is not None:

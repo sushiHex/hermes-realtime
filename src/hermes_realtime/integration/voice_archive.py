@@ -135,6 +135,7 @@ class VoiceArchiveSender:
         self._fence: str | None = None
         self._transient = False
         self._unavailable = False
+        self._capability_unavailable = False
         self.sent = 0
         self.resent = 0
 
@@ -203,8 +204,11 @@ class VoiceArchiveSender:
                 if VOICE_ARCHIVE_CAPABILITY not in link.capabilities:
                     with contextlib.suppress(Exception):
                         await link.close()
-                    evidence = {"refusal": "capability"}
+                    if not self._capability_unavailable:
+                        evidence = {"refusal": "capability"}
+                    self._capability_unavailable = True
                     return "unknown"
+                self._capability_unavailable = False
                 self._link = link
             if self._writer.binding != (event.conversation_id, event.generation):
                 await self._drop()
