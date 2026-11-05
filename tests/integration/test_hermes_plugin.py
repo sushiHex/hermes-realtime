@@ -181,7 +181,7 @@ async def test_plugin_dispatcher_rejects_responses_without_live_handle(
 ) -> None:
     dispatcher = HermesPluginDispatcher(RecordingPluginContext(result))
 
-    with pytest.raises(HermesDispatchRejected, match=message):
+    with pytest.raises(RuntimeError, match=message):
         await dispatcher.dispatch(
             HermesDispatchCommand(
                 session_id="session_001",
@@ -203,7 +203,7 @@ async def test_plugin_dispatcher_rejects_delegation_id_with_control_text() -> No
         )
     )
 
-    with pytest.raises(HermesDispatchRejected, match="delegation ID"):
+    with pytest.raises(RuntimeError, match="delegation ID"):
         await dispatcher.dispatch(
             HermesDispatchCommand(
                 session_id="session_001",
@@ -228,7 +228,7 @@ class InvalidJsonPluginContext:
 async def test_plugin_dispatcher_rejects_invalid_json() -> None:
     dispatcher = HermesPluginDispatcher(InvalidJsonPluginContext())
 
-    with pytest.raises(HermesDispatchRejected, match="invalid dispatch response"):
+    with pytest.raises(RuntimeError, match="invalid dispatch response"):
         await dispatcher.dispatch(
             HermesDispatchCommand(
                 session_id="session_001",
@@ -275,3 +275,56 @@ def test_runtime_fails_clearly_when_exact_interruption_api_is_unavailable() -> N
 
     with pytest.raises(RuntimeError, match="interrupt_delegation"):
         HermesPluginRuntime(LegacyContext())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "status,text",
+    [
+        ("failed", "x" * 1025),
+        ("interrupted", "a\ud800b"),
+        ("completed", "x" * 4097),
+        ("completed", "a\ud800b"),
+    ],
+)
+def test_unusable_hook_text_preserves_terminal(status: str, text: str) -> None:
+    context = RecordingPluginContext({"status": "unused"})
+    runtime = HermesPluginRuntime(context)
+    completions = []
+    runtime.subscribe_completion(completions.append)
+    callback = context.hooks["subagent_stop"]
+    assert callable(callback)
+    callback(delegation_id="deleg_result", child_status=status, child_summary=text)
+    completion = completions[0]
+    from hermes_realtime.integration.bridge import LocalHermesBridgeServer
+
+    LocalHermesBridgeServer._validate_completion_text(
+        completion.summary if status == "completed" else completion.reason,
+        completed=status == "completed",
+    )
+    assert completion.status == status
+
+
+@pytest.mark.asyncio
+async def test_uncertain_dispatch_retains_authority_and_refuses_retries() -> None:
+    context = RecordingPluginContext({"status": "dispatched", "delegation_id": "deleg_mismatch"})
+    runtime = HermesPluginRuntime(context)
+    command = HermesDispatchCommand(
+        session_id="session_001",
+        task_id="task_001",
+        objective="Inspect",
+        durability=Durability.EPHEMERAL,
+    )
+    completions = []
+    runtime.subscribe_completion(completions.append)
+    with pytest.raises(RuntimeError):
+        await runtime.dispatcher.dispatch(command)
+    reserved = context.reserved_ids[0]
+    assert reserved in runtime._reserved_run_ids
+    with pytest.raises(RuntimeError, match="uncertain"):
+        await runtime.dispatcher.dispatch(command)
+    assert len(context.reserved_ids) == 1
+    callback = context.hooks["subagent_stop"]
+    assert callable(callback)
+    callback(delegation_id=reserved, child_status="failed", child_summary="Failed")
+    assert completions[0].authoritative
+    assert reserved not in runtime._reserved_run_ids
