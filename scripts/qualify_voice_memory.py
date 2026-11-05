@@ -38,7 +38,7 @@ _STEP_TIMEOUT = 240
 _SRC = Path(__file__).resolve().parents[1] / "src"
 _REQUIRED = frozenset({
     "recall", "freshness", "isolation", "fail_closed", "latency",
-    "authority", "bounds", "capability", "review_model_calls", "unattributed",
+    "authority", "bounds", "capability", "review_model_calls", "unattributed", "proposal_boundary",
 })
 _RECALL = frozenset({
     "review_finished", "next", "restart", "gap_hours", "gap",
@@ -86,6 +86,17 @@ def _passed(observed: dict[str, object], hermes: dict[str, object]) -> bool:
     if observed["review_model_calls"] != 6 or observed["unattributed"] != 0:
         return False
     if not _exact_int(observed["review_model_calls"]) or not _exact_int(observed["unattributed"]):
+        return False
+    boundary = observed["proposal_boundary"]
+    expected_boundary = {
+        "confirmation_attempts": 3, "proposals_before_confirmation": 3,
+        "dispatches_before_confirmation": 0, "cancellations_before_confirmation": 0,
+        "accepted_after_confirmation": 3,
+    }
+    if (
+        type(boundary) is not dict or boundary != expected_boundary
+        or not all(_exact_int(value) for value in boundary.values())
+    ):
         return False
     recall = _section(observed, "recall", _RECALL)
     freshness = _section(observed, "freshness", _FRESHNESS)
@@ -1310,6 +1321,7 @@ async def _qualify(python: Path) -> None:
                 "capability": guards["capability"],
                 "review_model_calls": sum(model.calls.values()),
                 "unattributed": model.unattributed,
+                "proposal_boundary": opened["proposal_boundary"],
             }
             evidence["hermes"] = installed_hermes_identity(
                 "0.21.0", PINNED_HERMES / "source"

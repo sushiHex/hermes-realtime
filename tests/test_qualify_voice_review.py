@@ -20,9 +20,53 @@ sys.modules[_SPEC.name] = _SCRIPT
 _SPEC.loader.exec_module(_SCRIPT)
 
 _BASELINE = {
-    "version": "0.21.0", "commit": "29112bef099274229cadff79cdff7bf7b99c4b77",
+    "version": "0.21.0",
+    "commit": "29112bef099274229cadff79cdff7bf7b99c4b77",
     "baseline": True,
 }
+
+
+@pytest.mark.asyncio
+async def test_confinement_witness_belongs_to_each_review(tmp_path, monkeypatch) -> None:
+    from types import ModuleType, SimpleNamespace
+
+    package = ModuleType("hermes_cli")
+    plugins = ModuleType("hermes_cli.plugins")
+    plugins.set_thread_tool_whitelist = lambda allowed: None
+    package.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    monkeypatch.setattr(_SCRIPT, "_ROUTES", ("routed",))
+    monkeypatch.setattr(_SCRIPT, "_ORDERINGS", ("first", "second"))
+    monkeypatch.setattr(_SCRIPT, "_config", lambda *args, **kwargs: None)
+    monkeypatch.setenv("M2_MODEL_URL", "http://localhost")
+
+    class Worker:
+        home = tmp_path
+        port = SimpleNamespace(settings=lambda: (None, {"extra_tools": []}))
+        calls = 0
+
+        async def archive_rows(self, *args):
+            pass
+
+        async def one_review(self, *args):
+            self.calls += 1
+            if self.calls == 1:
+                plugins.set_thread_tool_whitelist(
+                    {
+                        "memory",
+                        "skill_manage",
+                        "skill_view",
+                        "skills_list",
+                        "read_file",
+                        "search_files",
+                    }
+                )
+            return "accepted", "finished"
+
+    evidence = await _SCRIPT._confinement(Worker())
+    assert evidence["confinement"]["routed_first"]["whitelist_equal"] == 1
+    assert evidence["confinement"]["routed_second"]["whitelist_equal"] == 0
 
 
 def _good() -> dict[str, object]:

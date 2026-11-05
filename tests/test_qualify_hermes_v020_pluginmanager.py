@@ -100,6 +100,7 @@ def test_source_archive_authority_is_shared_without_pluginmanager_policy_couplin
     assert expected_policy == module._SOURCE_ARCHIVE_POLICY
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows retained ownership")
 def test_hermes_source_archive_container_has_a_separate_bound(tmp_path: Path, monkeypatch) -> None:
     module = runner()
     request, files = write_request_inputs(module, tmp_path)
@@ -599,6 +600,34 @@ def test_stage_parser_rejects_wrong_origin_duplicate_fields_and_noncanonical_byt
             )
 
 
+@pytest.mark.parametrize("child", [False, True])
+def test_protected_snapshot_refuses_unreadable_subtree(tmp_path: Path, monkeypatch, child) -> None:
+    module = runner()
+    root = tmp_path / "protected"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "file").write_bytes(b"protected")
+    original = module.os.scandir
+
+    def denied(path):
+        if Path(path) == root / "sub":
+            raise PermissionError("unreadable subtree")
+        return original(path)
+
+    monkeypatch.setattr(module.os, "scandir", denied)
+    with pytest.raises(PermissionError, match="unreadable subtree"):
+        if child:
+            import ast
+            import pathlib
+
+            tree = ast.parse(module._ENABLE_CHILD)
+            function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "tree")
+            namespace = {"os": module.os, "pathlib": pathlib, "hashlib": hashlib, "profile": root}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), "<tree>", "exec"), namespace)
+            namespace["tree"]()
+        else:
+            module.snapshot_regular_tree(root)
+
+
 def test_protected_snapshot_rejects_changes_case_collisions_links_and_ads(tmp_path: Path) -> None:
     module = runner()
     root = tmp_path.resolve() / "protected"
@@ -610,6 +639,7 @@ def test_protected_snapshot_rejects_changes_case_collisions_links_and_ads(tmp_pa
         module.require_tree_unchanged(before, module.snapshot_regular_tree(root))
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows retained ownership")
 def test_snapshot_regular_tree_reads_each_file_through_one_retained_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -913,6 +943,7 @@ def test_parent_manifest_python_pin_is_frozen_to_311(tmp_path: Path) -> None:
         module._verify_bound_wheelhouse_closure(request)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows retained ownership")
 def test_source_archive_uses_a_retained_random_root_without_publication_destination(
     tmp_path: Path,
 ) -> None:
@@ -1530,6 +1561,7 @@ def test_journal_parser_fails_closed_on_zero_overflow_and_malformed_records() ->
             owner._parse_records(buffer, count, None)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows retained ownership")
 def test_stage_failure_always_finalizes_job_and_preserves_dual_failure(
     tmp_path: Path,
 ) -> None:
@@ -1652,6 +1684,7 @@ def test_stage_failure_always_finalizes_job_and_preserves_dual_failure(
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows retained ownership")
 def test_governed_aggregation_requires_disabled_false_and_publishes_reopened_output(
     tmp_path: Path,
 ) -> None:

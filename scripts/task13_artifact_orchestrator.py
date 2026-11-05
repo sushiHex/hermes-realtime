@@ -64,6 +64,11 @@ def _full_oid(candidate: Path, revision: str, *, label: str) -> str:
 
 
 def _require_clean_tracked_state(candidate: Path) -> None:
+    tracked = _git(candidate, "ls-files", "-v", "-z")
+    if tracked.returncode != 0:
+        raise ArtifactOrchestrationError("could not inspect candidate index flags")
+    if any(row[:1] == b"S" or row[:1].islower() for row in tracked.stdout.split(b"\0") if row):
+        raise ArtifactOrchestrationError("candidate has hidden index flags")
     status = _git(candidate, "status", "--porcelain=v1", "-z", "--untracked-files=no")
     if status.returncode != 0:
         raise ArtifactOrchestrationError("could not inspect candidate tracked state")
