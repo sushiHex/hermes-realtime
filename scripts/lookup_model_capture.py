@@ -45,6 +45,8 @@ def capture_endpoint(mode: Any, manifest: Any, config: Any) -> str | None:
         model = config["model"]
         presentation = config["plugins"]["entries"]["ordinary-lookup-experimental"][
             "settings"]["presentation"]
+        if type(model) is not dict or type(presentation) is not dict:
+            raise ValueError("capture_route")
         base = model["base_url"]
         if (type(port) is not int or not 1 <= port <= 65535 or port == 11434
                 or type(base) is not str or model.get("provider") != "custom"

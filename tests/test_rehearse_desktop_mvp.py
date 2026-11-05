@@ -734,6 +734,26 @@ def test_the_database_scan_reads_every_table_and_full_text_index(tmp_path: Path)
         rehearsal.phrase_in_database(tmp_path / "missing.db", "hoopoe")
 
 
+def test_database_scan_refuses_an_unreadable_table_instead_of_reporting_zero(tmp_path, monkeypatch):
+    database = tmp_path / "state.db"
+    database.touch()
+    class Query:
+        def fetchall(self):
+            return [("messages", "CREATE TABLE messages (body TEXT)")]
+    class Connection:
+        def execute(self, query, *args):
+            if query.startswith("SELECT name"):
+                return Query()
+            if query.startswith("PRAGMA"):
+                return type("Columns", (), {"fetchall": lambda self: [(0, "body")]})()
+            raise sqlite3.DatabaseError("synthetic unreadable table")
+        def close(self):
+            pass
+    monkeypatch.setattr(rehearsal.sqlite3, "connect", lambda *args, **kwargs: Connection())
+    with pytest.raises(sqlite3.DatabaseError):
+        rehearsal.phrase_in_database(database, "fixture")
+
+
 def test_the_file_scan_reads_every_file_and_refuses_a_missing_directory(tmp_path: Path) -> None:
     (tmp_path / "sessions" / "nested").mkdir(parents=True)
     (tmp_path / "sessions" / "a.json").write_text('{"t":"x"}', encoding="utf-8")

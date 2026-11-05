@@ -1260,16 +1260,14 @@ def phrase_in_database(database: Path, phrase: str) -> int:
         for table, sql in tables:
             quoted = '"' + table.replace('"', '""') + '"'
             if re.search(r"USING\s+fts", sql, re.IGNORECASE):
-                with contextlib.suppress(sqlite3.Error):
-                    query = f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?"
-                    total += db.execute(query, ('"' + phrase + '"',)).fetchone()[0]
+                query = f"SELECT count(*) FROM {quoted} WHERE {quoted} MATCH ?"
+                total += db.execute(query, ('"' + phrase + '"',)).fetchone()[0]
             for column in db.execute(f"PRAGMA table_info({quoted})").fetchall():
                 name = '"' + str(column[1]).replace('"', '""') + '"'
-                with contextlib.suppress(sqlite3.Error):
-                    total += db.execute(
-                        f"SELECT count(*) FROM {quoted} WHERE lower(CAST({name} AS TEXT)) LIKE ?",
-                        (pattern,),
-                    ).fetchone()[0]
+                total += db.execute(
+                    f"SELECT count(*) FROM {quoted} WHERE lower(CAST({name} AS TEXT)) LIKE ?",
+                    (pattern,),
+                ).fetchone()[0]
     return int(total)
 
 

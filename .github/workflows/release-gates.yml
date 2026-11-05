@@ -408,7 +408,7 @@ jobs:
             $ready = $false
             for ($attempt = 1; $attempt -le 30; $attempt++) {
               try {
-                if ((Invoke-WebRequest 'http://127.0.0.1:7880/' -UseBasicParsing).Content.Trim() -eq 'OK') {
+                if ((Invoke-WebRequest 'http://127.0.0.1:7880/' -UseBasicParsing -TimeoutSec 2).Content.Trim() -eq 'OK') {
                   $ready = $true
                   break
                 }

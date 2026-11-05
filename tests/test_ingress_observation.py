@@ -74,6 +74,15 @@ def test_ingress_event_observation_refuses_a_reset_or_nonmonotonic_cursor() -> N
     }
 
 
+@pytest.mark.parametrize("events, after", [
+    ([], -1), ([_event(i, "speech_ended", {}) for i in range(1, 34)], 0),
+    ([_event(True, "speech_ended", {})], 0),
+    ([_event(1, None, {})], 0), ([_event(1, "speech_ended", [])], 0),
+])
+def test_ingress_observation_rejects_invalid_bounds_and_event_types(events, after):
+    assert ingress_event_observation(events, after=after) == {"available": False}
+
+
 @pytest.mark.parametrize(
     ("completed_sequence", "ready_sequence", "expected"),
     [(14, 9, 14), (9, 14, 14)],

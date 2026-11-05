@@ -24,8 +24,8 @@ _CREDENTIAL_LINE = re.compile(
 )
 _SENSITIVE_STEM = (
     r"(?:access[_-]?token|api[_-]?(?:key|secret|token)|authorization|id|identity|"
-    r"livekit[_-]?keys|participant(?:[_-]?(?:id|identity))?|password|"
-    r"room(?:[_-]?(?:id|identity|name))?|secret(?:[_-]?key)?|token|key)"
+    r"livekit[_-]?keys|participants?(?:[_-]?(?:id|identity))?|password|"
+    r"rooms?(?:[_-]?(?:id|identity|name))?|secret(?:[_-]?key)?|token|key)"
 )
 _SENSITIVE_NAME = re.compile(
     rf"(?:[A-Za-z0-9]+[_-])*{_SENSITIVE_STEM}\Z", re.IGNORECASE
@@ -62,6 +62,9 @@ def _sanitize_url(match: re.Match[str]) -> str:
 
 
 def _sanitize_text(value: str) -> str:
+    value = re.sub(r"\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", value, flags=re.I)
+    value = re.sub(r"\b(?:browser_[A-Za-z0-9_-]+|browser-acceptance-[A-Za-z0-9_-]+)\b",
+                   "[REDACTED]", value)
     value = _ESCAPED_URL.sub("[REDACTED-URL]", value)
     value = _URL.sub(_sanitize_url, value)
     value = _CREDENTIAL_LINE.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
@@ -88,20 +91,24 @@ def _sanitize_line(value: str) -> str:
     printable = "".join(
         character if character >= " " or character == "\t" else "?" for character in value
     )
-    if printable.startswith(("{", "[")):
+    if printable.lstrip().startswith(("{", "[")):
         try:
             return json.dumps(_sanitize_json(json.loads(printable)), separators=(",", ":"))
-        except (json.JSONDecodeError, RecursionError):
+        except RecursionError:
+            return "[REDACTED-NESTED-JSON]"
+        except json.JSONDecodeError:
             pass
     else:
         fields = printable.split("\t")
         if len(fields) >= 2 and fields[-1].startswith(("{", "[")):
             try:
                 payload = json.loads(fields[-1])
-            except (json.JSONDecodeError, RecursionError):
+                sanitized = json.dumps(_sanitize_json(payload), separators=(",", ":"))
+            except RecursionError:
+                return _sanitize_text("\t".join(fields[:-1])) + "\t[REDACTED-NESTED-JSON]"
+            except json.JSONDecodeError:
                 pass
             else:
-                sanitized = json.dumps(_sanitize_json(payload), separators=(",", ":"))
                 return _sanitize_text("\t".join(fields[:-1]) + "\t") + sanitized
     return _sanitize_text(printable)
 

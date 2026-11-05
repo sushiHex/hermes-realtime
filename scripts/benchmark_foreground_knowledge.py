@@ -491,13 +491,17 @@ def collect_environment_identity() -> dict[str, str]:
             check=True,
             capture_output=True,
         ).stdout
-        untracked_paths = _git_output("ls-files", "--others", "--exclude-standard").splitlines()
+        untracked_raw = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            check=True, capture_output=True,
+        ).stdout
+        untracked_paths = [os.fsdecode(path) for path in untracked_raw.split(b"\0") if path]
         untracked_fingerprint = bytearray()
         for relative in sorted(untracked_paths):
             path = Path(relative)
             if not path.is_file():
                 continue
-            untracked_fingerprint.extend(relative.encode("utf-8"))
+            untracked_fingerprint.extend(os.fsencode(relative))
             untracked_fingerprint.extend(b"\0")
             untracked_fingerprint.extend(hashlib.sha256(path.read_bytes()).digest())
         diff_sha = hashlib.sha256(diff + b"\0" + bytes(untracked_fingerprint)).hexdigest()
@@ -581,14 +585,19 @@ async def _run_bakeoff_and_close(
     backends: dict[str, CurrentFactLookup],
     environment: dict[str, str],
 ) -> dict[str, object]:
+    report: dict[str, object] | None = None
     try:
-        return await run_backend_bakeoff(
+        report = await run_backend_bakeoff(
             corpus,
             backends=backends,
             environment=environment,
         )
+        return report
     finally:
-        await asyncio.gather(*(backend.close() for backend in backends.values()))
+        closed = await asyncio.gather(
+            *(backend.close() for backend in backends.values()), return_exceptions=True)
+        if report is not None:
+            report["cleanupFailureCount"] = sum(isinstance(item, BaseException) for item in closed)
 
 
 if __name__ == "__main__":

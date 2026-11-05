@@ -31,6 +31,44 @@ parse_args = _BENCHMARK._parse_args
 _FIXTURE = Path(__file__).parent / "fixtures" / "source_backed_latency_cases.json"
 
 
+def test_candidate_identity_includes_unicode_untracked_files(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "--allow-empty", "-qm", "fixture"], check=True)
+    file = tmp_path / "café.txt"
+    file.write_text("one")
+    before = _BENCHMARK.collect_environment_identity()
+    file.write_text("two")
+    after = _BENCHMARK.collect_environment_identity()
+    assert before["head"] != "unavailable"
+    assert before["diffSha256"] != after["diffSha256"]
+
+
+@pytest.mark.asyncio
+async def test_completed_report_survives_cleanup_failure_and_all_closes_settle(monkeypatch):
+    from types import SimpleNamespace
+
+    closed = []
+    async def run(*args, **kwargs):
+        return {"result": "retained"}
+    async def close_bad():
+        closed.append("bad")
+        raise RuntimeError("synthetic-private-detail")
+    async def close_good():
+        closed.append("good")
+    monkeypatch.setattr(_BENCHMARK, "run_backend_bakeoff", run)
+    report = await _BENCHMARK._run_bakeoff_and_close({}, backends={
+        "a": SimpleNamespace(close=close_bad), "b": SimpleNamespace(close=close_good)},
+        environment={})
+    assert report["result"] == "retained"
+    assert report["cleanupFailureCount"] == 1
+    assert sorted(closed) == ["bad", "good"]
+    assert "synthetic-private-detail" not in json.dumps(report)
+
+
 def test_nearest_rank_percentile_is_deterministic_and_rejects_bad_samples() -> None:
     assert nearest_rank_percentile((10.0, 40.0, 20.0, 30.0), 0.50) == 20.0
     assert nearest_rank_percentile((10.0, 40.0, 20.0, 30.0), 0.95) == 40.0

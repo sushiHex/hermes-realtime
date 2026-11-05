@@ -62,7 +62,7 @@ failure position. It complements the separate deterministic-equivalence scenario
 
 This is one `packaged_process` scenario at unchanged ordinal 19, with the governed
 assertions `conversation_trace_equal_to_revised_close_baseline` and
-`owned_process_cleanup`. Thirteen producers remain unavailable; full Slice 0
+`owned_process_cleanup`. Twelve producers remain unavailable; full Slice 0
 qualification remains incomplete. Capture remains disabled by default.
 
 [Issue #43](https://github.com/sushiHex/hermes-realtime/issues/43) records exact

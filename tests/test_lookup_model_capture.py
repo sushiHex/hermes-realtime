@@ -23,6 +23,17 @@ def config(port=11441):
             }}}}}
 
 
+@pytest.mark.parametrize("field", ["model", "presentation"])
+def test_capture_route_refuses_non_mapping_sections(field):
+    value = config()
+    if field == "model":
+        value[field] = {"base_url": "http://127.0.0.1:11441/v1"}.keys()
+    else:
+        value["plugins"]["entries"]["ordinary-lookup-experimental"]["settings"][field] = []
+    with pytest.raises(ValueError, match="capture_route"):
+        capture.capture_endpoint("metadata", {"model_port": 11441}, value)
+
+
 def recorder(tmp_path, mode="metadata"):
     return capture.ModelResponseCapture(tmp_path, mode, {"model_port": 11441}, config())
 
