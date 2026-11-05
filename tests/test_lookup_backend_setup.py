@@ -312,7 +312,7 @@ def test_untracked_python_refused_before_wheel_read(monkeypatch, tmp_path):
             return ""
         if args == ("rev-parse", "HEAD"):
             return setup.PIN
-        if args[0] == "ls-files":
+        if args == ("ls-files", "--others", "--exclude-standard", "--", "*.py"):
             return "unexpected.py"
         return ""
 
