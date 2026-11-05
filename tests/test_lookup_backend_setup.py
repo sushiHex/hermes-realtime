@@ -766,3 +766,23 @@ print("fresh-parent-import-passed")
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "fresh-parent-import-passed"
+
+
+@pytest.mark.parametrize(
+    "category", ["manifest_fields", "candidate_dirty", "wheel_digest", "output_scope"],
+)
+def test_setup_retains_only_fixed_source_owned_refusal_categories(
+    tmp_path, monkeypatch, capsys, category,
+):
+    from scripts import setup_lookup_backend as setup
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+
+    def refuse(_):
+        setup.require(False, category)
+
+    monkeypatch.setattr(setup, "validate_manifest", refuse)
+    assert setup.main(["--manifest", str(manifest_path), "--output", str(tmp_path / "output")]) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output.split("] ", 1)[1])["failure_category"] == category
