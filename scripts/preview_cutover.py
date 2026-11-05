@@ -1822,8 +1822,9 @@ def serve(active_path: Path) -> int:
                     require(livekit_process.pid in members, "livekit_process_owner")
                     try:
                         health = request_json(base_url + "/health/detailed", token, timeout=3)
-                    except HTTPError:
-                        raise PreviewRefusal("gateway_health_refused") from None
+                    except HTTPError as error:
+                        if error.code not in {502, 503, 504}:
+                            raise PreviewRefusal("gateway_health_refused") from None
                     except ValueError:
                         raise PreviewRefusal("gateway_health_invalid") from None
                     except (OSError, TimeoutError):

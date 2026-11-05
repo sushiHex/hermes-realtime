@@ -178,6 +178,8 @@ def dev_service_case(tmp_path, monkeypatch):
         assert timeout == 3
         if state["fault"] == "gateway_auth_failure":
             raise HTTPError(url, 401, "Unauthorized", {}, None)
+        if state["fault"] == "gateway_transient" and state["health_calls"] == 1:
+            raise HTTPError(url, 503, "Starting", {}, None)
         return {"pid": 41999 if state["fault"] == "wrong_gateway_pid" else pids["gateway"]}
 
     monkeypatch.setattr(lookup_backend_task, "request_json", request_json)
@@ -219,6 +221,14 @@ def test_dev_serve_starts_ready_and_settles_without_kernel_listener_reads(dev_se
     assert case.state["spawned"] == ["gateway", "livekit", "host"]
     assert case.state["health_calls"] == 1
     assert case.state["host_http_calls"] == 1
+
+
+def test_dev_serve_retries_transient_health_without_bypassing_ownership(dev_service_case):
+    case = dev_service_case
+    case.state["fault"] = "gateway_transient"
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 0
+    assert case.state["health_calls"] == 2
+    assert _read_receipt(case.plan.output, "ready-receipt.private.json")["ready"] is True
 
 
 @pytest.mark.parametrize(
