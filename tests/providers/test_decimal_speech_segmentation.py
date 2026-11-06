@@ -79,7 +79,7 @@ class _Playback:
 @pytest.mark.parametrize("prefix", [
     "It is ", "The synthetic instrument calibration reference measurement is ",
 ])
-@pytest.mark.parametrize("value", ["12.5", "0.25", "-0.5", ".5", "-.5"])
+@pytest.mark.parametrize("value", ["12.5", "0.25", "-0.5", ".5", "-.5", "\u2212.5"])
 @pytest.mark.asyncio
 async def test_split_decimal_reaches_synthesis_and_playback_without_space_or_boundary(
     kind, prefix, value,

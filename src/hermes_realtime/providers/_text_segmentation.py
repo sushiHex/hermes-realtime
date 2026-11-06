@@ -21,7 +21,7 @@ def first_speakable_sentence_end(text: str) -> int | None:
             and (
                 text[match.start() - 1].isdecimal()
                 or text[match.start() - 1].isspace()
-                or text[match.start() - 1] in "+-"
+                or text[match.start() - 1] in "+-\u2212"
             )
         ):
             continue
