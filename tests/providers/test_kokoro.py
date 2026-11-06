@@ -85,6 +85,37 @@ async def test_kokoro_overlapping_downloads_own_their_staging_files(
 
 
 @pytest.mark.asyncio
+async def test_kokoro_publication_releases_the_staging_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    payload = b"synthetic pinned asset"
+    asset = kokoro_module._PinnedAsset(
+        filename="asset.bin", size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    synthesizer = KokoroSynthesizer(cache_dir=tmp_path)
+    recreated: list[Path] = []
+    replace = Path.replace
+
+    def publish_then_reuse(path: Path, target: Path) -> Path:
+        result = replace(path, target)
+        path.write_bytes(b"new staging owner")
+        recreated.append(path)
+        return result
+
+    monkeypatch.setattr(Path, "replace", publish_then_reuse)
+    monkeypatch.setattr(
+        kokoro_module.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(payload),
+    )
+    try:
+        result = synthesizer._ensure_asset(asset)
+        assert result.read_bytes() == payload
+        assert len(recreated) == 1
+        assert recreated[0].read_bytes() == b"new staging owner"
+    finally:
+        await synthesizer.close()
+
+
+@pytest.mark.asyncio
 async def test_kokoro_failed_download_preserves_other_staging_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

@@ -561,6 +561,7 @@ class KokoroSynthesizer:
             if total != asset.size or digest.hexdigest() != asset.sha256:
                 raise ValueError("Kokoro asset download failed pinned integrity verification")
             partial.replace(path)
+            partial = None
         finally:
             if partial is not None:
                 partial.unlink(missing_ok=True)
