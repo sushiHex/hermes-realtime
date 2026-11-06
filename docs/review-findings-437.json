@@ -153,8 +153,8 @@
       "id": "W20",
       "file": "tests/test_release_integrity_regressions.py",
       "reported_severity": "should-fix",
-      "disposition": "deferred_compatibility",
-      "evidence": "Git 2.43 argv incompatibility was reported, not disproved. Not observed on native Git 2.53 or the admitted Windows Git 2.55 toolchain. No global minimum Git version is inferred; older-toolchain compatibility remains tracked in issue 437."
+      "disposition": "fixed",
+      "evidence": "Use the documented attached -O<orderfile> form in both canonical diff paths, avoiding the Git 2.43 preliminary parser that can mistake a separated null-device argument plus a revision range for implicit --no-index. The modeled upstream parser boundary fails before the repair and passes after; isolated reversion fails its target while the root-digest control passes. Native Git 2.53 scratch-repository and ambient order-file controls pass. No trusted Git 2.43 binary was available, so native Git 2.43 qualification and a global version floor are not claimed."
     },
     {
       "id": "W21",
