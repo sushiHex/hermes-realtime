@@ -333,6 +333,16 @@ def test_voice_keeps_source_attribution_in_detail_unless_objective_asks(setup):
     assert "Put every supported requested date, qualification" in instructions
 
 
+def test_native_lead_uses_everyday_findings_without_upgrading_evidence(setup):
+    instructions = setup.module.PRESENTATION_INSTRUCTIONS
+    assert "Start lead with the supported finding in everyday language" in instructions
+    assert "not a report-style preamble about supplied evidence" in instructions
+    assert "Do not turn an earlier observation into a current fact" in instructions
+    assert "Put every supported requested date, qualification" in instructions
+    assert "Preserve the original source timestamp in support" in instructions
+    assert "Select only unique catalog IDs that support the answer" in instructions
+
+
 def test_presentation_is_one_fresh_tool_free_call_and_preserves_original(setup):
     s = setup
     result = s.run()

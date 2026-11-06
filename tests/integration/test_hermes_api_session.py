@@ -366,6 +366,9 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
             in instructions
         )
         assert "at most 1800 characters" in instructions
+        assert "Use everyday answer-first wording in voice" in instructions
+        assert "Keep all material limits and requested detail" in instructions
+        assert "never imply newer or broader evidence" in instructions
         from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
 
         assert QUANTITY_PRESENTATION_POLICY in instructions

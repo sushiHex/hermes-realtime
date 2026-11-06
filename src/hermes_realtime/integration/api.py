@@ -122,6 +122,9 @@ _BACKGROUND_INSTRUCTIONS = (
     "be semantically consistent; detail may expand voice but must not replace its "
     "important findings. Do not put line breaks or markup inside voice, or text "
     "outside these elements. "
+    "Use everyday answer-first wording in voice rather than report-style lead-ins about "
+    "supplied evidence. Keep all material limits and requested detail; "
+    "never imply newer or broader evidence. "
     + QUANTITY_PRESENTATION_POLICY
 )
 
