@@ -21,7 +21,7 @@ classifiers = [
 dependencies = [
   "aiohttp>=3.11,<4",
   "ddgs>=9.5,<10",
-  "livekit>=1.1.14,<2",
+  "livekit>=1.2.1,<2",
   "livekit-api>=1.2.0,<2",
   "pydantic>=2.11,<3",
 ]
