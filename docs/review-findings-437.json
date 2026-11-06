@@ -16,15 +16,15 @@
       "id": "W02",
       "file": "src/hermes_realtime/integration/completion.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "accepted_consistency_limit",
+      "evidence": "Completion allocates a sequence before validating status/payload. Invalid input still refuses, retry remains valid and monotonic sequences permit gaps; no terminal loss or authority failure demonstrated. Do not add a lifecycle change for this consistency nit."
     },
     {
       "id": "W03",
       "file": "src/hermes_realtime/conversation/telemetry.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "accepted_bounded_callers",
+      "evidence": "RollingRouteMetrics bounds samples per key but not key count. Current production route/backend callers use finite built-in vocabularies; no dynamic-cardinality consumer is demonstrated. Revisit if that caller contract changes."
     },
     {
       "id": "W04",
@@ -54,15 +54,16 @@
       "id": "W07",
       "file": "src/hermes_realtime/host_launcher.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "deferred_consequence",
+      "evidence": "Concurrent qualification no-task close can invoke dependencies twice. The seam is qualification-only and downstream close owners are idempotent; no duplicate consequential effect demonstrated. Revisit on a concrete non-idempotent owner."
     },
     {
       "id": "W08",
       "file": "src/hermes_realtime/providers/kokoro.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "fixed",
+      "evidence": "Independent Kokoro instances now allocate exclusive unique staging files and clean only their own partial. Deterministic overlapping-download and failed-download controls fail on baseline and pass after repair; shared-path mutant fails the targeted overlap control.",
+      "commit": "a611b5c9ee2b7d7a7cdcdadd5eca09263001c543"
     },
     {
       "id": "W09",
@@ -76,15 +77,16 @@
       "id": "W10",
       "file": "src/hermes_realtime/providers/current_facts.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "fixed",
+      "evidence": "Exactly the RFC6052 well-known NAT64 /96 prefix reuses the existing IPv4 public-address policy for its final 32 bits. Literal and mixed-resolver regressions preserve public IPv6/NAT64 and neighboring prefixes; omitted-normalization and widened-prefix mutants each fail their targeted control. No exploit is claimed.",
+      "commit": "d6b466a28347792cc32916beda3afb4eb5b2e79d"
     },
     {
       "id": "W11",
       "file": "src/hermes_realtime/testing/harness.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "accepted_harness_semantics",
+      "evidence": "The test harness represents one shared conversation/turn/STT scope and exposes no participant-owned response API. Any-participant disconnect cancels that scope by current semantics; changing ownership requires a distinct contract, not a reported production defect."
     },
     {
       "id": "W12",
@@ -98,8 +100,8 @@
       "id": "W13",
       "file": "scripts/qualification_cpu_readiness.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "accepted_diagnostic_semantics",
+      "evidence": "The CLI-owned diagnostic controller converts cancellation into a bounded unavailable/refused report and performs process cleanup; cancellation never yields ready. No caller contract requiring CancelledError propagation demonstrated."
     },
     {
       "id": "W14",
@@ -144,8 +146,8 @@
       "id": "W19",
       "file": "scripts/task13_artifact_orchestrator.py",
       "reported_severity": "nit",
-      "disposition": "deferred",
-      "evidence": "Not accepted as a verified defect in this delivery. Retained in issue 437 for separate consequence-based triage; no incidental repair added."
+      "disposition": "accepted_error_shape_limit",
+      "evidence": "A Git CalledProcessError may escape instead of ArtifactOrchestrationError. The command still fails closed; no acceptance, cleanup or source-integrity bypass is demonstrated. Exception normalization is optional interface cleanup."
     },
     {
       "id": "W20",
@@ -171,6 +173,6 @@
       "source_integrity": 20
     },
     "independent_review": "Privacy/Swift and lifecycle/speech independently reviewed; final source-integrity review tracked in issue/PR.",
-    "limits": "Python structural Swift checks are not native Swift compilation. Native iOS retention proof remains issue 435. Deferred review nits and older Git compatibility are not marked fixed."
+    "limits": "Native iOS retention proof remains issue 435. Remaining eight nits now have explicit consequence-based dispositions; two are repaired. Older Git compatibility W20 remains deferred, not disproved. No general audible quality or universal network-translation guarantee is claimed."
   }
 }
