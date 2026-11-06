@@ -920,6 +920,22 @@ def gate_materialized_candidate(
         cwd=root,
         env=source_env,
     )
+    # Reject static errors before running provider, native or full test suites.
+    # This changes failure ordering only; every final check remains required.
+    run(
+        "uv",
+        "run",
+        "--frozen",
+        "--group",
+        "dev",
+        "ruff",
+        "check",
+        ".",
+        cwd=root,
+        env=environment,
+    )
+    run("uv", "run", "--frozen", "--group", "dev", "mypy", "src", cwd=root, env=environment)
+    run_script_mypy(root, environment)
     # Fail on the small, relevant provider contracts and native LiveKit path
     # before the full release matrix. This intentionally repeats a few tiny
     # provider tests in the full suite; no second suite is run. All checks stay
@@ -971,20 +987,6 @@ def gate_materialized_candidate(
         cwd=root,
         env=environment,
     )
-    run(
-        "uv",
-        "run",
-        "--frozen",
-        "--group",
-        "dev",
-        "ruff",
-        "check",
-        ".",
-        cwd=root,
-        env=environment,
-    )
-    run("uv", "run", "--frozen", "--group", "dev", "mypy", "src", cwd=root, env=environment)
-    run_script_mypy(root, environment)
     run(NPM, "ci", "--ignore-scripts", cwd=root / "web", env=environment)
     run(NPM, "test", *VITEST_DURATIONS, cwd=root / "web", env=environment)
     run(NPM, "run", "build", cwd=root / "web", env=environment)
