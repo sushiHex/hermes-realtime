@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import sys
 import threading
 import urllib.request
@@ -41,6 +43,63 @@ async def test_default_kokoro_cache_is_bound_to_model_digest_without_touching_le
         assert len(requests) == 1
         assert previous.read_bytes() == b"synthetic previous export"
         assert list(synthesizer._cache_dir.iterdir()) == []
+    finally:
+        await synthesizer.close()
+
+
+@pytest.mark.asyncio
+async def test_kokoro_overlapping_downloads_own_their_staging_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    payload = b"synthetic pinned asset"
+    asset = kokoro_module._PinnedAsset(
+        filename="asset.bin", size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    first = KokoroSynthesizer(cache_dir=tmp_path)
+    second = KokoroSynthesizer(cache_dir=tmp_path)
+    calls = 0
+    nested_paths: list[Path] = []
+
+    class OverlappingResponse(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            if not nested_paths:
+                # Enter the other downloader while this one's staging file is open.
+                nested_paths.append(second._ensure_asset(asset))
+            return super().read(size)
+
+    def response(request: urllib.request.Request, timeout: int) -> io.BytesIO:
+        nonlocal calls
+        calls += 1
+        return OverlappingResponse(payload) if calls == 1 else io.BytesIO(payload)
+
+    monkeypatch.setattr(kokoro_module.urllib.request, "urlopen", response)
+    try:
+        result = first._ensure_asset(asset)
+        assert nested_paths == [result]
+        assert result.read_bytes() == payload
+        assert calls == 2
+        assert list(tmp_path.iterdir()) == [result]
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_kokoro_failed_download_preserves_other_staging_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    foreign = tmp_path / "asset.bin.part"
+    foreign.write_bytes(b"another downloader")
+    asset = kokoro_module._PinnedAsset(filename="asset.bin", size=1, sha256="0" * 64)
+    synthesizer = KokoroSynthesizer(cache_dir=tmp_path)
+    monkeypatch.setattr(
+        kokoro_module.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b"x"),
+    )
+    try:
+        with pytest.raises(ValueError, match="pinned integrity"):
+            synthesizer._ensure_asset(asset)
+        assert foreign.read_bytes() == b"another downloader"
+        assert list(tmp_path.iterdir()) == [foreign]
     finally:
         await synthesizer.close()
 
