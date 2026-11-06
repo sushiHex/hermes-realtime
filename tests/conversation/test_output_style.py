@@ -40,7 +40,7 @@ def test_output_styles_are_exact_bounded_communication_preferences() -> None:
         assert "manageable spoken chunks" in policy
         assert "Ordinary replies: one or two short sentences" in policy
         assert "Name sources only on request" in policy
-        assert "omit supporting detail unless asked or essential to avoid misleading" in policy
+        assert "Expand when asked or needed" in policy
 
 
 def test_casual_quantity_guidance_preserves_requested_precision() -> None:
@@ -54,6 +54,17 @@ def test_casual_quantity_guidance_preserves_requested_precision() -> None:
         assert "Keep exact values in detail, on request and in quotes" in policy
         assert "never invent units/conversions" in policy
         assert "Preserve material qualifications and uncertainty." in policy
+
+
+@pytest.mark.parametrize("style", OUTPUT_STYLES)
+def test_informational_wording_is_direct_without_weakening_detail_or_evidence(style) -> None:
+    policy = communication_policy(style)
+    assert "answer first in everyday language" in policy
+    assert "no report-style preamble" in policy
+    assert "Expand when asked or needed" in policy
+    assert "Preserve exact quotations and source text" in policy
+    assert "Use requested formatting" in policy
+    assert "Preserve material qualifications and uncertainty" in policy
 
 
 @pytest.mark.parametrize("value", ["Default", "", "unknown", True, None, 1])
