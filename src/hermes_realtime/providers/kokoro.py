@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import importlib
 import re
+import tempfile
 import threading
 import unicodedata
 import urllib.request
@@ -534,31 +535,36 @@ class KokoroSynthesizer:
         if path.exists():
             self._verify_asset(path, asset)
             return path
-        partial = path.with_suffix(path.suffix + ".part")
-        partial.unlink(missing_ok=True)
         request = urllib.request.Request(
             f"{_MODEL_BASE_URL}/{asset.filename}",
             headers={"User-Agent": f"hermes-realtime/{__version__}"},
         )
         digest = hashlib.sha256()
         total = 0
+        partial: Path | None = None
         try:
-            with urllib.request.urlopen(request, timeout=60) as response, partial.open("wb") as out:
-                while True:
-                    block = response.read(1024 * 1024)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > _MAX_DOWNLOAD_BYTES or total > asset.size:
-                        raise ValueError("Kokoro asset download exceeds pinned bounds")
-                    digest.update(block)
-                    out.write(block)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=self._cache_dir, prefix=f".{asset.filename}.", suffix=".part",
+                delete=False,
+            ) as out:
+                partial = Path(out.name)
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    while True:
+                        block = response.read(1024 * 1024)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > _MAX_DOWNLOAD_BYTES or total > asset.size:
+                            raise ValueError("Kokoro asset download exceeds pinned bounds")
+                        digest.update(block)
+                        out.write(block)
             if total != asset.size or digest.hexdigest() != asset.sha256:
                 raise ValueError("Kokoro asset download failed pinned integrity verification")
             partial.replace(path)
-        except BaseException:
-            partial.unlink(missing_ok=True)
-            raise
+            partial = None
+        finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
         return path
 
     @staticmethod

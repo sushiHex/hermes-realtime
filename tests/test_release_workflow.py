@@ -164,6 +164,52 @@ def test_release_gate_runs_real_speech_presence_calibration_extra() -> None:
     assert 'speech_verification_env["HERMES_RELEASE_SPEECH_VERIFICATION"] = "1"' in script
 
 
+def test_materialized_gate_runs_static_checks_before_the_first_test_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    release_gate = run_path(str(root / "scripts" / "release_gate.py"))
+    gate = release_gate["gate_materialized_candidate"]
+    environment = {"BASE": "retained"}
+    calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
+
+    class ReachedTests(Exception):
+        pass
+
+    def observe_run(*command: str, cwd: Path, env: dict[str, str]) -> None:
+        calls.append((command, cwd, dict(env)))
+        if "pytest" in command:
+            raise ReachedTests
+
+    namespace = gate.__globals__
+    monkeypatch.setitem(namespace, "clean_environment", lambda: environment)
+    monkeypatch.setitem(namespace, "reject_ambient_paths", lambda _root: None)
+    monkeypatch.setitem(namespace, "scan_for_secrets", lambda _root: None)
+    monkeypatch.setitem(namespace, "snapshot_packaged_static", lambda *_args: None)
+    monkeypatch.setitem(namespace, "run", observe_run)
+    with pytest.raises(ReachedTests):
+        gate(root, livekit=False)
+
+    commands = [command for command, _, _ in calls]
+    ruff = ("uv", "run", "--frozen", "--group", "dev", "ruff", "check", ".")
+    runtime_mypy = ("uv", "run", "--frozen", "--group", "dev", "mypy", "src")
+    assert commands.count(ruff) == commands.count(runtime_mypy) == 1
+    script_indices = [
+        index for index, command in enumerate(commands) if "--follow-imports=skip" in command
+    ]
+    assert len(script_indices) == 1
+    first_suite = len(commands) - 1
+    assert commands.index(ruff) < commands.index(runtime_mypy) < script_indices[0] < first_suite
+    for command in (ruff, runtime_mypy):
+        _, cwd, env = calls[commands.index(command)]
+        assert cwd == root and env == environment
+    _, cwd, env = calls[script_indices[0]]
+    assert cwd == root
+    assert env == environment | {
+        "MYPYPATH": os.pathsep.join((str(root / "src"), str(root / "scripts")))
+    }
+
+
 def test_every_gate_suite_records_per_test_durations() -> None:
     # Issue #13: timeout diagnostics are not a consistent source of comparable
     # healthy-run timing; some restate only the configured authority, others
