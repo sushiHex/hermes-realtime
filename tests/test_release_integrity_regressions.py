@@ -42,6 +42,33 @@ def _repo(tmp_path: Path) -> Path:
     return root
 
 
+def test_release_digest_avoids_git_243_implicit_no_index(tmp_path: Path, monkeypatch) -> None:
+    root = _repo(tmp_path)
+    baseline = _git(root, "rev-parse", "HEAD")
+    (root / "keep.py").write_bytes(b"changed\n")
+    _git(root, "commit", "-qam", "candidate")
+    run = subprocess.run
+    diff_commands = []
+
+    def git_243_boundary(command, *args, **kwargs):
+        if command[0] == "git" and "diff" in command:
+            options = command[command.index("diff") + 1:]
+            diff_commands.append(options)
+            # https://github.com/git/git/blob/v2.43.0/builtin/diff.c#L413-L441
+            # stops at the first non-option before parsing option arguments.
+            # Two remaining operands, one outside the repo, imply --no-index.
+            # Model /dev/null using the platform's null-device argument here;
+            # all actual diff execution still uses the installed native Git.
+            first = next(i for i, item in enumerate(options) if not item.startswith("-"))
+            if len(options) - first == 2 and options[first] == gate.os.devnull:
+                raise subprocess.CalledProcessError(129, command)
+        return run(command, *args, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", git_243_boundary)
+    digest = gate.canonical_candidate_diff_sha256(root, baseline)
+    assert len(digest) == 64 and len(diff_commands) == 1
+
+
 @pytest.mark.parametrize("scope", ["global", "local"])
 def test_release_digest_ignores_ambient_config(tmp_path: Path, monkeypatch, scope) -> None:
     root = _repo(tmp_path)

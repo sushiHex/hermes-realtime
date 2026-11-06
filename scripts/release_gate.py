@@ -260,7 +260,11 @@ def _resolved_commit_oid(source: Path, revision: str, *, label: str) -> str:
 def canonical_candidate_diff_sha256(
     source: Path, baseline_commit: str | None, *, revision: str = "HEAD"
 ) -> str:
-    """Return the SHA-256 of the candidate's canonical raw binary diff."""
+    """Return the SHA-256 of the candidate's canonical raw binary diff.
+
+    Keep the null order-file argument attached to -O: older Git diff pre-parsers
+    can mistake a separate null-device operand plus a revision range for --no-index.
+    """
 
     head_oid = _resolved_commit_oid(source, revision, label="candidate HEAD")
     _require_no_local_attributes(source)
@@ -299,7 +303,7 @@ def canonical_candidate_diff_sha256(
                     "--unified=3",
                     "--inter-hunk-context=0",
                     "--indent-heuristic",
-                    "-O", os.devnull,
+                    f"-O{os.devnull}",
                     "--no-commit-id",
                     "-r",
                     head_oid,
@@ -346,7 +350,7 @@ def canonical_candidate_diff_sha256(
             "--unified=3",
             "--inter-hunk-context=0",
             "--indent-heuristic",
-            "-O", os.devnull,
+            f"-O{os.devnull}",
             f"{baseline_oid}..{head_oid}",
         ),
         cwd=source,

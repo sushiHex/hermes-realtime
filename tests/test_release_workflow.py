@@ -897,6 +897,6 @@ def test_canonical_baseline_diff_uses_exact_no_ext_diff_argv(
         "--unified=3",
         "--inter-hunk-context=0",
         "--indent-heuristic",
-        "-O", __import__('os').devnull,
+        f"-O{__import__('os').devnull}",
         f"{baseline}..{head}",
     )
