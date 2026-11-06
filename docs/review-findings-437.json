@@ -62,8 +62,8 @@
       "file": "src/hermes_realtime/providers/kokoro.py",
       "reported_severity": "nit",
       "disposition": "fixed",
-      "evidence": "Independent Kokoro instances now allocate exclusive unique staging files and clean only their own partial. Deterministic overlapping-download and failed-download controls fail on baseline and pass after repair; shared-path mutant fails the targeted overlap control.",
-      "commit": "a611b5c9ee2b7d7a7cdcdadd5eca09263001c543"
+      "evidence": "Independent Kokoro instances now allocate exclusive unique staging files and clean only their own partial. Deterministic overlapping-download and failed-download controls fail on baseline and pass after repair; shared-path mutant fails the targeted overlap control. Successful publication relinquishes the former staging pathname; a recreate-after-replace regression and isolated omission mutant cover that cleanup edge.",
+      "commit": "a0998457024cf028178cac7d4d0595a74dc24fc7"
     },
     {
       "id": "W09",
