@@ -655,6 +655,58 @@ def test_page_extraction_destination_policy_allows_only_public_ips(
     assert _is_public_ip_address(address) is expected
 
 
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    (
+        ("64:ff9b::127.0.0.1", False),
+        ("64:ff9b::a00:1", False),
+        ("64:ff9b::a9fe:a9fe", False),
+        ("64:ff9b::6440:1", False),
+        ("64:ff9b::c000:201", False),
+        ("64:ff9b::e000:1", False),
+        ("64:ff9b::ffff:ffff", False),
+        ("64:ff9b::", False),
+        ("64:ff9b::808:808", True),
+        ("64:ff9b::1.1.1.1", True),
+        ("64:ff9b:0:1::a00:1", True),
+    ),
+)
+def test_nat64_well_known_prefix_requires_public_embedded_ipv4(
+    address: str, expected: bool,
+) -> None:
+    assert _is_public_ip_address(address) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private", [False, True], ids=["public-only", "mixed-private"])
+async def test_page_resolver_checks_nat64_embedded_destination(
+    monkeypatch: pytest.MonkeyPatch, private: bool,
+) -> None:
+    addresses = ["64:ff9b::808:808", "2606:4700:4700::1111"]
+    if private:
+        addresses.append("64:ff9b::a00:1")
+    rows = [{"host": address} for address in addresses]
+
+    class Resolver:
+        async def resolve(self, host: str, port: int, family: int) -> list[dict[str, str]]:
+            assert host == "synthetic.example"
+            return rows
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(current_facts_module, "DefaultResolver", Resolver)
+    resolver = current_facts_module._PublicResolver()
+    try:
+        if private:
+            with pytest.raises(OSError, match="not globally routable"):
+                await resolver.resolve("synthetic.example")
+        else:
+            assert await resolver.resolve("synthetic.example") == rows
+    finally:
+        await resolver.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "url",
@@ -666,6 +718,7 @@ def test_page_extraction_destination_policy_allows_only_public_ips(
         "http://[::1]/private",
         "http://[fec0::1]/site-local",
         "http://[ff02::1]/multicast",
+        "http://[64:ff9b::a00:1]/translated-private",
     ),
 )
 async def test_page_extractor_rejects_private_literal_ips_before_network_access(

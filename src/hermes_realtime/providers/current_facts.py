@@ -172,6 +172,7 @@ _EXPLICIT_SEARCH_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _PUBLIC_HTTP_URL = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
 _LOCAL_SEARCH_TARGET = re.compile(
     r"\b(?:file|files|folder|directory|path|repository|repo|workspace|codebase|working\s+tree)\b",
     re.IGNORECASE,
@@ -253,6 +254,9 @@ def _is_public_ip_address(value: str) -> bool:
         address = ipaddress.ip_address(value)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address in _NAT64_WELL_KNOWN_PREFIX:
+        # RFC 6052 sections 2.2/3.1: the /96 suffix is an IPv4 destination.
+        address = ipaddress.IPv4Address(address.packed[-4:])
     return (
         address.is_global
         and not address.is_multicast
