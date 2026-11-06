@@ -170,3 +170,25 @@ Before changing defaults:
 6. pass the Windows browser and iPhone physical matrix on one frozen candidate.
 
 Generated files under `artifacts/` are qualification evidence and are not release inputs.
+
+## Diagnostic inference boundaries
+
+The optional Codex adapter `timing_observer(stage, elapsed_ms)` reports only a
+stage label and an integer local-monotonic duration. Timing starts immediately
+before scheduling `turn/start`, after thread setup and any pre-inference lookup.
+`first_model_delta` means the first nonempty, identity-validated assistant text
+delta processed by the adapter; it is not a provider token count or a direct
+measurement of server inference time. `first_speakable_segment` means the first
+verified text segment about to be yielded, including a final unpunctuated flush.
+Each stage is observed at most once per adapter turn. An empty or tool-only turn
+may have neither stage; a host acknowledgment fallback may have a segment without
+a model delta. Observer failures do not affect the stream and their details are
+not logged. No text or identities are passed to this observer.
+The observer is a trusted synchronous callback and must return promptly; the hook
+does not isolate blocking callbacks or suppress system-level cancellation.
+
+This diagnostic hook does not alter browser events, speech chunking, cancellation,
+or acceptance. The existing browser `first_foreground_token` marker retains its
+historical first-inference-segment meaning. Its `transcript_to_first_token` value
+includes segment assembly; `first_token_to_audio` also includes initial-segment
+coalescing, synthesis and transport preparation. Neither isolates Kokoro inference.

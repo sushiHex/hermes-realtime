@@ -72,6 +72,7 @@ _SEND_REFUSAL_PREFIX = "[codex-send-bound] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
+_InferenceTimingObserver = Callable[[str, int], None]
 
 if TYPE_CHECKING:
     from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
@@ -672,6 +673,7 @@ class CodexAppServerStreamingInference:
         conversation_cwd: str | None = None,
         transport_factory: _TransportFactory | None = None,
         token_usage_observer: _TokenUsageObserver | None = None,
+        timing_observer: _InferenceTimingObserver | None = None,
         current_fact_lookup: CurrentFactLookup | None = None,
         knowledge_coordinator: KnowledgePrefetchCoordinator | None = None,
         knowledge_timing_observer: _KnowledgeTimingObserver | None = None,
@@ -702,6 +704,8 @@ class CodexAppServerStreamingInference:
             raise TypeError("transport_factory must be callable")
         if token_usage_observer is not None and not callable(token_usage_observer):
             raise TypeError("token_usage_observer must be callable")
+        if timing_observer is not None and not callable(timing_observer):
+            raise TypeError("timing_observer must be callable")
         if current_fact_lookup is not None and not callable(
             getattr(current_fact_lookup, "lookup", None)
         ):
@@ -768,6 +772,7 @@ class CodexAppServerStreamingInference:
             selected_factory = transport_factory
         self._transport_factory = selected_factory
         self._token_usage_observer = token_usage_observer
+        self._timing_observer = timing_observer
         self._current_fact_lookup = current_fact_lookup
         self._knowledge_coordinator = knowledge_coordinator
         self._knowledge_timing_observer = knowledge_timing_observer
@@ -1307,6 +1312,8 @@ class CodexAppServerStreamingInference:
             active: _ActiveTurn | None = None
             opening: _OpeningTurn | None = None
             try:
+                timing_started = time.monotonic()
+                first_delta_seen = False
                 response_task = asyncio.create_task(
                     self._request(
                         "turn/start",
@@ -1376,6 +1383,9 @@ class CodexAppServerStreamingInference:
                         delta = self._exact_string(params.get("delta"), "assistant delta")
                         if not delta:
                             continue
+                        if not first_delta_seen:
+                            first_delta_seen = True
+                            self._observe_inference_timing("first_model_delta", timing_started)
                         buffer += delta
                         segments, buffer = self._extract_segments(buffer, final=False)
                         for segment in segments:
@@ -1390,6 +1400,10 @@ class CodexAppServerStreamingInference:
                                 thread_id=server_thread_id,
                                 turn_id=server_turn_id,
                             )
+                            if not emitted_speech:
+                                self._observe_inference_timing(
+                                    "first_speakable_segment", timing_started,
+                                )
                             emitted_speech = True
                             yield segment
                     elif method == "thread/tokenUsage/updated":
@@ -1435,6 +1449,8 @@ class CodexAppServerStreamingInference:
                         thread_id=server_thread_id,
                         turn_id=server_turn_id,
                     )
+                    if not emitted_speech:
+                        self._observe_inference_timing("first_speakable_segment", timing_started)
                     emitted_speech = True
                     yield segment
                 if buffer:
@@ -1450,7 +1466,11 @@ class CodexAppServerStreamingInference:
                         _START_WORK_CONTINUATION_FALLBACK,
                         final=True,
                     )
-                    for segment in fallback_segments:
+                    for index, segment in enumerate(fallback_segments):
+                        if index == 0:
+                            self._observe_inference_timing(
+                                "first_speakable_segment", timing_started,
+                            )
                         yield segment
                     if fallback_buffer:
                         raise AssertionError("fallback segmentation retained text")
@@ -3295,6 +3315,18 @@ class CodexAppServerStreamingInference:
                 separators=(",", ":"),
             )
         )
+
+    def _observe_inference_timing(self, stage: str, started: float) -> None:
+        """Best-effort durations only; never influence routing or stream acceptance."""
+        observer = self._timing_observer
+        if observer is None:
+            return
+        elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
+        try:
+            observer(stage, elapsed_ms)
+        except Exception:
+            # Do not render arbitrary observer errors, provider text, or identities.
+            _LOGGER.warning("Inference timing observer failed")
 
     def _extract_segments(self, text: str, *, final: bool) -> tuple[list[str], str]:
         segments: list[str] = []

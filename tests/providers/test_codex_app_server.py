@@ -10,6 +10,7 @@ import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -52,6 +53,122 @@ from hermes_realtime.providers.codex_app_server import (
 from hermes_realtime.providers.current_facts import CurrentFactEvidence, CurrentFactSource
 from hermes_realtime.speech import Transcript
 from tests.support.work_routing_policy import assert_aligned_work_routing
+
+
+@pytest.mark.asyncio
+async def test_codex_timing_distinguishes_delta_from_speakable_segment(monkeypatch) -> None:
+    class FragmentedTransport(FakeCodexTransport):
+        async def send(self, message):
+            await super().send(message)
+            if message.get("method") != "turn/start":
+                return
+            rows = [self.incoming.get_nowait() for _ in range(4)]
+            await self.incoming.put(rows[0])
+            for text in ("", "The answer", " remains unchanged.", " Another sentence."):
+                event = dict(rows[1])
+                event["params"] = {**rows[1]["params"], "delta": text}
+                await self.incoming.put(event)
+            for row in rows[2:]:
+                await self.incoming.put(row)
+
+    ticks = iter((10.0, 10.25, 11.0))
+    monkeypatch.setattr(codex_app_server_module, "time", SimpleNamespace(
+        monotonic=lambda: next(ticks), time=time.time,
+    ))
+    observed = []
+    transport = FragmentedTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        timing_observer=lambda stage, elapsed: observed.append((stage, elapsed)),
+    )
+    try:
+        result = [part async for part in inference.stream(_snapshot(), turn_id="turn_timing")]
+        assert result == ["The answer remains unchanged.", "Another sentence."]
+        assert observed == [("first_model_delta", 250), ("first_speakable_segment", 1000)]
+        assert all(type(value) is int for _, value in observed)
+    finally:
+        await inference.close()
+
+
+@pytest.mark.parametrize("text", ("", "Final unpunctuated answer"))
+@pytest.mark.asyncio
+async def test_codex_timing_handles_empty_and_final_flush_without_changing_text(text) -> None:
+    observed = []
+    transport = FakeCodexTransport(assistant_delta=text)
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        timing_observer=lambda stage, elapsed: observed.append((stage, elapsed)),
+    )
+    try:
+        result = [part async for part in inference.stream(_snapshot(), turn_id="turn_timing")]
+        assert result == ([text] if text else [])
+        assert [stage for stage, _ in observed] == (
+            ["first_model_delta", "first_speakable_segment"] if text else []
+        )
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_timing_observer_failure_does_not_change_stream() -> None:
+    def fail_observer(stage, elapsed):
+        raise RuntimeError("diagnostic observer failure")
+
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        timing_observer=fail_observer,
+    )
+    try:
+        assert [part async for part in inference.stream(_snapshot(), turn_id="turn_timing")] == [
+            "Four.",
+        ]
+    finally:
+        await inference.close()
+
+
+@pytest.mark.parametrize("field", ("threadId", "turnId"))
+@pytest.mark.asyncio
+async def test_codex_timing_never_observes_unbound_delta(field, monkeypatch) -> None:
+    observed = []
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        timing_observer=lambda stage, elapsed: observed.append((stage, elapsed)),
+    )
+    next_event = inference._next_event
+
+    async def unbound_event(*args, **kwargs):
+        event = await next_event(*args, **kwargs)
+        assert type(event) is dict
+        return {**event, "params": {**event["params"], field: "unbound_identity"}}
+
+    monkeypatch.setattr(inference, "_next_event", unbound_event)
+    try:
+        with pytest.raises(RuntimeError, match="event .* mismatch"):
+            [part async for part in inference.stream(_snapshot(), turn_id="turn_timing")]
+        assert observed == []
+    finally:
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_timing_resets_for_each_turn() -> None:
+    observed = []
+    transport = FakeCodexTransport()
+    inference = CodexAppServerStreamingInference(
+        model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
+        timing_observer=lambda stage, elapsed: observed.append((stage, elapsed)),
+    )
+    try:
+        for turn in ("turn_first", "turn_second"):
+            assert [part async for part in inference.stream(_snapshot(), turn_id=turn)] == ["Four."]
+        assert [stage for stage, _ in observed] == [
+            "first_model_delta", "first_speakable_segment",
+            "first_model_delta", "first_speakable_segment",
+        ]
+    finally:
+        await inference.close()
 
 _OBJECTIVE_CONTEXT_CONTRACT = (
     "Background work receives the objective, not this conversation. Make the objective "
