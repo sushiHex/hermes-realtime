@@ -15,11 +15,14 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from hermes_realtime import __version__
 from hermes_realtime.providers._speech_text import project_speech_text
-from hermes_realtime.providers.kokoro_worker import KokoroWorkerClient
+from hermes_realtime.providers.kokoro_worker import (
+    KokoroWorkerClient,
+    _emit_client_startup_refusal,
+)
 from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
 
 _MODEL_SAMPLE_RATE_HZ = 24_000
@@ -118,6 +121,18 @@ _VOICES_ASSET = _PinnedAsset(
 )
 
 
+class KokoroWorkerClientFactory(Protocol):
+    def create(
+        self, *, model_path: Path, voices_path: Path, expected_model_sha256: str,
+        expected_voices_sha256: str, language: str, max_pcm_bytes: int,
+        attestation_voice: str,
+    ) -> KokoroWorkerClient: ...
+
+    def close(self) -> None:
+        """Idempotently settle owned clients and scope; retain unknown cleanup as an error."""
+        ...
+
+
 class KokoroSynthesizer:
     """Synthesize each inference segment locally as one cancellable PCM chunk."""
 
@@ -134,6 +149,7 @@ class KokoroSynthesizer:
         pronunciations: Mapping[str, str] | None = None,
         stream_chunk_chars: int = 400,
         worker_python: Path | None = None,
+        worker_client_factory: KokoroWorkerClientFactory | None = None,
         synthesize_pcm: _SynthesizePcm | None = None,
     ) -> None:
         if type(voice) is not str or voice not in _VOICE_IDS:
@@ -156,6 +172,23 @@ class KokoroSynthesizer:
                 raise ValueError(f"{name} exceeds supported bounds")
         if synthesize_pcm is not None and not callable(synthesize_pcm):
             raise TypeError("synthesize_pcm must be callable")
+        if worker_client_factory is not None:
+            if not (
+                callable(getattr(worker_client_factory, "create", None))
+                and callable(getattr(worker_client_factory, "close", None))
+            ):
+                try:
+                    raise TypeError("worker_client_factory must expose create and close")
+                finally:
+                    _emit_client_startup_refusal("schema_rejected")
+            if worker_python is not None or synthesize_pcm is not None:
+                try:
+                    raise ValueError(
+                        "worker_client_factory cannot be combined with "
+                        "worker_python or synthesize_pcm"
+                    )
+                finally:
+                    _emit_client_startup_refusal("schema_rejected")
         if worker_python is not None:
             if not isinstance(worker_python, Path):
                 raise TypeError("worker_python must be a Path")
@@ -220,6 +253,9 @@ class KokoroSynthesizer:
         )
         self._engine: object | None = None
         self._worker_python = worker_python
+        self._worker_client_factory = worker_client_factory
+        self._managed_close_error: BaseException | None = None
+        self._managed_close_pending = False
         self._worker_client: KokoroWorkerClient | None = None
         self._backend_lock = threading.Lock()
         self._uses_default_backend = synthesize_pcm is None
@@ -362,20 +398,59 @@ class KokoroSynthesizer:
     async def close(self) -> None:
         async with self._lock:
             if self._closed:
+                if self._worker_client_factory is not None and self._managed_close_pending:
+                    try:
+                        raise RuntimeError("Kokoro managed backend cleanup_pending")
+                    finally:
+                        _emit_client_startup_refusal("cleanup_unknown")
+                if (
+                    self._worker_client_factory is not None
+                    and self._managed_close_error is not None
+                ):
+                    try:
+                        raise self._managed_close_error
+                    finally:
+                        _emit_client_startup_refusal("cleanup_unknown")
                 return
             self._closed = True
+            if self._worker_client_factory is not None:
+                self._managed_close_pending = True
             operations = tuple(self._operations.values())
             self._operations.clear()
-        for operation in operations:
-            operation.cancel()
-        await asyncio.gather(*operations, return_exceptions=True)
-        with self._backend_lock:
-            worker_client = self._worker_client
-            self._worker_client = None
-        if worker_client is not None:
-            await asyncio.to_thread(worker_client.close)
-        await asyncio.to_thread(lambda: self._executor.shutdown(wait=True, cancel_futures=True))
-        self._engine = None
+        try:
+            try:
+                for operation in operations:
+                    operation.cancel()
+                await asyncio.gather(*operations, return_exceptions=True)
+            finally:
+                with self._backend_lock:
+                    worker_client = self._worker_client
+                    self._worker_client = None
+                try:
+                    await asyncio.to_thread(self._close_worker_backend, worker_client)
+                finally:
+                    await asyncio.to_thread(
+                        lambda: self._executor.shutdown(wait=True, cancel_futures=True),
+                    )
+                    self._engine = None
+        except BaseException as error:
+            if self._worker_client_factory is not None:
+                self._managed_close_error = error
+            try:
+                raise
+            finally:
+                if self._worker_client_factory is not None:
+                    _emit_client_startup_refusal("cleanup_unknown")
+        finally:
+            self._managed_close_pending = False
+
+    def _close_worker_backend(self, worker: KokoroWorkerClient | None) -> None:
+        try:
+            if worker is not None:
+                worker.close()
+        finally:
+            if self._worker_client_factory is not None:
+                self._worker_client_factory.close()
 
     async def _build_chunk(self, text: str, turn_id: str, voice: str) -> SpeechChunk:
         loop = asyncio.get_running_loop()
@@ -463,18 +538,34 @@ class KokoroSynthesizer:
             return self._engine
         model_path = self._ensure_asset(_MODEL_ASSET)
         voices_path = self._ensure_asset(_VOICES_ASSET)
-        if self._worker_python is not None:
-            worker = KokoroWorkerClient(
-                python_executable=self._worker_python,
-                worker_script=Path(__file__).with_name("kokoro_worker.py").resolve(),
-                model_path=model_path,
-                voices_path=voices_path,
-                expected_model_sha256=_MODEL_ASSET.sha256,
-                expected_voices_sha256=_VOICES_ASSET.sha256,
-                language=self._language,
-                max_pcm_bytes=self._max_pcm_bytes,
-                attestation_voice=self._voice,
-            )
+        if self._worker_python is not None or self._worker_client_factory is not None:
+            if self._worker_client_factory is not None:
+                try:
+                    worker = self._worker_client_factory.create(
+                        model_path=model_path,
+                        voices_path=voices_path,
+                        expected_model_sha256=_MODEL_ASSET.sha256,
+                        expected_voices_sha256=_VOICES_ASSET.sha256,
+                        language=self._language,
+                        max_pcm_bytes=self._max_pcm_bytes,
+                        attestation_voice=self._voice,
+                    )
+                except BaseException:
+                    self._worker_client_factory.close()
+                    raise
+            else:
+                assert self._worker_python is not None
+                worker = KokoroWorkerClient(
+                    python_executable=self._worker_python,
+                    worker_script=Path(__file__).with_name("kokoro_worker.py").resolve(),
+                    model_path=model_path,
+                    voices_path=voices_path,
+                    expected_model_sha256=_MODEL_ASSET.sha256,
+                    expected_voices_sha256=_VOICES_ASSET.sha256,
+                    language=self._language,
+                    max_pcm_bytes=self._max_pcm_bytes,
+                    attestation_voice=self._voice,
+                )
             with self._backend_lock:
                 if self._closed:
                     publish_worker = False
@@ -482,7 +573,7 @@ class KokoroSynthesizer:
                     self._worker_client = worker
                     publish_worker = True
             if not publish_worker:
-                worker.close()
+                self._close_worker_backend(worker)
                 raise RuntimeError("Kokoro synthesizer is closed")
             try:
                 worker.warm()
@@ -490,7 +581,7 @@ class KokoroSynthesizer:
                 with self._backend_lock:
                     if self._worker_client is worker:
                         self._worker_client = None
-                worker.close()
+                self._close_worker_backend(worker)
                 raise
             with self._backend_lock:
                 if self._closed or self._worker_client is not worker:
@@ -499,7 +590,7 @@ class KokoroSynthesizer:
                     self._engine = worker
                     publish_engine = True
             if not publish_engine:
-                worker.close()
+                self._close_worker_backend(worker)
                 raise RuntimeError("Kokoro synthesizer closed during worker startup")
             return worker
         try:

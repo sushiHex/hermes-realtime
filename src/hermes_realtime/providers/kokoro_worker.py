@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import IO, Any, Literal, cast
+from typing import IO, Any, Literal, Protocol, cast
 
 _PROTOCOL_VERSION = 1
 _MAX_HEADER_BYTES = 32 * 1024
@@ -93,6 +93,23 @@ _PROFILE_OPERATION_CATALOGS = {
         "Where",
     }),
 }
+
+
+class KokoroWorkerProcess(Protocol):
+    @property
+    def returncode(self) -> int | None: ...
+
+    def poll(self) -> int | None: ...
+
+    def terminate(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+    def kill(self) -> None: ...
+
+
+class KokoroWorkerLauncher(Protocol):
+    def launch(self, *, connect_port: int, token: str) -> KokoroWorkerProcess: ...
 
 
 class KokoroCpuPlacementRejected(RuntimeError):
@@ -175,7 +192,7 @@ def _emit_worker_failure(exit_code: int, error: Exception) -> None:
 
 _StartupRefusalCategory = Literal[
     "schema_rejected", "authentication_rejected", "assets_rejected",
-    "operation_catalog_rejected", "startup_deadline_expired", "policy_rejected",
+    "operation_catalog_rejected", "startup_deadline_expired", "policy_rejected", "cleanup_unknown",
 ]
 
 
@@ -319,6 +336,7 @@ class KokoroWorkerClient:
         max_pcm_bytes: int,
         attestation_voice: str = "bf_isabella",
         execution_policy: str = _STRICT_EXECUTION_POLICY,
+        worker_launcher: KokoroWorkerLauncher | None = None,
         startup_timeout_seconds: float = 15.0,
         request_timeout_seconds: float = 60.0,
     ) -> None:
@@ -376,13 +394,19 @@ class KokoroWorkerClient:
                 raise ValueError("Kokoro execution policy binding is unsupported")
             finally:
                 _emit_client_startup_refusal("policy_rejected")
+        if worker_launcher is not None and not callable(getattr(worker_launcher, "launch", None)):
+            try:
+                raise TypeError("worker_launcher must expose launch")
+            finally:
+                _emit_client_startup_refusal("schema_rejected")
+        self._worker_launcher = worker_launcher
         self._execution_policy = execution_policy
         self._language = language
         self._attestation_voice = attestation_voice
         self._max_pcm_bytes = max_pcm_bytes
         self._startup_timeout = float(startup_timeout_seconds)
         self._request_timeout = float(request_timeout_seconds)
-        self._process: subprocess.Popen[bytes] | None = None
+        self._process: KokoroWorkerProcess | None = None
         self._listener: socket.socket | None = None
         self._socket: socket.socket | None = None
         self._stderr_file: IO[bytes] | None = None
@@ -475,45 +499,48 @@ class KokoroWorkerClient:
         environment[_TOKEN_ENV] = token
         port = cast(tuple[str, int], listener.getsockname())[1]
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        process: subprocess.Popen[bytes] | None = None
+        process: KokoroWorkerProcess | None = None
         connection: socket.socket | None = None
         stderr_file: IO[bytes] | None = None
         published = False
         try:
             # The file is owned until worker close/fault, beyond this startup scope.
             stderr_file = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
-            process = subprocess.Popen(
-                [
-                    str(self._python_executable),
-                    "-I",
-                    str(self._worker_script),
-                    "--connect-port",
-                    str(port),
-                    "--parent-pid",
-                    str(os.getpid()),
-                    "--model",
-                    str(self._model_path),
-                    "--model-sha256",
-                    self._expected_model_sha256,
-                    "--voices",
-                    str(self._voices_path),
-                    "--voices-sha256",
-                    self._expected_voices_sha256,
-                    "--attestation-voice",
-                    self._attestation_voice,
-                    "--language",
-                    self._language,
-                    "--max-pcm-bytes",
-                    str(self._max_pcm_bytes),
-                ] + (["--execution-policy", self._execution_policy]
-                     if self._execution_policy == _BENCHMARK_EXECUTION_POLICY else []),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_file,
-                shell=False,
-                env=environment,
-                creationflags=creationflags,
-            )
+            if self._worker_launcher is not None:
+                process = self._worker_launcher.launch(connect_port=port, token=token)
+            else:
+                process = subprocess.Popen(
+                    [
+                        str(self._python_executable),
+                        "-I",
+                        str(self._worker_script),
+                        "--connect-port",
+                        str(port),
+                        "--parent-pid",
+                        str(os.getpid()),
+                        "--model",
+                        str(self._model_path),
+                        "--model-sha256",
+                        self._expected_model_sha256,
+                        "--voices",
+                        str(self._voices_path),
+                        "--voices-sha256",
+                        self._expected_voices_sha256,
+                        "--attestation-voice",
+                        self._attestation_voice,
+                        "--language",
+                        self._language,
+                        "--max-pcm-bytes",
+                        str(self._max_pcm_bytes),
+                    ] + (["--execution-policy", self._execution_policy]
+                         if self._execution_policy == _BENCHMARK_EXECUTION_POLICY else []),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    shell=False,
+                    env=environment,
+                    creationflags=creationflags,
+                )
             with self._state_lock:
                 if self._closed:
                     raise RuntimeError("Kokoro worker client is closed")
@@ -806,7 +833,7 @@ class KokoroWorkerClient:
             stderr_file.close()
 
     @staticmethod
-    def _settle_process(process: subprocess.Popen[bytes] | None) -> None:
+    def _settle_process(process: KokoroWorkerProcess | None) -> None:
         if process is None:
             return
         if process.poll() is None:
@@ -1155,4 +1182,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["KokoroCpuPlacementRejected", "KokoroWorkerClient", "serve_kokoro_worker_connection"]
+__all__ = [
+    "KokoroCpuPlacementRejected", "KokoroWorkerClient", "KokoroWorkerLauncher",
+    "KokoroWorkerProcess", "serve_kokoro_worker_connection",
+]
