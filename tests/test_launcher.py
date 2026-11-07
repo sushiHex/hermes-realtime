@@ -853,6 +853,7 @@ def test_host_tts_selection_uses_kokoro_isabella_without_edge_fallback(
                 "pronunciations": {"Hermes": "Her-mees", "LiveKit": "Live Kit"},
                 "stream_chunk_chars": 320,
                 "worker_python": Path("C:/isolated-kokoro/python.exe"),
+                "worker_client_factory": None,
             },
         )
     ]
