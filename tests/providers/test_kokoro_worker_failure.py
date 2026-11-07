@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -222,3 +226,39 @@ def test_system_exit_is_not_reclassified_as_a_worker_failure(monkeypatch, capsys
         worker.main()
     assert caught.value.code == 70
     assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("alias_original_stderr", (False, True))
+def test_native_buffered_stderr_failure_preserves_reserved_authentication_exit(
+    alias_original_stderr,
+):
+    code = """
+import io,runpy,sys
+class FullSink(io.RawIOBase):
+    def writable(self):
+        return True
+    def write(self, data):
+        raise OSError('SYNTHETIC_PRIVATE_DIAGNOSTIC_DETAIL')
+buffered = io.BufferedWriter(FullSink())
+diagnostic_stream = io.TextIOWrapper(buffered, encoding='utf-8')
+sys.stderr = diagnostic_stream
+if sys.argv[1] == 'alias':
+    sys.__stderr__ = diagnostic_stream
+sys.argv = sys.argv[2:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+    environment = os.environ.copy()
+    environment.pop(worker._TOKEN_ENV, None)
+    done = subprocess.run(
+        [sys.executable, "-I", "-B", "-S", "-c", code,
+         "alias" if alias_original_stderr else "original", str(Path(worker.__file__).resolve()),
+         "--connect-port", "12345", "--parent-pid", "123",
+         "--model", "synthetic-model-not-read.onnx", "--model-sha256", "0" * 64,
+         "--voices", "synthetic-voices-not-read.bin", "--voices-sha256", "0" * 64,
+         "--attestation-voice", "bf_isabella", "--language", "en-gb",
+         "--max-pcm-bytes", "1024"],
+        env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+        timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert done.returncode == 80
+    assert done.stdout == b"" and done.stderr == b""

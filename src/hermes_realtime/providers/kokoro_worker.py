@@ -92,13 +92,20 @@ def _emit_worker_failure(exit_code: int, error: Exception) -> None:
     )
     kind = next((label for exact_type, label in kinds if type(error) is exact_type),
                 "unknown_exception")
-    # Diagnostics cannot replace the already selected nonzero failure status.
-    with contextlib.suppress(Exception):
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
         print("[kokoro-worker-failure] " + json.dumps(
             {"version": 1, "category": _FAILURE_CATEGORIES.get(exit_code, "unknown_worker_failure"),
              "kind": kind},
             separators=(",", ":"), sort_keys=True,
-        ), file=sys.stderr, flush=True)
+        ), file=stream, flush=True)
+    except Exception:
+        # CPython flushes sys.stderr again at shutdown and may replace the status
+        # with 120. Detach only the failed stream; never echo through a fallback.
+        if sys.stderr is stream:
+            sys.stderr = None
 
 
 def _create_exclusive_listener() -> socket.socket:

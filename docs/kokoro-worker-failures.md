@@ -35,6 +35,9 @@ Exception messages, arguments, paths, tokens, request identifiers, provider outp
 and stderr are not copied into that marker. A broken diagnostic stream cannot
 replace the selected exit status. Collectors should use the reserved exit-code
 mapping rather than parsing or replaying arbitrary worker stderr.
+After a diagnostic write/flush failure, the failed Python stderr is detached so
+CPython shutdown cannot retry that stream and replace the status with exit 120.
+No raw fallback diagnostic is emitted.
 
 Success remains exit code 0 with the existing version 1 authenticated wire protocol.
 Parent-watchdog exits 70 and 71 remain unchanged. Argument-parser exits, native
