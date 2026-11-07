@@ -20,12 +20,12 @@ REVIEWED_SOURCES = {
 }
 REVIEWED_SIZES = {'entrypoint.py': 2612, 'policy.py': 53739}
 REVIEWED_SHARED_SOURCES = {
-    "evidence_presentation": "c3e5ac0e33a39671af1c272675832b70f0dc7325906b30a98486a55aabab7ac1",
+    "evidence_presentation": "b8b076a1d5106e73abfde7db21256797593df0c8f69ef19dd501a086783bd2d7",
     "presentation_transport": "5067a775f24ddfae272ce40ed2c925073119180727a58294aea9a02fdaf85009",
     "result_limits": "cdb48e4dd7d001b00086a7d816f2d9821e4419ef0799f619f776e16a065adfdb",
 }
 REVIEWED_SHARED_SIZES = {
-    "evidence_presentation": 23859, "presentation_transport": 16551, "result_limits": 833,
+    "evidence_presentation": 24222, "presentation_transport": 16551, "result_limits": 833,
 }
 PLUGIN = "ordinary-lookup-experimental"
 POLICY = "ordinary-lookup/v1"
