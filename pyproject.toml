@@ -42,6 +42,9 @@ hermes-realtime-host = "hermes_realtime.host_launcher:main"
 hermes-realtime-local = "hermes_realtime.launcher:main"
 
 [project.optional-dependencies]
+kokoro-mcp = [
+    "mcp>=1.30,<2",
+]
 browser-acceptance = [
     "playwright>=1.50,<2",
 ]
@@ -70,6 +73,7 @@ qualification-hermes = [
   "rich==14.3.3",
 ]
 dev = [
+  "mcp>=1.30,<2",
   "cryptography>=50,<51",
   "jsonschema>=4.23,<5",
   "mypy>=1.15",

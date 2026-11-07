@@ -1197,6 +1197,13 @@ def _parse_kokoro_worker_python(value: str) -> Path:
     return path.resolve()
 
 
+def _parse_kokoro_mcp_config(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or not path.is_file():
+        raise argparse.ArgumentTypeError("--kokoro-mcp-config requires an existing absolute file")
+    return path.resolve()
+
+
 def _encode_speech_timing_event(
     chunk: SpeechChunk,
     stream_identity: str,
@@ -1605,18 +1612,40 @@ def _build_synthesizer(
     kokoro_pronunciations: Mapping[str, str] | None = None,
     kokoro_stream_chunk_chars: int = 400,
     kokoro_worker_python: Path | None = None,
+    kokoro_mcp_config: Path | None = None,
 ) -> EdgeTtsSynthesizer | KokoroSynthesizer:
     if type(tts_provider) is not str:
         raise TypeError("tts_provider must be an exact built-in string")
+    if kokoro_mcp_config is not None and (
+        tts_provider != "kokoro" or kokoro_worker_python is not None
+    ):
+        try:
+            raise ValueError("MCP Kokoro requires exclusive Kokoro backend selection")
+        finally:
+            print('[kokoro-mcp-host-refused] {"category":"backend_conflict",'
+                  '"version":1}', file=sys.stderr, flush=True)
     if tts_provider == "kokoro":
-        return KokoroSynthesizer(
-            voice=kokoro_voice,
-            speed=kokoro_speed,
-            intra_op_threads=kokoro_intra_op_threads,
-            pronunciations=kokoro_pronunciations,
-            stream_chunk_chars=kokoro_stream_chunk_chars,
-            worker_python=kokoro_worker_python,
-        )
+        from hermes_realtime.providers.kokoro import KokoroWorkerClientFactory
+
+        factory: KokoroWorkerClientFactory | None = None
+        if kokoro_mcp_config is not None:
+            from hermes_realtime.providers.kokoro_mcp import KokoroMcpWorkerFactory
+
+            factory = KokoroMcpWorkerFactory.from_config(kokoro_mcp_config)
+        try:
+            return KokoroSynthesizer(
+                voice=kokoro_voice,
+                speed=kokoro_speed,
+                intra_op_threads=kokoro_intra_op_threads,
+                pronunciations=kokoro_pronunciations,
+                stream_chunk_chars=kokoro_stream_chunk_chars,
+                worker_python=kokoro_worker_python,
+                worker_client_factory=factory,
+            )
+        except BaseException:
+            if factory is not None:
+                factory.close()
+            raise
     if tts_provider == "edge":
         return EdgeTtsSynthesizer(voice=edge_voice)
     raise ValueError("tts_provider must be exactly 'kokoro' or 'edge'")
@@ -1884,6 +1913,7 @@ def build_local_host_launcher(
     kokoro_pronunciations: Mapping[str, str] | None = None,
     kokoro_stream_chunk_chars: int = 400,
     kokoro_worker_python: Path | None = None,
+    kokoro_mcp_config: Path | None = None,
     allow_unsandboxed_tasks: bool = False,
     natural_work_tools: bool = False,
     task_start_policy: TaskStartPolicy = "confirm",
@@ -2412,6 +2442,7 @@ def build_local_host_launcher(
             kokoro_pronunciations=kokoro_pronunciations,
             kokoro_stream_chunk_chars=kokoro_stream_chunk_chars,
             kokoro_worker_python=kokoro_worker_python,
+            kokoro_mcp_config=kokoro_mcp_config,
         )
     )
     transcriber = (
@@ -3201,6 +3232,7 @@ async def _run_host_cli(args: argparse.Namespace) -> None:
             kokoro_pronunciations=_parse_kokoro_pronunciations(args.kokoro_pronunciation),
             kokoro_stream_chunk_chars=args.kokoro_stream_chunk_chars,
             kokoro_worker_python=args.kokoro_worker_python,
+            kokoro_mcp_config=args.kokoro_mcp_config,
             allow_unsandboxed_tasks=args.allow_unsandboxed_hermes_tasks,
             natural_work_tools=args.natural_work_tools,
             task_start_policy=args.task_start_policy,
@@ -3686,6 +3718,11 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--kokoro-worker-python",
         type=_parse_kokoro_worker_python,
         help="absolute Python executable in an isolated CUDA Kokoro environment",
+    )
+    parser.add_argument(
+        "--kokoro-mcp-config",
+        type=_parse_kokoro_mcp_config,
+        help="trusted operator configuration for vram-mcp-owned CUDA Kokoro",
     )
     parser.add_argument(
         "--allow-unsandboxed-hermes-tasks",

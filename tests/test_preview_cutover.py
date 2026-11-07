@@ -14,6 +14,89 @@ import pytest
 from scripts import preview_cutover
 
 
+def _mcp_plan(tmp_path):
+    plan_path, profile = _plan(tmp_path)
+    config = tmp_path / "gpu-operator.json"
+    config.write_text("{}", encoding="utf-8")
+    value = json.loads(plan_path.read_text())
+    value["host_options"].update({
+        "kokoro_mcp_config": str(config),
+        "kokoro_mcp_config_sha256": preview_cutover.digest(config),
+    })
+    plan_path.write_text(json.dumps(value))
+    return plan_path, profile, config
+
+
+@pytest.mark.parametrize("fault", [None, "partial", "digest", "relative", "extra"])
+def test_managed_mcp_plan_requires_complete_bound_configuration(tmp_path, fault):
+    path, _, _ = _mcp_plan(tmp_path)
+    value = json.loads(path.read_text())
+    options = value["host_options"]
+    if fault == "partial":
+        del options["kokoro_mcp_config_sha256"]
+    elif fault == "digest":
+        options["kokoro_mcp_config_sha256"] = "invalid"
+    elif fault == "relative":
+        options["kokoro_mcp_config"] = "relative.json"
+    elif fault == "extra":
+        options["arbitrary_command"] = "refused"
+    path.write_text(json.dumps(value))
+    if fault is not None:
+        category = {"partial": "kokoro_mcp_config_fields", "digest": "kokoro_mcp_config_digest",
+                    "relative": "kokoro_mcp_config_path", "extra": "host_options_fields"}[fault]
+        with pytest.raises(ValueError, match=category):
+            preview_cutover.load_plan(path)
+    else:
+        assert preview_cutover.load_plan(path).host_options == options
+
+
+def test_managed_mcp_config_drift_refused_before_host_construction(tmp_path):
+    path, _, config = _mcp_plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    config.write_text('{"changed":true}')
+    with pytest.raises(ValueError, match="kokoro_mcp_config_binding"):
+        preview_cutover._bound_kokoro_mcp_config(plan)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_managed_mcp_config_forwards_to_real_host_builder(tmp_path, monkeypatch, supported):
+    path, profile, config = _mcp_plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    plan.output.mkdir()
+    (plan.output / "host.stop").touch()
+    observed = []
+
+    class Launcher:
+        async def start(self):
+            observed.append("start")
+        async def close(self):
+            observed.append("close")
+
+    def build(*, hermes_discover_tools=False, kokoro_mcp_config=None, **kwargs):
+        assert kokoro_mcp_config == config
+        return Launcher()
+
+    def unsupported(*, hermes_discover_tools=False, **kwargs):
+        return Launcher()
+
+    host = SimpleNamespace(
+        _load_api_bearer=lambda _: "synthetic-not-a-credential",
+        _load_voice_companion=lambda *_: None,
+        LoopbackPeerAuthorizer=object,
+        build_local_host_launcher=build if supported else unsupported,
+    )
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda _: (plan, None, profile))
+    monkeypatch.setattr(preview_cutover, "_runtime_modules", lambda _: (None, host))
+    if supported:
+        await preview_cutover._host_child(tmp_path / "active")
+        assert observed == ["start", "close"]
+    else:
+        with pytest.raises(ValueError, match="kokoro_mcp_host_unavailable"):
+            await preview_cutover._host_child(tmp_path / "active")
+        assert observed == []
+
+
 def test_native_evidence_host_selection_is_explicit():
     from scripts.preview_cutover import native_web_evidence_contract
 

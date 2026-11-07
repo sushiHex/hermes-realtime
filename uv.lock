@@ -286,7 +286,7 @@ name = "cryptography"
 version = "48.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "(platform_python_implementation != 'PyPy' and extra == 'group-15-hermes-realtime-qualification-hermes') or (extra == 'group-15-hermes-realtime-dev' and extra == 'group-15-hermes-realtime-qualification-hermes')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/12/45/870e7f4bef50e5f53b9f51d4428aee5290eedf58ba443f16b1ebb7ab8e66/cryptography-48.0.1.tar.gz", hash = "sha256:266f4ee051abb2f725b74ef8072b521ce1feacf685a3364fa6a6b45548db791a", size = 832989, upload-time = "2026-06-09T22:32:31.8Z" }
 wheels = [
@@ -331,7 +331,7 @@ name = "cryptography"
 version = "50.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "(platform_python_implementation != 'PyPy' and extra == 'group-15-hermes-realtime-dev') or (platform_python_implementation != 'PyPy' and extra != 'group-15-hermes-realtime-qualification-hermes') or (extra == 'group-15-hermes-realtime-dev' and extra == 'group-15-hermes-realtime-qualification-hermes')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ad/5d6702db60b1e40b41ef513b6967ff5848f307d50f8449baf1634f5908f1/cryptography-50.0.1.tar.gz", hash = "sha256:5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20", size = 880381, upload-time = "2026-08-25T19:45:45.499Z" }
 wheels = [
@@ -601,6 +601,9 @@ dependencies = [
 browser-acceptance = [
     { name = "playwright" },
 ]
+kokoro-mcp = [
+    { name = "mcp" },
+]
 local = [
     { name = "edge-tts" },
     { name = "faster-whisper" },
@@ -623,6 +626,7 @@ build = [
 dev = [
     { name = "cryptography", version = "50.0.1", source = { registry = "https://pypi.org/simple" } },
     { name = "jsonschema" },
+    { name = "mcp" },
     { name = "mypy" },
     { name = "packaging" },
     { name = "pytest" },
@@ -646,6 +650,7 @@ requires-dist = [
     { name = "kokoro-onnx", marker = "sys_platform == 'win32' and extra == 'local'", specifier = "==0.6.1" },
     { name = "livekit", specifier = ">=1.2.1,<2" },
     { name = "livekit-api", specifier = ">=1.2.0,<2" },
+    { name = "mcp", marker = "extra == 'kokoro-mcp'", specifier = ">=1.30,<2" },
     { name = "moonshine-voice", marker = "extra == 'local'", specifier = "==0.1.5" },
     { name = "numpy", marker = "extra == 'local'", specifier = ">=1.26,<3" },
     { name = "numpy", marker = "extra == 'speech-verification'", specifier = ">=1.26,<3" },
@@ -656,13 +661,14 @@ requires-dist = [
     { name = "webrtcvad-wheels", marker = "extra == 'local'", specifier = ">=2.0.14" },
     { name = "webrtcvad-wheels", marker = "extra == 'speech-verification'", specifier = ">=2.0.14" },
 ]
-provides-extras = ["browser-acceptance", "local", "speech-verification"]
+provides-extras = ["kokoro-mcp", "browser-acceptance", "local", "speech-verification"]
 
 [package.metadata.requires-dev]
 build = [{ name = "hatchling", specifier = "==1.27.0" }]
 dev = [
     { name = "cryptography", specifier = ">=50,<51" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "mcp", specifier = ">=1.30,<2" },
     { name = "mypy", specifier = ">=1.15" },
     { name = "packaging", specifier = ">=26.3,<27" },
     { name = "pytest", specifier = ">=8.3" },
@@ -740,6 +746,15 @@ http2 = [
 ]
 socks = [
     { name = "socksio" },
+]
+
+[[package]]
+name = "httpx-sse"
+version = "0.4.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/4c/751061ffa58615a32c31b2d82e8482be8dd4a89154f003147acee90f2be9/httpx_sse-0.4.3.tar.gz", hash = "sha256:9b1ed0127459a66014aec3c56bebd93da3c1bc8bb6618c8082039a44889a755d", size = 15943, upload-time = "2025-10-10T21:48:22.271Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/fd/6668e5aec43ab844de6fc74927e155a3b37bf40d7c3790e49fc0406b6578/httpx_sse-0.4.3-py3-none-any.whl", hash = "sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc", size = 8960, upload-time = "2025-10-10T21:48:21.158Z" },
 ]
 
 [[package]]
@@ -950,6 +965,31 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/81/4da04ced5a082363ecfa159c010d200ecbd959ae410c10c0264a38cac0f5/markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a", size = 91687, upload-time = "2026-05-07T12:08:27.182Z" },
+]
+
+[[package]]
+name = "mcp"
+version = "1.30.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "jsonschema" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "python-multipart" },
+    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'group-15-hermes-realtime-dev' and extra == 'group-15-hermes-realtime-qualification-hermes')" },
+    { name = "sse-starlette" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+    { name = "uvicorn", marker = "sys_platform != 'emscripten' or (extra == 'group-15-hermes-realtime-dev' and extra == 'group-15-hermes-realtime-qualification-hermes')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/93/0142dc84a666daf8ad51a34268f34c12fd6fda4f3810c4be2504eecc8212/mcp-1.30.0.tar.gz", hash = "sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4", size = 680511, upload-time = "2026-09-07T14:34:15.845Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/f4/e58bc33317c92a0203664daaf00bf6f41166cc0149e5d6870a03f7cd004a/mcp-1.30.0-py3-none-any.whl", hash = "sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0", size = 234581, upload-time = "2026-09-07T14:34:14.266Z" },
 ]
 
 [[package]]
@@ -1292,6 +1332,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pydantic-settings"
+version = "2.16.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d0/31/21d21e0e38a8f5f7a7f0cde22820117b6d17d6bc36f348129527f915d7f4/pydantic_settings-2.16.2.tar.gz", hash = "sha256:3dc08ffabed2bbd5dc2dd55ead7b78b4e4c5cd776aecd04310db5f1224caaf46", size = 309225, upload-time = "2026-10-28T11:14:28.066Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/39/88/4131c51ff87b7cd7f82a1194d0c0a2b7ca68c72d9da04c3b7e69ab91a79f/pydantic_settings-2.16.2-py3-none-any.whl", hash = "sha256:8d523e5c129b097686bde019bd6109bff53f4c8c3f63f1ddf9933ffa42e5ab4f", size = 81994, upload-time = "2026-10-28T11:14:26.716Z" },
+]
+
+[[package]]
 name = "pyee"
 version = "13.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1319,6 +1374,12 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/02/a5/5197bfd06417837ac079921c66fa6393f1dea3557272a263cebfef69e432/pyjwt-2.15.0.tar.gz", hash = "sha256:b11c5f9791d7bf51c2b39a81ed669f6b2dbbd669df2942f6c60167e9e3d1abe4", size = 120513, upload-time = "2026-09-23T16:56:00.689Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e8/55/40e45bf052ee8ee12a4dfd785519660f8effa7b065442b91646ec6828619/pyjwt-2.15.0-py3-none-any.whl", hash = "sha256:7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8", size = 33680, upload-time = "2026-09-23T16:55:59.241Z" },
+]
+
+[package.optional-dependencies]
+crypto = [
+    { name = "cryptography", version = "48.0.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'group-15-hermes-realtime-qualification-hermes'" },
+    { name = "cryptography", version = "50.0.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'group-15-hermes-realtime-dev' or extra != 'group-15-hermes-realtime-qualification-hermes'" },
 ]
 
 [[package]]
@@ -1357,6 +1418,25 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
+name = "python-multipart"
+version = "0.0.33"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/b7/15b905f6142a9a8a68f66900788da1a32e4d4254452783b37ad1eccb0506/python_multipart-0.0.33.tar.gz", hash = "sha256:b8112424a6abd162ec08d390565dd113ad699f2fe6fef3c987b8bbcbfe9e390d", size = 50499, upload-time = "2026-10-31T14:23:47.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/1b/6b1b4164ec734cac911460ab599bfbe46afedd42c5c9627fe4235942c314/python_multipart-0.0.33-py3-none-any.whl", hash = "sha256:8f16c07b36add9da6b2ee87d3efcaf0a45a6de9c3d0a5dd94e9ccf7675a7bc45", size = 32253, upload-time = "2026-10-31T14:23:46.33Z" },
+]
+
+[[package]]
+name = "pywin32"
+version = "312"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1f/f5/10a6e845a00fc5e7afd0a988b744f403d4d57162a28d160a093c4d9322f0/pywin32-312-cp311-cp311-win32.whl", hash = "sha256:17948aeadbdb091f0ced6ef0841620794e68327b94ee415571c1203594b7215c", size = 6362659, upload-time = "2026-06-04T07:49:21.349Z" },
+    { url = "https://files.pythonhosted.org/packages/35/c4/dcd2d62b5944b6d5db53413a5899016ccd57ffcb7278f3f81655d25d2027/pywin32-312-cp311-cp311-win_amd64.whl", hash = "sha256:d11417d84412f859b722fad0841b3614459ed0047f7542d8362e77884f6b6e8a", size = 6928825, upload-time = "2026-06-04T07:49:23.934Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/56/3cbb433fe4501cdba2eb9040f56a4e1a8243faa4186b25295564d1a7a79d/pywin32-312-cp311-cp311-win_arm64.whl", hash = "sha256:b2200a054ca6d6625c4842fc56a4976a4b47f96b73dbe5538c3f813a80359f47", size = 6721875, upload-time = "2026-06-04T07:49:26.416Z" },
 ]
 
 [[package]]
@@ -1513,6 +1593,32 @@ wheels = [
 ]
 
 [[package]]
+name = "sse-starlette"
+version = "3.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "starlette" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/71/7f/3b8ec4f27833f7b8c270a3ef960b6d435e1065439847bc0fcd1e58ae898b/sse_starlette-3.6.0.tar.gz", hash = "sha256:623151d6c20dc0eebf1b3379c27faae91fff883bac7ab6665f16f46440a88b3a", size = 41174, upload-time = "2026-10-25T20:31:59.372Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/49/35053078cdfcf639237e8bee6dc6f34f1b3a3cc8d01800a1e213e1660ff6/sse_starlette-3.6.0-py3-none-any.whl", hash = "sha256:e4dfa4d237d2712cb2b4d4918eda9b457cd6b44bbecdc838af75de836565bafd", size = 17985, upload-time = "2026-10-25T20:31:58.134Z" },
+]
+
+[[package]]
+name = "starlette"
+version = "1.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/bb/3d8757f21e9a53d9035c9eb039a777047139a16bfdbedfc7a58241c3d914/starlette-1.10.0.tar.gz", hash = "sha256:b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b", size = 2734356, upload-time = "2026-10-24T15:04:12.342Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/2e/947cfe02def9371c07cd5bf5b6b61c829e9aecb9904db02a66cfafbc1eec/starlette-1.10.0-py3-none-any.whl", hash = "sha256:478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4", size = 80571, upload-time = "2026-10-24T15:04:10.371Z" },
+]
+
+[[package]]
 name = "tabulate"
 version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1605,6 +1711,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
+]
+
+[[package]]
+name = "uvicorn"
+version = "0.54.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/34/30e9280707135d2cfc589dfff3cb796bd07a3aeb1a3e415ba09dd89d7bb4/uvicorn-0.54.0.tar.gz", hash = "sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620", size = 112283, upload-time = "2026-09-25T06:52:37.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/0c/b54a4fdd7f90a3af8b02ebc9ce6712c2c208b7926a2f7bad95c33ebbe943/uvicorn-0.54.0-py3-none-any.whl", hash = "sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf", size = 87427, upload-time = "2026-09-25T06:52:35.829Z" },
 ]
 
 [[package]]
