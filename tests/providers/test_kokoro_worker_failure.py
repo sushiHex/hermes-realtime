@@ -262,3 +262,55 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     )
     assert done.returncode == 80
     assert done.stdout == b"" and done.stderr == b""
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_guard91_reports_complete_authenticated_types_and_preserves_exit(
+    monkeypatch, tmp_path, capsys, send_fails,
+):
+    install_fake_dependencies(monkeypatch, tmp_path, "cpu_core")
+    model_hash = hashlib.sha256(b"synthetic model").hexdigest()
+    monkeypatch.setattr(worker, "_PROFILE_OPERATION_CATALOGS", {model_hash: frozenset({"Conv"})})
+    frames = []
+    class Connection:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def sendall(self, data):
+            if send_fails:
+                raise OSError(PRIVATE_DETAIL)
+            frames.append(data)
+    monkeypatch.setattr(worker, "socket", SimpleNamespace(
+        create_connection=lambda *a, **k: Connection(),
+    ))
+    assert worker.main() == 91
+    assert not (tmp_path / "profile.json").exists()
+    if send_fails:
+        assert frames == []
+    else:
+        payload = json.loads(frames[0][4:])
+        assert payload == {
+            "version": 1, "type": "startup_failure", "token": "synthetic-one-use-token",
+            "modelSha256": model_hash,
+            "voicesSha256": hashlib.sha256(b"synthetic voices").hexdigest(),
+            "category": "cuda_profile_forbidden_cpu_ops", "cpuOperationTypes": ["Conv"],
+        }
+    assert PRIVATE_DETAIL not in capsys.readouterr().err
+
+
+def test_guard91_does_not_send_known_subset_of_unknown_operations(monkeypatch, tmp_path, capsys):
+    install_fake_dependencies(monkeypatch, tmp_path, "cpu_core")
+    model_hash = hashlib.sha256(b"synthetic model").hexdigest()
+    monkeypatch.setattr(worker, "_PROFILE_OPERATION_CATALOGS", {model_hash: frozenset({"Conv"})})
+    profile = tmp_path / "profile.json"
+    events = json.loads(profile.read_text())
+    events.append({"args": {"provider": "CPUExecutionProvider", "op_name": "PRIVATE_NODE_NAME"}})
+    profile.write_text(json.dumps(events))
+    connections = []
+    monkeypatch.setattr(worker, "socket", SimpleNamespace(
+        create_connection=lambda *a, **k: connections.append(1),
+    ))
+    assert worker.main() == 91
+    assert connections == []
+    assert "PRIVATE_NODE_NAME" not in capsys.readouterr().err
