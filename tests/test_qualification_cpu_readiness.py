@@ -228,6 +228,11 @@ async def test_controller_reuses_one_existing_preflight_and_leaves_tree_settleme
         monkeypatch.setattr(recipe.evaluator, "_READINESS_BUDGET_SECONDS", -1)
     if fault == "slow_identity":
         monkeypatch.setattr(recipe.evaluator, "_READINESS_BUDGET_SECONDS", 0.01)
+        # Setup scheduling must not consume the identity timeout's test budget.
+        # Freeze this loop only for this case, then expire it inside identity.
+        loop = recipe.asyncio.get_running_loop()
+        identity_clock = [loop.time()]
+        monkeypatch.setattr(loop, "time", lambda: identity_clock[0])
 
     class Process:
         pid = 42
@@ -278,7 +283,10 @@ async def test_controller_reuses_one_existing_preflight_and_leaves_tree_settleme
             events.append("identity")
             assert model == "phi-campaign-canonical:latest"
             if fault == "slow_identity":
-                await recipe.asyncio.sleep(0.05)
+                identity_clock[0] += 0.05
+                # Let the actual timeout_at callback cancel this request.
+                await recipe.asyncio.sleep(0)
+                await recipe.asyncio.sleep(0)
             return "0" * 64 if fault == "identity" else recipe._MODEL_DIGEST
 
     class Inference:
@@ -328,6 +336,9 @@ async def test_controller_reuses_one_existing_preflight_and_leaves_tree_settleme
         assert report["runtime_root_stopped"] is (fault != "root_stop")
     if fault in {"version", "identity", "slow_identity"}:
         assert "preflight" not in events
+    if fault == "slow_identity":
+        assert "identity" in events
+        assert report["stage"] == "startup" and report["category"] == "deadline"
     if fault == "none":
         assert events.count("preflight") == 1 and events.index("adapter_close") < events.index(
             "terminate"
