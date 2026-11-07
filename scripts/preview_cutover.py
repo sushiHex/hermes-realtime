@@ -533,6 +533,58 @@ def _bound_kokoro_mcp_config(plan: PreviewPlanV1) -> Path | None:
     return _kokoro_mcp_config(plan.host_options)
 
 
+def _verify_managed_kokoro_assets(plan: PreviewPlanV1, home: Path) -> None:
+    """Exercise the existing factory binding without starting a worker or MCP scope."""
+    config = _bound_kokoro_mcp_config(plan)
+    if config is None:
+        return
+    accepted = False
+    try:
+        model, voices = _kokoro_asset_pins(plan)
+        prefix = Path(".cache") / "hermes-realtime" / "kokoro" / model.sha256
+        expected = [
+            (prefix / model.filename, model.sha256, model.size),
+            (prefix / voices.filename, voices.sha256, voices.size),
+        ]
+        planned = [
+            (relative, sha, size)
+            for _, relative, sha, size in _speech_asset_manifest(plan)
+            if relative.is_relative_to(Path(".cache") / "hermes-realtime" / "kokoro")
+        ]
+        require(sorted(planned) == sorted(expected), "kokoro_mcp_asset_binding")
+        _runtime_modules(plan)
+        managed = importlib.import_module("hermes_realtime.providers.kokoro_mcp")
+        expected_module = plan.runtime_target / "hermes_realtime" / "providers" / "kokoro_mcp.py"
+        require(managed.__file__ is not None
+                and Path(managed.__file__).resolve() == expected_module.resolve(),
+                "kokoro_mcp_asset_binding")
+        factory = managed.KokoroMcpWorkerFactory.from_config(config)
+        try:
+            factory.create(
+                model_path=(home / prefix / model.filename).resolve(),
+                voices_path=(home / prefix / voices.filename).resolve(),
+                expected_model_sha256=model.sha256,
+                expected_voices_sha256=voices.sha256,
+                language="en-gb", max_pcm_bytes=16 * 1024 * 1024,
+                attestation_voice=plan.speech["tts_voice"],
+            )
+        finally:
+            factory.close()
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("kokoro_mcp_asset_binding") from None
+    finally:
+        if not accepted:
+            stream = sys.stderr
+            if stream is not None:
+                try:
+                    print('[kokoro-mcp-preview-refused] {"category":"asset_binding_refused",'
+                          '"version":1}', file=stream, flush=True)
+                except Exception:
+                    if sys.stderr is stream:
+                        sys.stderr = None
+
+
 def verify_cpu_speech(plan: PreviewPlanV1) -> None:
     code = (
         "import importlib.metadata as m,json,sys; "
@@ -807,7 +859,7 @@ def preflight(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, Any]:
     verify_cpu_speech(plan)
     verify_host_profile_mode(plan, home or plan.profile_source)
     verify_speech_assets(plan, home or plan.profile_source)
-    _bound_kokoro_mcp_config(plan)
+    _verify_managed_kokoro_assets(plan, home or plan.profile_source)
     return {
         "category": "preflight_ready",
         "launch_authorized": False,
