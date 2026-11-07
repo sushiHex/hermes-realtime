@@ -341,10 +341,10 @@ def load_plan(path: Path) -> PreviewPlanV1:
     )
     require(all(type(raw) is str for raw in executables.values()), "executable_path")
     host_options = value["host_options"]
+    mcp_fields = {"kokoro_mcp_config", "kokoro_mcp_config_sha256"}
     require(
         type(host_options) is dict
-        and set(host_options)
-        == {
+        and set(host_options) - mcp_fields == {
             "allow_unsandboxed_tasks",
             "natural_work_tools",
             "task_start_policy",
@@ -361,6 +361,7 @@ def load_plan(path: Path) -> PreviewPlanV1:
         and _LABEL.fullmatch(host_options["conversation_profile"]),
         "host_options_values",
     )
+    _kokoro_mcp_config(host_options)
     return PreviewPlanV1(
         output=abs_path(value["output"], "output"),
         realtime_source=abs_path(realtime["source"], "realtime_source"),
@@ -499,6 +500,37 @@ def verify_profile(plan: PreviewPlanV1, home: Path) -> dict[str, Any]:
         "config_sha256": digest(config_path),
         "file_count": len(files),
     }
+
+
+def _kokoro_mcp_config(options: dict[str, Any]) -> Path | None:
+    fields = {"kokoro_mcp_config", "kokoro_mcp_config_sha256"}
+    if not fields.intersection(options):
+        return None
+    accepted = False
+    try:
+        require(fields.issubset(options), "kokoro_mcp_config_fields")
+        raw, expected = options["kokoro_mcp_config"], options["kokoro_mcp_config_sha256"]
+        require(type(raw) is str and 0 < len(raw) <= 2048, "kokoro_mcp_config_path")
+        config = Path(raw)
+        require(config.is_absolute() and ".." not in config.parts,
+                "kokoro_mcp_config_path")
+        require(type(expected) is str and _HEX64.fullmatch(expected) is not None,
+                "kokoro_mcp_config_digest")
+        require(config.is_file() and not config.is_symlink()
+                and config.stat().st_size <= _JSON_LIMIT
+                and digest(config) == expected, "kokoro_mcp_config_binding")
+        accepted = True
+        return config
+    except OSError:
+        raise PreviewRefusal("kokoro_mcp_config_binding") from None
+    finally:
+        if not accepted:
+            print('[kokoro-mcp-preview-refused] {"category":"configuration_refused",'
+                  '"version":1}', file=sys.stderr, flush=True)
+
+
+def _bound_kokoro_mcp_config(plan: PreviewPlanV1) -> Path | None:
+    return _kokoro_mcp_config(plan.host_options)
 
 
 def verify_cpu_speech(plan: PreviewPlanV1) -> None:
@@ -775,6 +807,7 @@ def preflight(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, Any]:
     verify_cpu_speech(plan)
     verify_host_profile_mode(plan, home or plan.profile_source)
     verify_speech_assets(plan, home or plan.profile_source)
+    _bound_kokoro_mcp_config(plan)
     return {
         "category": "preflight_ready",
         "launch_authorized": False,
@@ -1589,6 +1622,10 @@ async def _host_child(active_path: Path) -> int:
             kwargs["hermes_web_evidence_contract"] = contract
     if "hermes_discover_tools" in parameters:
         kwargs["hermes_discover_tools"] = discover
+    mcp_config = _bound_kokoro_mcp_config(plan)
+    if mcp_config is not None:
+        require("kokoro_mcp_config" in parameters, "kokoro_mcp_host_unavailable")
+        kwargs["kokoro_mcp_config"] = mcp_config
     launcher = host.build_local_host_launcher(**kwargs)
     ready = plan.output / "host-ready.private.json"
     try:

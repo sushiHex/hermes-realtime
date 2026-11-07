@@ -30,6 +30,7 @@ The current baseline includes:
 - authenticated Hermes run dispatch, exact task stop, request-bound approvals, and bounded concurrent run ownership;
 - a durable local voice tail and, when a voice companion is configured, bounded Hermes-owned voice archiving, native memory and skills review, memory readback, and archive deletion;
 - opt-in local speech providers and explicit Codex or Ollama inference selection;
+- optional [vram-mcp-owned Kokoro GPU speech](docs/kokoro-mcp.md), with an explicit CPU rollback;
 - synthetic browser, LiveKit, packaging, and installed-wheel release gates.
 
 Evidence-only Slice 0 includes host capture controls, storage, and lifecycle code.
