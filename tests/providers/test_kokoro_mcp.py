@@ -279,6 +279,7 @@ def test_failed_status_or_stop_cannot_establish_settlement(configured):
     assert factory.cleanup_state == "cleanup_unknown"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows base/venv process custody")
 def test_native_model_free_sdk_scope_settles_and_joins_thread(configured, monkeypatch):
     module, _, state, _, _, config_path = configured
     source = config_path.parent
