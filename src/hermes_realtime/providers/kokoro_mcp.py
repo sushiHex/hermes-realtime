@@ -28,7 +28,7 @@ _POLICIES = {"cuda-primary-profiled", "cuda-primary-profiled-kokoro-v1-benchmark
 _CONFIG_FIELDS = {
     "version", "server_python", "server_python_sha256", "server_venv_python",
     "server_venv_python_sha256", "server_source", "server_commit", "server_tree",
-    "profile", "profile_sha256",
+    "profile", "profile_sha256", "server_state_dir",
 }
 _PROFILE_FIELDS = {
     "version", "python", "python_sha256", "venv_python", "venv_python_sha256",
@@ -103,6 +103,7 @@ class _Config:
     server_tree: str
     profile: Path
     profile_sha256: str
+    server_state_dir: Path
 
 
 def _read_config(path: Path) -> tuple[_Config, dict[str, Any]]:
@@ -110,12 +111,14 @@ def _read_config(path: Path) -> tuple[_Config, dict[str, Any]]:
         raw = _json_file(path)
         _require(set(raw) == _CONFIG_FIELDS and type(raw["version"]) is int
                  and raw["version"] == 1, "configuration_invalid")
-        for field in ("server_python", "server_venv_python", "server_source", "profile"):
+        for field in ("server_python", "server_venv_python", "server_source", "profile",
+                      "server_state_dir"):
             _require(type(raw[field]) is str, "configuration_invalid")
             value = Path(raw[field])
             _require(value.is_absolute() and value.exists() and not value.is_symlink(),
                      "configuration_invalid")
             raw[field] = value.resolve(strict=True)
+        _require(raw["server_state_dir"].is_dir(), "configuration_invalid")
         for field in ("server_python_sha256", "server_venv_python_sha256", "profile_sha256"):
             _require(type(raw[field]) is str and re.fullmatch(r"[0-9a-f]{64}", raw[field])
                      is not None, "configuration_invalid")
@@ -186,7 +189,7 @@ def _environment(config: _Config) -> dict[str, str]:
     result = {key: value for key, value in os.environ.items() if key.upper() in _ENV}
     result.update(__PYVENV_LAUNCHER__=str(config.server_venv_python),
                   VRAM_MCP_KOKORO_PROFILE=str(config.profile), PYTHONDONTWRITEBYTECODE="1",
-                  VRAM_MCP_GPU_INDEX=str(index))
+                  VRAM_MCP_GPU_INDEX=str(index), VRAM_MCP_STATE_DIR=str(config.server_state_dir))
     return result
 
 
@@ -253,7 +256,7 @@ class KokoroMcpWorkerFactory:
         self._requests: set[asyncio.Task[Any]] = set()
         self._load_future: concurrent.futures.Future[None] | None = None
         self._clients: list[KokoroWorkerClient] = []
-        self._owner, self._request_id = "hermes-kokoro", secrets.token_urlsafe(32)
+        self._owner, self._request_id = "hermes-kokoro", secrets.token_hex(16)
         self._operation: str | None = None
         self._launch_attempted = self._closing = self._closed = False
         self._known_refusal = self._stopped = False
@@ -291,6 +294,7 @@ class KokoroMcpWorkerFactory:
                 expected_voices_sha256=expected_voices_sha256, language=language,
                 max_pcm_bytes=max_pcm_bytes, attestation_voice=attestation_voice,
                 execution_policy=p["execution_policy"], worker_launcher=self,
+                startup_timeout_seconds=60.0,
             )
             self._clients.append(client)
             return client

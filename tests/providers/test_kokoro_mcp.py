@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -32,13 +33,15 @@ def configured(tmp_path, monkeypatch):
     profile["python_sha256"] = profile["venv_python_sha256"] = digest(Path(sys.executable))
     profile_path = tmp_path / "operator.json"
     profile_path.write_text(json.dumps(profile))
+    shared_state = tmp_path / "shared-coordinator-state"
+    shared_state.mkdir()
     config = {"version": 1, "server_python": sys.executable,
               "server_python_sha256": digest(Path(sys.executable)),
               "server_venv_python": sys.executable,
               "server_venv_python_sha256": digest(Path(sys.executable)),
               "server_source": str(tmp_path), "server_commit": "a" * 40,
               "server_tree": "b" * 40, "profile": str(profile_path),
-              "profile_sha256": digest(profile_path)}
+              "profile_sha256": digest(profile_path), "server_state_dir": str(shared_state)}
     config_path = tmp_path / "managed.json"
     config_path.write_text(json.dumps(config))
     native_source_verifier = module._verify_source
@@ -246,6 +249,17 @@ def test_fixed_factory_asset_binding_and_no_force_fallback(configured):
         handle.kill()
 
 
+def test_managed_startup_budget_matches_qualified_worker_configuration(configured):
+    _, factory, _, _, profile, _ = configured
+    client = factory.create(
+        model_path=Path(profile["model"]), voices_path=Path(profile["voices"]),
+        expected_model_sha256=profile["model_sha256"],
+        expected_voices_sha256=profile["voices_sha256"], language="en-gb",
+        max_pcm_bytes=1024, attestation_voice="bf_isabella",
+    )
+    assert client._startup_timeout == 60.0
+
+
 def test_private_configuration_errors_never_echo_values(tmp_path, capsys):
     from hermes_realtime.providers import kokoro_mcp as module
     path = tmp_path / "config.json"
@@ -254,6 +268,57 @@ def test_private_configuration_errors_never_echo_values(tmp_path, capsys):
         module.KokoroMcpWorkerFactory.from_config(path)
     assert "SYNTHETIC_PRIVATE" not in str(caught.value)
     assert "SYNTHETIC_PRIVATE" not in capsys.readouterr().err
+
+
+def test_trusted_state_directory_survives_redirected_app_home(configured, monkeypatch):
+    module, _, _, _, _, path = configured
+    state_dir = path.parent / "coordinator-state"
+    state_dir.mkdir()
+    config = json.loads(path.read_text())
+    config["server_state_dir"] = str(state_dir)
+    path.write_text(json.dumps(config))
+    factory = module.KokoroMcpWorkerFactory.from_config(path)
+    monkeypatch.setenv("USERPROFILE", str(path.parent / "isolated-app-home"))
+    monkeypatch.setenv("HOME", str(path.parent / "isolated-app-home"))
+    try:
+        assert module._environment(factory._config)["VRAM_MCP_STATE_DIR"] == str(
+            state_dir.resolve())
+    finally:
+        factory.close()
+
+
+def test_request_identity_always_matches_coordinator_label_schema(configured, monkeypatch):
+    module, _, _, _, _, path = configured
+    monkeypatch.setattr(module.secrets, "token_urlsafe", lambda size: "_" * 43)
+    factory = module.KokoroMcpWorkerFactory.from_config(path)
+    try:
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", factory._request_id)
+    finally:
+        factory.close()
+
+
+@pytest.mark.parametrize("invalid", ["file", "relative", "symlink", "missing"])
+def test_trusted_state_directory_is_existing_absolute_directory_not_symlink(
+    configured, monkeypatch, invalid,
+):
+    module, _, state, _, _, path = configured
+    config = json.loads(path.read_text())
+    directory = Path(config["server_state_dir"])
+    if invalid == "file":
+        file = path.parent / "not-a-directory"
+        file.write_text("fixture")
+        config["server_state_dir"] = str(file)
+    elif invalid == "relative":
+        monkeypatch.chdir(path.parent)
+        config["server_state_dir"] = directory.name
+    elif invalid == "symlink":
+        original = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda item: item == directory or original(item))
+    else:
+        config["server_state_dir"] = str(path.parent / "missing-directory")
+    path.write_text(json.dumps(config))
+    with pytest.raises(module.KokoroMcpError, match="configuration_invalid"):
+        module.KokoroMcpWorkerFactory.from_config(path)
 
 
 def test_broken_refusal_stream_preserves_error_and_detaches(monkeypatch):
@@ -286,7 +351,18 @@ def test_native_model_free_sdk_scope_settles_and_joins_thread(configured, monkey
     package = source / "vram_mcp"
     package.mkdir()
     (package / "__init__.py").write_text("")
+    shared_state = Path(state["config"]["server_state_dir"])
+    control_file = shared_state / "claims.json"
+    control_bytes = json.dumps({"claims": [{"claim_id": "synthetic-control"}], "operations": []})
+    control_file.write_text(control_bytes)
+    isolated_home = source / "isolated-app-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(isolated_home))
+    monkeypatch.setenv("HOME", str(isolated_home))
     (package / "server.py").write_text('''
+import json
+import os
+from pathlib import Path
 from typing import Any
 from typing_extensions import TypedDict
 from mcp.server.fastmcp import FastMCP
@@ -308,6 +384,8 @@ def reply(state: str) -> Reply:
 @server.tool()
 def load_kokoro(owner: Any=None, request_id: Any=None, connect_port: Any=None,
                 auth_token: Any=None) -> Reply:
+    shared = json.loads((Path(os.environ["VRAM_MCP_STATE_DIR"]) / "claims.json").read_text())
+    assert any(c["claim_id"] == "synthetic-control" for c in shared["claims"])
     return reply("launch_accepted")
 @server.tool()
 def kokoro_status(owner: Any=None, operation_id: Any=None) -> Reply:
@@ -336,6 +414,7 @@ def main():
         factory.close()
     assert factory.cleanup_state == "stopped"
     assert factory._transport_closed and not factory._thread.is_alive()
+    assert control_file.read_text() == control_bytes
 
 
 @pytest.mark.parametrize("shadow", ["json.py", "vram_mcp/shadow.py", "mcp/__init__.py",
