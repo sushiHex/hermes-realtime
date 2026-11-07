@@ -33,6 +33,34 @@ def _foreground_failure_category(raw: bytes) -> str:
     return f"foreground_producer_{value['failure_kind']}_{value['text_phase']}"
 
 
+_HOST_STAGES = {"configuration", "host_construction", "host_start", "serving", "host_close"}
+_FAILURE_KINDS = {"ValueError", "RuntimeError", "OSError", "TimeoutError", "TypeError",
+                  "ImportError", "PermissionError", "other"}
+_MCP_CATEGORIES = {
+    "cleanup_unknown", "client_binding", "closed", "configuration_invalid",
+    "interpreter_binding", "launch_attempted", "load_refused", "load_unknown",
+    "profile_binding", "same_thread", "source_binding", "status_unknown",
+    "transport_unavailable", "unsupported_force", "unsupported_platform",
+}
+
+
+def _startup_failure_category(raw: bytes, host: bool) -> str:
+    value = json.loads(raw, object_pairs_hook=_unique_fields)
+    fields = {"version", "stage", "failure_kind"} if host else {"version", "category"}
+    if (type(value) is not dict or set(value) != fields
+            or type(value["version"]) is not int or value["version"] != 1):
+        raise ValueError("invalid startup diagnostic")
+    if host:
+        if (type(value["stage"]) is not str or value["stage"] not in _HOST_STAGES
+                or type(value["failure_kind"]) is not str
+                or value["failure_kind"] not in _FAILURE_KINDS):
+            raise ValueError("invalid host diagnostic")
+        return f"{value['stage']}_{value['failure_kind']}"
+    if type(value["category"]) is not str or value["category"] not in _MCP_CATEGORIES:
+        raise ValueError("invalid managed speech diagnostic")
+    return "kokoro_mcp_" + value["category"]
+
+
 class CappedCapture:
     def __init__(self, path: Any, limit: Any = 1048576) -> None:
         self.stream = Path(path).open("xb")  # noqa: SIM115 -- retained through owned settlement.
@@ -72,6 +100,21 @@ class CappedCapture:
                     self._pending.clear()
 
     def _line(self, raw: Any, now: Any) -> Any:
+        for prefix, host, invalid in (
+            (b"[voice-preview-host-failure] ", True, "host_failure_invalid"),
+            (b"[kokoro-mcp-refused] ", False, "kokoro_mcp_failure_invalid"),
+        ):
+            if raw.startswith(prefix):
+                try:
+                    name = _startup_failure_category(raw[len(prefix):], host)
+                except (ValueError, TypeError, RecursionError):
+                    name = invalid
+                item = self.categories.setdefault(
+                    name, {"count": 0, "first_ns": now, "last_ns": now},
+                )
+                item["count"] = min(1000000, item["count"] + 1)
+                item["last_ns"] = now
+                return
         prefix = b"[foreground-failure] "
         if raw.startswith(prefix):
             try:
@@ -183,4 +226,15 @@ class CappedProcesses:
                 process.stdout.close()
 
     def finish(self) -> Any:
-        return {name: capture.finish() for name, capture in self.captures.items()}
+        facts = {}
+        for name, capture in self.captures.items():
+            item = capture.finish()
+            process = self.roots.get(name)
+            try:
+                code = process.poll() if process is not None else None
+            except Exception:
+                code = None  # Diagnostic uncertainty cannot change settlement authority.
+            item["exit_code"] = (code if type(code) is int and -(2**31) <= code <= 2**32 - 1
+                                 else None)
+            facts[name] = item
+        return facts

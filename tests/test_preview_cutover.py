@@ -788,7 +788,7 @@ def test_host_spawn_follows_gateway_readiness_and_protected_snapshot_is_diagnost
     assert "_require_gateway_health_owner" in calls
     assert "'pid': host_pid" in ast.unparse(tree)
 
-    host_tree = ast.parse(inspect.getsource(preview_cutover._host_child))
+    host_tree = ast.parse(inspect.getsource(preview_cutover._run_host_child))
     host_ready = next(
         node
         for node in ast.walk(host_tree)

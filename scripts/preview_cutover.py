@@ -1619,7 +1619,33 @@ def _livekit_command(executable: Path, port: int) -> list[str]:
     return local_livekit.server_command(executable) + ["--port", str(port)]
 
 
+def _emit_host_failure(facts: dict[str, str], error: BaseException) -> None:
+    stream = sys.stderr
+    if stream is not None:
+        try:
+            print("[voice-preview-host-failure] " + json.dumps({
+                "version": 1, "stage": facts["stage"],
+                "failure_kind": _failure_status(error)["failure_kind"],
+            }, separators=(",", ":")), file=stream, flush=True)
+        except Exception:
+            if sys.stderr is stream:
+                sys.stderr = None
+
+
 async def _host_child(active_path: Path) -> int:
+    facts = {"stage": "configuration"}
+    failure: BaseException | None = None
+    try:
+        return await _run_host_child(active_path, facts)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if failure is not None:
+            _emit_host_failure(facts, failure)
+
+
+async def _run_host_child(active_path: Path, facts: dict[str, str]) -> int:
     plan, _, profile = _active_plan(active_path)
     _, host = _runtime_modules(plan)
     env_file = profile / ".env"
@@ -1678,15 +1704,22 @@ async def _host_child(active_path: Path) -> int:
     if mcp_config is not None:
         require("kokoro_mcp_config" in parameters, "kokoro_mcp_host_unavailable")
         kwargs["kokoro_mcp_config"] = mcp_config
+    facts["stage"] = "host_construction"
     launcher = host.build_local_host_launcher(**kwargs)
     ready = plan.output / "host-ready.private.json"
     try:
+        facts["stage"] = "host_start"
         await launcher.start()
         _write_new(ready, {"version": 1, "ready": True, "pid": os.getpid()})
+        facts["stage"] = "serving"
         while not (plan.output / "host.stop").exists():
             await asyncio.sleep(_STOP_POLL_SECONDS)
     finally:
-        await launcher.close()
+        try:
+            await launcher.close()
+        except BaseException:
+            facts["stage"] = "host_close"
+            raise
     return 0
 
 
