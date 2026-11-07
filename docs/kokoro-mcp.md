@@ -22,6 +22,7 @@ The private JSON configuration has version `1` and these exact fields:
 | `server_python`, `server_python_sha256` | Native base Python executable and digest. |
 | `server_venv_python`, `server_venv_python_sha256` | Scoped MCP environment interpreter and digest. |
 | `server_source`, `server_commit`, `server_tree` | Clean reviewed vram-mcp source and exact Git identities. |
+| `server_state_dir` | Existing coordination directory shared with the other vram-mcp clients, independent of the app's isolated home. |
 | `profile`, `profile_sha256` | Existing trusted vram-mcp Kokoro operator profile and digest. |
 
 Use a dedicated source checkout with no extra importable modules or bytecode
@@ -32,6 +33,9 @@ The operator profile binds the device, worker/interpreter and model/voice assets
 execution policy, reservation estimate and free headroom. These values are not
 model-controlled tool arguments. Keep the configuration and profile private.
 Never include provider credentials in either file.
+Before the first GPU load, verify that a temporary control claim made through the
+existing coordinator is visible through the configured scoped server. A separate
+home directory must not silently create a separate reservation domain.
 
 Managed preview plans may add the pair `kokoro_mcp_config` and
 `kokoro_mcp_config_sha256` to `host_options`. Both are required together; the
