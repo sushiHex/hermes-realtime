@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, Literal, cast
 
 _PROTOCOL_VERSION = 1
 _MAX_HEADER_BYTES = 32 * 1024
@@ -65,6 +65,60 @@ _ALLOWED_CPU_PROFILE_OPS = frozenset(
 )
 
 
+# Witness vocabulary only: this does not expand the CPU placement allowlist.
+# Pinned v1.0 model graph plus reviewed ORT 1.28 fused/transfer operation types.
+_PROFILE_OPERATION_CATALOGS = {
+    "beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a": frozenset({
+        "Add", "And", "Atan", "BiasGelu", "Cast", "Clip", "Concat", "ConcatFromSequence",
+        "Constant", "ConstantOfShape", "Conv", "ConvTranspose", "Cos", "CumSum", "Div",
+        "Equal", "Exp", "Expand", "FastGelu", "Flatten", "Floor", "FusedConv", "FusedGemm",
+        "FusedMatMul", "FusedMatMulActivation", "Gather", "GatherElements", "Gelu", "Gemm",
+        "Greater", "GreaterOrEqual", "Identity", "If", "InstanceNormalization", "IsNaN",
+        "LSTM", "LayerNormalization", "LeakyRelu", "Less", "Loop", "MatMul", "MemcpyFromHost",
+        "MemcpyToHost", "Mul", "NhwcConv", "NhwcFusedConv", "Not", "Pad", "Pow", "QuickGelu",
+        "RandomNormalLike", "RandomUniformLike", "Range", "Reciprocal", "ReduceMax",
+        "ReduceProd", "ReduceSum", "ReorderInput", "ReorderOutput", "Reshape", "Resize",
+        "Round", "STFT", "ScatterElements", "ScatterND", "SequenceAt", "SequenceEmpty",
+        "SequenceInsert", "Shape", "Sigmoid", "SimplifiedLayerNormalization", "Sin",
+        "SkipLayerNormalization", "SkipSimplifiedLayerNormalization", "Slice", "Softmax",
+        "SplitToSequence", "Sqrt", "Squeeze", "Sub", "Tanh", "TopK", "Transpose", "Unsqueeze",
+        "Where",
+    }),
+}
+
+
+class KokoroCpuPlacementRejected(RuntimeError):
+    """Authenticated profile-rejection witness; not readiness or natural-exit proof."""
+
+    def __init__(self, cpu_operation_types: tuple[str, ...], *, model_sha256: str) -> None:
+        if (
+            type(cpu_operation_types) is not tuple
+            or _validated_cpu_operation_types(list(cpu_operation_types), model_sha256)
+            != cpu_operation_types
+        ):
+            raise ValueError("Kokoro CPU placement witness is unavailable")
+        super().__init__("Kokoro CUDA profile rejected CPU operation placement")
+        self._cpu_operation_types = cpu_operation_types
+
+    @property
+    def cpu_operation_types(self) -> tuple[str, ...]:
+        return self._cpu_operation_types
+
+
+def _validated_cpu_operation_types(value: object, model_sha256: str) -> tuple[str, ...] | None:
+    catalog = _PROFILE_OPERATION_CATALOGS.get(model_sha256)
+    if catalog is None or type(value) is not list or not 1 <= len(value) <= 64:
+        return None
+    if any(type(item) is not str or not 1 <= len(item) <= 64 for item in value):
+        return None
+    operations = cast(list[str], value)
+    if operations != sorted(set(operations)):
+        return None
+    if any(item not in catalog or item in _ALLOWED_CPU_PROFILE_OPS for item in operations):
+        return None
+    return tuple(operations)
+
+
 class _DuplicateJsonKey(ValueError):
     pass
 
@@ -75,9 +129,12 @@ class _WorkerFailurePhase:
 
 
 class _CudaProfileFailure(RuntimeError):
-    def __init__(self, exit_code: int, message: str) -> None:
+    def __init__(
+        self, exit_code: int, message: str, cpu_operation_types: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.cpu_operation_types = cpu_operation_types
 
 
 def _emit_worker_failure(exit_code: int, error: Exception) -> None:
@@ -104,6 +161,27 @@ def _emit_worker_failure(exit_code: int, error: Exception) -> None:
     except Exception:
         # CPython flushes sys.stderr again at shutdown and may replace the status
         # with 120. Detach only the failed stream; never echo through a fallback.
+        if sys.stderr is stream:
+            sys.stderr = None
+
+
+_StartupRefusalCategory = Literal[
+    "schema_rejected", "authentication_rejected", "assets_rejected",
+    "operation_catalog_rejected", "startup_deadline_expired",
+]
+
+
+def _emit_client_startup_refusal(category: _StartupRefusalCategory) -> None:
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print("[kokoro-startup-witness-refused] " + json.dumps(
+            {"version": 1, "category": category},
+            separators=(",", ":"), sort_keys=True,
+        ), file=stream, flush=True)
+    except Exception:
+        # Keep the original refusal, including at interpreter shutdown.
         if sys.stderr is stream:
             sys.stderr = None
 
@@ -167,6 +245,7 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
     cpu_ops: set[str] = set()
     cuda_events = 0
     cpu_events = 0
+    cpu_types_complete = True
     for event in events:
         if type(event) is not dict:
             continue
@@ -176,6 +255,8 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
         provider = args.get("provider")
         operation = args.get("op_name")
         if type(operation) is not str:
+            if provider == "CPUExecutionProvider":
+                cpu_types_complete = False
             continue
         if provider == "CUDAExecutionProvider":
             cuda_events += 1
@@ -192,7 +273,8 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
         raise _CudaProfileFailure(
             91,
             f"Kokoro CUDA execution profile assigned unsupported ops to CPU: "
-            f"{sorted(unsupported_cpu_ops)!r}"
+            f"{sorted(unsupported_cpu_ops)!r}",
+            tuple(sorted(unsupported_cpu_ops)) if cpu_types_complete else (),
         )
     return cuda_events, cpu_events
 
@@ -404,8 +486,21 @@ class KokoroWorkerClient:
                 self._stderr_file = stderr_file
                 published = True
             deadline = time.monotonic() + self._startup_timeout
+            exited_before_accept = False
             while True:
-                if process.poll() is not None:
+                observed_exit = process.poll()
+                if observed_exit is not None:
+                    if observed_exit == 91:
+                        # The failure frame may already be queued when the child exits.
+                        # Never wait for a new peer or accept ready from a dead child.
+                        listener.settimeout(0.0)
+                        try:
+                            connection, address = listener.accept()
+                        except BlockingIOError:
+                            pass
+                        else:
+                            exited_before_accept = True
+                            break
                     diagnostics = self._read_diagnostics(stderr_file)
                     detail = f": {diagnostics}" if diagnostics else ""
                     raise RuntimeError(
@@ -425,8 +520,14 @@ class KokoroWorkerClient:
                     continue
             if address[0] != "127.0.0.1":
                 raise RuntimeError("Kokoro worker connected from a non-loopback address")
-            connection.settimeout(self._startup_timeout)
-            ready = self._receive_json(connection)
+            ready = self._receive_json(connection, deadline=deadline)
+            if ready.get("type") == "startup_failure":
+                operations = self._validate_startup_failure(ready, token)
+                raise KokoroCpuPlacementRejected(
+                    operations, model_sha256=self._expected_model_sha256,
+                )
+            if exited_before_accept or process.poll() is not None:
+                raise RuntimeError("Kokoro worker exited before startup attestation")
             providers = self._validate_ready(ready, token)
             with self._state_lock:
                 if self._closed or self._process is not process:
@@ -456,6 +557,48 @@ class KokoroWorkerClient:
             raise
         finally:
             listener.close()
+
+    def _validate_startup_failure(
+        self, value: Mapping[str, object], token: str,
+    ) -> tuple[str, ...]:
+        unavailable = "Kokoro worker startup failure witness is unavailable"
+        refusal_category: _StartupRefusalCategory | None = "schema_rejected"
+        try:
+            if set(value) != {
+                "version", "type", "token", "modelSha256", "voicesSha256",
+                "category", "cpuOperationTypes",
+            }:
+                raise RuntimeError(unavailable)
+            if (
+                type(value.get("version")) is not int or value.get("version") != _PROTOCOL_VERSION
+                or value.get("type") != "startup_failure"
+                or value.get("category") != "cuda_profile_forbidden_cpu_ops"
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "authentication_rejected"
+            if (
+                type(value.get("token")) is not str
+                or not cast(str, value.get("token")).isascii()
+                or not secrets.compare_digest(cast(str, value.get("token")), token)
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "assets_rejected"
+            if (
+                value.get("modelSha256") != self._expected_model_sha256
+                or value.get("voicesSha256") != self._expected_voices_sha256
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "operation_catalog_rejected"
+            operations = _validated_cpu_operation_types(
+                value.get("cpuOperationTypes"), self._expected_model_sha256,
+            )
+            if operations is None:
+                raise RuntimeError(unavailable)
+            refusal_category = None
+            return operations
+        finally:
+            if refusal_category is not None:
+                _emit_client_startup_refusal(refusal_category)
 
     def _validate_ready(self, value: Mapping[str, object], token: str) -> tuple[str, ...]:
         required = {
@@ -544,22 +687,32 @@ class KokoroWorkerClient:
         connection.sendall(struct.pack("!I", len(encoded)) + encoded)
 
     @classmethod
-    def _receive_json(cls, connection: socket.socket) -> dict[str, object]:
-        size = struct.unpack("!I", cls._receive_exact(connection, 4))[0]
-        if not 1 <= size <= _MAX_HEADER_BYTES:
-            raise RuntimeError("Kokoro worker protocol header exceeds supported bounds")
+    def _receive_json(
+        cls, connection: socket.socket, *, deadline: float | None = None,
+    ) -> dict[str, object]:
+        startup_timeout = False
         try:
-            value = json.loads(
-                cls._receive_exact(connection, size),
-                object_pairs_hook=cls._reject_duplicate_keys,
-            )
-        except _DuplicateJsonKey as error:
-            raise RuntimeError(f"duplicate JSON key: {error}") from error
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("Kokoro worker emitted malformed JSON") from error
-        if type(value) is not dict:
-            raise RuntimeError("Kokoro worker message must be an exact JSON object")
-        return cast(dict[str, object], value)
+            size = struct.unpack("!I", cls._receive_exact(connection, 4, deadline=deadline))[0]
+            if not 1 <= size <= _MAX_HEADER_BYTES:
+                raise RuntimeError("Kokoro worker protocol header exceeds supported bounds")
+            try:
+                value = json.loads(
+                    cls._receive_exact(connection, size, deadline=deadline),
+                    object_pairs_hook=cls._reject_duplicate_keys,
+                )
+            except _DuplicateJsonKey as error:
+                raise RuntimeError(f"duplicate JSON key: {error}") from error
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("Kokoro worker emitted malformed JSON") from error
+            if type(value) is not dict:
+                raise RuntimeError("Kokoro worker message must be an exact JSON object")
+            return cast(dict[str, object], value)
+        except TimeoutError:
+            startup_timeout = deadline is not None
+            raise
+        finally:
+            if startup_timeout:
+                _emit_client_startup_refusal("startup_deadline_expired")
 
     @staticmethod
     def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -571,10 +724,17 @@ class KokoroWorkerClient:
         return value
 
     @staticmethod
-    def _receive_exact(connection: socket.socket, size: int) -> bytes:
+    def _receive_exact(
+        connection: socket.socket, size: int, *, deadline: float | None = None,
+    ) -> bytes:
         blocks: list[bytes] = []
         remaining = size
         while remaining:
+            if deadline is not None:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("Kokoro worker startup deadline expired")
+                connection.settimeout(budget)
             block = connection.recv(remaining)
             if not block:
                 raise RuntimeError("Kokoro worker connection closed unexpectedly")
@@ -859,7 +1019,31 @@ def _run_cuda_worker(
     profile_path = Path(session.end_profiling())
     try:
         profile_events = json.loads(profile_path.read_bytes())
-        profiled_cuda_events, profiled_cpu_events = _validate_cuda_profile_events(profile_events)
+        try:
+            profiled_cuda_events, profiled_cpu_events = _validate_cuda_profile_events(
+                profile_events,
+            )
+        except _CudaProfileFailure as error:
+            if error.exit_code == 91:
+                # Only a complete, reviewed operation-type set can leave this process.
+                operations = _validated_cpu_operation_types(
+                    list(error.cpu_operation_types), model_sha256,
+                )
+                if operations is not None:
+                    with (
+                        contextlib.suppress(Exception),
+                        socket.create_connection(
+                            ("127.0.0.1", args.connect_port), timeout=15.0,
+                        ) as connection,
+                    ):
+                        KokoroWorkerClient._send_json(connection, {
+                            "version": _PROTOCOL_VERSION, "type": "startup_failure",
+                            "token": token, "modelSha256": model_sha256,
+                            "voicesSha256": voices_sha256,
+                            "category": "cuda_profile_forbidden_cpu_ops",
+                            "cpuOperationTypes": list(operations),
+                        })
+            raise
     finally:
         profile_path.unlink(missing_ok=True)
 
@@ -917,4 +1101,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["KokoroWorkerClient", "serve_kokoro_worker_connection"]
+__all__ = ["KokoroCpuPlacementRejected", "KokoroWorkerClient", "serve_kokoro_worker_connection"]
