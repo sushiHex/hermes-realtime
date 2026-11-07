@@ -284,8 +284,14 @@ async def test_api_session_posts_independent_dispatches_concurrently() -> None:
         await session.close()
 
 
+@pytest.mark.parametrize("objective", [
+    "Find today's major news.",
+    "Explain this supplied place label: CA means California in this report.",
+    "Explain this report's definitions: CPU means central processing unit; ms means milliseconds.",
+    'The source only says "CA" without defining it; retain that label without guessing.',
+], ids=["ordinary", "geographic-context", "technical-context", "ambiguous-label"])
 @pytest.mark.asyncio
-async def test_api_session_requests_a_bounded_priority_background_run() -> None:
+async def test_api_session_requests_a_bounded_priority_background_run(objective: str) -> None:
     captured: list[dict[str, object]] = []
     session = HermesApiTaskSession(
         config=HermesApiConfig(
@@ -322,7 +328,7 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         type="work.dispatch.requested",
         utterance_id="utt_priority_background",
         task_id="task_priority_background",
-        payload=WorkDispatchRequestedPayload(objective="Find today's major news."),
+        payload=WorkDispatchRequestedPayload(objective=objective),
     )
 
     try:
@@ -330,7 +336,7 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         assert acknowledgement.payload.accepted is True
         assert captured == [
             {
-                "input": "Find today's major news.",
+                "input": objective,
                 "instructions": captured[0]["instructions"],
                 "provider": "openai-codex",
                 "model": "gpt-5.6-terra",
@@ -369,9 +375,14 @@ async def test_api_session_requests_a_bounded_priority_background_run() -> None:
         assert "Use everyday answer-first wording in voice" in instructions
         assert "Keep all material limits and requested detail" in instructions
         assert "never imply newer or broader evidence" in instructions
-        from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
+        from hermes_realtime.conversation.output_style import (
+            QUANTITY_PRESENTATION_POLICY,
+            SPEECH_WORDING_POLICY,
+        )
 
         assert QUANTITY_PRESENTATION_POLICY in instructions
+        assert SPEECH_WORDING_POLICY in instructions
+        assert captured[0]["input"] == objective
     finally:
         for authority in session._runs_by_task.values():
             authority.terminal = True
