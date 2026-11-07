@@ -314,3 +314,78 @@ def test_guard91_does_not_send_known_subset_of_unknown_operations(monkeypatch, t
     assert worker.main() == 91
     assert connections == []
     assert "PRIVATE_NODE_NAME" not in capsys.readouterr().err
+
+
+
+def prepare_benchmark(monkeypatch, tmp_path, *, runtime_version="1.28.0"):
+    calls = install_fake_dependencies(monkeypatch, tmp_path)
+    args = worker._worker_argument_parser().parse_args()
+    args.execution_policy = "cuda-primary-profiled-kokoro-v1-benchmark"
+    importer = worker.importlib.import_module
+    def dependency(name):
+        result = importer(name)
+        if name == "onnxruntime":
+            result.__version__ = runtime_version
+        return result
+    monkeypatch.setattr(worker, "importlib", SimpleNamespace(import_module=dependency))
+    return calls, args
+
+
+def test_benchmark_actual_model_gate_precedes_runtime_import(monkeypatch, tmp_path, capsys):
+    calls, args = prepare_benchmark(monkeypatch, tmp_path)
+    assert worker.main() == 82
+    assert calls == ["watchdog"]
+    payload = json.loads(capsys.readouterr().err.removeprefix("[kokoro-worker-failure] "))
+    assert payload["category"] == "asset_attestation_failed"
+
+
+@pytest.mark.parametrize("version", ["1.27.0", "1.28.0+cuda", None, True])
+def test_benchmark_actual_runtime_gate_precedes_allocation(monkeypatch, tmp_path, capsys, version):
+    calls, args = prepare_benchmark(monkeypatch, tmp_path, runtime_version=version)
+    monkeypatch.setattr(worker, "_BENCHMARK_MODEL_SHA256", args.model_sha256)
+    assert worker.main() == 83
+    assert calls == ["watchdog", "onnxruntime"]
+    payload = json.loads(capsys.readouterr().err.removeprefix("[kokoro-worker-failure] "))
+    assert payload["category"] == "dependency_import_failed"
+
+
+def test_benchmark_selected_policy_reaches_profile_and_ready(monkeypatch, tmp_path, capsys):
+    calls, args = prepare_benchmark(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker, "_BENCHMARK_MODEL_SHA256", args.model_sha256)
+    profile = tmp_path / "profile.json"
+    events = json.loads(profile.read_text())
+    events += [{"args": {"provider": "CPUExecutionProvider", "op_name": op}}
+               for op in ("ReduceProd", "Reshape", "Shape", "SplitToSequence")]
+    profile.write_text(json.dumps(events))
+    received = []
+    monkeypatch.setattr(
+        worker, "serve_kokoro_worker_connection", lambda **kwargs: received.append(kwargs),
+    )
+    assert worker.main() == 0
+    assert received[0]["execution_policy"] == args.execution_policy
+    assert received[0]["profiled_cpu_events"] == 4
+    assert capsys.readouterr() == ("", "")
+
+
+
+def test_unknown_worker_policy_refuses_before_runtime_import(monkeypatch, tmp_path, capsys):
+    calls, args = prepare_benchmark(monkeypatch, tmp_path)
+    args.execution_policy = "unknown"
+    assert worker.main() == 82
+    assert calls == ["watchdog"]
+    assert "unknown" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("operation", [None, True, 123, ""])
+def test_benchmark_incomplete_cpu_profile_refuses_phase89(monkeypatch, tmp_path, capsys, operation):
+    calls, args = prepare_benchmark(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker, "_BENCHMARK_MODEL_SHA256", args.model_sha256)
+    profile = tmp_path / "profile.json"
+    events = json.loads(profile.read_text())
+    events.append({"args": {"provider": "CPUExecutionProvider", "op_name": operation}})
+    profile.write_text(json.dumps(events))
+    assert worker.main() == 89
+    assert "connect" not in calls and "serve" not in calls
+    assert not profile.exists()
+    payload = json.loads(capsys.readouterr().err.removeprefix("[kokoro-worker-failure] "))
+    assert payload["category"] == "cuda_profile_unavailable_or_invalid"
