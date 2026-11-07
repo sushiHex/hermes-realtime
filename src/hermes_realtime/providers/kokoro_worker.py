@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, Literal, cast
 
 _PROTOCOL_VERSION = 1
 _MAX_HEADER_BYTES = 32 * 1024
@@ -161,6 +161,27 @@ def _emit_worker_failure(exit_code: int, error: Exception) -> None:
     except Exception:
         # CPython flushes sys.stderr again at shutdown and may replace the status
         # with 120. Detach only the failed stream; never echo through a fallback.
+        if sys.stderr is stream:
+            sys.stderr = None
+
+
+_StartupRefusalCategory = Literal[
+    "schema_rejected", "authentication_rejected", "assets_rejected",
+    "operation_catalog_rejected", "startup_deadline_expired",
+]
+
+
+def _emit_client_startup_refusal(category: _StartupRefusalCategory) -> None:
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print("[kokoro-startup-witness-refused] " + json.dumps(
+            {"version": 1, "category": category},
+            separators=(",", ":"), sort_keys=True,
+        ), file=stream, flush=True)
+    except Exception:
+        # Keep the original refusal, including at interpreter shutdown.
         if sys.stderr is stream:
             sys.stderr = None
 
@@ -541,28 +562,43 @@ class KokoroWorkerClient:
         self, value: Mapping[str, object], token: str,
     ) -> tuple[str, ...]:
         unavailable = "Kokoro worker startup failure witness is unavailable"
-        if set(value) != {
-            "version", "type", "token", "modelSha256", "voicesSha256",
-            "category", "cpuOperationTypes",
-        }:
-            raise RuntimeError(unavailable)
-        if (
-            type(value.get("version")) is not int or value.get("version") != _PROTOCOL_VERSION
-            or value.get("type") != "startup_failure"
-            or type(value.get("token")) is not str
-            or not cast(str, value.get("token")).isascii()
-            or not secrets.compare_digest(cast(str, value.get("token")), token)
-            or value.get("modelSha256") != self._expected_model_sha256
-            or value.get("voicesSha256") != self._expected_voices_sha256
-            or value.get("category") != "cuda_profile_forbidden_cpu_ops"
-        ):
-            raise RuntimeError(unavailable)
-        operations = _validated_cpu_operation_types(
-            value.get("cpuOperationTypes"), self._expected_model_sha256,
-        )
-        if operations is None:
-            raise RuntimeError(unavailable)
-        return operations
+        refusal_category: _StartupRefusalCategory | None = "schema_rejected"
+        try:
+            if set(value) != {
+                "version", "type", "token", "modelSha256", "voicesSha256",
+                "category", "cpuOperationTypes",
+            }:
+                raise RuntimeError(unavailable)
+            if (
+                type(value.get("version")) is not int or value.get("version") != _PROTOCOL_VERSION
+                or value.get("type") != "startup_failure"
+                or value.get("category") != "cuda_profile_forbidden_cpu_ops"
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "authentication_rejected"
+            if (
+                type(value.get("token")) is not str
+                or not cast(str, value.get("token")).isascii()
+                or not secrets.compare_digest(cast(str, value.get("token")), token)
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "assets_rejected"
+            if (
+                value.get("modelSha256") != self._expected_model_sha256
+                or value.get("voicesSha256") != self._expected_voices_sha256
+            ):
+                raise RuntimeError(unavailable)
+            refusal_category = "operation_catalog_rejected"
+            operations = _validated_cpu_operation_types(
+                value.get("cpuOperationTypes"), self._expected_model_sha256,
+            )
+            if operations is None:
+                raise RuntimeError(unavailable)
+            refusal_category = None
+            return operations
+        finally:
+            if refusal_category is not None:
+                _emit_client_startup_refusal(refusal_category)
 
     def _validate_ready(self, value: Mapping[str, object], token: str) -> tuple[str, ...]:
         required = {
@@ -654,21 +690,29 @@ class KokoroWorkerClient:
     def _receive_json(
         cls, connection: socket.socket, *, deadline: float | None = None,
     ) -> dict[str, object]:
-        size = struct.unpack("!I", cls._receive_exact(connection, 4, deadline=deadline))[0]
-        if not 1 <= size <= _MAX_HEADER_BYTES:
-            raise RuntimeError("Kokoro worker protocol header exceeds supported bounds")
+        startup_timeout = False
         try:
-            value = json.loads(
-                cls._receive_exact(connection, size, deadline=deadline),
-                object_pairs_hook=cls._reject_duplicate_keys,
-            )
-        except _DuplicateJsonKey as error:
-            raise RuntimeError(f"duplicate JSON key: {error}") from error
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("Kokoro worker emitted malformed JSON") from error
-        if type(value) is not dict:
-            raise RuntimeError("Kokoro worker message must be an exact JSON object")
-        return cast(dict[str, object], value)
+            size = struct.unpack("!I", cls._receive_exact(connection, 4, deadline=deadline))[0]
+            if not 1 <= size <= _MAX_HEADER_BYTES:
+                raise RuntimeError("Kokoro worker protocol header exceeds supported bounds")
+            try:
+                value = json.loads(
+                    cls._receive_exact(connection, size, deadline=deadline),
+                    object_pairs_hook=cls._reject_duplicate_keys,
+                )
+            except _DuplicateJsonKey as error:
+                raise RuntimeError(f"duplicate JSON key: {error}") from error
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("Kokoro worker emitted malformed JSON") from error
+            if type(value) is not dict:
+                raise RuntimeError("Kokoro worker message must be an exact JSON object")
+            return cast(dict[str, object], value)
+        except TimeoutError:
+            startup_timeout = deadline is not None
+            raise
+        finally:
+            if startup_timeout:
+                _emit_client_startup_refusal("startup_deadline_expired")
 
     @staticmethod
     def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

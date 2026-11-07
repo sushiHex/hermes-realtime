@@ -88,3 +88,17 @@ This header proves only authenticated profile rejection on the attempted pinned
 worker. It publishes no providers or synthesis socket and establishes neither
 CUDA readiness nor a natural OS exit. Client cleanup can precede natural exit;
 only separately observed MCP exit metadata may establish that exit category.
+
+
+Client-side witness validation records refusals separately from worker failures.
+Its `finally` attempts one `[kokoro-startup-witness-refused]` JSON line containing
+only `version: 1` and one fixed category: `schema_rejected`,
+`authentication_rejected`, `assets_rejected` or `operation_catalog_rejected`.
+It emits no payload values or operation names. Accepted witnesses emit no refusal
+marker. A diagnostic-stream failure is suppressed and the failed Python stderr
+is detached; it cannot replace the original fixed validation error. There is no
+raw fallback, and this marker changes no acceptance or cleanup decision.
+A header-read `TimeoutError` while the original startup deadline is supplied
+emits the same marker once with `startup_deadline_expired`; prefix/body reads
+do not each emit a marker. The original exception and deadline are preserved.
+Non-startup receives without a deadline retain their previous silent behavior.

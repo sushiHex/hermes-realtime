@@ -201,3 +201,77 @@ def test_non_ascii_wire_token_has_fixed_unavailable_refusal(client):
     with pytest.raises(RuntimeError) as caught:
         client._validate_startup_failure(header(token="synthetic-\N{SNOWMAN}"), TOKEN)
     assert str(caught.value) == "Kokoro worker startup failure witness is unavailable"
+
+
+@pytest.mark.parametrize("changes,category", [
+    ({"extra": "SYNTHETIC_PRIVATE_FIELD"}, "schema_rejected"),
+    ({"version": True}, "schema_rejected"),
+    ({"token": "SYNTHETIC_PRIVATE_TOKEN"}, "authentication_rejected"),
+    ({"token": "synthetic-\N{SNOWMAN}"}, "authentication_rejected"),
+    ({"modelSha256": "SYNTHETIC_PRIVATE_HASH"}, "assets_rejected"),
+    ({"voicesSha256": "SYNTHETIC_PRIVATE_HASH"}, "assets_rejected"),
+    ({"cpuOperationTypes": ["SYNTHETIC_PRIVATE_NODE"]}, "operation_catalog_rejected"),
+])
+def test_refusal_emits_one_fixed_category_marker_without_payload(client, capsys, changes, category):
+    with pytest.raises(RuntimeError, match="witness is unavailable"):
+        client._validate_startup_failure(header(**changes), TOKEN)
+    output = capsys.readouterr()
+    assert output.out == "" and output.err.count("\n") == 1 and len(output.err) < 160
+    assert output.err.startswith("[kokoro-startup-witness-refused] ")
+    assert json.loads(output.err.removeprefix("[kokoro-startup-witness-refused] ")) == {
+        "version": 1, "category": category,
+    }
+    for private_value in ("SYNTHETIC_PRIVATE", TOKEN, MODEL, VOICES, "Conv", "Mul"):
+        assert private_value not in output.err
+
+
+def test_valid_witness_emits_no_refusal_marker(client, capsys):
+    assert client._validate_startup_failure(header(), TOKEN) == ("Conv", "Mul")
+    assert capsys.readouterr() == ("", "")
+
+
+def test_broken_refusal_marker_keeps_fixed_rejection_and_detaches_stream(client, monkeypatch):
+    class BrokenStream:
+        def write(self, text):
+            raise OSError("SYNTHETIC_PRIVATE_MARKER_ERROR")
+        def flush(self):
+            raise OSError("SYNTHETIC_PRIVATE_MARKER_ERROR")
+    broken = BrokenStream()
+    monkeypatch.setattr(worker.sys, "stderr", broken)
+    with pytest.raises(RuntimeError, match="witness is unavailable") as caught:
+        client._validate_startup_failure(header(token="wrong"), TOKEN)
+    assert str(caught.value) == "Kokoro worker startup failure witness is unavailable"
+    assert worker.sys.stderr is None
+
+
+@pytest.mark.parametrize("phase", ["prefix", "body"])
+def test_header_deadline_timeout_emits_once_and_preserves_original_error(capsys, phase):
+    failure = TimeoutError("SYNTHETIC_PRIVATE_TIMEOUT_DETAIL")
+    class Connection:
+        def __init__(self):
+            self.calls = 0
+        def settimeout(self, value):
+            assert value > 0
+        def recv(self, size):
+            self.calls += 1
+            if phase == "body" and self.calls == 1:
+                return struct.pack("!I", 2)
+            raise failure
+    with pytest.raises(TimeoutError) as caught:
+        worker.KokoroWorkerClient._receive_json(Connection(), deadline=worker.time.monotonic() + 1)
+    assert caught.value is failure
+    output = capsys.readouterr()
+    assert output.out == "" and output.err.count("\n") == 1
+    assert json.loads(output.err.removeprefix("[kokoro-startup-witness-refused] ")) == {
+        "version": 1, "category": "startup_deadline_expired",
+    }
+    assert "SYNTHETIC_PRIVATE" not in output.err
+
+
+def test_non_startup_receive_timeout_keeps_original_behavior_without_marker(capsys):
+    class Connection:
+        def recv(self, size):
+            raise TimeoutError("synthetic timeout")
+    with pytest.raises(TimeoutError):
+        worker.KokoroWorkerClient._receive_json(Connection())
+    assert capsys.readouterr() == ("", "")
