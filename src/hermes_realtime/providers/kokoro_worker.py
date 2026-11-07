@@ -29,6 +29,10 @@ _MAX_ID_CHARS = 128
 _MAX_PCM_BYTES = 64 * 1024 * 1024
 _MODEL_SAMPLE_RATE_HZ = 24_000
 _TOKEN_ENV = "HERMES_KOKORO_WORKER_TOKEN"
+_STRICT_EXECUTION_POLICY = "cuda-primary-profiled"
+_BENCHMARK_EXECUTION_POLICY = "cuda-primary-profiled-kokoro-v1-benchmark"
+_BENCHMARK_MODEL_SHA256 = "beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a"
+_EXECUTION_POLICIES = frozenset({_STRICT_EXECUTION_POLICY, _BENCHMARK_EXECUTION_POLICY})
 _FAILURE_CATEGORIES = {
     80: "authentication_failed",
     81: "parent_watchdog_failed",
@@ -64,6 +68,10 @@ _ALLOWED_CPU_PROFILE_OPS = frozenset(
     }
 )
 
+
+_BENCHMARK_ALLOWED_CPU_PROFILE_OPS = _ALLOWED_CPU_PROFILE_OPS | frozenset({
+    "ReduceProd", "Reshape", "Shape", "SplitToSequence",
+})
 
 # Witness vocabulary only: this does not expand the CPU placement allowlist.
 # Pinned v1.0 model graph plus reviewed ORT 1.28 fused/transfer operation types.
@@ -167,7 +175,7 @@ def _emit_worker_failure(exit_code: int, error: Exception) -> None:
 
 _StartupRefusalCategory = Literal[
     "schema_rejected", "authentication_rejected", "assets_rejected",
-    "operation_catalog_rejected", "startup_deadline_expired",
+    "operation_catalog_rejected", "startup_deadline_expired", "policy_rejected",
 ]
 
 
@@ -231,6 +239,9 @@ def _worker_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attestation-voice", required=True)
     parser.add_argument("--language", choices=("en-us", "en-gb"), required=True)
     parser.add_argument(
+        "--execution-policy", choices=sorted(_EXECUTION_POLICIES), default=_STRICT_EXECUTION_POLICY,
+    )
+    parser.add_argument(
         "--max-pcm-bytes",
         type=_bounded_integer("maximum PCM bytes", 1, _MAX_PCM_BYTES),
         required=True,
@@ -238,7 +249,11 @@ def _worker_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
+def _validate_cuda_profile_events(
+    events: object, *, execution_policy: str = _STRICT_EXECUTION_POLICY,
+) -> tuple[int, int]:
+    if type(execution_policy) is not str or execution_policy not in _EXECUTION_POLICIES:
+        raise RuntimeError("Kokoro execution policy is unsupported")
     if type(events) is not list:
         raise RuntimeError("Kokoro CUDA execution profile is not a JSON list")
     cuda_ops: set[str] = set()
@@ -254,6 +269,12 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
             continue
         provider = args.get("provider")
         operation = args.get("op_name")
+        if (
+            execution_policy == _BENCHMARK_EXECUTION_POLICY
+            and provider == "CPUExecutionProvider"
+            and (type(operation) is not str or not operation)
+        ):
+            raise RuntimeError("Kokoro CUDA profile CPU operation metadata is invalid")
         if type(operation) is not str:
             if provider == "CPUExecutionProvider":
                 cpu_types_complete = False
@@ -268,7 +289,10 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
         raise _CudaProfileFailure(
             90, "Kokoro CUDA execution profile is missing required CUDA core ops",
         )
-    unsupported_cpu_ops = cpu_ops - _ALLOWED_CPU_PROFILE_OPS
+    allowed_cpu_ops = (_BENCHMARK_ALLOWED_CPU_PROFILE_OPS
+                       if execution_policy == _BENCHMARK_EXECUTION_POLICY
+                       else _ALLOWED_CPU_PROFILE_OPS)
+    unsupported_cpu_ops = cpu_ops - allowed_cpu_ops
     if unsupported_cpu_ops:
         raise _CudaProfileFailure(
             91,
@@ -294,6 +318,7 @@ class KokoroWorkerClient:
         language: str,
         max_pcm_bytes: int,
         attestation_voice: str = "bf_isabella",
+        execution_policy: str = _STRICT_EXECUTION_POLICY,
         startup_timeout_seconds: float = 15.0,
         request_timeout_seconds: float = 60.0,
     ) -> None:
@@ -342,6 +367,16 @@ class KokoroWorkerClient:
         self._voices_path = voices_path
         self._expected_model_sha256 = expected_model_sha256
         self._expected_voices_sha256 = expected_voices_sha256
+        if (
+            type(execution_policy) is not str or execution_policy not in _EXECUTION_POLICIES
+            or (execution_policy == _BENCHMARK_EXECUTION_POLICY
+                and expected_model_sha256 != _BENCHMARK_MODEL_SHA256)
+        ):
+            try:
+                raise ValueError("Kokoro execution policy binding is unsupported")
+            finally:
+                _emit_client_startup_refusal("policy_rejected")
+        self._execution_policy = execution_policy
         self._language = language
         self._attestation_voice = attestation_voice
         self._max_pcm_bytes = max_pcm_bytes
@@ -470,7 +505,8 @@ class KokoroWorkerClient:
                     self._language,
                     "--max-pcm-bytes",
                     str(self._max_pcm_bytes),
-                ],
+                ] + (["--execution-policy", self._execution_policy]
+                     if self._execution_policy == _BENCHMARK_EXECUTION_POLICY else []),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_file,
@@ -619,32 +655,37 @@ class KokoroWorkerClient:
         providers = value.get("providers")
         profiled_cuda_events = value.get("profiledCudaEvents")
         profiled_cpu_events = value.get("profiledCpuEvents")
-        if (
-            type(value.get("version")) is not int
-            or value.get("version") != _PROTOCOL_VERSION
-            or type(value.get("type")) is not str
-            or value.get("type") != "ready"
-            or type(value.get("token")) is not str
-            or not secrets.compare_digest(cast(str, value.get("token")), token)
-            or type(value.get("provider")) is not str
-            or value.get("provider") != "CUDAExecutionProvider"
-            or type(providers) is not list
-            or providers != ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            or type(value.get("executionPolicy")) is not str
-            or value.get("executionPolicy") != "cuda-primary-profiled"
-            or type(profiled_cuda_events) is not int
-            or profiled_cuda_events < len(_REQUIRED_CUDA_PROFILE_OPS)
-            or type(profiled_cpu_events) is not int
-            or profiled_cpu_events < 0
-            or type(value.get("modelSha256")) is not str
-            or value.get("modelSha256") != self._expected_model_sha256
-            or type(value.get("voicesSha256")) is not str
-            or value.get("voicesSha256") != self._expected_voices_sha256
-            or type(value.get("sampleRateHz")) is not int
-            or value.get("sampleRateHz") != _MODEL_SAMPLE_RATE_HZ
-        ):
-            raise RuntimeError("Kokoro CUDA worker failed startup attestation")
-        return tuple(cast(list[str], providers))
+        policy_matches = (type(value.get("executionPolicy")) is str
+                          and value.get("executionPolicy") == self._execution_policy)
+        try:
+            if (
+                type(value.get("version")) is not int
+                or value.get("version") != _PROTOCOL_VERSION
+                or type(value.get("type")) is not str
+                or value.get("type") != "ready"
+                or type(value.get("token")) is not str
+                or not secrets.compare_digest(cast(str, value.get("token")), token)
+                or type(value.get("provider")) is not str
+                or value.get("provider") != "CUDAExecutionProvider"
+                or type(providers) is not list
+                or providers != ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                or not policy_matches
+                or type(profiled_cuda_events) is not int
+                or profiled_cuda_events < len(_REQUIRED_CUDA_PROFILE_OPS)
+                or type(profiled_cpu_events) is not int
+                or profiled_cpu_events < 0
+                or type(value.get("modelSha256")) is not str
+                or value.get("modelSha256") != self._expected_model_sha256
+                or type(value.get("voicesSha256")) is not str
+                or value.get("voicesSha256") != self._expected_voices_sha256
+                or type(value.get("sampleRateHz")) is not int
+                or value.get("sampleRateHz") != _MODEL_SAMPLE_RATE_HZ
+            ):
+                raise RuntimeError("Kokoro CUDA worker failed startup attestation")
+            return tuple(cast(list[str], providers))
+        finally:
+            if not policy_matches:
+                _emit_client_startup_refusal("policy_rejected")
 
     def _validate_result(self, value: Mapping[str, object], request_id: str) -> None:
         if set(value) != {
@@ -804,6 +845,7 @@ def serve_kokoro_worker_connection(
     profiled_cpu_events: int,
     max_pcm_bytes: int,
     synthesize_pcm: _WorkerSynthesizePcm,
+    execution_policy: str = _STRICT_EXECUTION_POLICY,
 ) -> None:
     """Serve one authenticated sequential worker connection."""
 
@@ -823,6 +865,8 @@ def serve_kokoro_worker_connection(
         or type(max_pcm_bytes) is not int
         or not 1 <= max_pcm_bytes <= _MAX_PCM_BYTES
         or not callable(synthesize_pcm)
+        or type(execution_policy) is not str
+        or execution_policy not in _EXECUTION_POLICIES
     ):
         raise ValueError("Kokoro worker server configuration is invalid")
     KokoroWorkerClient._send_json(
@@ -833,7 +877,7 @@ def serve_kokoro_worker_connection(
             "token": token,
             "provider": "CUDAExecutionProvider",
             "providers": list(actual_providers),
-            "executionPolicy": "cuda-primary-profiled",
+            "executionPolicy": execution_policy,
             "profiledCudaEvents": profiled_cuda_events,
             "profiledCpuEvents": profiled_cpu_events,
             "modelSha256": model_sha256,
@@ -965,8 +1009,17 @@ def _run_cuda_worker(
         raise RuntimeError("Kokoro model failed pre-load SHA-256 attestation")
     if not secrets.compare_digest(voices_sha256, expected_voices_sha256):
         raise RuntimeError("Kokoro voices failed pre-load SHA-256 attestation")
+    execution_policy = getattr(args, "execution_policy", _STRICT_EXECUTION_POLICY)
+    if type(execution_policy) is not str or execution_policy not in _EXECUTION_POLICIES:
+        raise RuntimeError("Kokoro execution policy is unsupported")
+    if execution_policy == _BENCHMARK_EXECUTION_POLICY and model_sha256 != _BENCHMARK_MODEL_SHA256:
+        raise RuntimeError("Kokoro benchmark model binding is unsupported")
     phase.exit_code = 83
     runtime = importlib.import_module("onnxruntime")
+    if execution_policy == _BENCHMARK_EXECUTION_POLICY:
+        version = getattr(runtime, "__version__", None)
+        if type(version) is not str or version != "1.28.0":
+            raise RuntimeError("Kokoro benchmark runtime binding is unsupported")
     phase.exit_code = 84
     preload_dlls = getattr(runtime, "preload_dlls", None)
     if callable(preload_dlls):
@@ -1021,7 +1074,7 @@ def _run_cuda_worker(
         profile_events = json.loads(profile_path.read_bytes())
         try:
             profiled_cuda_events, profiled_cpu_events = _validate_cuda_profile_events(
-                profile_events,
+                profile_events, execution_policy=execution_policy,
             )
         except _CudaProfileFailure as error:
             if error.exit_code == 91:
@@ -1076,6 +1129,7 @@ def _run_cuda_worker(
             profiled_cpu_events=profiled_cpu_events,
             max_pcm_bytes=args.max_pcm_bytes,
             synthesize_pcm=synthesize_pcm,
+            execution_policy=execution_policy,
         )
 
 

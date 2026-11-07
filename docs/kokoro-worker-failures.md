@@ -102,3 +102,42 @@ A header-read `TimeoutError` while the original startup deadline is supplied
 emits the same marker once with `startup_deadline_expired`; prefix/body reads
 do not each emit a marker. The original exception and deadline are preserved.
 Non-startup receives without a deadline retain their previous silent behavior.
+
+
+## Explicit benchmark placement policy
+
+`cuda-primary-profiled` remains the strict default. Its placement allowlist and
+legacy worker arguments are unchanged. An explicit client `execution_policy`
+may select the fixed `cuda-primary-profiled-kokoro-v1-benchmark` identifier;
+only that selection appends `--execution-policy` to the worker command. The
+client also refuses benchmark selection with a different expected model digest. There
+is no host/UI selector or default promotion in this change.
+
+The benchmark policy permits the immutable union of the strict CPU operation
+allowlist with exactly `ReduceProd`, `Reshape`, `Shape` and `SplitToSequence`.
+This is an explicit allowance for auxiliary/control/copy CPU work, not a claim
+that all such operations are cheap metadata. Required CUDA `Conv`, `Gemm` and
+`LSTM` coverage remains mandatory; every other unapproved CPU type still fails.
+
+Before runtime import or session allocation, the worker requires the actual
+verified model digest to equal
+`beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a`.
+A mismatch returns the existing phase 82 asset-failure category. Immediately
+after importing ONNX Runtime, its actual `__version__` must be exactly `1.28.0`
+before preload or session allocation; a mismatch returns phase 83. Values and
+version strings are not copied into failure markers. Benchmark CPU profile
+events with missing, non-string or empty operation names fail phase 89 rather
+than disappearing from placement evidence. Strict legacy handling is retained.
+
+The ready header reports the selected policy identifier, and the client requires
+exact equality to its expected identifier. Strict and benchmark clients reject
+each other's ready headers. The existing authenticated operation-type failure
+witness does not attest which policy ran. Authentication, provider selection,
+cancellation, process custody and cleanup remain unchanged. Readiness, bounded
+performance/resource evidence and a separate adoption decision are still needed
+before using this opt-in policy for the voice host.
+
+New client policy-binding or ready-policy refusals retain one `policy_rejected`
+category through the existing startup-refusal marker in a narrow `finally`.
+The marker contains no policy strings, asset hashes or incoming values and
+preserves the original fixed exception; valid/default paths remain silent.
