@@ -14,6 +14,7 @@ import secrets
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,6 +29,22 @@ _MAX_ID_CHARS = 128
 _MAX_PCM_BYTES = 64 * 1024 * 1024
 _MODEL_SAMPLE_RATE_HZ = 24_000
 _TOKEN_ENV = "HERMES_KOKORO_WORKER_TOKEN"
+_FAILURE_CATEGORIES = {
+    80: "authentication_failed",
+    81: "parent_watchdog_failed",
+    82: "asset_attestation_failed",
+    83: "dependency_import_failed",
+    84: "dll_preload_failed",
+    85: "cuda_session_failed",
+    86: "cuda_provider_rejected",
+    87: "kokoro_engine_failed",
+    88: "attestation_synthesis_failed",
+    89: "cuda_profile_unavailable_or_invalid",
+    90: "cuda_profile_missing_core_ops",
+    91: "cuda_profile_forbidden_cpu_ops",
+    92: "loopback_connection_failed",
+    93: "worker_service_failed",
+}
 _WorkerSynthesizePcm = Callable[[str, str, float], bytes]
 _REQUIRED_CUDA_PROFILE_OPS = frozenset({"Conv", "Gemm", "LSTM"})
 _ALLOWED_CPU_PROFILE_OPS = frozenset(
@@ -50,6 +67,38 @@ _ALLOWED_CPU_PROFILE_OPS = frozenset(
 
 class _DuplicateJsonKey(ValueError):
     pass
+
+
+class _WorkerFailurePhase:
+    def __init__(self) -> None:
+        self.exit_code = 80
+
+
+class _CudaProfileFailure(RuntimeError):
+    def __init__(self, exit_code: int, message: str) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _emit_worker_failure(exit_code: int, error: Exception) -> None:
+    kinds: tuple[tuple[type[BaseException], str], ...] = (
+        (_CudaProfileFailure, "RuntimeError"), (RuntimeError, "RuntimeError"),
+        (ValueError, "ValueError"), (TypeError, "TypeError"),
+        (OSError, "OSError"), (FileNotFoundError, "FileNotFoundError"),
+        (PermissionError, "PermissionError"), (TimeoutError, "TimeoutError"),
+        (ConnectionError, "ConnectionError"), (ConnectionResetError, "ConnectionResetError"),
+        (ImportError, "ImportError"), (ModuleNotFoundError, "ModuleNotFoundError"),
+        (json.JSONDecodeError, "JSONDecodeError"),
+    )
+    kind = next((label for exact_type, label in kinds if type(error) is exact_type),
+                "unknown_exception")
+    # Diagnostics cannot replace the already selected nonzero failure status.
+    with contextlib.suppress(Exception):
+        print("[kokoro-worker-failure] " + json.dumps(
+            {"version": 1, "category": _FAILURE_CATEGORIES.get(exit_code, "unknown_worker_failure"),
+             "kind": kind},
+            separators=(",", ":"), sort_keys=True,
+        ), file=sys.stderr, flush=True)
 
 
 def _create_exclusive_listener() -> socket.socket:
@@ -128,10 +177,13 @@ def _validate_cuda_profile_events(events: object) -> tuple[int, int]:
             cpu_events += 1
             cpu_ops.add(operation)
     if not cuda_ops >= _REQUIRED_CUDA_PROFILE_OPS:
-        raise RuntimeError("Kokoro CUDA execution profile is missing required CUDA core ops")
+        raise _CudaProfileFailure(
+            90, "Kokoro CUDA execution profile is missing required CUDA core ops",
+        )
     unsupported_cpu_ops = cpu_ops - _ALLOWED_CPU_PROFILE_OPS
     if unsupported_cpu_ops:
-        raise RuntimeError(
+        raise _CudaProfileFailure(
+            91,
             f"Kokoro CUDA execution profile assigned unsupported ops to CPU: "
             f"{sorted(unsupported_cpu_ops)!r}"
         )
@@ -725,11 +777,17 @@ def _start_parent_watchdog(parent_pid: int) -> None:
     threading.Thread(target=watch_posix_parent, daemon=True).start()
 
 
-def _run_cuda_worker(args: argparse.Namespace) -> None:
+def _run_cuda_worker(
+    args: argparse.Namespace, *, failure_phase: _WorkerFailurePhase | None = None,
+) -> None:
+    phase = failure_phase if failure_phase is not None else _WorkerFailurePhase()
+    phase.exit_code = 80
     token = os.environ.get(_TOKEN_ENV)
     if token is None or not token:
         raise RuntimeError("Kokoro worker authentication token is unavailable")
+    phase.exit_code = 81
     _start_parent_watchdog(args.parent_pid)
+    phase.exit_code = 82
     model_path = Path(args.model).resolve(strict=True)
     voices_path = Path(args.voices).resolve(strict=True)
     expected_model_sha256 = _require_sha256(args.model_sha256, "model SHA-256")
@@ -740,15 +798,19 @@ def _run_cuda_worker(args: argparse.Namespace) -> None:
         raise RuntimeError("Kokoro model failed pre-load SHA-256 attestation")
     if not secrets.compare_digest(voices_sha256, expected_voices_sha256):
         raise RuntimeError("Kokoro voices failed pre-load SHA-256 attestation")
+    phase.exit_code = 83
     runtime = importlib.import_module("onnxruntime")
+    phase.exit_code = 84
     preload_dlls = getattr(runtime, "preload_dlls", None)
     if callable(preload_dlls):
         preload_dlls(directory="")
+    phase.exit_code = 83
     module = importlib.import_module("kokoro_onnx")
     engine_type = getattr(module, "Kokoro", None)
     from_session = getattr(engine_type, "from_session", None)
     if not callable(from_session):
         raise RuntimeError("kokoro-onnx Kokoro.from_session is unavailable")
+    phase.exit_code = 85
     session_options = runtime.SessionOptions()
     session_options.intra_op_num_threads = 1
     session_options.inter_op_num_threads = 1
@@ -763,13 +825,17 @@ def _run_cuda_worker(args: argparse.Namespace) -> None:
         sess_options=session_options,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
+    phase.exit_code = 86
     actual_providers = tuple(session.get_providers())
     if actual_providers != ("CUDAExecutionProvider", "CPUExecutionProvider"):
         raise RuntimeError(
             f"Kokoro CUDA worker selected {actual_providers!r}; refusing CPU fallback"
         )
+    phase.exit_code = 87
     engine = cast(Any, from_session(session, str(voices_path)))
+    phase.exit_code = 83
     numpy = importlib.import_module("numpy")
+    phase.exit_code = 88
     attestation_samples, attestation_rate = engine.create(
         "CUDA provider attestation.",
         voice=args.attestation_voice,
@@ -782,6 +848,7 @@ def _run_cuda_worker(args: argparse.Namespace) -> None:
         or not numpy.asarray(attestation_samples).size
     ):
         raise RuntimeError("Kokoro CUDA worker attestation synthesis failed")
+    phase.exit_code = 89
     profile_path = Path(session.end_profiling())
     try:
         profile_events = json.loads(profile_path.read_bytes())
@@ -804,7 +871,9 @@ def _run_cuda_worker(args: argparse.Namespace) -> None:
         clipped = numpy.clip(array, -1.0, 1.0)
         return bytes((clipped * 32767.0).astype("<i2", copy=False).tobytes())
 
+    phase.exit_code = 92
     with socket.create_connection(("127.0.0.1", args.connect_port), timeout=15.0) as connection:
+        phase.exit_code = 93
         connection.settimeout(None)
         serve_kokoro_worker_connection(
             connection=connection,
@@ -821,7 +890,19 @@ def _run_cuda_worker(args: argparse.Namespace) -> None:
 
 def main() -> int:
     args = _worker_argument_parser().parse_args()
-    _run_cuda_worker(args)
+    phase = _WorkerFailurePhase()
+    try:
+        _run_cuda_worker(args, failure_phase=phase)
+    except Exception as error:
+        exit_code = phase.exit_code
+        if type(error) is _CudaProfileFailure and error.exit_code in {90, 91}:
+            exit_code = error.exit_code
+        if type(exit_code) is not int or exit_code not in _FAILURE_CATEGORIES:
+            exit_code = 1
+        try:
+            return exit_code
+        finally:
+            _emit_worker_failure(exit_code, error)
     return 0
 
 
