@@ -21,7 +21,10 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 
-from hermes_realtime.conversation.output_style import QUANTITY_PRESENTATION_POLICY
+from hermes_realtime.conversation.output_style import (
+    QUANTITY_PRESENTATION_POLICY,
+    SPEECH_WORDING_POLICY,
+)
 from hermes_realtime.integration import run_record
 from hermes_realtime.integration import web_evidence_contract as web_contract
 from hermes_realtime.integration.run_record import PendingRun
@@ -125,6 +128,7 @@ _BACKGROUND_INSTRUCTIONS = (
     "Use everyday answer-first wording in voice rather than report-style lead-ins about "
     "supplied evidence. Keep all material limits and requested detail; "
     "never imply newer or broader evidence. "
+    + SPEECH_WORDING_POLICY
     + QUANTITY_PRESENTATION_POLICY
 )
 

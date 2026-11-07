@@ -2318,3 +2318,49 @@ def test_optional_null_title_preserves_bound_search_passage(setup):
     assert setup.row["passages"]["https://example.invalid/source"] == (
         ("search", "Bound source passage."),
     )
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+@pytest.mark.parametrize("setup", [
+    {"success": True, "data": {"web": [{"url": "https://example.invalid/source",
+        "description": "In this supplied report, CA means California."}]}},
+    {"success": True, "data": {"web": [{"url": "https://example.invalid/source",
+        "description": (
+            "This report defines CPU as central processing unit and ms as milliseconds."
+        )}]}},
+    {"success": True, "data": {"web": [{"url": "https://example.invalid/source",
+        "description": 'The exact source label is "CA"; its meaning is not supplied.'}]}},
+], indirect=True, ids=["geographic-context", "technical-context", "ambiguous-label"])
+def test_background_wording_guidance_reaches_actual_request_without_rewriting_evidence(
+    setup, api_mode,
+):
+    from hermes_realtime.conversation.output_style import SPEECH_WORDING_POLICY
+
+    s = setup
+    original_passages = dict(s.row["passages"])
+    original_text = original_passages["https://example.invalid/source"][0][1]
+    if api_mode == "codex_responses":
+        s.g.presentation = s.module.Presentation(CODEX_CONFIG)
+        s.run.original = s.codex_response([s.codex_message("Full source result.")])
+    result = s.run(api_mode=api_mode)
+    assert result is not s.refused
+    if api_mode == "codex_responses":
+        body = s.captured["responses_requests"][0]
+        instructions = body["instructions"]
+        payload = json.loads(body["input"][0]["content"])
+    else:
+        body = s.captured["requests"][0]
+        instructions = body["messages"][0]["content"]
+        payload = json.loads(body["messages"][-1]["content"])
+    assert SPEECH_WORDING_POLICY in instructions
+    assert "retain ambiguous terms without guessing" in instructions
+    assert "Preserve exact quotations and source text" in instructions
+    assert "using only findings supported by the supplied passages" in instructions
+    assert payload["objective"] == "synthetic lookup"
+    assert payload["sources"] == [{"id": 0, "url": "https://example.invalid/source"}]
+    assert payload["missing_source_ids"] == []
+    assert payload["evidence"] == [{
+        "source_id": 0, "kind": "search", "text": original_text,
+        "original_bytes": len(original_text.encode()), "truncated": False,
+    }]
+    assert dict(s.row["passages"]) == original_passages
