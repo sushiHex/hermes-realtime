@@ -44,6 +44,7 @@ from hermes_realtime.conversation.work_tools import (
     WORK_ROUTING_POLICY,
     WorkStartResult,
 )
+from hermes_realtime.providers._call_imitation import contains_tool_call_imitation
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.current_facts import (
@@ -1389,6 +1390,7 @@ class CodexAppServerStreamingInference:
                         buffer += delta
                         segments, buffer = self._extract_segments(buffer, final=False)
                         for segment in segments:
+                            self._require_no_call_imitation(segment)
                             self._require_verified_background_claim(
                                 segment,
                                 thread_id=server_thread_id,
@@ -1438,6 +1440,7 @@ class CodexAppServerStreamingInference:
                         break
                 segments, buffer = self._extract_segments(buffer, final=True)
                 for segment in segments:
+                    self._require_no_call_imitation(segment)
                     self._require_verified_background_claim(
                         segment,
                         thread_id=server_thread_id,
@@ -1523,6 +1526,11 @@ class CodexAppServerStreamingInference:
                     self._advertised_dynamic_tools.pop(server_thread_id, None)
                     self._server_turn_ready.pop(server_thread_id, None)
                     self._teardown_dynamic_thread(server_thread_id)
+
+    @staticmethod
+    def _require_no_call_imitation(segment: str) -> None:
+        if contains_tool_call_imitation(segment):
+            raise RuntimeError("Codex emitted tool-call imitation")
 
     def _require_verified_background_claim(
         self,

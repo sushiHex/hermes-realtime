@@ -346,6 +346,32 @@ completion and use one inference call rather than a classification round trip.
 The provider's framing must be qualified, but valid framing does not establish
 routing quality. A valid reply string can still contain misleading or tool-like
 prose; structural validation is not a semantic guarantee about that string.
+
+Model output that imitates a tool call is refused before it is yielded
+([#311](https://github.com/sushiHex/hermes-realtime/issues/311)). Real calls arrive only
+through structured provider channels, so reply text containing call syntax for an
+advertised tool (`start_work`, `task_status`, `search_knowledge`) is an imitation and is
+not speakable. The guard is a bounded, case-insensitive, per-segment syntactic check in
+`providers/_call_imitation.py`, applied in the Ollama adapter (both the no-tools stream
+and the structured reply path) and the Codex adapter (every agent-message segment, in
+all modes, whether or not work tools are bound). It matches an advertised name as a
+whole identifier, optionally namespace-qualified, immediately followed by `(`; a quoted
+`name`, `kind` or `tool` key whose value is an advertised name; an advertised name used as
+a quoted key opening an object; and `<function=NAME`. Quotes and backticks do not exempt
+a segment because speech strips them. A plain mention, or a name followed by whitespace
+and a parenthetical aside, is allowed.
+
+The refusal is the same as the existing unverified-claim guards: the turn fails (Ollama
+records the `call_imitation` category through its work-evidence line; Codex raises
+`RuntimeError`), and, as with those guards today, the response error ends the binding.
+That pre-existing policy is tracked in
+[#470](https://github.com/sushiHex/hermes-realtime/issues/470). Limits: the check is syntactic and
+per segment, so a call split across segments (for example JSON with the arguments before
+the name) is not detected; host-composed text, such as proposal readback and Hermes
+completion summaries, is not model output and is not checked, so it may quote a call;
+an automatic-start acknowledgment continuation refused after an accepted dispatch does
+not undo that dispatch; and the name set is a static superset of what any one turn
+advertises.
 Failed real-model qualification remains a failure; do not replace it with
 stand-in evidence or loosen thresholds after seeing the result.
 
