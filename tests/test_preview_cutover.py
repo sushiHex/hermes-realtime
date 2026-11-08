@@ -1569,6 +1569,43 @@ def test_make_speech_receipt_refuses_a_missing_pinned_voice(tmp_path):
         preview_cutover.make_speech_receipt(plan)
 
 
+def test_make_speech_receipt_refuses_an_empty_moonshine_cache(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    for item in plan.speech_assets["moonshine_cache"].rglob("*"):
+        if item.is_file():
+            item.unlink()
+
+    with pytest.raises(ValueError, match="speech_cache_receipt_files"):
+        preview_cutover.make_speech_receipt(plan)
+
+
+def test_make_speech_receipt_refuses_nested_cache_roots(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    # The Kokoro cache lives under the shared asset root.
+    plan.speech_assets["moonshine_cache"] = plan.speech_assets["kokoro_cache"].parents[1]
+
+    with pytest.raises(ValueError, match="speech_cache_roots"):
+        preview_cutover.make_speech_receipt(plan)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs a case-insensitive filesystem")
+def test_make_speech_receipt_refuses_a_pinned_name_with_different_case(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    model = plan.speech_assets["kokoro_cache"] / _FAKE_MODEL.filename
+    model.rename(model.with_name(_FAKE_MODEL.filename.upper()))
+
+    with pytest.raises(ValueError, match="kokoro_model_asset"):
+        preview_cutover.make_speech_receipt(plan)
+
+    assert not plan.speech_assets["receipt"].exists()
+
+
 def test_make_speech_receipt_refuses_a_linked_moonshine_file(tmp_path):
     plan_path, _ = _plan(tmp_path)
     plan = preview_cutover.load_plan(plan_path)

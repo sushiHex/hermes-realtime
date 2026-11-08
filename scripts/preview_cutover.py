@@ -822,12 +822,19 @@ def make_speech_receipt(plan: PreviewPlanV1) -> dict[str, int | str]:
     )
     moonshine_root = moonshine_root.resolve(strict=True)
     kokoro_root = kokoro_root.resolve(strict=True)
+    # The consumer admits each file under exactly one root.
+    require(
+        not moonshine_root.is_relative_to(kokoro_root)
+        and not kokoro_root.is_relative_to(moonshine_root),
+        "speech_cache_roots",
+    )
 
     pinned = (
         (kokoro_root / model_pin.filename, model_pin, "kokoro_model_asset"),
         (kokoro_root / voice_pin.filename, voice_pin, "kokoro_voice_asset"),
     )
     selected = [(path, None, "") for path in _moonshine_cache_files(moonshine_root)]
+    require(bool(selected), "speech_cache_receipt_files")
     for path, pin, category in pinned:
         require(path.is_file() and not _is_link(path), category)
         selected.append((path, pin, category))
@@ -838,10 +845,13 @@ def make_speech_receipt(plan: PreviewPlanV1) -> dict[str, int | str]:
     total = 0
     for path, pin, category in selected:
         resolved = path.resolve(strict=True)
+        require(0 < len(str(resolved)) <= 2048, "speech_asset_entry")
         require(
             resolved.is_relative_to(moonshine_root if pin is None else kokoro_root),
             "speech_asset_outside_cache",
         )
+        # resolve() returns on-disk case; the consumer matches pinned names exactly.
+        require(pin is None or resolved.name == pin.filename, category)
         size = resolved.stat().st_size
         require(0 < size <= _MAX_SPEECH_FILE_BYTES, "speech_asset_size")
         total += size
@@ -869,17 +879,18 @@ def make_speech_receipt(plan: PreviewPlanV1) -> dict[str, int | str]:
         }
     ).encode("utf-8")
     require(len(encoded) <= _MAX_SPEECH_RECEIPT_BYTES, "speech_cache_receipt_bound")
+    created = False
     try:
-        stream = receipt_path.open("xb")
-    except FileExistsError:
-        raise PreviewRefusal("speech_receipt_exists") from None
-    try:
-        with stream:
+        with receipt_path.open("xb") as stream:
+            created = True
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
+    except FileExistsError:
+        raise PreviewRefusal("speech_receipt_exists") from None
     except BaseException:
-        receipt_path.unlink(missing_ok=True)
+        if created:
+            receipt_path.unlink(missing_ok=True)
         raise
     return {"category": "speech_receipt_written", "files": len(files)}
 
