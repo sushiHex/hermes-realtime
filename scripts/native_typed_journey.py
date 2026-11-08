@@ -25,6 +25,9 @@ from scripts.native_run_witness import RUN_ID, NativeRunWitness, require, valida
 LABEL = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 TASK = re.compile(r"task_[A-Za-z0-9][A-Za-z0-9_.:-]{0,122}\Z")
 TERMINAL = {"completed", "failed", "interrupted"}
+_PUBLICATION_TIMING_FIELDS = (
+    "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
+)
 
 
 def read_json(path: Path, cap: int = 65_536) -> Any:
@@ -148,6 +151,9 @@ class EventTracker:
             "firstTokenMs": None,
             "firstPlayableAudioMs": None,
             "tokenToPlayableMs": None,
+            "firstPublicationMs": None,
+            "tokenToPublicationMs": None,
+            "publicationToPlayableMs": None,
             "deliveredSegments": 0,
             "unboundTerminalEvents": 0,
         }
@@ -268,6 +274,9 @@ class EventTracker:
                 continue
             if kind == "assistant_text_generated":
                 self.current["assistantSegments"] += 1
+                if (self.current["firstPublicationMs"] is None
+                        and event.monotonic_ms >= self.started):
+                    self.current["firstPublicationMs"] = event.monotonic_ms - self.started
             elif kind == "transcript_final" and data.get("role") == "assistant":
                 self.current["deliveredSegments"] += 1
             for marker, key in (
@@ -281,6 +290,14 @@ class EventTracker:
             token, playable = marks.get("first_foreground_token"), marks.get("first_playable_audio")
             if token is not None and playable is not None and playable >= token:
                 self.current["tokenToPlayableMs"] = playable - token
+            publication = self.current["firstPublicationMs"]
+            if publication is not None:
+                relative_token = self.current["firstTokenMs"]
+                relative_playable = self.current["firstPlayableAudioMs"]
+                if relative_token is not None and publication >= relative_token:
+                    self.current["tokenToPublicationMs"] = publication - relative_token
+                if relative_playable is not None and relative_playable >= publication:
+                    self.current["publicationToPlayableMs"] = relative_playable - publication
 
     def receipt(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.turns]
@@ -615,6 +632,14 @@ def main(argv: list[str] | None = None) -> int:
                 receipt["osError"] = _os_error_evidence(error)
     finally:
         raw = json.dumps(receipt, sort_keys=True)
+        if len(raw) > 65_536 and type(receipt.get("turns")) is list:
+            # Passive timings cannot reject a previously fitting receipt or
+            # displace its existing failure evidence. Keep the original bound.
+            for turn in receipt["turns"]:
+                if type(turn) is dict:
+                    for key in _PUBLICATION_TIMING_FIELDS:
+                        turn.pop(key, None)
+            raw = json.dumps(receipt, sort_keys=True)
         if "osError" in receipt and len(raw) > 65_536:
             # Optional evidence cannot make a previously fitting receipt fail.
             receipt.pop("osError")

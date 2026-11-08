@@ -31,6 +31,7 @@ def configured(tmp_path):
     }
     (tmp_path / "config.yaml").write_text(json.dumps(config))
     plan = SimpleNamespace(runtime_target=source, policy_mode="native", profile_source=tmp_path,
+                           speech={},
                            hermes_python=Path(sys.executable),
                            executables={"host_python": Path(sys.executable)})
     return plan, config, executable
