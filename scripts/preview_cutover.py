@@ -788,6 +788,102 @@ def _speech_asset_manifest(plan: PreviewPlanV1) -> list[tuple[Path, Path, str, i
     return result
 
 
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0) & 0x400)
+
+
+def _moonshine_cache_files(root: Path) -> list[Path]:
+    found: list[Path] = []
+    for directory, subdirectories, names in os.walk(root, followlinks=False):
+        base = Path(directory)
+        require(not any(_is_link(base / name) for name in subdirectories), "speech_asset_link")
+        for name in names:
+            path = base / name
+            require(not _is_link(path) and path.is_file(), "speech_asset_link")
+            found.append(path)
+            require(len(found) <= _MAX_SPEECH_FILES, "speech_cache_receipt_files")
+    return found
+
+
+def make_speech_receipt(plan: PreviewPlanV1) -> dict[str, int | str]:
+    """Write the receipt that `_speech_asset_manifest` admits, from existing caches only."""
+    model_pin, voice_pin = _kokoro_asset_pins(plan)
+    receipt_path = plan.speech_assets["receipt"]
+    require(not receipt_path.exists() and not receipt_path.is_symlink(), "speech_receipt_exists")
+    moonshine_root = plan.speech_assets["moonshine_cache"]
+    kokoro_root = plan.speech_assets["kokoro_cache"]
+    require(
+        moonshine_root.is_dir()
+        and not _is_link(moonshine_root)
+        and kokoro_root.is_dir()
+        and not _is_link(kokoro_root)
+        and kokoro_root.name == model_pin.sha256,
+        "speech_cache_roots",
+    )
+    moonshine_root = moonshine_root.resolve(strict=True)
+    kokoro_root = kokoro_root.resolve(strict=True)
+
+    pinned = (
+        (kokoro_root / model_pin.filename, model_pin, "kokoro_model_asset"),
+        (kokoro_root / voice_pin.filename, voice_pin, "kokoro_voice_asset"),
+    )
+    selected = [(path, None, "") for path in _moonshine_cache_files(moonshine_root)]
+    for path, pin, category in pinned:
+        require(path.is_file() and not _is_link(path), category)
+        selected.append((path, pin, category))
+    require(0 < len(selected) <= _MAX_SPEECH_FILES, "speech_cache_receipt_files")
+
+    files: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    total = 0
+    for path, pin, category in selected:
+        resolved = path.resolve(strict=True)
+        require(
+            resolved.is_relative_to(moonshine_root if pin is None else kokoro_root),
+            "speech_asset_outside_cache",
+        )
+        size = resolved.stat().st_size
+        require(0 < size <= _MAX_SPEECH_FILE_BYTES, "speech_asset_size")
+        total += size
+        require(total <= _MAX_SPEECH_TOTAL_BYTES, "speech_assets_total_bound")
+        sha = digest(resolved)
+        if pin is not None:
+            require((sha, size) == (pin.sha256, pin.size), category)
+        files[str(resolved)] = sha
+        sizes[str(resolved)] = size
+
+    encoded = json.dumps(
+        {
+            "version": 1,
+            "moonshine_tier": plan.speech["stt_tier"],
+            "moonshine_package_version": plan.speech["moonshine_version"],
+            "moonshine_cache_root": str(moonshine_root),
+            "kokoro_cache_root": str(kokoro_root),
+            "kokoro_model_sha256": model_pin.sha256,
+            "kokoro_model_bytes": model_pin.size,
+            "kokoro_voice": plan.speech["tts_voice"],
+            "kokoro_voice_sha256": voice_pin.sha256,
+            "kokoro_voice_bytes": voice_pin.size,
+            "files": files,
+            "file_sizes": sizes,
+        }
+    ).encode("utf-8")
+    require(len(encoded) <= _MAX_SPEECH_RECEIPT_BYTES, "speech_cache_receipt_bound")
+    try:
+        stream = receipt_path.open("xb")
+    except FileExistsError:
+        raise PreviewRefusal("speech_receipt_exists") from None
+    try:
+        with stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        receipt_path.unlink(missing_ok=True)
+        raise
+    return {"category": "speech_receipt_written", "files": len(files)}
+
+
 def verify_speech_assets(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, int | str]:
     assets = _speech_asset_manifest(plan)
     total = 0
@@ -2327,6 +2423,8 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser = commands.add_parser("preflight")
     preflight_parser.add_argument("--plan", type=Path, required=True)
     preflight_parser.add_argument("--home", type=Path, required=True)
+    receipt_parser = commands.add_parser("make-speech-receipt")
+    receipt_parser.add_argument("--plan", type=Path, required=True)
     finalize_parser = commands.add_parser("finalize")
     finalize_parser.add_argument("--prepared", type=Path, required=True)
     finalize_parser.add_argument("--previous", type=Path, required=True)
@@ -2357,6 +2455,9 @@ def main(argv: list[str] | None = None) -> int:
                     "ports": [plan.ports[name] for name in ("api", "companion", "livekit", "host")],
                 }
             )
+            return 0
+        if args.command == "make-speech-receipt":
+            emit(make_speech_receipt(load_plan(args.plan)))
             return 0
         if args.command == "finalize":
             result = finalize(args.prepared, args.previous)

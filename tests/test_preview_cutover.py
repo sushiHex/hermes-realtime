@@ -1518,3 +1518,68 @@ def test_shipped_native_examples_still_fail_closed(tmp_path, edit):
         preview_cutover._validate_native_model_binding(
             config, preview_cutover.load_plan(path)
         )
+
+
+def test_make_speech_receipt_round_trips_through_the_consumer(tmp_path, capsys):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    receipt_path = plan.speech_assets["receipt"]
+    expected = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_path.unlink()
+
+    assert preview_cutover.main(["make-speech-receipt", "--plan", str(plan_path)]) == 0
+
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == expected
+    assert '"category":"speech_receipt_written"' in capsys.readouterr().out
+    assert len(preview_cutover._speech_asset_manifest(plan)) == 3
+
+
+def test_make_speech_receipt_never_overwrites_an_existing_receipt(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    before = plan.speech_assets["receipt"].read_bytes()
+
+    with pytest.raises(ValueError, match="speech_receipt_exists"):
+        preview_cutover.make_speech_receipt(plan)
+
+    assert plan.speech_assets["receipt"].read_bytes() == before
+
+
+def test_make_speech_receipt_refuses_a_kokoro_file_that_does_not_match_its_pin(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    (plan.speech_assets["kokoro_cache"] / _FAKE_MODEL.filename).write_bytes(
+        b"x" * len(_FAKE_MODEL_BYTES)
+    )
+
+    with pytest.raises(ValueError, match="kokoro_model_asset"):
+        preview_cutover.make_speech_receipt(plan)
+
+    assert not plan.speech_assets["receipt"].exists()
+
+
+def test_make_speech_receipt_refuses_a_missing_pinned_voice(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    (plan.speech_assets["kokoro_cache"] / _FAKE_VOICES.filename).unlink()
+
+    with pytest.raises(ValueError, match="kokoro_voice_asset"):
+        preview_cutover.make_speech_receipt(plan)
+
+
+def test_make_speech_receipt_refuses_a_linked_moonshine_file(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    plan.speech_assets["receipt"].unlink()
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"outside")
+    link = plan.speech_assets["moonshine_cache"] / "linked.bin"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(ValueError, match="speech_asset_link"):
+        preview_cutover.make_speech_receipt(plan)

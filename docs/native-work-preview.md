@@ -42,18 +42,23 @@ optional live-Codex `key_cmd` route is described in
 the public [vram-mcp](https://github.com/sushiHex/vram-mcp) server; the staged
 profile exposes only its `vram_status` tool.
 
+`prepare` requires a speech asset receipt at the plan's `speech_assets.receipt`.
+`python scripts/preview_cutover.py make-speech-receipt --plan <plan.json>` writes it
+from the caches that already exist; it never downloads anything, so populating the
+Moonshine and Kokoro caches remains a known gap below. The receipt is a version 1
+JSON object with `moonshine_tier`, `moonshine_package_version`, `moonshine_cache_root`
+and `kokoro_cache_root` (resolved absolute paths equal to the plan's caches),
+`kokoro_model_sha256`, `kokoro_model_bytes`, `kokoro_voice`, `kokoro_voice_sha256`,
+`kokoro_voice_bytes`, and `files` and `file_sizes`, which map the same absolute
+file paths to SHA-256 and byte size. It lists every regular file under the Moonshine
+cache and exactly the pinned Kokoro model and voice files, whose directory is named by
+the pinned model SHA-256. The command refuses links, pin mismatches, the consumer's
+count and size bounds, and an existing receipt (it never overwrites).
+
 ### Known gaps (#295)
 
 These steps are not yet published as maintained procedures:
 
-- **Speech asset receipt.** No script writes it. `prepare` requires a version 1 JSON
-  object with `moonshine_tier`, `moonshine_package_version`, `moonshine_cache_root`
-  and `kokoro_cache_root` (resolved absolute paths equal to the plan's caches),
-  `kokoro_model_sha256`, `kokoro_model_bytes`, `kokoro_voice`, `kokoro_voice_sha256`,
-  `kokoro_voice_bytes`, and `files` and `file_sizes`, which map the same absolute
-  file paths to SHA-256 and byte size. The Kokoro cache directory is named by the
-  pinned model SHA-256, and the receipt lists exactly the pinned model and voice
-  files under it.
 - **Moonshine model cache.** The model is fetched on first use; no documented
   warm-up step populates the cache that `prepare` copies.
 - **Codex CLI.** No install route, version or sign-in step is documented for
