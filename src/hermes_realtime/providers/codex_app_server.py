@@ -70,6 +70,7 @@ _MIN_SESSION_ACCESS_SECONDS = 3600
 _SESSION_AUTH_REFUSAL_PREFIX = "[codex-session-auth] "
 _TOOL_REFUSAL_PREFIX = "[codex-tool-refusal] "
 _SEND_REFUSAL_PREFIX = "[codex-send-bound] "
+_OUTPUT_REFUSAL_PREFIX = "[codex-output-refusal] "
 _MAX_OBJECTIVE_CHARS = 65_536
 _KnowledgeTimingValue = str | int | bool | None
 _KnowledgeTimingObserver = Callable[[dict[str, _KnowledgeTimingValue]], None]
@@ -1529,8 +1530,17 @@ class CodexAppServerStreamingInference:
 
     @staticmethod
     def _require_no_call_imitation(segment: str) -> None:
-        if contains_tool_call_imitation(segment):
+        if not contains_tool_call_imitation(segment):
+            return
+        try:
             raise RuntimeError("Codex emitted tool-call imitation")
+        finally:
+            print(
+                _OUTPUT_REFUSAL_PREFIX + json.dumps(
+                    {"refusal": "call_imitation", "version": 1}, separators=(",", ":"),
+                ),
+                flush=True,
+            )
 
     def _require_verified_background_claim(
         self,

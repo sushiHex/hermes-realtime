@@ -33,7 +33,7 @@ def _inference(text: str, *, bound: bool) -> CodexAppServerStreamingInference:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bound", [True, False], ids=["work_tools", "conversation_only"])
 @pytest.mark.parametrize("text", IMITATIONS)
-async def test_imitation_segment_is_never_yielded(text, bound) -> None:
+async def test_imitation_segment_is_never_yielded(text, bound, capsys) -> None:
     inference = _inference(text, bound=bound)
     spoken: list[object] = []
     try:
@@ -46,6 +46,12 @@ async def test_imitation_segment_is_never_yielded(text, bound) -> None:
         await inference.close()
     assert all("start_work" not in str(s) and "search_knowledge" not in str(s)
                and "task_status" not in str(s) for s in spoken)
+    markers = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[codex-output-refusal] ")
+    ]
+    # One bounded category marker; never the refused text.
+    assert markers == ['[codex-output-refusal] {"refusal":"call_imitation","version":1}']
 
 
 @pytest.mark.asyncio
