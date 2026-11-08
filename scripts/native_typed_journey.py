@@ -204,6 +204,11 @@ class EventTracker:
             valid_pair = type(pair[0]) is str and type(pair[1]) is int and pair[1] > 0
             if kind in {"task_state", "task_result"}:
                 identity, status = data.get("taskId"), data.get("status")
+                if kind == "task_state" and status == "rejected":
+                    require(identity is None or (type(identity) is str
+                            and TASK.fullmatch(identity) is not None), "journey_task_identity")
+                    # A rejected control is not a task admission or terminal outcome.
+                    continue
                 require(
                     type(identity) is str
                     and TASK.fullmatch(identity) is not None
@@ -322,6 +327,7 @@ class Journey:
         self.journal = options.preview_dir / "state/hermes-runs-v1.json"
         self.expiry = time.monotonic() + credential["expiresInSeconds"] / 2
         self.admissions: set[str] = set()
+        self.pending = 0
         self.bindings: dict[str, tuple[str, str]] = {}
         self.results: dict[str, dict] = {}
         self.sequence = 0
@@ -338,7 +344,7 @@ class Journey:
         return value
 
     async def poll(self) -> None:
-        ids, _ = read_journal(self.journal)
+        ids, self.pending = read_journal(self.journal)
         self.admissions.update(ids)
         require(len(self.admissions) <= 12, "journey_admission_bound")
         if time.monotonic() >= self.expiry:
@@ -359,7 +365,7 @@ class Journey:
             self.credential = value
             self.expiry = time.monotonic() + value["expiresInSeconds"] / 2
         value = await self.request("events", {"after": self.tracker.cursor})
-        ids, _ = read_journal(self.journal)
+        ids, self.pending = read_journal(self.journal)
         self.admissions.update(ids)
         require(len(self.admissions) <= 12, "journey_admission_bound")
         require(value.get("version") == 2, "journey_event_version")
@@ -499,7 +505,9 @@ async def execute(options, steps, receipt) -> None:
             15,
         )
         await journey.poll()
-        require(not journey.tracker.tasks and not journey.admissions, "journey_existing_task")
+        require(not journey.admissions and journey.pending == 0
+                and all(status in TERMINAL for status in journey.tracker.tasks.values()),
+                "journey_existing_task")
         for step in steps:
             await journey.step(step)
         for label in journey.bindings:
