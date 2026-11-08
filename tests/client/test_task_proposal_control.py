@@ -15,6 +15,7 @@ from hermes_realtime.client import (
     BrowserTokenVerifier,
     LoopbackPeerAuthorizer,
 )
+from hermes_realtime.client.session import NoBrowserSession
 from hermes_realtime.client.task_proposal_control import TaskProposalDecision
 from hermes_realtime.conversation.task_proposals import (
     ConversationTaskProposals,
@@ -606,3 +607,71 @@ async def test_real_runtime_constructor_routes_optional_proposal_control_without
         assert dispatched == []
     assert approvals == []
     await runtime._sessions.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raised", "replayed"),
+    [
+        (PermissionError, PermissionError),
+        (RuntimeError, RuntimeError),
+        (ValueError, ValueError),
+        (TypeError, ValueError),
+        (TimeoutError, TimeoutError),
+    ],
+)
+async def test_replayed_failure_is_a_fixed_category_never_the_raised_exception(raised, replayed):
+    director, _app, _proposals, _projection, _dispatched, _approvals = setup()
+    credential = await director.start()
+    secret = "private-objective-text-must-not-persist"
+
+    async def fail(*args):
+        raise raised(secret)
+
+    director._task_proposal_decision = fail
+    values = dict(
+        participant_identity=credential.participant_identity,
+        generation=1,
+        proposal_id="proposal_12345678",
+        objective="Exact objective",
+        sequence=1,
+        decision="confirm",
+    )
+    with pytest.raises(raised):
+        await director.decide_task_proposal(**values)
+    stored = director._last_proposal_failure
+    assert type(stored) is str
+    assert secret not in stored
+    with pytest.raises(replayed) as replay:
+        await director.decide_task_proposal(**values)
+    assert type(replay.value) is replayed
+    assert secret not in str(replay.value)
+    assert replay.value.__cause__ is None
+    await director.stop(participant_identity=credential.participant_identity)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError("x"),
+        ValueError("x"),
+        TypeError("x"),
+        UnicodeError("x"),
+        asyncio.IncompleteReadError(b"", 1),
+        TimeoutError("x"),
+        asyncio.LimitOverrunError("x", 1),
+        NoBrowserSession("x"),
+        RuntimeError("x"),
+        OSError("x"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_replayed_failure_family_keeps_the_original_http_status(error):
+    from hermes_realtime.client.server import error_status
+    from hermes_realtime.client.session import (
+        _PROPOSAL_REPLAY_ERRORS,
+        _proposal_failure_family,
+    )
+
+    replay = _PROPOSAL_REPLAY_ERRORS[_proposal_failure_family(error)]("refused")
+    assert error_status(replay) == error_status(error)

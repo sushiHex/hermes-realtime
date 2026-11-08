@@ -50,6 +50,30 @@ class NoBrowserSession(RuntimeError):
     """No browser session is active: the one state refusal a client may act on as such."""
 
 
+#: Fixed failure families a replayed proposal decision reproduces. They mirror the status
+#: classes of ``server.error_status`` so a replay answers with the same HTTP status as the
+#: original failure, while the raised exception (and any private text it carried) is never kept.
+_PROPOSAL_REPLAY_ERRORS: dict[str, type[Exception]] = {
+    "no_session": NoBrowserSession,
+    "permission": PermissionError,
+    "invalid": ValueError,
+    "timeout": TimeoutError,
+    "unavailable": RuntimeError,
+}
+
+
+def _proposal_failure_family(error: Exception) -> str:
+    if isinstance(error, PermissionError):
+        return "permission"
+    if isinstance(error, (TypeError, ValueError, UnicodeError, asyncio.IncompleteReadError)):
+        return "invalid"
+    if isinstance(error, (TimeoutError, asyncio.LimitOverrunError)):
+        return "timeout"
+    if isinstance(error, NoBrowserSession):
+        return "no_session"
+    return "unavailable"
+
+
 def _validate_rebind_request_id(request_id: object) -> None:
     if request_id is None:
         return
@@ -489,7 +513,7 @@ class BrowserSessionDirector:
         self._task_proposal_decision = task_proposal_decision
         self._proposal_decision_binding: tuple[str, int] | None = None
         self._last_proposal_decision: TaskProposalDecision | None = None
-        self._last_proposal_failure: Exception | None = None
+        self._last_proposal_failure: str | None = None
         self._projection = projection
         self._speech_runtime = speech_runtime or BrowserSpeechRuntime(
             stt_provider="unavailable",
@@ -1587,7 +1611,8 @@ class BrowserSessionDirector:
                     self._touch_activity()
                     category = "replayed"
                     if self._last_proposal_failure is not None:
-                        raise self._last_proposal_failure.with_traceback(None)
+                        replay = _PROPOSAL_REPLAY_ERRORS[self._last_proposal_failure]
+                        raise replay("proposal decision was refused")
                     return
                 category = "sequence_refused"
                 if sequence != (previous.sequence + 1 if previous is not None else 1):
@@ -1596,7 +1621,7 @@ class BrowserSessionDirector:
                 # when proposal authority refuses. Reserve before awaiting any side effect.
                 self._proposal_decision_binding = binding
                 self._last_proposal_decision = request
-                self._last_proposal_failure = PermissionError("proposal outcome is uncertain")
+                self._last_proposal_failure = "permission"
                 try:
                     decide = self._task_proposal_decision
                     category = "unavailable"
@@ -1614,7 +1639,7 @@ class BrowserSessionDirector:
                         category = "admission_refused"
                         raise PermissionError("proposal decision was not admitted")
                 except Exception as error:
-                    self._last_proposal_failure = error.with_traceback(None)
+                    self._last_proposal_failure = _proposal_failure_family(error)
                     raise
                 self._last_proposal_failure = None
                 self._touch_activity()
