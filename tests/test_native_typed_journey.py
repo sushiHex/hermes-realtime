@@ -856,3 +856,116 @@ def test_unhashable_native_tool_name_retains_refusal_category(tmp_path, capsys, 
     with pytest.raises(ValueError, match="witness_tool_identity"):
         subject.read()
     assert "witness_tool_identity" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "historical", ["completed", "failed", "interrupted", "active", "cancelling"],
+)
+@pytest.mark.parametrize("journal", ["empty", "admitted", "pending"])
+def test_initial_baseline_allows_only_terminal_history_and_an_empty_native_journal(
+    tmp_path, monkeypatch, historical, journal,
+):
+    import hashlib
+    import sys
+
+    import scripts.native_typed_journey as client
+    from hermes_realtime import host_launcher
+    options = SimpleNamespace(preview_dir=tmp_path, native_profile=tmp_path,
+                              browser_origin="http://127.0.0.1:1",
+                              livekit_url="ws://127.0.0.1:2")
+    suffix = hashlib.sha256(str(tmp_path / "active.private.json").encode()).hexdigest()[:16]
+    credential = dict(
+        workerIdentity="worker_preview_" + suffix, roomName="hermes-preview-" + suffix,
+        url=options.livekit_url, token="synthetic-lease", participantIdentity="synthetic",
+        expiresInSeconds=3600,
+    )
+    class Room:
+        async def connect(self, *args, **kwargs):
+            pass
+        async def disconnect(self):
+            pass
+    monkeypatch.setitem(sys.modules, "livekit", SimpleNamespace(rtc=SimpleNamespace(
+        Room=Room, RoomOptions=lambda **kwargs: kwargs)))
+    monkeypatch.setattr(host_launcher, "_load_api_bearer", lambda _: "synthetic")
+    reads = []
+    def read(_):
+        reads.append(True)
+        if len(reads) == 1 or journal == "empty":
+            return set(), 0
+        return ({"run_" + "a" * 32}, 0) if journal == "admitted" else (set(), 1)
+    monkeypatch.setattr(client, "read_journal", read)
+    def request(origin, route, **kwargs):
+        if route == "stable-bootstrap":
+            return 200, credential
+        if route == "events":
+            return 200, {"version": 2, "events": [
+                event(1, "task_state", taskId="task_history", status=historical),
+            ]}
+        assert route == "stop"
+        return 200, {}
+    monkeypatch.setattr(client, "request_json", request)
+    started = []
+    async def step(self, value):
+        started.append(dict(self.tracker.tasks))
+    monkeypatch.setattr(client.Journey, "step", step)
+    receipt = {"outcome": "refused"}
+    operation = client.execute(options, [{"label": "synthetic"}], receipt)
+    if historical in client.TERMINAL and journal == "empty":
+        asyncio.run(operation)
+        assert started == [{"task_history": historical}]
+        assert receipt["acceptedDispatches"] == 0
+        assert receipt["outcome"] == "completed"
+    else:
+        with pytest.raises(ValueError, match="journey_existing_task"):
+            asyncio.run(operation)
+        assert started == []
+
+
+@pytest.mark.parametrize("prior", [None, "active", "completed", "failed", "interrupted"])
+@pytest.mark.parametrize("identity", [None, "task_history", "task_other"])
+def test_rejected_task_control_never_changes_task_lifecycle_or_admission(prior, identity):
+    tracker = EventTracker()
+    if prior is not None:
+        tracker.tasks["task_history"] = prior
+    before = dict(tracker.tasks)
+    tracker.consume([event(1, "task_state", taskId=identity, status="rejected")])
+    assert tracker.tasks == before
+
+
+@pytest.mark.parametrize("kind,status,identity", [
+    ("task_result", "rejected", "task_valid"),
+    ("task_state", "unknown", "task_valid"),
+    ("task_state", "cancelled", "task_valid"),
+    ("task_state", "rejected", "invalid"),
+    ("task_state", "rejected", "task_"),
+    ("task_state", "rejected", 1),
+    ("task_state", "rejected", True),
+    ("task_state", "rejected", "task_" + "a" * 124),
+])
+def test_task_control_compatibility_keeps_unknown_status_and_id_guards(kind, status, identity):
+    tracker = EventTracker()
+    with pytest.raises(ValueError, match="journey_task_identity"):
+        tracker.consume([event(1, kind, taskId=identity, status=status)])
+    assert tracker.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_terminal_map_entry_never_counts_as_a_new_dispatch(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    journey = Journey(
+        SimpleNamespace(preview_dir=tmp_path), {"expiresInSeconds": 3600}, "synthetic",
+    )
+    journey.tracker.tasks["task_history"] = "completed"
+    run = "run_" + "b" * 32
+    monkeypatch.setattr(client, "read_journal", lambda _: ({run}, 0))
+    async def request(route, payload=None):
+        if route == "input":
+            return {}
+        return {"version": 2, "events": [
+            event(1, "task_state", taskId="task_new", status="active"),
+        ]}
+    journey.request = request
+    await journey.step({"label": "new", "kind": "dispatch", "text": "Synthetic work",
+                        "wait": "accepted"})
+    assert journey.bindings == {"new": ("task_new", run)}
+    assert journey.tracker.tasks["task_history"] == "completed"
