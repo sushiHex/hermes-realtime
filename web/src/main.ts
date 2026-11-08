@@ -661,7 +661,7 @@ function projectTaskStateCard(event: PublicEvent): void {
   const data = event.data;
   const taskId = data.taskId;
   const status = data.status;
-  if (status === "rejected" && taskId === null) {
+  if ((status === "rejected" || status === "uncertain") && taskId === null) {
     const knownReasons = new Set([
       "No active task to cancel.",
       "Several tasks are active. Use Cancel on the task you want to stop.",

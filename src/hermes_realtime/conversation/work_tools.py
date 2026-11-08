@@ -624,7 +624,7 @@ class ConversationWorkControlSurface:
             self._observer(
                 "task_state",
                 {
-                    "status": "rejected",
+                    "status": "uncertain",
                     "taskId": None,
                     "reason": (
                         "Task command acknowledgment is uncertain. "
