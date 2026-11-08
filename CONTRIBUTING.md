@@ -70,6 +70,11 @@ for the matching native run.
 
 Focused checks guide local iteration; they do not replace the committed-candidate gate or its required PR checks.
 
+On Windows, use the existing [contained validation path](docs/contained-validation.md)
+when a local check needs an execution deadline and owned descendant cleanup. A
+timeout around `uv` or another wrapper does not establish Python process-tree
+settlement. Reuse the existing guardian instead of creating another launcher.
+
 For changes that affect packaging, browser assets, dependencies, workflows, or release policy, run the full committed-candidate gate after committing:
 
 ```bash

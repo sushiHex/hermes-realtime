@@ -1,16 +1,31 @@
 # Desktop MVP acceptance
 
 This procedure preserves the historical explicit-command desktop diagnostic,
-including its Phi4096 profile. Active natural-request acceptance belongs to
-[#159](https://github.com/sushiHex/hermes-realtime/issues/159) under
-[#284's exact-objective confirmation decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
-and the [shared acceptance contract](https://github.com/sushiHex/hermes-realtime/issues/159#issuecomment-6336110969).
-The steps below supply isolation, provenance and lifecycle observations; they do
-not nominate a candidate or control, qualify natural confirmation, or authorize
-execution. The [experimental backend setup reference](ordinary-lookup-setup.md)
-records the separate source-backed lookup configuration and its remaining setup
-limits. An automated rehearsal or green CI cannot establish physical audibility,
-microphone behavior or the operator's experience.
+including its Phi4096/Qwen profile. Its frozen commands, artifact identities and
+observations are historical evidence. The active desktop outcome and acceptance
+record belong to [#159](https://github.com/sushiHex/hermes-realtime/issues/159).
+An automated rehearsal, API judgment or typed runtime check cannot establish
+physical audibility, microphone behavior or the operator's experience.
+
+## Current native-preview entry point
+
+Start with the [native work voice preview](native-work-preview.md) for current
+source/wheel-bound preparation and owned cutover, rather than the frozen local-model
+setup below. Cloud inference and speech choices such as Moonshine `medium` and
+MCP-managed GPU Kokoro are explicit operator-profile settings, not new repository
+defaults or a transfer of the historical profile's qualification.
+
+Use [live access credentials](live-credentials.md) for the selected native cloud
+credential route, [managed Kokoro](kokoro-mcp.md) for GPU ownership and the explicit
+CPU option, and the [typed native journey](native-typed-journey.md) for bounded
+runtime checks and their measurement limits. Current task-start authority follows
+[ADR 0004](adr/0004-model-action-authority.md); settings and typed checks do not
+supply whole-profile physical acceptance. [#295](https://github.com/sushiHex/hermes-realtime/issues/295)
+retains its exact-profile public walkthrough scope. The steps below preserve its
+historical setup and lifecycle observations; they do not select a new candidate
+or authorize execution.
+The [experimental backend setup reference](ordinary-lookup-setup.md) retains the
+separate historical lookup configuration and its remaining setup limits.
 
 ## Freeze before observing
 
@@ -39,7 +54,7 @@ Publish only the candidate/artifact digests, comparison counts and outcomes.
 
 ### Isolated-session setup overrides
 
-The diagnostic guide describes a single default installation. For a separate
+The diagnostic guide records a historical single-installation setup. For a separate
 test installation, these rules override its setup and process-control examples:
 
 - Set `HERMES_HOME` only in this session's child-process environment. Install the
@@ -76,7 +91,7 @@ Follow that guide for detailed Hermes, wheel, `.env`, and LiveKit setup. Diagnos
 endpoint refusals within the isolated setup; start, restart, and stop only
 processes owned by this session.
 
-The candidate profile follows the [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445):
+The historical candidate profile follows the [#226 owner decision](https://github.com/sushiHex/hermes-realtime/issues/226#issuecomment-6226820445):
 phi4-mini at context 4096 with Ollama 0.40.4 and pinned Hermes commit
 `29112bef099274229cadff79cdff7bf7b99c4b77`. This is a qualification candidate;
 it does not change the project default or claim that human acceptance has
@@ -315,14 +330,14 @@ kept natural routing off and started work only through deterministic explicit
 commands. The model default remains unchanged unless and until this owner
 acceptance passes and a separate default-change is made.
 
-[ADR 0004](adr/0004-model-action-authority.md) remains the design record for
-model-proposed work. For the active natural-request scope, the [#284 owner
-decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
-requires explicit user confirmation of the proposed objective before dispatch.
-That flow is outside this historical diagnostic; its acceptance remains under
-the shared #159 contract linked above. It grants no model cancellation or approval
-authority. The steps here cover explicit task commands, task-card Cancel, and
-interruption independence only.
+[ADR 0004](adr/0004-model-action-authority.md) remains the current design record for
+model-proposed work, including explicitly selected standing authorization. The
+[#284 confirmation decision](https://github.com/sushiHex/hermes-realtime/issues/284#issuecomment-6226820862)
+is retained as a historical policy record, not the current policy for every mode.
+Natural-request acceptance remains under #159 and is outside this frozen
+explicit-command diagnostic. Neither mode grants model cancellation or downstream
+approval authority. The steps here cover explicit task commands, task-card Cancel,
+and interruption independence only.
 
 Before starting, declare the observations: final transcript to first token,
 first token to audio, task acknowledgment/completion/cancellation, and reconnect
