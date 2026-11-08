@@ -81,6 +81,7 @@ dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.25",
   "ruff>=0.11",
+  "pytest-timeout>=2.4",
 ]
 
 [tool.uv]
@@ -117,6 +118,11 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# Every test, including its fixtures, gets one wall-clock bound so a hang aborts the run with a
+# stack dump instead of stalling it. "thread" is the only method Windows supports; set it so Linux
+# CI behaves alike.
+timeout = 300
+timeout_method = "thread"
 
 [tool.ruff]
 target-version = "py311"
