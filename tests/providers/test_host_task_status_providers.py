@@ -557,9 +557,13 @@ async def test_expired_status_cleanup_stall_closes_session_within_one_budget(sta
             await super().send(message)
 
     transport = Stalled()
+    # One request budget bounds each send and the stalled cleanup. 0.05 s (about three 15.6 ms
+    # Windows ticks) expired on a loaded hosted runner during thread/start, before the stall
+    # under test, so the budget is 0.2 s and the window keeps its original 8x ratio.
+    budget = 0.2
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
-        request_timeout_seconds=0.05,
+        request_timeout_seconds=budget,
     )
     handler = FakeWorkToolHandler()
     inference.bind_work_tools(handler)
@@ -583,7 +587,7 @@ async def test_expired_status_cleanup_stall_closes_session_within_one_budget(sta
 
     response = asyncio.create_task(collect_turn())
     try:
-        async with asyncio.timeout(0.4):
+        async with asyncio.timeout(8 * budget):
             await transport.turn_started.get()
             await transport.start_item(tool="task_status", arguments={})
             await transport.request_tool(request_id=91, tool="task_status", arguments={})
