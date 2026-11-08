@@ -1474,3 +1474,47 @@ def test_optional_pronunciations_preflight_capability(tmp_path, monkeypatch, map
     else:
         preview_cutover.verify_host_profile_mode(plan)
     assert sys.path == before
+
+
+_EXAMPLES = Path(__file__).resolve().parents[1] / "scripts"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the example plan uses Windows paths")
+def test_shipped_native_examples_satisfy_the_offline_validators(tmp_path):
+    from scripts.native_work_profile import StatusServer, build_native_work_profile
+
+    plan = preview_cutover.load_plan(_EXAMPLES / "preview-plan.example.json")
+    assert plan.policy_mode == "native"
+    config = preview_cutover._profile_config(
+        (_EXAMPLES / "native-profile-config.example.yaml").read_bytes()
+    )
+    preview_cutover._validate_native_model_binding(config, plan)
+    launcher = tmp_path / "status.exe"
+    launcher.write_bytes(b"synthetic launcher fixture")
+    state = tmp_path / "state"
+    state.mkdir()
+    server = StatusServer(launcher, hashlib.sha256(launcher.read_bytes()).hexdigest(), state)
+    build_native_work_profile(config, server)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda value: value.pop("native_status"),
+        lambda value: value["models"].update(background="other-model"),
+    ],
+    ids=["plan_field_missing", "profile_model_mismatch"],
+)
+@pytest.mark.skipif(sys.platform != "win32", reason="the example plan uses Windows paths")
+def test_shipped_native_examples_still_fail_closed(tmp_path, edit):
+    value = json.loads((_EXAMPLES / "preview-plan.example.json").read_text(encoding="utf-8"))
+    edit(value)
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    config = preview_cutover._profile_config(
+        (_EXAMPLES / "native-profile-config.example.yaml").read_bytes()
+    )
+    with pytest.raises(ValueError):
+        preview_cutover._validate_native_model_binding(
+            config, preview_cutover.load_plan(path)
+        )

@@ -1,0 +1,14 @@
+{
+  "model": {"default": "gpt-6-luna"},
+  "agent": {"reasoning_effort": "low", "reasoning_overrides": {}},
+  "approvals": {"mode": "manual", "unattended_mode": "deny"},
+  "plugins": {
+    "enabled": ["hermes-realtime"],
+    "entries": {
+      "hermes-realtime": {
+        "allow_tool_override": false,
+        "settings": {"background_capabilities": true}
+      }
+    }
+  }
+}

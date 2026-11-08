@@ -6,6 +6,63 @@ task objective. A `native` plan stages the capability profile through
 `native_work_profile`; a `lookup` plan keeps the separate ordinary-lookup
 readiness gate and interactive lookup gateway.
 
+## Prerequisites
+
+The preview runs on Windows. It needs no Hermes core patch: Hermes v0.20 and later
+provide the `/v1/runs` surface the bridge uses, and the additive patch applies only
+to v0.19 ([bridge requirements](hermes-bridge.md)). Start from the
+[example plan](../scripts/preview-plan.example.json) and the redacted
+[profile skeleton](../scripts/native-profile-config.example.yaml). The example is a
+CPU Kokoro plan: it has no managed GPU worker fields (`kokoro_mcp_config`), so it
+does not reproduce an operator's opt-in GPU worker profile. The skeleton is JSON,
+which is also valid YAML, and holds no provider or credential fields. Digests and
+paths are placeholders; a test keeps both accepted by the plan parser and the native
+profile validators, and checks that they still refuse a missing field or mismatched
+model.
+
+| Interpreter | Plan field | Role and requirements |
+| --- | --- | --- |
+| Host Python (`$previewPython`) | `executables.host_python` | Runs this script and the host. Needs `moonshine-voice`, `kokoro-onnx` and `onnxruntime` at the plan's `speech` versions and no `onnxruntime-gpu`, which `prepare` checks, plus PyYAML and `packaging`. An opt-in managed Kokoro GPU worker runs in its own environment. |
+| Hermes Python | `hermes.python` | The Hermes installer's environment. Install Hermes at an exact commit with the [recorded installer procedure](desktop-mvp-diagnostic.md#1-install-hermes-at-the-exact-commit). |
+| Isolated runtime | `realtime.runtime_target` | The hermes-realtime wheel installed with `--no-deps` as described below; the host and preflight import it from this target. |
+
+Two Hermes pins have different roles. `29112bef` (v0.21.0) is the owner-selected
+qualification baseline used by the installed-boundary gates and the recorded
+diagnostic (`scripts/real_gate_support.py`). `3c27eb62` (release v2026.8.3) is the
+reviewed publisher source for release-candidate qualification
+(`scripts/qualification_hermes_source.py`). The plan binds the revision and tree you
+actually install.
+
+The source profile's `config.yaml` must match the plan's background model and
+effort, keep `agent.reasoning_overrides` empty, use manual approvals with
+unattended consequential effects denied, and set the `hermes-realtime` plugin entry's
+`allow_tool_override` to `false`; staging keeps only that plugin. Configure the model provider with `hermes setup`; the
+optional live-Codex `key_cmd` route is described in
+[live credentials](live-credentials.md). `native_status.command` is the launcher of
+the public [vram-mcp](https://github.com/sushiHex/vram-mcp) server; the staged
+profile exposes only its `vram_status` tool.
+
+### Known gaps (#295)
+
+These steps are not yet published as maintained procedures:
+
+- **Speech asset receipt.** No script writes it. `prepare` requires a version 1 JSON
+  object with `moonshine_tier`, `moonshine_package_version`, `moonshine_cache_root`
+  and `kokoro_cache_root` (resolved absolute paths equal to the plan's caches),
+  `kokoro_model_sha256`, `kokoro_model_bytes`, `kokoro_voice`, `kokoro_voice_sha256`,
+  `kokoro_voice_bytes`, and `files` and `file_sizes`, which map the same absolute
+  file paths to SHA-256 and byte size. The Kokoro cache directory is named by the
+  pinned model SHA-256, and the receipt lists exactly the pinned model and voice
+  files under it.
+- **Moonshine model cache.** The model is fetched on first use; no documented
+  warm-up step populates the cache that `prepare` copies.
+- **Codex CLI.** No install route, version or sign-in step is documented for
+  `executables.codex`, and the plan's models must be available to your account.
+- **Web tools.** The native profile selects the `web` toolset; which search backend
+  and credential it needs is not documented here.
+- **vram-mcp revision.** No reviewed vram-mcp revision or launcher hash is
+  recorded for `native_status`.
+
 The version 1 JSON plan binds the Hermes Realtime source revision/tree, wheel
 and installed runtime RECORD, Hermes source revision/tree, profile directory,
 model and speech settings, executable paths, and owned/protected ports. Native
