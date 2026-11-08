@@ -170,6 +170,7 @@ groups in [GitHub Issues](https://github.com/sushiHex/hermes-realtime/issues) an
 
 - [Desktop MVP setup and diagnostic session](docs/desktop-mvp-diagnostic.md)
 - [Native work preview cutover](docs/native-work-preview.md)
+- [Live access credentials for managed native profiles](docs/live-credentials.md)
 - [Typed native journey client](docs/native-typed-journey.md)
 - [Local LiveKit setup and automated gates](docs/local-livekit.md)
 - [Hermes bridge and natural-work authority](docs/hermes-bridge.md)

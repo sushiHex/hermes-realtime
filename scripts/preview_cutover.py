@@ -533,6 +533,58 @@ def _bound_kokoro_mcp_config(plan: PreviewPlanV1) -> Path | None:
     return _kokoro_mcp_config(plan.host_options)
 
 
+def _verify_managed_kokoro_assets(plan: PreviewPlanV1, home: Path) -> None:
+    """Exercise the existing factory binding without starting a worker or MCP scope."""
+    config = _bound_kokoro_mcp_config(plan)
+    if config is None:
+        return
+    accepted = False
+    try:
+        model, voices = _kokoro_asset_pins(plan)
+        prefix = Path(".cache") / "hermes-realtime" / "kokoro" / model.sha256
+        expected = [
+            (prefix / model.filename, model.sha256, model.size),
+            (prefix / voices.filename, voices.sha256, voices.size),
+        ]
+        planned = [
+            (relative, sha, size)
+            for _, relative, sha, size in _speech_asset_manifest(plan)
+            if relative.is_relative_to(Path(".cache") / "hermes-realtime" / "kokoro")
+        ]
+        require(sorted(planned) == sorted(expected), "kokoro_mcp_asset_binding")
+        _runtime_modules(plan)
+        managed = importlib.import_module("hermes_realtime.providers.kokoro_mcp")
+        expected_module = plan.runtime_target / "hermes_realtime" / "providers" / "kokoro_mcp.py"
+        require(managed.__file__ is not None
+                and Path(managed.__file__).resolve() == expected_module.resolve(),
+                "kokoro_mcp_asset_binding")
+        factory = managed.KokoroMcpWorkerFactory.from_config(config)
+        try:
+            factory.create(
+                model_path=(home / prefix / model.filename).resolve(),
+                voices_path=(home / prefix / voices.filename).resolve(),
+                expected_model_sha256=model.sha256,
+                expected_voices_sha256=voices.sha256,
+                language="en-gb", max_pcm_bytes=16 * 1024 * 1024,
+                attestation_voice=plan.speech["tts_voice"],
+            )
+        finally:
+            factory.close()
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("kokoro_mcp_asset_binding") from None
+    finally:
+        if not accepted:
+            stream = sys.stderr
+            if stream is not None:
+                try:
+                    print('[kokoro-mcp-preview-refused] {"category":"asset_binding_refused",'
+                          '"version":1}', file=stream, flush=True)
+                except Exception:
+                    if sys.stderr is stream:
+                        sys.stderr = None
+
+
 def verify_cpu_speech(plan: PreviewPlanV1) -> None:
     code = (
         "import importlib.metadata as m,json,sys; "
@@ -759,6 +811,120 @@ def native_web_evidence_contract(config: dict[str, Any]) -> str | None:
     return "hermes.web-evidence/v1" if web_evidence_selected(config) else None
 
 
+def _native_credential_python(plan: PreviewPlanV1) -> Path:
+    """Resolve native Hermes's base interpreter, avoiding a Windows venv child."""
+    try:
+        completed = subprocess.run(
+            [str(plan.hermes_python), "-I", "-B", "-S", "-c",
+             "import json,sys; print(json.dumps({'base':sys._base_executable}))"],
+            env=_base_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", timeout=15,
+        )
+        require(completed.returncode == 0 and completed.stderr == ""
+                and len(completed.stdout) <= 4096,
+                "native_credential_binding")
+        value = _json(completed.stdout.encode("utf-8"))
+        require(set(value) == {"base"} and type(value["base"]) is str,
+                "native_credential_binding")
+        base = Path(value["base"])
+        require(base.is_absolute() and base.is_file(), "native_credential_binding")
+        return base.resolve(strict=True)
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+
+
+def _verify_native_credentials(plan: PreviewPlanV1, config: dict[str, Any]) -> None:
+    accepted = False
+    try:
+        module = importlib.import_module("hermes_realtime.integration.codex_access_credentials")
+        expected = plan.runtime_target / "hermes_realtime/integration/codex_access_credentials.py"
+        require(module.__file__ is not None
+                and Path(module.__file__).resolve() == expected.resolve(),
+                "native_credential_binding")
+        module.validate_native_binding(config, _native_credential_python(plan), expected)
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+    finally:
+        if not accepted:
+            print('[native-credential-refused] {"version":1,"category":"binding_refused"}',
+                  file=sys.stderr, flush=True)
+
+
+def _native_credential_packages(plan: PreviewPlanV1) -> Path:
+    """Discover the matching native environment's purelib without loading a model."""
+    try:
+        completed = subprocess.run(
+            [str(plan.hermes_python), "-I", "-B", "-c",
+             "import json,sysconfig; "
+             "print(json.dumps({'packages':sysconfig.get_path('purelib')}))"],
+            env=_base_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", timeout=15,
+        )
+        require(completed.returncode == 0 and completed.stderr == ""
+                and len(completed.stdout) <= 4096,
+                "native_credential_binding")
+        value = _json(completed.stdout.encode("utf-8"))
+        require(set(value) == {"packages"} and type(value["packages"]) is str,
+                "native_credential_binding")
+        packages = Path(value["packages"])
+        require(packages.is_absolute() and packages.is_dir(), "native_credential_binding")
+        return packages.resolve(strict=True)
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+
+
+def _verify_native_credential_runtime(plan: PreviewPlanV1, home: Path) -> None:
+    if plan.policy_mode != "native":
+        return
+    config_bytes = _read(home / "config.yaml", _JSON_LIMIT)
+    config = _profile_config(config_bytes)
+    settings = config.get("plugins", {}).get("entries", {}).get("hermes-realtime", {}).get(
+        "settings", {})
+    if "key_cmd_argv" not in settings.get("presentation", {}):
+        return
+    accepted = False
+    try:
+        require(home.resolve() == (plan.output / "input" / "home").resolve()
+                and home.resolve() != plan.profile_source.resolve(),
+                "native_credential_binding")
+        module = importlib.import_module("hermes_realtime.integration.native_credential_probe")
+        expected = plan.runtime_target / "hermes_realtime/integration/native_credential_probe.py"
+        require(module.__file__ is not None
+                and Path(module.__file__).resolve() == expected.resolve(),
+                "native_credential_binding")
+        provider = config["model"]["provider"]
+        selected = config["providers"][provider.split(":", 1)[1]]
+        env_file = home / ".env"
+        if not env_file.is_file():
+            env_file = plan.profile_source / ".env"
+        scratch = Path(tempfile.mkdtemp(prefix="credential-probe-", dir=plan.output))
+        require(scratch.parent.resolve() == plan.output.resolve()
+                and scratch.is_dir() and not scratch.is_symlink()
+                and not (getattr(scratch.lstat(), "st_file_attributes", 0) & 0x400),
+                "native_credential_binding")
+        copied = _copy_bounded_file(home / "config.yaml", scratch / "config.yaml", _JSON_LIMIT)
+        require(copied == hashlib.sha256(config_bytes).hexdigest()
+                and digest(scratch / "config.yaml") == copied, "native_credential_binding")
+        # Native configuration/pool defaults stay in this retained private scratch
+        # home, never the profile that finalize will copy into. Do not delete it.
+        module.verify_native_credential_resolution(
+            executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
+            native_site_packages=_native_credential_packages(plan),
+            home=scratch, env_file=env_file, provider=provider, base_url=selected["base_url"],
+            model=selected["default_model"], api_mode=selected["api_mode"],
+            command=selected["key_cmd"],
+            environment=_gateway_environment(scratch, plan.ports["api"]),
+        )
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+    finally:
+        if not accepted:
+            print('[native-credential-refused] {"version":1,"category":"runtime_refused"}',
+                  file=sys.stderr, flush=True)
+
+
 def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> None:
     import importlib
     import inspect
@@ -794,6 +960,8 @@ def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> N
                     presentation.Presentation(settings["presentation"])
                 except (TypeError, ValueError):
                     raise PreviewRefusal("native_web_presentation_config") from None
+                if "key_cmd_argv" in settings["presentation"]:
+                    _verify_native_credentials(plan, config)
         else:
             require("hermes_lookup_policy" in parameters, "lookup_policy_unavailable")
     finally:
@@ -807,7 +975,8 @@ def preflight(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, Any]:
     verify_cpu_speech(plan)
     verify_host_profile_mode(plan, home or plan.profile_source)
     verify_speech_assets(plan, home or plan.profile_source)
-    _bound_kokoro_mcp_config(plan)
+    _verify_managed_kokoro_assets(plan, home or plan.profile_source)
+    _verify_native_credential_runtime(plan, home or plan.profile_source)
     return {
         "category": "preflight_ready",
         "launch_authorized": False,
@@ -1567,7 +1736,33 @@ def _livekit_command(executable: Path, port: int) -> list[str]:
     return local_livekit.server_command(executable) + ["--port", str(port)]
 
 
+def _emit_host_failure(facts: dict[str, str], error: BaseException) -> None:
+    stream = sys.stderr
+    if stream is not None:
+        try:
+            print("[voice-preview-host-failure] " + json.dumps({
+                "version": 1, "stage": facts["stage"],
+                "failure_kind": _failure_status(error)["failure_kind"],
+            }, separators=(",", ":")), file=stream, flush=True)
+        except Exception:
+            if sys.stderr is stream:
+                sys.stderr = None
+
+
 async def _host_child(active_path: Path) -> int:
+    facts = {"stage": "configuration"}
+    failure: BaseException | None = None
+    try:
+        return await _run_host_child(active_path, facts)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if failure is not None:
+            _emit_host_failure(facts, failure)
+
+
+async def _run_host_child(active_path: Path, facts: dict[str, str]) -> int:
     plan, _, profile = _active_plan(active_path)
     _, host = _runtime_modules(plan)
     env_file = profile / ".env"
@@ -1626,15 +1821,22 @@ async def _host_child(active_path: Path) -> int:
     if mcp_config is not None:
         require("kokoro_mcp_config" in parameters, "kokoro_mcp_host_unavailable")
         kwargs["kokoro_mcp_config"] = mcp_config
+    facts["stage"] = "host_construction"
     launcher = host.build_local_host_launcher(**kwargs)
     ready = plan.output / "host-ready.private.json"
     try:
+        facts["stage"] = "host_start"
         await launcher.start()
         _write_new(ready, {"version": 1, "ready": True, "pid": os.getpid()})
+        facts["stage"] = "serving"
         while not (plan.output / "host.stop").exists():
             await asyncio.sleep(_STOP_POLL_SECONDS)
     finally:
-        await launcher.close()
+        try:
+            await launcher.close()
+        except BaseException:
+            facts["stage"] = "host_close"
+            raise
     return 0
 
 

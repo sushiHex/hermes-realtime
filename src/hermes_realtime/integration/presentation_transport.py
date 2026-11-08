@@ -8,10 +8,13 @@ import copy
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
+import sys
 import time
 from collections.abc import AsyncIterable
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
@@ -103,10 +106,12 @@ async def _consume_codex_stream(
 class Presentation:
     """One explicit same-route SDK call, independent of native tool dispatch."""
 
-    def __init__(self, config: dict[str, str]) -> None:
-        required = {"provider", "base_url", "model", "api_key_env"}
+    def __init__(self, config: dict[str, Any]) -> None:
+        required = {"provider", "base_url", "model"}
+        credential_fields = {"api_key_env", "key_cmd_argv"}
         if (type(config) is not dict or not required <= set(config)
-                or set(config) - required not in (set(), {"api_mode"})):
+                or len(set(config) & credential_fields) != 1
+                or set(config) - required - credential_fields - {"api_mode"}):
             raise ValueError("presentation-config")
         normalized = dict(config)
         normalized.setdefault("api_mode", "chat_completions")
@@ -118,10 +123,134 @@ class Presentation:
             raise ValueError("presentation-config")
         url = urlsplit(normalized["base_url"])
         if (url.scheme not in {"http", "https"} or not url.hostname
-                or url.username or url.password or url.query or url.fragment
-                or re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", normalized["api_key_env"]) is None):
+                or url.username or url.password or url.query or url.fragment):
             raise ValueError("presentation-config")
+        if "api_key_env" in normalized:
+            if (type(normalized["api_key_env"]) is not str or re.fullmatch(
+                    r"[A-Z_][A-Z0-9_]{0,127}", normalized["api_key_env"]) is None):
+                raise ValueError("presentation-config")
+        else:
+            argv = normalized["key_cmd_argv"]
+            if (type(argv) is not list or not 2 <= len(argv) <= 16
+                    or any(type(arg) is not str or not 1 <= len(arg) <= 2048
+                           or any(character in arg for character in "\x00\r\n") for arg in argv)
+                    or not Path(argv[0]).is_absolute()):
+                raise ValueError("presentation-config")
+            normalized["key_cmd_argv"] = tuple(argv)
         self.config = MappingProxyType(normalized)
+
+    async def _credential(
+        self, generation: PresentationOwner, row: dict[str, Any], evidence: dict[str, Any],
+    ) -> str:
+        if "api_key_env" in self.config:
+            key = os.environ.get(self.config["api_key_env"])
+            if not key:
+                raise ValueError("presentation-credential")
+            return key
+        # Operator-owned, reviewed local helper only: it must create no descendants.
+        # No shell, inherited stdin, user task arguments, retries, or token environment.
+        active = {"loop": asyncio.get_running_loop(), "task": asyncio.current_task(),
+                  "cancel_requested": False, "closing": False}
+        with generation.lock:
+            _, current = generation.scope()
+            if current is not row or row["cancelled"] or row.get("presentation_active"):
+                raise ValueError("presentation-ownership")
+            remaining = min(15.0, row["deadline"] - time.monotonic())
+            if remaining <= 0:
+                raise ValueError("presentation-deadline")
+            row["presentation_active"] = active
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            *self.config["key_cmd_argv"], stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            limit=32769,
+        ))
+        failure: BaseException | None = None
+        key = ""
+        settled = False
+        try:
+            async with asyncio.timeout(remaining):
+                process = await asyncio.shield(spawn)
+                assert process.stdout is not None
+                raw = bytearray()
+                while block := await process.stdout.read(min(4096, 32769 - len(raw))):
+                    raw.extend(block)
+                    if len(raw) > 32768:
+                        raise ValueError("presentation-credential")
+                if await process.wait() != 0:
+                    raise ValueError("presentation-credential")
+                def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                    value: dict[str, Any] = {}
+                    for name, item in pairs:
+                        if name in value:
+                            raise ValueError("presentation-credential")
+                        value[name] = item
+                    return value
+                payload = json.loads(raw, object_pairs_hook=unique)
+                if type(payload) is not dict or set(payload) != {"access_token", "expires_in"}:
+                    raise ValueError("presentation-credential")
+                key, ttl = payload["access_token"], payload["expires_in"]
+                if (type(key) is not str or not 1 <= len(key) <= 16384
+                        or not key.isascii() or any(character.isspace() for character in key)
+                        or type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0):
+                    raise ValueError("presentation-credential")
+        except BaseException as error:
+            failure = (error if isinstance(error, asyncio.CancelledError)
+                       else ValueError("presentation-credential"))
+        finally:
+            with generation.lock:
+                active["closing"] = True
+            async def close_helper() -> None:
+                try:
+                    process = await asyncio.shield(spawn)
+                except Exception:
+                    return  # Spawn failed with no owned process handle.
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.terminate()
+                    async def drain() -> None:
+                        assert process.stdout is not None
+                        while await process.stdout.read(4096):
+                            pass
+                    drain_task = asyncio.create_task(drain())
+                    try:
+                        await asyncio.wait_for(asyncio.shield(process.wait()), 2.0)
+                    except TimeoutError:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), 2.0)
+                    finally:
+                        await asyncio.wait_for(drain_task, 2.0)
+                elif process.stdout is not None:
+                    while await process.stdout.read(4096):
+                        pass
+            cleanup = asyncio.create_task(close_helper())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as error:
+                    if failure is None:
+                        failure = error
+                except Exception:
+                    break
+            settled = not cleanup.cancelled() and cleanup.exception() is None
+            evidence["credential_helper_settled"] = settled
+            if failure is not None or not settled:
+                stream = sys.stderr
+                if stream is not None:
+                    try:
+                        print('[presentation-credential-refused] {"version":1,"category":"'
+                              + ("credential" if settled else "cleanup_unknown") + '"}',
+                              file=stream, flush=True)
+                    except Exception:
+                        if sys.stderr is stream:
+                            sys.stderr = None
+            with generation.lock:
+                if settled and row.get("presentation_active") is active:
+                    row["presentation_active"] = None
+        if not settled:
+            raise ValueError("presentation-credential-cleanup")
+        if failure is not None:
+            raise failure
+        return key
 
     def validate_route(self, kw: dict[str, Any]) -> None:
         if any(kw.get(key) != self.config[key]
@@ -138,9 +267,7 @@ class Presentation:
         httpx = importlib.import_module("httpx")
         AsyncOpenAI = importlib.import_module("openai").AsyncOpenAI
 
-        key = os.environ.get(self.config["api_key_env"])
-        if not key:
-            raise ValueError("presentation-credential")
+        key = await self._credential(generation, row, evidence)
         if self.config["api_mode"] == "codex_responses":
             return await self._complete_codex(generation, row, source_input, evidence, key,
                                                httpx, AsyncOpenAI)

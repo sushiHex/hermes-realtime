@@ -869,6 +869,52 @@ class NativeWebEvidence:
         register_platform("api_server", self.install)
 
 
+def _verify_live_credential_runtime(presentation_config: dict[str, Any]) -> None:
+    """Prove the selected native source after the gateway's real env loading."""
+    accepted = False
+    try:
+        import importlib
+        import os
+        import sys
+        import sysconfig
+        from pathlib import Path
+
+        from .codex_access_credentials import validate_native_binding
+        from .native_credential_probe import verify_native_credential_resolution
+
+        native_config = importlib.import_module("hermes_cli.config").load_config()
+        expected_presentation = native_config["plugins"]["entries"]["hermes-realtime"][
+            "settings"]["presentation"]
+        if expected_presentation != presentation_config:
+            raise ValueError("credential_config_drift")
+        helper = Path(__file__).with_name("codex_access_credentials.py")
+        executable = Path(sys._base_executable)  # type: ignore[attr-defined]
+        validate_native_binding(native_config, executable, helper)
+        selected = native_config["model"]["provider"]
+        provider = native_config["providers"][selected.split(":", 1)[1]]
+        native_package = importlib.import_module("hermes_cli")
+        if native_package.__file__ is None:
+            raise ValueError("credential_runtime_origin")
+        verify_native_credential_resolution(
+            executable=executable,
+            hermes_source=Path(native_package.__file__).resolve().parent.parent,
+            native_site_packages=Path(sysconfig.get_path("purelib")),
+            home=Path(os.environ["HERMES_HOME"]), env_file=None,
+            provider=selected, base_url=provider["base_url"], model=provider["default_model"],
+            api_mode=provider["api_mode"], command=provider["key_cmd"],
+            environment=dict(os.environ),
+        )
+        accepted = True
+    except Exception:
+        raise RuntimeError("native_credential_binding") from None
+    finally:
+        if not accepted:
+            import sys
+
+            print('[native-credential-refused] {"version":1,"category":"runtime_refused"}',
+                  file=sys.stderr, flush=True)
+
+
 def register_web_evidence(context: object) -> NativeWebEvidence | None:
     """Install the explicitly enabled native evidence observer; default is off."""
     get_config = getattr(context, "get_config", None)
@@ -885,7 +931,10 @@ def register_web_evidence(context: object) -> NativeWebEvidence | None:
     on_unload = getattr(context, "on_unload", None)
     if not callable(on_unload):
         raise RuntimeError("web-evidence-unload-hook-required")
-    observer = NativeWebEvidence(Presentation(presentation_config))
+    presentation = Presentation(presentation_config)
+    if "key_cmd_argv" in presentation_config:
+        _verify_live_credential_runtime(presentation_config)
+    observer = NativeWebEvidence(presentation)
     observer.register(context)
     on_unload(observer.close)
     return observer
