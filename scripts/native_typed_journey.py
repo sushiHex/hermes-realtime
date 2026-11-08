@@ -548,6 +548,35 @@ async def execute(options, steps, receipt) -> None:
             require(all(receipt["cleanup"].values()), "journey_cleanup_unsettled")
 
 
+def _os_error_evidence(error: OSError) -> dict[str, object]:
+    """Nearest supported journey context, never an attribution of the OS cause."""
+    facts: dict[str, object] = {
+        "sourceFunction": "other", "sourceLine": None, "pathRole": "other",
+        "exceptionKind": {
+            OSError: "OSError", PermissionError: "PermissionError",
+            FileNotFoundError: "FileNotFoundError", TimeoutError: "TimeoutError",
+            NotADirectoryError: "NotADirectoryError", IsADirectoryError: "IsADirectoryError",
+        }.get(type(error), "OSError"),
+    }
+    frame = error.__traceback__
+    for _ in range(64):
+        if frame is None:
+            break
+        context = _OS_ERROR_CONTEXTS.get(frame.tb_frame.f_code)
+        if context is not None:
+            function, role = context
+            facts["sourceFunction"] = function
+            line = frame.tb_lineno
+            facts["sourceLine"] = line if type(line) is int and 1 <= line <= 1_000_000 else None
+            if role is not None:
+                facts["pathRole"] = role
+        frame = frame.tb_next
+    for name in ("errno", "winerror"):
+        value = getattr(error, name, None)
+        facts[name] = (value if type(value) is int and -(2**31) <= value <= 2**32 - 1 else None)
+    return facts
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("preview-dir", "native-profile", "scenario", "receipt"):
@@ -581,14 +610,39 @@ def main(argv: list[str] | None = None) -> int:
             else type(error).__name__
         )
         receipt.update(outcome="refused", failure=category)
+        if isinstance(error, OSError):
+            with contextlib.suppress(Exception):
+                receipt["osError"] = _os_error_evidence(error)
     finally:
         raw = json.dumps(receipt, sort_keys=True)
+        if "osError" in receipt and len(raw) > 65_536:
+            # Optional evidence cannot make a previously fitting receipt fail.
+            receipt.pop("osError")
+            raw = json.dumps(receipt, sort_keys=True)
         if reserved is not None:
             with reserved:
                 require(len(raw) <= 65_536, "journey_receipt_bound")
                 reserved.write(raw + "\n")
         print("[native-typed-journey] " + raw)
     return int(receipt["outcome"] == "refused")
+
+
+# Capture code identities once: wrappers or arbitrary traceback names cannot
+# supply private names/paths. No frame locals or exception messages are read.
+_OS_ERROR_CONTEXTS = {
+    read_json.__code__: ("read_json", None),
+    load_scenario.__code__: ("load_scenario", "scenario"),
+    read_journal.__code__: ("read_journal", "journal"),
+    request_json.__code__: ("request_json", None),
+    execute.__code__: ("execute", None),
+    Journey.request.__code__: ("Journey.request", None),
+    Journey.poll.__code__: ("Journey.poll", None),
+    Journey.wait.__code__: ("Journey.wait", None),
+    Journey.collect.__code__: ("Journey.collect", None),
+    Journey.step.__code__: ("Journey.step", None),
+    Journey.settle_owned.__code__: ("Journey.settle_owned", None),
+    main.__code__: ("main", None),
+}
 
 
 if __name__ == "__main__":

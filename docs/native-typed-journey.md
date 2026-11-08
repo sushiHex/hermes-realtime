@@ -105,6 +105,14 @@ are cancelled by exact task ID before the client stops its browser lease and
 disconnects; services and native processes remain owned by the preview owner.
 Unresolved cleanup is reported, never treated as a successful journey.
 
+When the existing failure handler catches an `OSError`, its receipt may include
+`osError`: a fixed source-context function and line, `journal`/`scenario`/`other`
+path role, fixed exception kind, and nullable bounded `errno`/`winerror` numbers.
+This is the nearest supported client context, not attribution of the OS cause.
+No exception message, filename, frame locals or credentials are retained. Pair
+the context with the client revision used for the check. Collection is best
+effort; it adds no reads or retries and does not change failure or cleanup rules.
+
 Warm measurements require matching turn ID **and** generation. A foreground
 pair is bound only after the matching typed admission and user transcript;
 background/replayed speech cannot supply that pair. Missing identities remain
