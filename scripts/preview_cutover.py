@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -297,7 +298,7 @@ def load_plan(path: Path) -> PreviewPlanV1:
     speech = value["speech"]
     require(
         type(speech) is dict
-        and set(speech)
+        and set(speech) - {"pronunciations"}
         == {
             "stt_provider",
             "stt_tier",
@@ -328,6 +329,8 @@ def load_plan(path: Path) -> PreviewPlanV1:
         ),
         "speech_values",
     )
+    if "pronunciations" in speech:
+        _validate_pronunciations(speech["pronunciations"])
     executables = value["executables"]
     require(
         type(executables) is dict
@@ -386,6 +389,30 @@ def load_plan(path: Path) -> PreviewPlanV1:
         executables={key: abs_path(raw, key) for key, raw in executables.items()},
         host_options=dict(host_options),
         readiness_policy=readiness_policy,
+    )
+
+
+def _validate_pronunciations(value: Any) -> None:
+    require(type(value) is dict and len(value) <= 64, "speech_pronunciations")
+    require(
+        all(
+            type(term) is str and type(spoken) is str
+            and 0 < len(term) <= 64 and term == term.strip()
+            and 0 < len(spoken) <= 128 and spoken == spoken.strip()
+            and not any(unicodedata.category(char).startswith("C") for char in term + spoken)
+            for term, spoken in value.items()
+        ),
+        "speech_pronunciations",
+    )
+    require(len({term.casefold() for term in value}) == len(value), "speech_pronunciations")
+
+
+def _verify_host_pronunciations(plan: PreviewPlanV1, host: Any) -> None:
+    if not plan.speech.get("pronunciations"):
+        return
+    require(
+        "kokoro_pronunciations" in inspect.signature(host.build_local_host_launcher).parameters,
+        "kokoro_pronunciations_host_unavailable",
     )
 
 
@@ -936,6 +963,7 @@ def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> N
         expected = plan.runtime_target / "hermes_realtime" / "host_launcher.py"
         require(Path(module.__file__).resolve() == expected.resolve(), "host_launcher_origin")
         parameters = inspect.signature(module.build_local_host_launcher).parameters
+        _verify_host_pronunciations(plan, module)
         if plan.policy_mode == "native":
             require("hermes_discover_tools" in parameters, "native_discovery_unavailable")
             config = _profile_config(
@@ -1821,6 +1849,9 @@ async def _run_host_child(active_path: Path, facts: dict[str, str]) -> int:
     if mcp_config is not None:
         require("kokoro_mcp_config" in parameters, "kokoro_mcp_host_unavailable")
         kwargs["kokoro_mcp_config"] = mcp_config
+    _verify_host_pronunciations(plan, host)
+    if plan.speech.get("pronunciations"):
+        kwargs["kokoro_pronunciations"] = dict(plan.speech["pronunciations"])
     facts["stage"] = "host_construction"
     launcher = host.build_local_host_launcher(**kwargs)
     ready = plan.output / "host-ready.private.json"

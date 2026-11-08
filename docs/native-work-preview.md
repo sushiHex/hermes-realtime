@@ -49,7 +49,7 @@ Nested keys are strict too:
 - `models`: `foreground`, `foreground_effort`, `background`, `background_effort`.
 - `speech`: `stt_provider`, `stt_tier`, `tts_provider`, `tts_voice`,
   `tts_threads`, `tts_chunk_chars`, `moonshine_version`, `kokoro_version`,
-  `onnxruntime_version`.
+  `onnxruntime_version`; optionally `pronunciations`.
 - `executables`: `codex`, `livekit`, `host_python`.
 - `host_options`: `allow_unsandboxed_tasks`, `natural_work_tools`,
   `task_start_policy` (`confirm` or `automatic`), `conversation_profile`.
@@ -58,6 +58,16 @@ Source revisions/trees are full lowercase Git object IDs; SHA-256 values are
 64 lowercase hex characters. Paths are absolute. Model, effort, voice, tier,
 and version strings use the validated label format; the speech providers are
 `moonshine` and `kokoro`. The plan contains no auth fields.
+
+The optional `speech.pronunciations` object forwards explicit operator term-to-spoken-text
+choices to Kokoro's existing pronunciation lexicon. Omission or an empty object keeps
+the lexicon empty. It accepts at most 64 case-insensitively unique whole terms, each
+1–64 characters, with spoken replacements of 1–128 characters; both must be trimmed
+and contain no control characters. The host must support the option when entries are
+provided. These substitutions affect synthesis only, leaving displayed text intact;
+they do not infer abbreviation meanings or provide phoneme overrides. For example,
+an operator can explicitly map `A P I` to `API` without expanding its meaning. Keep
+such choices profile-specific; text projection alone does not qualify pronunciation.
 
 Use the existing host Python environment, which supplies the CPU speech packages,
 PyYAML, and packaging helpers. The commands below use `$previewPython` for its

@@ -1377,3 +1377,100 @@ def test_preview_source_tree_ignores_foreign_git_selection(
             preview_cutover.verify_realtime_runtime(plan)
     else:
         assert preview_cutover.verify_realtime_runtime(plan)["package_files"] == 114
+
+
+@pytest.mark.parametrize("mapping", [{}, {"A P I": "API"}, {"x" * 64: "y" * 128}])
+def test_optional_pronunciations_preserve_exact_mapping(tmp_path, mapping):
+    path, _ = _plan(tmp_path)
+    value = json.loads(path.read_text())
+    value["speech"]["pronunciations"] = mapping
+    path.write_text(json.dumps(value))
+    assert preview_cutover.load_plan(path).speech["pronunciations"] == mapping
+
+
+@pytest.mark.parametrize("mapping", [
+    None, [], "API", {"": "API"}, {" A": "API"}, {"A ": "API"},
+    {"A": ""}, {"A": " API"}, {"A": "API "}, {"A": 1},
+    {"A" * 65: "API"}, {"A": "B" * 129}, {"A\nP": "API"},
+    {"A": "B\u200b"}, {"A": "one", "a": "two"},
+    {str(i): "word" for i in range(65)},
+])
+def test_optional_pronunciations_refuse_invalid_mapping(tmp_path, mapping):
+    path, _ = _plan(tmp_path)
+    value = json.loads(path.read_text())
+    value["speech"]["pronunciations"] = mapping
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="speech_pronunciations"):
+        preview_cutover.load_plan(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mapping", [None, {}, {"A P I": "API"}])
+@pytest.mark.parametrize("supported", [True, False])
+async def test_optional_pronunciations_host_forwarding(tmp_path, monkeypatch, mapping, supported):
+    path, profile = _plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    if mapping is not None:
+        plan.speech["pronunciations"] = mapping
+    plan.output.mkdir()
+    (plan.output / "host.stop").touch()
+    observed = []
+
+    class Launcher:
+        async def start(self):
+            observed.append("start")
+        async def close(self):
+            observed.append("close")
+
+    def supported_build(*, hermes_discover_tools=False, kokoro_pronunciations=None, **kwargs):
+        assert kokoro_pronunciations == (mapping or None)
+        return Launcher()
+
+    def unsupported_build(*, hermes_discover_tools=False, **kwargs):
+        assert "kokoro_pronunciations" not in kwargs
+        return Launcher()
+
+    host = SimpleNamespace(
+        _load_api_bearer=lambda _: "synthetic-not-a-credential",
+        _load_voice_companion=lambda *_: None,
+        LoopbackPeerAuthorizer=object,
+        build_local_host_launcher=supported_build if supported else unsupported_build,
+    )
+    monkeypatch.setattr(preview_cutover, "_active_plan", lambda _: (plan, None, profile))
+    monkeypatch.setattr(preview_cutover, "_runtime_modules", lambda _: (None, host))
+    if mapping and not supported:
+        with pytest.raises(ValueError, match="kokoro_pronunciations_host_unavailable"):
+            await preview_cutover._host_child(tmp_path / "active")
+        assert observed == []
+    else:
+        await preview_cutover._host_child(tmp_path / "active")
+        assert observed == ["start", "close"]
+
+
+@pytest.mark.parametrize("mapping", [None, {}, {"A P I": "API"}])
+@pytest.mark.parametrize("supported", [True, False])
+def test_optional_pronunciations_preflight_capability(tmp_path, monkeypatch, mapping, supported):
+    path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(path)
+    if mapping is not None:
+        plan.speech["pronunciations"] = mapping
+    plan.runtime_target.mkdir()
+
+    def supported_build(*, hermes_discover_tools=False, kokoro_pronunciations=None):
+        pass
+
+    def unsupported_build(*, hermes_discover_tools=False):
+        pass
+
+    host = SimpleNamespace(
+        __file__=str(plan.runtime_target / "hermes_realtime" / "host_launcher.py"),
+        build_local_host_launcher=supported_build if supported else unsupported_build,
+    )
+    monkeypatch.setattr(preview_cutover.importlib, "import_module", lambda _: host)
+    before = list(sys.path)
+    if mapping and not supported:
+        with pytest.raises(ValueError, match="kokoro_pronunciations_host_unavailable"):
+            preview_cutover.verify_host_profile_mode(plan)
+    else:
+        preview_cutover.verify_host_profile_mode(plan)
+    assert sys.path == before

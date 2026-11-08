@@ -117,7 +117,20 @@ Warm measurements require matching turn ID **and** generation. A foreground
 pair is bound only after the matching typed admission and user transcript;
 background/replayed speech cannot supply that pair. Missing identities remain
 unknown. Same-pair token-to-playable timing measures server preparation, not
-browser audibility or first nonzero PCM. The client does not infer semantic
+browser audibility or first nonzero PCM.
+
+Three optional passive fields partition that interval without changing acceptance.
+`firstPublicationMs` records the first matching current-pair
+`assistant_text_generated` timestamp relative to the input start.
+`tokenToPublicationMs` measures from the existing first-segment marker to that
+publication; it can include opening coalescing and model continuation, rather than
+raw first-model-delta latency. `publicationToPlayableMs` includes publication
+queueing, synthesis and consumer admission before the transport play call. It is
+neither isolated backend/GPU inference time nor browser-audible latency.
+Missing timestamps or reversed interval endpoints leave the affected interval null.
+These observations do not bind another turn or expand the existing marker cache. The three fields may be
+omitted if they would overflow the unchanged receipt bound; existing failure
+evidence takes precedence. The client does not infer semantic
 recall accuracy, source quality, phonemes, microphone recognition, or voice
 interruption from an HTTP transcript. Those remain separate acceptance checks.
 

@@ -1148,3 +1148,140 @@ def test_optional_os_metadata_never_relaxes_existing_receipt_bound(tmp_path, mon
     monkeypatch.setattr(client, "execute", execute)
     with pytest.raises(ValueError, match="journey_receipt_bound"):
         client.main([*argv, "--execute"])
+
+
+def test_passive_publication_intervals_use_only_first_current_pair():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.started = 1000.0
+    batch = [
+        event(1, "transcript_final", role="user", text="Synthetic input"),
+        event(2, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(3, "first_foreground_token", turnId="current", turnGeneration=1),
+        event(4, "assistant_text_generated", turnId="foreign", turnGeneration=1),
+        event(5, "assistant_text_generated", turnId="current", turnGeneration=1),
+        event(6, "assistant_text_generated", turnId="current", turnGeneration=1),
+        event(7, "first_playable_audio", turnId="current", turnGeneration=1),
+        event(8, "assistant_turn_completed", turnId="current", turnGeneration=1),
+    ]
+    for row, offset in zip(batch, [1, 2, 10, 20, 70, 80, 120, 130], strict=True):
+        row["monotonicMs"] = tracker.started + offset
+    tracker.consume(batch)
+    assert tracker.current["firstPublicationMs"] == 70
+    assert tracker.current["tokenToPublicationMs"] == 60
+    assert tracker.current["publicationToPlayableMs"] == 50
+    assert tracker.current["tokenToPlayableMs"] == 110
+    assert tracker.current["assistantSegments"] == 2
+    assert tracker.current["outcome"] == "completed"
+    assert set(tracker.markers) == {("current", 1)}
+    assert "Synthetic input" not in json.dumps(tracker.receipt())
+
+
+def test_missing_publication_does_not_change_existing_completion():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([
+        event(1, "transcript_final", role="user", text="Synthetic input"),
+        event(2, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(3, "first_foreground_token", turnId="current", turnGeneration=1),
+        event(4, "first_playable_audio", turnId="current", turnGeneration=1),
+        event(5, "assistant_turn_completed", turnId="current", turnGeneration=1),
+    ])
+    assert tracker.current["outcome"] == "completed"
+    for key in ("firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs"):
+        assert tracker.current[key] is None
+
+
+def test_publication_observation_does_not_expand_existing_marker_capacity():
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.consume([event(i + 1, "first_foreground_token", turnId=f"prior_{i}",
+                           turnGeneration=1) for i in range(128)])
+    tracker.consume([event(129, "assistant_text_generated", turnId="foreign", turnGeneration=1)])
+    assert len(tracker.markers) == 128
+    assert tracker.current["firstPublicationMs"] is None
+    with pytest.raises(ValueError, match="journey_marker_bound"):
+        tracker.consume([event(130, "first_playable_audio", turnId="foreign", turnGeneration=1)])
+
+
+def test_optional_publication_metadata_cannot_overflow_existing_fitting_receipt(
+    tmp_path, monkeypatch, capsys,
+):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    baseline = {"version": 1, "outcome": "completed", "executed": True,
+                "stepCount": 1, "turns": [{"outcome": "completed"}], "padding": ""}
+    padding = "x" * (65536 - len(json.dumps(baseline, sort_keys=True)))
+    async def execute(options, steps, result):
+        result.update(baseline | {"padding": padding})
+        result["turns"] = [{"outcome": "completed", "firstPublicationMs": 10,
+                            "tokenToPublicationMs": 2, "publicationToPlayableMs": 3}]
+    monkeypatch.setattr(client, "execute", execute)
+    assert client.main([*argv, "--execute"]) == 0
+    saved = json.loads(receipt.read_text())
+    assert saved == baseline | {"padding": padding}
+    assert len(json.dumps(saved, sort_keys=True)) == 65536
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("publication,playable,expected", [
+    (999, 1120, (None, None, None)),
+    (1070, 1060, (70, 60, None)),
+])
+def test_publication_intervals_keep_unsupported_timestamps_unknown(
+    publication, playable, expected,
+):
+    tracker = EventTracker()
+    tracker.begin("synthetic", 1, "Synthetic input")
+    tracker.started = 1000.0
+    batch = [
+        event(1, "transcript_final", role="user", text="Synthetic input"),
+        event(2, "typed_input_admitted", inputSequence=1, bindingGeneration=7),
+        event(3, "first_foreground_token", turnId="current", turnGeneration=1),
+        event(4, "assistant_text_generated", turnId="current", turnGeneration=1),
+        event(5, "first_playable_audio", turnId="current", turnGeneration=1),
+        event(6, "assistant_turn_completed", turnId="current", turnGeneration=1),
+    ]
+    for row, stamp in zip(batch, [1001, 1002, 1010, publication, playable, 1130], strict=True):
+        row["monotonicMs"] = stamp
+    tracker.consume(batch)
+    assert tuple(tracker.current[key] for key in (
+        "firstPublicationMs", "tokenToPublicationMs", "publicationToPlayableMs",
+    )) == expected
+    assert tracker.current["outcome"] == "completed"
+
+
+def test_optional_publication_fields_do_not_displace_existing_failure_evidence(
+    tmp_path, monkeypatch, capsys,
+):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    metadata = {"sourceFunction": "other", "sourceLine": None, "pathRole": "other",
+                "exceptionKind": "PermissionError", "errno": 13, "winerror": None}
+    baseline = {"version": 1, "outcome": "refused", "executed": True, "stepCount": 1,
+                "failure": "PermissionError", "osError": metadata,
+                "turns": [{"outcome": "pending"}], "padding": ""}
+    padding = "x" * (65536 - len(json.dumps(baseline, sort_keys=True)))
+    async def execute(options, steps, result):
+        result.update(baseline | {"padding": padding})
+        result["turns"] = [{"outcome": "pending", "firstPublicationMs": 10,
+                            "tokenToPublicationMs": 2, "publicationToPlayableMs": 3}]
+        raise PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE")
+    monkeypatch.setattr(client, "execute", execute)
+    monkeypatch.setattr(client, "_os_error_evidence", lambda error: metadata)
+    assert client.main([*argv, "--execute"]) == 1
+    saved = json.loads(receipt.read_text())
+    assert saved == baseline | {"padding": padding}
+    assert "SYNTHETIC" not in capsys.readouterr().out
+
+
+def test_optional_publication_metadata_never_relaxes_original_receipt_bound(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    _, _, argv = os_error_options(tmp_path)
+    async def execute(options, steps, result):
+        result.update(outcome="completed", padding="x" * 65536, turns=[{
+            "firstPublicationMs": 10, "tokenToPublicationMs": 2, "publicationToPlayableMs": 3,
+        }])
+    monkeypatch.setattr(client, "execute", execute)
+    with pytest.raises(ValueError, match="journey_receipt_bound"):
+        client.main([*argv, "--execute"])
