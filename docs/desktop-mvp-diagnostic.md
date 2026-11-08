@@ -1,8 +1,22 @@
 # Desktop MVP: setup and diagnostic session
 
-This guide sets up the exact profile of the Windows desktop MVP
-([#159](https://github.com/sushiHex/hermes-realtime/issues/159)) and walks the operator through
-the diagnostic session, step two of its plan.
+This guide preserves the historical Windows desktop diagnostic profile and its
+operator observation steps. The profile table and setup commands below are frozen
+reference material. Current integrated acceptance belongs to
+[#159](https://github.com/sushiHex/hermes-realtime/issues/159); the historical
+exact-profile public walkthrough remains under
+[#295](https://github.com/sushiHex/hermes-realtime/issues/295).
+
+For current source-bound native-preview setup, start with the
+[native work voice preview](native-work-preview.md). A managed profile can select
+cloud inference, Moonshine `medium` STT and MCP-managed GPU Kokoro explicitly;
+these are operator settings, not a change to portable defaults. The relevant
+references are [live access credentials](live-credentials.md),
+[managed Kokoro and its CPU option](kokoro-mcp.md), and
+[typed runtime checks](native-typed-journey.md). Their scoped API/typed evidence
+does not qualify the whole profile's physical voice experience. Use the
+[acceptance guide](desktop-mvp-acceptance.md) for provenance and observation limits,
+not to substitute frozen Phi/Qwen settings into the current native route.
 
 **This is a diagnostic session, not the acceptance session.** Its purpose is to bring
 integration findings forward. A failed step is a finding to record, not a reason to stop: record
@@ -135,7 +149,10 @@ Delegated-task session retention is an explicit acceptance witness, not a deleti
 
 ## The profile
 
-| Aspect | MVP setting |
+The default labels here refer to the recorded diagnostic, not the current native
+preview configuration. Preserve the actual settings with each observation.
+
+| Aspect | Historical setting |
 | --- | --- |
 | Operator | One operator, one Chrome browser on Windows. |
 | Hermes | v0.21.0 at `29112bef099274229cadff79cdff7bf7b99c4b77`, by the upstream installer. |

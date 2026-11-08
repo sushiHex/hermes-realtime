@@ -88,6 +88,10 @@ or an in-progress run; never imply that PR checks establish main's result.
 
 Windows is the primary target and several hazards are specific to it.
 
+- For deadline-bound Windows validation, follow the existing
+  [contained validation path](docs/contained-validation.md). A wrapper timeout or
+  exit alone does not establish owned process-tree settlement; do not copy the
+  guardian into another launcher.
 - For private profile diagnostics, use `scripts/profile_summary.py` to emit
   allowlisted routing metadata. Never print or search raw private configuration,
   `.env`, authentication caches, or environment dumps into tool output. Read
