@@ -236,7 +236,7 @@ async def test_deferred_command_failure_is_once_safe_and_fail_closed(
     await asyncio.sleep(0)
     assert surface.health == "uncertain"
     assert events == [("task_state", {
-        "status": "rejected", "taskId": None,
+        "status": "uncertain", "taskId": None,
         "reason": ("Task command acknowledgment is uncertain. "
                    "Check task status before trying again."),
     })]

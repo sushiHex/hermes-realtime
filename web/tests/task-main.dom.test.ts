@@ -600,6 +600,16 @@ describe("mounted task controls", () => {
     expect(dom.window.document.querySelectorAll('[data-operation="task"]')).toHaveLength(0);
   });
 
+  it("displays an uncertain acknowledgment as guidance without inventing a task or a refusal", async () => {
+    const reason = "Task command acknowledgment is uncertain. Check task status before trying again.";
+    const { task } = await mount();
+    await task(null, "uncertain", reason);
+    const text = dom.window.document.querySelector("#transcript")!.textContent;
+    expect(text).toContain(reason);
+    expect(text).not.toContain("Task command was refused.");
+    expect(dom.window.document.querySelectorAll('[data-operation="task"]')).toHaveLength(0);
+  });
+
   it("does not mark still-running work terminal when cancellation is refused", async () => {
     const { task, card, cancel } = await mount();
     await task("task_fixture", "active");

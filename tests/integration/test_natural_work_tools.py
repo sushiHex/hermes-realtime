@@ -999,7 +999,7 @@ async def test_uncertain_http_failure_blocks_later_work_admission(mode: str) -> 
         _assert_proposal_only(second, second_transport)
         assert await runtime.confirm() is WorkCommandAdmission.UNAVAILABLE
         assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
-            {"status": "rejected", "taskId": None, "reason": _UNCERTAIN_REASON},
+            {"status": "uncertain", "taskId": None, "reason": _UNCERTAIN_REASON},
         ]
         assert runtime.surface.health == "uncertain"
         assert len(runtime.stub.posts) == 1
