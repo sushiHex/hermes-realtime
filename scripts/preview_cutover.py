@@ -811,6 +811,108 @@ def native_web_evidence_contract(config: dict[str, Any]) -> str | None:
     return "hermes.web-evidence/v1" if web_evidence_selected(config) else None
 
 
+def _native_credential_python(plan: PreviewPlanV1) -> Path:
+    """Resolve native Hermes's base interpreter, avoiding a Windows venv child."""
+    try:
+        completed = subprocess.run(
+            [str(plan.hermes_python), "-I", "-B", "-S", "-c",
+             "import json,sys; print(json.dumps({'base':sys._base_executable}))"],
+            env=_base_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", timeout=15,
+        )
+        require(completed.returncode == 0 and completed.stderr == ""
+                and len(completed.stdout) <= 4096,
+                "native_credential_binding")
+        value = _json(completed.stdout.encode("utf-8"))
+        require(set(value) == {"base"} and type(value["base"]) is str,
+                "native_credential_binding")
+        base = Path(value["base"])
+        require(base.is_absolute() and base.is_file(), "native_credential_binding")
+        return base.resolve(strict=True)
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+
+
+def _verify_native_credentials(plan: PreviewPlanV1, config: dict[str, Any]) -> None:
+    accepted = False
+    try:
+        module = importlib.import_module("hermes_realtime.integration.codex_access_credentials")
+        expected = plan.runtime_target / "hermes_realtime/integration/codex_access_credentials.py"
+        require(module.__file__ is not None
+                and Path(module.__file__).resolve() == expected.resolve(),
+                "native_credential_binding")
+        module.validate_native_binding(config, _native_credential_python(plan), expected)
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+    finally:
+        if not accepted:
+            print('[native-credential-refused] {"version":1,"category":"binding_refused"}',
+                  file=sys.stderr, flush=True)
+
+
+def _native_credential_packages(plan: PreviewPlanV1) -> Path:
+    """Discover the matching native environment's purelib without loading a model."""
+    try:
+        completed = subprocess.run(
+            [str(plan.hermes_python), "-I", "-B", "-c",
+             "import json,sysconfig; "
+             "print(json.dumps({'packages':sysconfig.get_path('purelib')}))"],
+            env=_base_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", timeout=15,
+        )
+        require(completed.returncode == 0 and completed.stderr == ""
+                and len(completed.stdout) <= 4096,
+                "native_credential_binding")
+        value = _json(completed.stdout.encode("utf-8"))
+        require(set(value) == {"packages"} and type(value["packages"]) is str,
+                "native_credential_binding")
+        packages = Path(value["packages"])
+        require(packages.is_absolute() and packages.is_dir(), "native_credential_binding")
+        return packages.resolve(strict=True)
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+
+
+def _verify_native_credential_runtime(plan: PreviewPlanV1, home: Path) -> None:
+    if plan.policy_mode != "native":
+        return
+    config = _profile_config(_read(home / "config.yaml", _JSON_LIMIT))
+    settings = config.get("plugins", {}).get("entries", {}).get("hermes-realtime", {}).get(
+        "settings", {})
+    if "key_cmd_argv" not in settings.get("presentation", {}):
+        return
+    accepted = False
+    try:
+        require(home.resolve() == (plan.output / "input" / "home").resolve()
+                and home.resolve() != plan.profile_source.resolve(),
+                "native_credential_binding")
+        module = importlib.import_module("hermes_realtime.integration.native_credential_probe")
+        expected = plan.runtime_target / "hermes_realtime/integration/native_credential_probe.py"
+        require(module.__file__ is not None
+                and Path(module.__file__).resolve() == expected.resolve(),
+                "native_credential_binding")
+        provider = config["model"]["provider"]
+        selected = config["providers"][provider.split(":", 1)[1]]
+        env_file = home / ".env"
+        if not env_file.is_file():
+            env_file = plan.profile_source / ".env"
+        module.verify_native_credential_resolution(
+            executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
+            native_site_packages=_native_credential_packages(plan),
+            home=home, env_file=env_file, provider=provider, base_url=selected["base_url"],
+            model=selected["default_model"], api_mode=selected["api_mode"],
+            command=selected["key_cmd"], environment=_gateway_environment(home, plan.ports["api"]),
+        )
+        accepted = True
+    except Exception:
+        raise PreviewRefusal("native_credential_binding") from None
+    finally:
+        if not accepted:
+            print('[native-credential-refused] {"version":1,"category":"runtime_refused"}',
+                  file=sys.stderr, flush=True)
+
+
 def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> None:
     import importlib
     import inspect
@@ -846,6 +948,8 @@ def verify_host_profile_mode(plan: PreviewPlanV1, home: Path | None = None) -> N
                     presentation.Presentation(settings["presentation"])
                 except (TypeError, ValueError):
                     raise PreviewRefusal("native_web_presentation_config") from None
+                if "key_cmd_argv" in settings["presentation"]:
+                    _verify_native_credentials(plan, config)
         else:
             require("hermes_lookup_policy" in parameters, "lookup_policy_unavailable")
     finally:
@@ -860,6 +964,7 @@ def preflight(plan: PreviewPlanV1, home: Path | None = None) -> dict[str, Any]:
     verify_host_profile_mode(plan, home or plan.profile_source)
     verify_speech_assets(plan, home or plan.profile_source)
     _verify_managed_kokoro_assets(plan, home or plan.profile_source)
+    _verify_native_credential_runtime(plan, home or plan.profile_source)
     return {
         "category": "preflight_ready",
         "launch_authorized": False,

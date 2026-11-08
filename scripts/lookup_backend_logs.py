@@ -42,6 +42,12 @@ _MCP_CATEGORIES = {
     "profile_binding", "same_thread", "source_binding", "status_unknown",
     "transport_unavailable", "unsupported_force", "unsupported_platform",
 }
+_CREDENTIAL_MARKERS = {
+    b"[native-credential-refused] ":
+        ("native_credential_", {"binding_refused", "runtime_refused"}),
+    b"[presentation-credential-refused] ":
+        ("presentation_credential_", {"credential", "cleanup_unknown"}),
+}
 
 
 def _startup_failure_category(raw: bytes, host: bool) -> str:
@@ -100,6 +106,23 @@ class CappedCapture:
                     self._pending.clear()
 
     def _line(self, raw: Any, now: Any) -> Any:
+        for prefix, (label, allowed) in _CREDENTIAL_MARKERS.items():
+            if raw.startswith(prefix):
+                name = "credential_failure_invalid"
+                try:
+                    value = json.loads(raw[len(prefix):], object_pairs_hook=_unique_fields)
+                    if (type(value) is dict and set(value) == {"version", "category"}
+                            and type(value["version"]) is int and value["version"] == 1
+                            and type(value["category"]) is str and value["category"] in allowed):
+                        name = label + value["category"]
+                except (ValueError, TypeError, RecursionError):
+                    pass
+                item = self.categories.setdefault(
+                    name, {"count": 0, "first_ns": now, "last_ns": now},
+                )
+                item["count"] = min(1000000, item["count"] + 1)
+                item["last_ns"] = now
+                return
         for prefix, host, invalid in (
             (b"[voice-preview-host-failure] ", True, "host_failure_invalid"),
             (b"[kokoro-mcp-refused] ", False, "kokoro_mcp_failure_invalid"),

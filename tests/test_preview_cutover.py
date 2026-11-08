@@ -259,11 +259,13 @@ def test_preflight_passes_the_staged_home_to_every_profile_check(tmp_path, monke
     called = []
     monkeypatch.setattr(preview_cutover, "verify_realtime_runtime", lambda p: None)
     monkeypatch.setattr(preview_cutover, "verify_cpu_speech", lambda p: None)
-    for name in ("verify_profile", "verify_host_profile_mode", "verify_speech_assets"):
+    for name in ("verify_profile", "verify_host_profile_mode", "verify_speech_assets",
+                 "_verify_native_credential_runtime"):
         monkeypatch.setattr(preview_cutover, name, lambda p, h, name=name: called.append((name, h)))
     preview_cutover.preflight(plan, home)
     assert called == [(name, home) for name in (
-        "verify_profile", "verify_host_profile_mode", "verify_speech_assets")]
+        "verify_profile", "verify_host_profile_mode", "verify_speech_assets",
+        "_verify_native_credential_runtime")]
 
 
 def test_base_environment_preserves_programfiles_without_passing_credentials(monkeypatch):
