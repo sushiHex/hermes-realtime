@@ -65,7 +65,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Bounded retry for transient release-download 5xx; the checksum below stays the authority.
-          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 4; 'Invoke-WebRequest:RetryIntervalSec' = 15; 'Invoke-WebRequest:TimeoutSec' = 60 }
+          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 4; 'Invoke-WebRequest:RetryIntervalSec' = 15 }
           $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
           Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
           $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -388,7 +388,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # Bounded retry for transient release-download 5xx; the checksum below stays the authority.
-          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 4; 'Invoke-WebRequest:RetryIntervalSec' = 15; 'Invoke-WebRequest:TimeoutSec' = 60 }
+          $PSDefaultParameterValues = @{ 'Invoke-WebRequest:MaximumRetryCount' = 4; 'Invoke-WebRequest:RetryIntervalSec' = 15 }
           $archive = Join-Path $env:RUNNER_TEMP 'livekit_1.13.4_windows_amd64.zip'
           Invoke-WebRequest 'https://github.com/livekit/livekit/releases/download/v1.13.4/livekit_1.13.4_windows_amd64.zip' -OutFile $archive
           $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
