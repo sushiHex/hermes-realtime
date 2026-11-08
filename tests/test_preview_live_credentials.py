@@ -332,3 +332,120 @@ def test_runtime_resolution_refuses_source_profile_even_at_planned_home(tmp_path
     with pytest.raises(preview_cutover.PreviewRefusal, match="^native_credential_binding$"):
         preview_cutover._verify_native_credential_runtime(s.plan, s.home)
     assert s.calls == []
+
+
+@pytest.mark.parametrize("probe_fails", [False, True])
+def test_native_probe_removes_only_its_new_empty_directories_before_profile_copy(
+    tmp_path, monkeypatch, probe_fails,
+):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    def probe(**kwargs):
+        for name in ("skills", "hooks"):
+            (s.home / name).mkdir()
+        if probe_fails:
+            raise ValueError("synthetic_probe_refusal")
+    monkeypatch.setattr(s.module, "verify_native_credential_resolution", probe)
+    if probe_fails:
+        with pytest.raises(preview_cutover.PreviewRefusal, match="native_credential_binding"):
+            preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    else:
+        preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    for name in ("skills", "hooks"):
+        assert not (s.home / name).exists()
+        original = tmp_path / ("source-" + name)
+        original.mkdir()
+        (original / "synthetic.txt").write_text("preserve this synthetic file")
+        assert preview_cutover._copy_tree(original, s.home / name)[0] == 1
+        assert (s.home / name / "synthetic.txt").read_text() == "preserve this synthetic file"
+
+
+def test_native_probe_preserves_preexisting_empty_directories_and_copy_collision_guard(
+    tmp_path, monkeypatch,
+):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    for name in ("skills", "hooks"):
+        (s.home / name).mkdir()
+    preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    for name in ("skills", "hooks"):
+        assert (s.home / name).is_dir()
+    source = tmp_path / "copy-source"
+    source.mkdir()
+    with pytest.raises(preview_cutover.PreviewRefusal, match="profile_copy_collision"):
+        preview_cutover._copy_tree(source, s.home / "skills")
+
+
+@pytest.mark.parametrize("kind", ["nonempty", "file", "reparse"])
+def test_native_probe_preserves_unsafe_new_path_and_refuses_ready(
+    tmp_path, monkeypatch, kind,
+):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    target = s.home / "skills"
+    original_lstat = Path.lstat
+    def lstat(path, *args, **kwargs):
+        metadata = original_lstat(path, *args, **kwargs)
+        if path == target and kind == "reparse":
+            return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=0x400)
+        return metadata
+    monkeypatch.setattr(Path, "lstat", lstat)
+    def probe(**kwargs):
+        if kind == "file":
+            target.write_text("synthetic retained data")
+        else:
+            target.mkdir()
+            if kind == "nonempty":
+                (target / "data").write_text("synthetic retained data")
+    monkeypatch.setattr(s.module, "verify_native_credential_resolution", probe)
+    with pytest.raises(preview_cutover.PreviewRefusal, match="native_credential_binding"):
+        preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    assert target.exists()
+    if kind == "nonempty":
+        assert (target / "data").read_text() == "synthetic retained data"
+    elif kind == "file":
+        assert target.read_text() == "synthetic retained data"
+
+
+def test_native_probe_cleanup_error_refuses_ready_without_echo(tmp_path, monkeypatch, capsys):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    target = s.home / "skills"
+    original_rmdir = Path.rmdir
+    def rmdir(path):
+        if path == target:
+            raise PermissionError("SYNTHETIC_PRIVATE_PATH")
+        return original_rmdir(path)
+    monkeypatch.setattr(Path, "rmdir", rmdir)
+    monkeypatch.setattr(s.module, "verify_native_credential_resolution",
+                        lambda **kwargs: target.mkdir())
+    with pytest.raises(preview_cutover.PreviewRefusal, match="native_credential_binding"):
+        preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    assert target.is_dir()
+    assert capsys.readouterr().err == ('[native-credential-refused] '
+                                     '{"version":1,"category":"runtime_refused"}\n')
+
+
+def test_native_probe_cleanup_rechecks_owned_parent_before_removal(tmp_path, monkeypatch):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    target = s.home / "skills"
+    original_resolve = Path.resolve
+    changed = False
+    def resolve(path, *args, **kwargs):
+        if changed and path == s.home:
+            return tmp_path / "outside"
+        return original_resolve(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    def probe(**kwargs):
+        nonlocal changed
+        target.mkdir()
+        changed = True
+    monkeypatch.setattr(s.module, "verify_native_credential_resolution", probe)
+    with pytest.raises(preview_cutover.PreviewRefusal, match="native_credential_binding"):
+        preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    assert target.is_dir()
+
+
+def test_native_probe_does_not_remove_other_new_directories(tmp_path, monkeypatch):
+    s = runtime_fixture(tmp_path, monkeypatch)
+    target = s.home / "keep"
+    monkeypatch.setattr(s.module, "verify_native_credential_resolution",
+                        lambda **kwargs: target.mkdir())
+    preview_cutover._verify_native_credential_runtime(s.plan, s.home)
+    assert target.is_dir()

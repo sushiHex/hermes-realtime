@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -897,13 +898,35 @@ def _verify_native_credential_runtime(plan: PreviewPlanV1, home: Path) -> None:
         env_file = home / ".env"
         if not env_file.is_file():
             env_file = plan.profile_source / ".env"
-        module.verify_native_credential_resolution(
-            executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
-            native_site_packages=_native_credential_packages(plan),
-            home=home, env_file=env_file, provider=provider, base_url=selected["base_url"],
-            model=selected["default_model"], api_mode=selected["api_mode"],
-            command=selected["key_cmd"], environment=_gateway_environment(home, plan.ports["api"]),
-        )
+        owned_home = home.resolve()
+        absent_directories = []
+        for name in ("skills", "hooks"):
+            directory = home / name
+            try:
+                directory.lstat()
+            except FileNotFoundError:
+                absent_directories.append(directory)
+        try:
+            module.verify_native_credential_resolution(
+                executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
+                native_site_packages=_native_credential_packages(plan),
+                home=home, env_file=env_file, provider=provider, base_url=selected["base_url"],
+                model=selected["default_model"], api_mode=selected["api_mode"],
+                command=selected["key_cmd"],
+                environment=_gateway_environment(home, plan.ports["api"]),
+            )
+        finally:
+            for directory in absent_directories:
+                require(directory.parent.resolve() == owned_home, "native_credential_binding")
+                try:
+                    metadata = directory.lstat()
+                except FileNotFoundError:
+                    continue
+                require(stat.S_ISDIR(metadata.st_mode)
+                        and not (getattr(metadata, "st_file_attributes", 0) & 0x400),
+                        "native_credential_binding")
+                # rmdir atomically refuses nonempty directories; never recurse or unlink.
+                directory.rmdir()
         accepted = True
     except Exception:
         raise PreviewRefusal("native_credential_binding") from None
