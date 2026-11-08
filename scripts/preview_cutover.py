@@ -12,7 +12,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -878,7 +877,8 @@ def _native_credential_packages(plan: PreviewPlanV1) -> Path:
 def _verify_native_credential_runtime(plan: PreviewPlanV1, home: Path) -> None:
     if plan.policy_mode != "native":
         return
-    config = _profile_config(_read(home / "config.yaml", _JSON_LIMIT))
+    config_bytes = _read(home / "config.yaml", _JSON_LIMIT)
+    config = _profile_config(config_bytes)
     settings = config.get("plugins", {}).get("entries", {}).get("hermes-realtime", {}).get(
         "settings", {})
     if "key_cmd_argv" not in settings.get("presentation", {}):
@@ -898,35 +898,24 @@ def _verify_native_credential_runtime(plan: PreviewPlanV1, home: Path) -> None:
         env_file = home / ".env"
         if not env_file.is_file():
             env_file = plan.profile_source / ".env"
-        owned_home = home.resolve()
-        absent_directories = []
-        for name in ("skills", "hooks"):
-            directory = home / name
-            try:
-                directory.lstat()
-            except FileNotFoundError:
-                absent_directories.append(directory)
-        try:
-            module.verify_native_credential_resolution(
-                executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
-                native_site_packages=_native_credential_packages(plan),
-                home=home, env_file=env_file, provider=provider, base_url=selected["base_url"],
-                model=selected["default_model"], api_mode=selected["api_mode"],
-                command=selected["key_cmd"],
-                environment=_gateway_environment(home, plan.ports["api"]),
-            )
-        finally:
-            for directory in absent_directories:
-                require(directory.parent.resolve() == owned_home, "native_credential_binding")
-                try:
-                    metadata = directory.lstat()
-                except FileNotFoundError:
-                    continue
-                require(stat.S_ISDIR(metadata.st_mode)
-                        and not (getattr(metadata, "st_file_attributes", 0) & 0x400),
-                        "native_credential_binding")
-                # rmdir atomically refuses nonempty directories; never recurse or unlink.
-                directory.rmdir()
+        scratch = Path(tempfile.mkdtemp(prefix="credential-probe-", dir=plan.output))
+        require(scratch.parent.resolve() == plan.output.resolve()
+                and scratch.is_dir() and not scratch.is_symlink()
+                and not (getattr(scratch.lstat(), "st_file_attributes", 0) & 0x400),
+                "native_credential_binding")
+        copied = _copy_bounded_file(home / "config.yaml", scratch / "config.yaml", _JSON_LIMIT)
+        require(copied == hashlib.sha256(config_bytes).hexdigest()
+                and digest(scratch / "config.yaml") == copied, "native_credential_binding")
+        # Native configuration/pool defaults stay in this retained private scratch
+        # home, never the profile that finalize will copy into. Do not delete it.
+        module.verify_native_credential_resolution(
+            executable=_native_credential_python(plan), hermes_source=plan.hermes_source,
+            native_site_packages=_native_credential_packages(plan),
+            home=scratch, env_file=env_file, provider=provider, base_url=selected["base_url"],
+            model=selected["default_model"], api_mode=selected["api_mode"],
+            command=selected["key_cmd"],
+            environment=_gateway_environment(scratch, plan.ports["api"]),
+        )
         accepted = True
     except Exception:
         raise PreviewRefusal("native_credential_binding") from None

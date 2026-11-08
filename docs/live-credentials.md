@@ -48,9 +48,13 @@ precedence over `key_cmd` in the pinned native resolver, so matching configurati
 strings alone do not establish the actual credential source. The native probe
 checks the real resolver's exact callable type, command and route without calling
 the credential. Resolution-time network/process I/O causes refusal, including a
-pool refresh that fails and falls back. Startup checks use the gateway's loaded
+pool refresh that fails and falls back. Preparation checks an exact bounded copy
+of the staged configuration in a retained private scratch home under the output,
+using the selected read-only environment file. Native initialization stays outside
+the profile handoff. This checks the configured resolver input, not the finalized
+home. Startup separately checks the real finalized home and the gateway's loaded
 environment before advertising the existing web-evidence readiness contract.
-Native pool/cache bookkeeping may occur inside the owned profile; the probe is
+Native pool/cache bookkeeping may occur inside those owned homes; the probe is
 not a filesystem-read-only operation. The source profile, source environment file
 and primary CLI sign-in remain unchanged.
 
