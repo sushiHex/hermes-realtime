@@ -969,3 +969,182 @@ async def test_historical_terminal_map_entry_never_counts_as_a_new_dispatch(tmp_
                         "wait": "accepted"})
     assert journey.bindings == {"new": ("task_new", run)}
     assert journey.tracker.tasks["task_history"] == "completed"
+
+
+def os_error_options(tmp_path):
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"version": 1, "steps": [
+        {"kind": "conversation", "label": "synthetic", "text": "Synthetic fixture"},
+    ]}))
+    receipt = tmp_path / "receipt.json"
+    return scenario, receipt, [
+        "--preview-dir", str(tmp_path), "--native-profile", str(tmp_path),
+        "--scenario", str(scenario), "--receipt", str(receipt),
+        "--browser-origin", "http://127.0.0.1:1", "--api-origin", "http://127.0.0.1:2",
+        "--livekit-url", "ws://127.0.0.1:3",
+    ]
+
+
+@pytest.mark.parametrize("role", ["scenario", "journal"])
+def test_main_os_error_receipt_identifies_trusted_read_context_without_private_data(
+    tmp_path, monkeypatch, capsys, role,
+):
+    import inspect
+    from pathlib import Path
+
+    import scripts.native_typed_journey as client
+    scenario, receipt, argv = os_error_options(tmp_path)
+    journal = tmp_path / "state" / "hermes-runs-v1.json"
+    target = scenario if role == "scenario" else journal
+    error = PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE", "SYNTHETIC_PRIVATE_PATH")
+    error.winerror = 5
+    original = Path.open
+    attempts = []
+    def open_file(path, *args, **kwargs):
+        if path == target:
+            attempts.append(True)
+            raise error
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", open_file)
+    if role == "journal":
+        async def execute(*args):
+            client.read_journal(journal)
+        monkeypatch.setattr(client, "execute", execute)
+        argv.append("--execute")
+    assert client.main(argv) == 1
+    assert attempts == [True]
+    output = capsys.readouterr()
+    saved = json.loads(receipt.read_text()) if receipt.exists() else json.loads(
+        output.out.removeprefix("[native-typed-journey] "))
+    assert saved["failure"] == "PermissionError" and saved["outcome"] == "refused"
+    metadata = saved["osError"]
+    assert metadata == {
+        "sourceFunction": "read_json", "sourceLine": metadata["sourceLine"],
+        "pathRole": role, "exceptionKind": "PermissionError", "errno": 13, "winerror": 5,
+    }
+    lines, first = inspect.getsourcelines(client.read_json)
+    assert metadata["sourceLine"] == first + next(
+        i for i, line in enumerate(lines) if 'with path.open("rb")' in line)
+    serialized = json.dumps(saved) + output.out + output.err
+    assert "SYNTHETIC_PRIVATE_MESSAGE" not in serialized
+    assert "SYNTHETIC_PRIVATE_PATH" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_passive_os_metadata_keeps_original_reader_exception(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import scripts.native_typed_journey as client
+    error = PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE")
+    def open_file(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(Path, "open", open_file)
+    with pytest.raises(PermissionError) as caught:
+        client.read_json(tmp_path / "synthetic")
+    assert caught.value is error
+
+
+def test_os_diagnostic_failure_cannot_mask_existing_outcome_or_cleanup(
+    tmp_path, monkeypatch, capsys,
+):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    error = PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE")
+    async def execute(options, steps, result):
+        try:
+            raise error
+        finally:
+            result["cleanup"] = {"syntheticSettled": True}
+    def failed_metadata(_):
+        raise RuntimeError("SYNTHETIC_DIAGNOSTIC_FAILURE")
+    monkeypatch.setattr(client, "execute", execute)
+    monkeypatch.setattr(client, "_os_error_evidence", failed_metadata)
+    assert client.main([*argv, "--execute"]) == 1
+    saved = json.loads(receipt.read_text())
+    assert saved["failure"] == "PermissionError" and saved["outcome"] == "refused"
+    assert saved["cleanup"] == {"syntheticSettled": True}
+    assert "osError" not in saved
+    assert "SYNTHETIC" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("code", [None, True, "SYNTHETIC_PRIVATE_VALUE", 1.5, -(2**31)-1, 2**32])
+def test_os_diagnostic_codes_are_exact_bounded_integers(code):
+    import scripts.native_typed_journey as client
+    error = OSError("SYNTHETIC_PRIVATE_MESSAGE")
+    error.errno = code
+    error.winerror = code
+    metadata = client._os_error_evidence(error)
+    assert metadata == {"sourceFunction": "other", "sourceLine": None, "pathRole": "other",
+                        "exceptionKind": "OSError", "errno": None, "winerror": None}
+    assert "SYNTHETIC" not in json.dumps(metadata)
+
+
+@pytest.mark.parametrize("code", [-(2**31), 0, 2**32-1])
+def test_os_diagnostic_retains_supported_integer_scalars(code):
+    import scripts.native_typed_journey as client
+    error = OSError("SYNTHETIC_PRIVATE_MESSAGE")
+    error.errno = error.winerror = code
+    metadata = client._os_error_evidence(error)
+    assert metadata["errno"] == metadata["winerror"] == code
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_success_and_non_os_failure_have_no_os_metadata(tmp_path, monkeypatch, capsys, failure):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    if failure:
+        async def execute(*args):
+            raise ValueError("journey_synthetic")
+        monkeypatch.setattr(client, "execute", execute)
+        argv.append("--execute")
+    assert client.main(argv) == int(failure)
+    saved = json.loads(receipt.read_text())
+    assert "osError" not in saved
+    assert saved["outcome"] == ("refused" if failure else "preflight_only")
+    assert saved.get("failure") == ("journey_synthetic" if failure else None)
+
+
+def test_unknown_os_subclass_and_wrapper_names_do_not_enter_metadata():
+    import scripts.native_typed_journey as client
+    class SyntheticPrivateException(OSError):
+        pass
+    def synthetic_private_wrapper():
+        raise SyntheticPrivateException(13, "SYNTHETIC_PRIVATE_MESSAGE", "SYNTHETIC_PRIVATE_PATH")
+    try:
+        synthetic_private_wrapper()
+    except OSError as error:
+        metadata = client._os_error_evidence(error)
+    assert metadata["sourceFunction"] == "other" and metadata["sourceLine"] is None
+    assert metadata["exceptionKind"] == "OSError" and metadata["pathRole"] == "other"
+    assert "synthetic" not in json.dumps(metadata).lower()
+
+
+def test_optional_os_metadata_cannot_overflow_an_existing_fitting_receipt(
+    tmp_path, monkeypatch, capsys,
+):
+    import scripts.native_typed_journey as client
+    _, receipt, argv = os_error_options(tmp_path)
+    baseline = {"version": 1, "outcome": "refused", "executed": True, "stepCount": 1,
+                "failure": "PermissionError", "padding": ""}
+    padding = "x" * (65536 - len(json.dumps(baseline, sort_keys=True)))
+    async def execute(options, steps, result):
+        result["padding"] = padding
+        raise PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE")
+    monkeypatch.setattr(client, "execute", execute)
+    assert client.main([*argv, "--execute"]) == 1
+    saved = json.loads(receipt.read_text())
+    assert saved == baseline | {"padding": padding}
+    assert "osError" not in saved
+    assert len(json.dumps(saved, sort_keys=True)) == 65536
+    assert "SYNTHETIC" not in capsys.readouterr().out
+
+
+def test_optional_os_metadata_never_relaxes_existing_receipt_bound(tmp_path, monkeypatch):
+    import scripts.native_typed_journey as client
+    _, _, argv = os_error_options(tmp_path)
+    async def execute(options, steps, result):
+        result["padding"] = "x" * 65536
+        raise PermissionError(13, "SYNTHETIC_PRIVATE_MESSAGE")
+    monkeypatch.setattr(client, "execute", execute)
+    with pytest.raises(ValueError, match="journey_receipt_bound"):
+        client.main([*argv, "--execute"])
