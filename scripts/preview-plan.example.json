@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "output": "C:/preview/output",
+  "readiness_policy": "kernel_listeners",
+  "realtime": {
+    "source": "C:/preview/hermes-realtime",
+    "revision": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "wheel": "C:/preview/hermes-realtime/dist/hermes_realtime-0.0.0-py3-none-any.whl",
+    "wheel_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "runtime_target": "C:/preview/runtime",
+    "record_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "git_executable": "C:/Program Files/Git/cmd/git.exe"
+  },
+  "hermes": {
+    "source": "C:/preview/hermes-home/hermes-agent",
+    "revision": "0000000000000000000000000000000000000000",
+    "tree": "0000000000000000000000000000000000000000",
+    "python": "C:/preview/hermes-home/hermes-agent/venv/Scripts/python.exe",
+    "profile_source": "C:/preview/profile"
+  },
+  "profile_mode": "native",
+  "native_status": {
+    "command": "C:/preview/vram-mcp/Scripts/vram-mcp.exe",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "state_dir": "C:/preview/vram-mcp-state",
+    "python_user_base": null
+  },
+  "speech_assets": {
+    "receipt": "C:/preview/speech-assets/receipt.json",
+    "moonshine_cache": "C:/preview/speech-assets/moonshine",
+    "kokoro_cache": "C:/preview/speech-assets/kokoro/0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "ports": {
+    "api": 59876,
+    "companion": 59877,
+    "livekit": 7880,
+    "host": 28765,
+    "protected": []
+  },
+  "models": {
+    "foreground": "gpt-5.6-terra",
+    "foreground_effort": "low",
+    "background": "gpt-6-luna",
+    "background_effort": "low"
+  },
+  "speech": {
+    "stt_provider": "moonshine",
+    "stt_tier": "medium",
+    "tts_provider": "kokoro",
+    "tts_voice": "bf_isabella",
+    "tts_threads": 8,
+    "tts_chunk_chars": 128,
+    "moonshine_version": "0.1.5",
+    "kokoro_version": "0.6.1",
+    "onnxruntime_version": "1.22.0"
+  },
+  "executables": {
+    "codex": "C:/preview/codex/codex.exe",
+    "livekit": "C:/preview/livekit/livekit-server.exe",
+    "host_python": "C:/preview/host-venv/Scripts/python.exe"
+  },
+  "host_options": {
+    "allow_unsandboxed_tasks": false,
+    "natural_work_tools": true,
+    "task_start_policy": "automatic",
+    "conversation_profile": "natural_v1"
+  }
+}
