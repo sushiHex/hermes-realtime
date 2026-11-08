@@ -542,6 +542,7 @@ async def test_expired_status_call_rejects_without_speech_and_same_adapter_recov
 @pytest.mark.parametrize("stall", ["receipt", "interrupt", "terminal_receipt"])
 async def test_expired_status_cleanup_stall_closes_session_within_one_budget(stall):
     import asyncio
+    import gc
 
     from test_codex_app_server import FakeWorkToolHandler, ManualDynamicCodexTransport, _snapshot
 
@@ -557,9 +558,7 @@ async def test_expired_status_cleanup_stall_closes_session_within_one_budget(sta
             await super().send(message)
 
     transport = Stalled()
-    # One request budget bounds each send and the stalled cleanup. 0.05 s (about three 15.6 ms
-    # Windows ticks) expired on a loaded hosted runner during thread/start, before the stall
-    # under test, so the budget is 0.2 s and the window keeps its original 8x ratio.
+    # One request budget bounds each send and the stalled cleanup; the window is 8x it.
     budget = 0.2
     inference = CodexAppServerStreamingInference(
         model="gpt-5.6-terra", effort="low", transport_factory=lambda: transport,
@@ -585,6 +584,12 @@ async def test_expired_status_cleanup_stall_closes_session_within_one_budget(sta
         async for part in inference.stream(_snapshot(), turn_id="turn_cleanup_stall"):
             rows.append(part)
 
+    # The fake transport's sends never suspend, and a send that returns after its deadline
+    # fails closed, so a stop-the-world collection inside the window fails thread/start on a
+    # large full-suite heap. Collect first, then keep automatic collection out of the window.
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     response = asyncio.create_task(collect_turn())
     try:
         async with asyncio.timeout(8 * budget):
@@ -603,8 +608,12 @@ async def test_expired_status_cleanup_stall_closes_session_within_one_budget(sta
         with pytest.raises(RuntimeError, match="closed"):
             [part async for part in inference.stream(_snapshot(), turn_id="turn_refused")]
     finally:
-        await inference.close()
-        await asyncio.gather(response, return_exceptions=True)
+        try:
+            await inference.close()
+            await asyncio.gather(response, return_exceptions=True)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ from hermes_realtime.conversation.work_tools import (
     WORK_OBJECTIVE_CONTEXT_POLICY,
     WORK_ROUTING_POLICY,
 )
+from hermes_realtime.providers._call_imitation import contains_tool_call_imitation
 from hermes_realtime.providers._text_segmentation import first_speakable_sentence_end
 from hermes_realtime.providers._work_claims import has_background_work_claim
 from hermes_realtime.providers.ollama_models import (
@@ -554,6 +555,7 @@ class OllamaStreamingInference:
                     if handler is None:
                         segments, buffer = self._extract_segments(buffer, final=False)
                         for segment in segments:
+                            self._refuse_call_imitation(segment)
                             async with self._state_lock:
                                 self._require_stream_ownership_locked(
                                     turn_id, response, phase="before_yield", work=False,
@@ -596,8 +598,10 @@ class OllamaStreamingInference:
                     return
                 if handler is not None and has_background_work_claim(buffer):
                     self._refuse_work("unverified_claim")
+                self._refuse_call_imitation(buffer)
             segments, buffer = self._extract_segments(buffer, final=True)
             for segment in segments:
+                self._refuse_call_imitation(segment)
                 async with self._state_lock:
                     self._require_stream_ownership_locked(
                         turn_id, response,
@@ -675,6 +679,11 @@ class OllamaStreamingInference:
             raise OllamaDecisionRefused(category)
         finally:
             cls._work_evidence(category, attempts=attempts)
+
+    @classmethod
+    def _refuse_call_imitation(cls, text: str) -> None:
+        if contains_tool_call_imitation(text):
+            cls._refuse_work("call_imitation")
 
     @classmethod
     def _work_limit(cls, category: str, *, attempts: int = 0) -> None:

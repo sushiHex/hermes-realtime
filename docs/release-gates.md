@@ -160,7 +160,9 @@ terminal selection and reports its count, case IDs and request latency separatel
 consults no live task controller and delivers no audio. The effect-free shadow handler owns
 the active case and refuses a status request mixed with recorded lifecycle calls. A later
 stream item, an unknown item or a marker subclass fails the attempt; readiness continues to
-accept speech strings only. Earlier model prose remains ordinary unreviewed prose.
+accept speech strings only. Earlier model prose remains ordinary unreviewed prose, except
+that the Ollama and Codex adapters refuse segments containing call syntax for an
+advertised tool (ADR 0004, #311).
 
 The evaluator also accepts the exact validated `HostTaskProposalRequest` as a terminal
 selection. It counts `start_work` in the existing shadow routing counters without calling
