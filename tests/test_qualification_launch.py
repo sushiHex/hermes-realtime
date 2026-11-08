@@ -951,15 +951,33 @@ def test_actual_evaluator_opted_in_cli_uses_default_owner_without_model(
 ) -> None:
     binding, digest = _binding(tmp_path)
     receipt = tmp_path / "cli-receipt.jsonl"
-    root = Path(__file__).resolve().parents[1]
-    if not (root / ".git").exists():
+    outer = Path(__file__).resolve().parents[1]
+    if not (outer / ".git").exists():
         pytest.skip("Git checkout required; materialized archive refusal runs separately")
     from tests.test_candidate_source_archive_oracle import GIT
 
+    # The evaluator correctly refuses a dirty source tree, so bind to a disposable
+    # clean clone of the committed HEAD instead of the developer's working tree.
+    # Check out the outer HEAD explicitly: a clone follows the advertised HEAD,
+    # which need not be this checkout's commit in a linked worktree.
+    outer_head = subprocess.run(
+        [str(GIT), "rev-parse", "HEAD"], cwd=outer, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    root = (tmp_path / "candidate").resolve()
+    for command, cwd in (
+        (("clone", "-q", "--no-checkout", "--no-hardlinks", str(outer), str(root)), outer),
+        (("checkout", "-q", "--detach", outer_head), root),
+    ):
+        subprocess.run(
+            [str(GIT), "-c", "core.autocrlf=false", *command], cwd=cwd, check=True,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=120,
+        )
     source_head = subprocess.run(
         [str(GIT), "rev-parse", "HEAD"], cwd=root, check=True,
         text=True, capture_output=True,
     ).stdout.strip()
+    assert source_head == outer_head
     source_tree = subprocess.run(
         [str(GIT), "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
         text=True, capture_output=True,
