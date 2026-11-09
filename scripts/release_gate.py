@@ -910,6 +910,10 @@ def gate_materialized_candidate(
     # rewrite generated static output.
     packaged_static = workspace / "packaged-static-before-web-build"
     snapshot_packaged_static(root, packaged_static)
+    # web/build.mjs rewrites the manifest's asset hashes, so the committed
+    # manifest must be checked against the committed bytes before it can be
+    # repaired. The post-build validation below still checks the build output.
+    validate_disclosure_manifest(root / "src")
     run("uv", "sync", "--frozen", "--python", "3.11", "--dev", cwd=root, env=environment)
     source_env = environment | {"PYTHONPATH": str(root / "src")}
     run(
@@ -1098,6 +1102,38 @@ def self_test() -> None:
         stale.write_bytes(b"fresh build output")
         expect_failure(
             lambda: check_static_parity(candidate, snapshot), "generated static asset is stale"
+        )
+
+        evidence = candidate / "src" / "hermes_realtime" / "evidence"
+        evidence.mkdir(parents=True)
+        disclosure = b"self-test disclosure\n"
+        (evidence / "disclosure_v1.txt").write_bytes(disclosure)
+        static = candidate / "src" / "hermes_realtime" / "client" / "static"
+        committed = {
+            name: hashlib.sha256((static / relative).read_bytes()).hexdigest()
+            for name, relative in (
+                ("app.js", "assets/app.js"),
+                ("index.html", "index.html"),
+                ("styles.css", "assets/styles.css"),
+            )
+        }
+        manifest = {
+            "assets": committed,
+            "consentVersion": "realtime-evidence-consent-v1",
+            "disclosureDigest": hashlib.sha256(
+                b"realtime-evidence-consent-v1\0" + disclosure
+            ).hexdigest(),
+            "disclosureSha256": hashlib.sha256(disclosure).hexdigest(),
+            "version": 1,
+        }
+        manifest_path = evidence / "disclosure_manifest_v1.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        validate_disclosure_manifest(candidate / "src")
+        manifest["assets"] = committed | {"styles.css": "0" * 64}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        expect_failure(
+            lambda: validate_disclosure_manifest(candidate / "src"),
+            "evidence disclosure manifest does not match packaged resources",
         )
 
         ambient = root / "ambient-candidate" / "web" / "tmp"
