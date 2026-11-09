@@ -384,7 +384,7 @@ async def test_duplicate_after_failed_receipt_shares_one_cleanup_deadline(
         assert deadline is not None
         assert routing.failure.is_set() and inference._closed is True
         assert handler.starts == handler.cancels == handler.exact_cancels == []
-        assert routing.lookup_attempted is True and routing.accepted_start is False
+        assert routing.lookup_attempted is True
         monkeypatch.setattr(loop, "time", lambda: deadline + (1 if expired else -0.01))
         async with asyncio.timeout(1):
             await asyncio.create_task(inference._route_server_request(request(92)))
@@ -435,7 +435,6 @@ async def test_failed_receipt_preserves_exact_proposal_without_start_authority(
             await _until_closed(inference)
         assert handler.starts == []
         assert handler.cancels == handler.exact_cancels == []
-        assert routing.accepted_start is False
         assert call.operation is not None and call.operation.done()
         assert not call.operation.cancelled()
         proposal = call.operation.result()

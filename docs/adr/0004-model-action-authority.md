@@ -296,7 +296,10 @@ cleanup budget grants no later admission or retry. Receipt or interruption
 uncertainty reports a bounded category and closes admission for the remainder of
 that adapter session. Matching peer terminal state is rechecked under send
 ownership to avoid a late interruption, while receipt ownership still drains
-before teardown. Codex then ends the foreground stream and uses its
+before teardown. Every interrupt outside a routing failure (refusal cleanup, cancel,
+close) applies the same recheck, and tolerates the peer's rejection of an interrupt
+whose completion was already routed
+([#478](https://github.com/sushiHex/hermes-realtime/issues/478)). Codex then ends the foreground stream and uses its
 existing owned-turn interruption/cleanup. It does not wait for or speak a
 model continuation. Speech emitted before a status selection cannot be undone.
 The speech loop accepts at most one terminal host item and refuses later items.

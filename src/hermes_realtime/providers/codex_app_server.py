@@ -79,7 +79,6 @@ _InferenceTimingObserver = Callable[[str, int], None]
 
 if TYPE_CHECKING:
     from hermes_realtime.conversation.knowledge import KnowledgePrefetchCoordinator
-_START_WORK_CONTINUATION_FALLBACK = "I'm curious what turns up here."
 _TRANSCRIPT_INTERPRETATION_POLICY = (
     "Treat user messages as fallible speech-recognition transcripts. Resolve ambiguous words, "
     "names, acronyms, and letter sequences from the immediate conversational context without "
@@ -647,7 +646,6 @@ class _TurnRouting:
     # the interrupt) shares it, so retries cannot renew it.
     cleanup_deadline: float | None = None
     terminal: bool = False
-    accepted_start: bool = False
     lookup_attempted: bool = False
     start_attempted: bool = False
     status_selected: bool = False
@@ -1361,7 +1359,6 @@ class CodexAppServerStreamingInference:
                     attempted=lookup_attempted,
                 )
                 buffer = ""
-                completed_normally = False
                 emitted_speech = False
                 while True:
                     event = await self._next_event(
@@ -1394,11 +1391,7 @@ class CodexAppServerStreamingInference:
                         for segment in segments:
                             self._require_no_call_imitation(segment)
                             self._require_verified_background_claim(
-                                segment,
-                                thread_id=server_thread_id,
-                                turn_id=server_turn_id,
-                                accepted_ack=accepted_ack,
-                            )
+                                segment, accepted_ack=accepted_ack)
                             self._require_verified_lookup_claim(
                                 segment,
                                 thread_id=server_thread_id,
@@ -1438,17 +1431,11 @@ class CodexAppServerStreamingInference:
                             break
                         if status != "completed":
                             raise RuntimeError(f"Codex turn ended with status {status}")
-                        completed_normally = True
                         break
                 segments, buffer = self._extract_segments(buffer, final=True)
                 for segment in segments:
                     self._require_no_call_imitation(segment)
-                    self._require_verified_background_claim(
-                        segment,
-                        thread_id=server_thread_id,
-                        turn_id=server_turn_id,
-                        accepted_ack=accepted_ack,
-                    )
+                    self._require_verified_background_claim(segment, accepted_ack=accepted_ack)
                     self._require_verified_lookup_claim(
                         segment,
                         thread_id=server_thread_id,
@@ -1460,25 +1447,6 @@ class CodexAppServerStreamingInference:
                     yield segment
                 if buffer:
                     raise AssertionError("final segmentation retained text")
-                routing = self._turn_routing.get((server_thread_id, server_turn_id))
-                if (
-                    completed_normally
-                    and routing is not None
-                    and routing.accepted_start
-                    and not emitted_speech
-                ):
-                    fallback_segments, fallback_buffer = self._extract_segments(
-                        _START_WORK_CONTINUATION_FALLBACK,
-                        final=True,
-                    )
-                    for index, segment in enumerate(fallback_segments):
-                        if index == 0:
-                            self._observe_inference_timing(
-                                "first_speakable_segment", timing_started,
-                            )
-                        yield segment
-                    if fallback_buffer:
-                        raise AssertionError("fallback segmentation retained text")
             finally:
                 cleanup_active = active
                 try:
@@ -1551,19 +1519,17 @@ class CodexAppServerStreamingInference:
         self,
         segment: str,
         *,
-        thread_id: str,
-        turn_id: str,
         accepted_ack: bool = False,
     ) -> None:
+        # Only the tool-free accepted-start acknowledgment may say work started; a proposal
+        # turn returns as soon as it yields its proposal (#478).
         if (
             self._work_tool_handler is None
             or accepted_ack
             or not has_background_work_claim(segment)
         ):
             return
-        routing = self._turn_routing.get((thread_id, turn_id))
-        if routing is None or not routing.accepted_start:
-            self._refuse_output("unverified_claim")
+        self._refuse_output("unverified_claim")
 
     def _require_verified_lookup_claim(
         self,
@@ -1767,23 +1733,29 @@ class CodexAppServerStreamingInference:
                 finally:
                     self._send_lock.release()
             raise RuntimeError("Codex app-server reader failed") from routing.error
-        if routing is not None and routing.host_status_ready:
-            async with self._send_lock:
-                # A matching terminal can arrive while the interrupt task is
-                # scheduled or quiescing. Recheck after acquiring send ownership.
-                if routing.terminal:
-                    active.terminal = True
-                    return
-                response = await self._request_locked(
-                    "turn/interrupt",
-                    {"threadId": active.thread_id, "turnId": active.server_id},
-                )
-        else:
-            response = await self._request(
+        async with self._send_lock:
+            # A matching terminal can arrive while the interrupt task is scheduled or
+            # quiescing, or before a refused segment was extracted (#478). Recheck after
+            # acquiring send ownership; a completed turn needs no interrupt.
+            if routing is not None and routing.terminal:
+                active.terminal = True
+                return
+            response = await self._request_locked(
                 "turn/interrupt",
                 {"threadId": active.thread_id, "turnId": active.server_id},
             )
-        self._result(response, "turn/interrupt")
+        self._interrupt_result(active, routing, response)
+
+    @staticmethod
+    def _interrupt_result(
+        active: _ActiveTurn, routing: _TurnRouting | None, response: Mapping[str, object],
+    ) -> None:
+        # The single reader keeps wire order, so a completion that raced this interrupt is
+        # routed before its error reply: the app-server rejects interrupting a completed turn.
+        if "error" in response and routing is not None and routing.terminal:
+            active.terminal = True
+            return
+        CodexAppServerStreamingInference._result(response, "turn/interrupt")
 
     async def _quiesce_dynamic_turn(self, active: _ActiveTurn) -> None:
         tasks: set[asyncio.Task[None]] = set()
