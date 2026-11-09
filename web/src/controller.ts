@@ -274,7 +274,8 @@ export function formatSessionModelConfiguration(
     rows.push(
       ["Requested context", tokens(configuration.requestedContextTokens, "Not reported")],
       ["Advertised maximum", tokens(configuration.advertisedContextTokens, "Unknown")],
-      ["Observed allocation", tokens(configuration.effectiveContextTokens, "Not observed")],
+      ["Runtime-reported context",
+        tokens(configuration.effectiveContextTokens, "Not reported by runtime")],
     );
   }
   return rows;

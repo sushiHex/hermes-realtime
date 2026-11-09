@@ -2447,8 +2447,8 @@ function renderLocalModelPicker(): void {
   localModelRequested.textContent = selection === null
     ? localModelCapacity(localModelContextInput.value === "" ? null : localModelContextInput.valueAsNumber)
     : localModelCapacity(selection.requestedContextTokens);
-  localModelEffective.textContent = selection === null
-    ? "Not observed"
+  localModelEffective.textContent = selection === null || selection.effectiveContextTokens === null
+    ? "Not reported by runtime"
     : localModelCapacity(selection.effectiveContextTokens);
 
   if (localModelDiscoveryState === "loading") {

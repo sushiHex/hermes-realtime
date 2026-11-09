@@ -1,7 +1,8 @@
 """Bounded, metadata-only Ollama discovery and immutable session context choices.
 
 No family/name table and no tokenizer estimate: advertised capacity is a metadata
-claim; ps reports an observed allocation, not a guarantee about the next request.
+claim; ps reports the runtime's configured context, not a measured allocation or a
+guarantee about the next request.
 """
 
 from __future__ import annotations
