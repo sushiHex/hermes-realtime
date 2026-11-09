@@ -1655,6 +1655,9 @@ class ManualDynamicCodexTransport(FakeCodexTransport):
         self.turn_started: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.tool_responses: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self.send_after_close = False
+        # "result" interrupts the turn; "error" answers as upstream does for a turn that has
+        # already completed; "race" routes that completion just before the error reply (#478).
+        self.interrupt_reply = "result"
 
     async def send(self, message: Mapping[str, object]) -> None:
         if self.closed:
@@ -1695,9 +1698,16 @@ class ManualDynamicCodexTransport(FakeCodexTransport):
                 }
             )
             await self.turn_started.put((self.thread_id, self.turn_id))
-        elif method == "turn/interrupt":
+        elif method == "turn/interrupt" and self.interrupt_reply == "result":
             await self.incoming.put({"id": request_id, "result": {}})
             await self.complete_turn(status="interrupted")
+        elif method == "turn/interrupt":
+            if self.interrupt_reply == "race":
+                await self.complete_turn()
+            await self.incoming.put({
+                "id": request_id,
+                "error": {"code": -32600, "message": "no active turn to interrupt"},
+            })
         elif request_id is not None and ("result" in copied or "error" in copied):
             await self.tool_responses.put(copied)
 
