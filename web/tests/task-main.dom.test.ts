@@ -145,7 +145,10 @@ async function mount(inputRequest: (body: { sequence: number; text: string }, si
       dispatch([{}]);
     }
   };
-  return { requests, approvals, approval, task, taskResult, taskBatch, card, cancel, submit, toggle, poisonProjection, refresh: () => refreshCredential!() };
+  // The host ended the session out of band: the next ordinary rebind is refused (409) and a
+  // fresh bootstrap starts a new session whose counters and projection restart at one.
+  const endServerSession = () => { sessionActive = false; sequence = 0; };
+  return { requests, approvals, approval, task, taskResult, taskBatch, card, cancel, submit, toggle, poisonProjection, endServerSession, refresh: () => refreshCredential!() };
 }
 
 afterEach(() => {
@@ -333,6 +336,24 @@ describe("mounted task controls", () => {
     submit("Synthetic input after reset");
     await approval("approval_fixture_second");
     await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 2, 1]));
+    expect(approvals.map((item) => item.sequence)).toEqual([1, 1]);
+  });
+
+  it("restarts admitted input and approval counters when a refused rebind starts a new session", async () => {
+    const { requests, approvals, approval, submit, toggle, endServerSession } = await mount();
+    await approval("approval_fixture_first");
+    submit("Synthetic input before new session");
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("typed_input_admitted"));
+    endServerSession();
+    media.rooms.at(-1)!.emit("participantDisconnected", { identity: credential.workerIdentity });
+    await vi.waitFor(() => expect(toggle.textContent).toBe("Connect"));
+    toggle.click();
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#markers")!.textContent).toContain("session_replaced"));
+    await vi.waitFor(() => expect(dom.window.document.querySelector("#connection-status")!.getAttribute("data-state")).toBe("typed-only"));
+    expect(vi.mocked(fetch).mock.calls.filter(([path]) => path === "/api/v1/stable-bootstrap")).toHaveLength(2);
+    submit("Synthetic input in new session");
+    await approval("approval_fixture_second");
+    await vi.waitFor(() => expect(requests.map((item) => item.sequence)).toEqual([1, 1]));
     expect(approvals.map((item) => item.sequence)).toEqual([1, 1]);
   });
 
