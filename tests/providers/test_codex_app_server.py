@@ -52,6 +52,7 @@ from hermes_realtime.providers.codex_app_server import (
 )
 from hermes_realtime.providers.current_facts import CurrentFactEvidence, CurrentFactSource
 from hermes_realtime.speech import Transcript
+from tests.support.automatic_gc import no_automatic_gc
 from tests.support.work_routing_policy import assert_aligned_work_routing
 
 
@@ -3874,14 +3875,18 @@ async def test_codex_registered_dynamic_call_suspends_ordinary_idle_timeout(monk
         await asyncio.sleep(0.1)
         selection.release.set()
 
-    release_task = asyncio.create_task(release_selection())
-    _assert_proposal([
-        segment
-        async for segment in inference.stream(_snapshot(), turn_id="turn_tool_idle_suspension")
-    ], inference)
-    await release_task
-    assert handler.starts == handler.cancels == handler.exact_cancels == []
-    await inference.close()
+    # The fake's sends never suspend; a collection inside a 50 ms setup send would fail it.
+    with no_automatic_gc():
+        release_task = asyncio.create_task(release_selection())
+        _assert_proposal([
+            segment
+            async for segment in inference.stream(
+                _snapshot(), turn_id="turn_tool_idle_suspension"
+            )
+        ], inference)
+        await release_task
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+        await inference.close()
 
 
 @pytest.mark.asyncio
@@ -3895,31 +3900,33 @@ async def test_codex_late_dynamic_registration_wakes_ordinary_idle_wait() -> Non
         work_tool_timeout_seconds=10,
     )
     inference.bind_work_tools(FakeWorkToolHandler())
-    stream_task = asyncio.create_task(
-        _collect_stream(inference, "turn_late_tool_idle_suspension")
-    )
-    await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
+    # The fake's sends never suspend; a collection inside a 50 ms setup send would fail it.
+    with no_automatic_gc():
+        stream_task = asyncio.create_task(
+            _collect_stream(inference, "turn_late_tool_idle_suspension")
+        )
+        await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
 
-    for _ in range(100):
-        if any(
-            task.get_name() == "codex-app-server-next-event"
-            for task in asyncio.all_tasks()
-        ):
-            break
-        await asyncio.sleep(0)
-    else:
-        pytest.fail("ordinary idle wait did not start")
+        for _ in range(100):
+            if any(
+                task.get_name() == "codex-app-server-next-event"
+                for task in asyncio.all_tasks()
+            ):
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("ordinary idle wait did not start")
 
-    await transport.start_item()
-    await asyncio.sleep(0.1)
-    assert not stream_task.done()
+        await transport.start_item()
+        await asyncio.sleep(0.1)
+        assert not stream_task.done()
 
-    await transport.request_tool(request_id=91)
-    response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
-    await transport.complete_item(response)
-    await transport.complete_turn(delta="I started it.")
-    _assert_proposal(await asyncio.wait_for(stream_task, timeout=0.2), inference)
-    await inference.close()
+        await transport.request_tool(request_id=91)
+        response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
+        await transport.complete_item(response)
+        await transport.complete_turn(delta="I started it.")
+        _assert_proposal(await asyncio.wait_for(stream_task, timeout=0.2), inference)
+        await inference.close()
 
 
 @pytest.mark.asyncio
@@ -4697,34 +4704,38 @@ async def test_codex_selection_timeout_responds_before_interrupt_without_work_au
     inference.bind_work_tools(handler)
     selection = BlockingProposalSelection(inference._invoke_dynamic_call)
     monkeypatch.setattr(inference, "_invoke_dynamic_call", selection)
-    stream_task = asyncio.create_task(_collect_stream(inference, "turn_timeout_tool"))
-    await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
-    await transport.start_item()
-    await transport.request_tool(request_id=91)
-    response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
-    assert response["result"]["success"] is False  # type: ignore[index]
+    # The fake's sends never suspend; a collection inside a 50 ms setup send would fail it.
+    with no_automatic_gc():
+        stream_task = asyncio.create_task(_collect_stream(inference, "turn_timeout_tool"))
+        await asyncio.wait_for(transport.turn_started.get(), timeout=0.2)
+        await transport.start_item()
+        await transport.request_tool(request_id=91)
+        response = await asyncio.wait_for(transport.tool_responses.get(), timeout=0.2)
+        assert response["result"]["success"] is False  # type: ignore[index]
 
-    # The provider's explicit admission deadline and the ordinary stream wait
-    # can expire in either order. Both must refuse before exposing a proposal.
-    with pytest.raises((TimeoutError, RuntimeError)) as expired:
-        await asyncio.wait_for(stream_task, timeout=0.2)
-    if type(expired.value) is RuntimeError:
-        assert str(expired.value) == "Codex status admission expired"
-    response_index = next(
-        index
-        for index, item in enumerate(transport.sent)
-        if item.get("id") == 91 and "result" in item
-    )
-    interrupt_index = next(
-        index for index, item in enumerate(transport.sent) if item.get("method") == "turn/interrupt"
-    )
-    assert response_index < interrupt_index
-    assert not selection.finished.is_set()
-    assert not selection.cancelled
-    selection.release.set()
-    await asyncio.wait_for(selection.finished.wait(), timeout=0.2)
-    assert handler.starts == handler.cancels == handler.exact_cancels == []
-    await inference.close()
+        # The provider's explicit admission deadline and the ordinary stream wait
+        # can expire in either order. Both must refuse before exposing a proposal.
+        with pytest.raises((TimeoutError, RuntimeError)) as expired:
+            await asyncio.wait_for(stream_task, timeout=0.2)
+        if type(expired.value) is RuntimeError:
+            assert str(expired.value) == "Codex status admission expired"
+        response_index = next(
+            index
+            for index, item in enumerate(transport.sent)
+            if item.get("id") == 91 and "result" in item
+        )
+        interrupt_index = next(
+            index
+            for index, item in enumerate(transport.sent)
+            if item.get("method") == "turn/interrupt"
+        )
+        assert response_index < interrupt_index
+        assert not selection.finished.is_set()
+        assert not selection.cancelled
+        selection.release.set()
+        await asyncio.wait_for(selection.finished.wait(), timeout=0.2)
+        assert handler.starts == handler.cancels == handler.exact_cancels == []
+        await inference.close()
 
 
 def test_codex_oversized_multibyte_reason_degrades_to_bounded_response() -> None:

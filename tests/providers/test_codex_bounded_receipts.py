@@ -11,7 +11,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 import pytest
 from test_codex_app_server import (
@@ -27,9 +27,18 @@ from hermes_realtime.providers.codex_app_server import (
     SubprocessCodexJsonLineTransport,
 )
 from hermes_realtime.providers.current_facts import CurrentFactEvidence
+from tests.support.automatic_gc import no_automatic_gc
 
 _RESULT_ID = 91
 _SEND_MARKER = "[codex-send-bound] "
+
+
+@pytest.fixture(autouse=True)
+def _no_automatic_gc() -> Iterator[None]:
+    # These fakes' sends never suspend and their budgets are tens of milliseconds, so a
+    # full-suite collection inside a setup send would fail it before the stall under test.
+    with no_automatic_gc():
+        yield
 
 
 def _no_transport() -> None:

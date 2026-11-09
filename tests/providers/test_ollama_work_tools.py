@@ -26,6 +26,7 @@ from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
 from hermes_realtime.providers.ollama_models import OllamaModelClient
 from hermes_realtime.speech import Transcript
+from tests.support.automatic_gc import no_automatic_gc
 from tests.support.ollama_metadata import supported_ollama_metadata
 from tests.support.work_routing_policy import assert_aligned_work_routing
 
@@ -822,10 +823,13 @@ async def test_decision_buffer_has_independent_byte_and_chunk_bounds(bound, monk
 async def test_provider_does_not_wait_for_or_invoke_task_admission(capsys) -> None:
     inference, handler, _, _ = adapter([start_frame()], request_timeout_seconds=0.05)
     handler.release.clear()
-    started = time.monotonic()
-    assert await collect(inference) == [expected_proposal()]
+    # A collection inside the 50 ms whole-decision deadline would refuse the decision.
+    with no_automatic_gc():
+        started = time.monotonic()
+        assert await collect(inference) == [expected_proposal()]
+        elapsed = time.monotonic() - started
     assert handler.calls == [] and not handler.entered.is_set()
-    assert time.monotonic() - started < 0.12
+    assert elapsed < 0.12
     assert not any(line.startswith("[ollama-work] ")
                    for line in capsys.readouterr().out.splitlines())
 
@@ -1111,7 +1115,9 @@ async def test_reply_playback_drain_does_not_reopen_decision_deadline() -> None:
         decision_frame({"kind": "reply", "text": "First sentence. Second sentence."}),
     ], request_timeout_seconds=0.05)
     stream = inference.stream(request(), turn_id="turn_test")
-    assert await anext(stream) == "First sentence."
+    # A collection inside the 50 ms whole-decision deadline would refuse the decision.
+    with no_automatic_gc():
+        assert await anext(stream) == "First sentence."
     await asyncio.sleep(0.06)
     assert await anext(stream) == "Second sentence."
     with pytest.raises(StopAsyncIteration):

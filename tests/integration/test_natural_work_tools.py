@@ -30,6 +30,7 @@ from hermes_realtime.conversation.worker import ConversationSessionWorker
 from hermes_realtime.integration import HermesApiConfig, HermesApiTaskSession
 from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
 from hermes_realtime.speech import AudioFrame, Transcript, VoiceActivity
+from tests.support.automatic_gc import no_automatic_gc
 
 _API_RUN_ID = "run_0123456789abcdef"
 _SECOND_API_RUN_ID = "run_123456789abcdef0"
@@ -988,25 +989,28 @@ async def test_model_forged_delegation_objective_is_rejected_before_dispatch() -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["timeout", "disconnect"])
 async def test_uncertain_http_failure_blocks_later_work_admission(mode: str) -> None:
-    runtime = await _runtime(mode=mode, request_timeout_seconds=0.05)
-    try:
-        first, first_transport = await runtime.invoke("Please inspect the release.")
-        _assert_proposal_only(first, first_transport)
-        assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
-        with pytest.raises(RuntimeError, match="Hermes API request failed"):
-            await runtime.settle()
-        second, second_transport = await runtime.invoke("Try another background inspection.")
-        _assert_proposal_only(second, second_transport)
-        assert await runtime.confirm() is WorkCommandAdmission.UNAVAILABLE
-        assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
-            {"status": "uncertain", "taskId": None, "reason": _UNCERTAIN_REASON},
-        ]
-        assert runtime.surface.health == "uncertain"
-        assert len(runtime.stub.posts) == 1
-        assert runtime.context.snapshot().active_tasks == ()
-    finally:
-        runtime.stub.create_gate.set()
-        await runtime.close()
+    # Every request shares the 50 ms budget, including the capabilities request that must
+    # succeed, so a full-suite collection while one is in flight would expire it.
+    with no_automatic_gc():
+        runtime = await _runtime(mode=mode, request_timeout_seconds=0.05)
+        try:
+            first, first_transport = await runtime.invoke("Please inspect the release.")
+            _assert_proposal_only(first, first_transport)
+            assert await runtime.confirm() is WorkCommandAdmission.ADMITTED
+            with pytest.raises(RuntimeError, match="Hermes API request failed"):
+                await runtime.settle()
+            second, second_transport = await runtime.invoke("Try another background inspection.")
+            _assert_proposal_only(second, second_transport)
+            assert await runtime.confirm() is WorkCommandAdmission.UNAVAILABLE
+            assert [data for kind, data in runtime.browser_events if kind == "task_state"] == [
+                {"status": "uncertain", "taskId": None, "reason": _UNCERTAIN_REASON},
+            ]
+            assert runtime.surface.health == "uncertain"
+            assert len(runtime.stub.posts) == 1
+            assert runtime.context.snapshot().active_tasks == ()
+        finally:
+            runtime.stub.create_gate.set()
+            await runtime.close()
 
 
 @pytest.mark.asyncio

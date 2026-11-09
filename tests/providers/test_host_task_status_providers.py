@@ -5,6 +5,7 @@ from test_ollama_work_tools import adapter, collect, decision_frame
 
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
+from tests.support.automatic_gc import no_automatic_gc
 
 
 def _no_transport():
@@ -463,19 +464,26 @@ async def test_status_receipt_send_uses_remaining_deadline_and_drains_terminal_t
         work_tool_timeout_seconds=0.05,
     )
     inference.bind_work_tools(FakeWorkToolHandler())
-    try:
-        with pytest.raises(RuntimeError, match="status receipt"):
-            async with asyncio.timeout(0.5):
-                [
-                    part
-                    async for part in inference.stream(_snapshot(), turn_id="turn_deadline_status")
-                ]
-        assert len([row for row in transport.sent if row.get("id") == transport.request_id]) == 1
-        assert not inference._server_request_tasks
-        with pytest.raises(RuntimeError, match="closed"):
-            [part async for part in inference.stream(_snapshot(), turn_id="turn_after_failure")]
-    finally:
-        await inference.close()
+    # The fake's sends never suspend, so a collection inside the 50 ms receipt send would
+    # fail it before it is written, and the held receipt under test would never be sent.
+    with no_automatic_gc():
+        try:
+            with pytest.raises(RuntimeError, match="status receipt"):
+                async with asyncio.timeout(0.5):
+                    [
+                        part
+                        async for part in inference.stream(
+                            _snapshot(), turn_id="turn_deadline_status"
+                        )
+                    ]
+            assert (
+                len([row for row in transport.sent if row.get("id") == transport.request_id]) == 1
+            )
+            assert not inference._server_request_tasks
+            with pytest.raises(RuntimeError, match="closed"):
+                [part async for part in inference.stream(_snapshot(), turn_id="turn_after_failure")]
+        finally:
+            await inference.close()
 
 
 @pytest.mark.asyncio
