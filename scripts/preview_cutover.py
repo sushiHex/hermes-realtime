@@ -2285,9 +2285,19 @@ def serve(active_path: Path) -> int:
         with contextlib.suppress(FileExistsError):
             (output / "host.stop").open("x").close()
         host_process = processes.roots.get("host") if processes is not None else None
+        host_stop_timed_out = False
+        host_exit_code: int | None = None
         if host_process is not None:
-            with contextlib.suppress(subprocess.TimeoutExpired):
+            try:
                 host_process.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                host_stop_timed_out = True
+            try:
+                code = host_process.poll()  # The host's own exit, read before stop_all kills.
+            except Exception:
+                code = None  # Diagnostic uncertainty cannot change settlement authority.
+            if type(code) is int and -(2**31) <= code <= 2**32 - 1:
+                host_exit_code = code
         cleanup_failed = False
         child_facts = {}
         survivors = {}
@@ -2353,7 +2363,14 @@ def serve(active_path: Path) -> int:
             "run_journal_empty": journal_empty,
             "ports": ports,
             "child_output_metadata": child_facts,
-            "failure_category": startup_error if not stopped else None,
+            "host_graceful_stop_timed_out": host_stop_timed_out,
+            "host_exit_code": host_exit_code,
+            "failure_category": (
+                None if stopped
+                else startup_error if startup_error is not None
+                else "host_graceful_stop_timeout" if host_stop_timed_out
+                else None
+            ),
         }
         _write_new(output / "result-receipt.private.json", receipt)
         for name in ("gateway.private.log", "livekit.private.log", "host.private.log"):
