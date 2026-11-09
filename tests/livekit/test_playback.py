@@ -11,6 +11,7 @@ from hermes_realtime.livekit import (
     LiveKitSpeechPlayback,
 )
 from hermes_realtime.speech import AudioFrame, SpeechChunk, WordTiming
+from tests.support.automatic_gc import no_automatic_gc
 
 
 class RecordingPublisher:
@@ -472,7 +473,8 @@ async def test_pcm_confirmation_accounts_for_source_quiet_onset_without_waiting(
     for frame in (quiet, quiet, material, quiet):
         await receiver.frames.put(frame)
 
-    await confirmation.confirm(chunk, is_valid=lambda: True)
+    with no_automatic_gc():
+        await confirmation.confirm(chunk, is_valid=lambda: True)
 
 
 @pytest.mark.asyncio
@@ -851,16 +853,17 @@ async def test_cancel_interrupts_receiver_prepare_before_releasing_publication_a
         confirmation_timeout_seconds=0.05,
     )
     first = _marked_chunk("turn_001", "chunk_a", 1000)
-    first_task = asyncio.create_task(playback.play(first, is_valid=lambda: True))
-    await asyncio.wait_for(receiver.first_prepare_started.wait(), timeout=1)
-
-    await playback.cancel(first.turn_id)
-    with pytest.raises(asyncio.CancelledError):
-        await first_task
-
     replacement = _marked_chunk("turn_002", "chunk_b", 2000)
-    await receiver.frames.put(replacement.audio)
-    await playback.play(replacement, is_valid=lambda: True)
+    with no_automatic_gc():
+        first_task = asyncio.create_task(playback.play(first, is_valid=lambda: True))
+        await asyncio.wait_for(receiver.first_prepare_started.wait(), timeout=1)
+
+        await playback.cancel(first.turn_id)
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+        await receiver.frames.put(replacement.audio)
+        await playback.play(replacement, is_valid=lambda: True)
     assert publisher.clear_count == 1
 
 
