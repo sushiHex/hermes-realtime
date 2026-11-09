@@ -361,11 +361,14 @@ a quoted key opening an object; and `<function=NAME`. Quotes and backticks do no
 a segment because speech strips them. A plain mention, or a name followed by whitespace
 and a parenthetical aside, is allowed.
 
-The refusal is the same as the existing unverified-claim guards: the turn fails (Ollama
-records the `call_imitation` category through its work-evidence line; Codex raises
-`RuntimeError`), and, as with those guards today, the response error ends the binding.
-That pre-existing policy is tracked in
-[#470](https://github.com/sushiHex/hermes-realtime/issues/470). Limits: the check is syntactic and
+The refusal is the same as the existing unverified-claim guards: the provider raises the
+exact `ModelOutputRefused(category)` (Ollama records the category through its
+work-evidence line; Codex prints one bounded `[codex-output-refusal]` category marker),
+which fails only that turn. The binding continues and the next utterance is answered;
+failed-turn speech is never kept for resumption
+([#470](https://github.com/sushiHex/hermes-realtime/issues/470)). Integrity, transport,
+protocol and bound refusals, subclasses, and refusals grouped with or replaced by a
+cleanup failure still end the binding. Limits: the check is syntactic and
 per segment, so a call split across segments (for example JSON with the arguments before
 the name) is not detected; host-composed text, such as proposal readback and Hermes
 completion summaries, is not model output and is not checked, so it may quote a call;

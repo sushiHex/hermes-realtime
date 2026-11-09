@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
 from hermes_realtime.conversation.context import ConversationContextStore, ConversationMessage
-from hermes_realtime.conversation.streaming import ConversationInferenceRequest
+from hermes_realtime.conversation.streaming import ConversationInferenceRequest, ModelOutputRefused
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from hermes_realtime.conversation.tasks import TaskDispatchOutcome
@@ -463,8 +463,8 @@ async def run_cases(
             row["decision_attempted"] = True
             try:
                 await asyncio.wait_for(collect(), 60)
-            except OllamaDecisionRefused as error:
-                if type(error) is not OllamaDecisionRefused:
+            except (OllamaDecisionRefused, ModelOutputRefused) as error:
+                if type(error) not in (OllamaDecisionRefused, ModelOutputRefused):
                     raise
                 row["error"] = "decision_refused"
                 row["refusal_category"] = error.category

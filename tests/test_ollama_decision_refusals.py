@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.providers import ollama
 from scripts import evaluate_natural_work_scenario as scenario
 from tests.support.ollama_metadata import supported_ollama_metadata
@@ -15,6 +16,37 @@ from tests.support.ollama_metadata import supported_ollama_metadata
 
 class ForeignDecisionRefusal(ollama.OllamaDecisionRefused):
     """A caller-owned exception cannot assert the adapter's refusal provenance."""
+
+
+class ForeignModelOutputRefusal(ModelOutputRefused):
+    """A caller-owned subclass cannot assert the exact refusal disposition either."""
+
+
+# Per-turn model-output refusals fail only the turn (#470); the rest stay terminal.
+NON_TERMINAL_CATEGORIES = (
+    "call_imitation", "unverified_claim", "unexpected_native_calls", "unadvertised",
+    "duplicate_keys", "decision_json", "decision_schema",
+    "reply_type", "reply_blank", "reply_length", "reply_unicode",
+    "objective_type", "objective_blank", "objective_length", "objective_unicode",
+)
+TERMINAL_CATEGORIES = (
+    "private_authority", "incomplete", "calls_type", "completion_reason", "decision_unicode",
+)
+
+
+@pytest.mark.parametrize("category", NON_TERMINAL_CATEGORIES + TERMINAL_CATEGORIES)
+def test_each_refusal_category_lands_on_its_assigned_exact_type(capsys, category):
+    expected = (
+        ModelOutputRefused if category in NON_TERMINAL_CATEGORIES
+        else ollama.OllamaDecisionRefused
+    )
+    with pytest.raises(Exception) as caught:
+        ollama.OllamaStreamingInference._refuse_work(category)
+    assert type(caught.value) is expected
+    assert caught.value.category == category
+    assert capsys.readouterr().out == "[ollama-work] " + json.dumps(
+        {"category": category, "kind": "start", "attempts": 0}, separators=(",", ":"),
+    ) + "\n"
 
 
 @pytest.fixture
@@ -71,6 +103,7 @@ def offline_cases(monkeypatch):
     ({"kind": "reply", "text": 1}, "reply_type"),
     ({"kind": "reply", "text": "\ud800"}, "reply_unicode"),
     ({"kind": "start_work", "objective": " "}, "objective_blank"),
+    ({"kind": "start_work", "objective": "Inspect deleg_private."}, "private_authority"),
 ])
 async def test_real_decision_refusals_retain_category_and_continue(
     offline_cases, decision, category,
@@ -129,8 +162,9 @@ async def test_resource_limits_remain_operational(offline_cases, monkeypatch, li
     RuntimeError("Ollama work unavailable: ownership_before_admission"),
     asyncio.CancelledError(),
     ForeignDecisionRefusal("unverified_claim"),
+    ForeignModelOutputRefusal("unverified_claim"),
 ], ids=["spoof_claim", "spoof_schema", "unknown", "transport", "deadline", "ownership", "cancel",
-        "foreign_subclass"])
+        "foreign_subclass", "foreign_refusal_subclass"])
 async def test_operational_errors_stop_after_first_case(offline_cases, failure):
     install, value, instances = offline_cases
     install(failure=failure)

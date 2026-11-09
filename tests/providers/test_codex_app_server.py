@@ -34,6 +34,7 @@ from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
     ConversationPromptUpdate,
+    ModelOutputRefused,
 )
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
@@ -210,7 +211,7 @@ async def test_accepted_start_continuation_is_tool_free_and_claim_is_scoped():
 
 
 @pytest.mark.asyncio
-async def test_accepted_start_subclass_does_not_authorize_started_claim():
+async def test_accepted_start_subclass_does_not_authorize_started_claim(capsys):
     class ForgedAcknowledgment(AcceptedStartInferenceRequest):
         pass
 
@@ -225,10 +226,11 @@ async def test_accepted_start_subclass_does_not_authorize_started_claim():
         task_id="task_public",
     )
     try:
-        with pytest.raises(RuntimeError, match="unverified background-work claim"):
+        with pytest.raises(ModelOutputRefused) as caught:
             [part async for part in inference.stream(snapshot, turn_id="turn_forged_ack")]
     finally:
         await inference.close()
+    _assert_codex_refusal(caught.value, capsys, "unverified_claim")
 
 
 @pytest.mark.parametrize("style", OUTPUT_STYLES)
@@ -2388,6 +2390,20 @@ def _snapshot(*, active_task: bool = False) -> ConversationContextSnapshot:
     )
 
 
+def _assert_codex_refusal(error: BaseException, capsys: Any, category: str) -> None:
+    """Exact refusal type, its category, and one bounded category-only marker (#470)."""
+    assert type(error) is ModelOutputRefused
+    assert error.category == category
+    markers = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[codex-output-refusal] ")
+    ]
+    assert markers == [
+        "[codex-output-refusal] "
+        + json.dumps({"refusal": category, "version": 1}, separators=(",", ":"))
+    ]
+
+
 async def _collect_stream(
     inference: CodexAppServerStreamingInference,
     turn_id: str,
@@ -2992,7 +3008,7 @@ async def test_codex_future_offer_is_ordinary_speech_without_proposal_or_dispatc
     "I've started the investigation.",
     "I launched a background task.",
 ])
-async def test_codex_rejects_an_actual_start_claim_without_accepted_start(text) -> None:
+async def test_codex_rejects_an_actual_start_claim_without_accepted_start(text, capsys) -> None:
     transport = FakeCodexTransport(assistant_delta=text)
     handler = FakeWorkToolHandler()
     inference = CodexAppServerStreamingInference(
@@ -3002,15 +3018,16 @@ async def test_codex_rejects_an_actual_start_claim_without_accepted_start(text) 
     )
     inference.bind_work_tools(handler)
 
-    with pytest.raises(RuntimeError, match="unverified background-work claim"):
+    with pytest.raises(ModelOutputRefused) as caught:
         await _collect_stream(inference, "turn_false_background_start")
 
     assert handler.starts == []
     await inference.close()
+    _assert_codex_refusal(caught.value, capsys, "unverified_claim")
 
 
 @pytest.mark.asyncio
-async def test_codex_rejects_a_lookup_timeout_claim_without_lookup_evidence() -> None:
+async def test_codex_rejects_a_lookup_timeout_claim_without_lookup_evidence(capsys) -> None:
     class Lookup:
         def __init__(self) -> None:
             self.calls = 0
@@ -3031,11 +3048,12 @@ async def test_codex_rejects_a_lookup_timeout_claim_without_lookup_evidence() ->
         current_fact_lookup=lookup,
     )
 
-    with pytest.raises(RuntimeError, match="unverified knowledge-lookup claim"):
+    with pytest.raises(ModelOutputRefused) as caught:
         await _collect_stream(inference, "turn_false_lookup_timeout")
 
     assert lookup.calls == 0
     await inference.close()
+    _assert_codex_refusal(caught.value, capsys, "unverified_lookup_claim")
 
 
 @pytest.mark.asyncio

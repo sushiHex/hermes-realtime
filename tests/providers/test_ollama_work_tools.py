@@ -21,6 +21,7 @@ from hermes_realtime.conversation.context import (
 from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
+    ModelOutputRefused,
 )
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.work_tools import WorkStartResult
@@ -482,9 +483,10 @@ async def test_no_call_background_claim_refuses_before_any_speech(chunks, capsys
         {"message": {"content": decision[boundary:]}, "done": True, "done_reason": "stop"},
     ])
     spoken = []
-    with pytest.raises(ValueError, match="unverified_claim"):
+    with pytest.raises(ModelOutputRefused, match="unverified_claim") as caught:
         async for segment in inference.stream(request(), turn_id="turn_test"):
             spoken.append(segment)
+    assert type(caught.value) is ModelOutputRefused
     assert spoken == []
     assert handler.calls == []
     assert response.closed
@@ -517,8 +519,9 @@ async def test_unbound_conversation_retains_existing_prose_behavior() -> None:
 async def test_without_current_user_request_no_work_schema_or_effect(snapshot) -> None:
     inference, handler, sent, _ = adapter([
         start_frame()])
-    with pytest.raises(ValueError, match="unadvertised"):
+    with pytest.raises(ModelOutputRefused, match="unadvertised") as caught:
         await collect(inference, snapshot)
+    assert type(caught.value) is ModelOutputRefused
     assert "tools" not in sent[0]
     assert sent[0]["format"] == reply_schema()
     assert handler.calls == []
@@ -539,6 +542,16 @@ async def test_routing_policy_is_offered_exactly_with_start_and_status() -> None
         await withheld.close()
     assert WORK_ROUTING_POLICY in offered_sent[0]["messages"][0]["content"]
     assert WORK_ROUTING_POLICY not in withheld_sent[0]["messages"][0]["content"]
+
+
+_TERMINAL_REFUSALS = frozenset({
+    "private_authority", "incomplete", "calls_type", "completion_reason", "decision_unicode",
+})
+
+
+def _refusal_type(category: str) -> type[Exception]:
+    """The exact type the adapter assigns a refusal category (#470)."""
+    return ollama.OllamaDecisionRefused if category in _TERMINAL_REFUSALS else ModelOutputRefused
 
 
 _INVALID_DECISIONS = [
@@ -586,9 +599,10 @@ async def test_invalid_decisions_refuse_before_effect_and_emit_content_free_evid
         {"message": {"content": content}, "done": True, "done_reason": "stop"},
     ])
     spoken = []
-    with pytest.raises(ValueError, match=category):
+    with pytest.raises(_refusal_type(category), match=category) as caught:
         async for segment in inference.stream(request(), turn_id="turn_test"):
             spoken.append(segment)
+    assert type(caught.value) is _refusal_type(category)
     assert handler.calls == spoken == []
     assert response.closed
     lines = [json.loads(line.removeprefix("[ollama-work] "))
@@ -606,8 +620,9 @@ async def test_native_calls_never_authorize_constrained_decision(calls, category
     frame = start_frame()
     frame["message"]["tool_calls"] = calls
     inference, handler, _, _ = adapter([frame])
-    with pytest.raises(ValueError, match=category):
+    with pytest.raises(_refusal_type(category), match=category) as caught:
         await collect(inference)
+    assert type(caught.value) is _refusal_type(category)
     assert handler.calls == []
 
 
@@ -616,8 +631,9 @@ async def test_multiple_streamed_decisions_refuse_before_dispatch() -> None:
     first = start_frame()
     first["done"] = False
     inference, handler, _, _ = adapter([first, start_frame()])
-    with pytest.raises(ValueError, match="decision_json"):
+    with pytest.raises(ModelOutputRefused, match="decision_json") as caught:
         await collect(inference)
+    assert type(caught.value) is ModelOutputRefused
     assert handler.calls == []
 
 
@@ -666,8 +682,9 @@ async def test_reply_field_bound_is_independent_of_wire_byte_bound(monkeypatch) 
     inference, handler, _, _ = adapter([
         decision_frame({"kind": "reply", "text": "x" * 65537}),
     ])
-    with pytest.raises(ValueError, match="reply_length"):
+    with pytest.raises(ModelOutputRefused, match="reply_length") as caught:
         await collect(inference)
+    assert type(caught.value) is ModelOutputRefused
     assert handler.calls == []
 
 

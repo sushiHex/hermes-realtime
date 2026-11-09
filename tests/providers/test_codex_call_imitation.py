@@ -2,6 +2,7 @@
 
 import pytest
 
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.providers.codex_app_server import CodexAppServerStreamingInference
 from tests.providers.test_codex_app_server import (
     FakeCodexTransport,
@@ -37,13 +38,15 @@ async def test_imitation_segment_is_never_yielded(text, bound, capsys) -> None:
     inference = _inference(text, bound=bound)
     spoken: list[object] = []
     try:
-        with pytest.raises(RuntimeError, match="tool-call imitation"):
+        with pytest.raises(ModelOutputRefused) as caught:
             async for segment in inference.stream(
                 _request(), turn_id="turn_imitation",
             ):
                 spoken.append(segment)
     finally:
         await inference.close()
+    assert type(caught.value) is ModelOutputRefused
+    assert caught.value.category == "call_imitation"
     assert all("start_work" not in str(s) and "search_knowledge" not in str(s)
                and "task_status" not in str(s) for s in spoken)
     markers = [

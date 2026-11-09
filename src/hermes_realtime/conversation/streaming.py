@@ -70,6 +70,42 @@ _PublicValue = str | int | bool | None
 _Observer = Callable[[str, dict[str, _PublicValue]], None]
 _LOGGER = logging.getLogger(__name__)
 
+MODEL_OUTPUT_REFUSAL_CATEGORIES = frozenset({
+    "call_imitation",
+    "unverified_claim",
+    "unverified_lookup_claim",
+    "unexpected_native_calls",
+    "unadvertised",
+    "duplicate_keys",
+    "decision_json",
+    "decision_schema",
+    "reply_type",
+    "reply_blank",
+    "reply_length",
+    "reply_unicode",
+    "objective_type",
+    "objective_blank",
+    "objective_length",
+    "objective_unicode",
+})
+
+
+class ModelOutputRefused(Exception):
+    """A provider guard refused model output; the turn fails, the binding continues.
+
+    ``category`` comes from a closed set, never model prose. Only this exact type
+    is non-terminal: subclasses, exception groups and replacing cleanup failures
+    keep their terminal semantics (#470).
+    """
+
+    def __init__(self, category: str) -> None:
+        if type(category) is not str:
+            raise TypeError("model output refusal category must be an exact built-in string")
+        if category not in MODEL_OUTPUT_REFUSAL_CATEGORIES:
+            raise ValueError("model output refusal category is not allowlisted")
+        self.category = category
+        super().__init__("model output refused: " + category)
+
 
 def _is_cancellation_only(error: BaseException) -> bool:
     if isinstance(error, asyncio.CancelledError):
@@ -1340,7 +1376,10 @@ class StreamingSpeechLoop:
             async with self._lifecycle_lock:
                 if self._active_consumer is consumer:
                     self._authority_revision += 1
-                    self._revoke_active_locked(preserve_resumable=preserve_resumable_on_cancel)
+                    self._revoke_active_locked(
+                        preserve_resumable=preserve_resumable_on_cancel
+                        and not self._future_failed(producer_result),
+                    )
             try:
                 await self._settle_owned_cleanups()
             except BaseException as candidate:
@@ -2533,6 +2572,12 @@ class StreamingSpeechLoop:
                 )
 
     @staticmethod
+    def _future_failed(result: asyncio.Future[None]) -> bool:
+        """A failed producer's unheard text must never become resumable speech (#470)."""
+
+        return result.done() and not result.cancelled() and result.exception() is not None
+
+    @staticmethod
     def _report_producer_failure(
         iteration: BaseException | None, close: BaseException | None, *, after_text: bool,
     ) -> None:
@@ -2542,6 +2587,8 @@ class StreamingSpeechLoop:
         error = errors[0]
         if len(errors) > 1 or isinstance(error, BaseExceptionGroup):
             kind = "group"
+        elif type(error) is ModelOutputRefused:
+            kind = "refused"
         else:
             kind = next((label for cls, label in (
                 (ValueError, "value"), (TypeError, "type"), (RuntimeError, "runtime"),

@@ -20,6 +20,7 @@ from hermes_realtime.conversation.output_style import communication_policy, requ
 from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
+    ModelOutputRefused,
 )
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
@@ -68,6 +69,14 @@ _MAX_WORK_RESPONSE_BYTES = _MAX_RESPONSE_LINE_BYTES
 _MAX_WORK_RESPONSE_CHUNKS = 1024
 _MAX_WORK_REPLY_CHARS = 65_536
 _PRIVATE_AUTHORITY = re.compile(r"deleg_[A-Za-z0-9][A-Za-z0-9_.:-]*")
+# Model-output refusals that fail only the turn (#470). Any category not listed,
+# including private_authority and transport, protocol or bound checks, stays terminal.
+_TURN_REFUSAL_CATEGORIES = frozenset({
+    "call_imitation", "unverified_claim", "unexpected_native_calls", "unadvertised",
+    "duplicate_keys", "decision_json", "decision_schema",
+    "reply_type", "reply_blank", "reply_length", "reply_unicode",
+    "objective_type", "objective_blank", "objective_length", "objective_unicode",
+})
 _WORK_REPLY_POLICY = (
     " Return exactly one JSON object matching the response schema. For an ordinary answer, "
     "use kind reply with the spoken answer in text. Do not include Markdown fences, tool calls, "
@@ -676,6 +685,8 @@ class OllamaStreamingInference:
     @classmethod
     def _refuse_work(cls, category: str, *, attempts: int = 0) -> None:
         try:
+            if category in _TURN_REFUSAL_CATEGORIES:
+                raise ModelOutputRefused(category)
             raise OllamaDecisionRefused(category)
         finally:
             cls._work_evidence(category, attempts=attempts)

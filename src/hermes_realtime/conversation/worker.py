@@ -37,7 +37,7 @@ from hermes_realtime.speech import (
 from .actions import ConversationUpdateExecutor
 from .ingress import BoundedPcmIngress, IngressRecord
 from .knowledge import KnowledgePrefetchCoordinator
-from .streaming import _ForegroundInterruptionAuthority
+from .streaming import ModelOutputRefused, _ForegroundInterruptionAuthority
 from .task_proposals import ConversationTaskProposals
 from .telemetry import KnowledgeTurnBudget, UtteranceTicket
 from .updates import _operation_failed
@@ -1173,6 +1173,9 @@ class ConversationSessionWorker:
         if operation.cancelled():
             return
         error = operation.exception()
+        if type(error) is ModelOutputRefused:
+            # The refused turn already failed and cleaned up; the binding continues (#470).
+            return
         if error is not None and self._terminal_error is None:
             self._terminal_error = error
 
