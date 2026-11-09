@@ -10,6 +10,7 @@ import pytest
 from test_codex_app_server import EofOnCloseCodexTransport, FakeWorkToolHandler, _snapshot
 
 from hermes_realtime.providers import codex_app_server as provider
+from tests.support.automatic_gc import no_automatic_gc
 
 
 def advisory(**changes: object) -> dict[str, object]:
@@ -251,12 +252,14 @@ async def test_advisory_flood_does_not_restart_the_original_event_wait():
         return await original(*args, **kwargs)
 
     inference._next_event = observed_wait
-    try:
-        with pytest.raises(TimeoutError):
-            await collect(inference)
-        assert waits == 1
-    finally:
-        await inference.close()
+    # The fake's sends never suspend; a collection inside a 30 ms setup send would fail it.
+    with no_automatic_gc():
+        try:
+            with pytest.raises(TimeoutError):
+                await collect(inference)
+            assert waits == 1
+        finally:
+            await inference.close()
 
 
 @pytest.mark.asyncio
