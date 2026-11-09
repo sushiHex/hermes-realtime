@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import types
 from urllib.error import HTTPError
 
@@ -14,13 +15,22 @@ class _FakeProcess:
     def __init__(self, pid: int, returncode: int | None = None):
         self.pid = pid
         self.returncode = returncode
+        self.hang = False
+        self.exit_code = 0
+        self.poll_error = False
+        self.waited = False
 
     def poll(self):
+        if self.poll_error and self.waited:
+            raise OSError("SYNTHETIC_PRIVATE_VALUE")
         return self.returncode
 
     def wait(self, timeout=None):
-        self.returncode = 0
-        return 0
+        self.waited = True
+        if self.hang:
+            raise subprocess.TimeoutExpired("synthetic-host", timeout)
+        self.returncode = self.exit_code
+        return self.exit_code
 
 
 def _read_receipt(output, name: str):
@@ -52,6 +62,7 @@ def dev_service_case(tmp_path, monkeypatch):
         "health_calls": 0,
         "host_http_calls": 0,
         "spawned": [],
+        "host_stop": {"hang": False, "exit_code": 0, "poll_error": False},
     }
     pids = {"gateway": 41001, "livekit": 41002, "host": 41003}
     for port in plan.ports["protected"]:
@@ -142,6 +153,9 @@ def dev_service_case(tmp_path, monkeypatch):
             elif name == "livekit":
                 state["tcp"][plan.ports["livekit"]] = True
             elif name == "host":
+                process.hang = state["host_stop"]["hang"]
+                process.exit_code = state["host_stop"]["exit_code"]
+                process.poll_error = state["host_stop"]["poll_error"]
                 if state["fault"] == "host_auth_failure":
                     process.returncode = 1
                 else:
@@ -288,3 +302,89 @@ def test_protected_tcp_unknown_is_optional_metadata_and_does_not_block_dev_readi
     assert stopped["protected_endpoints_unchanged"] is None
     assert stopped["remaining_accepting_endpoints"] == 0
     assert case.state["listener_calls"] == 0
+
+
+def _leave_pending_run(plan) -> None:
+    (plan.output / "state" / "hermes-runs-v1.json").write_text(
+        json.dumps({"version": 1, "pending": [{"run": 1}], "admitted": []}), encoding="utf-8"
+    )
+
+
+def test_host_graceful_stop_timeout_names_a_shutdown_only_refusal(dev_service_case):
+    case = dev_service_case
+    case.state["host_stop"]["hang"] = True
+    _leave_pending_run(case.plan)
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 1
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["category"] == "refused"
+    assert stopped["cleanup_settled"] is True
+    assert stopped["host_graceful_stop_timed_out"] is True
+    assert stopped["host_exit_code"] is None
+    assert stopped["failure_category"] == "host_graceful_stop_timeout"
+
+
+def test_host_clean_exit_records_neither_timeout_nor_category(dev_service_case):
+    case = dev_service_case
+    _leave_pending_run(case.plan)
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 1
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["category"] == "refused"
+    assert stopped["host_graceful_stop_timed_out"] is False
+    assert stopped["host_exit_code"] == 0
+    assert stopped["failure_category"] is None
+
+
+def test_host_clean_stop_receipt_carries_exit_without_timeout(dev_service_case):
+    case = dev_service_case
+    case.state["host_stop"]["exit_code"] = 3
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 0
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["category"] == "stopped"
+    assert stopped["host_graceful_stop_timed_out"] is False
+    assert stopped["host_exit_code"] == 3
+    assert stopped["failure_category"] is None
+
+
+def test_host_graceful_stop_timeout_keeps_existing_settlement_authority(dev_service_case):
+    case = dev_service_case
+    case.state["host_stop"]["hang"] = True
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 0
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["category"] == "stopped"
+    assert stopped["host_graceful_stop_timed_out"] is True
+    assert stopped["host_exit_code"] is None
+    assert stopped["failure_category"] is None
+
+
+def test_startup_failure_outranks_host_graceful_stop_timeout(dev_service_case):
+    case = dev_service_case
+    case.state["fault"] = "host_http_failure"
+    case.state["host_stop"]["hang"] = True
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 1
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["host_graceful_stop_timed_out"] is True
+    assert stopped["failure_category"] == "host_http_not_ready"
+
+
+@pytest.mark.parametrize("code", [True, -(2**31) - 1, 2**32])
+def test_host_exit_code_rejects_noninteger_or_out_of_range(dev_service_case, code):
+    case = dev_service_case
+    case.state["host_stop"]["exit_code"] = code
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 0
+    assert _read_receipt(case.plan.output, "result-receipt.private.json")["host_exit_code"] is None
+
+
+def test_host_exit_observation_failure_is_null_and_keeps_cleanup(dev_service_case):
+    case = dev_service_case
+    case.state["host_stop"]["poll_error"] = True
+    assert preview_cutover.serve(case.plan.output / "active.private.json") == 0
+
+    stopped = _read_receipt(case.plan.output, "result-receipt.private.json")
+    assert stopped["category"] == "stopped"
+    assert stopped["host_exit_code"] is None
+    assert "SYNTHETIC_PRIVATE_VALUE" not in json.dumps(stopped)
