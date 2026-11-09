@@ -364,6 +364,9 @@ def bounded_exa_send(
             phase = "response_status"
             if not 200 <= response.status_code < 300:
                 raise RuntimeError("exa_http_refused")
+            # MCP JSON-RPC bodies are UTF-8 (RFC 8259). Exa answers text/event-stream
+            # without a charset, which requests decodes as ISO-8859-1 for native .text.
+            response.encoding = "utf-8"
             return response
         except BaseException as error:
             with lock:
