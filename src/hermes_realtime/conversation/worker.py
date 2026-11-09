@@ -46,6 +46,8 @@ _MAX_IDENTITY_CHARS = 128
 _MAX_SESSION_GENERATION = (1 << 63) - 1
 _MAX_RESPONSE_OPERATIONS = 64
 _MAX_TYPED_TRANSCRIPT_CHARS = 4096
+# A persistently refused model ends the session loudly instead of going silent (#470).
+_MAX_CONSECUTIVE_REFUSED_RESPONSES = 3
 _DEFAULT_MAX_BUFFERED_AUDIO_BYTES = 256 * 1024
 _MAX_BUFFERED_AUDIO_BYTES = 2 * 1024 * 1024
 # How long closing a binding waits for the speech it started to stop.
@@ -292,6 +294,7 @@ class ConversationSessionWorker:
         self._binding_cleanup_settled = False
         self._audio_lock = asyncio.Lock()
         self._terminal_error: BaseException | None = None
+        self._consecutive_refused_responses = 0
         self._binding_close_operation: asyncio.Task[None] | None = None
         self._close_operation: asyncio.Task[None] | None = None
         self._started = False
@@ -1174,8 +1177,13 @@ class ConversationSessionWorker:
             return
         error = operation.exception()
         if type(error) is ModelOutputRefused:
-            # The refused turn already failed and cleaned up; the binding continues (#470).
-            return
+            # The refused turn already failed and cleaned up; the binding continues
+            # until the refusals repeat (#470).
+            self._consecutive_refused_responses += 1
+            if self._consecutive_refused_responses < _MAX_CONSECUTIVE_REFUSED_RESPONSES:
+                return
+        elif error is None:
+            self._consecutive_refused_responses = 0
         if error is not None and self._terminal_error is None:
             self._terminal_error = error
 

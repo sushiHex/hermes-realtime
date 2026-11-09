@@ -36,6 +36,7 @@ from hermes_realtime.speech import Transcript
 
 from .context import ConversationMessage, ConversationRole
 from .streaming import (
+    ModelOutputRefused,
     StreamingSpeechLoop,
     _ForegroundInterruptionAuthority,
     _UpdateSpeechAuthority,
@@ -1053,7 +1054,10 @@ class ConversationUpdateExecutor:
                 )
         with contextlib.suppress(BaseException):
             task.result()
-        if succeeded and releases_idle_floor:
+        # A refused turn failed only itself; mentions requeued behind it must still
+        # drain (#470). Other failures may be terminal, so they add no speech.
+        refused = not task.cancelled() and type(task.exception()) is ModelOutputRefused
+        if (succeeded or refused) and releases_idle_floor:
             self._start_idle_mention_drain()
 
     async def _close_owned(self) -> None:

@@ -20,6 +20,7 @@ from hermes_realtime.conversation import (
     UpdateDirective,
     UpdatePolicyInput,
 )
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.host_launcher import ProactiveCompletionUpdatePolicy
 from hermes_realtime.speech import (
     AudioFrame,
@@ -553,6 +554,96 @@ async def test_mid_turn_mention_drains_when_foreground_releases_without_another_
     assert director.pending_mentions() == ()
     record = await asyncio.wait_for(executor.wait_for_action_record(1), timeout=1)
     assert record.disposition == "delivered"
+    await executor.close()
+
+
+class GatedFailureInference:
+    """Speak one segment, then fail the turn with a chosen error once released."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.fail = asyncio.Event()
+
+    async def _stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        del snapshot, turn_id
+        yield "I have started counting for you right now."
+        await self.fail.wait()
+        raise self._error
+
+    def stream(
+        self,
+        snapshot: ConversationContextSnapshot,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[str]:
+        return self._stream(snapshot, turn_id=turn_id)
+
+    async def cancel(self, turn_id: str) -> None:
+        del turn_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", [True, False], ids=["refused", "terminal_error"])
+async def test_mention_queued_during_a_failed_turn_drains_only_after_a_refusal(refused) -> None:
+    """#470: a refused turn must not strand a mention; a terminal failure adds no speech."""
+    context = ConversationContextStore()
+    source = GatedCompletionSource(
+        TaskTerminalOutcome(
+            task_id="task_mid_turn_report",
+            status="completed",
+            summary="The report is ready.",
+        )
+    )
+    director = director_for_test(context, source)
+    playback = BlockingPlayback()
+    error = (
+        ModelOutputRefused("call_imitation") if refused
+        else RuntimeError("synthetic provider failure")
+    )
+    inference = GatedFailureInference(error)
+    speech = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=inference,
+        synthesizer=Synthesizer(),
+        playback=playback,
+        ledger=DeliveredSpeechLedger(),
+    )
+    executor = ConversationUpdateExecutor(director=director, speech=speech)
+    executor.start()
+    response = asyncio.create_task(
+        executor.respond(
+            "turn_counting",
+            Transcript(text="Count to thirty.", final=True),
+        )
+    )
+    await playback.first_started.wait()
+
+    source.release.set()
+    for _ in range(100):
+        if director.pending_mentions():
+            break
+        await asyncio.sleep(0)
+    assert director.pending_mentions()
+
+    inference.fail.set()
+    with pytest.raises(type(error)):
+        await asyncio.wait_for(response, timeout=1)
+
+    if refused:
+        await asyncio.wait_for(playback.update_played.wait(), timeout=1)
+        assert playback.played_text[-1] == "The requested report is ready."
+        assert director.pending_mentions() == ()
+    else:
+        for _ in range(200):
+            await asyncio.sleep(0)
+        assert not playback.update_played.is_set()
+        assert director.pending_mentions()
     await executor.close()
 
 

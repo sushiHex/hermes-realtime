@@ -27,6 +27,14 @@ def test_fixed_foreground_failure_survives_split_drain_and_finish(tmp_path):
     assert "foreground-failure" not in json.dumps(facts)
 
 
+def test_refused_foreground_failure_is_counted_not_invalid(tmp_path):
+    capture = CappedCapture(tmp_path / "child.private.log")
+    capture.feed(marker(failure_kind="refused", text_phase="after_text"))
+    facts = capture.finish()
+    assert set(facts["categories"]) == {"foreground_producer_refused_after_text"}
+    assert facts["categories"]["foreground_producer_refused_after_text"]["count"] == 1
+
+
 def test_unterminated_final_marker_is_counted_exactly_once(tmp_path):
     capture = CappedCapture(tmp_path / "child.private.log")
     capture.feed(marker().rstrip(b"\n"))

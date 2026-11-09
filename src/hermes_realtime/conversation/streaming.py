@@ -926,6 +926,10 @@ class StreamingSpeechLoop:
 
         producer_done = asyncio.Event()
         producer_result: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        # Set synchronously before a failing producer invalidates its publications, so
+        # revocation never keeps a failed turn's unheard text as resumable speech,
+        # however the producer's own cleanup is scheduled (#470).
+        producer_failed = asyncio.Event()
         pending_admissions: list[AssistantTextAdmission] = []
         generated_segments: list[ForegroundPublication] = []
         proposal_readback: list[TaskProposal] = []
@@ -1138,6 +1142,7 @@ class StreamingSpeechLoop:
                 except asyncio.CancelledError:
                     raise
                 except BaseException as error:
+                    producer_failed.set()
                     lease.invalidate_publications()
                     iteration_error = error
                 close_error = await self._close_stream(inference)
@@ -1194,6 +1199,7 @@ class StreamingSpeechLoop:
                                         break
                             except BaseException as error:
                                 if not isinstance(error, asyncio.CancelledError):
+                                    producer_failed.set()
                                     lease.invalidate_publications()
                                 continuation_error = error
                             finally:
@@ -1378,7 +1384,7 @@ class StreamingSpeechLoop:
                     self._authority_revision += 1
                     self._revoke_active_locked(
                         preserve_resumable=preserve_resumable_on_cancel
-                        and not self._future_failed(producer_result),
+                        and not producer_failed.is_set(),
                     )
             try:
                 await self._settle_owned_cleanups()
@@ -1416,7 +1422,10 @@ class StreamingSpeechLoop:
             async with self._lifecycle_lock:
                 if self._active_consumer is consumer:
                     self._authority_revision += 1
-                    self._revoke_active_locked(preserve_resumable=preserve_resumable_on_cancel)
+                    self._revoke_active_locked(
+                        preserve_resumable=preserve_resumable_on_cancel
+                        and not producer_failed.is_set(),
+                    )
             try:
                 await self._settle_owned_cleanups()
             except BaseException as cleanup_error:
@@ -2570,12 +2579,6 @@ class StreamingSpeechLoop:
                 StreamingSpeechLoop._report_producer_failure(
                     iteration_error, close_error, after_text=producer_after_text,
                 )
-
-    @staticmethod
-    def _future_failed(result: asyncio.Future[None]) -> bool:
-        """A failed producer's unheard text must never become resumable speech (#470)."""
-
-        return result.done() and not result.cancelled() and result.exception() is not None
 
     @staticmethod
     def _report_producer_failure(
