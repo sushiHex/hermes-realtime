@@ -5,6 +5,7 @@ import json
 import pytest
 
 import hermes_realtime.providers.ollama as ollama
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from tests.providers.test_ollama_work_tools import (
     Response,
     adapter,
@@ -37,9 +38,10 @@ def _evidence(capsys) -> list[dict[str, object]]:
 async def test_structured_reply_imitation_is_never_yielded(text, capsys) -> None:
     inference, handler, _, response = adapter([decision_frame({"kind": "reply", "text": text})])
     spoken: list[object] = []
-    with pytest.raises(ValueError, match="call_imitation"):
+    with pytest.raises(ModelOutputRefused, match="call_imitation") as caught:
         async for segment in inference.stream(request(), turn_id="turn_test"):
             spoken.append(segment)
+    assert type(caught.value) is ModelOutputRefused
     assert spoken == []
     assert handler.calls == []
     assert response.closed
@@ -75,9 +77,10 @@ async def test_no_tools_stream_imitation_is_never_yielded(text) -> None:
         {"message": {"content": text + " "}, "done": True},
     ])
     spoken: list[object] = []
-    with pytest.raises(ValueError, match="call_imitation"):
+    with pytest.raises(ModelOutputRefused, match="call_imitation") as caught:
         async for segment in inference.stream(request(), turn_id="turn_test"):
             spoken.append(segment)
+    assert type(caught.value) is ModelOutputRefused
     assert all("start_work" not in str(s) and "task_status" not in str(s) for s in spoken)
     await inference.close()
 

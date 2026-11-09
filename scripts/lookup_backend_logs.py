@@ -25,7 +25,8 @@ def _foreground_failure_category(raw: bytes) -> str:
         or value["version"] != 1
         or value["stage"] != "producer"
         or type(value["failure_kind"]) is not str
-        or value["failure_kind"] not in {"value", "type", "runtime", "timeout", "group", "other"}
+        or value["failure_kind"]
+        not in {"value", "type", "runtime", "timeout", "group", "refused", "other"}
         or type(value["text_phase"]) is not str
         or value["text_phase"] not in {"before_text", "after_text"}
     ):

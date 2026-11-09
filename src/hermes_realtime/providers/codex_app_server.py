@@ -32,6 +32,7 @@ from hermes_realtime.conversation.output_style import (
 from hermes_realtime.conversation.streaming import (
     AcceptedStartInferenceRequest,
     ConversationInferenceRequest,
+    ModelOutputRefused,
 )
 from hermes_realtime.conversation.task_proposals import (
     MAX_TASK_PROPOSAL_OBJECTIVE_CHARS,
@@ -1529,18 +1530,22 @@ class CodexAppServerStreamingInference:
                     self._teardown_dynamic_thread(server_thread_id)
 
     @staticmethod
-    def _require_no_call_imitation(segment: str) -> None:
-        if not contains_tool_call_imitation(segment):
-            return
+    def _refuse_output(category: str) -> None:
+        """Fail only this turn (#470), with one bounded category-only marker."""
         try:
-            raise RuntimeError("Codex emitted tool-call imitation")
+            raise ModelOutputRefused(category)
         finally:
             print(
                 _OUTPUT_REFUSAL_PREFIX + json.dumps(
-                    {"refusal": "call_imitation", "version": 1}, separators=(",", ":"),
+                    {"refusal": category, "version": 1}, separators=(",", ":"),
                 ),
                 flush=True,
             )
+
+    @classmethod
+    def _require_no_call_imitation(cls, segment: str) -> None:
+        if contains_tool_call_imitation(segment):
+            cls._refuse_output("call_imitation")
 
     def _require_verified_background_claim(
         self,
@@ -1558,7 +1563,7 @@ class CodexAppServerStreamingInference:
             return
         routing = self._turn_routing.get((thread_id, turn_id))
         if routing is None or not routing.accepted_start:
-            raise RuntimeError("Codex emitted an unverified background-work claim")
+            self._refuse_output("unverified_claim")
 
     def _require_verified_lookup_claim(
         self,
@@ -1571,7 +1576,7 @@ class CodexAppServerStreamingInference:
             return
         routing = self._turn_routing.get((thread_id, turn_id))
         if routing is None or not routing.lookup_attempted:
-            raise RuntimeError("Codex emitted an unverified knowledge-lookup claim")
+            self._refuse_output("unverified_lookup_claim")
 
     @staticmethod
     def _dynamic_tools(

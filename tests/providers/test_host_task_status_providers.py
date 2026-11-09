@@ -3,6 +3,7 @@
 import pytest
 from test_ollama_work_tools import adapter, collect, decision_frame
 
+from hermes_realtime.conversation.streaming import ModelOutputRefused
 from hermes_realtime.conversation.task_proposals import HostTaskProposalRequest
 from hermes_realtime.conversation.task_status import HostSpeechRequest
 from tests.support.automatic_gc import no_automatic_gc
@@ -103,8 +104,9 @@ async def test_provider_prompts_preserve_heard_host_provenance():
 async def test_ollama_status_rejects_every_argument(extra):
     inference, handler, _, _ = adapter([decision_frame({"kind": "task_status", **extra})])
     try:
-        with pytest.raises(ValueError, match="decision_schema"):
+        with pytest.raises(ModelOutputRefused, match="decision_schema") as caught:
             await collect(inference)
+        assert type(caught.value) is ModelOutputRefused
         assert handler.calls == []
     finally:
         await inference.close()
@@ -119,7 +121,7 @@ async def test_ollama_status_not_offered_to_plain_snapshot():
 
     inference, handler, sent, _ = adapter([decision_frame({"kind": "task_status"})])
     try:
-        with pytest.raises(ValueError, match="unadvertised"):
+        with pytest.raises(ModelOutputRefused, match="unadvertised"):
             await collect(
                 inference,
                 ConversationContextSnapshot(
