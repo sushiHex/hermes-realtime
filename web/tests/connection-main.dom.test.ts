@@ -474,6 +474,29 @@ describe("mounted connection recovery", () => {
     expect(toggle.textContent).not.toBe("Fresh launch required");
   });
 
+  it("labels runtime-reported context without claiming measured allocation", async () => {
+    const frozen = {
+      model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 8192,
+      advertisedContextTokens: 32768, effectiveContextTokens: null,
+    };
+    await mount(normalRequest, false, false,
+      Response.json({ ...localModelOptions(), state: "prepared", selection: frozen }));
+    const document = dom.window.document;
+    for (const id of ["#local-model-effective", "#model-effective-context"]) {
+      const row = document.querySelector(id)!.parentElement!;
+      expect(row.querySelector("dt")?.textContent).toBe("Runtime-reported context");
+    }
+    expect(document.querySelector("#local-model-effective")?.textContent)
+      .toBe("Not reported by runtime");
+    expect(document.querySelector("#model-effective-context")?.textContent)
+      .toBe("Not reported by runtime");
+    for (const id of ["#local-model-options", "#local-model-context"]) {
+      expect(document.querySelector(id)?.textContent)
+        .toContain("Physical memory allocation is not measured here.");
+    }
+    expect(document.body.textContent).not.toMatch(/observed allocation/i);
+  });
+
   it("recovers an already-prepared host selection without preparing it again", async () => {
     const frozen = {
       model: "synthetic:installed", digest: "a".repeat(64), requestedContextTokens: 8192,

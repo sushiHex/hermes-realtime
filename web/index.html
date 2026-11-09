@@ -140,8 +140,9 @@
                 <dl class="local-model-observations">
                   <div><dt>Advertised maximum</dt><dd id="local-model-advertised">Unknown</dd></div>
                   <div><dt>Requested context</dt><dd id="local-model-requested">Not selected</dd></div>
-                  <div><dt>Observed allocation</dt><dd id="local-model-effective">Not observed</dd></div>
+                  <div><dt>Runtime-reported context</dt><dd id="local-model-effective">Not reported by runtime</dd></div>
                 </dl>
+                <p class="local-model-budget-note">Runtime-reported context is the value the model runtime reports. Physical memory allocation is not measured here.</p>
               </fieldset>
               <output id="local-model-selection-state" class="local-model-selection-state" role="status" aria-live="polite">Choose a model and context before connecting.</output>
               <button id="local-model-retry" class="button secondary" type="button" hidden>Retry local model discovery</button>
@@ -170,8 +171,8 @@
               <div id="local-model-context" hidden>
                 <div class="model-stat"><dt>Requested context</dt><dd id="model-requested-context">—</dd></div>
                 <div class="model-stat"><dt>Advertised maximum</dt><dd id="model-advertised-context">Unknown</dd></div>
-                <div class="model-stat"><dt>Observed allocation</dt><dd id="model-effective-context">Not observed</dd></div>
-                <p>Stored history may not be included in every response. Advertised capacity is not a guarantee of quality or available memory.</p>
+                <div class="model-stat"><dt>Runtime-reported context</dt><dd id="model-effective-context">Not reported by runtime</dd></div>
+                <p>Stored history may not be included in every response. Advertised capacity is not a guarantee of quality or available memory. Physical memory allocation is not measured here.</p>
               </div>
               <div class="model-stat"><dt>Usage feed</dt><dd id="model-usage-reporting">Awaiting session</dd></div>
               <div class="model-stat model-stat-section"><dt>Speech runtime</dt><dd></dd></div>
