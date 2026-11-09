@@ -629,6 +629,171 @@ async def test_ollama_retains_and_closes_response_when_cancelled_during_open() -
     await inference.close()
 
 
+async def _settle_turn_cleanups(inference: OllamaStreamingInference) -> None:
+    for _ in range(10):
+        pending = [*inference._opening_cleanups.values(), *inference._response_cleanups.values()]
+        if not pending:
+            await asyncio.sleep(0)
+            return
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2)
+    pytest.fail("Ollama turn cleanups did not settle")
+
+
+def _assert_no_retained_turn_state(inference: OllamaStreamingInference) -> None:
+    assert inference._openings == {}
+    assert inference._opening_cleanups == {}
+    assert inference._responses == {}
+    assert inference._response_cleanups == {}
+    assert inference._reads == {}
+    assert inference._cancelled_turns == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["http_refusal", "late_success"])
+@pytest.mark.parametrize(
+    "interruption", ["adapter_cancel", "consumer_then_adapter_cancel", "consumer_cancel"],
+)
+async def test_cancelled_opening_releases_its_tombstone_once_cleanup_owns_nothing(
+    outcome: str, interruption: str,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    refusal = HTTPError("http://127.0.0.1:11434/api/chat", 400, "overflow", {},
+                        io.BytesIO(b"Synthetic refusal body."))
+    late = LineResponse(({"message": {"content": "Late reply."}, "done": True},))
+    requests: list[Request] = []
+
+    def open_request(request: Request, timeout: float) -> LineResponse:
+        del timeout
+        requests.append(request)
+        if len(requests) > 1:
+            return LineResponse(({"message": {"content": "Next reply."}, "done": True},))
+        entered.set()
+        assert release.wait(3)
+        if outcome == "http_refusal":
+            raise refusal
+        return late
+
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("model"),
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+    emitted: list[str] = []
+
+    async def consume() -> None:
+        async for segment in inference.stream(_snapshot(), turn_id="turn_reused"):
+            emitted.append(segment)
+
+    stream = asyncio.create_task(consume())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        if interruption != "adapter_cancel":
+            stream.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stream
+        cancelling = None
+        if interruption != "consumer_cancel":
+            cancelling = asyncio.create_task(inference.cancel("turn_reused"))
+            await asyncio.sleep(0)
+        assert inference._cancelled_turns == {"turn_reused"}
+        release.set()
+        if cancelling is not None:
+            await asyncio.wait_for(cancelling, timeout=2)
+        if interruption == "adapter_cancel":
+            if outcome == "http_refusal":
+                with pytest.raises(HTTPError):
+                    await asyncio.wait_for(stream, timeout=2)
+            else:
+                with pytest.raises(RuntimeError, match="cancelled while opening"):
+                    await asyncio.wait_for(stream, timeout=2)
+        await _settle_turn_cleanups(inference)
+
+        assert emitted == []
+        assert late.closed is (outcome == "late_success")
+        _assert_no_retained_turn_state(inference)
+        # The released tombstone must not refuse an independent turn reusing the identifier.
+        assert [
+            segment async for segment in inference.stream(_snapshot(), turn_id="turn_reused")
+        ] == ["Next reply."]
+        _assert_no_retained_turn_state(inference)
+    finally:
+        release.set()
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancelled_openings_retain_no_cancellation_state() -> None:
+    release = threading.Event()
+
+    def open_request(request: Request, timeout: float) -> LineResponse:
+        del request, timeout
+        assert release.wait(3)
+        raise HTTPError("http://127.0.0.1:11434/api/chat", 400, "overflow", {},
+                        io.BytesIO(b"Synthetic refusal body."))
+
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("model"),
+        base_url="http://127.0.0.1:11434", model="model", open_request=open_request)
+
+    async def consume(turn_id: str) -> list[str]:
+        return [segment async for segment in inference.stream(_snapshot(), turn_id=turn_id)]
+
+    try:
+        for index in range(3):
+            release.clear()
+            turn_id = f"turn_repeat_{index}"
+            stream = asyncio.create_task(consume(turn_id))
+            while turn_id not in inference._openings:
+                await asyncio.sleep(0)
+            cancelling = asyncio.create_task(inference.cancel(turn_id))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(cancelling, timeout=2)
+            with pytest.raises(HTTPError):
+                await asyncio.wait_for(stream, timeout=2)
+            await _settle_turn_cleanups(inference)
+            _assert_no_retained_turn_state(inference)
+    finally:
+        release.set()
+        await inference.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_response_cannot_resume_output_while_its_close_is_pending() -> None:
+    close_started = threading.Event()
+    allow_close = threading.Event()
+
+    class SlowCloseResponse(LineResponse):
+        def close(self) -> None:
+            close_started.set()
+            assert allow_close.wait(timeout=5)
+            super().close()
+
+    response = SlowCloseResponse((
+        {"message": {"content": "First sentence."}, "done": False},
+        {"message": {"content": "Second sentence."}, "done": True},
+    ))
+    inference = OllamaStreamingInference(metadata_client=supported_ollama_metadata("model"),
+        base_url="http://127.0.0.1:11434", model="model",
+        open_request=lambda _request, _timeout: response)
+    stream = inference.stream(_snapshot(), turn_id="turn_resumed")
+    try:
+        assert await asyncio.wait_for(anext(stream), timeout=2) == "First sentence."
+        cancelling = asyncio.create_task(inference.cancel("turn_resumed"))
+        assert await asyncio.to_thread(close_started.wait, 2)
+        # Resume the generator while its response is still owned by the pending cleanup, and
+        # give an unguarded read time to return the remaining line before the close finishes.
+        resume = asyncio.create_task(anext(stream))
+        await asyncio.wait({resume}, timeout=0.2)
+        allow_close.set()
+        with pytest.raises(RuntimeError, match="cancelled while reading"):
+            await asyncio.wait_for(resume, timeout=2)
+        await asyncio.wait_for(cancelling, timeout=2)
+        await _settle_turn_cleanups(inference)
+        _assert_no_retained_turn_state(inference)
+    finally:
+        allow_close.set()
+        await stream.aclose()
+        await inference.close()
+
+
 @pytest.mark.asyncio
 async def test_ollama_cancel_waits_for_owned_blocked_reader_thread() -> None:
     read_started = threading.Event()

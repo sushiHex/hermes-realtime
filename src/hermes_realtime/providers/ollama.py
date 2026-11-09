@@ -636,8 +636,7 @@ class OllamaStreamingInference:
                     response_cleanup = self._ensure_response_cleanup_locked(
                         turn_id, response, read_operation
                     )
-                if opening is None and response is None:
-                    self._cancelled_turns.discard(turn_id)
+                self._release_cancelled_turn_locked(turn_id)
             if response_cleanup is not None:
                 await asyncio.shield(response_cleanup)
 
@@ -883,7 +882,7 @@ class OllamaStreamingInference:
                 current = asyncio.current_task()
                 if self._response_cleanups.get(turn_id) is current:
                     del self._response_cleanups[turn_id]
-                self._cancelled_turns.discard(turn_id)
+                self._release_cancelled_turn_locked(turn_id)
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -919,6 +918,20 @@ class OllamaStreamingInference:
             current = asyncio.current_task()
             if self._opening_cleanups.get(turn_id) is current:
                 del self._opening_cleanups[turn_id]
+            self._release_cancelled_turn_locked(turn_id)
+
+    def _release_cancelled_turn_locked(self, turn_id: str) -> None:
+        # The tombstone refuses a resumed read or yield while any owner of this turn can
+        # still be claimed. Once no opener, response, or pending cleanup owns it, ownership
+        # identity alone refuses a late claimant, so the tombstone is released.
+        if (
+            turn_id in self._openings
+            or turn_id in self._opening_cleanups
+            or turn_id in self._responses
+            or turn_id in self._response_cleanups
+        ):
+            return
+        self._cancelled_turns.discard(turn_id)
 
     @staticmethod
     def _urlopen(request: Request, timeout: float) -> _LineResponse:
