@@ -34,7 +34,7 @@ def test_materialized_gate_forwards_native_git_selection_only_to_full_pytest(
         ):
             raise FullPytestReached
 
-    for name in ("reject_ambient_paths", "scan_for_secrets"):
+    for name in ("reject_ambient_paths", "scan_for_secrets", "validate_disclosure_manifest"):
         monkeypatch.setitem(gate.__globals__, name, lambda root: None)
     monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", lambda root, target: None)
     monkeypatch.setitem(gate.__globals__, "run", observe)
@@ -90,7 +90,7 @@ def test_native_and_provider_contract_checks_precede_full_pytest_matrix(
     def observe_livekit(root, environment, **ownership) -> None:
         events.append(("native", ownership))
 
-    for name in ("reject_ambient_paths", "scan_for_secrets"):
+    for name in ("reject_ambient_paths", "scan_for_secrets", "validate_disclosure_manifest"):
         monkeypatch.setitem(gate.__globals__, name, lambda root: None)
     monkeypatch.setitem(gate.__globals__, "snapshot_packaged_static", lambda root, target: None)
     monkeypatch.setitem(gate.__globals__, "run", observe)
@@ -133,6 +133,73 @@ def test_native_and_provider_contract_checks_precede_full_pytest_matrix(
             "process_id": 321,
         },
     )
+
+
+_DISCLOSURE_RESOURCES = (
+    "hermes_realtime/evidence/disclosure_v1.txt",
+    "hermes_realtime/evidence/disclosure_manifest_v1.json",
+    "hermes_realtime/client/static/index.html",
+    "hermes_realtime/client/static/assets/app.js",
+    "hermes_realtime/client/static/assets/app.js.LEGAL.txt",
+    "hermes_realtime/client/static/assets/styles.css",
+)
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["committed", "stale-asset-hash"])
+def test_materialized_gate_validates_committed_disclosure_manifest_before_any_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: bool
+) -> None:
+    """Issue #235: ``web/build.mjs`` rewrites the manifest's asset hashes.
+
+    A stale committed manifest must be rejected against the committed packaged
+    bytes before ``uv sync`` or any npm step can run, not repaired by the build
+    and then validated.
+    """
+
+    gate = run_path(str(ROOT / "scripts" / "release_gate.py"))["gate_materialized_candidate"]
+    candidate = tmp_path / "candidate"
+    for relative in _DISCLOSURE_RESOURCES:
+        destination = candidate / "src" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((ROOT / "src" / relative).read_bytes())
+    manifest = candidate / "src" / _DISCLOSURE_RESOURCES[1]
+    if stale:
+        manifest.write_text(
+            re.sub(
+                r'("styles\.css":")[0-9a-f]{64}"',
+                lambda match: match.group(1) + "0" * 64 + '"',
+                manifest.read_text(encoding="utf-8"),
+                count=1,
+            ),
+            encoding="utf-8",
+        )
+        assert manifest.read_bytes() != (ROOT / "src" / _DISCLOSURE_RESOURCES[1]).read_bytes()
+    commands: list[tuple[str, ...]] = []
+
+    class DependencySyncReached(Exception):
+        pass
+
+    def observe(*command: str, **kwargs: object) -> None:
+        commands.append(command)
+        if command[:2] == ("uv", "sync"):
+            raise DependencySyncReached
+
+    for name in ("reject_ambient_paths", "scan_for_secrets"):
+        monkeypatch.setitem(gate.__globals__, name, lambda root: None)
+    monkeypatch.setitem(gate.__globals__, "run", observe)
+
+    if stale:
+        with pytest.raises(
+            RuntimeError, match="evidence disclosure manifest does not match packaged resources"
+        ):
+            gate(candidate, livekit=False)
+        assert [command[:3] for command in commands] == [("uv", "lock", "--check")]
+    else:
+        with pytest.raises(DependencySyncReached):
+            gate(candidate, livekit=False)
+        assert [command[:2] for command in commands] == [("uv", "lock"), ("uv", "sync")]
+    assert all(command[0] != gate.__globals__["NPM"] for command in commands)
+    assert (tmp_path / "packaged-static-before-web-build").is_dir()
 
 
 def _run(*command: str, cwd: Path) -> bytes:
