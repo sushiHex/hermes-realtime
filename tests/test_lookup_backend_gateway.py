@@ -425,6 +425,80 @@ def test_interactive_profile_ignores_old_process_total_but_keeps_query_binding()
     assert state["searchRequests"] == 7
 
 
+_UNICODE_SAMPLE = "Rayleigh’s “blue” sky — 5 °C… ‘ok’"
+
+
+def _exa_sse_body(text):
+    envelope = {"jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text", "text": text}]}}
+    return ("event: message\ndata: " + json.dumps(envelope, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _first_sse_text(body):
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            return json.loads(line[len("data: "):])["result"]["content"][0]["text"]
+    raise AssertionError("no SSE data line")
+
+
+def _search_send_response(response):
+    module, state, wire = gateway(), witness(), SimpleNamespace()
+    wire.search = {"query": "sample", "limit": 5, "spent": False}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "web_search_exa", "arguments": {
+                           "query": "sample", "numResults": 5}}})
+    send = module.bounded_exa_send(
+        lambda _session, _request, **_kwargs: response, state, set(), lambda: None, wire,
+    )
+    return send(None, SimpleNamespace(url="https://mcp.exa.ai/mcp", method="POST", body=body),
+                timeout=30)
+
+
+class _UndeclaredEventStreamResponse:
+    """requests.Response decode semantics for an Exa SSE body without a charset."""
+
+    def __init__(self, body):
+        self.status_code = 200
+        self.headers = {"Content-Type": "text/event-stream"}
+        # requests.utils.get_encoding_from_headers: undeclared text/* -> ISO-8859-1.
+        self.encoding = "ISO-8859-1"
+        self.raw = SimpleNamespace(read=lambda *_a, **_k: body)
+
+    def close(self):
+        return None
+
+    @property
+    def text(self):
+        return str(self._content, self.encoding, errors="replace")
+
+
+def test_exa_event_stream_text_decodes_utf8_punctuation_exactly():
+    result = _search_send_response(_UndeclaredEventStreamResponse(_exa_sse_body(_UNICODE_SAMPLE)))
+    assert _first_sse_text(result.text) == _UNICODE_SAMPLE
+
+
+def test_exa_event_stream_preserves_punctuation_through_real_requests_response():
+    requests = pytest.importorskip("requests")
+    from requests.structures import CaseInsensitiveDict
+    from requests.utils import get_encoding_from_headers
+
+    def response(body):
+        value = requests.Response()
+        value.status_code = 200
+        value.headers = CaseInsensitiveDict({"Content-Type": "text/event-stream"})
+        value.encoding = get_encoding_from_headers(value.headers)
+        value.raw = SimpleNamespace(read=lambda *_a, **_k: body, close=lambda: None)
+        return value
+
+    result = _search_send_response(response(_exa_sse_body(_UNICODE_SAMPLE)))
+    assert _first_sse_text(result.text) == _UNICODE_SAMPLE
+    # A CESU-style encoded surrogate is invalid UTF-8; it never becomes a lone surrogate.
+    raw = _exa_sse_body("x").replace(b'"x"', b'"\xed\xa0\x80"')
+    text = _search_send_response(response(raw)).text
+    assert not any(0xD800 <= ord(character) <= 0xDFFF for character in text)
+
+
 def test_interactive_profile_keeps_single_wire_send_per_active_search_call():
     module, state, wire = gateway(), witness(), SimpleNamespace()
     wire.search = {"query": "same-run", "limit": 5, "spent": False}
