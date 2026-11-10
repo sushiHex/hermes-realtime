@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 import threading
-from contextlib import nullcontext, redirect_stdout, suppress
+from contextlib import redirect_stdout, suppress
 from pathlib import Path
 from typing import Any
 
@@ -607,18 +607,17 @@ def main() -> Any:
     if args.transport_profile == "interactive":
         require_interactive_policy_profile(config, Path(os.environ["HERMES_HOME"]))
     metadata_urls = metadata_urls_from_config(config)
-    capture_context: Any = nullcontext()
-    if args.model_response_capture != "off":
-        capture_module = _model_capture_module()
+    # Off still reports token counts; the observer itself keeps it numbers-only.
+    capture_module = _model_capture_module()
 
-        def capture_updated(summary: Any) -> None:
-            witness["modelResponseCapture"] = summary
-            save()
+    def capture_updated(summary: Any) -> None:
+        witness["modelResponseCapture"] = summary
+        save()
 
-        recorder = capture_module.ModelResponseCapture(
-            output, args.model_response_capture, manifest, config, on_update=capture_updated,
-        )
-        capture_context = recorder.installed()
+    recorder = capture_module.ModelResponseCapture(
+        output, args.model_response_capture, manifest, config, on_update=capture_updated,
+    )
+    capture_context = recorder.installed()
     returned_urls: set[str] = set()
     allowed_urls: set[str] = set()
     projection_lock = threading.Lock()
