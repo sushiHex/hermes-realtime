@@ -219,6 +219,116 @@ def test_docker_runner_preserves_bounded_output_and_nonzero_policy():
     assert "private" not in str(stopped.value)
 
 
+_SENTINEL = "private-sentinel-image-ref/credential"
+
+
+def _docker_markers(capsys) -> list[dict[str, object]]:
+    lines = capsys.readouterr().out.splitlines()
+    assert all(line.startswith("[linux-docker] ") for line in lines)
+    assert all(_SENTINEL not in line for line in lines)
+    return [json.loads(line.removeprefix("[linux-docker] ")) for line in lines]
+
+
+def test_docker_runner_marks_a_nonzero_exit_without_output_content(capsys):
+    script = (
+        "import os,sys;"
+        f"os.write(1,b'out-{_SENTINEL}');"
+        f"os.write(2,b'err-{_SENTINEL}!!');"
+        "sys.exit(9)"
+    )
+    with pytest.raises(ValueError, match="^owned Docker operation failed$"):
+        _python_docker()._run("-c", script)
+    assert _docker_markers(capsys) == [
+        {
+            "category": "nonzero_exit",
+            "exitStatus": 9,
+            "operation": "other",
+            "stderrBytes": len(_SENTINEL) + 6,
+            "stdoutBytes": len(_SENTINEL) + 4,
+            "version": 1,
+        }
+    ]
+
+
+def test_docker_runner_marks_a_timeout(monkeypatch, capsys):
+    from scripts import qualification_linux_producer as producer
+
+    monkeypatch.setattr(producer, "_DOCKER_TIMEOUT_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(producer, "_DOCKER_CLEANUP_RESERVE_SECONDS", 0.5, raising=False)
+    script = f"import os,time;os.write(2,b'{_SENTINEL}');time.sleep(3)"
+    with pytest.raises(ValueError, match="^owned Docker operation timed out$"):
+        _python_docker()._run("-c", script)
+    (marker,) = _docker_markers(capsys)
+    assert marker["category"] == "timeout"
+    assert marker["operation"] == "other"
+    assert marker["stderrBytes"] == len(_SENTINEL)
+
+
+def test_docker_runner_marks_output_overflow(capsys):
+    script = f"import os;os.write(2,b'{_SENTINEL}');[os.write(1,b'x'*65536) for _ in range(257)]"
+    with pytest.raises(ValueError, match="^owned Docker output exceeds its bound$"):
+        _python_docker()._run("-c", script)
+    (marker,) = _docker_markers(capsys)
+    assert marker["category"] == "output_overflow"
+    assert marker["stdoutBytes"] == 16 * 1024**2 + 1
+
+
+def test_docker_runner_marks_undecodable_output_without_its_content(capsys):
+    script = f"import os;os.write(2,b'{_SENTINEL}');os.write(1,b'bad-\\xff-out')"
+    with pytest.raises(ValueError, match="^owned Docker output differs$"):
+        _python_docker()._run("-c", script)
+    assert _docker_markers(capsys) == [
+        {
+            "category": "output_decode",
+            "exitStatus": 0,
+            "operation": "other",
+            "stderrBytes": len(_SENTINEL),
+            "stdoutBytes": 9,
+            "version": 1,
+        }
+    ]
+
+
+def test_docker_runner_marks_a_lifecycle_failure_before_any_process(monkeypatch, capsys):
+    from scripts import qualification_linux_producer as producer
+
+    def refuse(*args, **kwargs):
+        raise OSError(_SENTINEL)
+
+    monkeypatch.setattr(producer.subprocess, "Popen", refuse)
+    with pytest.raises(ValueError, match="^owned Docker operation failed$"):
+        _python_docker()._run("pull", _SENTINEL)
+    assert _docker_markers(capsys) == [
+        {
+            "category": "lifecycle",
+            "exitStatus": None,
+            "operation": "pull",
+            "stderrBytes": 0,
+            "stdoutBytes": 0,
+            "version": 1,
+        }
+    ]
+
+
+def test_docker_runner_emits_no_marker_for_success_or_unchecked_nonzero(capsys):
+    docker = _python_docker()
+    docker._run("-c", f"import os;os.write(2,b'{_SENTINEL}')")
+    docker._run("-c", "import sys;sys.exit(3)", check=False)
+    assert capsys.readouterr().out == ""
+
+
+def test_docker_marker_operation_comes_only_from_a_fixed_allowlist(capsys):
+    from scripts.qualification_linux_producer import _docker_refusal_marker
+
+    for arguments in (("pull", _SENTINEL), (_SENTINEL, "pull"), ()):
+        _docker_refusal_marker(arguments, "nonzero_exit", 1, 0, 0)
+    assert [marker["operation"] for marker in _docker_markers(capsys)] == [
+        "pull",
+        "other",
+        "other",
+    ]
+
+
 @pytest.mark.parametrize(
     ("descriptor", "chunks"),
     [(1, 256), (2, 16)],
