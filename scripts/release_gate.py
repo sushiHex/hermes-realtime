@@ -348,6 +348,9 @@ def declared_stage_environments(
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Bind the uv stages and the browser stages to their own declared tools."""
     path = environment.get("PATH", "")
+    # Hosted runners have no user Git config (signing, hooks, aliases). System
+    # Git config stays, because hosted Git for Windows ships one too.
+    hosted = environment | {"GIT_CONFIG_GLOBAL": os.devnull}
 
     def resolve(names: tuple[str, ...]) -> dict[str, Path]:
         tools: dict[str, Path] = {}
@@ -369,7 +372,7 @@ def declared_stage_environments(
         stage.name = "uv"
         python_tools["python"] = uv_selected_python(python_tools["uv"], environment, root)
         python_environment = declared_tool_environment(
-            environment, python_tools, system_directories=system
+            hosted, python_tools, system_directories=system
         )
         if (
             uv_selected_python(python_tools["uv"], python_environment, root)
@@ -381,9 +384,7 @@ def declared_stage_environments(
                 "declared-tool PATH: uv no longer selects the declared Python 3.11",
             )
         stage.name = "web"
-        web_environment = declared_tool_environment(
-            environment, web_tools, system_directories=system
-        )
+        web_environment = declared_tool_environment(hosted, web_tools, system_directories=system)
     return python_environment, web_environment
 
 

@@ -52,7 +52,9 @@ python scripts/release_gate.py --candidate . --declared-tool-path
 ```
 
 Each stage's `PATH` is rebuilt from the directories of its exact declared tools,
-plus the Windows system directories:
+plus the Windows system directories. Both stages also ignore the developer's
+global Git config (`GIT_CONFIG_GLOBAL` set to the null device), because hosted
+runners have none. System Git config is kept.
 
 | Stage | Declared tools |
 | --- | --- |

@@ -179,6 +179,10 @@ def test_declared_stage_environments_bind_each_stage_to_its_own_tools(
 
     assert _resolved(gate, python_environment) == python_tools
     assert _resolved(gate, web_environment) == web_tools
+    # Hosted runners have no user Git config; both stages exclude the developer's.
+    for stage_environment in (python_environment, web_environment):
+        assert stage_environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert "GIT_CONFIG_NOSYSTEM" not in stage_environment
     # uv's interpreter choice is re-resolved under the rebuilt environment.
     assert [selection["PATH"] for selection in selections] == [
         ambient,
@@ -293,6 +297,7 @@ def test_default_mode_keeps_the_clean_environment_path(
 
     assert {env["PATH"] for _, env in calls} == {environment["PATH"]}
     assert {command[0] for command, _ in calls} == {"uv", gate["NPM"]}
+    assert all("GIT_CONFIG_GLOBAL" not in env for _, env in calls)
 
 
 # Refusal evidence (AGENTS.md): one bounded JSON line per guard rejection,
@@ -464,7 +469,7 @@ def test_unsupported_platform_refusal(
 ) -> None:
     gate = _release_gate()
     namespace = gate["declared_stage_environments"].__globals__
-    monkeypatch.setitem(namespace, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setitem(namespace, "os", SimpleNamespace(name="posix", devnull=os.devnull))
 
     assert _refuse(gate, "", tmp_path, capsys) == [
         {"stage": "setup", "refusal": "unsupported_platform", "tool": None}
