@@ -1538,11 +1538,42 @@ def _absent(path: Path) -> bool:
     return False
 
 
+def _host_lock_held(path: Path) -> bool:
+    """Try the one-byte lock ``run_record.lock_run_record`` takes, without creating or writing.
+
+    That helper opens with O_CREAT, which would write into the previous run, so the same
+    non-blocking region lock is taken here on a read-only handle, then released.
+    """
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
-    if not _absent(previous / "result-receipt.private.json"):
+    receipt_path = previous / "result-receipt.private.json"
+    if not _absent(receipt_path):
         return verify_normal_stop(previous, plan)
     # An owner that died abruptly never wrote its receipt. Its ports come from the plan
-    # its owner launched: active binds prepared, and prepared binds the plan.
+    # its owner launched: active binds prepared and handoff, and prepared binds the plan.
     active = _read_json_file(previous / "active.private.json")
     prepared_path = previous / "prepared.private.json"
     prepared = _read_json_file(prepared_path)
@@ -1552,6 +1583,8 @@ def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         and active.get("category") == "ready_to_launch"
         and type(active.get("prepared_sha256")) is str
         and digest(prepared_path) == active["prepared_sha256"]
+        and type(active.get("handoff_sha256")) is str
+        and digest(previous / "handoff.private.json") == active["handoff_sha256"]
         and prepared.get("version") == 1
         and prepared.get("preflight") == "accepted"
         and type(prepared.get("plan_sha256")) is str
@@ -1574,13 +1607,16 @@ def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         [ports.get(name) for name in ("api", "companion", "livekit", "host")],
         journal_may_be_absent=True,
     )
+    # An owner that settled while these checks ran must not be read as abandoned.
+    require(_absent(receipt_path), "previous_receipt_appeared")
     return {
         "category": "abandoned_stop_verified",
         "receipt_sha256": None,
         "plan_sha256": prepared["plan_sha256"],
         "processes_absent": True,
         "listeners_absent": None if _dev_readiness(plan) else True,
-        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+        # Only absence was observed; there was no owner whose listeners could be verified.
+        "listener_ownership": "unavailable",
         "endpoints_not_accepting": True if _dev_readiness(plan) else None,
         "work_journal_empty": True if journal_present else None,
         "work_journal_absent": not journal_present,
@@ -1622,6 +1658,17 @@ def _require_previous_quiescent(
         set(previous_ports) | {plan.ports[name] for name in ("api", "companion", "livekit", "host")}
     )
     require(not any(_endpoint_snapshot(plan, all_ports).values()), "previous_listener_alive")
+    for name in ("hermes-runs-v1.json.lock", "voice-tail-v1.json.lock"):
+        lock_path = previous / "state" / name
+        if _absent(lock_path):
+            continue
+        require(
+            lock_path.is_file()
+            and not lock_path.is_symlink()
+            and not (getattr(lock_path.lstat(), "st_file_attributes", 0) & 0x400),
+            "previous_lock_file",
+        )
+        require(not _host_lock_held(lock_path), "previous_lock_held")
     journal_path = previous / "state" / "hermes-runs-v1.json"
     if journal_may_be_absent and _absent(journal_path):
         # The host writes its run record ahead of its first Hermes POST, and otherwise only
@@ -1785,17 +1832,51 @@ def _copy_voice_tail(previous: Path, output: Path, runtime_target: Path) -> dict
             "voice_tail_import_origin",
         )
         maximum = voice_tail.max_voice_tail_bytes(32, 1024)
+        import hermes_realtime.integration.voice_deletes as voice_deletes
+
+        require(
+            Path(voice_deletes.__file__).resolve()
+            == expected_module.with_name("voice_deletes.py").resolve(),
+            "voice_tail_import_origin",
+        )
+        deletes_maximum = voice_deletes.MAX_VOICE_DELETES_BYTES
     finally:
         with contextlib.suppress(ValueError):
             sys.path.remove(str(package_parent))
     require(source.stat().st_size <= maximum, "saved_voice_tail_bound")
     raw = _read(source, maximum)
+    # The forget record beside the tail decides which tail binding may be restored. Without
+    # it, a tail a forget had already retired would be restored into the new run.
+    deletes_source = previous / "state" / "voice-tail-v1.deletes.json"
+    deletes_raw: bytes | None = None
+    if not _absent(deletes_source):
+        require(
+            deletes_source.is_file()
+            and not deletes_source.is_symlink()
+            and not (getattr(deletes_source.lstat(), "st_file_attributes", 0) & 0x400),
+            "saved_voice_deletes_file",
+        )
+        require(deletes_source.stat().st_size <= deletes_maximum, "saved_voice_deletes_bound")
+        deletes_raw = _read(deletes_source, deletes_maximum)
     target_state = output / "state"
     target_state.mkdir(parents=False, exist_ok=False)
+    deletes_sha256: str | None = None
+    if deletes_raw is not None:
+        # The record first, as the host writes it: a tail never lands without its deletes.
+        deletes_target = target_state / "voice-tail-v1.deletes.json"
+        with deletes_target.open("xb") as stream:
+            stream.write(deletes_raw)
+        deletes_sha256 = digest(deletes_target)
+        require(digest(deletes_source) == deletes_sha256, "saved_voice_deletes_copy")
     target = target_state / "voice-tail-v1.json"
     target.write_bytes(raw)
     require(digest(source) == digest(target), "saved_voice_tail_copy")
-    return {"bytes": len(raw), "sha256": digest(target)}
+    return {
+        "bytes": len(raw),
+        "sha256": digest(target),
+        "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
+        "deletes_sha256": deletes_sha256,
+    }
 
 
 def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
