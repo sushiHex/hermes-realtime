@@ -112,7 +112,7 @@ def test_worker_exit_observations_survive_normal_and_abnormal_process_exit(exit_
             [sys.executable, "-c",
              "import os,sys,msvcrt; "
              "f=msvcrt.open_osfhandle(int(sys.argv[1]),os.O_WRONLY|os.O_BINARY); "
-             "os.write(f,b'DTSPA'); sys.exit(int(sys.argv[2]))", str(handle), str(exit_code)],
+             "os.write(f,b'DTSPAX'); sys.exit(int(sys.argv[2]))", str(handle), str(exit_code)],
             close_fds=True, startupinfo=startup, creationflags=subprocess.CREATE_NO_WINDOW,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
@@ -121,7 +121,7 @@ def test_worker_exit_observations_survive_normal_and_abnormal_process_exit(exit_
         assert child.wait(timeout=5) == exit_code
         assert _read_worker_exit_events(read_fd) == [
             "done_acknowledged", "server_stop_entered", "server_stop_returned",
-            "protocol_closed", "atexit_entered",
+            "protocol_closed", "atexit_entered", "atexit_callbacks_returned",
         ]
     finally:
         if child is not None and child.poll() is None:
@@ -133,7 +133,74 @@ def test_worker_exit_observations_survive_normal_and_abnormal_process_exit(exit_
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows diagnostic pipe")
-@pytest.mark.parametrize("raw", [b"", b"DT", b"private-output", b"DD", b"AD", b"DTSPAD"])
+@pytest.mark.parametrize(
+    ("stop", "exit_code", "expected"),
+    [
+        ("callback", 9, ["atexit_entered"]),
+        ("finalization", 0, ["atexit_entered", "atexit_callbacks_returned"]),
+    ],
+)
+def test_worker_exit_milestones_separate_exit_callbacks_from_finalization(
+    stop: str, exit_code: int, expected: list[str],
+) -> None:
+    import msvcrt
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from scripts.equivalence_process import _read_worker_exit_events
+
+    read_fd, write_fd = os.pipe()
+    handle = msvcrt.get_osfhandle(write_fd)
+    os.set_handle_inheritable(handle, True)
+    startup = subprocess.STARTUPINFO()
+    startup.lpAttributeList = {"handle_list": [handle]}
+    child = None
+    try:
+        # Same registration order as the worker: X before the scenario, a library
+        # exit callback during it, and A in the worker's final cleanup. A callback
+        # that never returns stands in for a native crash inside library teardown.
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c",
+             "import atexit,os,sys,msvcrt; sys.path.insert(0,sys.argv[3]); "
+             "from scripts.equivalence_worker import _mark_exit; "
+             "f=msvcrt.open_osfhandle(int(sys.argv[1]),os.O_WRONLY|os.O_BINARY); "
+             "atexit.register(_mark_exit,f,b'X'); "
+             "sys.argv[2]=='callback' and atexit.register(os._exit,9); "
+             "atexit.register(_mark_exit,f,b'A')",
+             str(handle), stop, str(Path(__file__).resolve().parent.parent)],
+            close_fds=True, startupinfo=startup, creationflags=subprocess.CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert child.wait(timeout=10) == exit_code
+        assert _read_worker_exit_events(read_fd) == expected
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        for fd in (read_fd, write_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
+def test_worker_registers_callbacks_returned_milestone_before_any_scenario_runs() -> None:
+    import inspect
+
+    from scripts import equivalence_worker
+
+    source = inspect.getsource(equivalence_worker.main)
+    registration = source.index('atexit.register(_mark_exit, progress_fd, b"X")')
+    assert registration < source.index("_redirect_diagnostics()")
+    assert registration < source.index("_read_frame(request_fd")
+    assert source.count('b"X"') == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows diagnostic pipe")
+@pytest.mark.parametrize(
+    "raw", [b"", b"DT", b"AX", b"private-output", b"DD", b"AD", b"XA", b"DTSPAD", b"DTSPAXX"],
+)
 def test_worker_exit_observations_are_bounded_even_with_a_live_writer(raw: bytes) -> None:
     from scripts.equivalence_process import _read_worker_exit_events
 
@@ -141,10 +208,11 @@ def test_worker_exit_observations_are_bounded_even_with_a_live_writer(raw: bytes
     try:
         if raw:
             os.write(write_fd, raw)
-        expected = (
-            [] if not raw else
-            ["done_acknowledged", "server_stop_entered"] if raw == b"DT" else None
-        )
+        expected = {
+            b"": [],
+            b"DT": ["done_acknowledged", "server_stop_entered"],
+            b"AX": ["atexit_entered", "atexit_callbacks_returned"],
+        }.get(raw)
         assert _read_worker_exit_events(read_fd) == expected
     finally:
         os.close(read_fd)

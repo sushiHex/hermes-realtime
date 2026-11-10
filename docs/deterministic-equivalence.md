@@ -60,16 +60,21 @@ finalization attempt, including on failure. It records the version, fixed scenar
 name, whether the full exchange was accepted, the exit code observed before Job
 cleanup (or null if unavailable), and fixed child milestones.
 
-A separate inherited pipe carries at most five bytes: `done_acknowledged`,
-`server_stop_entered`, `server_stop_returned`, `protocol_closed`, and
-`atexit_entered`. The parent samples available bytes without an EOF wait, extra
+A separate inherited pipe carries at most six bytes: `done_acknowledged`,
+`server_stop_entered`, `server_stop_returned`, `protocol_closed`,
+`atexit_entered`, and `atexit_callbacks_returned`. The parent samples available bytes without an EOF wait, extra
 reader thread, or additional timeout. Unknown, duplicate, or reordered bytes
 produce null; an empty list means no milestone was observed. No provider output,
 paths, credentials, traces, or exception text enter this diagnostic.
 
-The exit callback is registered after scenario imports and runs before their
+The `atexit_entered` callback is registered after scenario imports and runs before their
 previously registered exit callbacks. Reaching it does not prove that library
-callbacks or interpreter finalization completed. The milestones establish only
+callbacks or interpreter finalization completed. The `atexit_callbacks_returned`
+callback is registered before any scenario runs, so it runs after every exit
+callback registered later, including the LiveKit FFI dispose callback registered
+when its client initializes. An abnormal exit with `atexit_entered` but without
+`atexit_callbacks_returned` happened inside those exit callbacks; one with both
+happened later, during interpreter finalization. Neither proves finalization completed. The milestones establish only
 the observed shutdown boundaries; they do not identify a failing native library.
 Normal worker exit, complete observations, and owned cleanup remain independent
 requirements for a successful qualification receipt. Diagnostics cannot supply

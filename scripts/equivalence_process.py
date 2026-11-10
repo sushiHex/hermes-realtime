@@ -124,7 +124,7 @@ def _read_frame(fd: int, deadline: float) -> Any:
 
 
 def _read_worker_exit_events(fd: int) -> list[str] | None:
-    """Sample five content-free milestones without waiting for pipe EOF."""
+    """Sample six content-free milestones without waiting for pipe EOF."""
     import _winapi
     import msvcrt
 
@@ -134,11 +134,13 @@ def _read_worker_exit_events(fd: int) -> list[str] | None:
         ord("S"): "server_stop_returned",
         ord("P"): "protocol_closed",
         ord("A"): "atexit_entered",
+        ord("X"): "atexit_callbacks_returned",
     }
     try:
         peek = cast(tuple[bytes, int, int], _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd), 1))
         available = peek[1]
-        raw = os.read(fd, min(available, 6)) if available else b""
+        # One byte past the six names, so an overfull pipe is a duplicate, never a prefix.
+        raw = os.read(fd, min(available, 7)) if available else b""
     except BrokenPipeError:
         raw = b""
     except OSError:
