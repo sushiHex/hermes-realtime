@@ -979,6 +979,473 @@ def test_legacy_ports_keep_strict_port_validation(tmp_path):
         preview_cutover.verify_normal_stop(previous, preview_cutover.load_plan(plan_path))
 
 
+# The abandoned run listened on its own ports, distinct from the replacement plan's.
+_ABANDONED_PORTS = {
+    "api": 59886, "companion": 59887, "livekit": 7890, "host": 28775, "protected": [8765],
+}
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _abandoned_previous(tmp_path: Path, plan_path: Path, *, journal: object = "empty") -> Path:
+    """A run directory as `serve` leaves it when its owner dies before writing a receipt."""
+    previous = tmp_path / "previous"
+    (previous / "state").mkdir(parents=True)
+    previous_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    previous_plan["output"] = str(previous)
+    previous_plan["ports"] = dict(_ABANDONED_PORTS)
+    (previous / "plan.private.json").write_text(json.dumps(previous_plan), encoding="utf-8")
+    (previous / "prepared.private.json").write_text(json.dumps({
+        "version": 1, "plan": previous_plan, "plan_sha256": _sha256(previous / "plan.private.json"),
+        "output": str(previous), "policy_mode": "native", "profile_complete": False,
+        "preflight": "accepted",
+    }), encoding="utf-8")
+    (previous / "handoff.private.json").write_text(
+        json.dumps({"version": 1, "category": "normal_stop_handoff_verified"}), encoding="utf-8"
+    )
+    (previous / "active.private.json").write_text(json.dumps({
+        "version": 1, "category": "ready_to_launch",
+        "prepared_sha256": _sha256(previous / "prepared.private.json"),
+        "handoff_sha256": _sha256(previous / "handoff.private.json"),
+        "profile_complete": True, "launch_authorized": False,
+    }), encoding="utf-8")
+    # A host leaves both lock files behind; only a live one holds them.
+    (previous / "state" / "hermes-runs-v1.json.lock").write_bytes(b"")
+    (previous / "state" / "voice-tail-v1.json.lock").write_bytes(b"")
+    (previous / "pids.json").write_text(
+        json.dumps({"gateway": 101, "host": 102, "livekit": 103}), encoding="utf-8"
+    )
+    (previous / "supervisor.pid.private.txt").write_text("104\n", encoding="ascii")
+    if journal == "empty":
+        journal = {"version": 1, "pending": [], "admitted": []}
+    if type(journal) is dict:
+        (previous / "state" / "hermes-runs-v1.json").write_text(
+            json.dumps(journal), encoding="utf-8"
+        )
+    (previous / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
+    return previous
+
+
+def _tree_snapshot(root: Path) -> dict[str, object]:
+    entries: dict[str, object] = {".": root.stat().st_mtime_ns}
+    for item in sorted(root.rglob("*")):
+        # Windows region locks are mandatory: a held lock file can be sized, never read.
+        content = (
+            None if item.is_dir()
+            else item.stat().st_size if item.name.endswith(".lock")
+            else item.read_bytes()
+        )
+        entries[item.relative_to(root).as_posix()] = (
+            item.is_dir(), content, item.stat().st_mtime_ns,
+        )
+    return entries
+
+
+@pytest.mark.parametrize("journal", ["empty", "absent"])
+def test_finalize_accepts_abandoned_run_without_writing_it(tmp_path, monkeypatch, journal):
+    plan_path, source_profile = _plan(tmp_path)
+    (source_profile / ".env").write_bytes(b"opaque-auth-value")
+    success = subprocess.CompletedProcess(
+        ["preflight"],
+        0,
+        stdout=(
+            '[voice-preview] {"category":"preflight_ready","launch_authorized":false,'
+            '"ports":[59876,59877,7880,28765]}\n'
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(preview_cutover, "run_preflight", lambda *_: success)
+    preview_cutover.prepare(plan_path)
+    previous = _abandoned_previous(tmp_path, plan_path, journal=journal)
+    before = _tree_snapshot(previous)
+    observed: list[int] = []
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(
+        preview_cutover, "_listener_rows", lambda port: observed.append(port) or []
+    )
+    copied: list[Path] = []
+
+    def copy_tail(source, output, _runtime):
+        copied.append(source)
+        (output / "state").mkdir()
+        (output / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
+        return {"bytes": 2, "sha256": "e" * 64}
+
+    monkeypatch.setattr(preview_cutover, "_copy_voice_tail", copy_tail)
+    output = tmp_path / "preview"
+
+    result = preview_cutover.finalize(output / "prepared.private.json", previous)
+
+    assert result["category"] == "ready_to_launch"
+    assert copied == [previous]
+    assert sorted(observed) == sorted(
+        {59876, 59877, 7880, 28765} | {59886, 59887, 7890, 28775}
+    )
+    handoff = json.loads((output / "handoff.private.json").read_text())
+    assert handoff["category"] == "abandoned_stop_handoff_verified"
+    stop = handoff["previous_stop"]
+    assert stop["category"] == "abandoned_stop_verified"
+    assert stop["receipt_sha256"] is None
+    assert stop["plan_sha256"] == _sha256(previous / "plan.private.json")
+    assert stop["processes_absent"] is True
+    assert stop["listeners_absent"] is True
+    # Only absence was observed; no owner was there to verify.
+    assert stop["listener_ownership"] == "unavailable"
+    assert stop["work_journal_empty"] is (True if journal == "empty" else None)
+    assert stop["work_journal_absent"] is (journal == "absent")
+    assert stop["protected_listeners_unchanged"] is None
+    assert _tree_snapshot(previous) == before
+
+
+def test_normal_stop_alone_still_requires_its_receipt(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    with pytest.raises(ValueError, match="receipt_file"):
+        preview_cutover.verify_normal_stop(previous, preview_cutover.load_plan(plan_path))
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        ("live_pid", "previous_process_alive"),
+        ("live_supervisor", "previous_process_alive"),
+        ("old_listener", "previous_listener_alive"),
+        ("new_listener", "previous_listener_alive"),
+        ("pending", "previous_work_unsettled"),
+        ("admitted", "previous_work_unsettled"),
+        ("journal_directory", "receipt_file"),
+        ("pid_shape", "previous_pid_shape"),
+        ("missing_supervisor", "previous_supervisor_pid_file"),
+        ("plan_drift", "previous_plan_binding"),
+        ("prepared_drift", "previous_plan_binding"),
+        ("handoff_drift", "previous_plan_binding"),
+        ("not_launched", "previous_plan_binding"),
+        ("lock_directory", "previous_lock_file"),
+        ("receipt_appeared", "previous_receipt_appeared"),
+        ("foreign_output", "previous_plan_binding"),
+        ("plan_ports", "previous_ports_shape"),
+    ],
+)
+def test_abandoned_run_refuses_live_or_unsettled_or_unbound_state(
+    tmp_path, monkeypatch, failure, category
+):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    journal: object = "empty"
+    if failure == "pending":
+        journal = {"version": 1, "pending": [{"run_id": "synthetic"}], "admitted": []}
+    if failure == "admitted":
+        journal = {"version": 1, "pending": [], "admitted": ["run_synthetic"]}
+    previous = _abandoned_previous(
+        tmp_path, plan_path, journal="absent" if failure == "journal_directory" else journal
+    )
+    if failure == "journal_directory":
+        (previous / "state" / "hermes-runs-v1.json").mkdir()
+    if failure == "pid_shape":
+        (previous / "pids.json").write_text(json.dumps({"gateway": 101}), encoding="utf-8")
+    if failure == "missing_supervisor":
+        (previous / "supervisor.pid.private.txt").unlink()
+    if failure == "plan_drift":
+        # Well formed, but not the plan prepared bound: only the hash can tell.
+        plan_value = json.loads((previous / "plan.private.json").read_text())
+        plan_value["ports"]["api"] = 59896
+        (previous / "plan.private.json").write_text(json.dumps(plan_value), encoding="utf-8")
+    if failure == "prepared_drift":
+        prepared = json.loads((previous / "prepared.private.json").read_text())
+        prepared["policy_mode"] = "lookup"
+        (previous / "prepared.private.json").write_text(json.dumps(prepared), encoding="utf-8")
+    if failure == "handoff_drift":
+        (previous / "handoff.private.json").write_text("{}", encoding="utf-8")
+    if failure == "lock_directory":
+        (previous / "state" / "voice-tail-v1.json.lock").unlink()
+        (previous / "state" / "voice-tail-v1.json.lock").mkdir()
+    if failure == "not_launched":
+        active = json.loads((previous / "active.private.json").read_text())
+        active["category"] = "prepared"
+        (previous / "active.private.json").write_text(json.dumps(active), encoding="utf-8")
+    if failure in {"foreign_output", "plan_ports"}:
+        plan_value = json.loads((previous / "plan.private.json").read_text())
+        if failure == "foreign_output":
+            plan_value["output"] = str(tmp_path / "elsewhere")
+        else:
+            plan_value["ports"]["api"] = plan_value["ports"]["companion"]
+        (previous / "plan.private.json").write_text(json.dumps(plan_value), encoding="utf-8")
+        prepared = json.loads((previous / "prepared.private.json").read_text())
+        prepared["plan_sha256"] = _sha256(previous / "plan.private.json")
+        if failure == "foreign_output":
+            prepared["output"] = str(tmp_path / "elsewhere")
+        (previous / "prepared.private.json").write_text(json.dumps(prepared), encoding="utf-8")
+        active = json.loads((previous / "active.private.json").read_text())
+        active["prepared_sha256"] = _sha256(previous / "prepared.private.json")
+        (previous / "active.private.json").write_text(json.dumps(active), encoding="utf-8")
+    live = {"live_pid": 102, "live_supervisor": 104}.get(failure)
+    listening = {"old_listener": 59886, "new_listener": 59876}.get(failure)
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda pid: 1 if pid == live else None)
+    receipt = previous / "result-receipt.private.json"
+
+    def listener_rows(port):
+        if failure == "receipt_appeared" and not receipt.exists():
+            # A late owner settles while the abandoned checks run; its receipt is clean.
+            receipt.write_text(json.dumps({
+                "version": 1, "category": "stopped", "cleanup_settled": True,
+                "cleanup_failed": False, "owned_survivor_count": 0,
+                "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+                "ports": [59886, 59887, 7890, 28775],
+            }), encoding="utf-8")
+        return [("127.0.0.1", 999)] if port == listening else []
+
+    monkeypatch.setattr(preview_cutover, "_listener_rows", listener_rows)
+    before = _tree_snapshot(previous)
+
+    with pytest.raises(ValueError, match=category):
+        preview_cutover.verify_previous_stop(previous, plan)
+    if failure == "receipt_appeared":
+        # The appeared receipt alone would have been accepted as a normal stop.
+        assert preview_cutover.verify_previous_stop(previous, plan)["category"] == (
+            "normal_stop_verified"
+        )
+    else:
+        assert _tree_snapshot(previous) == before
+
+
+@pytest.mark.parametrize("stop", ["abandoned", "normal"])
+@pytest.mark.parametrize("record", ["hermes-runs-v1.json", "voice-tail-v1.json"])
+def test_a_held_host_lock_refuses_the_previous_run_without_touching_it(
+    tmp_path, monkeypatch, stop, record
+):
+    from hermes_realtime.integration.run_record import lock_run_record, unlock_run_record
+
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    if stop == "normal":
+        (previous / "result-receipt.private.json").write_text(json.dumps({
+            "version": 1, "category": "stopped", "cleanup_settled": True,
+            "cleanup_failed": False, "owned_survivor_count": 0,
+            "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+            "ports": [59886, 59887, 7890, 28775],
+        }), encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    # The host's own mechanism, on the host's own path: a second handle must not get it.
+    owner = lock_run_record(previous / "state" / record)
+    assert owner is not None
+    try:
+        before = _tree_snapshot(previous)
+        with pytest.raises(ValueError, match="previous_lock_held"):
+            preview_cutover.verify_previous_stop(previous, plan)
+        assert _tree_snapshot(previous) == before
+    finally:
+        unlock_run_record(owner)
+    # Released, the same run is accepted, and the probe leaves the lock files as they were.
+    before = _tree_snapshot(previous)
+    assert preview_cutover.verify_previous_stop(previous, plan)["category"] == (
+        f"{stop}_stop_verified"
+    )
+    assert _tree_snapshot(previous) == before
+    if stop == "abandoned":
+        for name in ("hermes-runs-v1.json.lock", "voice-tail-v1.json.lock"):
+            (previous / "state" / name).unlink()
+        # A missing lock file is never created by the probe.
+        assert preview_cutover.verify_previous_stop(previous, plan)["category"] == (
+            "abandoned_stop_verified"
+        )
+        assert not (previous / "state" / "hermes-runs-v1.json.lock").exists()
+        assert not (previous / "state" / "voice-tail-v1.json.lock").exists()
+
+
+def _real_runtime() -> Path:
+    from hermes_realtime.integration import voice_tail as voice_tail_module
+
+    return Path(voice_tail_module.__file__).resolve().parents[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["pending_forget", "other_live", "none"])
+async def test_voice_tail_copy_carries_the_deletes_record_so_a_forget_survives(
+    tmp_path, record
+):
+    from hermes_realtime.conversation import ConversationContextStore
+    from hermes_realtime.integration.voice_deletes import VoiceDeletes, voice_deletes_bytes
+    from hermes_realtime.integration.voice_tail import VoiceTailWriter
+    from hermes_realtime.speech import Transcript
+
+    state = tmp_path / "previous" / "state"
+    state.mkdir(parents=True)
+    writer = VoiceTailWriter(state / "voice-tail-v1.json", conversation_ids=iter(["old"]).__next__)
+    store = ConversationContextStore(on_change=writer.update)
+    await writer.open(store)
+    store.record_user_transcript(Transcript(text="said before the forget", final=True))
+    await writer.close()
+    deletes = state / "voice-tail-v1.deletes.json"
+    # The crash came after the record was written and before the cleared tail was.
+    if record == "pending_forget":
+        deletes.write_bytes(voice_deletes_bytes(VoiceDeletes(pending=(("old", 0),))))
+    elif record == "other_live":
+        deletes.write_bytes(
+            voice_deletes_bytes(VoiceDeletes(outcome=("older", 0), live=("newer", 1)))
+        )
+    output = tmp_path / "output"
+    output.mkdir()
+    before = _tree_snapshot(state.parent)
+
+    copied = preview_cutover._copy_voice_tail(state.parent, output, _real_runtime())
+
+    assert _tree_snapshot(state.parent) == before
+    target = output / "state" / "voice-tail-v1.json"
+    target_deletes = output / "state" / "voice-tail-v1.deletes.json"
+    expected_tail_sha256 = _sha256(target)
+    expected_deletes = None if record == "none" else target_deletes.read_bytes()
+    # The new run's own mirror decides: a forgotten conversation is retired, not restored.
+    reopened = VoiceTailWriter(target, conversation_ids=iter(["new"]).__next__)
+    reopened_store = ConversationContextStore(on_change=reopened.update)
+    await reopened.open(reopened_store)
+    try:
+        restored = [message.text for message in reopened_store.snapshot().messages]
+        assert restored == (["said before the forget"] if record == "none" else [])
+    finally:
+        await reopened.close()
+    assert copied["sha256"] == expected_tail_sha256 == _sha256(state / "voice-tail-v1.json")
+    if record == "none":
+        assert copied["deletes_sha256"] is None and copied["deletes_bytes"] is None
+    else:
+        assert expected_deletes == deletes.read_bytes()
+        assert copied["deletes_sha256"] == _sha256(deletes)
+        assert copied["deletes_bytes"] == deletes.stat().st_size
+
+
+@pytest.mark.parametrize(
+    ("deletes", "category"),
+    [
+        ("directory", "saved_voice_deletes_file"),
+        ("oversized", "saved_voice_deletes_bound"),
+        ("torn_copy", "saved_voice_deletes_copy"),
+    ],
+)
+def test_voice_tail_copy_refuses_an_unsafe_deletes_record(
+    tmp_path, monkeypatch, deletes, category
+):
+    from hermes_realtime.integration.voice_deletes import MAX_VOICE_DELETES_BYTES
+
+    state = tmp_path / "previous" / "state"
+    state.mkdir(parents=True)
+    (state / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
+    path = state / "voice-tail-v1.deletes.json"
+    if deletes == "directory":
+        path.mkdir()
+    elif deletes == "oversized":
+        path.write_bytes(b" " * (MAX_VOICE_DELETES_BYTES + 1))
+    else:
+        path.write_bytes(b"{}")
+        read = preview_cutover._read
+        monkeypatch.setattr(
+            preview_cutover, "_read",
+            lambda source, limit=preview_cutover._JSON_LIMIT: (
+                read(source, limit) + (b" " if source == path else b"")
+            ),
+        )
+    output = tmp_path / "output"
+    output.mkdir()
+
+    with pytest.raises(ValueError, match=category):
+        preview_cutover._copy_voice_tail(state.parent, output, _real_runtime())
+    # Refused before anything lands, or, for a torn copy, before any tail lands beside it.
+    if deletes == "torn_copy":
+        assert not (output / "state" / "voice-tail-v1.json").exists()
+    else:
+        assert not (output / "state").exists()
+
+
+@pytest.mark.parametrize(
+    "receipt", ["directory", "dangling_junction", "dangling_link", "settled_link"]
+)
+def test_receipt_that_is_not_a_plain_file_is_never_treated_as_absent(
+    tmp_path, monkeypatch, receipt
+):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    path = previous / "result-receipt.private.json"
+    if receipt == "directory":
+        path.mkdir()
+    elif receipt == "dangling_junction":
+        if sys.platform != "win32":
+            pytest.skip("junctions are Windows-only")
+        import _winapi
+
+        target_dir = tmp_path / "removed-target"
+        target_dir.mkdir()
+        _winapi.CreateJunction(str(target_dir), str(path))
+        target_dir.rmdir()
+        # Path.exists() follows the reparse point and would call this receipt absent.
+        assert not path.exists()
+    else:
+        target = tmp_path / "outside-receipt.json"
+        if receipt == "settled_link":
+            target.write_text(json.dumps({
+                "version": 1, "category": "stopped", "cleanup_settled": True,
+                "cleanup_failed": False, "owned_survivor_count": 0,
+                "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+                "ports": [59886, 59887, 7890, 28775],
+            }), encoding="utf-8")
+        try:
+            path.symlink_to(target)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+
+    with pytest.raises(ValueError, match="receipt_file"):
+        preview_cutover.verify_previous_stop(previous, preview_cutover.load_plan(plan_path))
+
+
+@pytest.mark.parametrize(
+    ("receipt", "category"),
+    [
+        ("unsettled", "previous_normal_stop"),
+        ("malformed", None),
+        # Absence of the journal is accepted only for a run that never wrote a receipt.
+        ("settled_without_journal", "receipt_file"),
+    ],
+)
+def test_present_receipt_keeps_its_refusal_even_when_the_run_looks_abandoned(
+    tmp_path, monkeypatch, receipt, category
+):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(
+        tmp_path, plan_path, journal="absent" if receipt == "settled_without_journal" else "empty"
+    )
+    path = previous / "result-receipt.private.json"
+    if receipt == "settled_without_journal":
+        path.write_text(json.dumps({
+            "version": 1, "category": "stopped", "cleanup_settled": True,
+            "cleanup_failed": False, "owned_survivor_count": 0,
+            "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+            "ports": [59886, 59887, 7890, 28775],
+        }), encoding="utf-8")
+    elif receipt == "unsettled":
+        path.write_text(json.dumps({
+            "version": 1, "category": "refused", "cleanup_settled": False,
+            "cleanup_failed": True, "owned_survivor_count": 1,
+            "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+            "ports": [59886, 59887, 7890, 28775],
+        }), encoding="utf-8")
+    else:
+        path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    plan = preview_cutover.load_plan(plan_path)
+
+    for verify in (preview_cutover.verify_previous_stop, preview_cutover.verify_normal_stop):
+        if category is not None:
+            with pytest.raises(ValueError, match=category):
+                verify(previous, plan)
+        else:
+            with pytest.raises(json.JSONDecodeError):
+                verify(previous, plan)
+
+
 def test_realtime_source_binding_refuses_before_wheel_acceptance(tmp_path, monkeypatch):
     plan_path, _ = _plan(tmp_path)
     plan_value = json.loads(plan_path.read_text(encoding="utf-8"))
