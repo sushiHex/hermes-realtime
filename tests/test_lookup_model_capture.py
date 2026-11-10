@@ -376,6 +376,216 @@ def test_native_observation_failure_and_bounds_preserve_result(tmp_path, monkeyp
 
 
 
+MODES = ["off", "metadata", "controlled-public"]
+USAGE_KEYS = {"index", "stage", "finish_reason", "prompt_tokens", "completion_tokens"}
+# Reported counts or the exact reason each is null; never inferred from text.
+USAGE_CASES = {
+    "present": ({"prompt_tokens": 5710, "completion_tokens": 216}, 5710, 216),
+    "zero": ({"prompt_tokens": 0, "completion_tokens": 0}, 0, 0),
+    "bound": ({"prompt_tokens": capture.MAX_TOKENS,
+               "completion_tokens": capture.MAX_TOKENS + 1}, capture.MAX_TOKENS, None),
+    "absent": (None, None, None),
+    "prompt-only": ({"prompt_tokens": 7}, 7, None),
+    "completion-only": ({"completion_tokens": 9}, None, 9),
+    "bool": ({"prompt_tokens": True, "completion_tokens": False}, None, None),
+    "negative": ({"prompt_tokens": -1, "completion_tokens": -5}, None, None),
+    "float": ({"prompt_tokens": 12.0, "completion_tokens": 3.5}, None, None),
+    "string": ({"prompt_tokens": "12", "completion_tokens": "3"}, None, None),
+    "null": ({"prompt_tokens": None, "completion_tokens": None}, None, None),
+    "native-ollama-names": ({"prompt_eval_count": 11, "eval_count": 4}, None, None),
+}
+
+
+class FakeUsage:
+    """Attribute shape of the OpenAI SDK usage object the native terminal returns."""
+
+    def __init__(self, fields):
+        self.__dict__.update(fields)
+
+
+def native_result(usage, text="Synthetic native answer"):
+    value = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=text), finish_reason="stop")])
+    if usage is not None:
+        value.usage = FakeUsage(usage)
+    return value
+
+
+def presentation_response(request, usage, text="Synthetic formatted answer"):
+    body = {"choices": [{"finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}]}
+    if usage is not None:
+        body["usage"] = usage
+    return httpx.Response(200, request=request, json=body)
+
+
+def watched(tmp_path, mode):
+    summaries = []
+    observer = capture.ModelResponseCapture(
+        tmp_path, mode, {"model_port": 11441}, config(), on_update=summaries.append)
+    return observer, summaries
+
+
+def retained_event(tmp_path, mode, summaries):
+    if mode == "off":
+        assert not (tmp_path / "model-response-capture.private.json").exists()
+        return summaries[-1]["usage"][0]
+    return read(tmp_path)["events"][0]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", list(USAGE_CASES))
+def test_presentation_usage_counts_are_exact_reported_integers(tmp_path, mode, case):
+    usage, prompt, completion = USAGE_CASES[case]
+    observer, summaries = watched(tmp_path, mode)
+    req = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
+    observer.observe(req, presentation_response(req, usage))
+    event = retained_event(tmp_path, mode, summaries)
+    assert type(event["prompt_tokens"]) is (int if prompt is not None else type(None))
+    assert type(event["completion_tokens"]) is (
+        int if completion is not None else type(None))
+    assert (event["prompt_tokens"], event["completion_tokens"]) == (prompt, completion)
+    assert event["stage"] == "presentation" and event["index"] == 1
+    assert summaries[-1]["usage"] == [{key: event[key] for key in USAGE_KEYS}]
+    assert summaries[-1]["available"] is True
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", list(USAGE_CASES))
+def test_native_usage_counts_are_exact_reported_integers(tmp_path, mode, case):
+    usage, prompt, completion = USAGE_CASES[case]
+    observer, summaries = watched(tmp_path, mode)
+    observer.observe_native({}, native_result(usage), native_context())
+    event = retained_event(tmp_path, mode, summaries)
+    assert (event["prompt_tokens"], event["completion_tokens"]) == (prompt, completion)
+    assert type(event["prompt_tokens"]) is (int if prompt is not None else type(None))
+    assert type(event["completion_tokens"]) is (
+        int if completion is not None else type(None))
+    assert event["stage"] == "native" and event["index"] == 1
+    assert summaries[-1]["usage"] == [{key: event[key] for key in USAGE_KEYS}]
+
+
+@pytest.mark.parametrize("usage", [[5710, 216], "5710", 5710, True])
+@pytest.mark.parametrize("mode", MODES)
+def test_non_mapping_presentation_usage_is_null_not_a_failure(tmp_path, mode, usage):
+    observer, summaries = watched(tmp_path, mode)
+    req = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
+    observer.observe(req, presentation_response(req, usage))
+    event = retained_event(tmp_path, mode, summaries)
+    assert event["prompt_tokens"] is None and event["completion_tokens"] is None
+    assert summaries[-1]["available"] is True
+
+
+@pytest.mark.parametrize("usage", [{"prompt_tokens": 5710, "completion_tokens": 216},
+                                   [5710, 216]])
+@pytest.mark.parametrize("mode", MODES)
+def test_native_mapping_usage_is_not_the_sdk_shape_and_is_null(tmp_path, mode, usage):
+    observer, summaries = watched(tmp_path, mode)
+    result = native_result(None)
+    result.usage = usage
+    observer.observe_native({}, result, native_context())
+    event = retained_event(tmp_path, mode, summaries)
+    assert event["prompt_tokens"] is None and event["completion_tokens"] is None
+
+
+def test_counts_are_never_derived_from_content(tmp_path):
+    observer, summaries = watched(tmp_path, "controlled-public")
+    observer.observe_native({}, native_result(None, "four words of text"), native_context())
+    req = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
+    observer.observe(req, presentation_response(req, None, "x" * 999))
+    assert [(row["prompt_tokens"], row["completion_tokens"])
+            for row in summaries[-1]["usage"]] == [(None, None), (None, None)]
+
+
+def test_default_mode_retains_only_counts_stage_index_and_finish(tmp_path):
+    observer, summaries = watched(tmp_path, "off")
+    text = "SYNTHETIC_PRIVATE_ANSWER"
+    req = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions",
+                        headers={"authorization": "SYNTHETIC_PRIVATE_TOKEN"},
+                        json={"messages": [{"content": "SYNTHETIC_PRIVATE_PROMPT"}],
+                              "response_format": {"type": "json_schema"}})
+    observer.observe_native({"response_format": {}}, native_result(
+        {"prompt_tokens": 3, "completion_tokens": 1}, text), native_context())
+    observer.observe(req, presentation_response(
+        req, {"prompt_tokens": 5, "completion_tokens": 2}, text))
+    summary = summaries[-1]
+    assert summary["usage"] == [
+        {"index": 1, "stage": "native", "finish_reason": "stop",
+         "prompt_tokens": 3, "completion_tokens": 1},
+        {"index": 2, "stage": "presentation", "finish_reason": "stop",
+         "prompt_tokens": 5, "completion_tokens": 2},
+    ]
+    assert all(set(row) == USAGE_KEYS for row in observer.status["events"])
+    serialized = json.dumps([summaries, observer.status])
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert not any(term in serialized for term in (
+        "SYNTHETIC_PRIVATE", digest, "content", "response_format", "11441"))
+    assert not list(tmp_path.iterdir())
+
+
+def test_default_mode_events_are_bounded_and_truncation_is_reported(tmp_path):
+    observer, summaries = watched(tmp_path, "off")
+    for _ in range(capture.MAX_EVENTS + 1):
+        observer.observe_native({}, native_result({"prompt_tokens": 1}), native_context())
+    summary = summaries[-1]
+    assert len(summary["usage"]) == capture.MAX_EVENTS and summary["truncated"] is True
+    assert summary["available"] is False and summary["unavailable_reason"] == "event_bound"
+    assert summary["observed"] == capture.MAX_EVENTS + 1
+
+
+def test_default_mode_unowned_route_observes_nothing_and_says_why(tmp_path, monkeypatch):
+    summaries = []
+    observer = capture.ModelResponseCapture(
+        tmp_path, "off", {"model_port": 11434}, config(11434), on_update=summaries.append)
+    assert observer.endpoint is None
+    assert summaries[-1]["available"] is False
+    assert summaries[-1]["unavailable_reason"] == "route_unavailable"
+    sentinel = object()
+    monkeypatch.setattr(httpx.AsyncClient, "send", sentinel)
+    module = SimpleNamespace(run_llm_execution_middleware=sentinel)
+    with observer.installed(module):
+        assert httpx.AsyncClient.send is sentinel
+        assert module.run_llm_execution_middleware is sentinel
+    observer.observe_native({}, native_result({"prompt_tokens": 1}), native_context())
+    req = httpx.Request("POST", "http://127.0.0.1:11434/v1/chat/completions", json={})
+    observer.observe(req, presentation_response(req, {"prompt_tokens": 1}))
+    assert summaries[-1]["observed"] == 0 and summaries[-1]["usage"] == []
+    assert not list(tmp_path.iterdir())
+
+
+def test_default_mode_installs_observers_on_the_owned_route(tmp_path, monkeypatch):
+    observer, summaries = watched(tmp_path, "off")
+    request = httpx.Request("POST", "http://127.0.0.1:11441/v1/chat/completions", json={})
+    returned = presentation_response(request, {"prompt_tokens": 8, "completion_tokens": 2})
+
+    async def send(*args, **kwargs):
+        return returned
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    module = SimpleNamespace(run_llm_execution_middleware=lambda req, call, **ctx: call(req))
+    result = native_result({"prompt_tokens": 4, "completion_tokens": 1})
+    with observer.installed(module):
+        assert module.run_llm_execution_middleware(
+            {}, lambda req: result, **native_context()) is result
+        assert asyncio.run(httpx.AsyncClient.send(object(), request)) is returned
+    assert httpx.AsyncClient.send is send
+    assert [(row["stage"], row["prompt_tokens"]) for row in summaries[-1]["usage"]] == [
+        ("native", 4), ("presentation", 8)]
+
+
+def test_unavailable_diagnostic_omits_usage_rows(tmp_path, monkeypatch, capsys):
+    observer, _ = watched(tmp_path, "metadata")
+    for _ in range(capture.MAX_EVENTS):
+        observer.observe_native({}, native_result(
+            {"prompt_tokens": capture.MAX_TOKENS, "completion_tokens": capture.MAX_TOKENS}),
+            native_context())
+    capsys.readouterr()
+    observer.unavailable("observation_failed")
+    marker = capsys.readouterr().out
+    assert "[lookup-model-capture] " in marker and "prompt_tokens" not in marker
+    assert all(len(line) <= 256 for line in marker.splitlines())
+
+
 @pytest.mark.parametrize("text", ["x" * (capture.MAX_RESPONSE_BYTES + 1),
                                  chr(0x1F600) * (capture.MAX_RESPONSE_BYTES // 4 + 1)],
                          ids=["characters", "utf8-bytes"])

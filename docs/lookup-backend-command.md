@@ -186,6 +186,19 @@ gateway; environment variables never enable capture. Enabled capture requires th
 native and presentation model routes to match the owned literal-loopback model port;
 the personal port 11434 is excluded. It does not change the manifest schema or model call.
 
+Every mode, including `off`, records each observed response's provider-reported token counts.
+`prompt_tokens` and `completion_tokens` are read from that response's `usage`: the parsed
+presentation body, or the OpenAI SDK usage object on the assembled native response. Each is an
+exact nonnegative integer up to 10,000,000, otherwise `null`; an absent or malformed count is
+never estimated from text. Ollama's own `prompt_eval_count`/`eval_count` reach neither
+observer, because both stages use its OpenAI-compatible route, which reports them as
+`usage.prompt_tokens`/`usage.completion_tokens`. The owner/witness summary carries these as
+`usage` rows of index, stage, finish reason and the two counts only. Under `off` that summary
+is the whole record: no artifact is written and no content, length or hash is retained. If the
+prepared routes do not match the owned port, `off` still runs, observes nothing and reports
+`route_unavailable`; the other modes refuse as before. A count is one call's report, not the
+peak context, and cached prompt tokens are not recorded separately.
+
 `metadata` retains assistant-content UTF-8 hashes/lengths, fixed finish reasons and whether
 the request specified a response format. Only `controlled-public` also retains the bounded
 assistant string: use that mode solely for an explicitly approved public-source case, never

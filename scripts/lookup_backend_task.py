@@ -325,7 +325,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
     watchdog.daemon = True
     watchdog.start()
     result: dict[str, Any] = {"category": "refused"}
-    capture_mode = "off"
+    capture_mode: str | None = None
     try:
         replay = load_frozen_search(frozen_search_fixture, frozen_search_sha256, m.get("objective"))
         capture_mode = validate_mode(model_response_capture)
@@ -447,7 +447,7 @@ def run_owned(m: Any, *, mcp_loader_factory: Any = None,
         except BaseException as error:
             cleanup_errors.append(type(error).__name__)
         result["logs"] = processes.finish()
-        if capture_mode != "off":
+        if capture_mode is not None:  # Every validated mode, including off, reports counts.
             try:
                 captured_witness = read_json(output / "gateway-witness.private.json")
                 result["model_response_capture"] = captured_witness["modelResponseCapture"]
