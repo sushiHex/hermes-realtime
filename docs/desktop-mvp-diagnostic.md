@@ -463,7 +463,9 @@ verbatim.
 The browser's **Session model** panel shows **Response last** and **Response average**: the time
 from your final transcript to the first foreground token. **Diagnostics → Latency markers** lists
 named timings in milliseconds, such as `transcript_to_first_token` and `first_token_to_audio`.
-The `[ollama-prompt]` marker's `load_duration_ns`, `prompt_eval_duration_ns`, `eval_duration_ns`,
+The marker's `eval_count` is Ollama's reported generated-token count from the same final record:
+an exact nonnegative integer, else `null` (absent or invalid). It is never inferred from text
+length. The `[ollama-prompt]` marker's `load_duration_ns`, `prompt_eval_duration_ns`, `eval_duration_ns`,
 and `total_duration_ns` are provider-reported timings from Ollama's final completion record, in
 nanoseconds ([Ollama API usage](https://github.com/ollama/ollama/blob/main/docs/api/usage.mdx)).
 They are read only from a `done=true` final stream record, so failed or uncompleted requests may

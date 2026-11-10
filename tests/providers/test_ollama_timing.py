@@ -135,6 +135,40 @@ async def test_each_completion_duration_rejects_bad_type_and_overbound_values(
     assert report["timing_invalid_fields"] == [field]
 
 
+@pytest.mark.asyncio
+async def test_terminal_eval_count_is_retained(capsys: pytest.CaptureFixture[str]) -> None:
+    payload: dict[str, object] = {
+        "message": {"content": "Synthetic answer."}, "done": True, "eval_count": 17,
+    }
+
+    assert [part async for part in _inference(payload).stream(_snapshot(), turn_id="timing")]
+
+    assert _report(capsys.readouterr().out)["eval_count"] == 17
+
+
+@pytest.mark.parametrize("bad_value", [True, False, -1, "5", 5.0, None, [], {}])
+@pytest.mark.asyncio
+async def test_invalid_eval_count_is_null(
+    bad_value: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload: dict[str, object] = {
+        "message": {"content": "Synthetic answer."}, "done": True, "eval_count": bad_value,
+    }
+
+    assert [part async for part in _inference(payload).stream(_snapshot(), turn_id="timing")]
+
+    assert _report(capsys.readouterr().out)["eval_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_absent_eval_count_is_null(capsys: pytest.CaptureFixture[str]) -> None:
+    payload: dict[str, object] = {"message": {"content": "Synthetic answer."}, "done": True}
+
+    assert [part async for part in _inference(payload).stream(_snapshot(), turn_id="timing")]
+
+    assert _report(capsys.readouterr().out)["eval_count"] is None
+
+
 @pytest.mark.parametrize("field", _SOURCE_NAMES)
 @pytest.mark.asyncio
 async def test_missing_completion_duration_is_unknown_not_a_stream_failure(

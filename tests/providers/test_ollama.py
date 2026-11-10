@@ -390,6 +390,7 @@ async def test_ollama_sends_an_explicit_context_window_and_reports_the_prompt(
         "prompt_bytes": len(content.encode("utf-8")),
         "prompt_chars": len(content),
         "prompt_eval_count": 31,
+        "eval_count": None,
         "load_duration_ns": None,
         "prompt_eval_duration_ns": None,
         "eval_duration_ns": None,
