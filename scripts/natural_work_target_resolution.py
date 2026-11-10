@@ -11,9 +11,12 @@ elsewhere and are refused here.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
+import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +68,28 @@ class TargetFixture:
 
 def _refuse(kind: str) -> ValueError:
     return ValueError(f"target_resolution_{kind}_refused")
+
+
+_REFUSAL = re.compile(r"target_resolution_[a-z]+_refused\Z")
+
+
+@contextlib.contextmanager
+def _refusal_evidence(stage: str) -> Iterator[None]:
+    """Emit one bounded marker line when a stage stops: its category, never input text."""
+    failure: str | None = None
+    try:
+        yield
+    except BaseException as error:
+        message = str(error) if type(error) is ValueError else ""
+        failure = message if _REFUSAL.fullmatch(message) else type(error).__name__
+        raise
+    finally:
+        if failure is not None:
+            print(
+                "[target-resolution] " + json.dumps({"stage": stage, "refusal": failure}),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -145,6 +170,7 @@ def _parse_case(row: object) -> TargetCase:
     return TargetCase(case_id, utterance, key_phrase, tuple(work), outcome, description)
 
 
+@_refusal_evidence("load")
 def load_target_resolution(
     path: Path, expected_sha256: str = TARGET_RESOLUTION_SHA256
 ) -> TargetFixture:
@@ -180,6 +206,7 @@ def load_target_resolution(
     return TargetFixture(document["fixture_id"], observed, cases)
 
 
+@_refusal_evidence("score")
 def score_target_resolution(
     fixture: TargetFixture, observations: list[dict[str, object]]
 ) -> dict[str, object]:

@@ -54,6 +54,35 @@ def test_frozen_fixture_is_hash_pinned_and_covers_each_bucket() -> None:
     assert [case.bucket for case in fixture.cases] == ["matched", "mismatched", "ambiguous"]
 
 
+def _markers(err: str) -> list[dict[str, object]]:
+    prefix = "[target-resolution] "
+    return [json.loads(line[len(prefix):]) for line in err.splitlines() if line.startswith(prefix)]
+
+
+def test_refusals_emit_one_bounded_marker_and_success_emits_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = target.load_target_resolution(FIXTURE)
+    target.score_target_resolution(fixture, _correct(fixture))
+    assert capsys.readouterr().err == ""
+
+    with pytest.raises(ValueError, match="target_resolution_binding_refused"):
+        target.load_target_resolution(FIXTURE, "0" * 64)
+    with pytest.raises(ValueError, match="target_resolution_observation_refused"):
+        target.score_target_resolution(fixture, _correct(fixture)[:-1])
+    missing = tmp_path / "secret-name-absent.json"
+    with pytest.raises(FileNotFoundError):
+        target.load_target_resolution(missing, "0" * 64)
+    err = capsys.readouterr().err
+    assert _markers(err) == [
+        {"stage": "load", "refusal": "target_resolution_binding_refused"},
+        {"stage": "score", "refusal": "target_resolution_observation_refused"},
+        {"stage": "load", "refusal": "FileNotFoundError"},
+    ]
+    assert len(err.splitlines()) == 3
+    assert "secret-name-absent" not in err and str(tmp_path) not in err
+
+
 def test_visible_active_work_fits_the_production_task_context() -> None:
     for case in target.load_target_resolution(FIXTURE).cases:
         for item in case.active_work:
