@@ -283,7 +283,7 @@ def test_docker_runner_marks_undecodable_output_without_its_content(capsys):
             "exitStatus": 0,
             "operation": "other",
             "stderrBytes": len(_SENTINEL),
-            "stdoutBytes": 10,
+            "stdoutBytes": 9,
             "version": 1,
         }
     ]
