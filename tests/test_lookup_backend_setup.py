@@ -614,8 +614,27 @@ def test_owned_runner_passes_explicit_capture_mode_to_gateway(
         raise RuntimeError("stop before any gateway process")
 
     monkeypatch.setattr(state.processes, "spawn", spawn, raising=False)
-    state.task.run_owned(state.manifest, model_response_capture=mode)
+    result = state.task.run_owned(state.manifest, model_response_capture=mode)
     assert seen[0][-2:] == ["--model-response-capture", mode]
+    # Default mode reports its count summary too; absent witness is never "no output".
+    assert result["model_response_capture"] == {
+        "mode": mode, "available": False, "unavailable_reason": "witness_unavailable"}
+
+
+def test_owned_runner_invalid_capture_mode_reports_no_capture_summary(
+    owned_runner_before_gateway,
+):
+    state = owned_runner_before_gateway
+    result = state.task.run_owned(state.manifest, model_response_capture="PRIVATE_INVALID_MODE")
+    assert "model_response_capture" not in result
+
+
+def test_gateway_constructs_count_observer_in_every_mode():
+    source = (Path(__file__).resolve().parents[1]
+              / "scripts/lookup_backend_gateway.py").read_text(encoding="utf-8")
+    body = source[source.index("    capture_module = _model_capture_module()"):
+                  source.index("    returned_urls: set[str] = set()")]
+    assert "!= \"off\"" not in source[source.index("def main"):] and "capture_context = " in body
 
 
 def test_owned_runner_capture_route_refuses_before_model_start(

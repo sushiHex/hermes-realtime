@@ -1,7 +1,9 @@
-"""Optional bounded observation of responses from one owned model endpoint.
+"""Bounded observation of responses from one owned model endpoint.
 
-No request text, headers or tool arguments are retained. Raw assistant content is
-available only under the explicit controlled-public mode, never by environment.
+No request text, headers or tool arguments are retained. The default ``off`` mode keeps
+only reported token counts, stage, index and finish reason in memory for the summary; it
+writes no artifact. Raw assistant content is available only under the explicit
+controlled-public mode, never by environment.
 """
 
 from __future__ import annotations
@@ -21,13 +23,15 @@ MAX_EVENTS = 8
 MAX_CONTENT_BYTES = 16384
 MAX_RESPONSE_BYTES = 65536
 MAX_FILE_BYTES = 150000
+MAX_TOKENS = 10_000_000
 _MODES = frozenset({"off", "metadata", "controlled-public"})
 _FINISH = frozenset({"stop", "length", "tool_calls", "content_filter", "function_call"})
 _REASONS = frozenset({
     "artifact_bound", "write_failed", "witness_write_failed", "streaming_response",
     "redirected_response", "unread_response", "response_bound", "event_bound",
-    "content_bound", "observation_failed", "wrapper_replaced",
+    "content_bound", "observation_failed", "wrapper_replaced", "route_unavailable",
 })
+_USAGE_FIELDS = ("index", "stage", "finish_reason", "prompt_tokens", "completion_tokens")
 
 
 def validate_mode(mode: Any) -> str:
@@ -36,10 +40,19 @@ def validate_mode(mode: Any) -> str:
     return mode
 
 
+def _count(value: Any) -> int | None:
+    """A provider-reported count, or None. Never estimated from text."""
+    return value if type(value) is int and 0 <= value <= MAX_TOKENS else None
+
+
 def capture_endpoint(mode: Any, manifest: Any, config: Any) -> str | None:
     """Bind only the configured native/presentation route to the owned model port."""
     if validate_mode(mode) == "off":
         return None
+    return _owned_route(manifest, config)
+
+
+def _owned_route(manifest: Any, config: Any) -> str:
     try:
         port = manifest["model_port"]
         model = config["model"]
@@ -77,26 +90,35 @@ class ModelResponseCapture:
     def __init__(self, directory: Path, mode: str, manifest: Any, config: Any,
                  on_update: Any = None) -> None:
         self.mode = validate_mode(mode)
-        self.endpoint = capture_endpoint(mode, manifest, config)
+        self.status: dict[str, Any] = {
+            "version": 1, "mode": mode, "available": True, "events": [],
+            "observed": 0, "truncated": False, "unavailable_reason": "none",
+        }
+        # Every mode observes only the owned route. Off never refuses a run over it:
+        # it observes nothing and says so.
+        self.endpoint: str | None = None
+        try:
+            self.endpoint = _owned_route(manifest, config)
+        except ValueError:
+            if self.mode != "off":
+                raise
+            self._fail("route_unavailable")
         self._native_scope = ({key: config["model"][field] for key, field in (
             ("provider", "provider"), ("model", "default"), ("base_url", "base_url"),
         )} if self.endpoint is not None else {})
         self.path = directory / "model-response-capture.private.json"
         self._lock = threading.RLock()
         self._on_update = on_update
-        self.status: dict[str, Any] = {
-            "version": 1, "mode": mode, "available": True, "events": [],
-            "observed": 0, "truncated": False, "unavailable_reason": "none",
-        }
-        if self.mode != "off":
-            if self.path.exists():
-                raise ValueError("capture_artifact_exists")
-            self._publish()
+        if self.mode != "off" and self.path.exists():
+            raise ValueError("capture_artifact_exists")
+        self._publish()
 
     def summary(self) -> dict[str, Any]:
         return {key: self.status[key] for key in (
             "mode", "available", "observed", "truncated", "unavailable_reason",
-        )} | {"retained": len(self.status["events"])}
+        )} | {"retained": len(self.status["events"]), "usage": [
+            {key: event[key] for key in _USAGE_FIELDS} for event in self.status["events"]
+        ]}
 
     def _fail(self, reason: str) -> None:
         self.status.update(available=False, unavailable_reason=(
@@ -126,10 +148,11 @@ class ModelResponseCapture:
                 temporary.unlink(missing_ok=True)
 
     def _publish(self) -> None:
-        try:
-            self._write()
-        except Exception:
-            self._fail("write_failed")
+        if self.mode != "off":
+            try:
+                self._write()
+            except Exception:
+                self._fail("write_failed")
         if self._on_update is not None:
             try:
                 self._on_update(self.summary())
@@ -139,18 +162,20 @@ class ModelResponseCapture:
             # A failed replace can leave an older artifact. Never let that imply
             # complete capture merely because it was the last successful write.
             with contextlib.suppress(Exception):
-                print("[lookup-model-capture] " + json.dumps(self.summary(), separators=(",", ":")),
+                marker = self.summary()
+                del marker["usage"]
+                print("[lookup-model-capture] " + json.dumps(marker, separators=(",", ":")),
                       flush=True)
 
     def unavailable(self, reason: str) -> None:
-        if self.mode == "off":
+        if self.endpoint is None:
             return
         with self._lock:
             self._fail(reason)
             self._publish()
 
     def observe(self, request: Any, response: Any, *, streaming: bool = False) -> None:
-        if self.mode == "off" or str(request.url) != self.endpoint:
+        if self.endpoint is None or str(request.url) != self.endpoint:
             return
         with self._lock:
             try:
@@ -178,19 +203,31 @@ class ModelResponseCapture:
                     choice = choices[0]
                     content = choice["message"]["content"]
                     finish = choice.get("finish_reason")
+                    # Ollama's OpenAI-compatible ChatCompletion body: usage.prompt_tokens
+                    # and usage.completion_tokens.
+                    usage = body.get("usage")
+                    if type(usage) is not dict:
+                        usage = {}
                     self._record_content(content, finish, "response_format" in payload,
-                                         "presentation")
+                                         "presentation", usage.get("prompt_tokens"),
+                                         usage.get("completion_tokens"))
             except Exception:
                 self._fail("observation_failed")
             self._publish()
 
     def _record_content(self, content: Any, finish: Any, response_format: bool,
-                        stage: str) -> None:
-        event = {"index": len(self.status["events"]) + 1, "stage": stage,
-                 "response_format": response_format,
-                 "finish_reason": finish if finish in _FINISH else "other",
-                 "content_kind": "string" if type(content) is str
-                 else "none" if content is None else "other"}
+                        stage: str, prompt_tokens: Any, completion_tokens: Any) -> None:
+        event: dict[str, Any] = {
+            "index": len(self.status["events"]) + 1, "stage": stage,
+            "finish_reason": finish if finish in _FINISH else "other",
+            "prompt_tokens": _count(prompt_tokens),
+            "completion_tokens": _count(completion_tokens)}
+        if self.mode == "off":
+            self.status["events"].append(event)
+            return
+        event.update(response_format=response_format,
+                     content_kind="string" if type(content) is str
+                     else "none" if content is None else "other")
         if type(content) is str:
             if len(content) > MAX_RESPONSE_BYTES:
                 self._fail("response_bound")
@@ -209,7 +246,7 @@ class ModelResponseCapture:
         self.status["events"].append(event)
 
     def observe_native(self, request: Any, response: Any, context: Any) -> None:
-        if self.mode == "off" or any(
+        if self.endpoint is None or any(
             context.get(key) != value for key, value in self._native_scope.items()
         ):
             return
@@ -224,15 +261,20 @@ class ModelResponseCapture:
                     if len(choices) != 1 or type(request) is not dict:
                         raise ValueError("response_shape")
                     choice = choices[0]
+                    # The assembled stream or SDK response carries the OpenAI SDK usage
+                    # object (or None) as an attribute, never a mapping.
+                    usage = getattr(response, "usage", None)
                     self._record_content(choice.message.content, choice.finish_reason,
-                                         "response_format" in request, "native")
+                                         "response_format" in request, "native",
+                                         getattr(usage, "prompt_tokens", None),
+                                         getattr(usage, "completion_tokens", None))
             except Exception:
                 self._fail("observation_failed")
             self._publish()
 
     @contextlib.contextmanager
     def installed(self, middleware: Any = None) -> Any:
-        if self.mode == "off":
+        if self.endpoint is None:
             yield
             return
         import httpx
