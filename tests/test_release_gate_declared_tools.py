@@ -6,10 +6,14 @@ secondary local check that reproduces hosted executable discovery.
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 from runpy import run_path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -289,3 +293,201 @@ def test_default_mode_keeps_the_clean_environment_path(
 
     assert {env["PATH"] for _, env in calls} == {environment["PATH"]}
     assert {command[0] for command, _ in calls} == {"uv", gate["NPM"]}
+
+
+# Refusal evidence (AGENTS.md): one bounded JSON line per guard rejection,
+# categories only. Every fixture path carries SENTINEL so a leak is visible.
+SENTINEL = "private-sentinel-7f3a"
+
+
+def _sentinel_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: dict[str, Any]
+) -> tuple[dict[str, Path], str]:
+    host = tmp_path / SENTINEL
+    python_tools = _python_stage(host)
+    web_tools = _web_stage(host, gate)
+    ambient = os.pathsep.join(
+        str(directory)
+        for directory in dict.fromkeys(
+            path.parent for path in (*python_tools.values(), *web_tools.values())
+        )
+    )
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "trusted_system_directories", lambda: ())
+    monkeypatch.setitem(namespace, "uv_selected_python", lambda *_args: python_tools["python"])
+    return python_tools, ambient
+
+
+def _evidence(capsys: pytest.CaptureFixture[str]) -> list[dict[str, object]]:
+    captured = capsys.readouterr()
+    assert SENTINEL not in captured.out + captured.err
+    lines = captured.err.splitlines()
+    assert all(line.startswith("[declared-tool-path] {") for line in lines)
+    return [json.loads(line.removeprefix("[declared-tool-path] ")) for line in lines]
+
+
+def _refuse(
+    gate: dict[str, Any], ambient: str, root: Path, capsys: pytest.CaptureFixture[str]
+) -> list[dict[str, object]]:
+    with pytest.raises((RuntimeError, OSError)) as raised:
+        gate["declared_stage_environments"]({"PATH": ambient}, root)
+    assert SENTINEL not in str(raised.value) or type(raised.value) is OSError
+    return _evidence(capsys)
+
+
+def test_success_emits_no_refusal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    gate["declared_stage_environments"]({"PATH": ambient}, tmp_path)
+
+    assert _evidence(capsys) == []
+
+
+def test_undeclared_tool_beside_uv_emits_one_bounded_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    python_tools, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    _tool(python_tools["uv"].parent, "codex")
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "undeclared_tool", "tool": "codex"}
+    ]
+
+
+def test_reresolve_mismatch_emits_one_bounded_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    python_tools, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    # Ambient git wins from its own directory; the rebuilt PATH puts uv's
+    # directory, which also holds a git, first.
+    _tool(python_tools["uv"].parent, "git")
+    ambient = os.pathsep.join((str(python_tools["git"].parent), ambient))
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "reresolve_mismatch", "tool": "git"}
+    ]
+
+
+def test_web_stage_refusal_names_the_web_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    _tool(tmp_path / SENTINEL / "nodejs", "ollama")
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "web", "refusal": "undeclared_tool", "tool": "ollama"}
+    ]
+
+
+def test_unguarded_declared_refusal_withholds_the_unguarded_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    python_tools, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    _tool(python_tools["uv"].parent, "bash")
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "PYTHON_STAGE_TOOLS", ("uv", "git", "bash"))
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "unguarded_declared", "tool": None}
+    ]
+
+
+def test_not_installed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    python_tools, _ = _sentinel_host(tmp_path, monkeypatch, gate)
+    ambient = os.pathsep.join(str(path.parent) for path in python_tools.values())
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "web", "refusal": "not_installed", "tool": "node"}
+    ]
+
+
+def test_python_selection_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "uv_selected_python", gate["uv_selected_python"])
+    failed = SimpleNamespace(
+        run=lambda *args, **_kwargs: subprocess.CompletedProcess(args, 2, SENTINEL, SENTINEL),
+        DEVNULL=subprocess.DEVNULL,
+    )
+    monkeypatch.setitem(namespace, "subprocess", failed)
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "python_selection", "tool": "python"}
+    ]
+
+
+def test_python_reselection_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    python_tools, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+    answers = iter((python_tools["python"], _tool(tmp_path / SENTINEL / "other", "python")))
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "uv_selected_python", lambda *_args: next(answers))
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "python_reselection", "tool": "python"}
+    ]
+
+
+def test_unexpected_error_reports_only_its_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    _, ambient = _sentinel_host(tmp_path, monkeypatch, gate)
+
+    def unavailable(*_args: object) -> Path:
+        raise OSError(f"cannot start {SENTINEL}")
+
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "uv_selected_python", unavailable)
+
+    assert _refuse(gate, ambient, tmp_path, capsys) == [
+        {"stage": "uv", "refusal": "OSError", "tool": None}
+    ]
+
+
+def test_unsupported_platform_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    namespace = gate["declared_stage_environments"].__globals__
+    monkeypatch.setitem(namespace, "os", SimpleNamespace(name="posix"))
+
+    assert _refuse(gate, "", tmp_path, capsys) == [
+        {"stage": "setup", "refusal": "unsupported_platform", "tool": None}
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="GetSystemDirectoryW is Windows-only")
+def test_system_directory_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = _release_gate()
+    real = ctypes.create_unicode_buffer
+    # A one-character buffer cannot hold the system directory, so the real
+    # GetSystemDirectoryW call reports a size at or above the buffer length.
+    monkeypatch.setattr(ctypes, "create_unicode_buffer", lambda _size: real(1))
+
+    assert _refuse(gate, "", tmp_path, capsys) == [
+        {"stage": "setup", "refusal": "system_directory", "tool": None}
+    ]
+
+
+def test_refusal_categories_are_a_closed_set() -> None:
+    gate = _release_gate()
+
+    with pytest.raises(ValueError, match="unknown declared-tool refusal category"):
+        gate["DeclaredToolRefusal"](SENTINEL, None, "message")

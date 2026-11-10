@@ -10,17 +10,19 @@ ambient worktree directories from affecting a release artifact.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NoReturn
 
@@ -187,6 +189,58 @@ NPX = "npx.cmd" if os.name == "nt" else "npx"
 PYTHON_STAGE_TOOLS = ("uv", "git")  # plus the Python 3.11 interpreter uv selects
 WEB_STAGE_TOOLS = ("node", NPM, NPX)  # npx ships beside npm in every Node install
 GUARDED_TOOLS = ("uv", "git", "python", "node", NPM, NPX, "codex", "ollama")
+DECLARED_TOOL_STAGES = frozenset({"setup", "uv", "web"})
+DECLARED_TOOL_REFUSALS = frozenset(
+    {
+        "undeclared_tool",
+        "reresolve_mismatch",
+        "unguarded_declared",
+        "not_installed",
+        "python_selection",
+        "python_reselection",
+        "system_directory",
+        "unsupported_platform",
+    }
+)
+
+
+class DeclaredToolRefusal(RuntimeError):
+    """A declared-tool guard rejection with a fixed category."""
+
+    def __init__(self, refusal: str, tool: str | None, message: str) -> None:
+        if type(refusal) is not str or refusal not in DECLARED_TOOL_REFUSALS:
+            raise ValueError("unknown declared-tool refusal category")
+        super().__init__(message)
+        self.refusal = refusal
+        self.tool = tool
+
+
+class _DeclaredToolStage:
+    def __init__(self) -> None:
+        self.name = "setup"
+
+
+@contextlib.contextmanager
+def _declared_tool_refusal_evidence() -> Iterator[_DeclaredToolStage]:
+    """Emit one bounded marker line when the guard refuses: categories, never paths."""
+    stage = _DeclaredToolStage()
+    record: dict[str, str | None] | None = None
+    try:
+        yield stage
+    except BaseException as error:
+        if type(error) is DeclaredToolRefusal:
+            refusal, tool = error.refusal, error.tool
+        else:
+            refusal, tool = type(error).__name__, None
+        record = {
+            "stage": stage.name if stage.name in DECLARED_TOOL_STAGES else "setup",
+            "refusal": refusal,
+            "tool": tool if type(tool) is str and tool in GUARDED_TOOLS else None,
+        }
+        raise
+    finally:
+        if record is not None:
+            print("[declared-tool-path] " + json.dumps(record), file=sys.stderr, flush=True)
 
 
 def resolve_on_path(name: str, path: str) -> Path | None:
@@ -218,7 +272,9 @@ def resolve_on_path(name: str, path: str) -> Path | None:
 
 def trusted_system_directories() -> tuple[str, ...]:
     if os.name != "nt":
-        fail("declared-tool PATH mode is only supported on Windows")
+        raise DeclaredToolRefusal(
+            "unsupported_platform", None, "declared-tool PATH mode is only supported on Windows"
+        )
     import ctypes
     from ctypes import wintypes
 
@@ -228,7 +284,9 @@ def trusted_system_directories() -> tuple[str, ...]:
     buffer = ctypes.create_unicode_buffer(32768)
     size = int(function(buffer, len(buffer)))
     if not size or size >= len(buffer):
-        fail("could not resolve the trusted Windows system directory")
+        raise DeclaredToolRefusal(
+            "system_directory", None, "could not resolve the trusted Windows system directory"
+        )
     system = Path(buffer.value)
     # Windows' default system PATH.
     return tuple(
@@ -248,7 +306,9 @@ def declared_tool_environment(
         if type(name) is not str or type(executable) is not type(Path()):
             raise TypeError("declared tools must map names to exact paths")
         if name not in GUARDED_TOOLS:
-            fail(f"declared tool is not guarded: {name}")
+            raise DeclaredToolRefusal(
+                "unguarded_declared", name, f"declared tool is not guarded: {name}"
+            )
     directories = dict.fromkeys(str(executable.parent) for executable in tools.values())
     environment = base | {"PATH": os.pathsep.join((*directories, *system_directories))}
     # A directory is not a tool: re-resolve every guarded name in the built
@@ -257,9 +317,15 @@ def declared_tool_environment(
         resolved = resolve_on_path(name, environment["PATH"])
         if name not in tools:
             if resolved is not None:
-                fail(f"declared-tool PATH exposes undeclared tool: {name}")
+                raise DeclaredToolRefusal(
+                    "undeclared_tool", name, f"declared-tool PATH exposes undeclared tool: {name}"
+                )
         elif resolved != Path(os.path.normcase(os.path.abspath(tools[name]))):
-            fail(f"declared tool does not re-resolve to its exact executable: {name}")
+            raise DeclaredToolRefusal(
+                "reresolve_mismatch",
+                name,
+                f"declared tool does not re-resolve to its exact executable: {name}",
+            )
     return environment
 
 
@@ -271,7 +337,9 @@ def uv_selected_python(uv: Path, environment: dict[str, str], cwd: Path) -> Path
         stdin=subprocess.DEVNULL, timeout=60, check=False,
     )
     if completed.returncode != 0 or len(completed.stdout.splitlines()) != 1:
-        fail("uv could not select a Python 3.11 interpreter")
+        raise DeclaredToolRefusal(
+            "python_selection", "python", "uv could not select a Python 3.11 interpreter"
+        )
     return Path(os.path.normcase(os.path.abspath(completed.stdout.strip())))
 
 
@@ -279,7 +347,6 @@ def declared_stage_environments(
     environment: dict[str, str], root: Path
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Bind the uv stages and the browser stages to their own declared tools."""
-    system = trusted_system_directories()
     path = environment.get("PATH", "")
 
     def resolve(names: tuple[str, ...]) -> dict[str, Path]:
@@ -287,19 +354,36 @@ def declared_stage_environments(
         for name in names:
             resolved = resolve_on_path(name, path)
             if resolved is None:
-                fail(f"declared tool is not installed: {name}")
+                raise DeclaredToolRefusal(
+                    "not_installed", name, f"declared tool is not installed: {name}"
+                )
             tools[name] = resolved
         return tools
 
-    python_tools = resolve(PYTHON_STAGE_TOOLS)
-    web_tools = resolve(WEB_STAGE_TOOLS)
-    python_tools["python"] = uv_selected_python(python_tools["uv"], environment, root)
-    python_environment = declared_tool_environment(
-        environment, python_tools, system_directories=system
-    )
-    if uv_selected_python(python_tools["uv"], python_environment, root) != python_tools["python"]:
-        fail("declared-tool PATH: uv no longer selects the declared Python 3.11")
-    web_environment = declared_tool_environment(environment, web_tools, system_directories=system)
+    with _declared_tool_refusal_evidence() as stage:
+        system = trusted_system_directories()
+        stage.name = "uv"
+        python_tools = resolve(PYTHON_STAGE_TOOLS)
+        stage.name = "web"
+        web_tools = resolve(WEB_STAGE_TOOLS)
+        stage.name = "uv"
+        python_tools["python"] = uv_selected_python(python_tools["uv"], environment, root)
+        python_environment = declared_tool_environment(
+            environment, python_tools, system_directories=system
+        )
+        if (
+            uv_selected_python(python_tools["uv"], python_environment, root)
+            != python_tools["python"]
+        ):
+            raise DeclaredToolRefusal(
+                "python_reselection",
+                "python",
+                "declared-tool PATH: uv no longer selects the declared Python 3.11",
+            )
+        stage.name = "web"
+        web_environment = declared_tool_environment(
+            environment, web_tools, system_directories=system
+        )
     return python_environment, web_environment
 
 

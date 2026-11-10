@@ -64,6 +64,9 @@ every guarded name (`uv`, `git`, `python`, `node`, `npm`, `npx`, `codex`,
 `ollama`). A declared tool must resolve to its exact original executable, uv
 must still select the same interpreter, and an undeclared guarded tool must not
 resolve. A shared directory that exposes one fails the gate; it is not dropped.
+Each refusal writes one `[declared-tool-path]` JSON line to stderr, giving the
+stage, a fixed refusal category and the guarded tool name. It contains no paths,
+no `PATH` contents and no versions.
 
 CI does not use this mode. Hosted `PATH` is already the reference, and setup-python
 supplies uv's interpreter there. Explicit injection in tests remains the primary
