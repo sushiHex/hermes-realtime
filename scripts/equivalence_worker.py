@@ -165,7 +165,7 @@ async def _run_arms(workspace: Path, livekit_url: str, emit: Any) -> None:
 
 
 def _mark_exit(fd: int, milestone: bytes) -> None:
-    # Five single-byte writes cannot fill the dedicated pipe. A disconnected
+    # Six single-byte writes cannot fill the dedicated pipe. A disconnected
     # diagnostic reader must never replace the worker's cleanup or outcome.
     with suppress(OSError):
         os.write(fd, milestone)
@@ -198,6 +198,10 @@ def main() -> None:
     request_fd = msvcrt.open_osfhandle(request_handle, os.O_RDONLY | os.O_BINARY)
     response_fd = msvcrt.open_osfhandle(response_handle, os.O_WRONLY | os.O_BINARY)
     progress_fd = msvcrt.open_osfhandle(progress_handle, os.O_WRONLY | os.O_BINARY)
+    # Registered before any scenario runs, so it runs after every exit callback
+    # registered later, including LiveKit's native FFI dispose callback. Reaching it
+    # does not prove interpreter finalization finished.
+    atexit.register(_mark_exit, progress_fd, b"X")
     # Provider/library diagnostics must not persist conversation or path data.
     _redirect_diagnostics()
     config = _read_frame(request_fd, time.monotonic() + 10)
