@@ -400,6 +400,39 @@ class _ContainerSpec:
     user: tuple[int, int] | None = None
 
 
+_DOCKER_OPERATIONS = frozenset(
+    {"container", "create", "image", "inspect", "ls", "pull", "rm", "start", "volume"}
+)
+
+
+def _docker_refusal_marker(
+    arguments: tuple[str, ...],
+    category: str,
+    returncode: int | None,
+    stdout_bytes: int,
+    stderr_bytes: int,
+) -> None:
+    """Emit one content-free line: operation, category, exit status and byte counts only."""
+    with suppress(Exception):
+        first = arguments[0] if arguments else ""
+        operation = first if type(first) is str and first in _DOCKER_OPERATIONS else "other"
+        status = returncode if type(returncode) is int else None
+        print(
+            "[linux-docker] "
+            + json.dumps(
+                {
+                    "category": category,
+                    "exitStatus": status,
+                    "operation": operation,
+                    "stderrBytes": stderr_bytes,
+                    "stdoutBytes": stdout_bytes,
+                    "version": 1,
+                },
+                sort_keys=True,
+            )
+        )
+
+
 class _Docker:
     def __init__(self) -> None:
         executable = shutil.which("docker")
@@ -617,38 +650,54 @@ class _Docker:
                 except BaseException:
                     cleanup_interrupted = True
 
-        if process is None:
-            if isinstance(primary, (KeyboardInterrupt, SystemExit)):
-                raise primary
-            raise ValueError("owned Docker operation failed") from None
-        if (
-            not finalized
-            or cleanup_interrupted
-            or not reaped
-            or readers_alive
-            or unstarted_stream_close_failed
-        ):
-            raise ValueError("owned Docker process cleanup failed") from None
-        if primary is not None:
-            if isinstance(primary, (KeyboardInterrupt, SystemExit)):
-                raise primary
-            raise ValueError("owned Docker operation failed") from None
-        if not readers_joined or reader_failure.is_set():
-            raise ValueError("owned Docker process cleanup failed") from None
-        if overflow.is_set() or outcome == "overflow":
-            raise ValueError("owned Docker output exceeds its bound")
-        if outcome == "timeout":
-            raise ValueError("owned Docker operation timed out")
+        refusal = "lifecycle"
+        refused = True
         try:
-            stdout = bytes(outputs[0]).decode("utf-8")
-            stderr = bytes(outputs[1]).decode("utf-8")
-        except UnicodeDecodeError:
-            raise ValueError("owned Docker output differs") from None
-        assert process.returncode is not None
-        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-        if check:
-            _require(result.returncode == 0, "owned Docker operation failed")
-        return result
+            if process is None:
+                if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+                    raise primary
+                raise ValueError("owned Docker operation failed") from None
+            if (
+                not finalized
+                or cleanup_interrupted
+                or not reaped
+                or readers_alive
+                or unstarted_stream_close_failed
+            ):
+                raise ValueError("owned Docker process cleanup failed") from None
+            if primary is not None:
+                if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+                    raise primary
+                raise ValueError("owned Docker operation failed") from None
+            if not readers_joined or reader_failure.is_set():
+                raise ValueError("owned Docker process cleanup failed") from None
+            if overflow.is_set() or outcome == "overflow":
+                refusal = "output_overflow"
+                raise ValueError("owned Docker output exceeds its bound")
+            if outcome == "timeout":
+                refusal = "timeout"
+                raise ValueError("owned Docker operation timed out")
+            try:
+                stdout = bytes(outputs[0]).decode("utf-8")
+                stderr = bytes(outputs[1]).decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("owned Docker output differs") from None
+            assert process.returncode is not None
+            result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            if check:
+                refusal = "nonzero_exit"
+                _require(result.returncode == 0, "owned Docker operation failed")
+            refused = False
+            return result
+        finally:
+            if refused:
+                _docker_refusal_marker(
+                    arguments,
+                    refusal,
+                    None if process is None else process.returncode,
+                    len(outputs[0]),
+                    len(outputs[1]),
+                )
 
     def _container_names(self) -> set[str]:
         result = self._run("container", "ls", "--all", "--format", "{{.Names}}")
