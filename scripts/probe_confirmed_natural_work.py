@@ -77,7 +77,7 @@ def fixture_metadata(version: str) -> dict[str, Any]:
 
 _NUMERIC = frozenset({
     "load_duration_ns", "prompt_eval_duration_ns", "eval_duration_ns", "total_duration_ns",
-    "prompt_eval_count", "num_ctx", "prompt_bytes", "prompt_chars", "messages",
+    "prompt_eval_count", "eval_count", "num_ctx", "prompt_bytes", "prompt_chars", "messages",
     "timing_invalid_count",
 })
 

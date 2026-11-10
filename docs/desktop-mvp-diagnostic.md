@@ -469,7 +469,9 @@ nanoseconds ([Ollama API usage](https://github.com/ollama/ollama/blob/main/docs/
 They are read only from a `done=true` final stream record, so failed or uncompleted requests may
 have no timing record. Each field accepts an exact integer from 0 through 86,400,000,000,000 ns
 (24 hours), independently. A `null` value means unavailable or invalid; `timing_invalid_count`
-and `timing_invalid_fields` identify invalid values without recording model text. The host's
+and `timing_invalid_fields` identify invalid values without recording model text. The marker's
+`eval_count` is Ollama's generated-token count from the same final record: an exact nonnegative
+integer, else `null`. It is never inferred from text length. The host's
 `first_playable_audio` marker is emitted before playback begins, so `first_token_to_audio` is not
 a browser-playback or physical-audibility measurement. Browser media-playback observations are
 separate, and no machine timing establishes speaker output or that a person heard it.

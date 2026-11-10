@@ -1081,6 +1081,9 @@ class OllamaStreamingInference:
             else:
                 durations[marker_name] = None
                 invalid_duration_fields.append(source_name)
+        # Provider-reported generated-token count from the terminal record only; never
+        # inferred from text length. Exact nonnegative int, else unavailable.
+        eval_count = completion.get("eval_count")
         print(
             _PROMPT_MARKER_PREFIX
             + json.dumps(
@@ -1092,6 +1095,9 @@ class OllamaStreamingInference:
                     "prompt_chars": len(content),
                     "prompt_eval_count": (
                         prompt_eval_count if type(prompt_eval_count) is int else None
+                    ),
+                    "eval_count": (
+                        eval_count if type(eval_count) is int and eval_count >= 0 else None
                     ),
                     **durations,
                     "timing_invalid_count": len(invalid_duration_fields),

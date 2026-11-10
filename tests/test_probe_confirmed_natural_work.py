@@ -312,6 +312,12 @@ def test_prompt_timing_sink_keeps_only_numeric_fields():
     assert "private" not in json.dumps(sink.rows)
 
 
+def test_prompt_timing_sink_retains_eval_count():
+    sink = probe.PromptTimingSink()
+    sink.write('[ollama-prompt] {"eval_count":17,"num_ctx":4096}\n')
+    assert sink.rows == [{"stage": "readiness", "eval_count": 17, "num_ctx": 4096}]
+
+
 def test_prompt_timing_sink_rejects_non_numeric_value():
     sink = probe.PromptTimingSink()
     with pytest.raises(ValueError, match="timing_numeric"):
