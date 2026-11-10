@@ -273,6 +273,22 @@ def test_docker_runner_marks_output_overflow(capsys):
     assert marker["stdoutBytes"] == 16 * 1024**2 + 1
 
 
+def test_docker_runner_marks_undecodable_output_without_its_content(capsys):
+    script = f"import os;os.write(2,b'{_SENTINEL}');os.write(1,b'bad-\\xff-out')"
+    with pytest.raises(ValueError, match="^owned Docker output differs$"):
+        _python_docker()._run("-c", script)
+    assert _docker_markers(capsys) == [
+        {
+            "category": "output_decode",
+            "exitStatus": 0,
+            "operation": "other",
+            "stderrBytes": len(_SENTINEL),
+            "stdoutBytes": 10,
+            "version": 1,
+        }
+    ]
+
+
 def test_docker_runner_marks_a_lifecycle_failure_before_any_process(monkeypatch, capsys):
     from scripts import qualification_linux_producer as producer
 

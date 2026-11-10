@@ -681,6 +681,7 @@ class _Docker:
                 stdout = bytes(outputs[0]).decode("utf-8")
                 stderr = bytes(outputs[1]).decode("utf-8")
             except UnicodeDecodeError:
+                refusal = "output_decode"
                 raise ValueError("owned Docker output differs") from None
             assert process.returncode is not None
             result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
