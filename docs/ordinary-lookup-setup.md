@@ -508,6 +508,16 @@ counts (each saturating at 1,000,000). A nonzero truncation count means the reta
 events are incomplete. Native workers' fragmented writes are tracked separately.
 Existing transport-refusal counters remain separate.
 
+Version 2 adds two fixed-key count maps, observation only. `stdoutWrites` counts
+every write that reaches the tee by what `sys.stdout` was at that moment: `tee`,
+`routing-proxy-tee` (Hermes's per-thread routing proxy whose passthrough is the
+tee), `routing-proxy-other` or `other`; the first write of each kind is saved
+immediately. `markerLines` counts completed lines containing the presentation
+prefix by `line-start` or `after-text` (the prefix follows unterminated text the
+same thread wrote earlier, so it is not parsed) and by the same kind. A marker
+present in the private log while both maps stay zero reached the log without
+passing through the tee.
+
 This metadata does not authorize completion or change the native policy. Some
 native refusal branches emit no presentation marker; their un-emitted reason
 remains unavailable. Absence of a retained event cannot establish that a formatter
