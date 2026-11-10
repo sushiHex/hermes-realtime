@@ -882,6 +882,7 @@ def run_script_mypy(root: Path, environment: dict[str, str]) -> None:
         "scripts/task13_artifact_orchestrator.py",
         "scripts/candidate_source_archive_oracle.py",
         "scripts/candidate_e2e_fast_track.py",
+        "scripts/natural_work_target_resolution.py",
         cwd=root,
         env=script_type_env,
     )

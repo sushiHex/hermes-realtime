@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "fixture_id": "natural-work-target-resolution-v1",
+  "derivation": "Each case names the visible key phrase it hinges on. The phrase must occur in the utterance. Exactly one active-work description containing it means target that description; none means no_match; two or more mean clarify. Internal task ids never decide the outcome.",
+  "cases": [
+    {
+      "id": "clear_match",
+      "utterance": "Please stop the flight price comparison.",
+      "key_phrase": "flight price comparison",
+      "active_work": [
+        {"task_id": "task_tr_001", "description": "Flight price comparison for the Lisbon trip."},
+        {"task_id": "task_tr_002", "description": "Weekly grocery budget spreadsheet update."}
+      ],
+      "expected": {"outcome": "target", "target_description": "Flight price comparison for the Lisbon trip."}
+    },
+    {
+      "id": "semantic_mismatch",
+      "utterance": "Please stop the hotel booking research.",
+      "key_phrase": "hotel booking",
+      "active_work": [
+        {"task_id": "task_tr_003", "description": "Background research on flight prices for the Lisbon trip."},
+        {"task_id": "task_tr_004", "description": "Weekly grocery budget spreadsheet update."}
+      ],
+      "expected": {"outcome": "no_match", "target_description": null}
+    },
+    {
+      "id": "multiple_plausible",
+      "utterance": "Cancel the release notes research.",
+      "key_phrase": "release notes",
+      "active_work": [
+        {"task_id": "task_tr_005", "description": "Research the LiveKit server release notes since our pinned version."},
+        {"task_id": "task_tr_006", "description": "Summarize the Python 3.14 release notes for the team."},
+        {"task_id": "task_tr_007", "description": "Weekly grocery budget spreadsheet update."}
+      ],
+      "expected": {"outcome": "clarify", "target_description": null}
+    }
+  ]
+}
