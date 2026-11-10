@@ -1514,6 +1514,84 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         previous_ports = [result.get(key) for key in (
             "api_port", "companion_port", "livekit_port", "browser_port",
         )]
+    _require_previous_quiescent(previous, plan, previous_ports, journal_may_be_absent=False)
+    return {
+        "category": "normal_stop_verified",
+        "receipt_sha256": digest(result_path),
+        "processes_absent": True,
+        "listeners_absent": None if _dev_readiness(plan) else True,
+        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
+        "work_journal_empty": True,
+        "protected_listeners_unchanged": (
+            None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
+        ),
+    }
+
+
+def _absent(path: Path) -> bool:
+    """Only a missing entry is absent; a link, junction or directory there is present."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
+    if not _absent(previous / "result-receipt.private.json"):
+        return verify_normal_stop(previous, plan)
+    # An owner that died abruptly never wrote its receipt. Its ports come from the plan
+    # its owner launched: active binds prepared, and prepared binds the plan.
+    active = _read_json_file(previous / "active.private.json")
+    prepared_path = previous / "prepared.private.json"
+    prepared = _read_json_file(prepared_path)
+    plan_path = previous / "plan.private.json"
+    require(
+        active.get("version") == 1
+        and active.get("category") == "ready_to_launch"
+        and type(active.get("prepared_sha256")) is str
+        and digest(prepared_path) == active["prepared_sha256"]
+        and prepared.get("version") == 1
+        and prepared.get("preflight") == "accepted"
+        and type(prepared.get("plan_sha256")) is str
+        and digest(plan_path) == prepared["plan_sha256"],
+        "previous_plan_binding",
+    )
+    previous_plan = _read_json_file(plan_path)
+    ports: Any = previous_plan.get("ports")
+    output = previous_plan.get("output")
+    require(
+        type(output) is str
+        and output == prepared.get("output")
+        and Path(output).resolve() == previous.resolve()
+        and type(ports) is dict,
+        "previous_plan_binding",
+    )
+    journal_present = _require_previous_quiescent(
+        previous,
+        plan,
+        [ports.get(name) for name in ("api", "companion", "livekit", "host")],
+        journal_may_be_absent=True,
+    )
+    return {
+        "category": "abandoned_stop_verified",
+        "receipt_sha256": None,
+        "plan_sha256": prepared["plan_sha256"],
+        "processes_absent": True,
+        "listeners_absent": None if _dev_readiness(plan) else True,
+        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
+        "work_journal_empty": True if journal_present else None,
+        "work_journal_absent": not journal_present,
+        "protected_listeners_unchanged": None,
+    }
+
+
+def _require_previous_quiescent(
+    previous: Path, plan: PreviewPlanV1, previous_ports: Any, *, journal_may_be_absent: bool
+) -> bool:
+    """Both stop categories: every owned process dead, no port listening, no unsettled work."""
     require(
         type(previous_ports) is list
         and len(previous_ports) == 4
@@ -1544,7 +1622,12 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         set(previous_ports) | {plan.ports[name] for name in ("api", "companion", "livekit", "host")}
     )
     require(not any(_endpoint_snapshot(plan, all_ports).values()), "previous_listener_alive")
-    journal = _read_json_file(previous / "state" / "hermes-runs-v1.json")
+    journal_path = previous / "state" / "hermes-runs-v1.json"
+    if journal_may_be_absent and _absent(journal_path):
+        # The host writes its run record ahead of its first Hermes POST, and otherwise only
+        # when settling an existing record or closing gracefully; none has run here.
+        return False
+    journal = _read_json_file(journal_path)
     require(
         set(journal) == {"version", "pending", "admitted"}
         and type(journal["version"]) is int
@@ -1555,18 +1638,7 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         and journal["admitted"] == [],
         "previous_work_unsettled",
     )
-    return {
-        "category": "normal_stop_verified",
-        "receipt_sha256": digest(result_path),
-        "processes_absent": True,
-        "listeners_absent": None if _dev_readiness(plan) else True,
-        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
-        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
-        "work_journal_empty": True,
-        "protected_listeners_unchanged": (
-            None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
-        ),
-    }
+    return True
 
 
 def _copy_tree(source: Path, target: Path) -> tuple[int, int]:
@@ -1742,12 +1814,16 @@ def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
     plan_path = output / "plan.private.json"
     require(digest(plan_path) == prepared.get("plan_sha256"), "prepared_plan_drift")
     plan = load_plan(plan_path)
-    stop = verify_normal_stop(previous, plan)
+    stop = verify_previous_stop(previous, plan)
     supplemental = _copy_profile_supplement(plan, prepared)
     tail = _copy_voice_tail(previous, output, plan.runtime_target)
     handoff = {
         "version": 1,
-        "category": "normal_stop_handoff_verified",
+        "category": (
+            "abandoned_stop_handoff_verified"
+            if stop["category"] == "abandoned_stop_verified"
+            else "normal_stop_handoff_verified"
+        ),
         "previous_stop": stop,
         "profile": supplemental,
         "voice_tail": tail,

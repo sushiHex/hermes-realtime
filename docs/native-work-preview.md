@@ -170,7 +170,13 @@ Python executable; they do not install dependencies into Hermes.
 
 `prepare` and its `preflight` are offline. `finalize` refuses unless the prior
 run has a settled stop receipt, no owned survivors/listeners, and an empty task
-journal. `launch` probes the bound host interpreter and starts its verified base Python
+journal. A prior run whose owner died before writing any receipt is accepted as
+`abandoned_stop_verified` only when every recorded PID, including the supervisor's,
+is dead, no port of its hash-bound plan or the new plan is listening, and its task
+journal is empty or absent. The host writes that journal before its first Hermes
+dispatch, so absence means nothing was submitted. A receipt that is present but
+not a settled regular file is refused as before. `finalize` only reads the prior
+run. `launch` probes the bound host interpreter and starts its verified base Python
 with CPython's standard virtual-environment launcher variable. This preserves
 the same virtual environment without the Windows venv redirector's extra Job.
 It uses the existing windowless Windows Job breakaway flags, NUL input and

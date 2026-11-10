@@ -979,6 +979,287 @@ def test_legacy_ports_keep_strict_port_validation(tmp_path):
         preview_cutover.verify_normal_stop(previous, preview_cutover.load_plan(plan_path))
 
 
+# The abandoned run listened on its own ports, distinct from the replacement plan's.
+_ABANDONED_PORTS = {
+    "api": 59886, "companion": 59887, "livekit": 7890, "host": 28775, "protected": [8765],
+}
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _abandoned_previous(tmp_path: Path, plan_path: Path, *, journal: object = "empty") -> Path:
+    """A run directory as `serve` leaves it when its owner dies before writing a receipt."""
+    previous = tmp_path / "previous"
+    (previous / "state").mkdir(parents=True)
+    previous_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    previous_plan["output"] = str(previous)
+    previous_plan["ports"] = dict(_ABANDONED_PORTS)
+    (previous / "plan.private.json").write_text(json.dumps(previous_plan), encoding="utf-8")
+    (previous / "prepared.private.json").write_text(json.dumps({
+        "version": 1, "plan": previous_plan, "plan_sha256": _sha256(previous / "plan.private.json"),
+        "output": str(previous), "policy_mode": "native", "profile_complete": False,
+        "preflight": "accepted",
+    }), encoding="utf-8")
+    (previous / "active.private.json").write_text(json.dumps({
+        "version": 1, "category": "ready_to_launch",
+        "prepared_sha256": _sha256(previous / "prepared.private.json"),
+        "handoff_sha256": "0" * 64, "profile_complete": True, "launch_authorized": False,
+    }), encoding="utf-8")
+    (previous / "pids.json").write_text(
+        json.dumps({"gateway": 101, "host": 102, "livekit": 103}), encoding="utf-8"
+    )
+    (previous / "supervisor.pid.private.txt").write_text("104\n", encoding="ascii")
+    if journal == "empty":
+        journal = {"version": 1, "pending": [], "admitted": []}
+    if type(journal) is dict:
+        (previous / "state" / "hermes-runs-v1.json").write_text(
+            json.dumps(journal), encoding="utf-8"
+        )
+    (previous / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
+    return previous
+
+
+def _tree_snapshot(root: Path) -> dict[str, object]:
+    entries: dict[str, object] = {".": root.stat().st_mtime_ns}
+    for item in sorted(root.rglob("*")):
+        entries[item.relative_to(root).as_posix()] = (
+            item.is_dir(), None if item.is_dir() else item.read_bytes(), item.stat().st_mtime_ns,
+        )
+    return entries
+
+
+@pytest.mark.parametrize("journal", ["empty", "absent"])
+def test_finalize_accepts_abandoned_run_without_writing_it(tmp_path, monkeypatch, journal):
+    plan_path, source_profile = _plan(tmp_path)
+    (source_profile / ".env").write_bytes(b"opaque-auth-value")
+    success = subprocess.CompletedProcess(
+        ["preflight"],
+        0,
+        stdout=(
+            '[voice-preview] {"category":"preflight_ready","launch_authorized":false,'
+            '"ports":[59876,59877,7880,28765]}\n'
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(preview_cutover, "run_preflight", lambda *_: success)
+    preview_cutover.prepare(plan_path)
+    previous = _abandoned_previous(tmp_path, plan_path, journal=journal)
+    before = _tree_snapshot(previous)
+    observed: list[int] = []
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(
+        preview_cutover, "_listener_rows", lambda port: observed.append(port) or []
+    )
+    copied: list[Path] = []
+
+    def copy_tail(source, output, _runtime):
+        copied.append(source)
+        (output / "state").mkdir()
+        (output / "state" / "voice-tail-v1.json").write_text("{}", encoding="utf-8")
+        return {"bytes": 2, "sha256": "e" * 64}
+
+    monkeypatch.setattr(preview_cutover, "_copy_voice_tail", copy_tail)
+    output = tmp_path / "preview"
+
+    result = preview_cutover.finalize(output / "prepared.private.json", previous)
+
+    assert result["category"] == "ready_to_launch"
+    assert copied == [previous]
+    assert sorted(observed) == sorted(
+        {59876, 59877, 7880, 28765} | {59886, 59887, 7890, 28775}
+    )
+    handoff = json.loads((output / "handoff.private.json").read_text())
+    assert handoff["category"] == "abandoned_stop_handoff_verified"
+    stop = handoff["previous_stop"]
+    assert stop["category"] == "abandoned_stop_verified"
+    assert stop["receipt_sha256"] is None
+    assert stop["plan_sha256"] == _sha256(previous / "plan.private.json")
+    assert stop["processes_absent"] is True
+    assert stop["listeners_absent"] is True
+    assert stop["work_journal_empty"] is (True if journal == "empty" else None)
+    assert stop["work_journal_absent"] is (journal == "absent")
+    assert stop["protected_listeners_unchanged"] is None
+    assert _tree_snapshot(previous) == before
+
+
+def test_normal_stop_alone_still_requires_its_receipt(tmp_path):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    with pytest.raises(ValueError, match="receipt_file"):
+        preview_cutover.verify_normal_stop(previous, preview_cutover.load_plan(plan_path))
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        ("live_pid", "previous_process_alive"),
+        ("live_supervisor", "previous_process_alive"),
+        ("old_listener", "previous_listener_alive"),
+        ("new_listener", "previous_listener_alive"),
+        ("pending", "previous_work_unsettled"),
+        ("admitted", "previous_work_unsettled"),
+        ("journal_directory", "receipt_file"),
+        ("pid_shape", "previous_pid_shape"),
+        ("missing_supervisor", "previous_supervisor_pid_file"),
+        ("plan_drift", "previous_plan_binding"),
+        ("prepared_drift", "previous_plan_binding"),
+        ("not_launched", "previous_plan_binding"),
+        ("foreign_output", "previous_plan_binding"),
+        ("plan_ports", "previous_ports_shape"),
+    ],
+)
+def test_abandoned_run_refuses_live_or_unsettled_or_unbound_state(
+    tmp_path, monkeypatch, failure, category
+):
+    plan_path, _ = _plan(tmp_path)
+    plan = preview_cutover.load_plan(plan_path)
+    journal: object = "empty"
+    if failure == "pending":
+        journal = {"version": 1, "pending": [{"run_id": "synthetic"}], "admitted": []}
+    if failure == "admitted":
+        journal = {"version": 1, "pending": [], "admitted": ["run_synthetic"]}
+    previous = _abandoned_previous(
+        tmp_path, plan_path, journal="absent" if failure == "journal_directory" else journal
+    )
+    if failure == "journal_directory":
+        (previous / "state" / "hermes-runs-v1.json").mkdir()
+    if failure == "pid_shape":
+        (previous / "pids.json").write_text(json.dumps({"gateway": 101}), encoding="utf-8")
+    if failure == "missing_supervisor":
+        (previous / "supervisor.pid.private.txt").unlink()
+    if failure == "plan_drift":
+        # Well formed, but not the plan prepared bound: only the hash can tell.
+        plan_value = json.loads((previous / "plan.private.json").read_text())
+        plan_value["ports"]["api"] = 59896
+        (previous / "plan.private.json").write_text(json.dumps(plan_value), encoding="utf-8")
+    if failure == "prepared_drift":
+        prepared = json.loads((previous / "prepared.private.json").read_text())
+        prepared["policy_mode"] = "lookup"
+        (previous / "prepared.private.json").write_text(json.dumps(prepared), encoding="utf-8")
+    if failure == "not_launched":
+        active = json.loads((previous / "active.private.json").read_text())
+        active["category"] = "prepared"
+        (previous / "active.private.json").write_text(json.dumps(active), encoding="utf-8")
+    if failure in {"foreign_output", "plan_ports"}:
+        plan_value = json.loads((previous / "plan.private.json").read_text())
+        if failure == "foreign_output":
+            plan_value["output"] = str(tmp_path / "elsewhere")
+        else:
+            plan_value["ports"]["api"] = plan_value["ports"]["companion"]
+        (previous / "plan.private.json").write_text(json.dumps(plan_value), encoding="utf-8")
+        prepared = json.loads((previous / "prepared.private.json").read_text())
+        prepared["plan_sha256"] = _sha256(previous / "plan.private.json")
+        if failure == "foreign_output":
+            prepared["output"] = str(tmp_path / "elsewhere")
+        (previous / "prepared.private.json").write_text(json.dumps(prepared), encoding="utf-8")
+        active = json.loads((previous / "active.private.json").read_text())
+        active["prepared_sha256"] = _sha256(previous / "prepared.private.json")
+        (previous / "active.private.json").write_text(json.dumps(active), encoding="utf-8")
+    live = {"live_pid": 102, "live_supervisor": 104}.get(failure)
+    listening = {"old_listener": 59886, "new_listener": 59876}.get(failure)
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda pid: 1 if pid == live else None)
+    monkeypatch.setattr(
+        preview_cutover,
+        "_listener_rows",
+        lambda port: [("127.0.0.1", 999)] if port == listening else [],
+    )
+    before = _tree_snapshot(previous)
+
+    with pytest.raises(ValueError, match=category):
+        preview_cutover.verify_previous_stop(previous, plan)
+    assert _tree_snapshot(previous) == before
+
+
+@pytest.mark.parametrize(
+    "receipt", ["directory", "dangling_junction", "dangling_link", "settled_link"]
+)
+def test_receipt_that_is_not_a_plain_file_is_never_treated_as_absent(
+    tmp_path, monkeypatch, receipt
+):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(tmp_path, plan_path)
+    path = previous / "result-receipt.private.json"
+    if receipt == "directory":
+        path.mkdir()
+    elif receipt == "dangling_junction":
+        if sys.platform != "win32":
+            pytest.skip("junctions are Windows-only")
+        import _winapi
+
+        target_dir = tmp_path / "removed-target"
+        target_dir.mkdir()
+        _winapi.CreateJunction(str(target_dir), str(path))
+        target_dir.rmdir()
+        # Path.exists() follows the reparse point and would call this receipt absent.
+        assert not path.exists()
+    else:
+        target = tmp_path / "outside-receipt.json"
+        if receipt == "settled_link":
+            target.write_text(json.dumps({
+                "version": 1, "category": "stopped", "cleanup_settled": True,
+                "cleanup_failed": False, "owned_survivor_count": 0,
+                "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+                "ports": [59886, 59887, 7890, 28775],
+            }), encoding="utf-8")
+        try:
+            path.symlink_to(target)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+
+    with pytest.raises(ValueError, match="receipt_file"):
+        preview_cutover.verify_previous_stop(previous, preview_cutover.load_plan(plan_path))
+
+
+@pytest.mark.parametrize(
+    ("receipt", "category"),
+    [
+        ("unsettled", "previous_normal_stop"),
+        ("malformed", None),
+        # Absence of the journal is accepted only for a run that never wrote a receipt.
+        ("settled_without_journal", "receipt_file"),
+    ],
+)
+def test_present_receipt_keeps_its_refusal_even_when_the_run_looks_abandoned(
+    tmp_path, monkeypatch, receipt, category
+):
+    plan_path, _ = _plan(tmp_path)
+    previous = _abandoned_previous(
+        tmp_path, plan_path, journal="absent" if receipt == "settled_without_journal" else "empty"
+    )
+    path = previous / "result-receipt.private.json"
+    if receipt == "settled_without_journal":
+        path.write_text(json.dumps({
+            "version": 1, "category": "stopped", "cleanup_settled": True,
+            "cleanup_failed": False, "owned_survivor_count": 0,
+            "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+            "ports": [59886, 59887, 7890, 28775],
+        }), encoding="utf-8")
+    elif receipt == "unsettled":
+        path.write_text(json.dumps({
+            "version": 1, "category": "refused", "cleanup_settled": False,
+            "cleanup_failed": True, "owned_survivor_count": 1,
+            "remaining_owned_listeners": 0, "protected_listeners_unchanged": True,
+            "ports": [59886, 59887, 7890, 28775],
+        }), encoding="utf-8")
+    else:
+        path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(preview_cutover, "_started_at", lambda _pid: None)
+    monkeypatch.setattr(preview_cutover, "_listener_rows", lambda _port: [])
+    plan = preview_cutover.load_plan(plan_path)
+
+    for verify in (preview_cutover.verify_previous_stop, preview_cutover.verify_normal_stop):
+        if category is not None:
+            with pytest.raises(ValueError, match=category):
+                verify(previous, plan)
+        else:
+            with pytest.raises(json.JSONDecodeError):
+                verify(previous, plan)
+
+
 def test_realtime_source_binding_refuses_before_wheel_acceptance(tmp_path, monkeypatch):
     plan_path, _ = _plan(tmp_path)
     plan_value = json.loads(plan_path.read_text(encoding="utf-8"))
