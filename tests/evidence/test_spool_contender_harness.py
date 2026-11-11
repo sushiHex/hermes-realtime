@@ -555,3 +555,85 @@ def test_cleanup_evidence_contains_only_exact_exit_categories(monkeypatch, tmp_p
         "failures": ["nonzero_exit"],
         "primaryFailure": True,
     }
+
+
+class _PermissionSubclass(PermissionError):
+    pass
+
+
+@pytest.mark.parametrize(
+    "error,category,exception,errno_name",
+    [
+        (PermissionError(13, "PRIVATE-CHILD-CONTENT"), "os_error", "PermissionError", "EACCES"),
+        (OSError(22, "PRIVATE-CHILD-CONTENT"), "os_error", "OSError", "EINVAL"),
+        (OSError("PRIVATE-CHILD-CONTENT"), "os_error", "OSError", None),
+        (OSError(987654, "PRIVATE-CHILD-CONTENT"), "os_error", "OSError", None),
+        (_PermissionSubclass(13, "PRIVATE-CHILD-CONTENT"), "os_error", "other", "EACCES"),
+        (RuntimeError("PRIVATE-CHILD-CONTENT"), "runtime_error", "RuntimeError", None),
+        (ValueError("PRIVATE-CHILD-CONTENT"), "unexpected", "ValueError", None),
+        (
+            worker.sqlite3.OperationalError("PRIVATE-CHILD-CONTENT"),
+            "unexpected",
+            "OperationalError",
+            None,
+        ),
+    ],
+)
+def test_worker_failure_names_allowlisted_exception_and_errno(
+    capsys, error, category, exception, errno_name
+):
+    worker._emit_contender_failure(0, "create_epoch", error)
+    output = capsys.readouterr().out
+    assert "PRIVATE" not in output
+    assert json.loads(output) == {
+        "contenderId": 0,
+        "protocolVersion": 1,
+        "state": "FAILED",
+        "stage": "create_epoch",
+        "category": category,
+        "exception": exception,
+        "errno": errno_name,
+    }
+
+
+def test_contender_os_error_cause_reaches_cleanup_marker(monkeypatch, tmp_path, capsys):
+    """A real worker failure frame names its bounded cause in the parent's cleanup marker."""
+
+    class Owned:
+        def create_epoch(self, request):
+            raise PermissionError(13, "PRIVATE-CHILD-CONTENT")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "_make_spool", lambda *a, **k: Owned())
+    monkeypatch.setattr(worker, "_wait_for_shared_start", lambda name: None)
+    with pytest.raises(PermissionError):
+        worker._run_marker_only_contender(tmp_path, 0, "private-event")
+    child_output = capsys.readouterr().out
+    children = [Child(child_output, exit_code=1), Child(frames(1))]
+    kernel, run = invoke(monkeypatch, tmp_path, children)
+    with pytest.raises(
+        pytest.fail.Exception,
+        match=r"failed at create_epoch \(os_error, PermissionError, EACCES\)",
+    ):
+        run()
+    assert_closed(children, kernel)
+    output = capsys.readouterr().out
+    assert "PRIVATE" not in output
+    report = json.loads(output.split("[task-5d-contender-cleanup] ")[1])
+    assert report == {
+        "causes": [
+            {
+                "category": "os_error",
+                "contenderId": 0,
+                "errno": "EACCES",
+                "exception": "PermissionError",
+                "stage": "create_epoch",
+            }
+        ],
+        "children": 2,
+        "exits": [{"category": "nonzero"}, {"category": "zero"}],
+        "failures": ["nonzero_exit"],
+        "primaryFailure": True,
+    }
