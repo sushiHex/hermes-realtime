@@ -1514,6 +1514,120 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         previous_ports = [result.get(key) for key in (
             "api_port", "companion_port", "livekit_port", "browser_port",
         )]
+    _require_previous_quiescent(previous, plan, previous_ports, journal_may_be_absent=False)
+    return {
+        "category": "normal_stop_verified",
+        "receipt_sha256": digest(result_path),
+        "processes_absent": True,
+        "listeners_absent": None if _dev_readiness(plan) else True,
+        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
+        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
+        "work_journal_empty": True,
+        "protected_listeners_unchanged": (
+            None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
+        ),
+    }
+
+
+def _absent(path: Path) -> bool:
+    """Only a missing entry is absent; a link, junction or directory there is present."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _host_lock_held(path: Path) -> bool:
+    """Try the one-byte lock ``run_record.lock_run_record`` takes, without creating or writing.
+
+    That helper opens with O_CREAT, which would write into the previous run, so the same
+    non-blocking region lock is taken here on a read-only handle, then released.
+    """
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def verify_previous_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
+    receipt_path = previous / "result-receipt.private.json"
+    if not _absent(receipt_path):
+        return verify_normal_stop(previous, plan)
+    # An owner that died abruptly never wrote its receipt. Its ports come from the plan
+    # its owner launched: active binds prepared and handoff, and prepared binds the plan.
+    active = _read_json_file(previous / "active.private.json")
+    prepared_path = previous / "prepared.private.json"
+    prepared = _read_json_file(prepared_path)
+    plan_path = previous / "plan.private.json"
+    require(
+        active.get("version") == 1
+        and active.get("category") == "ready_to_launch"
+        and type(active.get("prepared_sha256")) is str
+        and digest(prepared_path) == active["prepared_sha256"]
+        and type(active.get("handoff_sha256")) is str
+        and digest(previous / "handoff.private.json") == active["handoff_sha256"]
+        and prepared.get("version") == 1
+        and prepared.get("preflight") == "accepted"
+        and type(prepared.get("plan_sha256")) is str
+        and digest(plan_path) == prepared["plan_sha256"],
+        "previous_plan_binding",
+    )
+    previous_plan = _read_json_file(plan_path)
+    ports: Any = previous_plan.get("ports")
+    output = previous_plan.get("output")
+    require(
+        type(output) is str
+        and output == prepared.get("output")
+        and Path(output).resolve() == previous.resolve()
+        and type(ports) is dict,
+        "previous_plan_binding",
+    )
+    journal_present = _require_previous_quiescent(
+        previous,
+        plan,
+        [ports.get(name) for name in ("api", "companion", "livekit", "host")],
+        journal_may_be_absent=True,
+    )
+    # An owner that settled while these checks ran must not be read as abandoned.
+    require(_absent(receipt_path), "previous_receipt_appeared")
+    return {
+        "category": "abandoned_stop_verified",
+        "receipt_sha256": None,
+        "plan_sha256": prepared["plan_sha256"],
+        "processes_absent": True,
+        "listeners_absent": None if _dev_readiness(plan) else True,
+        # Only absence was observed; there was no owner whose listeners could be verified.
+        "listener_ownership": "unavailable",
+        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
+        "work_journal_empty": True if journal_present else None,
+        "work_journal_absent": not journal_present,
+        "protected_listeners_unchanged": None,
+    }
+
+
+def _require_previous_quiescent(
+    previous: Path, plan: PreviewPlanV1, previous_ports: Any, *, journal_may_be_absent: bool
+) -> bool:
+    """Both stop categories: every owned process dead, no port listening, no unsettled work."""
     require(
         type(previous_ports) is list
         and len(previous_ports) == 4
@@ -1544,7 +1658,23 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         set(previous_ports) | {plan.ports[name] for name in ("api", "companion", "livekit", "host")}
     )
     require(not any(_endpoint_snapshot(plan, all_ports).values()), "previous_listener_alive")
-    journal = _read_json_file(previous / "state" / "hermes-runs-v1.json")
+    for name in ("hermes-runs-v1.json.lock", "voice-tail-v1.json.lock"):
+        lock_path = previous / "state" / name
+        if _absent(lock_path):
+            continue
+        require(
+            lock_path.is_file()
+            and not lock_path.is_symlink()
+            and not (getattr(lock_path.lstat(), "st_file_attributes", 0) & 0x400),
+            "previous_lock_file",
+        )
+        require(not _host_lock_held(lock_path), "previous_lock_held")
+    journal_path = previous / "state" / "hermes-runs-v1.json"
+    if journal_may_be_absent and _absent(journal_path):
+        # The host writes its run record ahead of its first Hermes POST, and otherwise only
+        # when settling an existing record or closing gracefully; none has run here.
+        return False
+    journal = _read_json_file(journal_path)
     require(
         set(journal) == {"version", "pending", "admitted"}
         and type(journal["version"]) is int
@@ -1555,18 +1685,7 @@ def verify_normal_stop(previous: Path, plan: PreviewPlanV1) -> dict[str, Any]:
         and journal["admitted"] == [],
         "previous_work_unsettled",
     )
-    return {
-        "category": "normal_stop_verified",
-        "receipt_sha256": digest(result_path),
-        "processes_absent": True,
-        "listeners_absent": None if _dev_readiness(plan) else True,
-        "listener_ownership": "unavailable" if _dev_readiness(plan) else "verified",
-        "endpoints_not_accepting": True if _dev_readiness(plan) else None,
-        "work_journal_empty": True,
-        "protected_listeners_unchanged": (
-            None if _dev_readiness(plan) else result["protected_listeners_unchanged"]
-        ),
-    }
+    return True
 
 
 def _copy_tree(source: Path, target: Path) -> tuple[int, int]:
@@ -1713,17 +1832,51 @@ def _copy_voice_tail(previous: Path, output: Path, runtime_target: Path) -> dict
             "voice_tail_import_origin",
         )
         maximum = voice_tail.max_voice_tail_bytes(32, 1024)
+        import hermes_realtime.integration.voice_deletes as voice_deletes
+
+        require(
+            Path(voice_deletes.__file__).resolve()
+            == expected_module.with_name("voice_deletes.py").resolve(),
+            "voice_tail_import_origin",
+        )
+        deletes_maximum = voice_deletes.MAX_VOICE_DELETES_BYTES
     finally:
         with contextlib.suppress(ValueError):
             sys.path.remove(str(package_parent))
     require(source.stat().st_size <= maximum, "saved_voice_tail_bound")
     raw = _read(source, maximum)
+    # The forget record beside the tail decides which tail binding may be restored. Without
+    # it, a tail a forget had already retired would be restored into the new run.
+    deletes_source = previous / "state" / "voice-tail-v1.deletes.json"
+    deletes_raw: bytes | None = None
+    if not _absent(deletes_source):
+        require(
+            deletes_source.is_file()
+            and not deletes_source.is_symlink()
+            and not (getattr(deletes_source.lstat(), "st_file_attributes", 0) & 0x400),
+            "saved_voice_deletes_file",
+        )
+        require(deletes_source.stat().st_size <= deletes_maximum, "saved_voice_deletes_bound")
+        deletes_raw = _read(deletes_source, deletes_maximum)
     target_state = output / "state"
     target_state.mkdir(parents=False, exist_ok=False)
+    deletes_sha256: str | None = None
+    if deletes_raw is not None:
+        # The record first, as the host writes it: a tail never lands without its deletes.
+        deletes_target = target_state / "voice-tail-v1.deletes.json"
+        with deletes_target.open("xb") as stream:
+            stream.write(deletes_raw)
+        deletes_sha256 = digest(deletes_target)
+        require(digest(deletes_source) == deletes_sha256, "saved_voice_deletes_copy")
     target = target_state / "voice-tail-v1.json"
     target.write_bytes(raw)
     require(digest(source) == digest(target), "saved_voice_tail_copy")
-    return {"bytes": len(raw), "sha256": digest(target)}
+    return {
+        "bytes": len(raw),
+        "sha256": digest(target),
+        "deletes_bytes": None if deletes_raw is None else len(deletes_raw),
+        "deletes_sha256": deletes_sha256,
+    }
 
 
 def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
@@ -1742,12 +1895,16 @@ def finalize(prepared_path: Path, previous: Path) -> dict[str, Any]:
     plan_path = output / "plan.private.json"
     require(digest(plan_path) == prepared.get("plan_sha256"), "prepared_plan_drift")
     plan = load_plan(plan_path)
-    stop = verify_normal_stop(previous, plan)
+    stop = verify_previous_stop(previous, plan)
     supplemental = _copy_profile_supplement(plan, prepared)
     tail = _copy_voice_tail(previous, output, plan.runtime_target)
     handoff = {
         "version": 1,
-        "category": "normal_stop_handoff_verified",
+        "category": (
+            "abandoned_stop_handoff_verified"
+            if stop["category"] == "abandoned_stop_verified"
+            else "normal_stop_handoff_verified"
+        ),
         "previous_stop": stop,
         "profile": supplemental,
         "voice_tail": tail,

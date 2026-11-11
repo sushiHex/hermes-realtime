@@ -70,6 +70,74 @@ async def test_automatic_ack_follows_real_dispatch_ack(accepted):
 
 
 @pytest.mark.asyncio
+async def test_automatic_start_anchors_its_card_to_the_admitting_foreground_turn():
+    context = ConversationContextStore()
+    surface, _controller, events = _surface(context=context)
+    proposals = ConversationTaskProposals(
+        surface=surface, observer=lambda *_: None, start_policy="automatic"
+    )
+    proposals.bind("participant", 1)
+
+    class Inference:
+        calls = 0
+
+        async def stream(self, snapshot, *, turn_id):
+            self.calls += 1
+            if self.calls == 1:
+                yield HostTaskProposalRequest("Inspect the release")
+            else:
+                yield "I have started the work."
+
+        async def cancel(self, turn_id):
+            pass
+
+    loop = StreamingSpeechLoop(
+        context=context,
+        foreground=ForegroundTurnCoordinator(),
+        inference=Inference(),
+        synthesizer=SegmentSynthesizer(),
+        playback=RecordingPlayback(),
+        ledger=DeliveredSpeechLedger(),
+        task_proposals=proposals,
+    )
+    try:
+        await loop.respond("turn_auto", Transcript(text="Inspect release", final=True))
+        assert events == [("task_state", {
+            "status": "active", "taskId": "task_release_check", "anchorTurnId": "turn_auto",
+        })]
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+async def test_unanchored_start_carries_no_presentation_anchor():
+    surface, _controller, events = _surface()
+    try:
+        result = await surface.start_work(objective="Inspect release", invocation_id="cmd_1")
+        assert result.accepted and result.state == "active"
+        assert events == [("task_state", {"status": "active", "taskId": "task_release_check"})]
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("anchor", "error"),
+    ((7, TypeError), ("", ValueError), ("1turn", ValueError), ("t" + "a" * 128, ValueError)),
+)
+async def test_start_refuses_malformed_anchor_before_dispatch(anchor, error):
+    surface, controller, events = _surface()
+    try:
+        with pytest.raises(error):
+            await surface.start_work(
+                objective="Inspect release", invocation_id="call_1", anchor_turn_id=anchor,
+            )
+        assert controller.dispatches == [] and events == []
+    finally:
+        await surface.close()
+
+
+@pytest.mark.asyncio
 async def test_barge_in_while_waiting_does_not_cancel_owned_dispatch():
     gate = asyncio.Event()
     context = ConversationContextStore()

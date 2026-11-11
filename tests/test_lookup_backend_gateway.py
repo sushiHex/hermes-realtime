@@ -6,8 +6,10 @@ import ast
 import importlib.util
 import io
 import json
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -249,7 +251,8 @@ def test_policy_diagnostic_save_failure_cannot_replace_stream_behavior():
     assert tee.write(line) == len(line)
     tee.flush()
     assert delegate.getvalue() == line
-    assert state["policyDiagnostics"]["saveFailures"] == 1
+    # One failed save for the first stdout-kind sighting, one for the marker event.
+    assert state["policyDiagnostics"]["saveFailures"] == 2
     assert "synthetic-private-value" not in json.dumps(state)
 
 
@@ -284,6 +287,114 @@ def test_policy_diagnostic_saturates_counters():
     tee.write('[lookup-presentation] {"category":"refused","stage":"source"}\n')
     assert state["policyDiagnostics"]["observed"] == 1000000
     assert len(state["policyDiagnostics"]["events"]) == 1
+
+
+MARKER = '[lookup-presentation] {"category":"refused","stage":"source"}'
+STDOUT_KINDS = ("tee", "routing-proxy-tee", "routing-proxy-other", "other")
+
+
+class _ThreadRoutingStream:
+    """Synthetic stand-in for Hermes's per-thread routing proxy (passthrough only)."""
+
+    def __init__(self, passthrough):
+        self._passthrough = passthrough
+
+    def write(self, data):
+        return self._passthrough.write(data)
+
+    def flush(self):
+        return self._passthrough.flush()
+
+
+def marker_lines(state):
+    return {key: value for key, value in state["policyDiagnostics"]["markerLines"].items()
+            if value}
+
+
+def stdout_writes(state):
+    return {key: value for key, value in state["policyDiagnostics"]["stdoutWrites"].items()
+            if value}
+
+
+def test_stdout_witness_counts_marker_at_line_start_through_tee():
+    module, state, delegate = gateway(), witness(), io.StringIO()
+    tee = module.PolicyDiagnosticTee(delegate, state, lambda: None)
+    with redirect_stdout(tee):
+        print(MARKER, flush=True)
+    assert delegate.getvalue() == MARKER + "\n"
+    assert marker_lines(state) == {"line-start:tee": 1}
+    assert stdout_writes(state) == {"tee": 2}
+    assert state["policyDiagnostics"]["observed"] == 1
+
+
+def test_stdout_witness_counts_marker_after_unterminated_same_thread_text():
+    module, state, delegate, saved = gateway(), witness(), io.StringIO(), []
+    tee = module.PolicyDiagnosticTee(delegate, state, lambda: saved.append(json.dumps(state)))
+    with redirect_stdout(tee):
+        print("synthetic-private-value", end="", flush=True)
+        print(MARKER, flush=True)
+    assert delegate.getvalue() == "synthetic-private-value" + MARKER + "\n"
+    assert marker_lines(state) == {"after-text:tee": 1}
+    assert json.loads(saved[-1])["policyDiagnostics"]["markerLines"]["after-text:tee"] == 1
+    diagnostic = state["policyDiagnostics"]
+    assert diagnostic["observed"] == 0 and diagnostic["invalid"] == 0
+    assert all("synthetic-private-value" not in value for value in [*saved, json.dumps(state)])
+
+
+def test_stdout_witness_names_routing_proxy_whose_passthrough_is_the_tee():
+    module, state, delegate, saved = gateway(), witness(), io.StringIO(), []
+    tee = module.PolicyDiagnosticTee(delegate, state, lambda: saved.append(json.dumps(state)))
+    with redirect_stdout(tee):
+        sys.stdout = _ThreadRoutingStream(tee)
+        print("synthetic-private-value", flush=True)
+        assert json.loads(saved[-1])["policyDiagnostics"]["stdoutWrites"][
+            "routing-proxy-tee"] == 1
+        print(MARKER, flush=True)
+    assert delegate.getvalue() == "synthetic-private-value\n" + MARKER + "\n"
+    assert marker_lines(state) == {"line-start:routing-proxy-tee": 1}
+    assert stdout_writes(state) == {"routing-proxy-tee": 4}
+    assert state["policyDiagnostics"]["observed"] == 1
+    assert all("synthetic-private-value" not in value for value in saved)
+
+
+def test_stdout_witness_separates_proxy_over_another_stream_and_other_stdout():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    with redirect_stdout(_ThreadRoutingStream(io.StringIO())):
+        tee.write(MARKER + "\n")
+    with redirect_stdout(io.StringIO()):
+        tee.write(MARKER + "\n")
+    assert marker_lines(state) == {"line-start:routing-proxy-other": 1, "line-start:other": 1}
+    assert stdout_writes(state) == {"routing-proxy-other": 1, "other": 1}
+
+
+def test_stdout_witness_records_nothing_for_a_write_that_bypasses_the_tee():
+    module, state, delegate = gateway(), witness(), io.StringIO()
+    tee = module.PolicyDiagnosticTee(delegate, state, lambda: None)
+    with redirect_stdout(tee):
+        print(MARKER, file=delegate, flush=True)
+        sys.stdout = io.StringIO()
+        print(MARKER, flush=True)
+    assert delegate.getvalue() == MARKER + "\n"
+    assert marker_lines(state) == {} and stdout_writes(state) == {}
+    assert state["policyDiagnostics"]["observed"] == 0
+
+
+def test_stdout_witness_keys_are_fixed_and_saturate():
+    module, state = gateway(), witness()
+    tee = module.PolicyDiagnosticTee(io.StringIO(), state, lambda: None)
+    diagnostic = state["policyDiagnostics"]
+    assert diagnostic["version"] == 2
+    assert set(diagnostic["stdoutWrites"]) == set(STDOUT_KINDS)
+    assert set(diagnostic["markerLines"]) == {
+        f"{position}:{kind}" for position in ("line-start", "after-text")
+        for kind in STDOUT_KINDS
+    }
+    diagnostic["stdoutWrites"]["other"] = 1000000
+    diagnostic["markerLines"]["line-start:other"] = 1000000
+    tee.write(MARKER + "\n")
+    assert diagnostic["stdoutWrites"]["other"] == 1000000
+    assert diagnostic["markerLines"]["line-start:other"] == 1000000
 
 
 def test_cloud_metadata_lane_preserves_native_fallback_and_two_request_limit(capsys):

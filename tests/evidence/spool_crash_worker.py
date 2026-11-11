@@ -7,6 +7,7 @@ spool and stops the process at named durable boundaries selected by the parent t
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -880,6 +881,32 @@ CONTENDER_FAILURE_STAGES = frozenset(
     }
 )
 CONTENDER_FAILURE_CATEGORIES = frozenset({"os_error", "runtime_error", "unexpected"})
+# Exact classes only: a subclass reports "other" so its name never crosses the pipe.
+_CONTENDER_FAILURE_EXCEPTION_TYPES: tuple[type[Exception], ...] = (
+    OSError,
+    PermissionError,
+    FileNotFoundError,
+    FileExistsError,
+    IsADirectoryError,
+    NotADirectoryError,
+    TimeoutError,
+    BlockingIOError,
+    InterruptedError,
+    BrokenPipeError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    KeyError,
+    AssertionError,
+    sqlite3.Error,
+    sqlite3.DatabaseError,
+    sqlite3.OperationalError,
+    sqlite3.IntegrityError,
+)
+CONTENDER_FAILURE_EXCEPTIONS = frozenset(
+    {kind.__name__ for kind in _CONTENDER_FAILURE_EXCEPTION_TYPES} | {"other"}
+)
+CONTENDER_FAILURE_ERRNOS = frozenset(errno.errorcode.values())
 
 
 def _emit_contender_failure(contender_id: int, stage: str, error: Exception) -> None:
@@ -890,6 +917,11 @@ def _emit_contender_failure(contender_id: int, stage: str, error: Exception) -> 
         if isinstance(error, RuntimeError)
         else "unexpected"
     )
+    exception = (
+        type(error).__name__ if type(error) in _CONTENDER_FAILURE_EXCEPTION_TYPES else "other"
+    )
+    code = error.errno if isinstance(error, OSError) else None
+    errno_name = errno.errorcode.get(code) if type(code) is int else None
     # A broken output pipe must not replace the exception being diagnosed.
     with suppress(OSError, ValueError):
         _emit_contender_frame(
@@ -899,6 +931,8 @@ def _emit_contender_failure(contender_id: int, stage: str, error: Exception) -> 
                 "state": "FAILED",
                 "stage": stage,
                 "category": category,
+                "exception": exception,
+                "errno": errno_name,
             }
         )
 

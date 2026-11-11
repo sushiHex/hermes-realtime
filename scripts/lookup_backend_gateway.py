@@ -45,6 +45,7 @@ _DIAGNOSTIC_COUNTS = {
 _DIAGNOSTIC_FLAGS = {"local_http_settled"}
 _MAX_TRANSPORT_RESPONSES = 16
 _MAX_WITNESS_COUNT = 1000000000
+_STDOUT_KINDS = ("tee", "routing-proxy-tee", "routing-proxy-other", "other")
 for _prefix in ("source", "response"):
     for _name in ("kind", "reasoning_content_kind", "reasoning_kind"):
         _DIAGNOSTIC_ENUMS[f"{_prefix}_{_name}"] = {"string", "none", "other"}
@@ -101,8 +102,15 @@ class PolicyDiagnosticTee:
         self._delegate, self._save = delegate, save
         self._lock = threading.RLock()
         self._lines = threading.local()
-        self._facts = {"version": 1, "events": [], "observed": 0, "invalid": 0,
-                       "oversized": 0, "truncated": 0, "saveFailures": 0}
+        # Fixed keys, pre-populated so a concurrent witness save never sees a dict resize.
+        self._stdout_writes = dict.fromkeys(_STDOUT_KINDS, 0)
+        self._marker_lines = {
+            f"{position}:{kind}": 0
+            for position in ("line-start", "after-text") for kind in _STDOUT_KINDS
+        }
+        self._facts = {"version": 2, "events": [], "observed": 0, "invalid": 0,
+                       "oversized": 0, "truncated": 0, "saveFailures": 0,
+                       "stdoutWrites": self._stdout_writes, "markerLines": self._marker_lines}
         witness["policyDiagnostics"] = self._facts
 
     def __getattr__(self, name: Any) -> Any:
@@ -111,15 +119,35 @@ class PolicyDiagnosticTee:
     def _increment(self, key: str) -> None:
         self._facts[key] = min(1000000, self._facts[key] + 1)
 
+    def _stdout_kind(self) -> str:
+        """Name what ``sys.stdout`` is while this write runs; never its content."""
+        current = sys.stdout
+        if current is self:
+            return "tee"
+        # Hermes agent/thread_scoped_output.py installs this proxy over the then-current
+        # sys.stdout (inside the gateway, this tee) on first thread_scoped_silence().
+        if type(current).__name__ == "_ThreadRoutingStream":
+            fields = getattr(current, "__dict__", None)
+            if type(fields) is dict and fields.get("_passthrough") is self:
+                return "routing-proxy-tee"
+            return "routing-proxy-other"
+        return "other"
+
     def _persist(self) -> None:
         try:
             self._save()
         except Exception:
             self._increment("saveFailures")
 
-    def _line(self, line: str) -> None:
+    def _line(self, line: str, kind: str) -> None:
         prefix = "[lookup-presentation] "
-        if not line.startswith(prefix):
+        index = line.find(prefix)
+        if index == -1:
+            return
+        key = f"{'line-start' if index == 0 else 'after-text'}:{kind}"
+        self._marker_lines[key] = min(1000000, self._marker_lines[key] + 1)
+        if index != 0:
+            self._persist()
             return
         try:
             event = _policy_diagnostic(json.loads(
@@ -138,6 +166,11 @@ class PolicyDiagnosticTee:
     def write(self, text: str) -> Any:
         with self._lock:
             result = self._delegate.write(text)
+            kind = self._stdout_kind()
+            seen = self._stdout_writes[kind]
+            self._stdout_writes[kind] = min(1000000, seen + 1)
+            if seen == 0:
+                self._persist()
             if type(result) is not int or not 0 <= result <= len(text):
                 return result
             pending = getattr(self._lines, "pending", "")
@@ -157,7 +190,7 @@ class PolicyDiagnosticTee:
                         pending += text[start:end]
                 if newline:
                     if not dropping:
-                        self._line(pending)
+                        self._line(pending, kind)
                     pending, dropping = "", False
                 start = end + 1
             self._lines.pending, self._lines.dropping = pending, dropping

@@ -25,7 +25,10 @@ class Surface:
         self.calls.append((objective, invocation_id))
         return WorkCommandAdmission.ADMITTED
 
-    async def start_work(self, *, objective: str, invocation_id: str):
+    async def start_work(
+        self, *, objective: str, invocation_id: str, anchor_turn_id: str | None = None,
+    ):
+        del anchor_turn_id
         self.calls.append((objective, invocation_id))
         return WorkStartResult(accepted=False, state="rejected", reason="synthetic refusal")
 

@@ -1162,7 +1162,11 @@ class StreamingSpeechLoop:
                 )
                 if automatic_proposal is not None and lease.is_current:
                     assert self._task_proposals is not None
-                    accepted = await self._task_proposals.submit_for_ack(automatic_proposal)
+                    # The acknowledgment below speaks under this lease's turn, so the
+                    # browser can place the task card after it (#500).
+                    accepted = await self._task_proposals.submit_for_ack(
+                        automatic_proposal, anchor_turn_id=lease.turn_id,
+                    )
                     if (accepted is not None and accepted.accepted and accepted.state == "active"
                             and accepted.task_id is not None and lease.is_current):
                         current = self._context.snapshot()

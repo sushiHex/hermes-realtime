@@ -260,6 +260,38 @@ def test_replay_reset_rejects_inexact_initial_slot_count(slots) -> None:
         projection.reset(initial_slots=slots)
 
 
+def test_active_task_state_carries_a_bounded_presentation_anchor() -> None:
+    projection = BrowserEventProjection()
+    for anchor in ("turn_ack", None):
+        data: dict[str, str | int | bool | None] = {
+            "taskId": "task_running", "status": "active", "anchorTurnId": anchor,
+        }
+        assert projection.publish("task_state", data).data == data
+
+
+@pytest.mark.parametrize(
+    ("status", "anchor", "error"),
+    (
+        ("active", 7, TypeError),
+        ("active", True, TypeError),
+        ("active", "", ValueError),
+        ("active", "1turn", ValueError),
+        ("active", "turn ack", ValueError),
+        ("active", "t" + "a" * 128, ValueError),
+        ("completed", "turn_ack", ValueError),
+        ("cancelling", "turn_ack", ValueError),
+    ),
+)
+def test_task_state_refuses_malformed_presentation_anchor(
+    status: str, anchor: object, error: type[Exception]
+) -> None:
+    projection = BrowserEventProjection()
+    data = {"taskId": "task_running", "status": status, "anchorTurnId": anchor}
+    with pytest.raises(error, match="task anchor"):
+        projection.publish("task_state", data)  # type: ignore[arg-type]
+    assert projection.events_after(0) == ()
+
+
 @pytest.mark.parametrize("slots", (-1, 3))
 def test_replay_reset_bounds_initial_slot_count(slots: int) -> None:
     projection = BrowserEventProjection(capacity=2)
