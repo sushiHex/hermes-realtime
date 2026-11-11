@@ -9300,6 +9300,8 @@ def assert_task_5d_single_winner_consent_resume(
     if not start_event:
         raise ctypes.WinError(ctypes.get_last_error())
     contenders: list[subprocess.Popen[str]] = []
+    # Validated, allowlisted failure-frame fields only; never child-controlled text.
+    causes: list[dict[str, object]] = []
 
     def bounded_line(process: subprocess.Popen[str], label: str) -> str:
         stdout = process.stdout
@@ -9338,10 +9340,24 @@ def assert_task_5d_single_winner_consent_resume(
                 pytrace=False,
             )
         if decoded.get("state") == "FAILED":
-            from spool_crash_worker import CONTENDER_FAILURE_CATEGORIES, CONTENDER_FAILURE_STAGES
+            from spool_crash_worker import (
+                CONTENDER_FAILURE_CATEGORIES,
+                CONTENDER_FAILURE_ERRNOS,
+                CONTENDER_FAILURE_EXCEPTIONS,
+                CONTENDER_FAILURE_STAGES,
+            )
 
             if not (
-                set(decoded) == {"contenderId", "protocolVersion", "state", "stage", "category"}
+                set(decoded)
+                == {
+                    "contenderId",
+                    "protocolVersion",
+                    "state",
+                    "stage",
+                    "category",
+                    "exception",
+                    "errno",
+                }
                 and type(decoded["contenderId"]) is int
                 and decoded["contenderId"] == expected_id
                 and type(decoded["protocolVersion"]) is int
@@ -9350,10 +9366,27 @@ def assert_task_5d_single_winner_consent_resume(
                 and decoded["stage"] in CONTENDER_FAILURE_STAGES
                 and type(decoded["category"]) is str
                 and decoded["category"] in CONTENDER_FAILURE_CATEGORIES
+                and type(decoded["exception"]) is str
+                and decoded["exception"] in CONTENDER_FAILURE_EXCEPTIONS
+                and (
+                    decoded["errno"] is None
+                    or (
+                        decoded["category"] == "os_error"
+                        and type(decoded["errno"]) is str
+                        and decoded["errno"] in CONTENDER_FAILURE_ERRNOS
+                    )
+                )
             ):
                 pytest.fail("Task 5D contender emitted an invalid failure frame", pytrace=False)
+            causes.append(
+                {
+                    key: decoded[key]
+                    for key in ("contenderId", "stage", "category", "exception", "errno")
+                }
+            )
             pytest.fail(
-                f"Task 5D contender failed at {decoded['stage']} ({decoded['category']})",
+                f"Task 5D contender failed at {decoded['stage']} ({decoded['category']}, "
+                f"{decoded['exception']}, {decoded['errno'] or 'no_errno'})",
                 pytrace=False,
             )
         return cast(dict[str, object], decoded)
@@ -9463,6 +9496,7 @@ def assert_task_5d_single_winner_consent_resume(
                 "[task-5d-contender-cleanup] "
                 + json.dumps(
                     {
+                        "causes": causes,
                         "children": len(contenders),
                         "exits": exits,
                         "failures": failures,
