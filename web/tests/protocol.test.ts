@@ -274,6 +274,20 @@ describe("public event protocol", () => {
     ).toThrow(/speech runtime/i);
   });
 
+  it("accepts a bounded task anchor only on an active task state", () => {
+    const parse = (data: object) =>
+      parseEventBatch({ version: 2, events: [{ sequence: 1, kind: "task_state", monotonicMs: 1, data }] });
+    const active = { status: "active", taskId: "task_fixture" };
+    expect(parse({ ...active, anchorTurnId: "turn_ack" }).events[0]?.data.anchorTurnId).toBe("turn_ack");
+    expect(parse({ ...active, anchorTurnId: null }).events[0]?.data.anchorTurnId).toBeNull();
+    expect(parse(active).events[0]?.data).toEqual(active);
+    for (const anchorTurnId of [7, true, "", "1turn", "turn ack", `t${"a".repeat(128)}`]) {
+      expect(() => parse({ ...active, anchorTurnId })).toThrow(/task anchor/i);
+    }
+    expect(() => parse({ status: "completed", taskId: "task_fixture", anchorTurnId: "turn_ack" }))
+      .toThrow(/task anchor/i);
+  });
+
   it("accepts sequenced objective events and rejects unknown fields", () => {
     const batch = parseEventBatch({
       version: 1,
