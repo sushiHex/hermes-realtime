@@ -129,6 +129,7 @@ def test_missing_terminal_preserves_primary_and_cleans_every_owner(monkeypatch, 
     assert "999999" not in output
     report = json.loads(output.split("[task-5d-contender-cleanup] ")[1])
     assert report == {
+        "causes": [],
         "children": 2,
         "exits": [{"category": "nonzero"}, {"category": "zero"}],
         "failures": ["send", "nonzero_exit"],
@@ -173,6 +174,8 @@ def test_failure_frame_is_bounded_and_fail_closed(monkeypatch, tmp_path, capsys,
         "state": "FAILED",
         "stage": "shared_start",
         "category": "runtime_error",
+        "exception": "RuntimeError",
+        "errno": None,
     }
     if bad:
         failure["stage"] = "PRIVATE-CHILD-CONTENT"
@@ -212,6 +215,8 @@ def test_worker_reports_stage_without_exception_content(monkeypatch, tmp_path, c
             "state": "FAILED",
             "stage": "shared_start",
             "category": "runtime_error",
+            "exception": "RuntimeError",
+            "errno": None,
         },
     ]
 
@@ -316,6 +321,11 @@ def test_cleanup_errors_never_skip_later_owners(monkeypatch, tmp_path, capsys, k
         ("stage", []),
         ("category", {}),
         ("category", "PRIVATE-CHILD-CONTENT"),
+        ("exception", None),
+        ("exception", "PRIVATE-CHILD-CONTENT"),
+        ("errno", 13),
+        ("errno", "PRIVATE-CHILD-CONTENT"),
+        ("errno", "EACCES"),
     ],
 )
 def test_failure_schema_rejects_each_untrusted_field(monkeypatch, tmp_path, capsys, field, value):
@@ -325,6 +335,8 @@ def test_failure_schema_rejects_each_untrusted_field(monkeypatch, tmp_path, caps
         "state": "FAILED",
         "stage": "shared_start",
         "category": "runtime_error",
+        "exception": "RuntimeError",
+        "errno": None,
     }
     failure[field] = value
     children = [Child(frames(0, False) + json.dumps(failure) + "\n"), Child(frames(1))]
@@ -336,14 +348,14 @@ def test_failure_schema_rejects_each_untrusted_field(monkeypatch, tmp_path, caps
 
 
 @pytest.mark.parametrize(
-    "error,category",
+    "error,category,exception,errno_name",
     [
-        (OSError(22, "PRIVATE-CHILD-CONTENT"), "os_error"),
-        (RuntimeError("PRIVATE-CHILD-CONTENT"), "runtime_error"),
-        (ValueError("PRIVATE-CHILD-CONTENT"), "unexpected"),
+        (OSError(22, "PRIVATE-CHILD-CONTENT"), "os_error", "OSError", "EINVAL"),
+        (RuntimeError("PRIVATE-CHILD-CONTENT"), "runtime_error", "RuntimeError", None),
+        (ValueError("PRIVATE-CHILD-CONTENT"), "unexpected", "ValueError", None),
     ],
 )
-def test_worker_categories_are_content_free(capsys, error, category):
+def test_worker_categories_are_content_free(capsys, error, category, exception, errno_name):
     worker._emit_contender_failure(0, "setup", error)
     assert json.loads(capsys.readouterr().out) == {
         "contenderId": 0,
@@ -351,6 +363,8 @@ def test_worker_categories_are_content_free(capsys, error, category):
         "state": "FAILED",
         "stage": "setup",
         "category": category,
+        "exception": exception,
+        "errno": errno_name,
     }
 
 
@@ -415,6 +429,8 @@ def test_worker_setup_failure_reports_without_unowned_cleanup(monkeypatch, tmp_p
         "state": "FAILED",
         "stage": "setup",
         "category": "os_error",
+        "exception": "OSError",
+        "errno": "EINVAL",
     }
 
 
@@ -494,6 +510,8 @@ def test_worker_failure_stage_matches_actual_boundary(monkeypatch, tmp_path, sta
         "state": "FAILED",
         "stage": stage,
         "category": "runtime_error",
+        "exception": "RuntimeError",
+        "errno": None,
     }
     assert "PRIVATE" not in json.dumps(reports)
 
@@ -550,6 +568,7 @@ def test_cleanup_evidence_contains_only_exact_exit_categories(monkeypatch, tmp_p
     assert_closed(children, kernel)
     report = json.loads(capsys.readouterr().out.split("[task-5d-contender-cleanup] ")[1])
     assert report == {
+        "causes": [],
         "children": 2,
         "exits": [{"category": "nonzero"}, {"category": "zero"}],
         "failures": ["nonzero_exit"],
